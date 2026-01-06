@@ -1,0 +1,179 @@
+"""Git operations for Theo."""
+
+import subprocess
+from pathlib import Path
+
+
+class GitError(Exception):
+    """Git operation failed."""
+    pass
+
+
+class Git:
+    """Git operations wrapper."""
+
+    def __init__(self, repo_dir: Path):
+        self.repo_dir = repo_dir
+
+    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        """Run a git command."""
+        result = subprocess.run(
+            ["git", *args],
+            cwd=self.repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if check and result.returncode != 0:
+            raise GitError(f"git {' '.join(args)} failed: {result.stderr}")
+        return result
+
+    def current_branch(self) -> str:
+        """Get current branch name."""
+        result = self._run("rev-parse", "--abbrev-ref", "HEAD")
+        return result.stdout.strip()
+
+    def default_branch(self) -> str:
+        """Detect the default branch (main or master)."""
+        # Try to get from origin HEAD
+        result = self._run("symbolic-ref", "refs/remotes/origin/HEAD", check=False)
+        if result.returncode == 0:
+            return result.stdout.strip().replace("refs/remotes/origin/", "")
+
+        # Fallback: check which exists locally
+        for branch in ["main", "master"]:
+            result = self._run("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+            if result.returncode == 0:
+                return branch
+
+        return "master"
+
+    def checkout(self, branch: str) -> None:
+        """Checkout a branch."""
+        self._run("checkout", branch)
+
+    def pull(self) -> bool:
+        """Pull latest changes. Returns True if successful."""
+        result = self._run("pull", "--ff-only", check=False)
+        return result.returncode == 0
+
+    def create_branch(self, branch: str, force: bool = False) -> None:
+        """Create and checkout a new branch."""
+        if force:
+            self._run("branch", "-D", branch, check=False)
+        self._run("checkout", "-b", branch)
+
+    def has_changes(self, path: str = ".") -> bool:
+        """Check if there are uncommitted changes."""
+        staged = self._run("diff", "--cached", "--quiet", "--", path, check=False)
+        unstaged = self._run("diff", "--quiet", "--", path, check=False)
+        return staged.returncode != 0 or unstaged.returncode != 0
+
+    def add(self, path: str = ".") -> None:
+        """Stage changes."""
+        self._run("add", path)
+
+    def commit(self, message: str) -> None:
+        """Create a commit."""
+        self._run("commit", "-m", message)
+
+    def amend(self) -> None:
+        """Amend the last commit with staged changes."""
+        self._run("commit", "--amend", "--no-edit")
+
+    def branch_exists(self, branch: str) -> bool:
+        """Check if a branch exists locally."""
+        result = self._run("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+        return result.returncode == 0
+
+    def worktree_add(self, path: Path, branch: str, base_branch: str | None = None) -> Path:
+        """Create a new worktree with a new branch.
+
+        Args:
+            path: Directory where worktree will be created
+            branch: Name of the new branch to create
+            base_branch: Branch to base the new branch on (defaults to HEAD)
+
+        Returns:
+            The path to the created worktree
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove existing worktree if it exists (handles stale worktrees)
+        if path.exists():
+            self.worktree_remove(path, force=True)
+
+        # Create worktree with new branch
+        args = ["worktree", "add", "-b", branch, str(path)]
+        if base_branch:
+            args.append(base_branch)
+        self._run(*args)
+        return path
+
+    def worktree_remove(self, path: Path, force: bool = False) -> None:
+        """Remove a worktree.
+
+        Args:
+            path: Path to the worktree to remove
+            force: Force removal even if worktree is dirty
+        """
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(str(path))
+        self._run(*args, check=False)
+
+    def worktree_list(self) -> list[dict]:
+        """List all worktrees.
+
+        Returns:
+            List of dicts with 'path', 'head', 'branch' keys
+        """
+        result = self._run("worktree", "list", "--porcelain")
+        worktrees = []
+        current = {}
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                if current:
+                    worktrees.append(current)
+                    current = {}
+            elif line.startswith("worktree "):
+                current["path"] = line[9:]
+            elif line.startswith("HEAD "):
+                current["head"] = line[5:]
+            elif line.startswith("branch "):
+                current["branch"] = line[7:]
+        if current:
+            worktrees.append(current)
+        return worktrees
+
+    def is_merged(self, branch: str, into: str | None = None) -> bool:
+        """Check if a branch has been merged into another branch.
+
+        Uses git cherry to detect if the branch's changes have been applied,
+        which works correctly for squash merges (where commit SHAs differ but
+        the patch content is the same).
+
+        Args:
+            branch: The branch to check
+            into: The target branch (defaults to default branch)
+
+        Returns:
+            True if the branch has been merged into the target
+        """
+        if into is None:
+            into = self.default_branch()
+
+        # Check if branch exists
+        if not self.branch_exists(branch):
+            return True  # Branch deleted, assume merged
+
+        # Use git cherry to detect if commits have been applied (works with squash merges)
+        # git cherry shows - for commits already in target, + for commits not in target
+        result = self._run("cherry", into, branch, check=False)
+        if result.returncode != 0:
+            return False
+
+        # If all lines start with -, all commits have been merged
+        # If there's no output, the branches are identical (also merged)
+        lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+        return all(line.startswith("-") for line in lines)
