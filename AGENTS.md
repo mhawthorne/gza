@@ -61,3 +61,10 @@ After making changes, run the test suite to verify everything works:
 ```
 uv run pytest tests/ -v
 ```
+
+### Testing Guidelines
+
+- Add unit tests for new functionality
+- Tests go in `tests/` with `test_` prefix (e.g., `tests/test_importer.py`)
+- Use pytest fixtures for common setup (see existing tests for patterns)
+- Test both success cases and error handling

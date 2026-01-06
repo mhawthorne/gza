@@ -15,7 +15,7 @@ class Task:
     id: int | None  # None for unsaved tasks
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged
-    task_type: str = "task"  # task, explore
+    task_type: str = "task"  # task, explore, plan, implement, review
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
     log_file: str | None = None
@@ -28,10 +28,19 @@ class Task:
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    # New fields for task import/chaining
+    group: str | None = None  # Group name for related tasks
+    depends_on: int | None = None  # Task ID this task depends on
+    spec: str | None = None  # Path to spec file for context
+    create_review: bool = False  # Auto-create review task on completion
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
         return self.task_type == "explore"
+
+    def is_blocked(self) -> bool:
+        """Check if this task is blocked by a dependency."""
+        return self.depends_on is not None
 
 
 @dataclass
@@ -43,7 +52,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -66,12 +75,29 @@ CREATE TABLE IF NOT EXISTS tasks (
     cost_usd REAL,
     created_at TEXT NOT NULL,
     started_at TEXT,
-    completed_at TEXT
+    completed_at TEXT,
+    -- New fields for task import/chaining (v2)
+    "group" TEXT,
+    depends_on INTEGER REFERENCES tasks(id),
+    spec TEXT,
+    create_review INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
+CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
+"""
+
+# Migration from v1 to v2
+MIGRATION_V1_TO_V2 = """
+ALTER TABLE tasks ADD COLUMN "group" TEXT;
+ALTER TABLE tasks ADD COLUMN depends_on INTEGER REFERENCES tasks(id);
+ALTER TABLE tasks ADD COLUMN spec TEXT;
+ALTER TABLE tasks ADD COLUMN create_review INTEGER DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
+CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
 """
 
 
@@ -86,12 +112,34 @@ class SqliteTaskStore:
         """Ensure database exists and schema is current."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            conn.executescript(SCHEMA)
-            # Check/set schema version
-            cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
-            row = cur.fetchone()
-            if row is None:
+            # Check if schema_version table exists
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            )
+            if cur.fetchone() is None:
+                # Fresh database - create full schema
+                conn.executescript(SCHEMA)
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+            else:
+                # Check current version and migrate if needed
+                cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+                row = cur.fetchone()
+                current_version = row["version"] if row else 0
+
+                if current_version < 2:
+                    # Run migration v1 -> v2
+                    for stmt in MIGRATION_V1_TO_V2.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column/index might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (2,))
+
+                if row is None:
+                    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
@@ -118,20 +166,33 @@ class SqliteTaskStore:
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            group=row["group"],
+            depends_on=row["depends_on"],
+            spec=row["spec"],
+            create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
         )
 
     # === Task CRUD ===
 
-    def add(self, prompt: str, task_type: str = "task", based_on: int | None = None) -> Task:
+    def add(
+        self,
+        prompt: str,
+        task_type: str = "task",
+        based_on: int | None = None,
+        group: str | None = None,
+        depends_on: int | None = None,
+        spec: str | None = None,
+        create_review: bool = False,
+    ) -> Task:
         """Add a new task."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now),
+                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0),
             )
             task_id = cur.lastrowid
             return self.get(task_id)
@@ -169,7 +230,11 @@ class SqliteTaskStore:
                     num_turns = ?,
                     cost_usd = ?,
                     started_at = ?,
-                    completed_at = ?
+                    completed_at = ?,
+                    "group" = ?,
+                    depends_on = ?,
+                    spec = ?,
+                    create_review = ?
                 WHERE id = ?
                 """,
                 (
@@ -187,6 +252,10 @@ class SqliteTaskStore:
                     task.cost_usd,
                     task.started_at.isoformat() if task.started_at else None,
                     task.completed_at.isoformat() if task.completed_at else None,
+                    task.group,
+                    task.depends_on,
+                    task.spec,
+                    1 if task.create_review else 0,
                     task.id,
                 ),
             )
@@ -200,13 +269,24 @@ class SqliteTaskStore:
     # === Query methods ===
 
     def get_next_pending(self) -> Task | None:
-        """Get the next pending task (oldest first)."""
+        """Get the next pending task (oldest first), skipping blocked tasks.
+
+        A task is blocked if it depends on another task that is not completed.
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT * FROM tasks
-                WHERE status = 'pending'
-                ORDER BY created_at ASC
+                SELECT t.* FROM tasks t
+                WHERE t.status = 'pending'
+                AND (
+                    t.depends_on IS NULL
+                    OR EXISTS (
+                        SELECT 1 FROM tasks dep
+                        WHERE dep.id = t.depends_on
+                        AND dep.status = 'completed'
+                    )
+                )
+                ORDER BY t.created_at ASC
                 LIMIT 1
                 """
             )
