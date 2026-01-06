@@ -5,13 +5,13 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .config import Config
+from .config import APP_NAME, Config
 from .db import SqliteTaskStore, Task, TaskStats
 from .git import Git, GitError
 from .providers import get_provider, Provider, RunResult
 
 
-DEFAULT_REPORT_DIR = ".theo/explorations"
+DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
 
 
 def format_duration(seconds: float) -> str:
@@ -41,11 +41,11 @@ def print_stats(stats: TaskStats, has_commits: bool | None = None) -> None:
 def load_dotenv(project_dir: Path) -> None:
     """Load .env files from home directory and project directory.
 
-    Home directory .env (~/.theo/.env) is loaded first, then project directory .env,
+    Home directory .env (~/.{APP_NAME}/.env) is loaded first, then project directory .env,
     so project-specific values override home directory values.
     """
-    # Load from home directory first (~/.theo/.env)
-    home_env = Path.home() / ".theo" / ".env"
+    # Load from home directory first (~/.{APP_NAME}/.env)
+    home_env = Path.home() / f".{APP_NAME}" / ".env"
     if home_env.exists():
         with open(home_env) as f:
             for line in f:
@@ -174,7 +174,10 @@ def run(config: Config) -> int:
     provider = get_provider(config)
 
     if not provider.check_credentials():
+        home_env = Path.home() / f".{APP_NAME}" / ".env"
         print(f"Error: No {provider.name} credentials found")
+        print(f"  Set ANTHROPIC_API_KEY in {home_env} or {config.project_dir}/.env")
+        print("  Or run 'claude login' to authenticate via OAuth")
         return 1
 
     # Verify credentials work before proceeding

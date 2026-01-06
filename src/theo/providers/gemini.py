@@ -100,6 +100,9 @@ class GeminiProvider(Provider):
         # Use gemini-specific image name
         image_name = f"{config.project_name}-theo-gemini"
         docker_config = _get_docker_config(image_name)
+        if not ensure_docker_image(docker_config, config.project_dir):
+            print("Error: Failed to build Docker image")
+            return False
         return verify_docker_credentials(
             docker_config=docker_config,
             version_cmd=["gemini", "--version"],

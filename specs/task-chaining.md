@@ -55,6 +55,8 @@ class Task:
     group: str | None = None        # Optional label for related tasks (e.g., "tarantino-v2")
     depends_on: int | None = None   # Task ID that must complete first
     create_review: bool = False     # Auto-create review task on completion
+    same_branch: bool = False       # If True, continue on depends_on task's branch instead of creating new
+    branch: str | None = None       # Git branch used/created by this task (set by runner)
 ```
 
 SQL migration:
@@ -63,6 +65,8 @@ SQL migration:
 ALTER TABLE tasks ADD COLUMN group_name TEXT;
 ALTER TABLE tasks ADD COLUMN depends_on INTEGER REFERENCES tasks(id);
 ALTER TABLE tasks ADD COLUMN create_review INTEGER DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN same_branch INTEGER DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN branch TEXT;
 ```
 
 ## Configuration
@@ -103,7 +107,13 @@ theo add --type implement --based-on 1
 
 # Explicit review task (alternative to --review flag)
 theo add --type review --based-on 2
+
+# Task that continues on the same branch as its dependency
+# (for multi-step implementations that build on unmerged code)
+theo add --based-on 1 --same-branch
 ```
+
+Note: `--same-branch` requires `--based-on`. When set, the task will check out and continue working on the branch from the dependency task instead of creating a new branch. This is useful when multiple tasks need to build on each other's code changes before merging.
 
 ### Viewing status
 
@@ -191,9 +201,12 @@ Behavior:
 ### Implement tasks
 
 1. Agent receives prompt + plan context (from `based_on` chain)
-2. Agent implements on feature branch
-3. Task marked complete
-4. If `create_review=True`:
+2. Branch handling:
+   - If `same_branch=True`: check out the branch from `depends_on` task
+   - Otherwise: create a new feature branch
+3. Agent implements on branch
+4. Task marked complete
+5. If `create_review=True`:
    - Review task auto-created
    - Review task auto-executed
 

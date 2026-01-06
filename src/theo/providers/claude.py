@@ -57,6 +57,9 @@ class ClaudeProvider(Provider):
     def _verify_docker(self, config: Config) -> bool:
         """Verify credentials work in Docker."""
         docker_config = _get_docker_config(config.docker_image)
+        if not ensure_docker_image(docker_config, config.project_dir):
+            print("Error: Failed to build Docker image")
+            return False
         return verify_docker_credentials(
             docker_config=docker_config,
             version_cmd=["claude", "--version"],

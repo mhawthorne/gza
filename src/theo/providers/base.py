@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..config import APP_NAME
+
 if TYPE_CHECKING:
     from ..config import Config
 
@@ -60,7 +62,7 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
         return True
 
     # Build the image
-    theo_dir = project_dir / ".theo"
+    theo_dir = project_dir / f".{APP_NAME}"
     theo_dir.mkdir(parents=True, exist_ok=True)
 
     dockerfile_content = DOCKERFILE_TEMPLATE.format(

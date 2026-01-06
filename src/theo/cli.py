@@ -71,8 +71,10 @@ def cmd_next(args: argparse.Namespace) -> int:
 
     for i, task in enumerate(pending, 1):
         type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
-        prompt_display = task.prompt[:70] + "..." if len(task.prompt) > 70 else task.prompt
-        print(f"{i}. [#{task.id}] {prompt_display}{type_label}")
+        # Get first line only, then truncate
+        first_line = task.prompt.split('\n')[0].strip()
+        prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
+        print(f"{i}. [#{task.id}]{type_label} {prompt_display}")
         if task.based_on:
             print(f"    based_on: task #{task.based_on}")
     return 0
@@ -363,6 +365,7 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     # Read and parse the log file (supports both single JSON and JSONL formats)
     log_data = None
+    entries = []
     try:
         with open(log_path) as f:
             content = f.read().strip()
@@ -371,16 +374,16 @@ def cmd_log(args: argparse.Namespace) -> int:
         try:
             log_data = json.loads(content)
         except json.JSONDecodeError:
-            # Try parsing as JSONL (new format) - find the result entry
+            # Try parsing as JSONL (new format)
             for line in content.split('\n'):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     entry = json.loads(line)
+                    entries.append(entry)
                     if entry.get("type") == "result":
                         log_data = entry
-                        break
                 except json.JSONDecodeError:
                     continue
 
@@ -401,15 +404,19 @@ def cmd_log(args: argparse.Namespace) -> int:
     print("=" * 70)
     print()
 
-    # Extract and display the result field (which contains markdown)
-    if "result" in log_data:
-        print(log_data["result"])
+    if args.turns and entries:
+        # Show the full conversation turns
+        _display_conversation_turns(entries)
     else:
-        # No result - show the subtype (e.g., error_max_turns)
-        subtype = log_data.get("subtype", "unknown")
-        print(f"Run ended with: {subtype}")
-        if log_data.get("errors"):
-            print(f"Errors: {log_data['errors']}")
+        # Extract and display the result field (which contains markdown)
+        if "result" in log_data:
+            print(log_data["result"])
+        else:
+            # No result - show the subtype (e.g., error_max_turns)
+            subtype = log_data.get("subtype", "unknown")
+            print(f"Run ended with: {subtype}")
+            if log_data.get("errors"):
+                print(f"Errors: {log_data['errors']}")
 
     print()
     print("=" * 70)
@@ -424,6 +431,79 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"Cost: ${log_data['total_cost_usd']:.4f}")
 
     return 0
+
+
+def _display_conversation_turns(entries: list[dict]) -> None:
+    """Display the conversation turns from JSONL log entries."""
+    turn_num = 0
+    for entry in entries:
+        entry_type = entry.get("type")
+
+        if entry_type == "system":
+            # Show init info briefly
+            model = entry.get("model", "unknown")
+            print(f"[System] Model: {model}")
+            print("-" * 40)
+            continue
+
+        if entry_type == "assistant":
+            message = entry.get("message", {})
+            content = message.get("content", [])
+
+            for item in content:
+                if item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text:
+                        turn_num += 1
+                        print(f"\n[Assistant - Turn {turn_num}]")
+                        print(text)
+                        print()
+                elif item.get("type") == "tool_use":
+                    tool_name = item.get("name", "unknown")
+                    tool_input = item.get("input", {})
+                    print(f"  -> Tool: {tool_name}")
+                    # Show brief summary of tool input
+                    if tool_name == "Read":
+                        print(f"     File: {tool_input.get('file_path', 'unknown')}")
+                    elif tool_name == "Edit":
+                        print(f"     File: {tool_input.get('file_path', 'unknown')}")
+                    elif tool_name == "Bash":
+                        cmd = tool_input.get('command', '')
+                        if len(cmd) > 80:
+                            cmd = cmd[:77] + "..."
+                        print(f"     Command: {cmd}")
+                    elif tool_name == "Grep":
+                        print(f"     Pattern: {tool_input.get('pattern', 'unknown')}")
+                    elif tool_name == "Glob":
+                        print(f"     Pattern: {tool_input.get('pattern', 'unknown')}")
+                    elif tool_name == "Write":
+                        print(f"     File: {tool_input.get('file_path', 'unknown')}")
+                    elif tool_name == "TodoWrite":
+                        todos = tool_input.get('todos', [])
+                        print(f"     Todos: {len(todos)} items")
+                    else:
+                        # Show first key-value for unknown tools
+                        for k, v in list(tool_input.items())[:1]:
+                            v_str = str(v)
+                            if len(v_str) > 60:
+                                v_str = v_str[:57] + "..."
+                            print(f"     {k}: {v_str}")
+
+        elif entry_type == "user":
+            # User entries are tool results - show brief summary
+            message = entry.get("message", {})
+            content = message.get("content", [])
+            for item in content:
+                if item.get("type") == "tool_result":
+                    is_error = item.get("is_error", False)
+                    result_content = item.get("content", "")
+                    if is_error:
+                        print(f"  <- Error: {result_content[:100]}")
+                    # Don't print successful tool results - too verbose
+
+        elif entry_type == "result":
+            # Final result - already shown in summary
+            pass
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -753,6 +833,11 @@ def main() -> int:
     log_parser.add_argument(
         "task_slug",
         help="Task ID, slug, or partial slug to match",
+    )
+    log_parser.add_argument(
+        "--turns",
+        action="store_true",
+        help="Show the full conversation turns instead of just the summary",
     )
     add_common_args(log_parser)
 

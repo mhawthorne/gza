@@ -7,7 +7,8 @@ from pathlib import Path
 
 import yaml
 
-CONFIG_FILENAME = "theo.yaml"
+APP_NAME = "theo"
+CONFIG_FILENAME = f"{APP_NAME}.yaml"
 
 
 class ConfigError(Exception):
@@ -16,13 +17,13 @@ class ConfigError(Exception):
 
 
 DEFAULT_TASKS_FILE = "tasks.yaml"
-DEFAULT_DB_FILE = ".theo/theo.db"
-DEFAULT_LOG_DIR = ".theo/logs"
+DEFAULT_DB_FILE = f".{APP_NAME}/{APP_NAME}.db"
+DEFAULT_LOG_DIR = f".{APP_NAME}/logs"
 DEFAULT_TIMEOUT_MINUTES = 10
 DEFAULT_USE_DOCKER = True
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
 DEFAULT_MAX_TURNS = 50
-DEFAULT_WORKTREE_DIR = "/tmp/theo-worktrees"
+DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
 DEFAULT_PROVIDER = "claude"  # "claude" or "gemini"
 DEFAULT_CLAUDE_ARGS = [
