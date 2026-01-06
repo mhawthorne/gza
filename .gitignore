@@ -1,3 +1,5 @@
+*.lock
 *.pyc
 __pycache__/
 .pytest_cache/
+tmp/

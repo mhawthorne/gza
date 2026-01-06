@@ -9,6 +9,7 @@ from pathlib import Path
 from .config import Config, ConfigError
 from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, Task as DbTask
 from .git import Git
+from .importer import parse_import_file, validate_import, import_tasks
 from .runner import run
 from .tasks import YamlTaskStore, Task as YamlTask
 
@@ -562,16 +563,89 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_import(args: argparse.Namespace) -> int:
-    """Import tasks from tasks.yaml into SQLite."""
+    """Import tasks from a YAML file."""
+    # Handle legacy usage: theo import <project_dir>
+    # If the file argument is a directory, treat it as project_dir
+    if args.file and Path(args.file).is_dir():
+        args.project_dir = Path(args.file).resolve()
+        args.file = None
+
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    tasks_yaml_path = config.tasks_path
-    if not tasks_yaml_path.exists():
-        print(f"Error: {tasks_yaml_path} not found")
+    # Determine which file to import
+    if args.file:
+        import_path = Path(args.file)
+        if not import_path.is_absolute():
+            import_path = config.project_dir / import_path
+    else:
+        # Legacy: import from tasks.yaml
+        import_path = config.tasks_path
+        if not import_path.exists():
+            print(f"Error: No file specified and {import_path} not found")
+            print("Usage: theo import <file> [--dry-run] [--force]")
+            return 1
+        return _cmd_import_legacy(config, store)
+
+    # Parse the import file
+    tasks, default_group, default_spec, parse_errors = parse_import_file(import_path)
+
+    if parse_errors:
+        print("Error: Failed to parse import file:")
+        for error in parse_errors:
+            if error.task_index:
+                print(f"  Task {error.task_index}: {error.message}")
+            else:
+                print(f"  {error.message}")
         return 1
 
-    yaml_store = YamlTaskStore(tasks_yaml_path)
+    # Validate the tasks
+    validation_errors = validate_import(tasks, config.project_dir, default_spec)
+
+    if validation_errors:
+        print("Error: Validation failed:")
+        for error in validation_errors:
+            if error.task_index:
+                print(f"  Task {error.task_index}: {error.message}")
+            else:
+                print(f"  {error.message}")
+        return 1
+
+    # Import the tasks
+    if args.dry_run:
+        print(f"Would import {len(tasks)} tasks:")
+    else:
+        print(f"Importing {len(tasks)} tasks...")
+
+    results, messages = import_tasks(
+        store=store,
+        tasks=tasks,
+        project_dir=config.project_dir,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
+
+    for message in messages:
+        print(message)
+
+    # Summary
+    if args.dry_run:
+        return 0
+
+    created = sum(1 for r in results if not r.skipped)
+    skipped = sum(1 for r in results if r.skipped)
+
+    if skipped:
+        print(f"Imported {created} tasks ({skipped} skipped)")
+    else:
+        print(f"Imported {created} tasks")
+
+    return 0
+
+
+def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
+    """Legacy import from tasks.yaml (old format)."""
+    yaml_store = YamlTaskStore(config.tasks_path)
     imported = 0
     skipped = 0
 
@@ -750,7 +824,22 @@ def main() -> int:
     add_common_args(show_parser)
 
     # import command
-    import_parser = subparsers.add_parser("import", help="Import tasks from tasks.yaml")
+    import_parser = subparsers.add_parser("import", help="Import tasks from a YAML file")
+    import_parser.add_argument(
+        "file",
+        nargs="?",
+        help="YAML file to import tasks from",
+    )
+    import_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be imported without creating tasks",
+    )
+    import_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Skip duplicate detection and import all tasks",
+    )
     add_common_args(import_parser)
 
     args = parser.parse_args()
