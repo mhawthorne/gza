@@ -549,24 +549,45 @@ class SqliteTaskStore:
 
 # === Editor support ===
 
-TASK_TEMPLATE = """# Enter your task prompt below.
+TASK_TEMPLATE_HEADER = """# Enter your task prompt below.
 # Lines starting with # are comments and will be ignored.
 # Save and close the editor when done.
 #
-# Task type: {task_type}
-{based_on_line}
 """
 
 
-def edit_prompt(initial_content: str = "", task_type: str = "task", based_on: int | None = None) -> str | None:
+def edit_prompt(
+    initial_content: str = "",
+    task_type: str = "task",
+    based_on: int | None = None,
+    spec: str | None = None,
+    group: str | None = None,
+    depends_on: int | None = None,
+    create_review: bool = False,
+    same_branch: bool = False,
+) -> str | None:
     """Open $EDITOR for the user to enter/edit a prompt.
 
     Returns the prompt text, or None if cancelled/empty.
     """
     editor = os.environ.get("EDITOR", "vim")
 
-    based_on_line = f"# Based on task: {based_on}" if based_on else ""
-    template = TASK_TEMPLATE.format(task_type=task_type, based_on_line=based_on_line)
+    # Build options section
+    options = [f"# Type: {task_type}"]
+    if based_on:
+        options.append(f"# Based on: #{based_on}")
+    if depends_on:
+        options.append(f"# Depends on: #{depends_on}")
+    if group:
+        options.append(f"# Group: {group}")
+    if spec:
+        options.append(f"# Spec: {spec}")
+    if create_review:
+        options.append("# Create review: yes")
+    if same_branch:
+        options.append("# Same branch: yes")
+
+    template = TASK_TEMPLATE_HEADER + "\n".join(options) + "\n"
 
     content = template + "\n" + initial_content
 
@@ -591,13 +612,30 @@ def edit_prompt(initial_content: str = "", task_type: str = "task", based_on: in
         os.unlink(tmp_path)
 
 
-def add_task_interactive(store: SqliteTaskStore, task_type: str = "task", based_on: int | None = None) -> Task | None:
+def add_task_interactive(
+    store: SqliteTaskStore,
+    task_type: str = "task",
+    based_on: int | None = None,
+    spec: str | None = None,
+    group: str | None = None,
+    depends_on: int | None = None,
+    create_review: bool = False,
+    same_branch: bool = False,
+) -> Task | None:
     """Interactively add a task using $EDITOR.
 
     Returns the created task, or None if cancelled.
     """
     while True:
-        prompt = edit_prompt(task_type=task_type, based_on=based_on)
+        prompt = edit_prompt(
+            task_type=task_type,
+            based_on=based_on,
+            spec=spec,
+            group=group,
+            depends_on=depends_on,
+            create_review=create_review,
+            same_branch=same_branch,
+        )
 
         if prompt is None:
             print("Task cancelled (empty prompt)")
@@ -630,7 +668,12 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
         prompt = edit_prompt(
             initial_content=task.prompt,
             task_type=task.task_type,
-            based_on=task.based_on
+            based_on=task.based_on,
+            spec=task.spec,
+            group=task.group,
+            depends_on=task.depends_on,
+            create_review=task.create_review,
+            same_branch=task.same_branch,
         )
 
         if prompt is None:

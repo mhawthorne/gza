@@ -111,7 +111,7 @@ def cmd_next(args: argparse.Namespace) -> int:
             # Get first line only, then truncate
             first_line = task.prompt.split('\n')[0].strip()
             prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
-            print(f"{i}. {type_label}{prompt_display}")
+            print(f"{i}. (#{task.id}) {type_label}{prompt_display}")
     else:
         if not show_all:
             print("No runnable tasks")
@@ -124,7 +124,7 @@ def cmd_next(args: argparse.Namespace) -> int:
             type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
             first_line = task.prompt.split('\n')[0].strip()
             prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
-            print(f"{i}. {type_label}{prompt_display} (blocked by #{blocking_id})")
+            print(f"{i}. (#{task.id}) {type_label}{prompt_display} (blocked by #{blocking_id})")
 
     # Show blocked count at the bottom (only if not showing all)
     if not show_all and blocked:
@@ -808,10 +808,19 @@ def cmd_add(args: argparse.Namespace) -> int:
 
     if args.edit or not args.prompt:
         # Interactive mode with $EDITOR
-        task = add_task_interactive(store, task_type=task_type, based_on=based_on)
+        task = add_task_interactive(
+            store,
+            task_type=task_type,
+            based_on=based_on,
+            spec=spec,
+            group=group,
+            depends_on=depends_on,
+            create_review=create_review,
+            same_branch=same_branch,
+        )
         if not task:
             return 1
-        # Update additional fields
+        # Update additional fields that aren't passed to store.add() by add_task_interactive
         if group:
             task.group = group
         if depends_on:
@@ -1048,6 +1057,12 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"Slug: {task.task_id}")
     if task.based_on:
         print(f"Based on: task #{task.based_on}")
+    if task.depends_on:
+        print(f"Depends on: task #{task.depends_on}")
+    if task.group:
+        print(f"Group: {task.group}")
+    if task.spec:
+        print(f"Spec: {task.spec}")
     if task.branch:
         print(f"Branch: {task.branch}")
     if task.log_file:
