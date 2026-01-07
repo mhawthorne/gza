@@ -515,11 +515,54 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("Use --force to overwrite")
         return 1
 
+    # Prompt for branch strategy
+    print("Branch naming strategy:")
+    print("  1. monorepo    - {project}/{task_id} (e.g., myproj/20260107-add-feature)")
+    print("  2. conventional - {type}/{slug} (e.g., feature/add-feature, fix/login-bug)")
+    print("  3. simple      - {slug} (e.g., add-feature)")
+    print("  4. custom      - Define your own pattern")
+
+    while True:
+        choice = input("Choose strategy [1-4, default=1]: ").strip() or "1"
+        if choice in ("1", "2", "3", "4"):
+            break
+        print("Invalid choice. Please enter 1, 2, 3, or 4.")
+
+    # Determine branch_strategy value
+    if choice == "1":
+        branch_strategy_line = "# branch_strategy: monorepo  # Default: {project}/{task_id}"
+    elif choice == "2":
+        branch_strategy_line = "branch_strategy: conventional  # {type}/{slug}"
+    elif choice == "3":
+        branch_strategy_line = "branch_strategy: simple  # {slug}"
+    else:  # custom
+        print("\nCustom pattern variables:")
+        print("  {project}  - Project name")
+        print("  {task_id}  - Full task ID (YYYYMMDD-slug)")
+        print("  {date}     - Date portion (YYYYMMDD)")
+        print("  {slug}     - Slug portion")
+        print("  {type}     - Inferred/default type (feature, fix, etc.)")
+
+        while True:
+            pattern = input("Enter custom pattern: ").strip()
+            if pattern:
+                break
+            print("Pattern cannot be empty.")
+
+        default_type = input("Default type [default=feature]: ").strip() or "feature"
+        branch_strategy_line = f"""branch_strategy:
+  pattern: "{pattern}"
+  default_type: {default_type}"""
+
     # Generate config file with project_name required and other defaults commented out
     config_content = f"""# Theo Configuration
 
 # Project name (required) - used for branch prefixes and Docker image naming
 project_name: {default_project_name}
+
+# Branch naming strategy (default: monorepo)
+# Options: monorepo, conventional, simple, or custom pattern dict
+{branch_strategy_line}
 
 # All settings below show default values and are commented out.
 # Uncomment and modify any setting you want to change.
@@ -779,6 +822,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     spec = args.spec if hasattr(args, 'spec') and args.spec else None
+    branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -817,21 +861,10 @@ def cmd_add(args: argparse.Namespace) -> int:
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
+            task_type_hint=branch_type,
         )
         if not task:
             return 1
-        # Update additional fields that aren't passed to store.add() by add_task_interactive
-        if group:
-            task.group = group
-        if depends_on:
-            task.depends_on = depends_on
-        if create_review:
-            task.create_review = create_review
-        if same_branch:
-            task.same_branch = same_branch
-        if spec:
-            task.spec = spec
-        store.update(task)
         print(f"✓ Added task #{task.id}")
         return 0
     else:
@@ -845,6 +878,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             create_review=create_review,
             same_branch=same_branch,
             spec=spec,
+            task_type_hint=branch_type,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -1332,6 +1366,11 @@ def main() -> int:
         "--type",
         choices=["task", "explore", "plan", "implement", "review"],
         help="Set task type (default: task)",
+    )
+    add_parser.add_argument(
+        "--branch-type",
+        metavar="TYPE",
+        help="Set branch type hint for branch naming (e.g., fix, feature, chore)",
     )
     add_parser.add_argument(
         "--explore",

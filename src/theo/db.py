@@ -34,6 +34,7 @@ class Task:
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
     same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
+    task_type_hint: str | None = None  # Explicit branch type hint (e.g., "fix", "feature")
     output_content: str | None = None  # Actual content of report/plan/review (for persistence)
 
     def is_explore(self) -> bool:
@@ -85,7 +86,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     create_review INTEGER DEFAULT 0,
     -- New field for task chaining (v3)
     same_branch INTEGER DEFAULT 0,
-    -- New field for plan persistence (v4)
+    -- New fields (v4)
+    task_type_hint TEXT,
     output_content TEXT
 );
 
@@ -113,6 +115,7 @@ ALTER TABLE tasks ADD COLUMN same_branch INTEGER DEFAULT 0;
 
 # Migration from v3 to v4
 MIGRATION_V3_TO_V4 = """
+ALTER TABLE tasks ADD COLUMN task_type_hint TEXT;
 ALTER TABLE tasks ADD COLUMN output_content TEXT;
 """
 
@@ -213,6 +216,7 @@ class SqliteTaskStore:
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
             same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
+            task_type_hint=row["task_type_hint"] if "task_type_hint" in row.keys() else None,
             output_content=row["output_content"] if "output_content" in row.keys() else None,
         )
 
@@ -228,16 +232,17 @@ class SqliteTaskStore:
         spec: str | None = None,
         create_review: bool = False,
         same_branch: bool = False,
+        task_type_hint: str | None = None,
     ) -> Task:
         """Add a new task."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0),
+                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint),
             )
             task_id = cur.lastrowid
             return self.get(task_id)
@@ -648,6 +653,7 @@ def add_task_interactive(
     depends_on: int | None = None,
     create_review: bool = False,
     same_branch: bool = False,
+    task_type_hint: str | None = None,
 ) -> Task | None:
     """Interactively add a task using $EDITOR.
 
@@ -672,7 +678,17 @@ def add_task_interactive(
         errors = validate_prompt(prompt)
 
         if not errors:
-            return store.add(prompt, task_type=task_type, based_on=based_on)
+            return store.add(
+                prompt,
+                task_type=task_type,
+                based_on=based_on,
+                group=group,
+                depends_on=depends_on,
+                spec=spec,
+                create_review=create_review,
+                same_branch=same_branch,
+                task_type_hint=task_type_hint,
+            )
 
         # Show errors and ask what to do
         print("Validation errors:")
