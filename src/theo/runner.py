@@ -162,11 +162,15 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
     )
 
 
-def run(config: Config) -> int:
-    """Run Theo on the next pending task.
+def run(config: Config, task_id: int | None = None) -> int:
+    """Run Theo on the next pending task or a specific task.
 
     Uses git worktrees to isolate task execution from the main working directory.
     This allows concurrent work in the main checkout while theo runs.
+
+    Args:
+        config: Configuration object
+        task_id: Optional specific task ID to run. If None, runs next pending task.
     """
     load_dotenv(config.project_dir)
 
@@ -188,7 +192,14 @@ def run(config: Config) -> int:
 
     # Load tasks from SQLite
     store = SqliteTaskStore(config.db_path)
-    task = store.get_next_pending()
+
+    if task_id:
+        task = store.get(task_id)
+        if not task:
+            print(f"Error: Task #{task_id} not found")
+            return 1
+    else:
+        task = store.get_next_pending()
 
     if not task:
         print("No pending tasks found")

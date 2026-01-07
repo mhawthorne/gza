@@ -33,6 +33,7 @@ class Task:
     depends_on: int | None = None  # Task ID this task depends on
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
+    same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -52,7 +53,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -80,7 +81,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     "group" TEXT,
     depends_on INTEGER REFERENCES tasks(id),
     spec TEXT,
-    create_review INTEGER DEFAULT 0
+    create_review INTEGER DEFAULT 0,
+    -- New field for task chaining (v3)
+    same_branch INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -98,6 +101,11 @@ ALTER TABLE tasks ADD COLUMN spec TEXT;
 ALTER TABLE tasks ADD COLUMN create_review INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
 CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
+"""
+
+# Migration from v2 to v3
+MIGRATION_V2_TO_V3 = """
+ALTER TABLE tasks ADD COLUMN same_branch INTEGER DEFAULT 0;
 """
 
 
@@ -136,7 +144,20 @@ class SqliteTaskStore:
                             except sqlite3.OperationalError:
                                 # Column/index might already exist
                                 pass
+                    current_version = 2
                     conn.execute("UPDATE schema_version SET version = ?", (2,))
+
+                if current_version < 3:
+                    # Run migration v2 -> v3
+                    for stmt in MIGRATION_V2_TO_V3.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (3,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -170,6 +191,7 @@ class SqliteTaskStore:
             depends_on=row["depends_on"],
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
+            same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
         )
 
     # === Task CRUD ===
@@ -183,16 +205,17 @@ class SqliteTaskStore:
         depends_on: int | None = None,
         spec: str | None = None,
         create_review: bool = False,
+        same_branch: bool = False,
     ) -> Task:
         """Add a new task."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0),
+                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0),
             )
             task_id = cur.lastrowid
             return self.get(task_id)
@@ -234,7 +257,8 @@ class SqliteTaskStore:
                     "group" = ?,
                     depends_on = ?,
                     spec = ?,
-                    create_review = ?
+                    create_review = ?,
+                    same_branch = ?
                 WHERE id = ?
                 """,
                 (
@@ -256,6 +280,7 @@ class SqliteTaskStore:
                     task.depends_on,
                     task.spec,
                     1 if task.create_review else 0,
+                    1 if task.same_branch else 0,
                     task.id,
                 ),
             )
@@ -371,6 +396,81 @@ class SqliteTaskStore:
                 (f"%{query}%",),
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def get_groups(self) -> dict[str, dict[str, int]]:
+        """Get all groups with task counts by status.
+
+        Returns:
+            Dict mapping group name to dict of status counts.
+            Example: {"tarantino-v2": {"pending": 1, "completed": 2}, ...}
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT "group", status, COUNT(*) as count
+                FROM tasks
+                WHERE "group" IS NOT NULL
+                GROUP BY "group", status
+                """
+            )
+            groups: dict[str, dict[str, int]] = {}
+            for row in cur.fetchall():
+                group_name = row["group"]
+                status = row["status"]
+                count = row["count"]
+                if group_name not in groups:
+                    groups[group_name] = {}
+                groups[group_name][status] = count
+            return groups
+
+    def get_by_group(self, group: str) -> list[Task]:
+        """Get all tasks in a group, ordered by creation time."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE "group" = ?
+                ORDER BY created_at ASC
+                """,
+                (group,)
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def is_task_blocked(self, task: Task) -> tuple[bool, int | None, str | None]:
+        """Check if a task is blocked by an incomplete dependency.
+
+        Returns:
+            Tuple of (is_blocked, blocking_task_id, blocking_task_status)
+        """
+        if task.depends_on is None:
+            return (False, None, None)
+
+        dep = self.get(task.depends_on)
+        if dep is None:
+            return (False, None, None)
+
+        if dep.status == "completed":
+            return (False, None, None)
+
+        return (True, dep.id, dep.status)
+
+    def count_blocked_tasks(self) -> int:
+        """Count pending tasks that are blocked by dependencies."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT COUNT(*) as count FROM tasks t
+                WHERE t.status = 'pending'
+                AND t.depends_on IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks dep
+                    WHERE dep.id = t.depends_on
+                    AND dep.status = 'completed'
+                )
+                """
+            )
+            row = cur.fetchone()
+            return row["count"] if row else 0
 
     # === Status transitions (TaskStore protocol) ===
 
