@@ -12,6 +12,8 @@ from .providers import get_provider, Provider, RunResult
 
 
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
+PLAN_DIR = f".{APP_NAME}/plans"
+REVIEW_DIR = f".{APP_NAME}/reviews"
 
 
 def format_duration(seconds: float) -> str:
@@ -126,31 +128,129 @@ def _task_id_exists(task_id: str, log_path: Path | None, git: Git | None, projec
     return False
 
 
-def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path: Path | None = None) -> str:
+def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path: Path | None = None, git: Git | None = None) -> str:
     """Build the prompt for Claude."""
     base_prompt = f"Complete this task: {task.prompt}"
 
-    # Add context from referenced parent task if task has based_on
-    if task.based_on:
-        parent_task = store.get(task.based_on)
-        if parent_task and parent_task.report_file:
-            base_prompt += f"\n\nThis task is based on the findings in: {parent_task.report_file}"
-            base_prompt += "\nRead and review that report for context before implementing."
-        elif parent_task:
-            base_prompt += f"\n\nThis task is a follow-up to task #{parent_task.id}: {parent_task.prompt[:100]}"
+    # Add context from based_on chain (walk up the chain to find plan tasks)
+    if task.based_on or task.task_type in ("implement", "review"):
+        context = _build_context_from_chain(task, store, config.project_dir, git)
+        if context:
+            base_prompt += "\n\n" + context
 
-    # For explore tasks, instruct to write findings to report file
-    if task.is_explore() and report_path:
-        base_prompt += f"""
+    # Task type-specific instructions
+    if task.task_type == "explore":
+        if report_path:
+            base_prompt += f"""
 
 This is an exploration/research task. Write your findings and recommendations to:
   {report_path}
 
 Structure the report with clear sections and actionable recommendations."""
+    elif task.task_type == "plan":
+        if report_path:
+            base_prompt += f"""
+
+This is a planning task. Write your design/architecture plan to:
+  {report_path}
+
+Structure the plan with clear sections covering:
+- Overview of the approach
+- Key design decisions
+- Implementation steps
+- Potential risks or considerations"""
+    elif task.task_type == "review":
+        if report_path:
+            base_prompt += f"""
+
+This is a review task. Write your review to:
+  {report_path}
+
+Your review should include:
+- Assessment of whether the implementation matches the plan
+- Code quality observations
+- Potential issues or improvements
+- Final verdict: APPROVED, CHANGES_REQUESTED, or NEEDS_DISCUSSION
+
+End your review with a clear verdict line like:
+Verdict: APPROVED"""
     else:
         base_prompt += "\n\nWhen you are done, report what you accomplished."
 
     return base_prompt
+
+
+def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: Path, git: Git | None) -> str:
+    """Build context by walking the depends_on and based_on chain."""
+    context_parts = []
+
+    # For implement tasks, include plan from based_on chain
+    if task.task_type == "implement" and task.based_on:
+        plan_task = _find_task_of_type_in_chain(task.based_on, "plan", store)
+        if plan_task and plan_task.report_file:
+            plan_path = project_dir / plan_task.report_file
+            if plan_path.exists():
+                context_parts.append(f"This task implements the plan in: {plan_task.report_file}")
+                context_parts.append("Read and follow that plan for implementation.")
+
+    # For review tasks, include both plan and diff
+    if task.task_type == "review":
+        # Find the implement task via depends_on
+        if task.depends_on:
+            impl_task = store.get(task.depends_on)
+            if impl_task:
+                # Get diff if we have a branch
+                if impl_task.branch and git:
+                    try:
+                        default_branch = git.default_branch()
+                        diff_stat = git.get_diff_stat(f"{default_branch}...{impl_task.branch}")
+                        if diff_stat:
+                            context_parts.append(f"Implementation branch: {impl_task.branch}")
+                            context_parts.append(f"\nDiff summary:\n{diff_stat}")
+                    except GitError:
+                        pass  # Ignore git errors
+
+                # Find plan task from impl_task's chain
+                if impl_task.based_on:
+                    plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
+                    if plan_task and plan_task.report_file:
+                        plan_path = project_dir / plan_task.report_file
+                        if plan_path.exists():
+                            context_parts.append(f"\nOriginal plan: {plan_task.report_file}")
+                            context_parts.append("Read the plan to understand the intended design.")
+
+    # Fallback for generic based_on references
+    if task.based_on and not context_parts:
+        parent_task = store.get(task.based_on)
+        if parent_task and parent_task.report_file:
+            context_parts.append(f"This task is based on the findings in: {parent_task.report_file}")
+            context_parts.append("Read and review that report for context before implementing.")
+        elif parent_task:
+            context_parts.append(f"This task is a follow-up to task #{parent_task.id}: {parent_task.prompt[:100]}")
+
+    return "\n".join(context_parts) if context_parts else ""
+
+
+def _find_task_of_type_in_chain(task_id: int, task_type: str, store: SqliteTaskStore, visited: set[int] | None = None) -> Task | None:
+    """Walk up the based_on chain to find a task of the given type."""
+    if visited is None:
+        visited = set()
+
+    if task_id in visited:
+        return None  # Avoid cycles
+    visited.add(task_id)
+
+    task = store.get(task_id)
+    if not task:
+        return None
+
+    if task.task_type == task_type:
+        return task
+
+    if task.based_on:
+        return _find_task_of_type_in_chain(task.based_on, task_type, store, visited)
+
+    return None
 
 
 def _run_result_to_stats(result: RunResult) -> TaskStats:
@@ -160,6 +260,32 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
         num_turns=result.num_turns,
         cost_usd=result.cost_usd,
     )
+
+
+def _create_and_run_review_task(completed_task: Task, config: Config, store: SqliteTaskStore) -> int:
+    """Create and immediately execute a review task for a completed implementation.
+
+    Returns:
+        Exit code from running the review task.
+    """
+    # Create review task
+    review_prompt = f"Review the implementation from task #{completed_task.id}"
+    if completed_task.prompt:
+        review_prompt += f": {completed_task.prompt[:100]}"
+
+    review_task = store.add(
+        prompt=review_prompt,
+        task_type="review",
+        depends_on=completed_task.id,
+        group=completed_task.group,
+        based_on=completed_task.based_on,  # Inherit based_on to find plan
+    )
+
+    print(f"\n=== Auto-created review task #{review_task.id} ===")
+    print(f"Running review task...")
+
+    # Run the review task immediately
+    return run(config, task_id=review_task.id)
 
 
 def run(config: Config, task_id: int | None = None) -> int:
@@ -198,6 +324,12 @@ def run(config: Config, task_id: int | None = None) -> int:
         if not task:
             print(f"Error: Task #{task_id} not found")
             return 1
+
+        # Check if task is blocked by dependencies
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        if is_blocked:
+            print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            return 1
     else:
         task = store.get_next_pending()
 
@@ -228,15 +360,23 @@ def run(config: Config, task_id: int | None = None) -> int:
     prompt_display = task.prompt[:80] + "..." if len(task.prompt) > 80 else task.prompt
     print(f"=== Task: {prompt_display} ===")
     print(f"    ID: {task.task_id}")
-    if task.is_explore():
-        print(f"    Type: explore (no code changes required)")
+    print(f"    Type: {task.task_type}")
 
-    # For explore tasks, run in project dir without creating a branch
-    if task.is_explore():
-        return _run_explore_task(task, config, store, provider)
+    # For explore, plan, and review tasks, run in project dir without creating a branch
+    if task.task_type in ("explore", "plan", "review"):
+        return _run_non_code_task(task, config, store, provider, git)
 
-    # Determine branch name based on branch_mode
-    if config.branch_mode == "single":
+    # Determine branch name based on same_branch and branch_mode
+    if task.same_branch and task.depends_on:
+        # Use the branch from the dependency task
+        dep_task = store.get(task.depends_on)
+        if dep_task and dep_task.branch:
+            branch_name = dep_task.branch
+            print(f"    Using existing branch from task #{dep_task.id}: {branch_name}")
+        else:
+            print(f"Error: Task #{task.id} has same_branch=True but dependency task has no branch")
+            return 1
+    elif config.branch_mode == "single":
         branch_name = f"{config.project_name}/theo-work"
     else:  # multi
         branch_name = f"{config.project_name}/{task.task_id}"
@@ -244,32 +384,52 @@ def run(config: Config, task_id: int | None = None) -> int:
     # Create worktree path
     worktree_path = config.worktree_path / task.task_id
 
-    # Delete existing branch if in single mode (worktree_add will recreate it)
-    if config.branch_mode == "single" and git.branch_exists(branch_name):
-        git._run("branch", "-D", branch_name, check=False)
+    # Handle branch and worktree creation
+    if task.same_branch:
+        # Check out existing branch in worktree
+        try:
+            # Remove existing worktree if it exists
+            if worktree_path.exists():
+                git.worktree_remove(worktree_path, force=True)
+
+            print(f"Creating worktree with existing branch: {worktree_path}")
+            # For existing branch, use git worktree add <path> <branch>
+            git._run("worktree", "add", str(worktree_path), branch_name)
+        except GitError as e:
+            print(f"Error: Could not check out branch {branch_name} in worktree: {e}")
+            return 1
+    else:
+        # Delete existing branch if in single mode (worktree_add will recreate it)
+        if config.branch_mode == "single" and git.branch_exists(branch_name):
+            git._run("branch", "-D", branch_name, check=False)
+
+        try:
+            # Create worktree with new branch based on origin/default_branch (or local if fetch failed)
+            base_ref = f"origin/{default_branch}"
+            result = git._run("rev-parse", "--verify", base_ref, check=False)
+            if result.returncode != 0:
+                base_ref = default_branch  # Fall back to local branch
+
+            print(f"Creating worktree: {worktree_path}")
+            git.worktree_add(worktree_path, branch_name, base_ref)
+        except GitError as e:
+            print(f"Git error: {e}")
+            return 1
+
+    # Create a Git instance for the worktree
+    worktree_git = Git(worktree_path)
+
+    # Mark task in progress
+    store.mark_in_progress(task)
+
+    # Setup logging - use task_id for naming (logs stay in main project)
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    log_file = config.log_path / f"{task.task_id}.log"
+
+    # Run provider in the worktree
+    prompt = build_prompt(task, config, store, report_path=None, git=git)
 
     try:
-        # Create worktree with new branch based on origin/default_branch (or local if fetch failed)
-        base_ref = f"origin/{default_branch}"
-        result = git._run("rev-parse", "--verify", base_ref, check=False)
-        if result.returncode != 0:
-            base_ref = default_branch  # Fall back to local branch
-
-        print(f"Creating worktree: {worktree_path}")
-        git.worktree_add(worktree_path, branch_name, base_ref)
-
-        # Create a Git instance for the worktree
-        worktree_git = Git(worktree_path)
-
-        # Mark task in progress
-        store.mark_in_progress(task)
-
-        # Setup logging - use task_id for naming (logs stay in main project)
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        log_file = config.log_path / f"{task.task_id}.log"
-
-        # Run provider in the worktree
-        prompt = build_prompt(task, config, store, report_path=None)
         result = provider.run(config, prompt, log_file, worktree_path)
 
         exit_code = result.exit_code
@@ -333,6 +493,10 @@ def run(config: Config, task_id: int | None = None) -> int:
 
         _cleanup_worktree(git, worktree_path)
 
+        # Auto-create and run review task if requested
+        if task.create_review:
+            return _create_and_run_review_task(task, config, store)
+
         return 0
 
     except GitError as e:
@@ -345,13 +509,14 @@ def run(config: Config, task_id: int | None = None) -> int:
         return 130
 
 
-def _run_explore_task(
+def _run_non_code_task(
     task: Task,
     config: Config,
     store: SqliteTaskStore,
     provider: Provider,
+    git: Git | None = None,
 ) -> int:
-    """Run an explore task in the project directory (no branch/worktree)."""
+    """Run a non-code task (explore, plan, review) in the project directory (no branch/worktree)."""
     # Mark task in progress
     store.mark_in_progress(task)
 
@@ -359,15 +524,27 @@ def _run_explore_task(
     config.log_path.mkdir(parents=True, exist_ok=True)
     log_file = config.log_path / f"{task.task_id}.log"
 
-    # Setup report file
-    report_dir = config.project_dir / DEFAULT_REPORT_DIR
+    # Setup report file based on task type
+    if task.task_type == "explore":
+        report_dir = config.project_dir / DEFAULT_REPORT_DIR
+        task_type_display = "Exploration"
+    elif task.task_type == "plan":
+        report_dir = config.project_dir / PLAN_DIR
+        task_type_display = "Plan"
+    elif task.task_type == "review":
+        report_dir = config.project_dir / REVIEW_DIR
+        task_type_display = "Review"
+    else:
+        report_dir = config.project_dir / DEFAULT_REPORT_DIR
+        task_type_display = "Report"
+
     report_dir.mkdir(parents=True, exist_ok=True)
     report_filename = f"{task.task_id}.md"
     report_path = report_dir / report_filename
-    report_file_relative = f"{DEFAULT_REPORT_DIR}/{report_filename}"
+    report_file_relative = str(report_path.relative_to(config.project_dir))
 
     # Run provider in the project directory
-    prompt = build_prompt(task, config, store, report_path)
+    prompt = build_prompt(task, config, store, report_path, git)
     try:
         result = provider.run(config, prompt, log_file, config.project_dir)
     except KeyboardInterrupt:
@@ -402,7 +579,7 @@ def _run_explore_task(
         print(f"Note: Report file not created, copying log output")
         with open(log_file) as lf:
             with open(report_path, 'w') as rf:
-                rf.write(f"# Exploration: {task.prompt}\n\n")
+                rf.write(f"# {task_type_display}: {task.prompt}\n\n")
                 rf.write(lf.read())
 
     # Mark completed with report file reference (no branch, no commits)
@@ -416,12 +593,17 @@ def _run_explore_task(
     )
 
     print("")
-    print("=== Exploration Complete ===")
+    print(f"=== {task_type_display} Complete ===")
     print_stats(stats, has_commits=False)
     print(f"Report: {report_file_relative}")
     print("")
-    print("To implement based on this exploration, add a task with:")
-    print(f"  theo add --based-on {task.id}")
+
+    if task.task_type == "explore":
+        print("To implement based on this exploration, add a task with:")
+        print(f"  theo add --based-on {task.id}")
+    elif task.task_type == "plan":
+        print("To implement this plan, add a task with:")
+        print(f"  theo add --type implement --based-on {task.id}")
 
     return 0
 

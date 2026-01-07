@@ -603,3 +603,224 @@ class TestPrCommand:
 
         assert result.returncode == 1
         assert "no commits" in result.stdout
+
+
+class TestGroupsCommand:
+    """Tests for 'theo groups' command."""
+
+    def test_groups_with_tasks(self, tmp_path: Path):
+        """Groups command shows all groups with task counts."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create tasks in different groups
+        store.add("Task 1", group="group-a")
+        store.add("Task 2", group="group-a")
+        task3 = store.add("Task 3", group="group-b")
+        task3.status = "completed"
+        task3.completed_at = datetime.now(timezone.utc)
+        store.update(task3)
+
+        result = run_theo("groups", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "group-a" in result.stdout
+        assert "group-b" in result.stdout
+
+    def test_groups_with_no_groups(self, tmp_path: Path):
+        """Groups command handles no groups."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from theo.db import SqliteTaskStore
+        SqliteTaskStore(db_path)
+
+        result = run_theo("groups", str(tmp_path))
+
+        assert result.returncode == 0
+
+
+class TestStatusCommand:
+    """Tests for 'theo status <group>' command."""
+
+    def test_status_with_group(self, tmp_path: Path):
+        """Status command shows tasks in a group."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create tasks in a group
+        task1 = store.add("First task", group="test-group")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        store.update(task1)
+        store.add("Second task", group="test-group", depends_on=task1.id)
+
+        result = run_theo("status", "test-group", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "test-group" in result.stdout
+        assert "First task" in result.stdout
+        assert "Second task" in result.stdout
+
+
+class TestEditCommand:
+    """Tests for 'theo edit' command."""
+
+    def test_edit_group(self, tmp_path: Path):
+        """Edit command can change task group."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task")
+        assert task.group is None
+
+        result = run_theo("edit", str(task.id), "--group", "new-group", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Verify group was updated
+        updated = store.get(task.id)
+        assert updated.group == "new-group"
+
+    def test_edit_remove_group(self, tmp_path: Path):
+        """Edit command can remove task from group."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task", group="old-group")
+        assert task.group == "old-group"
+
+        result = run_theo("edit", str(task.id), "--group", "", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Verify group was removed
+        updated = store.get(task.id)
+        assert updated.group is None or updated.group == ""
+
+
+class TestNextCommandWithDependencies:
+    """Tests for 'theo next' command with dependencies."""
+
+    def test_next_skips_blocked_tasks(self, tmp_path: Path):
+        """Next command skips tasks blocked by dependencies."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create task chain
+        task1 = store.add("First task")
+        task2 = store.add("Blocked task", depends_on=task1.id)
+        task3 = store.add("Independent task")
+
+        result = run_theo("next", str(tmp_path))
+
+        assert result.returncode == 0
+        # Should show task1 or task3, but not task2
+        assert "Blocked task" not in result.stdout or "blocked" in result.stdout.lower()
+
+    def test_next_all_shows_blocked_tasks(self, tmp_path: Path):
+        """Next --all command shows blocked tasks."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create task chain
+        task1 = store.add("First task")
+        task2 = store.add("Blocked task", depends_on=task1.id)
+
+        result = run_theo("next", "--all", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "First task" in result.stdout
+        assert "Blocked task" in result.stdout
+
+    def test_next_shows_blocked_count(self, tmp_path: Path):
+        """Next command shows count of blocked tasks."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create blocked tasks
+        task1 = store.add("First task")
+        store.add("Blocked task 1", depends_on=task1.id)
+        store.add("Blocked task 2", depends_on=task1.id)
+        store.add("Independent task")
+
+        result = run_theo("next", str(tmp_path))
+
+        assert result.returncode == 0
+        # Should mention 2 blocked tasks
+        assert "2" in result.stdout and "blocked" in result.stdout.lower()
+
+
+class TestAddCommandWithChaining:
+    """Tests for 'theo add' command with chaining features."""
+
+    def test_add_with_type_plan(self, tmp_path: Path):
+        """Add command can create plan tasks."""
+        setup_config(tmp_path)
+        result = run_theo("add", "--type", "plan", "Create a plan", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+    def test_add_with_type_implement(self, tmp_path: Path):
+        """Add command can create implement tasks."""
+        setup_config(tmp_path)
+        result = run_theo("add", "--type", "implement", "Implement feature", str(tmp_path))
+
+        assert result.returncode == 0
+
+    def test_add_with_type_review(self, tmp_path: Path):
+        """Add command can create review tasks."""
+        setup_config(tmp_path)
+        result = run_theo("add", "--type", "review", "Review implementation", str(tmp_path))
+
+        assert result.returncode == 0
+
+    def test_add_with_based_on(self, tmp_path: Path):
+        """Add command can create tasks with based_on reference."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task1 = store.add("First task")
+
+        result = run_theo("add", "--based-on", str(task1.id), "Follow-up task", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Verify based_on was set
+        tasks = store.get_pending()
+        follow_up = next((t for t in tasks if t.prompt == "Follow-up task"), None)
+        assert follow_up is not None
+        assert follow_up.based_on == task1.id
