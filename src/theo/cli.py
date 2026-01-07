@@ -778,6 +778,14 @@ def cmd_add(args: argparse.Namespace) -> int:
     based_on = args.based_on if hasattr(args, 'based_on') and args.based_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
+    spec = args.spec if hasattr(args, 'spec') and args.spec else None
+
+    # Validation: --spec must reference an existing file
+    if spec:
+        spec_path = config.project_dir / spec
+        if not spec_path.exists():
+            print(f"Error: Spec file not found: {spec}")
+            return 1
 
     # Validation: --same-branch requires --based-on or --depends-on
     if same_branch and not based_on and not depends_on:
@@ -812,6 +820,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             task.create_review = create_review
         if same_branch:
             task.same_branch = same_branch
+        if spec:
+            task.spec = spec
         store.update(task)
         print(f"✓ Added task #{task.id}")
         return 0
@@ -825,6 +835,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
+            spec=spec,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -1338,6 +1349,11 @@ def main() -> int:
         "--same-branch",
         action="store_true",
         help="Continue on depends_on task's branch instead of creating new",
+    )
+    add_parser.add_argument(
+        "--spec",
+        metavar="FILE",
+        help="Path to spec file for task context",
     )
     add_common_args(add_parser)
 

@@ -51,11 +51,13 @@ Review priorities:
    - consistent code style
    - appropriate test coverage
 
+Important: You are only seeing a diff of changed files. If changes reference or depend on code in files not shown (e.g., imports, function calls, database schemas), explicitly note what additional files you would need to see to complete the review. Flag incomplete implementations where a feature is partially added but dependent code paths are not updated.
+
 Output format:
 - Summary (1-3 bullets)
 - Must-fix issues
 - Suggestions
-- Questions/assumptions
+- Questions/assumptions (include what files/context would help verify your assumptions)
 
 Now review the following content:
 EOF

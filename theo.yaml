@@ -1,0 +1,4 @@
+project_name: theo
+use_docker: true
+timeout_minutes: 10
+max_turns: 70

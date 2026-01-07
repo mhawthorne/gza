@@ -824,3 +824,97 @@ class TestAddCommandWithChaining:
         follow_up = next((t for t in tasks if t.prompt == "Follow-up task"), None)
         assert follow_up is not None
         assert follow_up.based_on == task1.id
+
+    def test_add_with_spec(self, tmp_path: Path):
+        """Add command with --spec sets spec file on task."""
+        setup_config(tmp_path)
+
+        # Create a spec file
+        spec_file = tmp_path / "specs" / "feature.md"
+        spec_file.parent.mkdir(parents=True, exist_ok=True)
+        spec_file.write_text("# Feature Spec\n\nThis is a test spec.")
+
+        result = run_theo("add", "--spec", "specs/feature.md", "Implement feature", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify spec was set
+        from theo.db import SqliteTaskStore
+        db_path = tmp_path / ".theo" / "theo.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Implement feature"), None)
+        assert task is not None
+        assert task.spec == "specs/feature.md"
+
+    def test_add_with_spec_file_not_found(self, tmp_path: Path):
+        """Add command with --spec fails if file doesn't exist."""
+        setup_config(tmp_path)
+
+        result = run_theo("add", "--spec", "nonexistent.md", "Implement feature", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: Spec file not found: nonexistent.md" in result.stdout
+
+
+class TestBuildPromptWithSpec:
+    """Tests for build_prompt with spec file content."""
+
+    def test_build_prompt_includes_spec_content(self, tmp_path: Path):
+        """build_prompt includes spec file content when task has spec."""
+        from theo.config import Config
+        from theo.db import SqliteTaskStore, Task
+        from theo.runner import build_prompt
+
+        # Setup config
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        # Setup database
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create spec file
+        spec_file = tmp_path / "specs" / "feature.md"
+        spec_file.parent.mkdir(parents=True, exist_ok=True)
+        spec_content = "# Feature Spec\n\nImplement X with Y."
+        spec_file.write_text(spec_content)
+
+        # Create task with spec
+        task = store.add("Implement the feature", spec="specs/feature.md")
+
+        # Build prompt
+        prompt = build_prompt(task, config, store)
+
+        # Verify spec content is included
+        assert "## Specification" in prompt
+        assert "specs/feature.md" in prompt
+        assert "# Feature Spec" in prompt
+        assert "Implement X with Y." in prompt
+
+    def test_build_prompt_without_spec(self, tmp_path: Path):
+        """build_prompt works correctly when task has no spec."""
+        from theo.config import Config
+        from theo.db import SqliteTaskStore, Task
+        from theo.runner import build_prompt
+
+        # Setup config
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        # Setup database
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create task without spec
+        task = store.add("Simple task")
+
+        # Build prompt
+        prompt = build_prompt(task, config, store)
+
+        # Verify no spec section
+        assert "## Specification" not in prompt
+        assert "Simple task" in prompt

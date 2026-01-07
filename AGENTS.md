@@ -69,7 +69,9 @@ uv run pytest tests/ -v
 
 ### Testing Guidelines
 
-- Add unit tests for new functionality
+- **Write tests for every change** - Each feature, bug fix, or enhancement should include corresponding tests
 - Tests go in `tests/` with `test_` prefix (e.g., `tests/test_importer.py`)
 - Use pytest fixtures for common setup (see existing tests for patterns)
 - Test both success cases and error handling
+- Run tests after making changes: `uv run pytest tests/ -v`
+- For CLI changes, add tests in `tests/test_cli.py` following the existing class structure (e.g., `TestAddCommandWithChaining`)

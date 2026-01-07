@@ -132,6 +132,13 @@ def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path
     """Build the prompt for Claude."""
     base_prompt = f"Complete this task: {task.prompt}"
 
+    # Include spec file content if specified
+    if task.spec:
+        spec_path = config.project_dir / task.spec
+        if spec_path.exists():
+            spec_content = spec_path.read_text()
+            base_prompt += f"\n\n## Specification\n\nThe following specification file ({task.spec}) provides context for this task:\n\n{spec_content}"
+
     # Add context from based_on chain (walk up the chain to find plan tasks)
     if task.based_on or task.task_type in ("implement", "review"):
         context = _build_context_from_chain(task, store, config.project_dir, git)
