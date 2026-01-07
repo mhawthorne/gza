@@ -32,6 +32,13 @@ DEFAULT_CLAUDE_ARGS = [
 
 
 @dataclass
+class TaskTypeConfig:
+    """Configuration for a specific task type."""
+    model: str | None = None
+    max_turns: int | None = None
+
+
+@dataclass
 class Config:
     project_dir: Path
     project_name: str  # Required - no default
@@ -47,10 +54,41 @@ class Config:
     work_count: int = DEFAULT_WORK_COUNT
     provider: str = DEFAULT_PROVIDER  # "claude" or "gemini"
     model: str = ""  # Provider-specific model name (optional)
+    task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
 
     def __post_init__(self):
         if not self.docker_image:
             self.docker_image = f"{self.project_name}-theo"
+
+    def get_model_for_task_type(self, task_type: str) -> str:
+        """Get the model for a given task type, falling back to defaults.
+
+        Args:
+            task_type: The task type (e.g., "plan", "review", "implement")
+
+        Returns:
+            The model name to use for this task type
+        """
+        # Check task_types config first
+        if task_type in self.task_types and self.task_types[task_type].model:
+            return self.task_types[task_type].model
+        # Fall back to default model
+        return self.model
+
+    def get_max_turns_for_task_type(self, task_type: str) -> int:
+        """Get the max_turns for a given task type, falling back to defaults.
+
+        Args:
+            task_type: The task type (e.g., "plan", "review", "implement")
+
+        Returns:
+            The max_turns to use for this task type
+        """
+        # Check task_types config first
+        if task_type in self.task_types and self.task_types[task_type].max_turns is not None:
+            return self.task_types[task_type].max_turns
+        # Fall back to default max_turns
+        return self.max_turns
 
     @property
     def worktree_path(self) -> Path:
@@ -94,7 +132,8 @@ class Config:
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "timeout_minutes", "branch_mode", "max_turns",
-            "claude_args", "worktree_dir", "work_count", "provider", "model"
+            "claude_args", "worktree_dir", "work_count", "provider", "model",
+            "defaults", "task_types"
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -106,6 +145,10 @@ class Config:
                 f"'project_name' is required in {config_path}\n"
                 f"Add 'project_name: your-project-name' to the config file."
             )
+
+        # Support both new "defaults" section and old flat structure
+        # If "defaults" exists, use it; otherwise use top-level fields
+        defaults = data.get("defaults", {})
 
         # Environment variables override file config
         use_docker = data.get("use_docker", DEFAULT_USE_DOCKER)
@@ -120,7 +163,8 @@ class Config:
         if os.getenv("THEO_BRANCH_MODE"):
             branch_mode = os.getenv("THEO_BRANCH_MODE")
 
-        max_turns = data.get("max_turns", DEFAULT_MAX_TURNS)
+        # max_turns: check defaults section first, then top-level
+        max_turns = defaults.get("max_turns") or data.get("max_turns", DEFAULT_MAX_TURNS)
         if os.getenv("THEO_MAX_TURNS"):
             max_turns = int(os.getenv("THEO_MAX_TURNS"))
 
@@ -136,9 +180,20 @@ class Config:
         if os.getenv("THEO_PROVIDER"):
             provider = os.getenv("THEO_PROVIDER")
 
-        model = data.get("model", "")
+        # model: check defaults section first, then top-level
+        model = defaults.get("model") or data.get("model", "")
         if os.getenv("THEO_MODEL"):
             model = os.getenv("THEO_MODEL")
+
+        # Parse task_types configuration
+        task_types = {}
+        if "task_types" in data and isinstance(data["task_types"], dict):
+            for task_type, config_data in data["task_types"].items():
+                if isinstance(config_data, dict):
+                    task_types[task_type] = TaskTypeConfig(
+                        model=config_data.get("model"),
+                        max_turns=config_data.get("max_turns")
+                    )
 
         return cls(
             project_dir=project_dir,
@@ -155,6 +210,7 @@ class Config:
             work_count=work_count,
             provider=provider,
             model=model,
+            task_types=task_types,
         )
 
     @classmethod
@@ -198,7 +254,7 @@ class Config:
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "timeout_minutes", "branch_mode", "max_turns", "claude_args",
-            "worktree_dir", "work_count", "provider", "model"
+            "worktree_dir", "work_count", "provider", "model", "defaults", "task_types"
         }
 
         for key in data.keys():
@@ -266,5 +322,46 @@ class Config:
 
         if "model" in data and not isinstance(data["model"], str):
             errors.append("'model' must be a string")
+
+        # Validate defaults section
+        if "defaults" in data:
+            if not isinstance(data["defaults"], dict):
+                errors.append("'defaults' must be a dictionary")
+            else:
+                defaults = data["defaults"]
+                if "model" in defaults and not isinstance(defaults["model"], str):
+                    errors.append("'defaults.model' must be a string")
+                if "max_turns" in defaults:
+                    if not isinstance(defaults["max_turns"], int):
+                        errors.append("'defaults.max_turns' must be an integer")
+                    elif defaults["max_turns"] <= 0:
+                        errors.append("'defaults.max_turns' must be positive")
+                # Warn about unknown keys in defaults
+                valid_defaults_keys = {"model", "max_turns"}
+                for key in defaults.keys():
+                    if key not in valid_defaults_keys:
+                        warnings.append(f"Unknown field in 'defaults': '{key}'")
+
+        # Validate task_types section
+        if "task_types" in data:
+            if not isinstance(data["task_types"], dict):
+                errors.append("'task_types' must be a dictionary")
+            else:
+                for task_type, config in data["task_types"].items():
+                    if not isinstance(config, dict):
+                        errors.append(f"'task_types.{task_type}' must be a dictionary")
+                    else:
+                        if "model" in config and not isinstance(config["model"], str):
+                            errors.append(f"'task_types.{task_type}.model' must be a string")
+                        if "max_turns" in config:
+                            if not isinstance(config["max_turns"], int):
+                                errors.append(f"'task_types.{task_type}.max_turns' must be an integer")
+                            elif config["max_turns"] <= 0:
+                                errors.append(f"'task_types.{task_type}.max_turns' must be positive")
+                        # Warn about unknown keys
+                        valid_task_type_keys = {"model", "max_turns"}
+                        for key in config.keys():
+                            if key not in valid_task_type_keys:
+                                warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
 
         return len(errors) == 0, errors, warnings
