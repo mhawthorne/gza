@@ -21,10 +21,31 @@ def get_store(config: Config) -> SqliteTaskStore:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Run the next pending task(s)."""
+    """Run the next pending task(s) or a specific task."""
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
+
+    # Check if a specific task ID was provided
+    if hasattr(args, 'task_id') and args.task_id:
+        store = get_store(config)
+        task = store.get(args.task_id)
+        if not task:
+            print(f"Error: Task #{args.task_id} not found")
+            return 1
+
+        if task.status != "pending":
+            print(f"Error: Task #{args.task_id} is not pending (status: {task.status})")
+            return 1
+
+        # Check if task is blocked by a dependency
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        if is_blocked:
+            print(f"Error: Task #{args.task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            return 1
+
+        # Run the specific task
+        return run(config, task_id=args.task_id)
 
     # Determine how many tasks to run
     count = args.count if args.count is not None else config.work_count
@@ -70,14 +91,48 @@ def cmd_next(args: argparse.Namespace) -> int:
         print("No pending tasks")
         return 0
 
-    for i, task in enumerate(pending, 1):
-        type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
-        # Get first line only, then truncate
-        first_line = task.prompt.split('\n')[0].strip()
-        prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
-        print(f"{i}. [#{task.id}]{type_label} {prompt_display}")
-        if task.based_on:
-            print(f"    based_on: task #{task.based_on}")
+    # Filter blocked tasks unless --all is specified
+    show_all = args.all if hasattr(args, 'all') else False
+
+    runnable = []
+    blocked = []
+
+    for task in pending:
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        if is_blocked:
+            blocked.append((task, blocking_id))
+        else:
+            runnable.append(task)
+
+    # Show runnable tasks
+    if runnable:
+        for i, task in enumerate(runnable, 1):
+            type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+            # Get first line only, then truncate
+            first_line = task.prompt.split('\n')[0].strip()
+            prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
+            print(f"{i}. {type_label}{prompt_display}")
+    else:
+        if not show_all:
+            print("No runnable tasks")
+
+    # Show blocked tasks if --all is specified
+    if show_all and blocked:
+        if runnable:
+            print()
+        for i, (task, blocking_id) in enumerate(blocked, len(runnable) + 1):
+            type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+            first_line = task.prompt.split('\n')[0].strip()
+            prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
+            print(f"{i}. {type_label}{prompt_display} (blocked by #{blocking_id})")
+
+    # Show blocked count at the bottom (only if not showing all)
+    if not show_all and blocked:
+        print()
+        count = len(blocked)
+        plural = "tasks" if count != 1 else "task"
+        print(f"({count} {plural} blocked by dependencies)")
+
     return 0
 
 
@@ -703,32 +758,80 @@ def cmd_add(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task_type = "explore" if args.explore else "task"
-    based_on = args.based_on
+    # Determine task type
+    if args.type:
+        task_type = args.type
+    elif args.explore:
+        task_type = "explore"
+    else:
+        task_type = "task"
 
-    if args.edit:
+    # Validate task type
+    valid_types = ["task", "explore", "plan", "implement", "review"]
+    if task_type not in valid_types:
+        print(f"Error: Invalid task type '{task_type}'. Must be one of: {', '.join(valid_types)}")
+        return 1
+
+    # Get optional parameters
+    group = args.group if hasattr(args, 'group') and args.group else None
+    depends_on = args.depends_on if hasattr(args, 'depends_on') and args.depends_on else None
+    based_on = args.based_on if hasattr(args, 'based_on') and args.based_on else None
+    create_review = args.review if hasattr(args, 'review') and args.review else False
+    same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
+
+    # Validation: --same-branch requires --based-on or --depends-on
+    if same_branch and not based_on and not depends_on:
+        print("Error: --same-branch requires --based-on or --depends-on")
+        return 1
+
+    # Validation: --based-on must reference an existing task
+    if based_on:
+        dep_task = store.get(based_on)
+        if not dep_task:
+            print(f"Error: Task #{based_on} not found")
+            return 1
+
+    # Validation: --depends-on must reference an existing task
+    if depends_on:
+        dep_task = store.get(depends_on)
+        if not dep_task:
+            print(f"Error: Task #{depends_on} not found")
+            return 1
+
+    if args.edit or not args.prompt:
         # Interactive mode with $EDITOR
         task = add_task_interactive(store, task_type=task_type, based_on=based_on)
-        if task:
-            print(f"✓ Added task #{task.id}")
-            return 0
-        return 1
-    elif args.prompt:
-        # Inline prompt
-        task = store.add(args.prompt, task_type=task_type, based_on=based_on)
+        if not task:
+            return 1
+        # Update additional fields
+        if group:
+            task.group = group
+        if depends_on:
+            task.depends_on = depends_on
+        if create_review:
+            task.create_review = create_review
+        if same_branch:
+            task.same_branch = same_branch
+        store.update(task)
         print(f"✓ Added task #{task.id}")
         return 0
     else:
-        # No prompt provided, open editor
-        task = add_task_interactive(store, task_type=task_type, based_on=based_on)
-        if task:
-            print(f"✓ Added task #{task.id}")
-            return 0
-        return 1
+        # Inline prompt
+        task = store.add(
+            args.prompt,
+            task_type=task_type,
+            based_on=based_on,
+            group=group,
+            depends_on=depends_on,
+            create_review=create_review,
+            same_branch=same_branch,
+        )
+        print(f"✓ Added task #{task.id}")
+        return 0
 
 
 def cmd_edit(args: argparse.Namespace) -> int:
-    """Edit a task's prompt."""
+    """Edit a task's prompt or metadata."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -740,6 +843,31 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if task.status != "pending":
         print(f"Error: Can only edit pending tasks (task is {task.status})")
         return 1
+
+    # Handle --group flag
+    if hasattr(args, 'group_flag') and args.group_flag is not None:
+        # Empty string removes from group
+        if args.group_flag == "":
+            task.group = None
+            store.update(task)
+            print(f"✓ Removed task #{task.id} from group")
+            return 0
+        else:
+            task.group = args.group_flag
+            store.update(task)
+            print(f"✓ Moved task #{task.id} to group '{args.group_flag}'")
+            return 0
+
+    # Handle --based-on flag
+    if hasattr(args, 'based_on_flag') and args.based_on_flag is not None:
+        dep_task = store.get(args.based_on_flag)
+        if not dep_task:
+            print(f"Error: Task #{args.based_on_flag} not found")
+            return 1
+        task.depends_on = args.based_on_flag
+        store.update(task)
+        print(f"✓ Set task #{task.id} to depend on task #{args.based_on_flag}")
+        return 0
 
     if args.explore and args.task:
         print("Error: Cannot use both --explore and --task")
@@ -760,6 +888,106 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"✓ Updated task #{task.id}")
         return 0
     return 1
+
+
+def cmd_groups(args: argparse.Namespace) -> int:
+    """List all groups with task counts."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    groups = store.get_groups()
+
+    # Count ungrouped tasks
+    all_tasks = store.get_all()
+    ungrouped_counts: dict[str, int] = {}
+    for task in all_tasks:
+        if task.group is None:
+            status = task.status
+            ungrouped_counts[status] = ungrouped_counts.get(status, 0) + 1
+
+    if not groups and not ungrouped_counts:
+        print("No tasks found")
+        return 0
+
+    # Sort groups by name
+    for group_name in sorted(groups.keys()):
+        status_counts = groups[group_name]
+        total = sum(status_counts.values())
+
+        # Build status summary
+        parts = []
+        for status in ["pending", "in_progress", "completed", "failed", "unmerged"]:
+            if status in status_counts and status_counts[status] > 0:
+                parts.append(f"{status_counts[status]} {status}")
+
+        status_str = ", ".join(parts) if parts else "0 tasks"
+        print(f"{group_name:<20} {total} tasks ({status_str})")
+
+    # Show ungrouped tasks
+    if ungrouped_counts:
+        total = sum(ungrouped_counts.values())
+        parts = []
+        for status in ["pending", "in_progress", "completed", "failed", "unmerged"]:
+            if status in ungrouped_counts and ungrouped_counts[status] > 0:
+                parts.append(f"{ungrouped_counts[status]} {status}")
+
+        status_str = ", ".join(parts) if parts else "0 tasks"
+        print(f"{'(ungrouped)':<20} {total} tasks ({status_str})")
+
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show tasks in a group."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    group_name = args.group
+    tasks = store.get_by_group(group_name)
+
+    if not tasks:
+        print(f"No tasks found in group '{group_name}'")
+        return 0
+
+    print(f"Group: {group_name}")
+    print()
+
+    for task in tasks:
+        # Status icon
+        if task.status == "completed":
+            icon = "✓"
+        elif task.status == "in_progress":
+            icon = "→"
+        elif task.status == "failed":
+            icon = "✗"
+        else:
+            icon = "○"
+
+        # Task type label
+        type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+
+        # Get first line of prompt
+        first_line = task.prompt.split('\n')[0].strip()
+        prompt_display = first_line[:50] + "..." if len(first_line) > 50 else first_line
+
+        # Status display
+        status_display = task.status
+
+        # Check if blocked
+        blocked_info = ""
+        if task.status == "pending":
+            is_blocked, blocking_id, _ = store.is_task_blocked(task)
+            if is_blocked:
+                blocked_info = f" (blocked by #{blocking_id})"
+
+        # Date info for completed tasks
+        date_info = ""
+        if task.completed_at:
+            date_info = f"  {task.completed_at.strftime('%m/%d')}"
+
+        print(f"  {icon} {task.id}. {type_label}{prompt_display:<50} {status_display}{date_info}{blocked_info}")
+
+    return 0
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
@@ -970,7 +1198,13 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # work command
-    work_parser = subparsers.add_parser("work", help="Run the next pending task")
+    work_parser = subparsers.add_parser("work", help="Run the next pending task or a specific task")
+    work_parser.add_argument(
+        "task_id",
+        nargs="?",
+        type=int,
+        help="Specific task ID to run (optional)",
+    )
     add_common_args(work_parser)
     work_parser.add_argument(
         "--no-docker",
@@ -987,6 +1221,11 @@ def main() -> int:
     # next command
     next_parser = subparsers.add_parser("next", help="List upcoming pending tasks")
     add_common_args(next_parser)
+    next_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all pending tasks including blocked ones",
+    )
 
     # history command
     history_parser = subparsers.add_parser("history", help="List recent completed/failed tasks")
@@ -1064,24 +1303,63 @@ def main() -> int:
         help="Open $EDITOR to write the prompt",
     )
     add_parser.add_argument(
+        "--type",
+        choices=["task", "explore", "plan", "implement", "review"],
+        help="Set task type (default: task)",
+    )
+    add_parser.add_argument(
         "--explore",
         action="store_true",
-        help="Create an explore task (no code changes required)",
+        help="Create an explore task (shorthand for --type explore)",
+    )
+    add_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Set task group",
     )
     add_parser.add_argument(
         "--based-on",
         type=int,
         metavar="ID",
-        help="Base this task on a previous task's output",
+        help="Base this task on a previous task's output (sets depends_on field)",
+    )
+    add_parser.add_argument(
+        "--depends-on",
+        type=int,
+        metavar="ID",
+        help="Set dependency on another task",
+    )
+    add_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Auto-create review task on completion (for implement tasks)",
+    )
+    add_parser.add_argument(
+        "--same-branch",
+        action="store_true",
+        help="Continue on depends_on task's branch instead of creating new",
     )
     add_common_args(add_parser)
 
     # edit command
-    edit_parser = subparsers.add_parser("edit", help="Edit a pending task's prompt")
+    edit_parser = subparsers.add_parser("edit", help="Edit a pending task's prompt or metadata")
     edit_parser.add_argument(
         "task_id",
         type=int,
         help="Task ID to edit",
+    )
+    edit_parser.add_argument(
+        "--group",
+        dest="group_flag",
+        metavar="NAME",
+        help="Move task to group (use empty string \"\" to remove from group)",
+    )
+    edit_parser.add_argument(
+        "--based-on",
+        dest="based_on_flag",
+        type=int,
+        metavar="ID",
+        help="Set dependency on another task",
     )
     edit_parser.add_argument(
         "--explore",
@@ -1137,6 +1415,18 @@ def main() -> int:
     )
     add_common_args(import_parser)
 
+    # groups command
+    groups_parser = subparsers.add_parser("groups", help="List all groups with task counts")
+    add_common_args(groups_parser)
+
+    # status command
+    status_parser = subparsers.add_parser("status", help="Show tasks in a group")
+    status_parser.add_argument(
+        "group",
+        help="Group name to show tasks for",
+    )
+    add_common_args(status_parser)
+
     args = parser.parse_args()
 
     # Handle project_dir for commands that have positional args before it
@@ -1175,6 +1465,10 @@ def main() -> int:
             return cmd_show(args)
         elif args.command == "import":
             return cmd_import(args)
+        elif args.command == "groups":
+            return cmd_groups(args)
+        elif args.command == "status":
+            return cmd_status(args)
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
