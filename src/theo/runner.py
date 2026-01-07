@@ -187,6 +187,21 @@ Verdict: APPROVED"""
     return base_prompt
 
 
+def _get_task_output(task: Task, project_dir: Path) -> str | None:
+    """Get task output content, preferring DB over filesystem."""
+    # Prefer DB content (works in distributed mode)
+    if task.output_content:
+        return task.output_content
+
+    # Fall back to file (local mode, backward compat)
+    if task.report_file:
+        path = project_dir / task.report_file
+        if path.exists():
+            return path.read_text()
+
+    return None
+
+
 def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: Path, git: Git | None) -> str:
     """Build context by walking the depends_on and based_on chain."""
     context_parts = []
@@ -194,11 +209,11 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
     # For implement tasks, include plan from based_on chain
     if task.task_type == "implement" and task.based_on:
         plan_task = _find_task_of_type_in_chain(task.based_on, "plan", store)
-        if plan_task and plan_task.report_file:
-            plan_path = project_dir / plan_task.report_file
-            if plan_path.exists():
-                context_parts.append(f"This task implements the plan in: {plan_task.report_file}")
-                context_parts.append("Read and follow that plan for implementation.")
+        if plan_task:
+            plan_content = _get_task_output(plan_task, project_dir)
+            if plan_content:
+                context_parts.append("## Plan to implement:\n")
+                context_parts.append(plan_content)
 
     # For review tasks, include both plan and diff
     if task.task_type == "review":
@@ -220,11 +235,11 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
                 # Find plan task from impl_task's chain
                 if impl_task.based_on:
                     plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
-                    if plan_task and plan_task.report_file:
-                        plan_path = project_dir / plan_task.report_file
-                        if plan_path.exists():
-                            context_parts.append(f"\nOriginal plan: {plan_task.report_file}")
-                            context_parts.append("Read the plan to understand the intended design.")
+                    if plan_task:
+                        plan_content = _get_task_output(plan_task, project_dir)
+                        if plan_content:
+                            context_parts.append("\n## Original plan:\n")
+                            context_parts.append(plan_content)
 
     # Fallback for generic based_on references
     if task.based_on and not context_parts:
@@ -589,12 +604,18 @@ def _run_non_code_task(
                 rf.write(f"# {task_type_display}: {task.prompt}\n\n")
                 rf.write(lf.read())
 
+    # Read output content for storage in DB
+    output_content = None
+    if report_path.exists():
+        output_content = report_path.read_text()
+
     # Mark completed with report file reference (no branch, no commits)
     store.mark_completed(
         task,
         branch=None,
         log_file=str(log_file.relative_to(config.project_dir)),
         report_file=report_file_relative,
+        output_content=output_content,
         has_commits=False,
         stats=stats,
     )
