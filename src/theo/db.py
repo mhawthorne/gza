@@ -318,6 +318,59 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
+    def claim_next_pending_task(self) -> Task | None:
+        """Atomically claim the next pending task by marking it in_progress.
+
+        This is used by background workers to ensure only one worker
+        picks up a given task, even in concurrent scenarios.
+
+        Returns:
+            The claimed task, or None if no tasks are available
+        """
+        with self._connect() as conn:
+            # Use a transaction to atomically claim the task
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Find next pending task
+                cur = conn.execute(
+                    """
+                    SELECT t.* FROM tasks t
+                    WHERE t.status = 'pending'
+                    AND (
+                        t.depends_on IS NULL
+                        OR EXISTS (
+                            SELECT 1 FROM tasks dep
+                            WHERE dep.id = t.depends_on
+                            AND dep.status = 'completed'
+                        )
+                    )
+                    ORDER BY t.created_at ASC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+
+                if not row:
+                    conn.rollback()
+                    return None
+
+                task = self._row_to_task(row)
+
+                # Mark as in_progress with timestamp
+                conn.execute(
+                    "UPDATE tasks SET status = 'in_progress', started_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), task.id)
+                )
+
+                conn.commit()
+                task.status = "in_progress"
+                task.started_at = datetime.now(timezone.utc)
+                return task
+
+            except Exception:
+                conn.rollback()
+                raise
+
     def get_pending(self, limit: int | None = None) -> list[Task]:
         """Get all pending tasks."""
         with self._connect() as conn:
