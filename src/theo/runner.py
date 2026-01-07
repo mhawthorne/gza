@@ -167,6 +167,12 @@ Structure the plan with clear sections covering:
 - Implementation steps
 - Potential risks or considerations"""
     elif task.task_type == "review":
+        # Check for REVIEW.md in project root for custom review guidelines
+        review_md_path = config.project_dir / "REVIEW.md"
+        if review_md_path.exists():
+            review_guidelines = review_md_path.read_text()
+            base_prompt += f"\n\n## Review Guidelines\n\n{review_guidelines}"
+
         if report_path:
             base_prompt += f"""
 
