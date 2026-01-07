@@ -8,7 +8,8 @@ from pathlib import Path
 
 from .config import Config, ConfigError
 from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, Task as DbTask
-from .git import Git
+from .git import Git, GitError
+from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
 from .runner import run
 from .tasks import YamlTaskStore, Task as YamlTask
@@ -155,6 +156,197 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if stats_str:
             print(f"    stats: {stats_str}")
     return 0
+
+
+def _generate_pr_content(
+    task: DbTask,
+    commit_log: str,
+    diff_stat: str,
+) -> tuple[str, str]:
+    """Generate PR title and body using Claude.
+
+    Args:
+        task: The task to create a PR for
+        commit_log: Git log output for the branch
+        diff_stat: Git diff --stat output
+
+    Returns:
+        Tuple of (title, body)
+    """
+    import subprocess
+
+    # Build a prompt for Claude
+    prompt = f"""Generate a GitHub pull request title and description for this completed task.
+
+Task prompt:
+{task.prompt}
+
+Commits on branch:
+{commit_log}
+
+Files changed:
+{diff_stat}
+
+Format your response EXACTLY like this (no markdown code fences):
+TITLE: <concise PR title, max 72 chars>
+
+BODY:
+## Summary
+<2-3 sentences describing what was done and why>
+
+## Changes
+<bullet points of key changes>
+
+Output ONLY in the format above, nothing else."""
+
+    try:
+        result = subprocess.run(
+            ["claude", "--print"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return _parse_pr_response(result.stdout.strip(), task)
+        elif result.returncode != 0 and result.stderr:
+            print(f"Warning: claude failed: {result.stderr.strip()}", file=sys.stderr)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Fallback: generate simple title/body from task
+    return _fallback_pr_content(task, commit_log)
+
+
+def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
+    """Parse Claude's response into title and body."""
+    lines = response.split("\n")
+    title = ""
+    body_lines = []
+    in_body = False
+
+    for line in lines:
+        if line.startswith("TITLE:"):
+            title = line[6:].strip()
+        elif line.strip() == "BODY:":
+            in_body = True
+        elif in_body:
+            body_lines.append(line)
+
+    if not title:
+        # Use task_id or first line of prompt
+        title = task.task_id or task.prompt.split("\n")[0][:72]
+
+    body = "\n".join(body_lines).strip()
+    if not body:
+        body = f"Task: {task.prompt[:500]}"
+
+    return title, body
+
+
+def _fallback_pr_content(task: DbTask, commit_log: str) -> tuple[str, str]:
+    """Generate simple PR content without AI."""
+    # Title from task_id or prompt
+    if task.task_id:
+        # Convert slug like "20240106-add-feature" to "Add feature"
+        parts = task.task_id.split("-")[1:]  # Remove date prefix
+        title = " ".join(parts).capitalize()
+    else:
+        title = task.prompt.split("\n")[0][:72]
+
+    body = f"""## Task Prompt
+
+> {task.prompt[:500].replace(chr(10), chr(10) + '> ')}
+
+## Commits
+```
+{commit_log}
+```
+"""
+    return title, body
+
+
+def cmd_pr(args: argparse.Namespace) -> int:
+    """Create a GitHub PR from a completed task."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+    gh = GitHub()
+
+    # Check gh CLI is available
+    if not gh.is_available():
+        print("Error: GitHub CLI (gh) is not installed or not authenticated")
+        print("Install: https://cli.github.com/")
+        print("Auth: gh auth login")
+        return 1
+
+    # Get the task
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    # Validate task state
+    if task.status not in ("completed", "unmerged"):
+        print(f"Error: Task #{task.id} is not completed (status: {task.status})")
+        return 1
+
+    if not task.branch:
+        print(f"Error: Task #{task.id} has no branch")
+        return 1
+
+    if not task.has_commits:
+        print(f"Error: Task #{task.id} has no commits")
+        return 1
+
+    default_branch = git.default_branch()
+
+    # Check branch is not already merged
+    if git.is_merged(task.branch, default_branch):
+        print(f"Error: Branch '{task.branch}' is already merged into {default_branch}")
+        return 1
+
+    # Check if PR already exists
+    existing_pr = gh.pr_exists(task.branch)
+    if existing_pr:
+        print(f"PR already exists: {existing_pr}")
+        return 0
+
+    # Ensure branch is pushed to remote
+    try:
+        if not git.remote_branch_exists(task.branch):
+            print(f"Pushing branch '{task.branch}' to origin...")
+            git.push_branch(task.branch)
+    except GitError as e:
+        print(f"Error pushing branch: {e}")
+        return 1
+
+    # Get commit log and diff stat for context
+    commit_log = git.get_log(f"{default_branch}..{task.branch}")
+    diff_stat = git.get_diff_stat(f"{default_branch}...{task.branch}")
+
+    # Generate or use provided title/body
+    if args.title:
+        title = args.title
+        body = f"## Summary\n{task.prompt[:500]}"
+    else:
+        print("Generating PR description...")
+        title, body = _generate_pr_content(task, commit_log, diff_stat)
+
+    # Create the PR
+    try:
+        pr = gh.create_pr(
+            head=task.branch,
+            base=default_branch,
+            title=title,
+            body=body,
+            draft=args.draft,
+        )
+        print(f"✓ Created PR: {pr.url}")
+        return 0
+    except GitHubError as e:
+        print(f"Error creating PR: {e}")
+        return 1
 
 
 def format_duration(seconds: float) -> str:
@@ -804,6 +996,24 @@ def main() -> int:
     unmerged_parser = subparsers.add_parser("unmerged", help="List tasks with unmerged work")
     add_common_args(unmerged_parser)
 
+    # pr command
+    pr_parser = subparsers.add_parser("pr", help="Create GitHub PR from completed task")
+    pr_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to create PR from",
+    )
+    pr_parser.add_argument(
+        "--title",
+        help="Override auto-generated PR title",
+    )
+    pr_parser.add_argument(
+        "--draft",
+        action="store_true",
+        help="Create as draft PR",
+    )
+    add_common_args(pr_parser)
+
     # stats command
     stats_parser = subparsers.add_parser("stats", help="Show cost and usage statistics")
     add_common_args(stats_parser)
@@ -945,6 +1155,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
+        elif args.command == "pr":
+            return cmd_pr(args)
         elif args.command == "stats":
             return cmd_stats(args)
         elif args.command == "validate":

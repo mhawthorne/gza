@@ -146,6 +146,62 @@ class Git:
             worktrees.append(current)
         return worktrees
 
+    def remote_branch_exists(self, branch: str, remote: str = "origin") -> bool:
+        """Check if a branch exists on the remote.
+
+        Args:
+            branch: The branch name to check
+            remote: The remote name (default: origin)
+
+        Returns:
+            True if the branch exists on the remote
+        """
+        result = self._run("ls-remote", "--heads", remote, branch, check=False)
+        return bool(result.stdout.strip())
+
+    def push_branch(self, branch: str, remote: str = "origin", set_upstream: bool = True) -> None:
+        """Push a branch to the remote.
+
+        Args:
+            branch: The branch to push
+            remote: The remote name (default: origin)
+            set_upstream: Whether to set upstream tracking (default: True)
+        """
+        args = ["push"]
+        if set_upstream:
+            args.append("-u")
+        args.extend([remote, branch])
+        self._run(*args)
+
+    def get_log(self, revision_range: str, oneline: bool = True) -> str:
+        """Get git log output for a revision range.
+
+        Args:
+            revision_range: The revision range (e.g., "main..feature")
+            oneline: Use --oneline format (default: True)
+
+        Returns:
+            The log output as a string
+        """
+        args = ["log"]
+        if oneline:
+            args.append("--oneline")
+        args.append(revision_range)
+        result = self._run(*args, check=False)
+        return result.stdout.strip()
+
+    def get_diff_stat(self, revision_range: str) -> str:
+        """Get diff --stat output for a revision range.
+
+        Args:
+            revision_range: The revision range (e.g., "main...feature")
+
+        Returns:
+            The diff stat output as a string
+        """
+        result = self._run("diff", "--stat", revision_range, check=False)
+        return result.stdout.strip()
+
     def is_merged(self, branch: str, into: str | None = None) -> bool:
         """Check if a branch has been merged into another branch.
 

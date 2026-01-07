@@ -21,6 +21,7 @@ DO_COPY=0
 USE_PAGER="auto" # auto | 1 | 0
 SAVE_RUN_OUTPUT="auto" # auto | 1 | 0
 REVIEWS_DIR="$ROOT/reviews"
+GEMINI_MODEL="gemini-2.0-flash-lite"
 FILES_MODE=0
 FILES=()
 
@@ -37,8 +38,8 @@ Modes:
   --files <paths> Review specific files/paths (no git diff required)
 
 Options:
-  --run           If an LLM CLI is installed, run it (otherwise prints prompt+diff)
-  --provider      Choose which CLI to run when using --run (default: auto)
+  -r, --run       If an LLM CLI is installed, run it (otherwise prints prompt+diff)
+  -p, --provider  Choose which CLI to run when using --run (default: auto)
   --claude        Shortcut for --provider claude
   --out <file>    Write prompt+diff to a file instead of printing
   --copy          Copy prompt+diff to clipboard (macOS: pbcopy) instead of printing
@@ -46,6 +47,7 @@ Options:
   --no-pager      Disable paging
   --save          Save --run output to reviews/YYYYmmddHHMMSS-$provider.txt (default: on for --run)
   --no-save       Do not save --run output
+  --gemini-model <model>  Set Gemini model (default: gemini-2.0-flash-lite)
 
 Notes:
   - This script prints a review prompt followed by the diff, suitable for pasting
@@ -79,7 +81,7 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
-    --run)
+    --run|-r)
       DO_RUN=1
       shift
       ;;
@@ -107,7 +109,7 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       ;;
-    --provider)
+    --provider|-p)
       PROVIDER="${2:-}"
       if [[ -z "$PROVIDER" ]]; then
         echo "ERROR: --provider requires a value" >&2
@@ -146,6 +148,14 @@ while [[ $# -gt 0 ]]; do
     --no-save)
       SAVE_RUN_OUTPUT="0"
       shift
+      ;;
+    --gemini-model)
+      GEMINI_MODEL="${2:-}"
+      if [[ -z "$GEMINI_MODEL" ]]; then
+        echo "ERROR: --gemini-model requires a model name" >&2
+        exit 2
+      fi
+      shift 2
       ;;
     -h|--help)
       usage
@@ -310,10 +320,10 @@ if [[ "$DO_RUN" == "1" ]]; then
         if [[ "$SAVE_RUN_OUTPUT" == "1" ]]; then
           mkdir -p "$REVIEWS_DIR"
           REVIEW_FILE="$(review_out_path "gemini" "$TS")"
-          printf "%s" "$OUTPUT" | gemini | tee "$REVIEW_FILE"
+          printf "%s" "$OUTPUT" | gemini -m "$GEMINI_MODEL" | tee "$REVIEW_FILE"
           echo "Saved output to: $REVIEW_FILE" >&2
         else
-          printf "%s" "$OUTPUT" | gemini
+          printf "%s" "$OUTPUT" | gemini -m "$GEMINI_MODEL"
         fi
         exit 0
       fi
@@ -331,10 +341,10 @@ if [[ "$DO_RUN" == "1" ]]; then
     if [[ "$SAVE_RUN_OUTPUT" == "1" ]]; then
       mkdir -p "$REVIEWS_DIR"
       REVIEW_FILE="$(review_out_path "gemini" "$TS")"
-      printf "%s" "$OUTPUT" | gemini | tee "$REVIEW_FILE"
+      printf "%s" "$OUTPUT" | gemini -m "$GEMINI_MODEL" | tee "$REVIEW_FILE"
       echo "Saved output to: $REVIEW_FILE" >&2
     else
-      printf "%s" "$OUTPUT" | gemini
+      printf "%s" "$OUTPUT" | gemini -m "$GEMINI_MODEL"
     fi
     exit 0
   fi

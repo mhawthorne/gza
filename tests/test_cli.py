@@ -533,3 +533,73 @@ class TestLogCommand:
 
         assert result.returncode == 1
         assert "No task found" in result.stdout
+
+
+class TestPrCommand:
+    """Tests for 'theo pr' command."""
+
+    def test_pr_task_not_found(self, tmp_path: Path):
+        """PR command handles nonexistent task."""
+        setup_config(tmp_path)
+
+        # Create empty database
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from theo.db import SqliteTaskStore
+        SqliteTaskStore(db_path)
+
+        result = run_theo("pr", "999", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout
+
+    def test_pr_task_not_completed(self, tmp_path: Path):
+        """PR command rejects pending tasks."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Pending task", "status": "pending"},
+        ])
+
+        result = run_theo("pr", "1", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not completed" in result.stdout
+
+    def test_pr_task_no_branch(self, tmp_path: Path):
+        """PR command rejects tasks without branches."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Completed task without branch")
+        task.status = "completed"
+        task.branch = None
+        task.has_commits = True
+        store.update(task)
+
+        result = run_theo("pr", "1", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no branch" in result.stdout
+
+    def test_pr_task_no_commits(self, tmp_path: Path):
+        """PR command rejects tasks without commits."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Completed task without commits")
+        task.status = "completed"
+        task.branch = "feature/test"
+        task.has_commits = False
+        store.update(task)
+
+        result = run_theo("pr", "1", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no commits" in result.stdout
