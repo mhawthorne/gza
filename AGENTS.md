@@ -59,6 +59,31 @@ When renaming a field across the codebase:
 - **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
 - **Do NOT create README files** unless explicitly requested.
 
+## Creating Tasks from Conversations
+
+When a conversation identifies work to be done, create a theo task rather than implementing inline:
+
+```bash
+# Basic task
+uv run theo add "description of what needs to be done"
+
+# With task type (plan, implement, review, explore)
+uv run theo add --type plan "explore authentication options and propose approach"
+uv run theo add --type implement "add user authentication with JWT"
+
+# Auto-review after implementation
+uv run theo add --type implement --review "add dark mode toggle"
+
+# Task chaining - implementation based on a plan
+uv run theo add --type implement --based-on 5 "implement the approach from task #5"
+```
+
+Tips for good task descriptions:
+- Be specific about what needs to change and where
+- Reference file paths or components when known
+- For multi-step work, create a `--type plan` task first
+- Use `--review` flag for significant changes that warrant code review
+
 ## Development
 
 After making changes, run the test suite to verify everything works:
