@@ -3,3 +3,7 @@
 __pycache__/
 .pytest_cache/
 tmp/
+
+# AI-generated artifacts (should not be created, but ignore as safety net)
+IMPLEMENTATION_SUMMARY.md
+CHANGES.md

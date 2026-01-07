@@ -318,7 +318,7 @@ def run(config: Config) -> int:
         print(f"git diff {default_branch}...{branch_name} --")
         print("")
         print("to merge:")
-        print(f"git merge --squash{branch_name}")
+        print(f"git merge --squash {branch_name}")
 
         _cleanup_worktree(git, worktree_path)
 

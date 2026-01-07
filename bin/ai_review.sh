@@ -21,9 +21,45 @@ DO_COPY=0
 USE_PAGER="auto" # auto | 1 | 0
 SAVE_RUN_OUTPUT="auto" # auto | 1 | 0
 REVIEWS_DIR="$ROOT/reviews"
-GEMINI_MODEL="gemini-2.0-flash-lite"
+GEMINI_MODEL="gemini-2.5-pro"
 FILES_MODE=0
 FILES=()
+
+# ============================================================================
+# REVIEW PROMPT - Update this when copying to a new project
+# ============================================================================
+read -r -d '' PROMPT <<'EOF' || true
+You are an automated code reviewer for this repository.
+
+Repo goal: theo is a CLI tool for running autonomous AI coding agents (Claude, Gemini) on development tasks. It manages task queues, git branches, logging, and supports task chaining with dependencies.
+
+Repo instructions (canonical): see AGENTS.md.
+
+Review priorities:
+1) Correctness
+   - proper error handling and edge cases
+   - correct subprocess/CLI invocation patterns
+   - database schema consistency
+2) Usability
+   - clear CLI output and error messages
+   - sensible defaults
+3) Safety
+   - no secrets in logs or output
+   - safe git operations (no force pushes, proper branch handling)
+   - proper credential handling
+4) Maintainability
+   - consistent code style
+   - appropriate test coverage
+
+Output format:
+- Summary (1-3 bullets)
+- Must-fix issues
+- Suggestions
+- Questions/assumptions
+
+Now review the following content:
+EOF
+# ============================================================================
 
 usage() {
   cat <<'EOF'
@@ -246,33 +282,6 @@ if [[ "$FILES_MODE" != "1" ]]; then
   fi
 fi
 
-read -r -d '' PROMPT <<'EOF' || true
-You are an automated code reviewer for this repository.
-
-Repo goal: repeatable micro-/meso-benchmarks comparing Python + NumPy performance across architectures (arm64 vs x86_64), producing interpretable pyperf JSON and simple plots.
-
-Repo instructions (canonical): see AGENTS.md.
-
-Review priorities:
-1) Correctness & determinism
-   - deterministic inputs (seed RNGs), stable sizes
-   - avoid measuring allocations you don’t care about (prefer preallocation / out= where applicable)
-   - appropriate pyperf usage (bench_func, inner_loops where relevant)
-2) Reproducibility across machines/architectures
-   - sufficient metadata (arch, python/numpy versions, numpy config, thread env vars)
-   - call out BLAS/threading/Rosetta/thermal/power gotchas
-3) Interpretability of outputs (pyperf JSON and plots)
-4) Safety (no secrets; don’t commit huge results unintentionally)
-
-Output format:
-- Summary (1-3 bullets)
-- Must-fix issues
-- Suggestions
-- Questions/assumptions
-
-Now review the following content:
-EOF
-
 if [[ "$FILES_MODE" == "1" ]]; then
   OUTPUT="$(printf "%s\n\n%s\n" "$PROMPT" "$FILES_BLOCK")"
 else
@@ -320,6 +329,7 @@ if [[ "$DO_RUN" == "1" ]]; then
         if [[ "$SAVE_RUN_OUTPUT" == "1" ]]; then
           mkdir -p "$REVIEWS_DIR"
           REVIEW_FILE="$(review_out_path "gemini" "$TS")"
+          echo "Using Gemini model: $GEMINI_MODEL" >&2
           printf "%s" "$OUTPUT" | gemini -m "$GEMINI_MODEL" | tee "$REVIEW_FILE"
           echo "Saved output to: $REVIEW_FILE" >&2
         else

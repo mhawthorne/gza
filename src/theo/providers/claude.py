@@ -160,6 +160,35 @@ class ClaudeProvider(Provider):
 
                 if event_type == "assistant":
                     message = event.get("message", {})
+                    msg_id = message.get("id")
+
+                    # Track unique message IDs as turn proxy
+                    if "seen_msg_ids" not in data:
+                        data["seen_msg_ids"] = set()
+                    if msg_id and msg_id not in data["seen_msg_ids"]:
+                        data["seen_msg_ids"].add(msg_id)
+                        turn_count = len(data["seen_msg_ids"])
+
+                        # Accumulate token usage for cost estimation
+                        usage = message.get("usage", {})
+                        if "total_input_tokens" not in data:
+                            data["total_input_tokens"] = 0
+                            data["total_output_tokens"] = 0
+                        data["total_input_tokens"] += usage.get("input_tokens", 0)
+                        data["total_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
+                        data["total_input_tokens"] += usage.get("cache_read_input_tokens", 0)
+                        data["total_output_tokens"] += usage.get("output_tokens", 0)
+
+                        # Display live stats
+                        total_tokens = data["total_input_tokens"] + data["total_output_tokens"]
+                        if total_tokens > 1_000_000:
+                            token_str = f"{total_tokens / 1_000_000:.1f}M tokens"
+                        elif total_tokens > 1000:
+                            token_str = f"{total_tokens // 1000}k tokens"
+                        else:
+                            token_str = f"{total_tokens} tokens"
+                        print(f"  [turn {turn_count}, {token_str}]")
+
                     for content in message.get("content", []):
                         if content.get("type") == "tool_use":
                             tool_name = content.get("name", "unknown")

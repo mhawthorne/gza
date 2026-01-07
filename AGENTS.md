@@ -54,6 +54,11 @@ When renaming a field across the codebase:
 2. Check both `tasks.py` and `db.py` for Task-related changes
 3. Update tests in bulk, not one test method at a time
 
+## Important Guidelines
+
+- **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
+- **Do NOT create README files** unless explicitly requested.
+
 ## Development
 
 After making changes, run the test suite to verify everything works:
