@@ -39,7 +39,7 @@ class DockerConfig:
     image_name: str
     npm_package: str
     cli_command: str
-    config_dir: str  # e.g., ".claude" or ".gemini"
+    config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
 
 
@@ -99,9 +99,13 @@ def build_docker_cmd(
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm",
         "-v", f"{work_dir}:/workspace",
-        "-v", f"{Path.home()}/{docker_config.config_dir}:/home/theo/{docker_config.config_dir}",
         "-w", "/workspace",
     ]
+
+    # Mount config directory if specified (for OAuth credentials)
+    if docker_config.config_dir:
+        cmd.insert(-2, "-v")
+        cmd.insert(-2, f"{Path.home()}/{docker_config.config_dir}:/home/theo/{docker_config.config_dir}")
 
     # Pass environment variables if set
     for env_var in docker_config.env_vars:
@@ -148,10 +152,10 @@ def verify_docker_credentials(
         return False
 
     try:
-        cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{Path.home()}/{docker_config.config_dir}:/home/theo/{docker_config.config_dir}",
-        ]
+        cmd = ["docker", "run", "--rm"]
+        # Mount config directory if specified (for OAuth credentials)
+        if docker_config.config_dir:
+            cmd.extend(["-v", f"{Path.home()}/{docker_config.config_dir}:/home/theo/{docker_config.config_dir}"])
         for env_var in docker_config.env_vars:
             if os.getenv(env_var):
                 cmd.extend(["-e", env_var])

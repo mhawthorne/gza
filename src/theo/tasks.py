@@ -2,7 +2,8 @@
 
 import sys
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import datetime, date, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
@@ -23,84 +24,51 @@ def literal_string_representer(dumper: yaml.Dumper, data: LiteralString) -> yaml
 yaml.add_representer(LiteralString, literal_string_representer)
 
 
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNMERGED = "unmerged"
+    BLOCKED = "blocked"
+
+
 @dataclass
 class Task:
-    description: str
-    status: str = "pending"  # pending, in_progress, completed, failed, unmerged
-    type: str = "task"  # task, explore (explore doesn't require code changes)
-    tags: list[str] = field(default_factory=list)
-    task_id: str | None = None  # Auto-generated: YYYYMMDD-slug format
-    completed_at: date | None = None
+    """A task in the database."""
+    id: int | None  # None for unsaved tasks
+    prompt: str
+    status: TaskStatus = TaskStatus.PENDING
+    task_type: str = "task"  # task, explore, plan, implement, review
+    task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
     log_file: str | None = None
-    report_file: str | None = None  # For explore tasks, stores findings
-    based_on: str | None = None  # Reference to a report file for follow-up tasks
-    has_commits: bool | None = None  # Whether the task made any git commits
-    # Stats from task execution
+    report_file: str | None = None
+    based_on: int | None = None  # Reference to parent task id
+    has_commits: bool | None = None
     duration_seconds: float | None = None
     num_turns: int | None = None
     cost_usd: float | None = None
-
-    def to_dict(self) -> dict:
-        """Convert to dict for serialization, omitting None/empty values."""
-        # Use LiteralString for multi-line or long descriptions
-        description = self.description
-        if len(description) > 50 or '\n' in description:
-            description = LiteralString(description)
-
-        d = {"description": description, "status": self.status}
-        if self.type != "task":
-            d["type"] = self.type
-        if self.tags:
-            d["tags"] = self.tags
-        if self.task_id:
-            d["task_id"] = self.task_id
-        if self.completed_at:
-            d["completed_at"] = self.completed_at.isoformat()
-        if self.branch:
-            d["branch"] = self.branch
-        if self.log_file:
-            d["log_file"] = self.log_file
-        if self.report_file:
-            d["report_file"] = self.report_file
-        if self.based_on:
-            d["based_on"] = self.based_on
-        if self.has_commits is not None:
-            d["has_commits"] = self.has_commits
-        if self.duration_seconds is not None:
-            d["duration_seconds"] = self.duration_seconds
-        if self.num_turns is not None:
-            d["num_turns"] = self.num_turns
-        if self.cost_usd is not None:
-            d["cost_usd"] = self.cost_usd
-        return d
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Task":
-        """Create Task from dict."""
-        completed_at = None
-        if d.get("completed_at"):
-            completed_at = date.fromisoformat(d["completed_at"])
-        return cls(
-            description=d["description"],
-            status=d.get("status", "pending"),
-            type=d.get("type", "task"),
-            tags=d.get("tags", []),
-            task_id=d.get("task_id"),
-            completed_at=completed_at,
-            branch=d.get("branch"),
-            log_file=d.get("log_file"),
-            report_file=d.get("report_file"),
-            based_on=d.get("based_on"),
-            has_commits=d.get("has_commits"),
-            duration_seconds=d.get("duration_seconds"),
-            num_turns=d.get("num_turns"),
-            cost_usd=d.get("cost_usd"),
-        )
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    # New fields for task import/chaining
+    group: str | None = None  # Group name for related tasks
+    depends_on: int | None = None  # Task ID this task depends on
+    spec: str | None = None  # Path to spec file for context
+    create_review: bool = False  # Auto-create review task on completion
+    same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
+    task_type_hint: str | None = None  # Explicit branch type hint (e.g., "fix", "feature")
+    output_content: str | None = None  # Actual content of report/plan/review (for persistence)
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
-        return self.type == "explore"
+        return self.task_type == "explore"
+
+    def is_blocked(self) -> bool:
+        """Check if this task is blocked by a dependency."""
+        # This will be properly checked against the database in SqliteTaskStore
+        return self.depends_on is not None
 
 
 @dataclass

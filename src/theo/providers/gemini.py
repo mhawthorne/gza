@@ -55,7 +55,7 @@ def _get_docker_config(image_name: str) -> DockerConfig:
         image_name=image_name,
         npm_package="@google/gemini-cli",
         cli_command="gemini",
-        config_dir=".gemini",
+        config_dir=None,  # Use API key auth, no need to mount ~/.gemini
         env_vars=["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
     )
 
@@ -172,7 +172,14 @@ class GeminiProvider(Provider):
             return RunResult(exit_code=1)
 
         cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes)
-        cmd.extend(["gemini", "-p", prompt, "--output-format", "stream-json"])
+        # Insert GEMINI_SHELL_ENABLED before the image name (last element from build_docker_cmd)
+        cmd.insert(-1, "-e")
+        cmd.insert(-1, "GEMINI_SHELL_ENABLED=true")
+        cmd.extend([
+            "gemini", "-p", prompt,
+            "--output-format", "stream-json",
+            "--allowed-tools", "run_shell_command",
+        ])
 
         # Add model if specified
         if config.model:
@@ -189,9 +196,11 @@ class GeminiProvider(Provider):
     ) -> RunResult:
         """Run Gemini directly."""
         cmd = [
+            "env", "GEMINI_SHELL_ENABLED=true",
             "timeout", f"{config.timeout_minutes}m",
             "gemini", "-p", prompt,
             "--output-format", "stream-json",
+            "--allowed-tools", "run_shell_command",
         ]
 
         # Add model if specified

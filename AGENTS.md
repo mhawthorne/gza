@@ -89,7 +89,11 @@ Tips for good task descriptions:
 After making changes, run the test suite to verify everything works:
 
 ```
+# Unit tests (fast, no external dependencies)
 uv run pytest tests/ -v
+
+# Integration tests (requires Docker and/or API credentials)
+uv run pytest tests_integration/ -v -m integration
 ```
 
 ### Testing Guidelines
