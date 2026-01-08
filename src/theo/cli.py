@@ -1649,8 +1649,8 @@ def cmd_ps(args: argparse.Namespace) -> int:
         return 0
 
     # Table output
-    print(f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'STATUS':<12} {'TASK':<30} {'DURATION':<10}")
-    print("-" * 96)
+    print(f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'TASK ID':<10} {'STATUS':<12} {'TASK':<30} {'DURATION':<10}")
+    print("-" * 106)
 
     for worker in workers:
         # Check if still running
@@ -1659,14 +1659,16 @@ def cmd_ps(args: argparse.Namespace) -> int:
 
         # Get task info
         task_display = ""
+        task_id_display = ""
         if worker.task_id:
+            task_id_display = f"#{worker.task_id}"
             task = store.get(worker.task_id)
             if task:
                 if task.task_id:
                     task_display = task.task_id
                 else:
                     prompt = task.prompt[:25] + "..." if len(task.prompt) > 25 else task.prompt
-                    task_display = f"#{task.id}: {prompt}"
+                    task_display = prompt
 
         # Calculate duration
         started = datetime.fromisoformat(worker.started_at)
@@ -1686,7 +1688,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
         # Determine worker type (default to background for old workers without is_background field)
         worker_type = "fg" if hasattr(worker, 'is_background') and not worker.is_background else "bg"
 
-        print(f"{worker.worker_id:<20} {worker.pid:<8} {worker_type:<6} {worker.status:<12} {task_display:<30} {duration:<10}")
+        print(f"{worker.worker_id:<20} {worker.pid:<8} {worker_type:<6} {task_id_display:<10} {worker.status:<12} {task_display:<30} {duration:<10}")
 
     return 0
 
