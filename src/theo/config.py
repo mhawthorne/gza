@@ -26,6 +26,7 @@ DEFAULT_MAX_TURNS = 50
 DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
 DEFAULT_PROVIDER = "claude"  # "claude" or "gemini"
+DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
 DEFAULT_CLAUDE_ARGS = [
     "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash",
 ]
@@ -36,6 +37,41 @@ class TaskTypeConfig:
     """Configuration for a specific task type."""
     model: str | None = None
     max_turns: int | None = None
+
+
+@dataclass
+class BranchStrategy:
+    """Configuration for branch naming strategy."""
+    pattern: str
+    default_type: str = "feature"
+
+    def __post_init__(self):
+        """Validate the branch strategy configuration."""
+        # Validate pattern contains valid variables
+        valid_vars = {"{project}", "{task_id}", "{date}", "{slug}", "{type}"}
+        # Check for invalid characters that would break git branch names
+        invalid_chars = [" ", "~", "^", ":", "?", "*", "[", "\\"]
+        for char in invalid_chars:
+            if char in self.pattern:
+                raise ConfigError(f"Invalid character '{char}' in branch_strategy pattern")
+
+        # Check for consecutive dots or slashes
+        if ".." in self.pattern:
+            raise ConfigError("Branch strategy pattern cannot contain consecutive dots (..)")
+        if "//" in self.pattern:
+            raise ConfigError("Branch strategy pattern cannot contain consecutive slashes (//)")
+
+        # Check pattern doesn't start with dot or slash
+        if self.pattern.startswith("."):
+            raise ConfigError("Branch strategy pattern cannot start with a dot")
+        if self.pattern.startswith("/"):
+            raise ConfigError("Branch strategy pattern cannot start with a slash")
+
+        # Check pattern doesn't end with slash or .lock
+        if self.pattern.endswith("/"):
+            raise ConfigError("Branch strategy pattern cannot end with a slash")
+        if self.pattern.endswith(".lock"):
+            raise ConfigError("Branch strategy pattern cannot end with .lock")
 
 
 @dataclass
@@ -55,10 +91,18 @@ class Config:
     provider: str = DEFAULT_PROVIDER  # "claude" or "gemini"
     model: str = ""  # Provider-specific model name (optional)
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
+    branch_strategy: BranchStrategy | None = None  # Branch naming strategy
 
     def __post_init__(self):
         if not self.docker_image:
             self.docker_image = f"{self.project_name}-theo"
+
+        # Set default branch strategy if not provided
+        if self.branch_strategy is None:
+            self.branch_strategy = BranchStrategy(
+                pattern="{project}/{task_id}",
+                default_type="feature"
+            )
 
     def get_model_for_task_type(self, task_type: str) -> str:
         """Get the model for a given task type, falling back to defaults.
@@ -133,7 +177,7 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "worktree_dir", "work_count", "provider", "model",
-            "defaults", "task_types"
+            "defaults", "task_types", "branch_strategy"
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -195,6 +239,42 @@ class Config:
                         max_turns=config_data.get("max_turns")
                     )
 
+        # Parse branch_strategy configuration
+        branch_strategy = None
+        if "branch_strategy" in data:
+            bs_data = data["branch_strategy"]
+            # Handle preset names
+            if isinstance(bs_data, str):
+                if bs_data == "monorepo":
+                    branch_strategy = BranchStrategy(
+                        pattern="{project}/{task_id}",
+                        default_type="feature"
+                    )
+                elif bs_data == "conventional":
+                    branch_strategy = BranchStrategy(
+                        pattern="{type}/{slug}",
+                        default_type="feature"
+                    )
+                elif bs_data == "simple":
+                    branch_strategy = BranchStrategy(
+                        pattern="{slug}",
+                        default_type="feature"
+                    )
+                else:
+                    raise ConfigError(
+                        f"Unknown branch_strategy preset: '{bs_data}'\n"
+                        f"Valid presets are: monorepo, conventional, simple\n"
+                        f"Or use a dict with 'pattern' key for custom patterns."
+                    )
+            # Handle custom pattern dict
+            elif isinstance(bs_data, dict):
+                if "pattern" not in bs_data:
+                    raise ConfigError("branch_strategy dict must have a 'pattern' key")
+                branch_strategy = BranchStrategy(
+                    pattern=bs_data["pattern"],
+                    default_type=bs_data.get("default_type", "feature")
+                )
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -211,6 +291,7 @@ class Config:
             provider=provider,
             model=model,
             task_types=task_types,
+            branch_strategy=branch_strategy,
         )
 
     @classmethod
@@ -254,7 +335,8 @@ class Config:
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "timeout_minutes", "branch_mode", "max_turns", "claude_args",
-            "worktree_dir", "work_count", "provider", "model", "defaults", "task_types"
+            "worktree_dir", "work_count", "provider", "model", "defaults", "task_types",
+            "branch_strategy"
         }
 
         for key in data.keys():
@@ -363,5 +445,43 @@ class Config:
                         for key in config.keys():
                             if key not in valid_task_type_keys:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
+
+        # Validate branch_strategy section
+        if "branch_strategy" in data:
+            bs_data = data["branch_strategy"]
+            if isinstance(bs_data, str):
+                # Validate preset names
+                valid_presets = {"monorepo", "conventional", "simple"}
+                if bs_data not in valid_presets:
+                    errors.append(
+                        f"'branch_strategy' preset '{bs_data}' is invalid. "
+                        f"Valid presets: {', '.join(sorted(valid_presets))}"
+                    )
+            elif isinstance(bs_data, dict):
+                # Validate custom pattern dict
+                if "pattern" not in bs_data:
+                    errors.append("'branch_strategy' dict must have a 'pattern' key")
+                elif not isinstance(bs_data["pattern"], str):
+                    errors.append("'branch_strategy.pattern' must be a string")
+                else:
+                    # Try to validate the pattern by creating a BranchStrategy
+                    try:
+                        BranchStrategy(
+                            pattern=bs_data["pattern"],
+                            default_type=bs_data.get("default_type", "feature")
+                        )
+                    except ConfigError as e:
+                        errors.append(f"'branch_strategy.pattern' is invalid: {e}")
+
+                if "default_type" in bs_data and not isinstance(bs_data["default_type"], str):
+                    errors.append("'branch_strategy.default_type' must be a string")
+
+                # Warn about unknown keys
+                valid_bs_keys = {"pattern", "default_type"}
+                for key in bs_data.keys():
+                    if key not in valid_bs_keys:
+                        warnings.append(f"Unknown field in 'branch_strategy': '{key}'")
+            else:
+                errors.append("'branch_strategy' must be a string (preset name) or dict (custom pattern)")
 
         return len(errors) == 0, errors, warnings

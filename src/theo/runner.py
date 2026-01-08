@@ -407,7 +407,16 @@ def run(config: Config, task_id: int | None = None) -> int:
     elif config.branch_mode == "single":
         branch_name = f"{config.project_name}/theo-work"
     else:  # multi
-        branch_name = f"{config.project_name}/{task.task_id}"
+        # Use branch naming strategy
+        from theo.branch_naming import generate_branch_name
+        branch_name = generate_branch_name(
+            pattern=config.branch_strategy.pattern,
+            project_name=config.project_name,
+            task_id=task.task_id,
+            prompt=task.prompt,
+            default_type=config.branch_strategy.default_type,
+            explicit_type=task.task_type_hint,
+        )
 
     # Create worktree path
     worktree_path = config.worktree_path / task.task_id
