@@ -870,6 +870,26 @@ class TestEditCommand:
         updated = store.get(task.id)
         assert updated.group is None or updated.group == ""
 
+    def test_edit_review_flag(self, tmp_path: Path):
+        """Edit command can enable automatic review task creation."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task")
+        assert task.create_review is False
+
+        result = run_theo("edit", str(task.id), "--review", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Verify create_review was enabled
+        updated = store.get(task.id)
+        assert updated.create_review is True
+
 
 class TestNextCommandWithDependencies:
     """Tests for 'theo next' command with dependencies."""

@@ -1333,6 +1333,13 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"✓ Set task #{task.id} to depend on task #{args.based_on_flag}")
         return 0
 
+    # Handle --review flag
+    if hasattr(args, 'review') and args.review:
+        task.create_review = True
+        store.update(task)
+        print(f"✓ Enabled automatic review task creation for task #{task.id}")
+        return 0
+
     if args.explore and args.task:
         print("Error: Cannot use both --explore and --task")
         return 1
@@ -2024,6 +2031,11 @@ def main() -> int:
         "--task",
         action="store_true",
         help="Convert to a regular task",
+    )
+    edit_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Enable automatic review task creation on completion",
     )
     add_common_args(edit_parser)
 
