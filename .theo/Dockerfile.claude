@@ -1,0 +1,28 @@
+FROM node:20-slim
+
+# Install Python and common build tools
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install the CLI tool globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Create theo user for isolation
+RUN useradd -m -s /bin/bash theo
+
+# Copy uv to theo user's path
+RUN cp /root/.local/bin/uv /usr/local/bin/uv
+
+USER theo
+WORKDIR /home/theo
+
+# Default command
+CMD ["claude"]

@@ -2,6 +2,10 @@
 
 A coding AI agent runner for Claude Code.
 
+## Quick Reference
+
+When the user asks to "add a task" or "create a task", use `uv run theo add "..."` - do NOT edit `etc/todo.txt` or other manual todo files.
+
 ## Usage
 
 ```

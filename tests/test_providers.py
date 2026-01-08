@@ -18,6 +18,8 @@ from theo.providers.base import (
     DOCKERFILE_TEMPLATE,
     is_docker_running,
     verify_docker_credentials,
+    ensure_docker_image,
+    _get_image_created_time,
 )
 from theo.providers.gemini import calculate_cost, GEMINI_PRICING
 
@@ -548,3 +550,196 @@ class TestClaudeErrorTypeExtraction:
         assert result.error_type is None
         assert result.num_turns == 5
         assert result.exit_code == 0
+
+
+class TestGetImageCreatedTime:
+    """Tests for Docker image timestamp retrieval."""
+
+    def test_returns_timestamp_when_image_exists(self):
+        """Should return Unix timestamp when image exists."""
+        with patch("theo.providers.base.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="2025-01-08T10:30:00.123456789Z\n",
+            )
+            result = _get_image_created_time("test-image")
+
+        assert result is not None
+        assert isinstance(result, float)
+        # Verify the timestamp is reasonable (after 2025-01-01)
+        assert result > 1735689600  # 2025-01-01 00:00:00 UTC
+
+    def test_returns_none_when_image_not_found(self):
+        """Should return None when image doesn't exist."""
+        with patch("theo.providers.base.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            result = _get_image_created_time("nonexistent-image")
+
+        assert result is None
+
+    def test_handles_timestamps_without_nanoseconds(self):
+        """Should handle timestamps without fractional seconds."""
+        with patch("theo.providers.base.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="2025-01-08T10:30:00Z\n",
+            )
+            result = _get_image_created_time("test-image")
+
+        assert result is not None
+
+    def test_returns_none_on_invalid_timestamp(self):
+        """Should return None for unparseable timestamps."""
+        with patch("theo.providers.base.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="not-a-timestamp\n",
+            )
+            result = _get_image_created_time("test-image")
+
+        assert result is None
+
+
+class TestEnsureDockerImage:
+    """Tests for Docker image build logic."""
+
+    def test_returns_true_when_image_up_to_date(self, tmp_path):
+        """Should return True without building when image is newer than Dockerfile."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        # Create Dockerfile
+        theo_dir = tmp_path / ".theo"
+        theo_dir.mkdir()
+        dockerfile = theo_dir / "Dockerfile.testcli"
+        dockerfile.write_text("FROM node:20-slim")
+
+        # Mock image as newer than Dockerfile
+        dockerfile_mtime = dockerfile.stat().st_mtime
+        image_time = dockerfile_mtime + 100  # Image created after Dockerfile
+
+        with patch("theo.providers.base._get_image_created_time", return_value=image_time):
+            with patch("theo.providers.base.subprocess.run") as mock_run:
+                result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is True
+        # subprocess.run should NOT be called (no build needed)
+        mock_run.assert_not_called()
+
+    def test_rebuilds_when_dockerfile_newer(self, tmp_path):
+        """Should rebuild image when Dockerfile is newer than image."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        # Create Dockerfile
+        theo_dir = tmp_path / ".theo"
+        theo_dir.mkdir()
+        dockerfile = theo_dir / "Dockerfile.testcli"
+        dockerfile.write_text("FROM node:20-slim")
+
+        # Mock image as older than Dockerfile
+        dockerfile_mtime = dockerfile.stat().st_mtime
+        image_time = dockerfile_mtime - 100  # Image created before Dockerfile
+
+        with patch("theo.providers.base._get_image_created_time", return_value=image_time):
+            with patch("theo.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is True
+        # Verify docker build was called
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "docker" in call_args
+        assert "build" in call_args
+
+    def test_builds_when_image_not_exists(self, tmp_path):
+        """Should build image when it doesn't exist."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch("theo.providers.base._get_image_created_time", return_value=None):
+            with patch("theo.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is True
+        mock_run.assert_called_once()
+
+    def test_preserves_custom_dockerfile(self, tmp_path):
+        """Should not overwrite existing custom Dockerfile."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        # Create custom Dockerfile with extra content
+        theo_dir = tmp_path / ".theo"
+        theo_dir.mkdir()
+        dockerfile = theo_dir / "Dockerfile.testcli"
+        custom_content = "FROM python:3.12\nRUN pip install pytest"
+        dockerfile.write_text(custom_content)
+
+        with patch("theo.providers.base._get_image_created_time", return_value=None):
+            with patch("theo.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                ensure_docker_image(docker_config, tmp_path)
+
+        # Dockerfile should still have custom content
+        assert dockerfile.read_text() == custom_content
+
+    def test_generates_dockerfile_when_missing(self, tmp_path):
+        """Should generate default Dockerfile when none exists."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch("theo.providers.base._get_image_created_time", return_value=None):
+            with patch("theo.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                ensure_docker_image(docker_config, tmp_path)
+
+        dockerfile = tmp_path / ".theo" / "Dockerfile.testcli"
+        assert dockerfile.exists()
+        content = dockerfile.read_text()
+        assert "@test/cli" in content
+        assert "testcli" in content
+
+    def test_returns_false_on_build_failure(self, tmp_path):
+        """Should return False when docker build fails."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch("theo.providers.base._get_image_created_time", return_value=None):
+            with patch("theo.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=1)
+                result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is False

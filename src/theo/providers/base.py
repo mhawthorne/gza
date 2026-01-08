@@ -43,6 +43,38 @@ class DockerConfig:
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
 
 
+def _get_image_created_time(image_name: str) -> float | None:
+    """Get the creation timestamp of a Docker image.
+
+    Returns:
+        Unix timestamp of image creation, or None if image doesn't exist.
+    """
+    import json
+
+    result = subprocess.run(
+        ["docker", "image", "inspect", image_name, "--format", "{{.Created}}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    # Parse ISO 8601 timestamp (e.g., "2025-01-08T10:30:00.123456789Z")
+    from datetime import datetime
+
+    timestamp_str = result.stdout.strip()
+    try:
+        # Handle nanoseconds by truncating to microseconds
+        if "." in timestamp_str:
+            base, frac = timestamp_str.rsplit(".", 1)
+            frac = frac.rstrip("Z")[:6]  # Keep only 6 digits for microseconds
+            timestamp_str = f"{base}.{frac}Z"
+        dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
 def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     """Ensure Docker image exists, building if needed.
 
@@ -53,24 +85,30 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     Returns:
         True if image is available, False on failure
     """
-    # Check if image already exists
-    result = subprocess.run(
-        ["docker", "image", "inspect", docker_config.image_name],
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        return True
-
-    # Build the image
     theo_dir = project_dir / f".{APP_NAME}"
     theo_dir.mkdir(parents=True, exist_ok=True)
-
-    dockerfile_content = DOCKERFILE_TEMPLATE.format(
-        npm_package=docker_config.npm_package,
-        cli_command=docker_config.cli_command,
-    )
     dockerfile_path = theo_dir / f"Dockerfile.{docker_config.cli_command}"
-    dockerfile_path.write_text(dockerfile_content)
+
+    # Check if image exists and is up-to-date
+    image_time = _get_image_created_time(docker_config.image_name)
+    if image_time is not None:
+        # Image exists - check if Dockerfile is newer
+        if dockerfile_path.exists():
+            dockerfile_time = dockerfile_path.stat().st_mtime
+            if dockerfile_time > image_time:
+                print(f"Dockerfile changed, rebuilding {docker_config.image_name}...")
+            else:
+                return True  # Image is up-to-date
+        else:
+            return True  # No Dockerfile to compare, image exists
+
+    # Generate Dockerfile if it doesn't exist (preserve custom Dockerfiles)
+    if not dockerfile_path.exists():
+        dockerfile_content = DOCKERFILE_TEMPLATE.format(
+            npm_package=docker_config.npm_package,
+            cli_command=docker_config.cli_command,
+        )
+        dockerfile_path.write_text(dockerfile_content)
 
     print(f"Building Docker image {docker_config.image_name}...")
     result = subprocess.run(

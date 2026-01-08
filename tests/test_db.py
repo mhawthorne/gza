@@ -290,3 +290,118 @@ class TestTaskMethods:
 
         task = Task(id=1, prompt="Test", depends_on=None)
         assert task.is_blocked() is False
+
+
+class TestOutputContentPersistence:
+    """Tests for output_content field persistence."""
+
+    def test_output_content_stored_and_retrieved(self, tmp_path: Path):
+        """Test that output_content is stored and retrieved correctly."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Add a plan task
+        task = store.add(prompt="Design authentication system", task_type="plan")
+
+        # Simulate completing the task with output content
+        plan_content = """# Authentication System Design
+
+## Overview
+This plan outlines the implementation of a JWT-based authentication system.
+
+## Key Components
+1. User registration endpoint
+2. Login endpoint with JWT generation
+"""
+        store.mark_completed(
+            task,
+            report_file=".theo/plans/test-plan.md",
+            output_content=plan_content,
+            has_commits=False,
+        )
+
+        # Retrieve and verify
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "completed"
+        assert retrieved.output_content == plan_content
+
+    def test_output_content_null_by_default(self, tmp_path: Path):
+        """Test that output_content is None for tasks without it."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Simple task")
+        retrieved = store.get(task.id)
+        assert retrieved.output_content is None
+
+    def test_migration_from_v3_to_v4(self, tmp_path: Path):
+        """Test that migration from v3 to v4 adds output_content column."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v3 database manually (without output_content)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0
+            )
+        """)
+
+        # Insert a test task
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
+            ("Old task", "plan", now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore - should auto-migrate to v4
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 4
+
+        # Verify old task can be retrieved (with NULL output_content)
+        task = store.get(1)
+        assert task is not None
+        assert task.output_content is None
+
+        # Create new task with output_content
+        new_task = store.add(prompt="New task", task_type="plan")
+        store.mark_completed(
+            new_task,
+            output_content="This is the plan content",
+            has_commits=False,
+        )
+
+        retrieved = store.get(new_task.id)
+        assert retrieved.output_content == "This is the plan content"

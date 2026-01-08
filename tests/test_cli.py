@@ -1094,3 +1094,73 @@ class TestBuildPromptWithSpec:
         # Verify no spec section
         assert "## Specification" not in prompt
         assert "Simple task" in prompt
+
+
+class TestGetTaskOutput:
+    """Tests for _get_task_output helper function."""
+
+    def test_prefers_db_content(self, tmp_path: Path):
+        """_get_task_output should prefer output_content from DB."""
+        from theo.runner import _get_task_output
+        from theo.db import Task
+
+        task = Task(
+            id=1,
+            prompt="Test",
+            output_content="Content from DB",
+        )
+        result = _get_task_output(task, tmp_path)
+        assert result == "Content from DB"
+
+    def test_falls_back_to_file(self, tmp_path: Path):
+        """_get_task_output should fall back to file when no DB content."""
+        from theo.runner import _get_task_output
+        from theo.db import Task
+
+        # Create report file
+        report_dir = tmp_path / ".theo" / "plans"
+        report_dir.mkdir(parents=True)
+        report_file = report_dir / "test.md"
+        report_file.write_text("Content from file")
+
+        task = Task(
+            id=2,
+            prompt="Test",
+            report_file=".theo/plans/test.md",
+            output_content=None,
+        )
+        result = _get_task_output(task, tmp_path)
+        assert result == "Content from file"
+
+    def test_prefers_db_over_file(self, tmp_path: Path):
+        """_get_task_output should prefer DB when both exist."""
+        from theo.runner import _get_task_output
+        from theo.db import Task
+
+        # Create report file
+        report_dir = tmp_path / ".theo" / "plans"
+        report_dir.mkdir(parents=True)
+        report_file = report_dir / "test.md"
+        report_file.write_text("Content from file")
+
+        task = Task(
+            id=3,
+            prompt="Test",
+            report_file=".theo/plans/test.md",
+            output_content="DB wins",
+        )
+        result = _get_task_output(task, tmp_path)
+        assert result == "DB wins"
+
+    def test_returns_none_when_no_content(self, tmp_path: Path):
+        """_get_task_output should return None when no content available."""
+        from theo.runner import _get_task_output
+        from theo.db import Task
+
+        task = Task(
+            id=4,
+            prompt="Test",
+            output_content=None,
+        )
+        result = _get_task_output(task, tmp_path)
+        assert result is None
