@@ -105,3 +105,7 @@ uv run pytest tests_integration/ -v -m integration
 - Test both success cases and error handling
 - Run tests after making changes: `uv run pytest tests/ -v`
 - For CLI changes, add tests in `tests/test_cli.py` following the existing class structure (e.g., `TestAddCommandWithChaining`)
+
+## Temporary Files
+
+When creating temporary files (e.g., task import files, test data), write them to the `tmp/` directory in the project root. This directory is gitignored and keeps the project clean.
