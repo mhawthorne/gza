@@ -591,14 +591,25 @@ def _run_non_code_task(
         if worktree_path.exists():
             git.worktree_remove(worktree_path, force=True)
 
-        # Create worktree without creating a new branch (use --detach to check out HEAD)
-        # This creates a worktree in detached HEAD state based on the default branch
-        print(f"Creating worktree: {worktree_path}")
-        base_ref = f"origin/{default_branch}"
-        result = git._run("rev-parse", "--verify", base_ref, check=False)
-        if result.returncode != 0:
-            base_ref = default_branch  # Fall back to local branch
+        # For review tasks with depends_on, check if we should run on the implementation branch
+        base_ref = None
+        if task.task_type == "review" and task.depends_on:
+            dep_task = store.get(task.depends_on)
+            if dep_task and dep_task.branch and dep_task.status == "completed":
+                # Run review on the implementation branch
+                base_ref = dep_task.branch
+                print(f"Running review on implementation branch: {base_ref}")
 
+        # Default to origin/default_branch or local default_branch
+        if not base_ref:
+            base_ref = f"origin/{default_branch}"
+            result = git._run("rev-parse", "--verify", base_ref, check=False)
+            if result.returncode != 0:
+                base_ref = default_branch  # Fall back to local branch
+
+        # Create worktree without creating a new branch (use --detach to check out HEAD)
+        # This creates a worktree in detached HEAD state based on the specified ref
+        print(f"Creating worktree: {worktree_path}")
         git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
 
         # Create report directory structure in worktree
