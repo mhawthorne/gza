@@ -363,6 +363,63 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_merge(args: argparse.Namespace) -> int:
+    """Merge a task's branch into the current branch."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    # Get the task
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    # Validate task state
+    if task.status not in ("completed", "unmerged"):
+        print(f"Error: Task #{task.id} is not completed or unmerged (status: {task.status})")
+        return 1
+
+    if not task.branch:
+        print(f"Error: Task #{task.id} has no branch")
+        return 1
+
+    # Get current and default branches
+    current_branch = git.current_branch()
+    default_branch = git.default_branch()
+
+    # Check if branch already merged
+    if git.is_merged(task.branch, current_branch):
+        print(f"Error: Branch '{task.branch}' is already merged into {current_branch}")
+        return 1
+
+    # Check for uncommitted changes
+    if git.has_changes():
+        print("Error: You have uncommitted changes. Please commit or stash them first.")
+        return 1
+
+    # Perform the merge
+    try:
+        print(f"Merging '{task.branch}' into '{current_branch}'...")
+        git.merge(task.branch, squash=False)
+        print(f"✓ Successfully merged {task.branch}")
+
+        # Delete branch if requested
+        if args.delete:
+            try:
+                git.delete_branch(task.branch)
+                print(f"✓ Deleted branch {task.branch}")
+            except GitError as e:
+                print(f"Warning: Could not delete branch: {e}")
+
+        return 0
+
+    except GitError as e:
+        print(f"Error merging branch: {e}")
+        print("\nMerge failed. You may need to resolve conflicts manually.")
+        return 1
+
+
 def _generate_pr_content(
     task: DbTask,
     commit_log: str,
@@ -1857,6 +1914,20 @@ def main() -> int:
     unmerged_parser = subparsers.add_parser("unmerged", help="List tasks with unmerged work")
     add_common_args(unmerged_parser)
 
+    # merge command
+    merge_parser = subparsers.add_parser("merge", help="Merge a task's branch into current branch")
+    merge_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to merge",
+    )
+    merge_parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete the branch after successful merge",
+    )
+    add_common_args(merge_parser)
+
     # pr command
     pr_parser = subparsers.add_parser("pr", help="Create GitHub PR from completed task")
     pr_parser.add_argument(
@@ -2152,6 +2223,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
+        elif args.command == "merge":
+            return cmd_merge(args)
         elif args.command == "pr":
             return cmd_pr(args)
         elif args.command == "stats":
