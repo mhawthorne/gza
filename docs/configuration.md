@@ -175,7 +175,7 @@ theo work [task_id] [options]
 |--------|-------------|
 | `task_id` | Specific task ID to run |
 | `--no-docker` | Run Claude directly instead of in Docker |
-| `--count N` | Number of tasks to run before stopping |
+| `--count N`, `-c N` | Number of tasks to run before stopping |
 | `--background`, `-b` | Run worker in background |
 
 ### add
