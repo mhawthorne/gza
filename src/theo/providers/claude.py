@@ -120,11 +120,11 @@ class ClaudeProvider(Provider):
             return RunResult(exit_code=1)
 
         cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes)
-        cmd.extend(["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"])
+        cmd.extend(["claude", "-p", "-", "--output-format", "stream-json", "--verbose"])
         cmd.extend(config.claude_args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
-        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes)
+        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, stdin_input=prompt)
 
     def _run_direct(
         self,
@@ -136,13 +136,13 @@ class ClaudeProvider(Provider):
         """Run Claude directly (no Docker)."""
         cmd = [
             "timeout", f"{config.timeout_minutes}m",
-            "claude", "-p", prompt,
+            "claude", "-p", "-",
             "--output-format", "stream-json", "--verbose",
         ]
         cmd.extend(config.claude_args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
-        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, cwd=work_dir)
+        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt)
 
     def _run_with_output_parsing(
         self,
@@ -150,6 +150,7 @@ class ClaudeProvider(Provider):
         log_file: Path,
         timeout_minutes: int,
         cwd: Path | None = None,
+        stdin_input: str | None = None,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
 
@@ -213,7 +214,7 @@ class ClaudeProvider(Provider):
                 print(line)
 
         result = self.run_with_logging(
-            cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_claude_output
+            cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_claude_output, stdin_input=stdin_input
         )
 
         # Extract stats and error info from result event
