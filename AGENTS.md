@@ -83,6 +83,7 @@ Tips for good task descriptions:
 - Reference file paths or components when known
 - For multi-step work, create a `--type plan` task first
 - Use `--review` flag for significant changes that warrant code review
+- Use `theo edit <id>` to update a task's prompt instead of deleting and recreating
 
 ## Development
 
