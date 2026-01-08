@@ -26,9 +26,14 @@ FILES_MODE=0
 FILES=()
 
 # ============================================================================
-# REVIEW PROMPT - Update this when copying to a new project
+# REVIEW PROMPT - Read from REVIEW.md or fall back to default
 # ============================================================================
-read -r -d '' PROMPT <<'EOF' || true
+if [[ -f "$ROOT/REVIEW.md" ]]; then
+  PROMPT="$(cat "$ROOT/REVIEW.md")"
+  PROMPT+=$'\n\nNow review the following content:'
+else
+  # Fallback prompt for projects without REVIEW.md
+  read -r -d '' PROMPT <<'EOF' || true
 You are an automated code reviewer for this repository.
 
 Repo goal: theo is a CLI tool for running autonomous AI coding agents (Claude, Gemini) on development tasks. It manages task queues, git branches, logging, and supports task chaining with dependencies.
@@ -61,6 +66,7 @@ Output format:
 
 Now review the following content:
 EOF
+fi
 # ============================================================================
 
 usage() {
