@@ -553,7 +553,7 @@ def _run_non_code_task(
     provider: Provider,
     git: Git | None = None,
 ) -> int:
-    """Run a non-code task (explore, plan, review) in the project directory (no branch/worktree)."""
+    """Run a non-code task (explore, plan, review) in a worktree (no branch creation)."""
     # Mark task in progress
     store.mark_in_progress(task)
 
@@ -580,75 +580,116 @@ def _run_non_code_task(
     report_path = report_dir / report_filename
     report_file_relative = str(report_path.relative_to(config.project_dir))
 
-    # Run provider in the project directory
-    prompt = build_prompt(task, config, store, report_path, git)
+    # Create worktree in /tmp for Docker compatibility on macOS
+    worktree_path = config.worktree_path / f"{task.task_id}-{task.task_type}"
+
     try:
-        result = provider.run(config, prompt, log_file, config.project_dir)
-    except KeyboardInterrupt:
-        print("\nInterrupted")
-        return 130
+        # Get default branch to base worktree on
+        default_branch = git.default_branch() if git else "main"
 
-    exit_code = result.exit_code
-    stats = _run_result_to_stats(result)
+        # Remove existing worktree if it exists
+        if worktree_path.exists():
+            git.worktree_remove(worktree_path, force=True)
 
-    # Handle failures - check error_type first, then exit codes
-    if result.error_type == "max_turns":
-        print(f"Task failed: max turns of {config.max_turns} exceeded")
+        # Create worktree without creating a new branch (use --detach to check out HEAD)
+        # This creates a worktree in detached HEAD state based on the default branch
+        print(f"Creating worktree: {worktree_path}")
+        base_ref = f"origin/{default_branch}"
+        result = git._run("rev-parse", "--verify", base_ref, check=False)
+        if result.returncode != 0:
+            base_ref = default_branch  # Fall back to local branch
+
+        git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
+
+        # Create report directory structure in worktree
+        worktree_report_dir = worktree_path / report_dir.relative_to(config.project_dir)
+        worktree_report_dir.mkdir(parents=True, exist_ok=True)
+        worktree_report_path = worktree_path / report_path.relative_to(config.project_dir)
+
+        # Run provider in the worktree
+        prompt = build_prompt(task, config, store, worktree_report_path, git)
+        try:
+            result = provider.run(config, prompt, log_file, worktree_path)
+        except KeyboardInterrupt:
+            print("\nInterrupted")
+            _cleanup_worktree(git, worktree_path)
+            return 130
+
+        exit_code = result.exit_code
+        stats = _run_result_to_stats(result)
+
+        # Handle failures - check error_type first, then exit codes
+        if result.error_type == "max_turns":
+            print(f"Task failed: max turns of {config.max_turns} exceeded")
+            print_stats(stats, has_commits=False)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            _cleanup_worktree(git, worktree_path)
+            return 0
+        elif exit_code == 124:
+            print(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
+            print_stats(stats, has_commits=False)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            _cleanup_worktree(git, worktree_path)
+            return 0
+        elif exit_code != 0:
+            print(f"Task failed: {provider.name} exited with code {exit_code}")
+            print_stats(stats, has_commits=False)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            _cleanup_worktree(git, worktree_path)
+            return 0
+
+        # Copy report file from worktree to main project directory
+        if worktree_report_path.exists():
+            print(f"Report written to: {report_file_relative}")
+            # Ensure target directory exists
+            report_dir.mkdir(parents=True, exist_ok=True)
+            # Copy report content from worktree to project dir
+            report_path.write_text(worktree_report_path.read_text())
+        else:
+            # Copy log to report if provider didn't create the report file
+            print(f"Note: Report file not created, copying log output")
+            with open(log_file) as lf:
+                with open(report_path, 'w') as rf:
+                    rf.write(f"# {task_type_display}: {task.prompt}\n\n")
+                    rf.write(lf.read())
+
+        # Read output content for storage in DB
+        output_content = None
+        if report_path.exists():
+            output_content = report_path.read_text()
+
+        # Mark completed with report file reference (no branch, no commits)
+        store.mark_completed(
+            task,
+            branch=None,
+            log_file=str(log_file.relative_to(config.project_dir)),
+            report_file=report_file_relative,
+            output_content=output_content,
+            has_commits=False,
+            stats=stats,
+        )
+
+        print("")
+        print(f"=== {task_type_display} Complete ===")
         print_stats(stats, has_commits=False)
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+        print(f"Report: {report_file_relative}")
+        print("")
+
+        if task.task_type == "explore":
+            print("To implement based on this exploration, add a task with:")
+            print(f"  theo add --based-on {task.id}")
+        elif task.task_type == "plan":
+            print("To implement this plan, add a task with:")
+            print(f"  theo add --type implement --based-on {task.id}")
+
+        # Cleanup worktree
+        _cleanup_worktree(git, worktree_path)
         return 0
-    elif exit_code == 124:
-        print(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
-        print_stats(stats, has_commits=False)
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
-        return 0
-    elif exit_code != 0:
-        print(f"Task failed: {provider.name} exited with code {exit_code}")
-        print_stats(stats, has_commits=False)
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
-        return 0
 
-    # Check if report was created
-    if report_path.exists():
-        print(f"Report written to: {report_file_relative}")
-    else:
-        # Copy log to report if provider didn't create the report file
-        print(f"Note: Report file not created, copying log output")
-        with open(log_file) as lf:
-            with open(report_path, 'w') as rf:
-                rf.write(f"# {task_type_display}: {task.prompt}\n\n")
-                rf.write(lf.read())
-
-    # Read output content for storage in DB
-    output_content = None
-    if report_path.exists():
-        output_content = report_path.read_text()
-
-    # Mark completed with report file reference (no branch, no commits)
-    store.mark_completed(
-        task,
-        branch=None,
-        log_file=str(log_file.relative_to(config.project_dir)),
-        report_file=report_file_relative,
-        output_content=output_content,
-        has_commits=False,
-        stats=stats,
-    )
-
-    print("")
-    print(f"=== {task_type_display} Complete ===")
-    print_stats(stats, has_commits=False)
-    print(f"Report: {report_file_relative}")
-    print("")
-
-    if task.task_type == "explore":
-        print("To implement based on this exploration, add a task with:")
-        print(f"  theo add --based-on {task.id}")
-    elif task.task_type == "plan":
-        print("To implement this plan, add a task with:")
-        print(f"  theo add --type implement --based-on {task.id}")
-
-    return 0
+    except GitError as e:
+        print(f"Git error: {e}")
+        _cleanup_worktree(git, worktree_path)
+        return 1
 
 
 def _cleanup_worktree(git: Git, worktree_path: Path) -> None:
