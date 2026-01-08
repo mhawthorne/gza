@@ -82,7 +82,7 @@ class TestDockerConfig:
         assert config.image_name == "my-project-theo-gemini"
         assert config.npm_package == "@google/gemini-cli"
         assert config.cli_command == "gemini"
-        assert config.config_dir == ".gemini"
+        assert config.config_dir is None  # Uses API key auth, no need to mount ~/.gemini
         assert "GEMINI_API_KEY" in config.env_vars
         assert "GOOGLE_API_KEY" in config.env_vars
         assert "GOOGLE_APPLICATION_CREDENTIALS" in config.env_vars

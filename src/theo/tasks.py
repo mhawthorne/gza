@@ -70,6 +70,75 @@ class Task:
         # This will be properly checked against the database in SqliteTaskStore
         return self.depends_on is not None
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "Task":
+        """Create a Task from a dictionary (legacy YAML format)."""
+        # Support both 'description' (legacy) and 'prompt' (new) field names
+        prompt = data.get("prompt") or data.get("description", "")
+        status = data.get("status", "pending")
+        # Convert status string to TaskStatus if needed
+        if isinstance(status, str):
+            status = TaskStatus(status) if status in [s.value for s in TaskStatus] else TaskStatus.PENDING
+
+        return cls(
+            id=data.get("id"),
+            prompt=prompt,
+            status=status,
+            task_type=data.get("type", data.get("task_type", "task")),
+            task_id=data.get("task_id"),
+            branch=data.get("branch"),
+            log_file=data.get("log_file"),
+            report_file=data.get("report_file"),
+            based_on=data.get("based_on"),
+            has_commits=data.get("has_commits"),
+            duration_seconds=data.get("duration_seconds"),
+            num_turns=data.get("num_turns"),
+            cost_usd=data.get("cost_usd"),
+            created_at=data.get("created_at"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            group=data.get("group"),
+            depends_on=data.get("depends_on"),
+            spec=data.get("spec"),
+            create_review=data.get("create_review", False),
+            same_branch=data.get("same_branch", False),
+            task_type_hint=data.get("task_type_hint"),
+            output_content=data.get("output_content"),
+        )
+
+    def to_dict(self) -> dict:
+        """Convert Task to a dictionary (for YAML serialization)."""
+        # Use LiteralString for long (>50 chars) or multiline descriptions
+        desc = self.prompt
+        if len(desc) > 50 or '\n' in desc:
+            desc = LiteralString(desc)
+
+        result = {
+            "description": desc,
+            "status": self.status.value if isinstance(self.status, TaskStatus) else self.status,
+        }
+        if self.task_type != "task":
+            result["type"] = self.task_type
+        if self.task_id:
+            result["task_id"] = self.task_id
+        if self.branch:
+            result["branch"] = self.branch
+        if self.log_file:
+            result["log_file"] = self.log_file
+        if self.report_file:
+            result["report_file"] = self.report_file
+        if self.has_commits:
+            result["has_commits"] = self.has_commits
+        if self.duration_seconds:
+            result["duration_seconds"] = self.duration_seconds
+        if self.num_turns:
+            result["num_turns"] = self.num_turns
+        if self.cost_usd:
+            result["cost_usd"] = self.cost_usd
+        if self.completed_at:
+            result["completed_at"] = self.completed_at
+        return result
+
 
 @dataclass
 class TaskStats:

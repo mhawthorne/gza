@@ -108,7 +108,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config) -> int:
             print(f"  Prompt: {prompt_display}")
         print()
         print(f"Use 'theo ps' to view running workers")
-        print(f"Use 'theo logs {worker_id}' to tail output")
+        print(f"Use 'theo log -w {worker_id} -f' to follow output")
 
         return 0
 
@@ -665,18 +665,25 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("Use --force to overwrite")
         return 1
 
-    # Prompt for branch strategy
-    print("Branch naming strategy:")
-    print("  1. monorepo    - {project}/{task_id} (e.g., myproj/20260107-add-feature)")
-    print("  2. conventional - {type}/{slug} (e.g., feature/add-feature, fix/login-bug)")
-    print("  3. simple      - {slug} (e.g., add-feature)")
-    print("  4. custom      - Define your own pattern")
+    # Check if running interactively (stdin is a TTY)
+    is_interactive = sys.stdin.isatty()
 
-    while True:
-        choice = input("Choose strategy [1-4, default=1]: ").strip() or "1"
-        if choice in ("1", "2", "3", "4"):
-            break
-        print("Invalid choice. Please enter 1, 2, 3, or 4.")
+    if is_interactive:
+        # Prompt for branch strategy
+        print("Branch naming strategy:")
+        print("  1. monorepo    - {project}/{task_id} (e.g., myproj/20260107-add-feature)")
+        print("  2. conventional - {type}/{slug} (e.g., feature/add-feature, fix/login-bug)")
+        print("  3. simple      - {slug} (e.g., add-feature)")
+        print("  4. custom      - Define your own pattern")
+
+        while True:
+            choice = input("Choose strategy [1-4, default=1]: ").strip() or "1"
+            if choice in ("1", "2", "3", "4"):
+                break
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+    else:
+        # Non-interactive mode: use default (monorepo)
+        choice = "1"
 
     # Determine branch_strategy value
     if choice == "1":
@@ -763,47 +770,176 @@ project_name: {default_project_name}
     return 0
 
 
+def _format_log_entry(entry: dict) -> str | None:
+    """Format a single JSON log entry for display.
+
+    Returns formatted string or None to skip the entry.
+    """
+    entry_type = entry.get("type")
+
+    if entry_type == "system":
+        subtype = entry.get("subtype", "")
+        if subtype == "init":
+            model = entry.get("model", "unknown")
+            return f"[system] Session initialized (model: {model})"
+        return None  # Skip other system messages
+
+    elif entry_type == "user":
+        # User messages contain tool results
+        message = entry.get("message", {})
+        content = message.get("content", [])
+        parts = []
+        for item in content:
+            if item.get("type") == "tool_result":
+                tool_id = item.get("tool_use_id", "")[:8]
+                result = item.get("content", "")
+                if isinstance(result, str) and len(result) > 200:
+                    result = result[:200] + "..."
+                parts.append(f"[tool result {tool_id}] {result}")
+        if parts:
+            return "\n".join(parts)
+        return None
+
+    elif entry_type == "assistant":
+        message = entry.get("message", {})
+        content = message.get("content", [])
+        parts = []
+        for item in content:
+            if item.get("type") == "text":
+                text = item.get("text", "")
+                parts.append(text)
+            elif item.get("type") == "tool_use":
+                name = item.get("name", "unknown")
+                tool_input = item.get("input", {})
+                # Show condensed tool use info
+                if name == "Bash":
+                    cmd = tool_input.get("command", "")
+                    if len(cmd) > 100:
+                        cmd = cmd[:100] + "..."
+                    parts.append(f"[tool: {name}] {cmd}")
+                elif name == "Read":
+                    path = tool_input.get("file_path", "")
+                    parts.append(f"[tool: {name}] {path}")
+                elif name == "Edit":
+                    path = tool_input.get("file_path", "")
+                    parts.append(f"[tool: {name}] {path}")
+                elif name == "Write":
+                    path = tool_input.get("file_path", "")
+                    parts.append(f"[tool: {name}] {path}")
+                elif name == "Grep":
+                    pattern = tool_input.get("pattern", "")
+                    parts.append(f"[tool: {name}] {pattern}")
+                elif name == "Glob":
+                    pattern = tool_input.get("pattern", "")
+                    parts.append(f"[tool: {name}] {pattern}")
+                elif name == "TodoWrite":
+                    todos = tool_input.get("todos", [])
+                    in_progress = [t for t in todos if t.get("status") == "in_progress"]
+                    if in_progress:
+                        parts.append(f"[tool: {name}] {in_progress[0].get('activeForm', '')}")
+                    else:
+                        parts.append(f"[tool: {name}]")
+                else:
+                    parts.append(f"[tool: {name}]")
+        if parts:
+            return "\n".join(parts)
+        return None
+
+    elif entry_type == "result":
+        result = entry.get("result", "")
+        is_error = entry.get("is_error", False)
+        if is_error:
+            return f"[result] ERROR: {result}"
+        # For success, show summary if available
+        duration = entry.get("duration_ms", 0)
+        num_turns = entry.get("num_turns", 0)
+        cost = entry.get("total_cost_usd", 0)
+        return f"[result] Completed in {num_turns} turns, {duration/1000:.1f}s, ${cost:.4f}"
+
+    return None
+
+
 def cmd_log(args: argparse.Namespace) -> int:
-    """Display the log for a given task slug."""
+    """Display the log for a task or worker."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    registry = WorkerRegistry(config.workers_path)
 
-    task_query = args.task_slug
-
-    # Try to find by ID first
+    query = args.identifier
     task = None
-    try:
-        task_id = int(task_query)
-        task = store.get(task_id)
-    except ValueError:
-        pass
+    worker = None
+    log_path = None
+    is_running = False
 
-    # Try to find by task_id (slug)
-    if not task:
-        task = store.get_by_task_id(task_query)
+    if args.worker:
+        # Look up by worker ID
+        worker = registry.get(query)
+        if not worker:
+            print(f"Error: Worker '{query}' not found")
+            return 1
+        is_running = registry.is_running(query)
+        if worker.task_id:
+            task = store.get(worker.task_id)
+        if task and task.log_file:
+            log_path = config.project_dir / task.log_file
+        elif task and task.task_id:
+            log_path = config.log_path / f"{task.task_id}.log"
 
-    # Try partial match
-    if not task:
-        all_tasks = store.get_all()
-        for t in all_tasks:
-            if t.task_id and task_query in t.task_id:
-                task = t
-                break
+    elif args.task:
+        # Look up by numeric task ID
+        try:
+            task_id = int(query)
+            task = store.get(task_id)
+        except ValueError:
+            print(f"Error: '{query}' is not a valid task ID (must be numeric)")
+            return 1
+        if not task:
+            print(f"Error: Task {query} not found")
+            return 1
+        if task.log_file:
+            log_path = config.project_dir / task.log_file
 
-    if not task:
-        print(f"Error: No task found matching '{task_query}'")
+    elif args.slug:
+        # Look up by slug (exact or partial match)
+        task = store.get_by_task_id(query)
+        if not task:
+            # Try partial match
+            all_tasks = store.get_all()
+            for t in all_tasks:
+                if t.task_id and query in t.task_id:
+                    task = t
+                    break
+        if not task:
+            print(f"Error: No task found matching slug '{query}'")
+            return 1
+        if task.log_file:
+            log_path = config.project_dir / task.log_file
+
+    if not log_path:
+        print(f"Error: No log file found")
         return 1
 
-    if not task.log_file:
-        print(f"Error: Task has no log file")
-        return 1
-
-    log_path = config.project_dir / task.log_file
     if not log_path.exists():
-        print(f"Error: Log file not found at {log_path}")
+        if is_running:
+            print(f"Log file not yet created: {log_path}")
+            print("Worker is still starting up...")
+        else:
+            print(f"Error: Log file not found at {log_path}")
         return 1
 
-    # Read and parse the log file (supports both single JSON and JSONL formats)
+    # Determine mode: follow (live tail) vs static display
+    follow = hasattr(args, 'follow') and args.follow
+    if follow and not is_running:
+        follow = False  # Can't follow a completed task
+
+    # Check for raw mode
+    raw_mode = hasattr(args, 'raw') and args.raw
+
+    if follow or raw_mode:
+        # Live streaming mode - use the formatted streaming output
+        return _tail_log_file(log_path, args, registry, query if worker else None)
+
+    # Static display mode - show summary or full turns
     log_data = None
     entries = []
     try:
@@ -827,27 +963,32 @@ def cmd_log(args: argparse.Namespace) -> int:
                 except json.JSONDecodeError:
                     continue
 
-        if log_data is None:
-            print("Error: No result entry found in log file")
+        if log_data is None and not entries:
+            print("Error: No log entries found in log file")
             return 1
     except Exception as e:
         print(f"Error: Failed to read log file: {e}")
         return 1
 
-    # Display the log content as markdown text instead of JSON
+    # Display header
     print("=" * 70)
-    print(f"Task: {task.prompt[:100]}")
-    print(f"ID: {task.id} | Slug: {task.task_id}")
-    print(f"Status: {task.status}")
-    if task.branch:
-        print(f"Branch: {task.branch}")
+    if task:
+        prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
+        print(f"Task: {prompt_display}")
+        print(f"ID: {task.id} | Slug: {task.task_id}")
+        print(f"Status: {task.status}")
+        if task.branch:
+            print(f"Branch: {task.branch}")
+    elif worker:
+        print(f"Worker: {worker.worker_id}")
+        print(f"Status: {'running' if is_running else 'completed'}")
     print("=" * 70)
     print()
 
     if args.turns and entries:
         # Show the full conversation turns
         _display_conversation_turns(entries)
-    else:
+    elif log_data:
         # Extract and display the result field (which contains markdown)
         if "result" in log_data:
             print(log_data["result"])
@@ -857,20 +998,139 @@ def cmd_log(args: argparse.Namespace) -> int:
             print(f"Run ended with: {subtype}")
             if log_data.get("errors"):
                 print(f"Errors: {log_data['errors']}")
+    else:
+        # No result entry yet - show formatted entries
+        for entry in entries:
+            output = _format_log_entry(entry)
+            if output:
+                print(output)
 
     print()
     print("=" * 70)
 
     # Display summary stats if available
-    if "duration_ms" in log_data:
-        duration_sec = log_data["duration_ms"] / 1000
-        print(f"Duration: {format_duration(duration_sec)}")
-    if "num_turns" in log_data:
-        print(f"Turns: {log_data['num_turns']}")
-    if "total_cost_usd" in log_data:
-        print(f"Cost: ${log_data['total_cost_usd']:.4f}")
+    if log_data:
+        if "duration_ms" in log_data:
+            duration_sec = log_data["duration_ms"] / 1000
+            print(f"Duration: {format_duration(duration_sec)}")
+        if "num_turns" in log_data:
+            print(f"Turns: {log_data['num_turns']}")
+        if "total_cost_usd" in log_data:
+            print(f"Cost: ${log_data['total_cost_usd']:.4f}")
 
     return 0
+
+
+def _tail_log_file(log_path: Path, args: argparse.Namespace, registry: WorkerRegistry, worker_id: str | None) -> int:
+    """Tail a log file with optional follow mode."""
+    raw_mode = hasattr(args, 'raw') and args.raw
+    follow = hasattr(args, 'follow') and args.follow
+
+    if raw_mode:
+        # Use tail directly for raw JSON output
+        try:
+            cmd = ["tail"]
+            if hasattr(args, 'tail') and args.tail:
+                cmd.extend(["-n", str(args.tail)])
+            if follow:
+                cmd.append("-f")
+            cmd.append(str(log_path))
+            subprocess.run(cmd)
+            return 0
+        except KeyboardInterrupt:
+            return 0
+        except Exception as e:
+            print(f"Error tailing log: {e}")
+            return 1
+
+    # Formatted output mode
+    try:
+        tail_lines = args.tail if hasattr(args, 'tail') and args.tail else None
+
+        def read_and_format_lines(file_path: Path, num_lines: int | None = None) -> list[str]:
+            """Read lines from file and return formatted output."""
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+
+            if num_lines:
+                lines = lines[-num_lines:]
+
+            formatted = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    output = _format_log_entry(entry)
+                    if output:
+                        formatted.append(output)
+                except json.JSONDecodeError:
+                    formatted.append(line)
+            return formatted
+
+        # Initial read
+        formatted = read_and_format_lines(log_path, tail_lines)
+        for line in formatted:
+            print(line)
+
+        if not follow:
+            return 0
+
+        # Follow mode - watch for new lines
+        last_size = log_path.stat().st_size
+        last_line_count = sum(1 for _ in open(log_path))
+
+        while True:
+            time.sleep(0.5)
+
+            current_size = log_path.stat().st_size
+            if current_size > last_size:
+                with open(log_path, 'r') as f:
+                    lines = f.readlines()
+
+                new_lines = lines[last_line_count:]
+                last_line_count = len(lines)
+                last_size = current_size
+
+                for line in new_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        output = _format_log_entry(entry)
+                        if output:
+                            print(output)
+                    except json.JSONDecodeError:
+                        print(line)
+
+            # Check if worker is still running
+            if worker_id and not registry.is_running(worker_id):
+                time.sleep(0.5)
+                with open(log_path, 'r') as f:
+                    lines = f.readlines()
+                new_lines = lines[last_line_count:]
+                for line in new_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        output = _format_log_entry(entry)
+                        if output:
+                            print(output)
+                    except json.JSONDecodeError:
+                        print(line)
+                break
+
+        return 0
+
+    except KeyboardInterrupt:
+        return 0
+    except Exception as e:
+        print(f"Error tailing log: {e}")
+        return 1
 
 
 def _display_conversation_turns(entries: list[dict]) -> None:
@@ -1261,64 +1521,6 @@ def cmd_ps(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_logs(args: argparse.Namespace) -> int:
-    """Tail logs for a worker."""
-    config = Config.load(args.project_dir)
-    registry = WorkerRegistry(config.workers_path)
-    store = get_store(config)
-
-    worker = registry.get(args.worker_id)
-    if not worker:
-        print(f"Error: Worker {args.worker_id} not found")
-        return 1
-
-    # Get log file path
-    task = None
-    if worker.task_id:
-        task = store.get(worker.task_id)
-
-    if task and task.log_file:
-        log_path = config.project_dir / task.log_file
-    elif task and task.task_id:
-        log_path = config.log_path / f"{task.task_id}.log"
-    else:
-        print(f"Error: No log file found for worker {args.worker_id}")
-        return 1
-
-    if not log_path.exists():
-        print(f"Log file not yet created: {log_path}")
-        if registry.is_running(args.worker_id):
-            print("Worker is still starting up...")
-        return 1
-
-    # Determine if we should follow
-    follow = not args.no_follow if hasattr(args, 'no_follow') else True
-    if not registry.is_running(args.worker_id):
-        follow = False  # Don't follow completed workers
-
-    # Tail the log file
-    try:
-        import subprocess
-        cmd = ["tail"]
-
-        if hasattr(args, 'tail') and args.tail:
-            cmd.extend(["-n", str(args.tail)])
-
-        if follow:
-            cmd.append("-f")
-
-        cmd.append(str(log_path))
-
-        subprocess.run(cmd)
-        return 0
-
-    except KeyboardInterrupt:
-        return 0
-    except Exception as e:
-        print(f"Error tailing log: {e}")
-        return 1
-
-
 def cmd_stop(args: argparse.Namespace) -> int:
     """Stop a running worker."""
     config = Config.load(args.project_dir)
@@ -1553,11 +1755,12 @@ def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
                 skipped += 1
                 continue
 
-        # Create task in SQLite
-        task = store.add(yaml_task.description, task_type=yaml_task.type)
+        # Create task in SQLite (Task class uses 'prompt' and 'task_type')
+        task = store.add(yaml_task.prompt, task_type=yaml_task.task_type)
 
-        # Copy over fields
-        task.status = yaml_task.status
+        # Copy over fields - need to convert TaskStatus enum to string for status
+        status_value = yaml_task.status.value if hasattr(yaml_task.status, 'value') else yaml_task.status
+        task.status = status_value
         task.task_id = yaml_task.task_id
         task.branch = yaml_task.branch
         task.log_file = yaml_task.log_file
@@ -1567,7 +1770,10 @@ def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
         task.num_turns = yaml_task.num_turns
         task.cost_usd = yaml_task.cost_usd
         if yaml_task.completed_at:
-            task.completed_at = datetime.combine(yaml_task.completed_at, datetime.min.time())
+            if isinstance(yaml_task.completed_at, datetime):
+                task.completed_at = yaml_task.completed_at
+            else:
+                task.completed_at = datetime.combine(yaml_task.completed_at, datetime.min.time())
 
         store.update(task)
         imported += 1
@@ -1684,15 +1890,47 @@ def main() -> int:
     )
 
     # log command
-    log_parser = subparsers.add_parser("log", help="Display log for a given task")
+    log_parser = subparsers.add_parser("log", help="Display log for a task or worker")
     log_parser.add_argument(
-        "task_slug",
-        help="Task ID, slug, or partial slug to match",
+        "identifier",
+        help="Task ID, slug, or worker ID",
+    )
+    log_type_group = log_parser.add_mutually_exclusive_group(required=True)
+    log_type_group.add_argument(
+        "--task", "-t",
+        action="store_true",
+        help="Look up by task ID (numeric)",
+    )
+    log_type_group.add_argument(
+        "--slug", "-s",
+        action="store_true",
+        help="Look up by task slug (supports partial match)",
+    )
+    log_type_group.add_argument(
+        "--worker", "-w",
+        action="store_true",
+        help="Look up by worker ID",
     )
     log_parser.add_argument(
         "--turns",
         action="store_true",
         help="Show the full conversation turns instead of just the summary",
+    )
+    log_parser.add_argument(
+        "--follow", "-f",
+        action="store_true",
+        help="Follow the log in real-time (for running workers)",
+    )
+    log_parser.add_argument(
+        "--tail",
+        type=int,
+        metavar="N",
+        help="Show last N lines only (used with --follow or --raw)",
+    )
+    log_parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Show raw JSON lines instead of formatted output",
     )
     add_common_args(log_parser)
 
@@ -1862,25 +2100,6 @@ def main() -> int:
     )
     add_common_args(ps_parser)
 
-    # logs command
-    logs_parser = subparsers.add_parser("logs", help="Tail logs for a worker")
-    logs_parser.add_argument(
-        "worker_id",
-        help="Worker ID to tail logs for",
-    )
-    logs_parser.add_argument(
-        "--tail",
-        type=int,
-        metavar="N",
-        help="Show last N lines only",
-    )
-    logs_parser.add_argument(
-        "--no-follow",
-        action="store_true",
-        help="Don't follow the log (just show and exit)",
-    )
-    add_common_args(logs_parser)
-
     # stop command
     stop_parser = subparsers.add_parser("stop", help="Stop a running worker")
     stop_parser.add_argument(
@@ -1944,8 +2163,6 @@ def main() -> int:
             return cmd_status(args)
         elif args.command == "ps":
             return cmd_ps(args)
-        elif args.command == "logs":
-            return cmd_logs(args)
         elif args.command == "stop":
             return cmd_stop(args)
     except ConfigError as e:

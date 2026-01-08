@@ -346,8 +346,8 @@ class TestImportCommand:
 class TestLogCommand:
     """Tests for 'theo log' command."""
 
-    def test_log_single_json_format_success(self, tmp_path: Path):
-        """Log command parses single JSON format with successful result."""
+    def test_log_by_task_id_single_json_format(self, tmp_path: Path):
+        """Log command with --task parses single JSON format with successful result."""
         import json
         from theo.db import SqliteTaskStore
 
@@ -376,7 +376,7 @@ class TestLogCommand:
         }
         log_file.write_text(json.dumps(log_data))
 
-        result = run_theo("log", "1", str(tmp_path))
+        result = run_theo("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task completed successfully!" in result.stdout
@@ -384,8 +384,8 @@ class TestLogCommand:
         assert "Turns: 10" in result.stdout
         assert "Cost: $0.5000" in result.stdout
 
-    def test_log_jsonl_format_success(self, tmp_path: Path):
-        """Log command parses JSONL format with successful result."""
+    def test_log_by_task_id_jsonl_format(self, tmp_path: Path):
+        """Log command with --task parses JSONL format with successful result."""
         import json
         from theo.db import SqliteTaskStore
 
@@ -419,7 +419,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_theo("log", "1", str(tmp_path))
+        result = run_theo("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "This was parsed from JSONL!" in result.stdout
@@ -427,8 +427,8 @@ class TestLogCommand:
         assert "Turns: 5" in result.stdout
         assert "Cost: $0.2500" in result.stdout
 
-    def test_log_jsonl_format_error_max_turns(self, tmp_path: Path):
-        """Log command handles JSONL format with error_max_turns result."""
+    def test_log_by_task_id_error_max_turns(self, tmp_path: Path):
+        """Log command with --task handles JSONL format with error_max_turns result."""
         import json
         from theo.db import SqliteTaskStore
 
@@ -461,15 +461,15 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_theo("log", "1", str(tmp_path))
+        result = run_theo("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "error_max_turns" in result.stdout
         assert "Turns: 60" in result.stdout
         assert "Cost: $1.5000" in result.stdout
 
-    def test_log_missing_log_file(self, tmp_path: Path):
-        """Log command handles missing log file."""
+    def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
+        """Log command with --task handles missing log file."""
         from theo.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -483,13 +483,13 @@ class TestLogCommand:
         task.log_file = ".theo/logs/nonexistent.log"
         store.update(task)
 
-        result = run_theo("log", "1", str(tmp_path))
+        result = run_theo("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
 
-    def test_log_no_result_entry(self, tmp_path: Path):
-        """Log command handles JSONL with no result entry."""
+    def test_log_by_task_id_no_result_entry(self, tmp_path: Path):
+        """Log command with --task shows formatted entries when no result entry exists."""
         import json
         from theo.db import SqliteTaskStore
 
@@ -509,18 +509,19 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         lines = [
-            {"type": "system", "subtype": "init", "session_id": "abc123"},
-            {"type": "assistant", "message": {"role": "assistant", "content": "Working..."}},
+            {"type": "system", "subtype": "init", "session_id": "abc123", "model": "test-model"},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Working..."}]}},
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_theo("log", "1", str(tmp_path))
+        result = run_theo("log", "--task", "1", str(tmp_path))
 
-        assert result.returncode == 1
-        assert "No result entry found" in result.stdout
+        # Should show formatted entries instead of failing
+        assert result.returncode == 0
+        assert "Working..." in result.stdout
 
-    def test_log_task_not_found(self, tmp_path: Path):
-        """Log command handles nonexistent task."""
+    def test_log_by_task_id_not_found(self, tmp_path: Path):
+        """Log command with --task handles nonexistent task."""
         setup_config(tmp_path)
 
         # Create empty database
@@ -529,10 +530,165 @@ class TestLogCommand:
         from theo.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_theo("log", "999", str(tmp_path))
+        result = run_theo("log", "--task", "999", str(tmp_path))
 
         assert result.returncode == 1
-        assert "No task found" in result.stdout
+        assert "Task 999 not found" in result.stdout
+
+    def test_log_by_task_id_invalid_id(self, tmp_path: Path):
+        """Log command with --task rejects non-numeric ID."""
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from theo.db import SqliteTaskStore
+        SqliteTaskStore(db_path)
+
+        result = run_theo("log", "--task", "not-a-number", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not a valid task ID" in result.stdout
+
+    def test_log_by_slug_exact_match(self, tmp_path: Path):
+        """Log command with --slug finds task by exact slug."""
+        import json
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Test task for slug lookup")
+        task.task_id = "20260108-test-slug"
+        task.status = "completed"
+        task.log_file = ".theo/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".theo" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "test.log"
+        log_data = {"type": "result", "result": "Slug lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
+        log_file.write_text(json.dumps(log_data))
+
+        result = run_theo("log", "--slug", "20260108-test-slug", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Slug lookup works!" in result.stdout
+
+    def test_log_by_slug_partial_match(self, tmp_path: Path):
+        """Log command with --slug finds task by partial slug match."""
+        import json
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Test task for partial slug")
+        task.task_id = "20260108-partial-slug-test"
+        task.status = "completed"
+        task.log_file = ".theo/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".theo" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "test.log"
+        log_data = {"type": "result", "result": "Partial match works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
+        log_file.write_text(json.dumps(log_data))
+
+        result = run_theo("log", "--slug", "partial-slug", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Partial match works!" in result.stdout
+
+    def test_log_by_slug_not_found(self, tmp_path: Path):
+        """Log command with --slug handles nonexistent slug."""
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from theo.db import SqliteTaskStore
+        SqliteTaskStore(db_path)
+
+        result = run_theo("log", "--slug", "nonexistent-slug", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "No task found matching slug" in result.stdout
+
+    def test_log_by_worker_success(self, tmp_path: Path):
+        """Log command with --worker finds log via worker registry."""
+        import json
+        from theo.db import SqliteTaskStore
+        from theo.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+
+        # Create task
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Test task for worker lookup")
+        task.status = "completed"
+        task.log_file = ".theo/logs/test.log"
+        store.update(task)
+
+        # Create worker registry entry
+        workers_path = tmp_path / ".theo" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker_id = registry.generate_worker_id()
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=12345,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-01-08T00:00:00Z",
+            status="completed",
+            log_file=".theo/logs/test.log",
+            worktree=None,
+        )
+        registry.register(worker)
+
+        # Create log file
+        log_dir = tmp_path / ".theo" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "test.log"
+        log_data = {"type": "result", "result": "Worker lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
+        log_file.write_text(json.dumps(log_data))
+
+        result = run_theo("log", "--worker", worker_id, str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Worker lookup works!" in result.stdout
+
+    def test_log_by_worker_not_found(self, tmp_path: Path):
+        """Log command with --worker handles nonexistent worker."""
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from theo.db import SqliteTaskStore
+        SqliteTaskStore(db_path)
+
+        # Create empty workers directory
+        workers_path = tmp_path / ".theo" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        result = run_theo("log", "--worker", "w-nonexistent", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Worker 'w-nonexistent' not found" in result.stdout
+
+    def test_log_requires_lookup_type(self, tmp_path: Path):
+        """Log command requires --task, --slug, or --worker flag."""
+        setup_config(tmp_path)
+
+        result = run_theo("log", "123", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "one of the arguments --task/-t --slug/-s --worker/-w is required" in result.stderr
 
 
 class TestPrCommand:

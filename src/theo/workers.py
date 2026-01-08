@@ -52,15 +52,33 @@ class WorkerRegistry:
         """Get path to worker PID file."""
         return self.workers_dir / f"{worker_id}.pid"
 
+    _last_timestamp: str | None = None
+    _last_counter: int = 0
+
     def generate_worker_id(self) -> str:
         """Generate a unique worker ID."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+        # Track within-instance collisions
+        if timestamp == WorkerRegistry._last_timestamp:
+            WorkerRegistry._last_counter += 1
+        else:
+            WorkerRegistry._last_timestamp = timestamp
+            WorkerRegistry._last_counter = 0
+
         # Find next available suffix if timestamp collision
-        counter = 1
-        worker_id = f"w-{timestamp}"
-        while self._metadata_path(worker_id).exists():
+        counter = WorkerRegistry._last_counter
+        if counter == 0:
+            worker_id = f"w-{timestamp}"
+        else:
             worker_id = f"w-{timestamp}-{counter}"
+
+        # Also check for file-based collisions (from previous runs)
+        while self._metadata_path(worker_id).exists():
             counter += 1
+            WorkerRegistry._last_counter = counter
+            worker_id = f"w-{timestamp}-{counter}"
+
         return worker_id
 
     def register(self, worker: WorkerMetadata) -> None:

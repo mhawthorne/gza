@@ -12,26 +12,44 @@ def infer_type_from_prompt(prompt: str) -> str | None:
 
     Returns:
         The inferred type string, or None if no match found
+
+    Priority order ensures more specific types are checked before generic ones.
+    For example, "test" is checked before "feature" since "Add tests" should
+    match "test" not "feature" (from "add").
     """
     # Normalize prompt to lowercase for keyword matching
     prompt_lower = prompt.lower()
 
-    # Type inference rules from spec
-    type_keywords = {
-        "fix": ["fix", "bug", "error", "crash", "broken", "issue"],
-        "feature": ["feat", "feature", "add", "implement", "create", "new"],
-        "refactor": ["refactor", "restructure", "reorganize", "clean"],
-        "docs": ["doc", "docs", "document", "readme"],
-        "test": ["test", "spec", "coverage"],
-        "chore": ["chore", "update", "upgrade", "bump", "deps"],
-        "perf": ["perf", "performance", "optimize", "speed"],
-    }
+    # Type inference rules - ordered by specificity (most specific first)
+    # This ensures "Add tests" matches "test" before "feature"
+    # and "Update documentation" matches "docs" before "chore"
+    #
+    # Each entry is (type_name, [(keyword, allow_prefix), ...])
+    # allow_prefix=True means "fixing" matches "fix", allow_prefix=False requires exact word boundary
+    type_keywords = [
+        # Highly specific types first
+        ("docs", [("documentation", False), ("document", False), ("doc", False), ("docs", False), ("readme", False)]),
+        ("test", [("tests", False), ("test", False), ("spec", False), ("coverage", False)]),
+        ("perf", [("performance", False), ("optimize", False), ("speed", False)]),  # "perf" removed to avoid "perforce" match
+        ("refactor", [("refactor", False), ("restructure", False), ("reorganize", False), ("clean", False)]),
+        # Fix-related (should come before feature since "fix" is more specific)
+        ("fix", [("fix", True), ("bug", False), ("error", False), ("crash", False), ("broken", False), ("issue", False)]),
+        # Chore - "update" needs special handling (allow prefix for "update" -> "updating")
+        ("chore", [("chore", False), ("update", True), ("upgrade", False), ("bump", False), ("deps", False), ("dependencies", False)]),
+        # Feature is most generic - should be last
+        ("feature", [("feat", False), ("feature", False), ("add", False), ("implement", False), ("create", False), ("new", False)]),
+    ]
 
-    # Check each type's keywords
-    for type_name, keywords in type_keywords.items():
-        for keyword in keywords:
-            # Use word boundary matching to avoid partial matches
-            if re.search(r'\b' + re.escape(keyword) + r'\b', prompt_lower):
+    # Check each type's keywords in priority order
+    for type_name, keywords in type_keywords:
+        for keyword, allow_prefix in keywords:
+            if allow_prefix:
+                # Allow word stems (e.g., "fixing" matches "fix")
+                pattern = r'\b' + re.escape(keyword)
+            else:
+                # Require exact word boundary
+                pattern = r'\b' + re.escape(keyword) + r'\b'
+            if re.search(pattern, prompt_lower):
                 return type_name
 
     return None

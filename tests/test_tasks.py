@@ -13,7 +13,7 @@ class TestTaskSerialization:
 
     def test_short_description_uses_regular_string(self):
         """Short descriptions (<= 50 chars) use regular YAML strings."""
-        task = Task(description="Short task")
+        task = Task(id=None, prompt="Short task")
         task_dict = task.to_dict()
 
         # Should not be a LiteralString
@@ -23,7 +23,7 @@ class TestTaskSerialization:
     def test_long_description_uses_literal_string(self):
         """Long descriptions (> 50 chars) use literal block scalar syntax."""
         long_desc = "This is a very long task description that exceeds the fifty character limit"
-        task = Task(description=long_desc)
+        task = Task(id=None, prompt=long_desc)
         task_dict = task.to_dict()
 
         # Should be a LiteralString
@@ -33,7 +33,7 @@ class TestTaskSerialization:
     def test_multiline_description_uses_literal_string(self):
         """Multi-line descriptions use literal block scalar syntax."""
         multiline_desc = "First line\nSecond line\nThird line"
-        task = Task(description=multiline_desc)
+        task = Task(id=None, prompt=multiline_desc)
         task_dict = task.to_dict()
 
         # Should be a LiteralString
@@ -42,7 +42,7 @@ class TestTaskSerialization:
 
     def test_yaml_output_format_short(self):
         """Short descriptions are serialized as regular YAML strings."""
-        task = Task(description="Short task", status="pending")
+        task = Task(id=None, prompt="Short task", status="pending")
         task_dict = task.to_dict()
         yaml_output = yaml.dump({"task": task_dict}, default_flow_style=False)
 
@@ -53,7 +53,7 @@ class TestTaskSerialization:
     def test_yaml_output_format_long(self):
         """Long descriptions are serialized with literal block scalar syntax."""
         long_desc = "This is a very long task description that exceeds the fifty character limit"
-        task = Task(description=long_desc, status="pending")
+        task = Task(id=None, prompt=long_desc, status="pending")
         task_dict = task.to_dict()
         yaml_output = yaml.dump({"task": task_dict}, default_flow_style=False)
 
@@ -64,7 +64,7 @@ class TestTaskSerialization:
     def test_yaml_output_format_multiline(self):
         """Multi-line descriptions are serialized with literal block scalar syntax."""
         multiline_desc = "First line\nSecond line\nThird line"
-        task = Task(description=multiline_desc, status="pending")
+        task = Task(id=None, prompt=multiline_desc, status="pending")
         task_dict = task.to_dict()
         yaml_output = yaml.dump({"task": task_dict}, default_flow_style=False)
 
@@ -86,13 +86,13 @@ class TestYamlTaskStore:
 
         try:
             store = YamlTaskStore(temp_file)
-            store._tasks = [Task(description="Short task")]
+            store._tasks = [Task(id=None, prompt="Short task")]
             store._save()
 
             # Load it back
             store2 = YamlTaskStore(temp_file)
             assert len(store2._tasks) == 1
-            assert store2._tasks[0].description == "Short task"
+            assert store2._tasks[0].prompt == "Short task"
         finally:
             temp_file.unlink()
 
@@ -104,13 +104,13 @@ class TestYamlTaskStore:
         try:
             long_desc = "This is a very long task description that exceeds the fifty character limit and should be formatted properly"
             store = YamlTaskStore(temp_file)
-            store._tasks = [Task(description=long_desc)]
+            store._tasks = [Task(id=None, prompt=long_desc)]
             store._save()
 
             # Load it back
             store2 = YamlTaskStore(temp_file)
             assert len(store2._tasks) == 1
-            assert store2._tasks[0].description == long_desc
+            assert store2._tasks[0].prompt == long_desc
         finally:
             temp_file.unlink()
 
@@ -122,13 +122,13 @@ class TestYamlTaskStore:
         try:
             multiline_desc = "First line\n\nSecond paragraph\nThird line"
             store = YamlTaskStore(temp_file)
-            store._tasks = [Task(description=multiline_desc)]
+            store._tasks = [Task(id=None, prompt=multiline_desc)]
             store._save()
 
             # Load it back
             store2 = YamlTaskStore(temp_file)
             assert len(store2._tasks) == 1
-            assert store2._tasks[0].description == multiline_desc
+            assert store2._tasks[0].prompt == multiline_desc
         finally:
             temp_file.unlink()
 
@@ -140,7 +140,7 @@ class TestYamlTaskStore:
         try:
             long_desc = "This is a very long task description that exceeds the fifty character limit"
             store = YamlTaskStore(temp_file)
-            store._tasks = [Task(description=long_desc)]
+            store._tasks = [Task(id=None, prompt=long_desc)]
             store._save()
 
             # Read raw YAML content
@@ -160,7 +160,7 @@ class TestYamlTaskStore:
         try:
             multiline_desc = "Line 1\nLine 2\nLine 3"
             store = YamlTaskStore(temp_file)
-            store._tasks = [Task(description=multiline_desc)]
+            store._tasks = [Task(id=None, prompt=multiline_desc)]
             store._save()
 
             # Read raw YAML content

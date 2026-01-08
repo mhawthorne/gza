@@ -130,10 +130,10 @@ class TestBranchNameGeneration:
             pattern="{type}/{date}-{slug}",
             project_name="myproj",
             task_id="20260107-add-auth",
-            prompt="Add authentication",
+            prompt="Add authentication",  # Infers to "feature" from "add"
             default_type="feat",
         )
-        assert name == "feat/20260107-add-auth"
+        assert name == "feature/20260107-add-auth"
 
     def test_custom_pattern_complex(self):
         """Test complex custom pattern."""
