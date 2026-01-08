@@ -162,6 +162,46 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         return 1
 
 
+def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
+    """Spawn N background workers in parallel.
+
+    Args:
+        args: Command-line arguments including count and task_id
+        config: Configuration object
+
+    Returns:
+        0 on success, 1 on error
+    """
+    # Determine how many workers to spawn
+    count = args.count if args.count is not None else 1
+
+    # If a specific task_id is provided, only spawn 1 worker for that task
+    if hasattr(args, 'task_id') and args.task_id:
+        if count > 1:
+            print("Warning: --count is ignored when a specific task ID is provided")
+        return _spawn_background_worker(args, config)
+
+    # Spawn N workers - each will atomically claim a pending task
+    # If there are fewer pending tasks than requested, some spawns will
+    # find no tasks and exit gracefully
+    spawned_count = 0
+
+    for i in range(count):
+        # _spawn_background_worker will atomically claim next pending task
+        # It returns 0 if successful OR if no tasks are available
+        # It returns 1 only on actual errors
+        result = _spawn_background_worker(args, config)
+        if result == 0:
+            spawned_count += 1
+
+    # Since _spawn_background_worker prints its own output for each worker,
+    # we just print a summary if multiple workers were requested
+    if count > 1:
+        print(f"\n=== Attempted to spawn {count} background worker(s) ===")
+
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the next pending task(s) or a specific task."""
     config = Config.load(args.project_dir)
@@ -170,7 +210,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Handle background mode
     if args.background:
-        return _spawn_background_worker(args, config)
+        return _spawn_background_workers(args, config)
 
     # Handle worker mode (internal)
     if args.worker_mode:
