@@ -2,8 +2,12 @@
 
 import argparse
 import json
+import os
+import signal
+import subprocess
 import sys
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import Config, ConfigError
@@ -13,6 +17,7 @@ from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
 from .runner import run
 from .tasks import YamlTaskStore, Task as YamlTask
+from .workers import WorkerMetadata, WorkerRegistry
 
 
 def get_store(config: Config) -> SqliteTaskStore:
@@ -20,11 +25,156 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+def _spawn_background_worker(args: argparse.Namespace, config: Config) -> int:
+    """Spawn a background worker process."""
+    # Initialize worker registry
+    registry = WorkerRegistry(config.workers_path)
+
+    # Get task to run (either specific or next pending)
+    store = get_store(config)
+    if hasattr(args, 'task_id') and args.task_id:
+        task = store.get(args.task_id)
+        if not task:
+            print(f"Error: Task #{args.task_id} not found")
+            return 1
+
+        if task.status != "pending":
+            print(f"Error: Task #{args.task_id} is not pending (status: {task.status})")
+            return 1
+
+        # Check if task is blocked
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        if is_blocked:
+            print(f"Error: Task #{args.task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            return 1
+
+        task_id = args.task_id
+    else:
+        # Atomically claim next task
+        task = store.claim_next_pending_task()
+        if not task:
+            print("No pending tasks found")
+            return 0
+        task_id = task.id
+
+    # Build command for worker subprocess
+    cmd = [
+        sys.executable, "-m", "theo",
+        "work",
+        "--worker-mode",
+    ]
+
+    if task_id:
+        cmd.append(str(task_id))
+
+    if args.no_docker:
+        cmd.append("--no-docker")
+
+    # Add project directory
+    cmd.append(str(config.project_dir.absolute()))
+
+    # Spawn detached process
+    try:
+        # Use nohup to detach from terminal
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+
+        # Generate worker ID
+        worker_id = registry.generate_worker_id()
+
+        # Register worker
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=proc.pid,
+            task_id=task.id,
+            task_slug=None,  # Will be set when runner starts
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,  # Will be set when runner starts
+            worktree=None,  # Will be set when runner starts
+        )
+        registry.register(worker)
+
+        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"  Task: #{task.id}")
+        if task.prompt:
+            prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
+            print(f"  Prompt: {prompt_display}")
+        print()
+        print(f"Use 'theo ps' to view running workers")
+        print(f"Use 'theo logs {worker_id}' to tail output")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error spawning background worker: {e}")
+        return 1
+
+
+def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
+    """Run in worker mode (called internally by background workers)."""
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = None
+
+    # Find our worker entry by PID
+    my_pid = os.getpid()
+    workers = registry.list_all(include_completed=False)
+    for w in workers:
+        if w.pid == my_pid:
+            worker_id = w.worker_id
+            break
+
+    # Set up signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        print("\nReceived shutdown signal, cleaning up...")
+        if worker_id:
+            registry.mark_completed(worker_id, exit_code=1, status="failed")
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Run the task normally
+    exit_code = 1
+    try:
+        if hasattr(args, 'task_id') and args.task_id:
+            exit_code = run(config, task_id=args.task_id)
+        else:
+            exit_code = run(config)
+
+        # Update worker status on completion
+        if worker_id:
+            status = "completed" if exit_code == 0 else "failed"
+            registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+
+        return exit_code
+
+    except Exception as e:
+        print(f"Worker error: {e}")
+        if worker_id:
+            registry.mark_completed(worker_id, exit_code=1, status="failed")
+        return 1
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the next pending task(s) or a specific task."""
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
+
+    # Handle background mode
+    if args.background:
+        return _spawn_background_worker(args, config)
+
+    # Handle worker mode (internal)
+    if args.worker_mode:
+        return _run_as_worker(args, config)
 
     # Check if a specific task ID was provided
     if hasattr(args, 'task_id') and args.task_id:
@@ -1044,6 +1194,192 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ps(args: argparse.Namespace) -> int:
+    """List running and completed workers."""
+    config = Config.load(args.project_dir)
+    registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
+
+    workers = registry.list_all(include_completed=args.all if hasattr(args, 'all') else False)
+
+    if not workers:
+        if hasattr(args, 'all') and args.all:
+            print("No workers found")
+        else:
+            print("No running workers (use --all to see completed)")
+        return 0
+
+    if hasattr(args, 'quiet') and args.quiet:
+        # Just print worker IDs
+        for worker in workers:
+            print(worker.worker_id)
+        return 0
+
+    if hasattr(args, 'json') and args.json:
+        # JSON output
+        import json as json_lib
+        print(json_lib.dumps([w.to_dict() for w in workers], indent=2))
+        return 0
+
+    # Table output
+    print(f"{'WORKER ID':<20} {'PID':<8} {'STATUS':<12} {'TASK':<30} {'DURATION':<10}")
+    print("-" * 90)
+
+    for worker in workers:
+        # Check if still running
+        if worker.status == "running" and not registry.is_running(worker.worker_id):
+            worker.status = "stale"
+
+        # Get task info
+        task_display = ""
+        if worker.task_id:
+            task = store.get(worker.task_id)
+            if task:
+                if task.task_id:
+                    task_display = task.task_id
+                else:
+                    prompt = task.prompt[:25] + "..." if len(task.prompt) > 25 else task.prompt
+                    task_display = f"#{task.id}: {prompt}"
+
+        # Calculate duration
+        started = datetime.fromisoformat(worker.started_at)
+        if worker.completed_at:
+            ended = datetime.fromisoformat(worker.completed_at)
+            duration_sec = (ended - started).total_seconds()
+        else:
+            duration_sec = (datetime.now(timezone.utc) - started).total_seconds()
+
+        if duration_sec < 60:
+            duration = f"{duration_sec:.0f}s"
+        else:
+            minutes = int(duration_sec // 60)
+            seconds = int(duration_sec % 60)
+            duration = f"{minutes}m {seconds}s"
+
+        print(f"{worker.worker_id:<20} {worker.pid:<8} {worker.status:<12} {task_display:<30} {duration:<10}")
+
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Tail logs for a worker."""
+    config = Config.load(args.project_dir)
+    registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
+
+    worker = registry.get(args.worker_id)
+    if not worker:
+        print(f"Error: Worker {args.worker_id} not found")
+        return 1
+
+    # Get log file path
+    task = None
+    if worker.task_id:
+        task = store.get(worker.task_id)
+
+    if task and task.log_file:
+        log_path = config.project_dir / task.log_file
+    elif task and task.task_id:
+        log_path = config.log_path / f"{task.task_id}.log"
+    else:
+        print(f"Error: No log file found for worker {args.worker_id}")
+        return 1
+
+    if not log_path.exists():
+        print(f"Log file not yet created: {log_path}")
+        if registry.is_running(args.worker_id):
+            print("Worker is still starting up...")
+        return 1
+
+    # Determine if we should follow
+    follow = not args.no_follow if hasattr(args, 'no_follow') else True
+    if not registry.is_running(args.worker_id):
+        follow = False  # Don't follow completed workers
+
+    # Tail the log file
+    try:
+        import subprocess
+        cmd = ["tail"]
+
+        if hasattr(args, 'tail') and args.tail:
+            cmd.extend(["-n", str(args.tail)])
+
+        if follow:
+            cmd.append("-f")
+
+        cmd.append(str(log_path))
+
+        subprocess.run(cmd)
+        return 0
+
+    except KeyboardInterrupt:
+        return 0
+    except Exception as e:
+        print(f"Error tailing log: {e}")
+        return 1
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop a running worker."""
+    config = Config.load(args.project_dir)
+    registry = WorkerRegistry(config.workers_path)
+
+    # Validate arguments
+    if not hasattr(args, 'worker_id') or (not args.worker_id and not (hasattr(args, 'all') and args.all)):
+        print("Error: Must specify worker_id or use --all")
+        return 1
+
+    if hasattr(args, 'all') and args.all:
+        # Stop all running workers
+        workers = registry.list_all(include_completed=False)
+        running_workers = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
+
+        if not running_workers:
+            print("No running workers to stop")
+            return 0
+
+        for worker in running_workers:
+            print(f"Stopping worker {worker.worker_id} (PID {worker.pid})...")
+            if registry.stop(worker.worker_id, force=args.force if hasattr(args, 'force') else False):
+                print(f"  ✓ Sent stop signal")
+            else:
+                print(f"  ✗ Failed to stop worker")
+
+        return 0
+
+    # Stop specific worker
+    worker = registry.get(args.worker_id)
+    if not worker:
+        print(f"Error: Worker {args.worker_id} not found")
+        return 1
+
+    if worker.status != "running":
+        print(f"Worker {args.worker_id} is not running (status: {worker.status})")
+        return 1
+
+    if not registry.is_running(args.worker_id):
+        print(f"Worker {args.worker_id} is not running (process not found)")
+        registry.mark_completed(args.worker_id, exit_code=1, status="stale")
+        return 1
+
+    print(f"Stopping worker {args.worker_id} (PID {worker.pid})...")
+    if registry.stop(args.worker_id, force=args.force if hasattr(args, 'force') else False):
+        print("✓ Sent stop signal")
+
+        # Wait a moment and check if it stopped
+        time.sleep(1)
+        if not registry.is_running(args.worker_id):
+            print("✓ Worker stopped")
+            registry.mark_completed(args.worker_id, exit_code=1, status="failed")
+        else:
+            print("Worker is still running, may take a moment to shut down")
+
+        return 0
+    else:
+        print("✗ Failed to stop worker")
+        return 1
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     """Delete a task."""
     config = Config.load(args.project_dir)
@@ -1277,6 +1613,16 @@ def main() -> int:
         metavar="N",
         help="Number of tasks to run before stopping (overrides config default)",
     )
+    work_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    work_parser.add_argument(
+        "--worker-mode",
+        action="store_true",
+        help=argparse.SUPPRESS,  # Internal flag for background workers
+    )
 
     # next command
     next_parser = subparsers.add_parser("next", help="List upcoming pending tasks")
@@ -1497,6 +1843,63 @@ def main() -> int:
     )
     add_common_args(status_parser)
 
+    # ps command
+    ps_parser = subparsers.add_parser("ps", help="List running workers")
+    ps_parser.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="Include completed/failed workers",
+    )
+    ps_parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Only show worker IDs",
+    )
+    ps_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON",
+    )
+    add_common_args(ps_parser)
+
+    # logs command
+    logs_parser = subparsers.add_parser("logs", help="Tail logs for a worker")
+    logs_parser.add_argument(
+        "worker_id",
+        help="Worker ID to tail logs for",
+    )
+    logs_parser.add_argument(
+        "--tail",
+        type=int,
+        metavar="N",
+        help="Show last N lines only",
+    )
+    logs_parser.add_argument(
+        "--no-follow",
+        action="store_true",
+        help="Don't follow the log (just show and exit)",
+    )
+    add_common_args(logs_parser)
+
+    # stop command
+    stop_parser = subparsers.add_parser("stop", help="Stop a running worker")
+    stop_parser.add_argument(
+        "worker_id",
+        nargs="?",
+        help="Worker ID to stop (optional if --all is used)",
+    )
+    stop_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Stop all running workers",
+    )
+    stop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force kill (SIGKILL instead of SIGTERM)",
+    )
+    add_common_args(stop_parser)
+
     args = parser.parse_args()
 
     # Handle project_dir for commands that have positional args before it
@@ -1539,6 +1942,12 @@ def main() -> int:
             return cmd_groups(args)
         elif args.command == "status":
             return cmd_status(args)
+        elif args.command == "ps":
+            return cmd_ps(args)
+        elif args.command == "logs":
+            return cmd_logs(args)
+        elif args.command == "stop":
+            return cmd_stop(args)
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

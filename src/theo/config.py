@@ -19,6 +19,7 @@ class ConfigError(Exception):
 DEFAULT_TASKS_FILE = "tasks.yaml"
 DEFAULT_DB_FILE = f".{APP_NAME}/{APP_NAME}.db"
 DEFAULT_LOG_DIR = f".{APP_NAME}/logs"
+DEFAULT_WORKERS_DIR = f".{APP_NAME}/workers"
 DEFAULT_TIMEOUT_MINUTES = 10
 DEFAULT_USE_DOCKER = True
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
@@ -149,6 +150,10 @@ class Config:
     @property
     def log_path(self) -> Path:
         return self.project_dir / self.log_dir
+
+    @property
+    def workers_path(self) -> Path:
+        return self.project_dir / DEFAULT_WORKERS_DIR
 
     @classmethod
     def config_path(cls, project_dir: Path) -> Path:

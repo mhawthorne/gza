@@ -29,11 +29,47 @@ theo work
 | `theo add <prompt>` | Add a new task |
 | `theo next` | List pending tasks |
 | `theo work` | Run the next pending task |
+| `theo work --background` | Run task in background (detached mode) |
+| `theo ps` | List running background workers |
+| `theo logs <worker_id>` | Tail logs for a background worker |
+| `theo stop <worker_id>` | Stop a running background worker |
 | `theo history` | Show completed/failed tasks |
 | `theo show <id>` | Show task details |
 | `theo log <id>` | Display task execution log |
 | `theo stats` | Show cost and usage statistics |
 | `theo import <file>` | Import tasks from YAML |
+
+## Background Workers
+
+Run tasks in the background to parallelize work:
+
+```bash
+# Start a background worker for the next task
+theo work --background
+
+# Start multiple workers (runs 3 tasks concurrently)
+for i in {1..3}; do theo work --background; done
+
+# List running workers
+theo ps
+
+# Tail logs for a worker
+theo logs w-20260107-123456
+
+# Stop a worker
+theo stop w-20260107-123456
+
+# Stop all workers
+theo stop --all
+```
+
+Background workers spawn detached processes that:
+- Atomically claim pending tasks (no conflicts with concurrent workers)
+- Write logs to `.theo/logs/<task_id>.log`
+- Update their status in `.theo/workers/<worker_id>.json`
+- Clean up automatically on completion
+
+See [specs/concurrent-work.md](specs/concurrent-work.md) for full documentation.
 
 ## Importing Tasks
 
