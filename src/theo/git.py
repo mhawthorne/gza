@@ -233,3 +233,39 @@ class Git:
         # If there's no output, the branches are identical (also merged)
         lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
         return all(line.startswith("-") for line in lines)
+
+    def merge(self, branch: str, squash: bool = False) -> None:
+        """Merge a branch into the current branch.
+
+        Args:
+            branch: The branch to merge
+            squash: Use squash merge (default: False, uses --no-ff)
+
+        Raises:
+            GitError: If the merge fails
+        """
+        args = ["merge"]
+        if squash:
+            args.append("--squash")
+        else:
+            args.append("--no-ff")
+        args.append(branch)
+        self._run(*args)
+
+    def delete_branch(self, branch: str, force: bool = False) -> None:
+        """Delete a local branch.
+
+        Args:
+            branch: The branch to delete
+            force: Force deletion even if not fully merged (default: False)
+
+        Raises:
+            GitError: If the deletion fails
+        """
+        args = ["branch"]
+        if force:
+            args.append("-D")
+        else:
+            args.append("-d")
+        args.append(branch)
+        self._run(*args)
