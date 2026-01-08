@@ -681,6 +681,36 @@ class TestLogCommand:
         assert result.returncode == 1
         assert "Worker 'w-nonexistent' not found" in result.stdout
 
+    def test_log_by_task_id_startup_failure(self, tmp_path: Path):
+        """Log command shows startup error when log contains non-JSON content."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        # Create a task with a log file
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Test task with startup failure")
+        task.status = "failed"
+        task.log_file = ".theo/logs/test-startup-error.log"
+        store.update(task)
+
+        # Create a log file with raw error text (simulating Docker startup failure)
+        log_dir = tmp_path / ".theo" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "test-startup-error.log"
+        log_file.write_text("exec /usr/local/bin/docker-entrypoint.sh: argument list too long")
+
+        result = run_theo("log", "--task", "1", str(tmp_path))
+
+        # Should detect startup failure and display the error
+        assert result.returncode == 1
+        assert "Task failed during startup (no Claude session):" in result.stdout
+        assert "exec /usr/local/bin/docker-entrypoint.sh: argument list too long" in result.stdout
+        # The error should be indented
+        assert "  exec /usr/local/bin/docker-entrypoint.sh" in result.stdout
+
     def test_log_requires_lookup_type(self, tmp_path: Path):
         """Log command requires --task, --slug, or --worker flag."""
         setup_config(tmp_path)
