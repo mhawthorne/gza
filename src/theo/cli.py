@@ -1064,8 +1064,16 @@ def cmd_log(args: argparse.Namespace) -> int:
                     continue
 
         if log_data is None and not entries:
-            print("Error: No log entries found in log file")
-            return 1
+            # If we have content but couldn't parse any JSON, it's likely a startup error
+            if content:
+                print("Task failed during startup (no Claude session):")
+                # Display the raw error message, indented for clarity
+                for line in content.split('\n'):
+                    print(f"  {line}")
+                return 1
+            else:
+                print("Error: No log entries found in log file")
+                return 1
     except Exception as e:
         print(f"Error: Failed to read log file: {e}")
         return 1
