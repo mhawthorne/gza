@@ -18,6 +18,20 @@ echo "Fetching latest from $REMOTE..."
 git fetch $REMOTE $MAIN_BRANCH
 
 CURRENT_BRANCH=$(git branch --show-current)
+
+# Check for uncommitted changes before attempting rebase
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo -e "${RED}Error: You have uncommitted changes.${NC}"
+    echo "Please commit or stash them before rebasing."
+    echo ""
+    echo "Unstaged changes:"
+    git diff --name-only
+    echo ""
+    echo "Staged changes:"
+    git diff --cached --name-only
+    exit 1
+fi
+
 echo "Rebasing $CURRENT_BRANCH onto $REMOTE/$MAIN_BRANCH..."
 
 # Attempt rebase
@@ -46,7 +60,14 @@ claude -p "Resolve the merge conflicts. For each conflicted file:
 5. Verify Python syntax with: uv run python -m py_compile <file>
 6. Stage the resolved file with: git add <file>
 
-After resolving all conflicts, run: git rebase --continue"
+After resolving all conflicts, run: git rebase --continue" \
+    --allowedTools 'Bash(git add:*)' \
+    --allowedTools 'Bash(git rebase --continue:*)' \
+    --allowedTools 'Bash(uv run python -m py_compile:*)' \
+    --allowedTools 'Edit' \
+    --allowedTools 'Read' \
+    --allowedTools 'Glob' \
+    --allowedTools 'Grep'
 
 echo ""
 echo -e "${YELLOW}Review the changes, then:${NC}"

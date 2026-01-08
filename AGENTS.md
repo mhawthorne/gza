@@ -113,3 +113,7 @@ uv run pytest tests_integration/ -v -m integration
 ## Temporary Files
 
 When creating temporary files (e.g., task import files, test data), write them to the `tmp/` directory in the project root. This directory is gitignored and keeps the project clean.
+
+## Line Endings
+
+Always use Unix-style line endings (LF, `\n`). Do NOT use Windows-style line endings (CRLF, `\r\n`). This applies to all files in the repository, including shell scripts, Python files, and configuration files.

@@ -1194,3 +1194,49 @@ class TestGetTaskOutput:
         )
         result = _get_task_output(task, tmp_path)
         assert result is None
+
+
+class TestPsCommand:
+    """Tests for 'theo ps' command."""
+
+    def test_ps_shows_task_id(self, tmp_path: Path):
+        """PS command should display task ID for running workers."""
+        from theo.db import SqliteTaskStore
+        from theo.workers import WorkerRegistry, WorkerMetadata
+
+        # Setup config and database
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a task
+        task = store.add("Test task for ps command")
+
+        # Create workers directory and register a worker
+        workers_dir = tmp_path / ".theo" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        worker = WorkerMetadata(
+            worker_id="w-test-ps",
+            pid=99999,  # Fake PID
+            task_id=task.id,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(worker)
+
+        # Run ps command
+        result = run_theo("ps", "--all", cwd=tmp_path)
+
+        # Verify task ID is in output
+        assert result.returncode == 0
+        assert "TASK ID" in result.stdout, "Header should contain 'TASK ID' column"
+        assert f"#{task.id}" in result.stdout, f"Output should contain task ID #{task.id}"
+
+        # Cleanup
+        registry.remove("w-test-ps")
