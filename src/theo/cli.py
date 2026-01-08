@@ -793,8 +793,11 @@ def _format_log_entry(entry: dict) -> str | None:
             if item.get("type") == "tool_result":
                 tool_id = item.get("tool_use_id", "")[:8]
                 result = item.get("content", "")
-                if isinstance(result, str) and len(result) > 200:
-                    result = result[:200] + "..."
+                if isinstance(result, str):
+                    # Unescape literal \n from double-escaped JSON (Claude Code logging artifact)
+                    result = result.replace("\\n", "\n").replace("\\t", "\t")
+                    if len(result) > 200:
+                        result = result[:200] + "..."
                 parts.append(f"[tool result {tool_id}] {result}")
         if parts:
             return "\n".join(parts)
