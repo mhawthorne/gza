@@ -19,6 +19,7 @@ class WorkerMetadata:
     status: str  # running, completed, failed
     log_file: str | None
     worktree: str | None
+    is_background: bool = True  # True for background workers, False for foreground
     exit_code: int | None = None
     completed_at: str | None = None
 

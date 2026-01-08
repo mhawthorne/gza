@@ -216,9 +216,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.worker_mode:
         return _run_as_worker(args, config)
 
+    # Register as a foreground worker
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = registry.generate_worker_id()
+
+    # Get task info for registration
+    store = get_store(config)
+    task_id_for_registration = None
+
     # Check if a specific task ID was provided
     if hasattr(args, 'task_id') and args.task_id:
-        store = get_store(config)
         task = store.get(args.task_id)
         if not task:
             print(f"Error: Task #{args.task_id} not found")
@@ -234,40 +241,85 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"Error: Task #{args.task_id} is blocked by task #{blocking_id} ({blocking_status})")
             return 1
 
-        # Run the specific task
-        return run(config, task_id=args.task_id)
+        task_id_for_registration = args.task_id
+    else:
+        # For loop mode, we'll register with the first task we're about to run
+        next_task = store.get_next_pending()
+        if next_task:
+            task_id_for_registration = next_task.id
 
-    # Determine how many tasks to run
-    count = args.count if args.count is not None else config.work_count
+    # Register foreground worker
+    worker = WorkerMetadata(
+        worker_id=worker_id,
+        pid=os.getpid(),
+        task_id=task_id_for_registration,
+        task_slug=None,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status="running",
+        log_file=None,
+        worktree=None,
+        is_background=False,
+    )
+    registry.register(worker)
 
-    # Run tasks in a loop
-    tasks_completed = 0
-    for i in range(count):
-        result = run(config)
+    # Set up signal handlers for cleanup
+    def cleanup_handler(signum, frame):
+        """Clean up worker registration on interrupt."""
+        registry.mark_completed(worker_id, exit_code=130, status="failed")
+        sys.exit(130)
 
-        # If run returns non-zero, it means something went wrong or no tasks left
-        if result != 0:
-            if tasks_completed == 0:
-                # First task failed or no tasks available, return the error code
-                return result
-            else:
-                # We completed some tasks before stopping, consider it success
-                break
+    signal.signal(signal.SIGINT, cleanup_handler)
+    signal.signal(signal.SIGTERM, cleanup_handler)
 
-        tasks_completed += 1
+    try:
+        # Run the task(s)
+        if hasattr(args, 'task_id') and args.task_id:
+            # Run the specific task
+            result = run(config, task_id=args.task_id)
+            registry.mark_completed(worker_id, exit_code=result,
+                                   status="completed" if result == 0 else "failed")
+            return result
 
-        # Check if there are more pending tasks
-        if i < count - 1:  # Not the last iteration
-            from .db import SqliteTaskStore
-            store = SqliteTaskStore(config.db_path)
-            if not store.get_next_pending():
-                print(f"\nCompleted {tasks_completed} task(s). No more pending tasks.")
-                break
+        # Determine how many tasks to run
+        count = args.count if args.count is not None else config.work_count
 
-    if tasks_completed > 1:
-        print(f"\n=== Completed {tasks_completed} tasks ===")
+        # Run tasks in a loop
+        tasks_completed = 0
+        for i in range(count):
+            result = run(config)
 
-    return 0
+            # If run returns non-zero, it means something went wrong or no tasks left
+            if result != 0:
+                if tasks_completed == 0:
+                    # First task failed or no tasks available, return the error code
+                    registry.mark_completed(worker_id, exit_code=result,
+                                           status="failed" if result != 0 else "completed")
+                    return result
+                else:
+                    # We completed some tasks before stopping, consider it success
+                    break
+
+            tasks_completed += 1
+
+            # Check if there are more pending tasks
+            if i < count - 1:  # Not the last iteration
+                from .db import SqliteTaskStore
+                store = SqliteTaskStore(config.db_path)
+                if not store.get_next_pending():
+                    print(f"\nCompleted {tasks_completed} task(s). No more pending tasks.")
+                    break
+
+        if tasks_completed > 1:
+            print(f"\n=== Completed {tasks_completed} tasks ===")
+
+        # Clean up worker registration on normal exit
+        registry.mark_completed(worker_id, exit_code=0, status="completed")
+        return 0
+
+    except Exception as e:
+        # Clean up worker registration on exception
+        registry.mark_completed(worker_id, exit_code=1, status="failed")
+        raise
 
 
 def cmd_next(args: argparse.Namespace) -> int:
@@ -1597,8 +1649,8 @@ def cmd_ps(args: argparse.Namespace) -> int:
         return 0
 
     # Table output
-    print(f"{'WORKER ID':<20} {'PID':<8} {'STATUS':<12} {'TASK':<30} {'DURATION':<10}")
-    print("-" * 90)
+    print(f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'STATUS':<12} {'TASK':<30} {'DURATION':<10}")
+    print("-" * 96)
 
     for worker in workers:
         # Check if still running
@@ -1631,7 +1683,10 @@ def cmd_ps(args: argparse.Namespace) -> int:
             seconds = int(duration_sec % 60)
             duration = f"{minutes}m {seconds}s"
 
-        print(f"{worker.worker_id:<20} {worker.pid:<8} {worker.status:<12} {task_display:<30} {duration:<10}")
+        # Determine worker type (default to background for old workers without is_background field)
+        worker_type = "fg" if hasattr(worker, 'is_background') and not worker.is_background else "bg"
+
+        print(f"{worker.worker_id:<20} {worker.pid:<8} {worker_type:<6} {worker.status:<12} {task_display:<30} {duration:<10}")
 
     return 0
 
