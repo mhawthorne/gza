@@ -284,6 +284,7 @@ class Provider(ABC):
         timeout_minutes: int,
         cwd: Path | None = None,
         parse_output: callable = None,
+        stdin_input: str | None = None,
     ) -> RunResult:
         """Run command with output to both console and log file.
 
@@ -297,6 +298,7 @@ class Provider(ABC):
             parse_output: Optional callback to parse each line of output.
                          Called with (line: str, accumulated_data: dict).
                          The callback should update accumulated_data in place.
+            stdin_input: Optional string to pass to stdin
 
         Returns:
             RunResult with exit code and duration. Stats should be filled
@@ -314,9 +316,15 @@ class Provider(ABC):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_input else None,
                 text=True,
                 cwd=cwd,
             )
+
+            # Write stdin if provided
+            if stdin_input:
+                process.stdin.write(stdin_input)
+                process.stdin.close()
 
             for line in process.stdout:
                 log.write(line)
