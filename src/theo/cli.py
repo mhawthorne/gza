@@ -1986,7 +1986,7 @@ def main() -> int:
         help="Run Claude directly instead of in Docker",
     )
     work_parser.add_argument(
-        "--count",
+        "--count", "-c",
         type=int,
         metavar="N",
         help="Number of tasks to run before stopping (overrides config default)",
