@@ -657,12 +657,9 @@ def _run_non_code_task(
             # Copy report content from worktree to project dir
             report_path.write_text(worktree_report_path.read_text())
         else:
-            # Copy log to report if provider didn't create the report file
-            print(f"Note: Report file not created, copying log output")
-            with open(log_file) as lf:
-                with open(report_path, 'w') as rf:
-                    rf.write(f"# {task_type_display}: {task.prompt}\n\n")
-                    rf.write(lf.read())
+            # Report file was not created - task likely failed to write output
+            print(f"Warning: Report file not created by provider")
+            print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
 
         # Read output content for storage in DB
         output_content = None
