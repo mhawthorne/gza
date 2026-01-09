@@ -107,6 +107,17 @@ class Git:
         if base_branch:
             args.append(base_branch)
         self._run(*args)
+
+        # Push the new branch to origin with upstream tracking
+        # This ensures git push works without errors later
+        worktree_git = Git(path)
+        try:
+            worktree_git.push_branch(branch, remote="origin", set_upstream=True)
+        except GitError:
+            # If push fails (e.g., no network, no remote configured), continue
+            # The branch is still created locally and the task can proceed
+            pass
+
         return path
 
     def worktree_remove(self, path: Path, force: bool = False) -> None:
