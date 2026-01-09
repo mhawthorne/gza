@@ -135,7 +135,7 @@ def build_docker_cmd(
     """
     cmd = [
         "timeout", f"{timeout_minutes}m",
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "-i",
         "-v", f"{work_dir}:/workspace",
         "-w", "/workspace",
     ]
