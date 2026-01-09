@@ -1783,6 +1783,37 @@ def cmd_delete(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_retry(args: argparse.Namespace) -> int:
+    """Retry a failed or completed task by creating a new pending task."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    # Get the original task
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    # Validate status
+    if task.status not in ("completed", "failed"):
+        print(f"Error: Can only retry completed or failed tasks (task is {task.status})")
+        return 1
+
+    # Create new task copying relevant fields
+    new_task = store.add(
+        prompt=task.prompt,
+        task_type=task.task_type,
+        group=task.group,
+        spec=task.spec,
+        create_review=task.create_review,
+        task_type_hint=task.task_type_hint,
+        based_on=args.task_id,  # Track retry lineage
+    )
+
+    print(f"✓ Created task #{new_task.id} (retry of #{args.task_id})")
+    return 0
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
     config = Config.load(args.project_dir)
@@ -2232,6 +2263,15 @@ def main() -> int:
     )
     add_common_args(delete_parser)
 
+    # retry command
+    retry_parser = subparsers.add_parser("retry", help="Retry a failed or completed task")
+    retry_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to retry",
+    )
+    add_common_args(retry_parser)
+
     # show command
     show_parser = subparsers.add_parser("show", help="Show details of a specific task")
     show_parser.add_argument(
@@ -2346,6 +2386,8 @@ def main() -> int:
             return cmd_edit(args)
         elif args.command == "delete":
             return cmd_delete(args)
+        elif args.command == "retry":
+            return cmd_retry(args)
         elif args.command == "show":
             return cmd_show(args)
         elif args.command == "import":

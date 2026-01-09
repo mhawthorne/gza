@@ -191,6 +191,59 @@ class TestDeleteCommand:
         assert "not found" in result.stdout
 
 
+class TestRetryCommand:
+    """Tests for 'theo retry' command."""
+
+    def test_retry_failed_task(self, tmp_path: Path):
+        """Retry command creates new task from failed task."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Original task", "status": "failed", "task_type": "implement"},
+        ])
+
+        result = run_theo("retry", "1", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created task #2" in result.stdout
+        assert "retry of #1" in result.stdout
+
+        # Verify new task was created
+        result = run_theo("show", "2", str(tmp_path))
+        assert result.returncode == 0
+        assert "Original task" in result.stdout
+        assert "Based on: task #1" in result.stdout
+
+    def test_retry_completed_task(self, tmp_path: Path):
+        """Retry command works on completed tasks."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Completed task", "status": "completed"},
+        ])
+
+        result = run_theo("retry", "1", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created task #2" in result.stdout
+
+    def test_retry_pending_task_fails(self, tmp_path: Path):
+        """Retry command fails on pending tasks."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Pending task", "status": "pending"},
+        ])
+
+        result = run_theo("retry", "1", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Can only retry completed or failed" in result.stdout
+
+    def test_retry_nonexistent_task(self, tmp_path: Path):
+        """Retry command handles nonexistent task."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_theo("retry", "999", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout
+
+
 class TestConfigRequirements:
     """Tests for theo.yaml configuration requirements."""
 

@@ -4,6 +4,10 @@ __pycache__/
 .pytest_cache/
 tmp/
 
+# Theo runtime data (but keep Dockerfiles)
+.theo/*
+!.theo/Dockerfile.*
+
 # AI-generated artifacts (should not be created, but ignore as safety net)
 IMPLEMENTATION_SUMMARY.md
 CHANGES.md
