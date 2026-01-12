@@ -14,9 +14,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo "Fetching latest from $REMOTE..."
-git fetch $REMOTE $MAIN_BRANCH
-
 CURRENT_BRANCH=$(git branch --show-current)
 
 # Check for uncommitted changes before attempting rebase
@@ -31,6 +28,9 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     git diff --cached --name-only
     exit 1
 fi
+
+echo "Fetching latest from $REMOTE..."
+git fetch $REMOTE $MAIN_BRANCH
 
 echo "Rebasing $CURRENT_BRANCH onto $REMOTE/$MAIN_BRANCH..."
 

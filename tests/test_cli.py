@@ -194,10 +194,10 @@ class TestDeleteCommand:
 class TestRetryCommand:
     """Tests for 'theo retry' command."""
 
-    def test_retry_failed_task(self, tmp_path: Path):
-        """Retry command creates new task from failed task."""
+    def test_retry_completed_task(self, tmp_path: Path):
+        """Retry command creates a new pending task from a completed task."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "Original task", "status": "failed", "task_type": "implement"},
+            {"prompt": "Original task", "status": "completed", "task_type": "implement"},
         ])
 
         result = run_theo("retry", "1", str(tmp_path))
@@ -206,25 +206,24 @@ class TestRetryCommand:
         assert "Created task #2" in result.stdout
         assert "retry of #1" in result.stdout
 
-        # Verify new task was created
-        result = run_theo("show", "2", str(tmp_path))
-        assert result.returncode == 0
+        # Verify new task was created with same prompt
+        result = run_theo("next", str(tmp_path))
         assert "Original task" in result.stdout
-        assert "Based on: task #1" in result.stdout
 
-    def test_retry_completed_task(self, tmp_path: Path):
-        """Retry command works on completed tasks."""
+    def test_retry_failed_task(self, tmp_path: Path):
+        """Retry command creates a new pending task from a failed task."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "Completed task", "status": "completed"},
+            {"prompt": "Failed task", "status": "failed"},
         ])
 
         result = run_theo("retry", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task #2" in result.stdout
+        assert "retry of #1" in result.stdout
 
     def test_retry_pending_task_fails(self, tmp_path: Path):
-        """Retry command fails on pending tasks."""
+        """Retry command fails for pending tasks."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "Pending task", "status": "pending"},
         ])
@@ -242,6 +241,44 @@ class TestRetryCommand:
 
         assert result.returncode == 1
         assert "not found" in result.stdout
+
+    def test_retry_preserves_task_fields(self, tmp_path: Path):
+        """Retry command preserves task_type, group, spec, and other fields."""
+        from theo.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".theo" / "theo.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a task with metadata
+        task = store.add(
+            "Test task with metadata",
+            task_type="explore",
+            group="test-group",
+            spec="spec.md",
+            create_review=True,
+            task_type_hint="feature",
+        )
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Retry the task
+        result = run_theo("retry", "1", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Verify the new task has the same metadata
+        new_task = store.get(2)
+        assert new_task is not None
+        assert new_task.prompt == "Test task with metadata"
+        assert new_task.task_type == "explore"
+        assert new_task.group == "test-group"
+        assert new_task.spec == "spec.md"
+        assert new_task.create_review is True
+        assert new_task.task_type_hint == "feature"
+        assert new_task.based_on == 1
+        assert new_task.status == "pending"
 
 
 class TestConfigRequirements:
