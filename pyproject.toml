@@ -1,5 +1,5 @@
 [project]
-name = "gza"
+name = "gza-agent"
 version = "0.0.1"
 description = "A coding AI agent runner for Claude Code"
 requires-python = ">=3.11"
