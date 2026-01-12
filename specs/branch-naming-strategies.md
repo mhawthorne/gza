@@ -7,12 +7,12 @@ Allow users to configure branch naming conventions to support different reposito
 ## Current Implementation
 
 Branches are currently named as `{project_name}/{task_id}`:
-- Example: `theo/20260107-add-user-auth`
+- Example: `gza/20260107-add-user-auth`
 - This pattern was designed for monorepos where the project name distinguishes branches
 
 ## Problem
 
-For standalone repos (like theo's own GitHub repo), the `project_name/` prefix is redundant. Common conventions use prefixes like:
+For standalone repos (like gza's own GitHub repo), the `project_name/` prefix is redundant. Common conventions use prefixes like:
 - `feature/add-user-auth`
 - `fix/null-pointer-exception`
 - `chore/update-dependencies`
@@ -21,10 +21,10 @@ For standalone repos (like theo's own GitHub repo), the `project_name/` prefix i
 
 ### Configuration
 
-Add `branch_strategy` to `theo.yaml`:
+Add `branch_strategy` to `gza.yaml`:
 
 ```yaml
-project_name: theo
+project_name: gza
 branch_strategy:
   pattern: "{type}/{slug}"      # Template for branch names
   default_type: feature         # Used when type cannot be inferred
@@ -34,7 +34,7 @@ branch_strategy:
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `{project}` | The `project_name` value | `theo` |
+| `{project}` | The `project_name` value | `gza` |
 | `{task_id}` | Full task ID | `20260107-add-auth` |
 | `{date}` | Date portion of task_id | `20260107` |
 | `{slug}` | Slug portion of task_id | `add-auth` |
@@ -64,7 +64,7 @@ The `{type}` variable is determined by:
 
 1. **Explicit `--type` flag** (highest priority):
    ```bash
-   theo add --type fix "Resolve null pointer in auth"
+   gza add --type fix "Resolve null pointer in auth"
    ```
 
 2. **Keyword detection in prompt** (if no explicit type):
@@ -90,20 +90,20 @@ The `{type}` variable is determined by:
 #### New `--type` flag for `add` command
 
 ```bash
-theo add --type fix "Resolve authentication timeout"
+gza add --type fix "Resolve authentication timeout"
 # Creates branch: fix/resolve-authentication-timeout
 
-theo add --type feature "Add dark mode support"
+gza add --type feature "Add dark mode support"
 # Creates branch: feature/add-dark-mode-support
 
-theo add "Improve query performance"
+gza add "Improve query performance"
 # Inferred from "improve" -> feature/improve-query-performance
 ```
 
 #### Init command update
 
 ```bash
-theo init
+gza init
 # Prompts: Branch strategy? [monorepo/conventional/simple/custom]
 ```
 
@@ -125,8 +125,8 @@ Add `task_type_hint` column to tasks table (nullable):
 ```yaml
 branch_strategy: monorepo
 ```
-- `theo/20260107-add-user-auth`
-- `theo/20260107-fix-login-bug`
+- `gza/20260107-add-user-auth`
+- `gza/20260107-fix-login-bug`
 
 ### Conventional (GitHub-style)
 ```yaml
@@ -157,7 +157,7 @@ branch_strategy:
   pattern: "user/{project}-{slug}"
   default_type: feature
 ```
-- `user/theo-add-user-auth`
+- `user/gza-add-user-auth`
 
 ## Implementation Tasks
 
@@ -167,7 +167,7 @@ branch_strategy:
 4. Add `--type` flag to `add` command
 5. Add `task_type_hint` column to database schema
 6. Update `generate_branch_name()` in runner.py
-7. Update `theo init` to prompt for branch strategy
+7. Update `gza init` to prompt for branch strategy
 8. Add tests for each preset and custom patterns
 
 ## Design Decisions
@@ -176,7 +176,7 @@ branch_strategy:
 
 `branch_strategy` only applies to `branch_mode: multi` (the default).
 
-Single mode continues to use `{project}/theo-work` regardless of the configured strategy. Rationale: single mode is a "scratchpad" - the branch is deleted and recreated from main on each task, so the name is irrelevant.
+Single mode continues to use `{project}/gza-work` regardless of the configured strategy. Rationale: single mode is a "scratchpad" - the branch is deleted and recreated from main on each task, so the name is irrelevant.
 
 ### Light branch name validation
 

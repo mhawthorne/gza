@@ -1,13 +1,13 @@
 # Docker Configuration
 
-Theo runs AI providers (Claude, Gemini) in Docker containers by default for isolation and reproducibility. This document explains how to customize the Docker environment for your project's needs.
+Gza runs AI providers (Claude, Gemini) in Docker containers by default for isolation and reproducibility. This document explains how to customize the Docker environment for your project's needs.
 
 ## Default Behavior
 
-When you first run `theo work`, it automatically:
+When you first run `gza work`, it automatically:
 
-1. Generates a minimal Dockerfile at `.theo/Dockerfile.claude` (or `.theo/Dockerfile.gemini`)
-2. Builds a Docker image named `{project_name}-theo`
+1. Generates a minimal Dockerfile at `etc/Dockerfile.claude` (or `etc/Dockerfile.gemini`)
+2. Builds a Docker image named `{project_name}-gza`
 3. Runs the AI provider inside that container
 
 The default Dockerfile only includes Node.js and the AI CLI tool:
@@ -17,9 +17,9 @@ FROM node:20-slim
 
 RUN npm install -g @anthropic-ai/claude-code
 
-RUN useradd -m -s /bin/bash theo
-USER theo
-WORKDIR /home/theo
+RUN useradd -m -s /bin/bash gza
+USER gza
+WORKDIR /home/gza
 
 CMD ["claude"]
 ```
@@ -30,9 +30,9 @@ For projects that need additional tools (Python, compilers, test frameworks, etc
 
 ### Creating a Custom Dockerfile
 
-1. Create or edit `.theo/Dockerfile.claude` (or `.theo/Dockerfile.gemini` for Gemini)
+1. Create or edit `etc/Dockerfile.claude` (or `etc/Dockerfile.gemini` for Gemini)
 2. Add your project's dependencies
-3. The image will be rebuilt automatically on the next `theo work`
+3. The image will be rebuilt automatically on the next `gza work`
 
 ### Example: Python Project
 
@@ -54,14 +54,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create theo user for isolation
-RUN useradd -m -s /bin/bash theo
+# Create gza user for isolation
+RUN useradd -m -s /bin/bash gza
 
-# Make uv available to theo user
+# Make uv available to gza user
 RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
-USER theo
-WORKDIR /home/theo
+USER gza
+WORKDIR /home/gza
 
 CMD ["claude"]
 ```
@@ -79,10 +79,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-RUN useradd -m -s /bin/bash theo
+RUN useradd -m -s /bin/bash gza
 ENV PATH="/root/.cargo/bin:$PATH"
-USER theo
-WORKDIR /home/theo
+USER gza
+WORKDIR /home/gza
 
 CMD ["claude"]
 ```
@@ -104,16 +104,16 @@ ENV PATH="/usr/local/go/bin:$PATH"
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-RUN useradd -m -s /bin/bash theo
-USER theo
-WORKDIR /home/theo
+RUN useradd -m -s /bin/bash gza
+USER gza
+WORKDIR /home/gza
 
 CMD ["claude"]
 ```
 
 ## Automatic Rebuild
 
-Theo automatically detects when your Dockerfile has changed:
+Gza automatically detects when your Dockerfile has changed:
 
 - Compares the Dockerfile's modification time against the Docker image's creation time
 - Rebuilds the image if the Dockerfile is newer
@@ -122,8 +122,8 @@ Theo automatically detects when your Dockerfile has changed:
 To force a rebuild manually:
 
 ```bash
-docker rmi {project_name}-theo
-theo work
+docker rmi {project_name}-gza
+gza work
 ```
 
 ## Disabling Docker
@@ -132,9 +132,9 @@ To run without Docker (using locally installed CLI tools):
 
 ```bash
 # One-time
-theo work --no-docker
+gza work --no-docker
 
-# Permanently in theo.yaml
+# Permanently in gza.yaml
 use_docker: false
 ```
 
@@ -142,8 +142,8 @@ use_docker: false
 
 | File | Purpose |
 |------|---------|
-| `.theo/Dockerfile.claude` | Custom Dockerfile for Claude provider |
-| `.theo/Dockerfile.gemini` | Custom Dockerfile for Gemini provider |
+| `etc/Dockerfile.claude` | Custom Dockerfile for Claude provider |
+| `etc/Dockerfile.gemini` | Custom Dockerfile for Gemini provider |
 
 ## Troubleshooting
 
@@ -153,18 +153,18 @@ The default container doesn't include Python. Create a custom Dockerfile that in
 
 ### "Permission denied" errors
 
-The container runs as the `theo` user for isolation. Make sure any installed tools are accessible to this user (copy binaries to `/usr/local/bin/` or add to PATH).
+The container runs as the `gza` user for isolation. Make sure any installed tools are accessible to this user (copy binaries to `/usr/local/bin/` or add to PATH).
 
 ### Build cache issues
 
 Docker caches layers. To rebuild from scratch:
 
 ```bash
-docker rmi {project_name}-theo
+docker rmi {project_name}-gza
 docker builder prune
-theo work
+gza work
 ```
 
 ### macOS file sharing
 
-On macOS, Docker needs access to the directories theo uses. The default `/tmp/theo-worktrees` path is accessible. If you change `worktree_dir` in `theo.yaml`, ensure Docker can access it via Docker Desktop > Settings > Resources > File Sharing.
+On macOS, Docker needs access to the directories gza uses. The default `/tmp/gza-worktrees` path is accessible. If you change `worktree_dir` in `gza.yaml`, ensure Docker can access it via Docker Desktop > Settings > Resources > File Sharing.

@@ -2,8 +2,8 @@
 
 import pytest
 
-from theo.branch_naming import generate_branch_name, infer_type_from_prompt
-from theo.config import BranchStrategy, Config, ConfigError
+from gza.branch_naming import generate_branch_name, infer_type_from_prompt
+from gza.config import BranchStrategy, Config, ConfigError
 
 
 class TestTypeInference:
@@ -227,7 +227,7 @@ class TestConfigBranchStrategy:
 
     def test_preset_monorepo(self, tmp_path):
         """Test loading monorepo preset."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy: monorepo
@@ -238,7 +238,7 @@ branch_strategy: monorepo
 
     def test_preset_conventional(self, tmp_path):
         """Test loading conventional preset."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy: conventional
@@ -249,7 +249,7 @@ branch_strategy: conventional
 
     def test_preset_simple(self, tmp_path):
         """Test loading simple preset."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy: simple
@@ -260,7 +260,7 @@ branch_strategy: simple
 
     def test_custom_pattern(self, tmp_path):
         """Test loading custom pattern."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy:
@@ -273,7 +273,7 @@ branch_strategy:
 
     def test_default_when_not_specified(self, tmp_path):
         """Test that default branch_strategy is used when not specified."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 """)
@@ -284,7 +284,7 @@ project_name: test
 
     def test_invalid_preset_name(self, tmp_path):
         """Test that invalid preset name raises error."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy: invalid_preset
@@ -294,7 +294,7 @@ branch_strategy: invalid_preset
 
     def test_custom_without_pattern(self, tmp_path):
         """Test that custom dict without pattern raises error."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy:
@@ -305,7 +305,7 @@ branch_strategy:
 
     def test_invalid_pattern_validation(self, tmp_path):
         """Test that invalid pattern in config is caught."""
-        config_file = tmp_path / "theo.yaml"
+        config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy:

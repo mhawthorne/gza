@@ -6,7 +6,7 @@ When multiple agents run in parallel (in Docker containers), they need to observ
 
 ## Decision
 
-Store the SQLite database at `~/.theo/<project-name>.db` on the host, and mount it into containers via Docker volume mount.
+Store the SQLite database at `~/.gza/<project-name>.db` on the host, and mount it into containers via Docker volume mount.
 
 ## Why SQLite + Volume Mount
 
@@ -19,7 +19,7 @@ Store the SQLite database at `~/.theo/<project-name>.db` on the host, and mount 
 ## Docker Usage
 
 ```bash
-docker run -v ~/.theo:/root/.theo ...
+docker run -v ~/.gza:/root/.gza ...
 ```
 
 All containers and the host CLI share the same database.

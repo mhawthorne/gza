@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from theo.workers import WorkerMetadata, WorkerRegistry
+from gza.workers import WorkerMetadata, WorkerRegistry
 
 
 @pytest.fixture
@@ -26,8 +26,8 @@ def test_worker_metadata_serialization():
         task_slug="20260107-test-task",
         started_at=datetime.now(timezone.utc).isoformat(),
         status="running",
-        log_file=".theo/logs/20260107-test-task.log",
-        worktree="/tmp/theo-worktrees/test/20260107-test-task",
+        log_file=".gza/logs/20260107-test-task.log",
+        worktree="/tmp/gza-worktrees/test/20260107-test-task",
     )
 
     # Convert to dict and back
@@ -67,7 +67,7 @@ def test_registry_register_and_get(temp_workers_dir):
         task_slug="20260107-test",
         started_at=datetime.now(timezone.utc).isoformat(),
         status="running",
-        log_file=".theo/logs/test.log",
+        log_file=".gza/logs/test.log",
         worktree=None,
     )
 
@@ -107,12 +107,12 @@ def test_registry_update(temp_workers_dir):
     registry.register(worker)
 
     # Update with log file
-    worker.log_file = ".theo/logs/20260107-test-2.log"
+    worker.log_file = ".gza/logs/20260107-test-2.log"
     registry.update(worker)
 
     # Retrieve and verify
     retrieved = registry.get("w-test-002")
-    assert retrieved.log_file == ".theo/logs/20260107-test-2.log"
+    assert retrieved.log_file == ".gza/logs/20260107-test-2.log"
 
 
 def test_registry_list_all(temp_workers_dir):

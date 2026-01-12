@@ -1,10 +1,10 @@
-# Theo Configuration Reference
+# Gza Configuration Reference
 
-This document provides a comprehensive reference for all configuration options available in Theo.
+This document provides a comprehensive reference for all configuration options available in Gza.
 
-## Configuration File (theo.yaml)
+## Configuration File (gza.yaml)
 
-The main configuration file is `theo.yaml` in your project root directory.
+The main configuration file is `gza.yaml` in your project root directory.
 
 ### Required Configuration
 
@@ -17,13 +17,13 @@ The main configuration file is `theo.yaml` in your project root directory.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
-| `log_dir` | String | `.theo/logs` | Directory for log files |
+| `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
-| `docker_image` | String | `{project_name}-theo` | Custom Docker image name |
+| `docker_image` | String | `{project_name}-gza` | Custom Docker image name |
 | `timeout_minutes` | Integer | `10` | Maximum time per task in minutes |
 | `branch_mode` | String | `multi` | Branch strategy: `single` or `multi` |
 | `max_turns` | Integer | `50` | Maximum conversation turns per task |
-| `worktree_dir` | String | `/tmp/theo-worktrees` | Directory for git worktrees |
+| `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
 | `provider` | String | `claude` | AI provider: `claude` or `gemini` |
 | `model` | String | *(empty)* | Provider-specific model name override |
@@ -102,18 +102,18 @@ Valid task types: `task`, `explore`, `plan`, `implement`, `review`
 
 ## Environment Variables
 
-All `theo.yaml` options can be overridden via environment variables:
+All `gza.yaml` options can be overridden via environment variables:
 
 | Environment Variable | Maps To | Description |
 |---------------------|---------|-------------|
-| `THEO_USE_DOCKER` | `use_docker` | Override Docker usage (`true`/`false`) |
-| `THEO_TIMEOUT_MINUTES` | `timeout_minutes` | Override task timeout |
-| `THEO_BRANCH_MODE` | `branch_mode` | Override branch strategy |
-| `THEO_MAX_TURNS` | `max_turns` | Override max conversation turns |
-| `THEO_WORKTREE_DIR` | `worktree_dir` | Override worktree directory |
-| `THEO_WORK_COUNT` | `work_count` | Override tasks per session |
-| `THEO_PROVIDER` | `provider` | Override AI provider |
-| `THEO_MODEL` | `model` | Override model name |
+| `GZA_USE_DOCKER` | `use_docker` | Override Docker usage (`true`/`false`) |
+| `GZA_TIMEOUT_MINUTES` | `timeout_minutes` | Override task timeout |
+| `GZA_BRANCH_MODE` | `branch_mode` | Override branch strategy |
+| `GZA_MAX_TURNS` | `max_turns` | Override max conversation turns |
+| `GZA_WORKTREE_DIR` | `worktree_dir` | Override worktree directory |
+| `GZA_WORK_COUNT` | `work_count` | Override tasks per session |
+| `GZA_PROVIDER` | `provider` | Override AI provider |
+| `GZA_MODEL` | `model` | Override model name |
 
 ### Provider Credentials
 
@@ -140,15 +140,15 @@ Environment variables can be set in `.env` files:
 
 | Location | Scope |
 |----------|-------|
-| `~/.theo/.env` | User-level (applies to all projects) |
+| `~/.gza/.env` | User-level (applies to all projects) |
 | `.env` | Project-level (overrides user-level) |
 
 **Format:**
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
-THEO_MAX_TURNS=100
-THEO_TIMEOUT_MINUTES=15
+GZA_MAX_TURNS=100
+GZA_TIMEOUT_MINUTES=15
 ```
 
 ---
@@ -158,7 +158,7 @@ THEO_TIMEOUT_MINUTES=15
 ### Global
 
 ```bash
-theo <command> [project_dir]
+gza <command> [project_dir]
 ```
 
 - `project_dir` - Target project directory (default: current directory)
@@ -168,7 +168,7 @@ theo <command> [project_dir]
 Run tasks from the queue.
 
 ```bash
-theo work [task_id] [options]
+gza work [task_id] [options]
 ```
 
 | Option | Description |
@@ -183,7 +183,7 @@ theo work [task_id] [options]
 Add a new task.
 
 ```bash
-theo add [prompt] [options]
+gza add [prompt] [options]
 ```
 
 | Option | Description |
@@ -205,7 +205,7 @@ theo add [prompt] [options]
 Edit an existing task.
 
 ```bash
-theo edit <task_id> [options]
+gza edit <task_id> [options]
 ```
 
 | Option | Description |
@@ -220,7 +220,7 @@ theo edit <task_id> [options]
 View task or worker logs.
 
 ```bash
-theo log <identifier> [options]
+gza log <identifier> [options]
 ```
 
 | Option | Description |
@@ -238,7 +238,7 @@ theo log <identifier> [options]
 Show task statistics.
 
 ```bash
-theo stats [options]
+gza stats [options]
 ```
 
 | Option | Description |
@@ -250,7 +250,7 @@ theo stats [options]
 Create a pull request for a completed task.
 
 ```bash
-theo pr <task_id> [options]
+gza pr <task_id> [options]
 ```
 
 | Option | Description |
@@ -263,7 +263,7 @@ theo pr <task_id> [options]
 Delete a task.
 
 ```bash
-theo delete <task_id> [options]
+gza delete <task_id> [options]
 ```
 
 | Option | Description |
@@ -275,7 +275,7 @@ theo delete <task_id> [options]
 Import tasks from a YAML file.
 
 ```bash
-theo import [file] [options]
+gza import [file] [options]
 ```
 
 | Option | Description |
@@ -289,7 +289,7 @@ theo import [file] [options]
 Show tasks in a group.
 
 ```bash
-theo status <group>
+gza status <group>
 ```
 
 ### ps
@@ -297,7 +297,7 @@ theo status <group>
 Show running workers.
 
 ```bash
-theo ps [options]
+gza ps [options]
 ```
 
 | Option | Description |
@@ -311,7 +311,7 @@ theo ps [options]
 Stop workers.
 
 ```bash
-theo stop [worker_id] [options]
+gza stop [worker_id] [options]
 ```
 
 | Option | Description |
@@ -325,7 +325,7 @@ theo stop [worker_id] [options]
 Validate configuration.
 
 ```bash
-theo validate [project_dir]
+gza validate [project_dir]
 ```
 
 ---
@@ -335,10 +335,10 @@ theo validate [project_dir]
 Configuration is resolved in the following order (highest to lowest priority):
 
 1. **Command-line arguments**
-2. **Environment variables** (`THEO_*`)
+2. **Environment variables** (`GZA_*`)
 3. **Project `.env` file**
-4. **Home `.env` file** (`~/.theo/.env`)
-5. **`theo.yaml` file**
+4. **Home `.env` file** (`~/.gza/.env`)
+5. **`gza.yaml` file**
 6. **Hardcoded defaults**
 
 ---
@@ -349,19 +349,19 @@ Configuration is resolved in the following order (highest to lowest priority):
 
 | Path | Purpose |
 |------|---------|
-| `theo.yaml` | Main configuration file |
+| `gza.yaml` | Main configuration file |
 | `.env` | Project-specific environment variables |
-| `.theo/theo.db` | SQLite task database |
-| `.theo/logs/` | Task execution logs |
-| `.theo/workers/` | Worker metadata |
-| `.theo/Dockerfile.claude` | Generated Docker image for Claude |
-| `.theo/Dockerfile.gemini` | Generated Docker image for Gemini |
+| `.gza/gza.db` | SQLite task database |
+| `.gza/logs/` | Task execution logs |
+| `.gza/workers/` | Worker metadata |
+| `etc/Dockerfile.claude` | Generated Docker image for Claude |
+| `etc/Dockerfile.gemini` | Generated Docker image for Gemini |
 
 ### Home Directory
 
 | Path | Purpose |
 |------|---------|
-| `~/.theo/.env` | User-level environment variables |
+| `~/.gza/.env` | User-level environment variables |
 | `~/.claude/` | Claude OAuth credentials |
 | `~/.gemini/` | Gemini OAuth credentials |
 
@@ -370,7 +370,7 @@ Configuration is resolved in the following order (highest to lowest priority):
 ## Example Configuration
 
 ```yaml
-# theo.yaml
+# gza.yaml
 project_name: my-app
 
 # Execution settings

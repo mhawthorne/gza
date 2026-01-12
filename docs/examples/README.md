@@ -1,6 +1,6 @@
-# Theo Examples
+# Gza Examples
 
-Practical examples showing common workflows with Theo.
+Practical examples showing common workflows with Gza.
 
 | Example | Description |
 |---------|-------------|
@@ -14,17 +14,17 @@ Practical examples showing common workflows with Theo.
 
 | Task | Command |
 |------|---------|
-| Add simple task | `theo add "prompt"` |
-| Add plan task | `theo add --type plan "prompt"` |
-| Add with auto-review | `theo add --review "prompt"` |
-| Run next task | `theo work` |
-| Run in background | `theo work --background` |
-| View pending | `theo next` |
-| View running workers | `theo ps` |
-| Tail worker logs | `theo log -w <worker_id> -f` |
-| View task log | `theo log -t <task_id>` |
-| Stop a worker | `theo stop <worker_id>` |
-| View unmerged work | `theo unmerged` |
-| Create PR | `theo pr <task_id>` |
-| View group status | `theo status <group>` |
-| View stats | `theo stats` |
+| Add simple task | `gza add "prompt"` |
+| Add plan task | `gza add --type plan "prompt"` |
+| Add with auto-review | `gza add --review "prompt"` |
+| Run next task | `gza work` |
+| Run in background | `gza work --background` |
+| View pending | `gza next` |
+| View running workers | `gza ps` |
+| Tail worker logs | `gza log -w <worker_id> -f` |
+| View task log | `gza log -t <task_id>` |
+| Stop a worker | `gza stop <worker_id>` |
+| View unmerged work | `gza unmerged` |
+| Create PR | `gza pr <task_id>` |
+| View group status | `gza status <group>` |
+| View stats | `gza stats` |

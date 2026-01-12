@@ -3,13 +3,13 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from theo.git import Git, GitError
+from gza.git import Git, GitError
 
 
 class TestWorktreeAdd:
     """Test worktree_add sets upstream tracking."""
 
-    @patch('theo.git.Git')
+    @patch('gza.git.Git')
     def test_worktree_add_pushes_with_upstream(self, mock_git_class, tmp_path: Path):
         """Test that worktree_add pushes branch with upstream tracking."""
         repo_dir = tmp_path / "repo"
@@ -45,7 +45,7 @@ class TestWorktreeAdd:
 
             assert result == worktree_path
 
-    @patch('theo.git.Git')
+    @patch('gza.git.Git')
     def test_worktree_add_continues_on_push_failure(self, mock_git_class, tmp_path: Path):
         """Test that worktree_add continues even if push fails."""
         repo_dir = tmp_path / "repo"

@@ -15,14 +15,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install the CLI tool globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create theo user for isolation
-RUN useradd -m -s /bin/bash theo
+# Create gza user for isolation
+RUN useradd -m -s /bin/bash gza
 
-# Copy uv to theo user's path
+# Copy uv to gza user's path
 RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
-USER theo
-WORKDIR /home/theo
+USER gza
+WORKDIR /home/gza
 
 # Default command
 CMD ["claude"]

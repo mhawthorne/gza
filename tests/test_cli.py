@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 
-def run_theo(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    """Run theo command and return result."""
+def run_gza(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Run gza command and return result."""
     return subprocess.run(
-        ["uv", "run", "theo", *args],
+        ["uv", "run", "gza", *args],
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -18,19 +18,19 @@ def run_theo(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess
 
 
 def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
-    """Set up a minimal theo config file."""
-    config_path = tmp_path / "theo.yaml"
+    """Set up a minimal gza config file."""
+    config_path = tmp_path / "gza.yaml"
     config_path.write_text(f"project_name: {project_name}\n")
 
 
 def setup_db_with_tasks(tmp_path: Path, tasks: list[dict]) -> None:
     """Set up a SQLite database with the given tasks (also creates config)."""
-    from theo.db import SqliteTaskStore
+    from gza.db import SqliteTaskStore
 
     # Ensure config exists
     setup_config(tmp_path)
 
-    db_path = tmp_path / ".theo" / "theo.db"
+    db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteTaskStore(db_path)
 
@@ -43,7 +43,7 @@ def setup_db_with_tasks(tmp_path: Path, tasks: list[dict]) -> None:
 
 
 class TestHistoryCommand:
-    """Tests for 'theo history' command."""
+    """Tests for 'gza history' command."""
 
     def test_history_with_tasks(self, tmp_path: Path):
         """History command works with SQLite tasks."""
@@ -53,7 +53,7 @@ class TestHistoryCommand:
             {"prompt": "Test task 3", "status": "pending"},
         ])
 
-        result = run_theo("history", str(tmp_path))
+        result = run_gza("history", str(tmp_path))
 
         assert result.returncode == 0
         assert "Test task 1" in result.stdout
@@ -63,7 +63,7 @@ class TestHistoryCommand:
     def test_history_with_no_tasks(self, tmp_path: Path):
         """History command handles missing database gracefully."""
         setup_config(tmp_path)
-        result = run_theo("history", str(tmp_path))
+        result = run_gza("history", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
@@ -73,14 +73,14 @@ class TestHistoryCommand:
         # Create empty database
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_theo("history", str(tmp_path))
+        result = run_gza("history", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
 
 
 class TestNextCommand:
-    """Tests for 'theo next' command."""
+    """Tests for 'gza next' command."""
 
     def test_next_shows_pending_tasks(self, tmp_path: Path):
         """Next command shows pending tasks."""
@@ -90,7 +90,7 @@ class TestNextCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
 
         assert result.returncode == 0
         assert "First pending task" in result.stdout
@@ -103,42 +103,42 @@ class TestNextCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
 
 
 class TestAddCommand:
-    """Tests for 'theo add' command."""
+    """Tests for 'gza add' command."""
 
     def test_add_with_inline_prompt(self, tmp_path: Path):
         """Add command with inline prompt creates a task."""
         setup_config(tmp_path)
-        result = run_theo("add", "Test inline task", str(tmp_path))
+        result = run_gza("add", "Test inline task", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task was added
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
         assert "Test inline task" in result.stdout
 
     def test_add_explore_task(self, tmp_path: Path):
         """Add command with --explore flag creates explore task."""
         setup_config(tmp_path)
-        result = run_theo("add", "--explore", "Explore the codebase", str(tmp_path))
+        result = run_gza("add", "--explore", "Explore the codebase", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task type is shown
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
         assert "[explore]" in result.stdout
 
 
 class TestShowCommand:
-    """Tests for 'theo show' command."""
+    """Tests for 'gza show' command."""
 
     def test_show_existing_task(self, tmp_path: Path):
         """Show command displays task details."""
@@ -146,7 +146,7 @@ class TestShowCommand:
             {"prompt": "A detailed task prompt", "status": "pending"},
         ])
 
-        result = run_theo("show", "1", str(tmp_path))
+        result = run_gza("show", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task #1" in result.stdout
@@ -157,14 +157,14 @@ class TestShowCommand:
         """Show command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_theo("show", "999", str(tmp_path))
+        result = run_gza("show", "999", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
 
 
 class TestDeleteCommand:
-    """Tests for 'theo delete' command."""
+    """Tests for 'gza delete' command."""
 
     def test_delete_with_force(self, tmp_path: Path):
         """Delete command with --force removes task without confirmation."""
@@ -172,27 +172,27 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_theo("delete", "1", "--force", str(tmp_path))
+        result = run_gza("delete", "1", "--force", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
 
         # Verify task was deleted
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
         assert "No pending tasks" in result.stdout
 
     def test_delete_nonexistent_task(self, tmp_path: Path):
         """Delete command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_theo("delete", "999", "--force", str(tmp_path))
+        result = run_gza("delete", "999", "--force", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
 
 
 class TestRetryCommand:
-    """Tests for 'theo retry' command."""
+    """Tests for 'gza retry' command."""
 
     def test_retry_completed_task(self, tmp_path: Path):
         """Retry command creates a new pending task from a completed task."""
@@ -200,14 +200,14 @@ class TestRetryCommand:
             {"prompt": "Original task", "status": "completed", "task_type": "implement"},
         ])
 
-        result = run_theo("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task #2" in result.stdout
         assert "retry of #1" in result.stdout
 
         # Verify new task was created with same prompt
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
         assert "Original task" in result.stdout
 
     def test_retry_failed_task(self, tmp_path: Path):
@@ -216,7 +216,7 @@ class TestRetryCommand:
             {"prompt": "Failed task", "status": "failed"},
         ])
 
-        result = run_theo("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task #2" in result.stdout
@@ -228,7 +228,7 @@ class TestRetryCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_theo("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", str(tmp_path))
 
         assert result.returncode == 1
         assert "Can only retry completed or failed" in result.stdout
@@ -237,17 +237,17 @@ class TestRetryCommand:
         """Retry command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_theo("retry", "999", str(tmp_path))
+        result = run_gza("retry", "999", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
 
     def test_retry_preserves_task_fields(self, tmp_path: Path):
         """Retry command preserves task_type, group, spec, and other fields."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         store = SqliteTaskStore(db_path)
 
         # Create a task with metadata
@@ -264,7 +264,7 @@ class TestRetryCommand:
         store.update(task)
 
         # Retry the task
-        result = run_theo("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -282,22 +282,22 @@ class TestRetryCommand:
 
 
 class TestConfigRequirements:
-    """Tests for theo.yaml configuration requirements."""
+    """Tests for gza.yaml configuration requirements."""
 
     def test_missing_config_file(self, tmp_path: Path):
-        """Commands fail when theo.yaml is missing."""
-        result = run_theo("next", str(tmp_path))
+        """Commands fail when gza.yaml is missing."""
+        result = run_gza("next", str(tmp_path))
 
         assert result.returncode == 1
         assert "Configuration file not found" in result.stderr
-        assert "theo init" in result.stderr
+        assert "gza init" in result.stderr
 
     def test_missing_project_name(self, tmp_path: Path):
         """Commands fail when project_name is missing from config."""
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         config_path.write_text("timeout_minutes: 5\n")
 
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_name" in result.stderr
@@ -305,10 +305,10 @@ class TestConfigRequirements:
 
     def test_unknown_keys_warning(self, tmp_path: Path):
         """Unknown keys in config produce warnings but don't fail."""
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_key: value\n")
 
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
 
         # Should succeed
         assert result.returncode == 0
@@ -318,29 +318,29 @@ class TestConfigRequirements:
 
 
 class TestValidateCommand:
-    """Tests for 'theo validate' command."""
+    """Tests for 'gza validate' command."""
 
     def test_validate_valid_config(self, tmp_path: Path):
         """Validate command succeeds with valid config."""
         setup_config(tmp_path)
-        result = run_theo("validate", str(tmp_path))
+        result = run_gza("validate", str(tmp_path))
 
         assert result.returncode == 0
         assert "valid" in result.stdout.lower()
 
     def test_validate_missing_config(self, tmp_path: Path):
         """Validate command fails with missing config."""
-        result = run_theo("validate", str(tmp_path))
+        result = run_gza("validate", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
 
     def test_validate_missing_project_name(self, tmp_path: Path):
         """Validate command fails when project_name is missing."""
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         config_path.write_text("timeout_minutes: 5\n")
 
-        result = run_theo("validate", str(tmp_path))
+        result = run_gza("validate", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_name" in result.stdout
@@ -348,10 +348,10 @@ class TestValidateCommand:
 
     def test_validate_unknown_keys_warning(self, tmp_path: Path):
         """Validate command shows warnings for unknown keys."""
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_field: value\n")
 
-        result = run_theo("validate", str(tmp_path))
+        result = run_gza("validate", str(tmp_path))
 
         assert result.returncode == 0  # Unknown keys don't fail validation
         assert "unknown_field" in result.stdout
@@ -359,14 +359,14 @@ class TestValidateCommand:
 
 
 class TestInitCommand:
-    """Tests for 'theo init' command."""
+    """Tests for 'gza init' command."""
 
     def test_init_creates_config(self, tmp_path: Path):
         """Init command creates config in project root."""
-        result = run_theo("init", str(tmp_path))
+        result = run_gza("init", str(tmp_path))
 
         assert result.returncode == 0
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         assert config_path.exists()
 
         # Verify project_name is set (derived from directory name)
@@ -378,31 +378,31 @@ class TestInitCommand:
         """Init command does not overwrite existing config without --force."""
         setup_config(tmp_path, project_name="original")
 
-        result = run_theo("init", str(tmp_path))
+        result = run_gza("init", str(tmp_path))
 
         assert result.returncode == 1
         assert "already exists" in result.stdout
 
         # Verify original content is preserved
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         assert "original" in config_path.read_text()
 
     def test_init_force_overwrites(self, tmp_path: Path):
         """Init command overwrites existing config with --force."""
         setup_config(tmp_path, project_name="original")
 
-        result = run_theo("init", "--force", str(tmp_path))
+        result = run_gza("init", "--force", str(tmp_path))
 
         assert result.returncode == 0
 
         # Verify config was overwritten (has directory name, not "original")
-        config_path = tmp_path / "theo.yaml"
+        config_path = tmp_path / "gza.yaml"
         content = config_path.read_text()
         assert tmp_path.name in content
 
 
 class TestImportCommand:
-    """Tests for 'theo import' command."""
+    """Tests for 'gza import' command."""
 
     def test_import_from_yaml(self, tmp_path: Path):
         """Import command imports tasks from tasks.yaml."""
@@ -415,45 +415,45 @@ class TestImportCommand:
   status: completed
 """)
 
-        result = run_theo("import", str(tmp_path))
+        result = run_gza("import", str(tmp_path))
 
         assert result.returncode == 0
         assert "Imported 2 tasks" in result.stdout
 
         # Verify tasks were imported
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
         assert "Task from YAML" in result.stdout
 
     def test_import_no_yaml(self, tmp_path: Path):
         """Import command handles missing tasks.yaml."""
         setup_config(tmp_path)
-        result = run_theo("import", str(tmp_path))
+        result = run_gza("import", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
 
 
 class TestLogCommand:
-    """Tests for 'theo log' command."""
+    """Tests for 'gza log' command."""
 
     def test_log_by_task_id_single_json_format(self, tmp_path: Path):
         """Log command with --task parses single JSON format with successful result."""
         import json
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for log")
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
         # Create a single JSON log file (old format)
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         log_data = {
@@ -466,7 +466,7 @@ class TestLogCommand:
         }
         log_file.write_text(json.dumps(log_data))
 
-        result = run_theo("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task completed successfully!" in result.stdout
@@ -477,21 +477,21 @@ class TestLogCommand:
     def test_log_by_task_id_jsonl_format(self, tmp_path: Path):
         """Log command with --task parses JSONL format with successful result."""
         import json
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for JSONL log")
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
         # Create a JSONL log file (new format)
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         lines = [
@@ -509,7 +509,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_theo("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "This was parsed from JSONL!" in result.stdout
@@ -520,21 +520,21 @@ class TestLogCommand:
     def test_log_by_task_id_error_max_turns(self, tmp_path: Path):
         """Log command with --task handles JSONL format with error_max_turns result."""
         import json
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task that hit max turns")
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
         # Create a JSONL log file with error_max_turns (no result field)
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         lines = [
@@ -551,7 +551,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_theo("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 0
         assert "error_max_turns" in result.stdout
@@ -560,20 +560,20 @@ class TestLogCommand:
 
     def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
         """Log command with --task handles missing log file."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
         # Create a task with a log file path that doesn't exist
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task with missing log")
         task.status = "completed"
-        task.log_file = ".theo/logs/nonexistent.log"
+        task.log_file = ".gza/logs/nonexistent.log"
         store.update(task)
 
-        result = run_theo("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", str(tmp_path))
 
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
@@ -581,21 +581,21 @@ class TestLogCommand:
     def test_log_by_task_id_no_result_entry(self, tmp_path: Path):
         """Log command with --task shows formatted entries when no result entry exists."""
         import json
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task with incomplete log")
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
         # Create a JSONL log file with no result entry
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         lines = [
@@ -604,7 +604,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_theo("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", str(tmp_path))
 
         # Should show formatted entries instead of failing
         assert result.returncode == 0
@@ -615,12 +615,12 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create empty database
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_theo("log", "--task", "999", str(tmp_path))
+        result = run_gza("log", "--task", "999", str(tmp_path))
 
         assert result.returncode == 1
         assert "Task 999 not found" in result.stdout
@@ -629,12 +629,12 @@ class TestLogCommand:
         """Log command with --task rejects non-numeric ID."""
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_theo("log", "--task", "not-a-number", str(tmp_path))
+        result = run_gza("log", "--task", "not-a-number", str(tmp_path))
 
         assert result.returncode == 1
         assert "not a valid task ID" in result.stdout
@@ -642,26 +642,26 @@ class TestLogCommand:
     def test_log_by_slug_exact_match(self, tmp_path: Path):
         """Log command with --slug finds task by exact slug."""
         import json
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for slug lookup")
         task.task_id = "20260108-test-slug"
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         log_data = {"type": "result", "result": "Slug lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_theo("log", "--slug", "20260108-test-slug", str(tmp_path))
+        result = run_gza("log", "--slug", "20260108-test-slug", str(tmp_path))
 
         assert result.returncode == 0
         assert "Slug lookup works!" in result.stdout
@@ -669,26 +669,26 @@ class TestLogCommand:
     def test_log_by_slug_partial_match(self, tmp_path: Path):
         """Log command with --slug finds task by partial slug match."""
         import json
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for partial slug")
         task.task_id = "20260108-partial-slug-test"
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         log_data = {"type": "result", "result": "Partial match works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_theo("log", "--slug", "partial-slug", str(tmp_path))
+        result = run_gza("log", "--slug", "partial-slug", str(tmp_path))
 
         assert result.returncode == 0
         assert "Partial match works!" in result.stdout
@@ -697,12 +697,12 @@ class TestLogCommand:
         """Log command with --slug handles nonexistent slug."""
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_theo("log", "--slug", "nonexistent-slug", str(tmp_path))
+        result = run_gza("log", "--slug", "nonexistent-slug", str(tmp_path))
 
         assert result.returncode == 1
         assert "No task found matching slug" in result.stdout
@@ -710,22 +710,22 @@ class TestLogCommand:
     def test_log_by_worker_success(self, tmp_path: Path):
         """Log command with --worker finds log via worker registry."""
         import json
-        from theo.db import SqliteTaskStore
-        from theo.workers import WorkerRegistry, WorkerMetadata
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
 
         # Create task
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for worker lookup")
         task.status = "completed"
-        task.log_file = ".theo/logs/test.log"
+        task.log_file = ".gza/logs/test.log"
         store.update(task)
 
         # Create worker registry entry
-        workers_path = tmp_path / ".theo" / "workers"
+        workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_path)
         worker_id = registry.generate_worker_id()
@@ -736,19 +736,19 @@ class TestLogCommand:
             task_slug=task.task_id,
             started_at="2026-01-08T00:00:00Z",
             status="completed",
-            log_file=".theo/logs/test.log",
+            log_file=".gza/logs/test.log",
             worktree=None,
         )
         registry.register(worker)
 
         # Create log file
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
         log_data = {"type": "result", "result": "Worker lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_theo("log", "--worker", worker_id, str(tmp_path))
+        result = run_gza("log", "--worker", worker_id, str(tmp_path))
 
         assert result.returncode == 0
         assert "Worker lookup works!" in result.stdout
@@ -757,42 +757,42 @@ class TestLogCommand:
         """Log command with --worker handles nonexistent worker."""
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
         # Create empty workers directory
-        workers_path = tmp_path / ".theo" / "workers"
+        workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
 
-        result = run_theo("log", "--worker", "w-nonexistent", str(tmp_path))
+        result = run_gza("log", "--worker", "w-nonexistent", str(tmp_path))
 
         assert result.returncode == 1
         assert "Worker 'w-nonexistent' not found" in result.stdout
 
     def test_log_by_task_id_startup_failure(self, tmp_path: Path):
         """Log command shows startup error when log contains non-JSON content."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task with startup failure")
         task.status = "failed"
-        task.log_file = ".theo/logs/test-startup-error.log"
+        task.log_file = ".gza/logs/test-startup-error.log"
         store.update(task)
 
         # Create a log file with raw error text (simulating Docker startup failure)
-        log_dir = tmp_path / ".theo" / "logs"
+        log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test-startup-error.log"
         log_file.write_text("exec /usr/local/bin/docker-entrypoint.sh: argument list too long")
 
-        result = run_theo("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", str(tmp_path))
 
         # Should detect startup failure and display the error
         assert result.returncode == 1
@@ -805,26 +805,26 @@ class TestLogCommand:
         """Log command requires --task, --slug, or --worker flag."""
         setup_config(tmp_path)
 
-        result = run_theo("log", "123", str(tmp_path))
+        result = run_gza("log", "123", str(tmp_path))
 
         assert result.returncode == 2
         assert "one of the arguments --task/-t --slug/-s --worker/-w is required" in result.stderr
 
 
 class TestPrCommand:
-    """Tests for 'theo pr' command."""
+    """Tests for 'gza pr' command."""
 
     def test_pr_task_not_found(self, tmp_path: Path):
         """PR command handles nonexistent task."""
         setup_config(tmp_path)
 
         # Create empty database
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_theo("pr", "999", str(tmp_path))
+        result = run_gza("pr", "999", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -835,18 +835,18 @@ class TestPrCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_theo("pr", "1", str(tmp_path))
+        result = run_gza("pr", "1", str(tmp_path))
 
         assert result.returncode == 1
         assert "not completed" in result.stdout
 
     def test_pr_task_no_branch(self, tmp_path: Path):
         """PR command rejects tasks without branches."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Completed task without branch")
@@ -855,18 +855,18 @@ class TestPrCommand:
         task.has_commits = True
         store.update(task)
 
-        result = run_theo("pr", "1", str(tmp_path))
+        result = run_gza("pr", "1", str(tmp_path))
 
         assert result.returncode == 1
         assert "no branch" in result.stdout
 
     def test_pr_task_no_commits(self, tmp_path: Path):
         """PR command rejects tasks without commits."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Completed task without commits")
@@ -875,21 +875,21 @@ class TestPrCommand:
         task.has_commits = False
         store.update(task)
 
-        result = run_theo("pr", "1", str(tmp_path))
+        result = run_gza("pr", "1", str(tmp_path))
 
         assert result.returncode == 1
         assert "no commits" in result.stdout
 
 
 class TestGroupsCommand:
-    """Tests for 'theo groups' command."""
+    """Tests for 'gza groups' command."""
 
     def test_groups_with_tasks(self, tmp_path: Path):
         """Groups command shows all groups with task counts."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -901,7 +901,7 @@ class TestGroupsCommand:
         task3.completed_at = datetime.now(timezone.utc)
         store.update(task3)
 
-        result = run_theo("groups", str(tmp_path))
+        result = run_gza("groups", str(tmp_path))
 
         assert result.returncode == 0
         assert "group-a" in result.stdout
@@ -910,25 +910,25 @@ class TestGroupsCommand:
     def test_groups_with_no_groups(self, tmp_path: Path):
         """Groups command handles no groups."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_theo("groups", str(tmp_path))
+        result = run_gza("groups", str(tmp_path))
 
         assert result.returncode == 0
 
 
 class TestStatusCommand:
-    """Tests for 'theo status <group>' command."""
+    """Tests for 'gza status <group>' command."""
 
     def test_status_with_group(self, tmp_path: Path):
         """Status command shows tasks in a group."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -939,7 +939,7 @@ class TestStatusCommand:
         store.update(task1)
         store.add("Second task", group="test-group", depends_on=task1.id)
 
-        result = run_theo("status", "test-group", str(tmp_path))
+        result = run_gza("status", "test-group", str(tmp_path))
 
         assert result.returncode == 0
         assert "test-group" in result.stdout
@@ -948,21 +948,21 @@ class TestStatusCommand:
 
 
 class TestEditCommand:
-    """Tests for 'theo edit' command."""
+    """Tests for 'gza edit' command."""
 
     def test_edit_group(self, tmp_path: Path):
         """Edit command can change task group."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
         task = store.add("Test task")
         assert task.group is None
 
-        result = run_theo("edit", str(task.id), "--group", "new-group", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--group", "new-group", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -972,17 +972,17 @@ class TestEditCommand:
 
     def test_edit_remove_group(self, tmp_path: Path):
         """Edit command can remove task from group."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
         task = store.add("Test task", group="old-group")
         assert task.group == "old-group"
 
-        result = run_theo("edit", str(task.id), "--group", "", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--group", "", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -992,17 +992,17 @@ class TestEditCommand:
 
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
         task = store.add("Test task")
         assert task.create_review is False
 
-        result = run_theo("edit", str(task.id), "--review", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--review", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1012,14 +1012,14 @@ class TestEditCommand:
 
 
 class TestNextCommandWithDependencies:
-    """Tests for 'theo next' command with dependencies."""
+    """Tests for 'gza next' command with dependencies."""
 
     def test_next_skips_blocked_tasks(self, tmp_path: Path):
         """Next command skips tasks blocked by dependencies."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -1028,7 +1028,7 @@ class TestNextCommandWithDependencies:
         task2 = store.add("Blocked task", depends_on=task1.id)
         task3 = store.add("Independent task")
 
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
 
         assert result.returncode == 0
         # Should show task1 or task3, but not task2
@@ -1036,10 +1036,10 @@ class TestNextCommandWithDependencies:
 
     def test_next_all_shows_blocked_tasks(self, tmp_path: Path):
         """Next --all command shows blocked tasks."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -1047,7 +1047,7 @@ class TestNextCommandWithDependencies:
         task1 = store.add("First task")
         task2 = store.add("Blocked task", depends_on=task1.id)
 
-        result = run_theo("next", "--all", str(tmp_path))
+        result = run_gza("next", "--all", str(tmp_path))
 
         assert result.returncode == 0
         assert "First task" in result.stdout
@@ -1055,10 +1055,10 @@ class TestNextCommandWithDependencies:
 
     def test_next_shows_blocked_count(self, tmp_path: Path):
         """Next command shows count of blocked tasks."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -1068,7 +1068,7 @@ class TestNextCommandWithDependencies:
         store.add("Blocked task 2", depends_on=task1.id)
         store.add("Independent task")
 
-        result = run_theo("next", str(tmp_path))
+        result = run_gza("next", str(tmp_path))
 
         assert result.returncode == 0
         # Should mention 2 blocked tasks
@@ -1076,12 +1076,12 @@ class TestNextCommandWithDependencies:
 
 
 class TestAddCommandWithChaining:
-    """Tests for 'theo add' command with chaining features."""
+    """Tests for 'gza add' command with chaining features."""
 
     def test_add_with_type_plan(self, tmp_path: Path):
         """Add command can create plan tasks."""
         setup_config(tmp_path)
-        result = run_theo("add", "--type", "plan", "Create a plan", str(tmp_path))
+        result = run_gza("add", "--type", "plan", "Create a plan", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -1089,29 +1089,29 @@ class TestAddCommandWithChaining:
     def test_add_with_type_implement(self, tmp_path: Path):
         """Add command can create implement tasks."""
         setup_config(tmp_path)
-        result = run_theo("add", "--type", "implement", "Implement feature", str(tmp_path))
+        result = run_gza("add", "--type", "implement", "Implement feature", str(tmp_path))
 
         assert result.returncode == 0
 
     def test_add_with_type_review(self, tmp_path: Path):
         """Add command can create review tasks."""
         setup_config(tmp_path)
-        result = run_theo("add", "--type", "review", "Review implementation", str(tmp_path))
+        result = run_gza("add", "--type", "review", "Review implementation", str(tmp_path))
 
         assert result.returncode == 0
 
     def test_add_with_based_on(self, tmp_path: Path):
         """Add command can create tasks with based_on reference."""
-        from theo.db import SqliteTaskStore
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
         task1 = store.add("First task")
 
-        result = run_theo("add", "--based-on", str(task1.id), "Follow-up task", str(tmp_path))
+        result = run_gza("add", "--based-on", str(task1.id), "Follow-up task", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1130,14 +1130,14 @@ class TestAddCommandWithChaining:
         spec_file.parent.mkdir(parents=True, exist_ok=True)
         spec_file.write_text("# Feature Spec\n\nThis is a test spec.")
 
-        result = run_theo("add", "--spec", "specs/feature.md", "Implement feature", str(tmp_path))
+        result = run_gza("add", "--spec", "specs/feature.md", "Implement feature", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify spec was set
-        from theo.db import SqliteTaskStore
-        db_path = tmp_path / ".theo" / "theo.db"
+        from gza.db import SqliteTaskStore
+        db_path = tmp_path / ".gza" / "gza.db"
         store = SqliteTaskStore(db_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Implement feature"), None)
@@ -1148,7 +1148,7 @@ class TestAddCommandWithChaining:
         """Add command with --spec fails if file doesn't exist."""
         setup_config(tmp_path)
 
-        result = run_theo("add", "--spec", "nonexistent.md", "Implement feature", str(tmp_path))
+        result = run_gza("add", "--spec", "nonexistent.md", "Implement feature", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: Spec file not found: nonexistent.md" in result.stdout
@@ -1159,16 +1159,16 @@ class TestBuildPromptWithSpec:
 
     def test_build_prompt_includes_spec_content(self, tmp_path: Path):
         """build_prompt includes spec file content when task has spec."""
-        from theo.config import Config
-        from theo.db import SqliteTaskStore, Task
-        from theo.runner import build_prompt
+        from gza.config import Config
+        from gza.db import SqliteTaskStore, Task
+        from gza.runner import build_prompt
 
         # Setup config
         setup_config(tmp_path)
         config = Config.load(tmp_path)
 
         # Setup database
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -1192,16 +1192,16 @@ class TestBuildPromptWithSpec:
 
     def test_build_prompt_without_spec(self, tmp_path: Path):
         """build_prompt works correctly when task has no spec."""
-        from theo.config import Config
-        from theo.db import SqliteTaskStore, Task
-        from theo.runner import build_prompt
+        from gza.config import Config
+        from gza.db import SqliteTaskStore, Task
+        from gza.runner import build_prompt
 
         # Setup config
         setup_config(tmp_path)
         config = Config.load(tmp_path)
 
         # Setup database
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -1221,8 +1221,8 @@ class TestGetTaskOutput:
 
     def test_prefers_db_content(self, tmp_path: Path):
         """_get_task_output should prefer output_content from DB."""
-        from theo.runner import _get_task_output
-        from theo.db import Task
+        from gza.runner import _get_task_output
+        from gza.db import Task
 
         task = Task(
             id=1,
@@ -1234,11 +1234,11 @@ class TestGetTaskOutput:
 
     def test_falls_back_to_file(self, tmp_path: Path):
         """_get_task_output should fall back to file when no DB content."""
-        from theo.runner import _get_task_output
-        from theo.db import Task
+        from gza.runner import _get_task_output
+        from gza.db import Task
 
         # Create report file
-        report_dir = tmp_path / ".theo" / "plans"
+        report_dir = tmp_path / ".gza" / "plans"
         report_dir.mkdir(parents=True)
         report_file = report_dir / "test.md"
         report_file.write_text("Content from file")
@@ -1246,7 +1246,7 @@ class TestGetTaskOutput:
         task = Task(
             id=2,
             prompt="Test",
-            report_file=".theo/plans/test.md",
+            report_file=".gza/plans/test.md",
             output_content=None,
         )
         result = _get_task_output(task, tmp_path)
@@ -1254,11 +1254,11 @@ class TestGetTaskOutput:
 
     def test_prefers_db_over_file(self, tmp_path: Path):
         """_get_task_output should prefer DB when both exist."""
-        from theo.runner import _get_task_output
-        from theo.db import Task
+        from gza.runner import _get_task_output
+        from gza.db import Task
 
         # Create report file
-        report_dir = tmp_path / ".theo" / "plans"
+        report_dir = tmp_path / ".gza" / "plans"
         report_dir.mkdir(parents=True)
         report_file = report_dir / "test.md"
         report_file.write_text("Content from file")
@@ -1266,7 +1266,7 @@ class TestGetTaskOutput:
         task = Task(
             id=3,
             prompt="Test",
-            report_file=".theo/plans/test.md",
+            report_file=".gza/plans/test.md",
             output_content="DB wins",
         )
         result = _get_task_output(task, tmp_path)
@@ -1274,8 +1274,8 @@ class TestGetTaskOutput:
 
     def test_returns_none_when_no_content(self, tmp_path: Path):
         """_get_task_output should return None when no content available."""
-        from theo.runner import _get_task_output
-        from theo.db import Task
+        from gza.runner import _get_task_output
+        from gza.db import Task
 
         task = Task(
             id=4,
@@ -1287,16 +1287,16 @@ class TestGetTaskOutput:
 
 
 class TestPsCommand:
-    """Tests for 'theo ps' command."""
+    """Tests for 'gza ps' command."""
 
     def test_ps_shows_task_id(self, tmp_path: Path):
         """PS command should display task ID for running workers."""
-        from theo.db import SqliteTaskStore
-        from theo.workers import WorkerRegistry, WorkerMetadata
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
 
         # Setup config and database
         setup_config(tmp_path)
-        db_path = tmp_path / ".theo" / "theo.db"
+        db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
@@ -1304,7 +1304,7 @@ class TestPsCommand:
         task = store.add("Test task for ps command")
 
         # Create workers directory and register a worker
-        workers_dir = tmp_path / ".theo" / "workers"
+        workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_dir)
 
@@ -1321,7 +1321,7 @@ class TestPsCommand:
         registry.register(worker)
 
         # Run ps command
-        result = run_theo("ps", "--all", cwd=tmp_path)
+        result = run_gza("ps", "--all", cwd=tmp_path)
 
         # Verify task ID is in output
         assert result.returncode == 0

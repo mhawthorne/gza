@@ -4,7 +4,7 @@ You are an automated code reviewer for this repository.
 
 ## Project Context
 
-Repo goal: theo is a CLI tool for running autonomous AI coding agents (Claude, Gemini) on development tasks. It manages task queues, git branches, logging, and supports task chaining with dependencies.
+Repo goal: gza is a CLI tool for running autonomous AI coding agents (Claude, Gemini) on development tasks. It manages task queues, git branches, logging, and supports task chaining with dependencies.
 
 Repo instructions (canonical): see AGENTS.md.
 

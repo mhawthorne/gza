@@ -11,17 +11,17 @@ from pathlib import Path
 
 import pytest
 
-from theo.config import Config
-from theo.providers import ClaudeProvider, GeminiProvider
+from gza.config import Config
+from gza.providers import ClaudeProvider, GeminiProvider
 
 
 # Skip all tests in this module unless explicitly running integration tests
 pytestmark = pytest.mark.integration
 
 
-def _load_theo_env() -> None:
-    """Load ~/.theo/.env if it exists (same as runner.py does)."""
-    home_env = Path.home() / ".theo" / ".env"
+def _load_gza_env() -> None:
+    """Load ~/.gza/.env if it exists (same as runner.py does)."""
+    home_env = Path.home() / ".gza" / ".env"
     if home_env.exists():
         with open(home_env) as f:
             for line in f:
@@ -33,8 +33,8 @@ def _load_theo_env() -> None:
                     os.environ.setdefault(key.strip(), value.strip())
 
 
-# Load env vars from ~/.theo/.env at module import time
-_load_theo_env()
+# Load env vars from ~/.gza/.env at module import time
+_load_gza_env()
 
 
 def has_claude_api_key() -> bool:

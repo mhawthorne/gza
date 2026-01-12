@@ -6,14 +6,14 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from theo.config import Config
-from theo.providers import (
+from gza.config import Config
+from gza.providers import (
     get_provider,
     ClaudeProvider,
     GeminiProvider,
     DockerConfig,
 )
-from theo.providers.base import (
+from gza.providers.base import (
     build_docker_cmd,
     DOCKERFILE_TEMPLATE,
     is_docker_running,
@@ -21,7 +21,7 @@ from theo.providers.base import (
     ensure_docker_image,
     _get_image_created_time,
 )
-from theo.providers.gemini import calculate_cost, GEMINI_PRICING
+from gza.providers.gemini import calculate_cost, GEMINI_PRICING
 
 
 class TestGetProvider:
@@ -65,11 +65,11 @@ class TestDockerConfig:
 
     def test_claude_docker_config(self, tmp_path):
         """Claude should have correct Docker config."""
-        from theo.providers.claude import _get_docker_config
+        from gza.providers.claude import _get_docker_config
 
-        config = _get_docker_config("my-project-theo")
+        config = _get_docker_config("my-project-gza")
 
-        assert config.image_name == "my-project-theo"
+        assert config.image_name == "my-project-gza"
         assert config.npm_package == "@anthropic-ai/claude-code"
         assert config.cli_command == "claude"
         assert config.config_dir == ".claude"
@@ -77,11 +77,11 @@ class TestDockerConfig:
 
     def test_gemini_docker_config(self, tmp_path):
         """Gemini should have correct Docker config."""
-        from theo.providers.gemini import _get_docker_config
+        from gza.providers.gemini import _get_docker_config
 
-        config = _get_docker_config("my-project-theo-gemini")
+        config = _get_docker_config("my-project-gza-gemini")
 
-        assert config.image_name == "my-project-theo-gemini"
+        assert config.image_name == "my-project-gza-gemini"
         assert config.npm_package == "@google/gemini-cli"
         assert config.cli_command == "gemini"
         assert config.config_dir is None  # Uses API key auth, no need to mount ~/.gemini
@@ -146,7 +146,7 @@ class TestBuildDockerCmd:
         assert len(v_indices) >= 2
         config_mount = cmd[v_indices[1] + 1]
         assert ".myconfig" in config_mount
-        assert "/home/theo/.myconfig" in config_mount
+        assert "/home/gza/.myconfig" in config_mount
 
     def test_passes_env_vars_when_set(self, tmp_path):
         """Should pass environment variables when they are set."""
@@ -204,15 +204,15 @@ class TestDockerfileTemplate:
         )
         assert 'CMD ["gemini"]' in content
 
-    def test_template_creates_theo_user(self):
-        """Template should create theo user for isolation."""
+    def test_template_creates_gza_user(self):
+        """Template should create gza user for isolation."""
         content = DOCKERFILE_TEMPLATE.format(
             npm_package="@test/cli",
             cli_command="test",
         )
         assert "useradd" in content
-        assert "theo" in content
-        assert "USER theo" in content
+        assert "gza" in content
+        assert "USER gza" in content
 
 
 class TestGeminiCostCalculation:
@@ -394,7 +394,7 @@ class TestDockerDaemonCheck:
 
     def test_is_docker_running_returns_true_when_daemon_available(self):
         """Should return True when docker info succeeds."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             assert is_docker_running() is True
             mock_run.assert_called_once()
@@ -404,20 +404,20 @@ class TestDockerDaemonCheck:
 
     def test_is_docker_running_returns_false_when_daemon_not_available(self):
         """Should return False when docker info fails."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1)
             assert is_docker_running() is False
 
     def test_is_docker_running_returns_false_on_timeout(self):
         """Should return False when docker info times out."""
         import subprocess
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(cmd="docker", timeout=5)
             assert is_docker_running() is False
 
     def test_is_docker_running_returns_false_when_docker_not_installed(self):
         """Should return False when docker command not found."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.side_effect = FileNotFoundError()
             assert is_docker_running() is False
 
@@ -431,7 +431,7 @@ class TestDockerDaemonCheck:
             env_vars=[],
         )
 
-        with patch("theo.providers.base.is_docker_running", return_value=False):
+        with patch("gza.providers.base.is_docker_running", return_value=False):
             result = verify_docker_credentials(
                 docker_config=docker_config,
                 version_cmd=["testcli", "--version"],
@@ -454,8 +454,8 @@ class TestDockerDaemonCheck:
             env_vars=[],
         )
 
-        with patch("theo.providers.base.is_docker_running", return_value=True):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.is_docker_running", return_value=True):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(
                     returncode=0,
                     stdout="v1.0.0",
@@ -481,7 +481,7 @@ class TestClaudeErrorTypeExtraction:
     def test_extracts_max_turns_error_from_result(self, tmp_path):
         """Should set error_type='max_turns' when result has subtype error_max_turns."""
         import json
-        from theo.providers.claude import ClaudeProvider
+        from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
         log_file = tmp_path / "test.log"
@@ -497,7 +497,7 @@ class TestClaudeErrorTypeExtraction:
             }) + "\n",
         ]
 
-        with patch("theo.providers.base.subprocess.Popen") as mock_popen:
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
             mock_process = MagicMock()
             mock_process.stdout = iter(json_lines)
             mock_process.wait.return_value = None
@@ -518,7 +518,7 @@ class TestClaudeErrorTypeExtraction:
     def test_no_error_type_on_success(self, tmp_path):
         """Should not set error_type when result is successful."""
         import json
-        from theo.providers.claude import ClaudeProvider
+        from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
         log_file = tmp_path / "test.log"
@@ -534,7 +534,7 @@ class TestClaudeErrorTypeExtraction:
             }) + "\n",
         ]
 
-        with patch("theo.providers.base.subprocess.Popen") as mock_popen:
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
             mock_process = MagicMock()
             mock_process.stdout = iter(json_lines)
             mock_process.wait.return_value = None
@@ -557,7 +557,7 @@ class TestGetImageCreatedTime:
 
     def test_returns_timestamp_when_image_exists(self):
         """Should return Unix timestamp when image exists."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout="2025-01-08T10:30:00.123456789Z\n",
@@ -571,7 +571,7 @@ class TestGetImageCreatedTime:
 
     def test_returns_none_when_image_not_found(self):
         """Should return None when image doesn't exist."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="")
             result = _get_image_created_time("nonexistent-image")
 
@@ -579,7 +579,7 @@ class TestGetImageCreatedTime:
 
     def test_handles_timestamps_without_nanoseconds(self):
         """Should handle timestamps without fractional seconds."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout="2025-01-08T10:30:00Z\n",
@@ -590,7 +590,7 @@ class TestGetImageCreatedTime:
 
     def test_returns_none_on_invalid_timestamp(self):
         """Should return None for unparseable timestamps."""
-        with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout="not-a-timestamp\n",
@@ -614,17 +614,17 @@ class TestEnsureDockerImage:
         )
 
         # Create Dockerfile
-        theo_dir = tmp_path / ".theo"
-        theo_dir.mkdir()
-        dockerfile = theo_dir / "Dockerfile.testcli"
+        etc_dir = tmp_path / "etc"
+        etc_dir.mkdir()
+        dockerfile = etc_dir / "Dockerfile.testcli"
         dockerfile.write_text("FROM node:20-slim")
 
         # Mock image as newer than Dockerfile
         dockerfile_mtime = dockerfile.stat().st_mtime
         image_time = dockerfile_mtime + 100  # Image created after Dockerfile
 
-        with patch("theo.providers.base._get_image_created_time", return_value=image_time):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base._get_image_created_time", return_value=image_time):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is True
@@ -642,17 +642,17 @@ class TestEnsureDockerImage:
         )
 
         # Create Dockerfile
-        theo_dir = tmp_path / ".theo"
-        theo_dir.mkdir()
-        dockerfile = theo_dir / "Dockerfile.testcli"
+        etc_dir = tmp_path / "etc"
+        etc_dir.mkdir()
+        dockerfile = etc_dir / "Dockerfile.testcli"
         dockerfile.write_text("FROM node:20-slim")
 
         # Mock image as older than Dockerfile
         dockerfile_mtime = dockerfile.stat().st_mtime
         image_time = dockerfile_mtime - 100  # Image created before Dockerfile
 
-        with patch("theo.providers.base._get_image_created_time", return_value=image_time):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base._get_image_created_time", return_value=image_time):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 result = ensure_docker_image(docker_config, tmp_path)
 
@@ -673,8 +673,8 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("theo.providers.base._get_image_created_time", return_value=None):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base._get_image_created_time", return_value=None):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 result = ensure_docker_image(docker_config, tmp_path)
 
@@ -692,14 +692,14 @@ class TestEnsureDockerImage:
         )
 
         # Create custom Dockerfile with extra content
-        theo_dir = tmp_path / ".theo"
-        theo_dir.mkdir()
-        dockerfile = theo_dir / "Dockerfile.testcli"
+        etc_dir = tmp_path / "etc"
+        etc_dir.mkdir()
+        dockerfile = etc_dir / "Dockerfile.testcli"
         custom_content = "FROM python:3.12\nRUN pip install pytest"
         dockerfile.write_text(custom_content)
 
-        with patch("theo.providers.base._get_image_created_time", return_value=None):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base._get_image_created_time", return_value=None):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 ensure_docker_image(docker_config, tmp_path)
 
@@ -716,12 +716,12 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("theo.providers.base._get_image_created_time", return_value=None):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base._get_image_created_time", return_value=None):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 ensure_docker_image(docker_config, tmp_path)
 
-        dockerfile = tmp_path / ".theo" / "Dockerfile.testcli"
+        dockerfile = tmp_path / "etc" / "Dockerfile.testcli"
         assert dockerfile.exists()
         content = dockerfile.read_text()
         assert "@test/cli" in content
@@ -737,8 +737,8 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("theo.providers.base._get_image_created_time", return_value=None):
-            with patch("theo.providers.base.subprocess.run") as mock_run:
+        with patch("gza.providers.base._get_image_created_time", return_value=None):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=1)
                 result = ensure_docker_image(docker_config, tmp_path)
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from theo.tasks import Task, YamlTaskStore, LiteralString
+from gza.tasks import Task, YamlTaskStore, LiteralString
 
 
 class TestTaskSerialization:

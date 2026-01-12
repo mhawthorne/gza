@@ -20,20 +20,20 @@ class TestWorkerSpawning:
     """Tests for worker process spawning."""
 
     def test_python_module_invocation(self):
-        """Test that 'python -m theo' works for spawning workers.
+        """Test that 'python -m gza' works for spawning workers.
 
-        This test verifies that the theo package can be invoked as a module,
+        This test verifies that the gza package can be invoked as a module,
         which is required for background worker spawning. The worker spawn
-        command uses `sys.executable -m theo work --worker-mode ...`.
+        command uses `sys.executable -m gza work --worker-mode ...`.
         """
         result = subprocess.run(
-            [sys.executable, "-m", "theo", "--help"],
+            [sys.executable, "-m", "gza", "--help"],
             capture_output=True,
             text=True,
             timeout=10,
         )
 
-        assert result.returncode == 0, f"Failed to run 'python -m theo': {result.stderr}"
+        assert result.returncode == 0, f"Failed to run 'python -m gza': {result.stderr}"
         assert "usage" in result.stdout.lower(), f"Unexpected output: {result.stdout}"
 
     def test_worker_mode_flag_accepted(self):
@@ -44,7 +44,7 @@ class TestWorkerSpawning:
         """
         # This should fail with "no pending tasks" not "unrecognized argument"
         result = subprocess.run(
-            [sys.executable, "-m", "theo", "work", "--worker-mode", "."],
+            [sys.executable, "-m", "gza", "work", "--worker-mode", "."],
             capture_output=True,
             text=True,
             timeout=10,

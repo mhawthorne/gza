@@ -1,4 +1,4 @@
-project_name: theo
+project_name: gza
 use_docker: true
 timeout_minutes: 10
 max_turns: 70

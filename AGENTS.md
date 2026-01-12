@@ -1,40 +1,40 @@
-# Theo
+# Gza
 
 A coding AI agent runner for Claude Code.
 
 ## Quick Reference
 
-When the user asks to "add a task" or "create a task", use `uv run theo add "..."` - do NOT edit `etc/todo.txt` or other manual todo files.
+When the user asks to "add a task" or "create a task", use `uv run gza add "..."` - do NOT edit `etc/todo.txt` or other manual todo files.
 
 ## Usage
 
 ```
-theo init [project_dir]     # Generate new theo.yaml with defaults
-theo work [project_dir]     # Run the next pending task
-theo next [project_dir]     # List upcoming pending tasks
-theo history [project_dir]  # List recent completed/failed tasks
-theo stats [project_dir]    # Show cost and usage statistics
-theo validate [project_dir] # Validate theo.yaml configuration
+gza init [project_dir]     # Generate new gza.yaml with defaults
+gza work [project_dir]     # Run the next pending task
+gza next [project_dir]     # List upcoming pending tasks
+gza history [project_dir]  # List recent completed/failed tasks
+gza stats [project_dir]    # Show cost and usage statistics
+gza validate [project_dir] # Validate gza.yaml configuration
 ```
 
 Options for `init`:
-- `--force` - Overwrite existing theo.yaml file
+- `--force` - Overwrite existing gza.yaml file
 
 Options for `stats`:
 - `--last N` - Show last N tasks (default: 5)
 
 ## Architecture
 
-Tasks are stored in a SQLite database (`.theo/theo.db`), not in YAML files. The database handles task state, history, and coordination.
+Tasks are stored in a SQLite database (`.gza/gza.db`), not in YAML files. The database handles task state, history, and coordination.
 
 ## Project Structure
 
 Key modules:
-- `src/theo/db.py` - SQLite task storage with `Task` class (uses `prompt` field)
-- `src/theo/tasks.py` - YAML task storage with `Task` class (uses `description` field) - LEGACY
-- `src/theo/cli.py` - CLI commands
-- `src/theo/runner.py` - Executes tasks via Claude Code
-- `src/theo/config.py` - Configuration loading
+- `src/gza/db.py` - SQLite task storage with `Task` class (uses `prompt` field)
+- `src/gza/tasks.py` - YAML task storage with `Task` class (uses `description` field) - LEGACY
+- `src/gza/cli.py` - CLI commands
+- `src/gza/runner.py` - Executes tasks via Claude Code
+- `src/gza/config.py` - Configuration loading
 
 **Important**: There are TWO Task classes:
 - `db.Task` (SQLite) - The primary storage, uses `prompt` field
@@ -42,14 +42,14 @@ Key modules:
 
 ## Running in Docker
 
-Theo tasks run inside a Docker container. The container:
+Gza tasks run inside a Docker container. The container:
 - Mounts the project at `/workspace`
 - Has Python 3.11+ but limited pre-installed packages
 - Use `uv run` for all commands (e.g., `uv run pytest tests/ -v`)
 
 **Do NOT use** `python -m pytest` or `pip install` directly - always use `uv run`.
 
-**Do NOT modify files outside `/workspace/theo/`** unless explicitly instructed. Other directories under `/workspace/` are sibling projects.
+**Do NOT modify files outside `/workspace/gza/`** unless explicitly instructed. Other directories under `/workspace/` are sibling projects.
 
 ## Renaming/Refactoring Tips
 
@@ -65,21 +65,21 @@ When renaming a field across the codebase:
 
 ## Creating Tasks from Conversations
 
-When a conversation identifies work to be done, create a theo task rather than implementing inline:
+When a conversation identifies work to be done, create a gza task rather than implementing inline:
 
 ```bash
 # Basic task
-uv run theo add "description of what needs to be done"
+uv run gza add "description of what needs to be done"
 
 # With task type (plan, implement, review, explore)
-uv run theo add --type plan "explore authentication options and propose approach"
-uv run theo add --type implement "add user authentication with JWT"
+uv run gza add --type plan "explore authentication options and propose approach"
+uv run gza add --type implement "add user authentication with JWT"
 
 # Auto-review after implementation
-uv run theo add --type implement --review "add dark mode toggle"
+uv run gza add --type implement --review "add dark mode toggle"
 
 # Task chaining - implementation based on a plan
-uv run theo add --type implement --based-on 5 "implement the approach from task #5"
+uv run gza add --type implement --based-on 5 "implement the approach from task #5"
 ```
 
 Tips for good task descriptions:
@@ -87,7 +87,7 @@ Tips for good task descriptions:
 - Reference file paths or components when known
 - For multi-step work, create a `--type plan` task first
 - Use `--review` flag for significant changes that warrant code review
-- Use `theo edit <id>` to update a task's prompt instead of deleting and recreating
+- Use `gza edit <id>` to update a task's prompt instead of deleting and recreating
 
 ## Development
 

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from theo.db import SqliteTaskStore
-from theo.importer import (
+from gza.db import SqliteTaskStore
+from gza.importer import (
     ImportTask,
     ValidationError,
     parse_import_file,
@@ -18,7 +18,7 @@ from theo.importer import (
 @pytest.fixture
 def store(tmp_path: Path) -> SqliteTaskStore:
     """Create a temporary task store."""
-    db_path = tmp_path / ".theo" / "theo.db"
+    db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return SqliteTaskStore(db_path)
 
