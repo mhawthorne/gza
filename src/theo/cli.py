@@ -1814,6 +1814,33 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Resume a failed task from where it left off."""
+    config = Config.load(args.project_dir)
+    if args.no_docker:
+        config.use_docker = False
+
+    store = get_store(config)
+
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    if task.status != "failed":
+        print(f"Error: Can only resume failed tasks (task is {task.status})")
+        return 1
+
+    if not task.session_id:
+        print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")
+        print("Use 'theo retry' to start fresh instead")
+        return 1
+
+    # Resume the task
+    print(f"=== Resuming Task #{args.task_id} ===")
+    return run(config, task_id=args.task_id, resume=True)
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
     config = Config.load(args.project_dir)
@@ -1844,6 +1871,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"Log: {task.log_file}")
     if task.report_file:
         print(f"Report: {task.report_file}")
+    if task.session_id:
+        print(f"Session ID: {task.session_id}")
     print()
     print("Prompt:")
     print("-" * 50)
@@ -2272,6 +2301,20 @@ def main() -> int:
     )
     add_common_args(retry_parser)
 
+    # resume command
+    resume_parser = subparsers.add_parser("resume", help="Resume a failed task from where it left off")
+    resume_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to resume",
+    )
+    resume_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker",
+    )
+    add_common_args(resume_parser)
+
     # show command
     show_parser = subparsers.add_parser("show", help="Show details of a specific task")
     show_parser.add_argument(
@@ -2388,6 +2431,8 @@ def main() -> int:
             return cmd_delete(args)
         elif args.command == "retry":
             return cmd_retry(args)
+        elif args.command == "resume":
+            return cmd_resume(args)
         elif args.command == "show":
             return cmd_show(args)
         elif args.command == "import":

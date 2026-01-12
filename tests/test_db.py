@@ -380,7 +380,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         conn.commit()
         conn.close()
 
-        # Open with SqliteTaskStore - should auto-migrate to v4
+        # Open with SqliteTaskStore - should auto-migrate to v5
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 4
+        assert version == 5
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -405,3 +405,110 @@ This plan outlines the implementation of a JWT-based authentication system.
 
         retrieved = store.get(new_task.id)
         assert retrieved.output_content == "This is the plan content"
+
+
+class TestTaskResume:
+    """Tests for task resume functionality."""
+
+    def test_session_id_stored_and_retrieved(self, tmp_path: Path):
+        """Test that session_id is stored and retrieved correctly."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Add a task
+        task = store.add(prompt="Test task")
+        assert task.session_id is None
+
+        # Update with session_id
+        task.session_id = "e9de1481-112a-4937-a06d-087a88a32999"
+        store.update(task)
+
+        # Retrieve and verify
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.session_id == "e9de1481-112a-4937-a06d-087a88a32999"
+
+    def test_session_id_persists_on_failure(self, tmp_path: Path):
+        """Test that session_id is persisted when a task fails."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Add a task and mark it as failed with session_id
+        task = store.add(prompt="Test task")
+        task.session_id = "test-session-123"
+        store.mark_failed(task, log_file="logs/test.log")
+
+        # Retrieve and verify
+        retrieved = store.get(task.id)
+        assert retrieved.status == "failed"
+        assert retrieved.session_id == "test-session-123"
+
+    def test_migration_from_v4_to_v5(self, tmp_path: Path):
+        """Test that migration from v4 to v5 adds session_id column."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v4 database manually (without session_id)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (4)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT
+            )
+        """)
+
+        # Insert a test task
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
+            ("Old task", "failed", now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore - should auto-migrate to v5
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 5
+
+        # Verify old task can be retrieved (with NULL session_id)
+        task = store.get(1)
+        assert task is not None
+        assert task.session_id is None
+
+        # Create new task with session_id
+        new_task = store.add(prompt="New task")
+        new_task.session_id = "new-session-456"
+        store.update(new_task)
+
+        retrieved = store.get(new_task.id)
+        assert retrieved.session_id == "new-session-456"

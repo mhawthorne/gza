@@ -235,6 +235,7 @@ class RunResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     error_type: str | None = None  # e.g., "max_turns" when turn limit exceeded
+    session_id: str | None = None  # Claude session ID for resume capability
 
 
 class Provider(ABC):

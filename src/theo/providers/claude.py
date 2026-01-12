@@ -99,11 +99,12 @@ class ClaudeProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        resume_session_id: str | None = None,
     ) -> RunResult:
         """Run Claude to execute a task."""
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir)
-        return self._run_direct(config, prompt, log_file, work_dir)
+            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id)
+        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id)
 
     def _run_docker(
         self,
@@ -111,6 +112,7 @@ class ClaudeProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        resume_session_id: str | None = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
         docker_config = _get_docker_config(config.docker_image)
@@ -121,6 +123,10 @@ class ClaudeProvider(Provider):
 
         cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes)
         cmd.extend(["claude", "-p", "-", "--output-format", "stream-json", "--verbose"])
+
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+
         cmd.extend(config.claude_args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
@@ -132,6 +138,7 @@ class ClaudeProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        resume_session_id: str | None = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
         cmd = [
@@ -139,6 +146,10 @@ class ClaudeProvider(Provider):
             "claude", "-p", "-",
             "--output-format", "stream-json", "--verbose",
         ]
+
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+
         cmd.extend(config.claude_args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
@@ -224,6 +235,8 @@ class ClaudeProvider(Provider):
                 result.num_turns = result_data["num_turns"]
             if "total_cost_usd" in result_data:
                 result.cost_usd = result_data["total_cost_usd"]
+            if "session_id" in result_data:
+                result.session_id = result_data["session_id"]
             # Check for error subtypes (e.g., error_max_turns)
             subtype = result_data.get("subtype", "")
             if subtype == "error_max_turns":
