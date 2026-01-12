@@ -316,7 +316,7 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     return run(config, task_id=review_task.id)
 
 
-def run(config: Config, task_id: int | None = None) -> int:
+def run(config: Config, task_id: int | None = None, resume: bool = False) -> int:
     """Run Theo on the next pending task or a specific task.
 
     Uses git worktrees to isolate task execution from the main working directory.
@@ -325,6 +325,7 @@ def run(config: Config, task_id: int | None = None) -> int:
     Args:
         config: Configuration object
         task_id: Optional specific task ID to run. If None, runs next pending task.
+        resume: If True, resume from previous session using stored session_id.
     """
     load_dotenv(config.project_dir)
 
@@ -353,12 +354,27 @@ def run(config: Config, task_id: int | None = None) -> int:
             print(f"Error: Task #{task_id} not found")
             return 1
 
-        # Check if task is blocked by dependencies
-        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
-        if is_blocked:
-            print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
-            return 1
+        # Resume mode validation
+        if resume:
+            if task.status != "failed":
+                print(f"Error: Can only resume failed tasks (task is {task.status})")
+                return 1
+            if not task.session_id:
+                print(f"Error: Task #{task_id} has no session ID (cannot resume)")
+                print("Use 'theo retry' to start fresh instead")
+                return 1
+            # Reset task to in_progress
+            store.mark_in_progress(task)
+        else:
+            # Check if task is blocked by dependencies
+            is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+            if is_blocked:
+                print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+                return 1
     else:
+        if resume:
+            print("Error: Cannot resume without specifying a task ID")
+            return 1
         task = store.get_next_pending()
 
     if not task:
@@ -392,10 +408,14 @@ def run(config: Config, task_id: int | None = None) -> int:
 
     # For explore, plan, and review tasks, run in project dir without creating a branch
     if task.task_type in ("explore", "plan", "review"):
-        return _run_non_code_task(task, config, store, provider, git)
+        return _run_non_code_task(task, config, store, provider, git, resume=resume)
 
-    # Determine branch name based on same_branch and branch_mode
-    if task.same_branch and task.depends_on:
+    # Determine branch name based on resume, same_branch, and branch_mode
+    if resume and task.branch:
+        # Resume uses the existing branch from the failed task
+        branch_name = task.branch
+        print(f"    Resuming on existing branch: {branch_name}")
+    elif task.same_branch and task.depends_on:
         # Use the branch from the dependency task
         dep_task = store.get(task.depends_on)
         if dep_task and dep_task.branch:
@@ -422,7 +442,13 @@ def run(config: Config, task_id: int | None = None) -> int:
     worktree_path = config.worktree_path / task.task_id
 
     # Handle branch and worktree creation
-    if task.same_branch:
+    if resume or task.same_branch:
+        # Validate branch exists before attempting to check it out
+        if not git.branch_exists(branch_name):
+            print(f"Error: Branch '{branch_name}' no longer exists. Cannot resume.")
+            print("The branch may have been deleted or merged.")
+            return 1
+
         # Check out existing branch in worktree
         try:
             # Remove existing worktree if it exists
@@ -456,21 +482,30 @@ def run(config: Config, task_id: int | None = None) -> int:
     # Create a Git instance for the worktree
     worktree_git = Git(worktree_path)
 
-    # Mark task in progress
-    store.mark_in_progress(task)
+    # Mark task in progress (unless resuming, in which case already set)
+    if not resume:
+        store.mark_in_progress(task)
 
     # Setup logging - use task_id for naming (logs stay in main project)
     config.log_path.mkdir(parents=True, exist_ok=True)
     log_file = config.log_path / f"{task.task_id}.log"
 
     # Run provider in the worktree
-    prompt = build_prompt(task, config, store, report_path=None, git=git)
+    if resume:
+        prompt = "Continue from where you left off. The task was interrupted due to max_turns limit."
+    else:
+        prompt = build_prompt(task, config, store, report_path=None, git=git)
 
     try:
-        result = provider.run(config, prompt, log_file, worktree_path)
+        result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
+
+        # Store session_id if available
+        if result.session_id:
+            task.session_id = result.session_id
+            store.update(task)
 
         # Handle failures - check error_type first, then exit codes
         if result.error_type == "max_turns":
@@ -552,8 +587,12 @@ def _run_non_code_task(
     store: SqliteTaskStore,
     provider: Provider,
     git: Git | None = None,
+    resume: bool = False,
 ) -> int:
     """Run a non-code task (explore, plan, review) in a worktree (no branch creation)."""
+    if resume:
+        print(f"    Resuming with session: {task.session_id[:12]}...")
+
     # Mark task in progress
     store.mark_in_progress(task)
 
@@ -619,8 +658,9 @@ def _run_non_code_task(
 
         # Run provider in the worktree
         prompt = build_prompt(task, config, store, worktree_report_path, git)
+        resume_session_id = task.session_id if resume else None
         try:
-            result = provider.run(config, prompt, log_file, worktree_path)
+            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=resume_session_id)
         except KeyboardInterrupt:
             print("\nInterrupted")
             _cleanup_worktree(git, worktree_path)
@@ -628,6 +668,11 @@ def _run_non_code_task(
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
+
+        # Store session_id if available
+        if result.session_id:
+            task.session_id = result.session_id
+            store.update(task)
 
         # Handle failures - check error_type first, then exit codes
         if result.error_type == "max_turns":
