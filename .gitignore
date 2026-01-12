@@ -1,6 +1,7 @@
 *.lock
 *.pyc
 __pycache__/
+.docker-build-marker
 .pytest_cache/
 tmp/
 
