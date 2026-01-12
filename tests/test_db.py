@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from theo.db import SqliteTaskStore, Task
+from gza.db import SqliteTaskStore, Task
 
 
 class TestTaskChaining:
@@ -315,7 +315,7 @@ This plan outlines the implementation of a JWT-based authentication system.
 """
         store.mark_completed(
             task,
-            report_file=".theo/plans/test-plan.md",
+            report_file=".gza/plans/test-plan.md",
             output_content=plan_content,
             has_commits=False,
         )

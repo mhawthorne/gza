@@ -1,4 +1,4 @@
-"""Main Theo runner orchestration."""
+"""Main Gza runner orchestration."""
 
 import os
 import re
@@ -317,10 +317,10 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
 
 
 def run(config: Config, task_id: int | None = None, resume: bool = False) -> int:
-    """Run Theo on the next pending task or a specific task.
+    """Run Gza on the next pending task or a specific task.
 
     Uses git worktrees to isolate task execution from the main working directory.
-    This allows concurrent work in the main checkout while theo runs.
+    This allows concurrent work in the main checkout while gza runs.
 
     Args:
         config: Configuration object
@@ -361,7 +361,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
                 return 1
             if not task.session_id:
                 print(f"Error: Task #{task_id} has no session ID (cannot resume)")
-                print("Use 'theo retry' to start fresh instead")
+                print("Use 'gza retry' to start fresh instead")
                 return 1
             # Reset task to in_progress
             store.mark_in_progress(task)
@@ -425,10 +425,10 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             print(f"Error: Task #{task.id} has same_branch=True but dependency task has no branch")
             return 1
     elif config.branch_mode == "single":
-        branch_name = f"{config.project_name}/theo-work"
+        branch_name = f"{config.project_name}/gza-work"
     else:  # multi
         # Use branch naming strategy
-        from theo.branch_naming import generate_branch_name
+        from gza.branch_naming import generate_branch_name
         branch_name = generate_branch_name(
             pattern=config.branch_strategy.pattern,
             project_name=config.project_name,
@@ -538,7 +538,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
 
         # Commit changes in worktree
         worktree_git.add(".")
-        worktree_git.commit(f"Theo: {task.prompt[:50]}\n\nTask ID: {task.task_id}")
+        worktree_git.commit(f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}")
 
         # Mark completed
         store.mark_completed(
@@ -555,7 +555,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         print(f"changes committed to branch: {branch_name}")
         print("")
         print("to view logs:")
-        print(f"theo log {task.task_id}")
+        print(f"gza log {task.task_id}")
         print("")
         print("to review changes:")
         print(f"git diff {default_branch}...{branch_name} --")
@@ -730,10 +730,10 @@ def _run_non_code_task(
 
         if task.task_type == "explore":
             print("To implement based on this exploration, add a task with:")
-            print(f"  theo add --based-on {task.id}")
+            print(f"  gza add --based-on {task.id}")
         elif task.task_type == "plan":
             print("To implement this plan, add a task with:")
-            print(f"  theo add --type implement --based-on {task.id}")
+            print(f"  gza add --type implement --based-on {task.id}")
 
         # Cleanup worktree
         _cleanup_worktree(git, worktree_path)

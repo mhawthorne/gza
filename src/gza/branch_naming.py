@@ -1,4 +1,4 @@
-"""Branch naming utilities for Theo."""
+"""Branch naming utilities for Gza."""
 
 import re
 from datetime import datetime

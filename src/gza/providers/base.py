@@ -23,10 +23,10 @@ FROM node:20-slim
 # Install the CLI tool globally
 RUN npm install -g {npm_package}
 
-# Create theo user for isolation
-RUN useradd -m -s /bin/bash theo
-USER theo
-WORKDIR /home/theo
+# Create gza user for isolation
+RUN useradd -m -s /bin/bash gza
+USER gza
+WORKDIR /home/gza
 
 # Default command
 CMD ["{cli_command}"]
@@ -85,9 +85,9 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     Returns:
         True if image is available, False on failure
     """
-    theo_dir = project_dir / f".{APP_NAME}"
-    theo_dir.mkdir(parents=True, exist_ok=True)
-    dockerfile_path = theo_dir / f"Dockerfile.{docker_config.cli_command}"
+    etc_dir = project_dir / "etc"
+    etc_dir.mkdir(parents=True, exist_ok=True)
+    dockerfile_path = etc_dir / f"Dockerfile.{docker_config.cli_command}"
 
     # Check if image exists and is up-to-date
     image_time = _get_image_created_time(docker_config.image_name)
@@ -113,7 +113,7 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     print(f"Building Docker image {docker_config.image_name}...")
     result = subprocess.run(
         ["docker", "build", "-t", docker_config.image_name,
-         "-f", str(dockerfile_path), str(theo_dir)],
+         "-f", str(dockerfile_path), str(etc_dir)],
     )
     return result.returncode == 0
 
@@ -143,7 +143,7 @@ def build_docker_cmd(
     # Mount config directory if specified (for OAuth credentials)
     if docker_config.config_dir:
         cmd.insert(-2, "-v")
-        cmd.insert(-2, f"{Path.home()}/{docker_config.config_dir}:/home/theo/{docker_config.config_dir}")
+        cmd.insert(-2, f"{Path.home()}/{docker_config.config_dir}:/home/gza/{docker_config.config_dir}")
 
     # Pass environment variables if set
     for env_var in docker_config.env_vars:
@@ -193,7 +193,7 @@ def verify_docker_credentials(
         cmd = ["docker", "run", "--rm"]
         # Mount config directory if specified (for OAuth credentials)
         if docker_config.config_dir:
-            cmd.extend(["-v", f"{Path.home()}/{docker_config.config_dir}:/home/theo/{docker_config.config_dir}"])
+            cmd.extend(["-v", f"{Path.home()}/{docker_config.config_dir}:/home/gza/{docker_config.config_dir}"])
         for env_var in docker_config.env_vars:
             if os.getenv(env_var):
                 cmd.extend(["-e", env_var])
@@ -268,7 +268,7 @@ class Provider(ABC):
         """Run the provider to execute a task.
 
         Args:
-            config: Theo configuration
+            config: Gza configuration
             prompt: The task prompt
             log_file: Path to write logs
             work_dir: Working directory for execution

@@ -2,14 +2,14 @@
 
 ## Problem
 
-Plan tasks write their output to `.theo/plans/{task_id}.md` in the main project directory. When an implement task runs, it creates a fresh worktree from `origin/main` which does not contain this file. The implement task cannot access the plan.
+Plan tasks write their output to `.gza/plans/{task_id}.md` in the main project directory. When an implement task runs, it creates a fresh worktree from `origin/main` which does not contain this file. The implement task cannot access the plan.
 
 Current flow:
 1. Plan task runs in `config.project_dir` (main checkout)
-2. Agent writes plan to `.theo/plans/123.md` (untracked file)
-3. `mark_completed()` stores `report_file = ".theo/plans/123.md"`
+2. Agent writes plan to `.gza/plans/123.md` (untracked file)
+3. `mark_completed()` stores `report_file = ".gza/plans/123.md"`
 4. Implement task creates worktree from `origin/main`
-5. Worktree has no `.theo/plans/` directory - **file not found**
+5. Worktree has no `.gza/plans/` directory - **file not found**
 
 ## Goals
 
@@ -42,7 +42,7 @@ class Task:
 ### Storage Behavior
 
 **Local mode (SQLite):**
-- Plan file written to disk: `.theo/plans/123.md`
+- Plan file written to disk: `.gza/plans/123.md`
 - `output_file` set to path (for human reference)
 - `output_content` set to file contents
 
@@ -126,17 +126,17 @@ Implementations:
 ### Configuration
 
 ```yaml
-# theo.yaml
+# gza.yaml
 
 # Local mode (default)
 database:
   type: sqlite
-  # path auto-derived: ~/.theo/{project}.db
+  # path auto-derived: ~/.gza/{project}.db
 
 # Team mode
 database:
   type: postgres
-  url: postgres://user:pass@host/theo_db
+  url: postgres://user:pass@host/gza_db
 ```
 
 ## Benefits

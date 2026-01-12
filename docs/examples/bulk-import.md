@@ -31,7 +31,7 @@ tasks:
 ## Preview the import
 
 ```bash
-$ theo import tasks.yaml --dry-run
+$ gza import tasks.yaml --dry-run
 Dry run - no tasks will be created
 
 Would create 5 tasks:
@@ -49,7 +49,7 @@ Would create 5 tasks:
 ## Import the tasks
 
 ```bash
-$ theo import tasks.yaml
+$ gza import tasks.yaml
 Imported 5 tasks to group: api-v2
 
 Created:
@@ -66,13 +66,13 @@ Created:
 Run sequentially:
 
 ```bash
-$ theo work --count 6
+$ gza work --count 6
 ```
 
 Or spawn background workers for parallel execution:
 
 ```bash
-$ for i in {1..3}; do theo work --background; done
+$ for i in {1..3}; do gza work --background; done
 ```
 
 ## Import file format reference

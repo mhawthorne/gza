@@ -1,4 +1,4 @@
-"""AI code generation providers for Theo."""
+"""AI code generation providers for Gza."""
 
 from .base import Provider, RunResult, DockerConfig, get_provider
 from .claude import ClaudeProvider

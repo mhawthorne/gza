@@ -5,7 +5,7 @@ Use exploration tasks for research, investigation, and codebase analysis.
 ## Create an exploration task
 
 ```bash
-$ theo add --explore "Investigate why the test suite is slow. Profile the tests and identify the top 5 slowest tests and what makes them slow."
+$ gza add --explore "Investigate why the test suite is slow. Profile the tests and identify the top 5 slowest tests and what makes them slow."
 
 Created task: 20260108-investigate-why-the-test (explore)
 ```
@@ -15,7 +15,7 @@ The `--explore` flag is shorthand for `--type explore`.
 ## Run it
 
 ```bash
-$ theo work
+$ gza work
 Running task: 20260108-investigate-why-the-test
 ...
 Task completed in 5m 18s (15 turns, $0.12)
@@ -23,10 +23,10 @@ Task completed in 5m 18s (15 turns, $0.12)
 
 ## View the exploration results
 
-Exploration outputs are saved to `.theo/explorations/`:
+Exploration outputs are saved to `.gza/explorations/`:
 
 ```bash
-$ cat .theo/explorations/20260108-investigate-why-the-test.md
+$ cat .gza/explorations/20260108-investigate-why-the-test.md
 
 # Exploration: Test Suite Performance
 
@@ -51,7 +51,7 @@ Identified 5 slowest tests consuming 73% of total test time...
 |--------|--------------|------------------|
 | Creates branch | Yes | No |
 | Modifies code | Yes | No |
-| Output location | Git branch | `.theo/explorations/` |
+| Output location | Git branch | `.gza/explorations/` |
 | Purpose | Implementation | Research & analysis |
 
 ## Use cases for exploration

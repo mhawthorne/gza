@@ -19,8 +19,8 @@ def verify_syntax(filepath):
 
 if __name__ == "__main__":
     files = [
-        "src/theo/db.py",
-        "src/theo/runner.py",
+        "src/gza/db.py",
+        "src/gza/runner.py",
         "test_plan_persistence.py"
     ]
 

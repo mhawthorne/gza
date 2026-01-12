@@ -1,4 +1,4 @@
-"""Command-line interface for Theo."""
+"""Command-line interface for Gza."""
 
 import argparse
 import json
@@ -59,7 +59,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config) -> int:
 
     # Build command for worker subprocess
     cmd = [
-        sys.executable, "-m", "theo",
+        sys.executable, "-m", "gza",
         "work",
         "--worker-mode",
     ]
@@ -107,8 +107,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config) -> int:
             prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
             print(f"  Prompt: {prompt_display}")
         print()
-        print(f"Use 'theo ps' to view running workers")
-        print(f"Use 'theo log -w {worker_id} -f' to follow output")
+        print(f"Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
 
         return 0
 
@@ -772,7 +772,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    """Validate the theo.yaml configuration file."""
+    """Validate the gza.yaml configuration file."""
     is_valid, errors, warnings = Config.validate(args.project_dir)
 
     # Print warnings first
@@ -790,7 +790,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Generate a new theo.yaml configuration file with defaults."""
+    """Generate a new gza.yaml configuration file with defaults."""
     from .config import (
         CONFIG_FILENAME,
         DEFAULT_TASKS_FILE,
@@ -861,7 +861,7 @@ def cmd_init(args: argparse.Namespace) -> int:
   default_type: {default_type}"""
 
     # Generate config file with project_name required and other defaults commented out
-    config_content = f"""# Theo Configuration
+    config_content = f"""# Gza Configuration
 
 # Project name (required) - used for branch prefixes and Docker image naming
 project_name: {default_project_name}
@@ -882,7 +882,7 @@ project_name: {default_project_name}
 # Whether to run Claude in Docker container
 # use_docker: {str(DEFAULT_USE_DOCKER).lower()}
 
-# Custom Docker image name (defaults to <project_name>-theo)
+# Custom Docker image name (defaults to <project_name>-gza)
 # docker_image: ""
 
 # Maximum time per task in minutes
@@ -1833,7 +1833,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     if not task.session_id:
         print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")
-        print("Use 'theo retry' to start fresh instead")
+        print("Use 'gza retry' to start fresh instead")
         return 1
 
     # Resume the task
@@ -1894,7 +1894,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_import(args: argparse.Namespace) -> int:
     """Import tasks from a YAML file."""
-    # Handle legacy usage: theo import <project_dir>
+    # Handle legacy usage: gza import <project_dir>
     # If the file argument is a directory, treat it as project_dir
     if args.file and Path(args.file).is_dir():
         args.project_dir = Path(args.file).resolve()
@@ -1913,7 +1913,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         import_path = config.tasks_path
         if not import_path.exists():
             print(f"Error: No file specified and {import_path} not found")
-            print("Usage: theo import <file> [--dry-run] [--force]")
+            print("Usage: gza import <file> [--dry-run] [--force]")
             return 1
         return _cmd_import_legacy(config, store)
 
@@ -2028,7 +2028,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Theo - AI agent task runner")
+    parser = argparse.ArgumentParser(description="Gza - AI agent task runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # work command
@@ -2123,16 +2123,16 @@ def main() -> int:
     )
 
     # validate command
-    validate_parser = subparsers.add_parser("validate", help="Validate theo.yaml configuration")
+    validate_parser = subparsers.add_parser("validate", help="Validate gza.yaml configuration")
     add_common_args(validate_parser)
 
     # init command
-    init_parser = subparsers.add_parser("init", help="Generate new theo.yaml with defaults")
+    init_parser = subparsers.add_parser("init", help="Generate new gza.yaml with defaults")
     add_common_args(init_parser)
     init_parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing theo.yaml file",
+        help="Overwrite existing gza.yaml file",
     )
 
     # log command

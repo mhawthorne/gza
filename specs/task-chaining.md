@@ -2,7 +2,7 @@
 
 ## Overview
 
-This spec describes extensions to theo for supporting multi-phase development workflows where tasks can depend on each other, be grouped together, and automatically trigger follow-up tasks like reviews.
+This spec describes extensions to gza for supporting multi-phase development workflows where tasks can depend on each other, be grouped together, and automatically trigger follow-up tasks like reviews.
 
 ## Motivation
 
@@ -27,10 +27,10 @@ Four task types, each with distinct behavior:
 | Type | Purpose | Output |
 |------|---------|--------|
 | `task` | General work (default) | Code changes |
-| `explore` | Research, no code expected | `.theo/explorations/{task_id}.md` |
-| `plan` | Design/architecture | `.theo/plans/{task_id}.md` |
+| `explore` | Research, no code expected | `.gza/explorations/{task_id}.md` |
+| `plan` | Design/architecture | `.gza/plans/{task_id}.md` |
 | `implement` | Build per a plan | Code changes on branch |
-| `review` | Evaluate implementation (optional) | `.theo/reviews/{task_id}.md` with verdict |
+| `review` | Evaluate implementation (optional) | `.gza/reviews/{task_id}.md` with verdict |
 
 ## Groups
 
@@ -94,23 +94,23 @@ task_types:
 
 ```bash
 # Simple task (unchanged)
-theo add
+gza add
 
 # Plan task
-theo add --type plan --group tarantino-v2
+gza add --type plan --group tarantino-v2
 
 # Implementation task that depends on plan, with auto-review
-theo add --type implement --based-on 1 --review
+gza add --type implement --based-on 1 --review
 
 # Implementation task without review (review is optional)
-theo add --type implement --based-on 1
+gza add --type implement --based-on 1
 
 # Explicit review task (alternative to --review flag)
-theo add --type review --based-on 2
+gza add --type review --based-on 2
 
 # Task that continues on the same branch as its dependency
 # (for multi-step implementations that build on unmerged code)
-theo add --based-on 1 --same-branch
+gza add --based-on 1 --same-branch
 ```
 
 Note: `--same-branch` requires `--based-on`. When set, the task will check out and continue working on the branch from the dependency task instead of creating a new branch. This is useful when multiple tasks need to build on each other's code changes before merging.
@@ -119,7 +119,7 @@ Note: `--same-branch` requires `--based-on`. When set, the task will check out a
 
 ```bash
 # Show status of a group
-theo status tarantino-v2
+gza status tarantino-v2
 
 # Output:
 # Group: tarantino-v2
@@ -128,7 +128,7 @@ theo status tarantino-v2
 #   ○ 3. Review ImageTransform impl          pending (blocked by #2)
 
 # List all groups
-theo groups
+gza groups
 
 # Output:
 # tarantino-v2      3 tasks (1 pending, 1 in_progress, 1 completed)
@@ -140,16 +140,16 @@ theo groups
 
 ```bash
 # Move a task into a group
-theo edit 5 --group tarantino-v2
+gza edit 5 --group tarantino-v2
 
 # Remove a task from a group
-theo edit 5 --group ""
+gza edit 5 --group ""
 ```
 
 ### Listing pending tasks
 
 ```bash
-theo next
+gza next
 
 # Output shows runnable tasks and blocked count:
 # 1. [plan] Design ImageTransform system
@@ -158,7 +158,7 @@ theo next
 # (2 tasks blocked by dependencies)
 
 # To see all pending tasks including blocked:
-theo next --all
+gza next --all
 
 # Output:
 # 1. [plan] Design ImageTransform system
@@ -171,17 +171,17 @@ theo next --all
 
 ```bash
 # Run next available task
-theo work
+gza work
 
 # Run a specific task
-theo work 3
+gza work 3
 ```
 
 Behavior:
 1. `get_next_pending()` skips tasks whose `depends_on` is not completed
-2. `theo work <id>` errors if the task is blocked:
+2. `gza work <id>` errors if the task is blocked:
    ```
-   $ theo work 2
+   $ gza work 2
    Error: Task #2 is blocked by task #1 (pending)
    ```
 3. After completing an `implement` task with `create_review=True`:
@@ -194,7 +194,7 @@ Behavior:
 ### Plan tasks
 
 1. Agent receives prompt
-2. Agent writes plan to `.theo/plans/{task_id}.md`
+2. Agent writes plan to `.gza/plans/{task_id}.md`
 3. Task marked complete
 4. Human reviews plan offline, then creates implement task if approved
 
@@ -217,7 +217,7 @@ Behavior:
    - Get branch and compute `git diff main...{branch}`
    - Walk chain to find plan task, include plan contents
 2. Agent reviews against plan
-3. Agent writes to `.theo/reviews/{task_id}.md`
+3. Agent writes to `.gza/reviews/{task_id}.md`
 4. Review includes verdict: `APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_DISCUSSION`
 5. Human reads review, decides next steps manually
 
@@ -248,29 +248,29 @@ def get_next_pending(self) -> Task | None:
 
 ```bash
 # 1. Create a plan task
-$ theo add --type plan --group tarantino-v2
+$ gza add --type plan --group tarantino-v2
 # Editor: "Design the ImageTransform system per specs/v2-design.md"
 
 # 2. Run the plan
-$ theo work
-# Agent writes .theo/plans/20241213-imagetransform.md
+$ gza work
+# Agent writes .gza/plans/20241213-imagetransform.md
 # ✓ Task #1 completed
 
 # 3. Human reviews plan offline...
 
 # 4. Create implementation task with auto-review
-$ theo add --type implement --based-on 1 --review --group tarantino-v2
+$ gza add --type implement --based-on 1 --review --group tarantino-v2
 # Editor: "Implement ImageTransform per the plan"
 
 # 5. Run implementation (and auto-review)
-$ theo work
+$ gza work
 # Agent implements on branch 20241213-imagetransform-impl
 # ✓ Task #2 completed
 # Running review task #3...
 # ✓ Review completed
 
 # 6. Check status
-$ theo status tarantino-v2
+$ gza status tarantino-v2
 # Group: tarantino-v2
 #   ✓ 1. Plan ImageTransform system          completed
 #   ✓ 2. Implement ImageTransform            completed
@@ -290,5 +290,5 @@ $ theo status tarantino-v2
 3. **Re-reviews**: After making changes, how to re-run a review?
    - Suggestion: Create a new review task with `--based-on` pointing to same implement task.
 
-4. **Plan approval gate**: Currently, creating the implement task is implicit approval. Should there be an explicit `theo approve <id>` command?
+4. **Plan approval gate**: Currently, creating the implement task is implicit approval. Should there be an explicit `gza approve <id>` command?
    - Suggestion: Keep it implicit for now. Explicit approval adds ceremony without clear benefit.

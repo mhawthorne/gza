@@ -14,51 +14,51 @@ This spec describes how to spawn `work` commands in the background, view running
 ## Design Goals
 
 1. **Background execution**: Spawn work commands that run independently
-2. **Process visibility**: List all running work processes (`theo ps`)
-3. **Log streaming**: Attach to a running process to see output (`theo logs`)
+2. **Process visibility**: List all running work processes (`gza ps`)
+3. **Log streaming**: Attach to a running process to see output (`gza logs`)
 4. **Simple implementation**: Leverage existing worktree isolation, minimal new infrastructure
 
 ---
 
 ## Commands
 
-### 1. `theo work --background` / `theo work -b`
+### 1. `gza work --background` / `gza work -b`
 
 Spawn a work command in the background.
 
 ```bash
 # Start a background worker for the next pending task
-theo work --background
+gza work --background
 
 # Start a specific task in background
-theo work --background <task_id>
+gza work --background <task_id>
 
 # Start multiple background workers
-theo work --background --count 3
+gza work --background --count 3
 ```
 
 **Behavior**:
 - Forks/daemonizes the work process
 - Returns immediately with the worker ID
-- Writes PID to `.theo/workers/{worker_id}.pid`
-- Logs continue writing to `.theo/logs/{task_id}.log` as normal
+- Writes PID to `.gza/workers/{worker_id}.pid`
+- Logs continue writing to `.gza/logs/{task_id}.log` as normal
 
 **Output**:
 ```
 Started worker w-20260107-001 (PID 12345)
   Task: implement-auth-flow
-  Log:  .theo/logs/20260107-implement-auth-flow.log
+  Log:  .gza/logs/20260107-implement-auth-flow.log
 
-Use 'theo ps' to view running workers
-Use 'theo logs w-20260107-001' to tail output
+Use 'gza ps' to view running workers
+Use 'gza logs w-20260107-001' to tail output
 ```
 
-### 2. `theo ps`
+### 2. `gza ps`
 
 List all running work processes.
 
 ```bash
-theo ps
+gza ps
 ```
 
 **Output** (table format, similar to `docker ps`):
@@ -80,26 +80,26 @@ w-20260107-003   12355  completed  20260107-fix-typo              1m 05s
 - `failed`: Process exited with error
 - `stale`: PID file exists but process not running (cleanup needed)
 
-### 3. `theo logs <worker_id>`
+### 3. `gza logs <worker_id>`
 
 Stream/tail logs from a running or completed worker.
 
 ```bash
 # Tail logs (follow mode, like tail -f)
-theo logs w-20260107-001
+gza logs w-20260107-001
 
 # Show last N lines only
-theo logs w-20260107-001 --tail 50
+gza logs w-20260107-001 --tail 50
 
 # Show all logs without following
-theo logs w-20260107-001 --no-follow
+gza logs w-20260107-001 --no-follow
 
 # Follow logs until worker completes
-theo logs w-20260107-001 --follow
+gza logs w-20260107-001 --follow
 ```
 
 **Behavior**:
-- Reads from `.theo/logs/{task_id}.log` (JSONL format)
+- Reads from `.gza/logs/{task_id}.log` (JSONL format)
 - Parses and pretty-prints the log entries (same as current console output)
 - In follow mode (`-f`, default for running workers): tails the file
 - For completed workers: shows full log then exits
@@ -107,18 +107,18 @@ theo logs w-20260107-001 --follow
 **Output format**:
 Same as current foreground execution—tool names, intermediate text, etc.
 
-### 4. `theo stop <worker_id>`
+### 4. `gza stop <worker_id>`
 
 Gracefully stop a running worker.
 
 ```bash
-theo stop w-20260107-001
+gza stop w-20260107-001
 
 # Force kill
-theo stop --force w-20260107-001
+gza stop --force w-20260107-001
 
 # Stop all running workers
-theo stop --all
+gza stop --all
 ```
 
 **Behavior**:
@@ -132,10 +132,10 @@ theo stop --all
 
 ### Worker Registry
 
-Store worker metadata in `.theo/workers/`:
+Store worker metadata in `.gza/workers/`:
 
 ```
-.theo/workers/
+.gza/workers/
 ├── w-20260107-001.json    # Worker metadata
 ├── w-20260107-001.pid     # PID file (for liveness check)
 ├── w-20260107-002.json
@@ -150,8 +150,8 @@ Store worker metadata in `.theo/workers/`:
   "task_id": "20260107-implement-auth-flow",
   "started_at": "2026-01-07T10:30:00Z",
   "status": "running",
-  "log_file": ".theo/logs/20260107-implement-auth-flow.log",
-  "worktree": ".theo/worktrees/20260107-implement-auth-flow"
+  "log_file": ".gza/logs/20260107-implement-auth-flow.log",
+  "worktree": ".gza/worktrees/20260107-implement-auth-flow"
 }
 ```
 
@@ -180,7 +180,7 @@ def spawn_background_worker(task_id: str | None = None):
 **Option B: subprocess with nohup (simpler, cross-platform)**
 ```python
 def spawn_background_worker(task_id: str | None = None):
-    cmd = ["nohup", "theo", "work", "--worker-mode", task_id or ""]
+    cmd = ["nohup", "gza", "work", "--worker-mode", task_id or ""]
     proc = subprocess.Popen(
         cmd,
         stdout=open(log_path, "a"),
@@ -196,7 +196,7 @@ def spawn_background_worker(task_id: str | None = None):
 
 ```python
 def is_worker_running(worker_id: str) -> bool:
-    pid_file = f".theo/workers/{worker_id}.pid"
+    pid_file = f".gza/workers/{worker_id}.pid"
     if not os.path.exists(pid_file):
         return False
 
@@ -210,7 +210,7 @@ def is_worker_running(worker_id: str) -> bool:
 
 ### Log Streaming
 
-Leverage existing JSONL log format. The `theo logs` command:
+Leverage existing JSONL log format. The `gza logs` command:
 
 1. Opens log file
 2. Seeks to end (or last N lines for `--tail`)
@@ -246,9 +246,9 @@ def tail_log(log_path: str, follow: bool = True):
 - Remove PID file
 - Worktree cleanup (existing behavior)
 
-**Stale worker detection** (`theo ps`):
+**Stale worker detection** (`gza ps`):
 - If PID file exists but process not running → mark as `stale`
-- `theo ps --cleanup` removes stale entries
+- `gza ps --cleanup` removes stale entries
 
 ---
 
@@ -276,19 +276,19 @@ def claim_next_task(store: SqliteTaskStore) -> Task | None:
 
 | Command | Description |
 |---------|-------------|
-| `theo work -b` | Start background worker |
-| `theo ps` | List running workers |
-| `theo ps -a` | List all workers (including completed) |
-| `theo logs <id>` | Tail worker logs |
-| `theo logs <id> --no-follow` | Show full log without following |
-| `theo stop <id>` | Stop a worker |
-| `theo stop --all` | Stop all workers |
+| `gza work -b` | Start background worker |
+| `gza ps` | List running workers |
+| `gza ps -a` | List all workers (including completed) |
+| `gza logs <id>` | Tail worker logs |
+| `gza logs <id> --no-follow` | Show full log without following |
+| `gza stop <id>` | Stop a worker |
+| `gza stop --all` | Stop all workers |
 
 ---
 
 ## Future Enhancements
 
-1. **Worker pools**: `theo work --pool 3` maintains N concurrent workers
+1. **Worker pools**: `gza work --pool 3` maintains N concurrent workers
 2. **Priority queues**: High-priority tasks get picked up first
 3. **Resource limits**: Memory/CPU limits per worker
 4. **Web dashboard**: Real-time view of all workers

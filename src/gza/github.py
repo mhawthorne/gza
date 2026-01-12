@@ -1,4 +1,4 @@
-"""GitHub operations for Theo."""
+"""GitHub operations for Gza."""
 
 import subprocess
 from dataclasses import dataclass

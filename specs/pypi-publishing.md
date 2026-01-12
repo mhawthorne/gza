@@ -2,11 +2,11 @@
 
 ## Overview
 
-Publish theo as a public Python package on PyPI, making it installable via `pip install theo` or `uv pip install theo`.
+Publish gza as a public Python package on PyPI, making it installable via `pip install gza` or `uv pip install gza`.
 
 ## Goals
 
-- Make theo easily installable without cloning the repository
+- Make gza easily installable without cloning the repository
 - Enable version management and upgrade paths
 - Establish automated release workflow
 
@@ -14,8 +14,8 @@ Publish theo as a public Python package on PyPI, making it installable via `pip 
 
 The project already has:
 - Modern `pyproject.toml` with hatchling build backend
-- Proper src-layout (`src/theo/`)
-- CLI entry point defined (`theo = theo.cli:main`)
+- Proper src-layout (`src/gza/`)
+- CLI entry point defined (`gza = gza.cli:main`)
 - Minimal runtime dependencies (only `pyyaml>=6.0`)
 
 ## Required Changes
@@ -26,7 +26,7 @@ Add required and recommended fields:
 
 ```toml
 [project]
-name = "theo"
+name = "gza"
 version = "0.1.0"
 description = "A coding AI agent runner for Claude Code"
 readme = "README.md"
@@ -54,9 +54,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/OWNER/theo"
-Repository = "https://github.com/OWNER/theo"
-Issues = "https://github.com/OWNER/theo/issues"
+Homepage = "https://github.com/OWNER/gza"
+Repository = "https://github.com/OWNER/gza"
+Issues = "https://github.com/OWNER/gza/issues"
 ```
 
 ### 2. Add LICENSE File
@@ -138,13 +138,13 @@ jobs:
 
 ### 5. Package Name Availability
 
-Check if "theo" is available on PyPI: https://pypi.org/project/theo/
+Check if "gza" is available on PyPI: https://pypi.org/project/gza/
 
 If taken, consider alternatives:
-- `theo-agent`
-- `theo-runner`
-- `theo-ai`
-- `claude-theo`
+- `gza-agent`
+- `gza-runner`
+- `gza-ai`
+- `claude-gza`
 
 ## Publishing Process
 
@@ -184,7 +184,7 @@ python -m build
 python -m twine upload --repository testpypi dist/*
 
 # Test installation
-pip install --index-url https://test.pypi.org/simple/ theo
+pip install --index-url https://test.pypi.org/simple/ gza
 ```
 
 ## Version Management
@@ -212,13 +212,13 @@ dynamic = ["version"]
 source = "vcs"
 
 [tool.hatch.build.hooks.vcs]
-version-file = "src/theo/_version.py"
+version-file = "src/gza/_version.py"
 ```
 
 **Workflow:**
 - For stable releases: create a git tag (`git tag v0.2.0`) and publish
 - For snapshot releases: CI can publish on every commit (or weekly) with auto-generated dev versions
-- Dev versions sort before the next stable release, so `pip install theo` always gets the latest stable
+- Dev versions sort before the next stable release, so `pip install gza` always gets the latest stable
 
 ### Semantic Versioning
 
@@ -233,13 +233,13 @@ After each release:
 
 ```bash
 # Verify package is available
-pip index versions theo
+pip index versions gza
 
 # Test fresh install
-pip install theo==X.Y.Z
+pip install gza==X.Y.Z
 
 # Verify CLI works
-theo --help
+gza --help
 ```
 
 ## Tasks
@@ -274,7 +274,7 @@ tasks:
 
   - prompt: |
       Upload to TestPyPI and verify installation works.
-      Test: pip install --index-url https://test.pypi.org/simple/ theo
+      Test: pip install --index-url https://test.pypi.org/simple/ gza
     type: task
     depends_on: 4
 
@@ -283,7 +283,7 @@ tasks:
       1. Add hatch-vcs to build-system.requires
       2. Add dynamic = ["version"] to [project] and remove static version
       3. Add [tool.hatch.version] with source = "vcs"
-      4. Add [tool.hatch.build.hooks.vcs] to generate src/theo/_version.py
+      4. Add [tool.hatch.build.hooks.vcs] to generate src/gza/_version.py
       5. Create initial git tag (v0.1.0) if none exists
       6. Verify: python -m build should produce correct version in wheel filename
     type: implement

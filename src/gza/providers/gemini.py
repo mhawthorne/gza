@@ -98,7 +98,7 @@ class GeminiProvider(Provider):
     def _verify_docker(self, config: Config) -> bool:
         """Verify credentials work in Docker."""
         # Use gemini-specific image name
-        image_name = f"{config.project_name}-theo-gemini"
+        image_name = f"{config.project_name}-gza-gemini"
         docker_config = _get_docker_config(image_name)
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
@@ -164,7 +164,7 @@ class GeminiProvider(Provider):
     ) -> RunResult:
         """Run Gemini in Docker container."""
         # Use gemini-specific image name
-        image_name = f"{config.project_name}-theo-gemini"
+        image_name = f"{config.project_name}-gza-gemini"
         docker_config = _get_docker_config(image_name)
 
         if not ensure_docker_image(docker_config, config.project_dir):

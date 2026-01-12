@@ -6,9 +6,9 @@ This spec describes the ability to resume a task that failed due to `max_turns` 
 
 ## Motivation
 
-When a task hits the `max_turns` limit, the work is incomplete but significant progress may have been made. Currently, the only option is `theo retry <id>` which starts completely fresh, losing all context and repeating work already done.
+When a task hits the `max_turns` limit, the work is incomplete but significant progress may have been made. Currently, the only option is `gza retry <id>` which starts completely fresh, losing all context and repeating work already done.
 
-Claude CLI supports session continuation via `--resume <session_id>`, which allows picking up exactly where the conversation left off. By capturing and storing the session ID, theo can offer true resume functionality.
+Claude CLI supports session continuation via `--resume <session_id>`, which allows picking up exactly where the conversation left off. By capturing and storing the session ID, gza can offer true resume functionality.
 
 ## How Claude CLI Sessions Work
 
@@ -68,7 +68,7 @@ if result.session_id:
 
 ### 3. Add resume command
 
-New CLI command: `theo resume <task_id>`
+New CLI command: `gza resume <task_id>`
 
 ```python
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -87,7 +87,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     if not task.session_id:
         print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")
-        print("Use 'theo retry' to start fresh instead")
+        print("Use 'gza retry' to start fresh instead")
         return 1
 
     # Resume the task
@@ -158,7 +158,7 @@ else:
 ## CLI Interface
 
 ```
-theo resume <task_id>     # Resume a failed task
+gza resume <task_id>     # Resume a failed task
 ```
 
 Options:
@@ -168,30 +168,30 @@ Options:
 
 ```bash
 # Task fails due to max_turns
-$ theo work
+$ gza work
 === Task: Implement feature X ===
 ...
 Task failed: max turns of 50 exceeded
 Stats: Runtime: 15m 32s | Turns: 50 | Cost: $1.23
 
 # Check the task
-$ theo show 42
+$ gza show 42
 Task #42
 Status: failed
 Session ID: e9de1481-112a-4937-a06d-087a88a32999
 ...
 
 # Resume where it left off
-$ theo resume 42
+$ gza resume 42
 === Resuming Task #42 ===
 ...
 ```
 
 ## Edge Cases
 
-1. **No session_id stored**: Tasks that failed before this feature was implemented won't have session IDs. Show helpful error directing to `theo retry`.
+1. **No session_id stored**: Tasks that failed before this feature was implemented won't have session IDs. Show helpful error directing to `gza retry`.
 
-2. **Session expired**: Claude CLI sessions may expire. If resume fails with session-not-found error, suggest using `theo retry`.
+2. **Session expired**: Claude CLI sessions may expire. If resume fails with session-not-found error, suggest using `gza retry`.
 
 3. **Branch already exists**: When resuming, reuse the existing branch from the failed attempt.
 
@@ -201,8 +201,8 @@ $ theo resume 42
 
 ## Future Enhancements
 
-1. **Auto-resume option**: `theo work --auto-resume` could automatically resume any failed max_turns tasks before picking up new pending tasks.
+1. **Auto-resume option**: `gza work --auto-resume` could automatically resume any failed max_turns tasks before picking up new pending tasks.
 
-2. **Resume with increased max_turns**: `theo resume 42 --max-turns 100` to give more headroom.
+2. **Resume with increased max_turns**: `gza resume 42 --max-turns 100` to give more headroom.
 
-3. **Session info command**: `theo session <task_id>` to show session details and whether resume is possible.
+3. **Session info command**: `gza session <task_id>` to show session details and whether resume is possible.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Import tasks from a YAML file into theo. Useful for:
+Import tasks from a YAML file into gza. Useful for:
 - Bulk-creating tasks from a spec or plan
 - Sharing task templates across projects
 - Generating tasks from external tools
@@ -10,13 +10,13 @@ Import tasks from a YAML file into theo. Useful for:
 ## Usage
 
 ```bash
-theo import <file>
+gza import <file>
 
 # Preview without creating tasks
-theo import <file> --dry-run
+gza import <file> --dry-run
 
 # Force re-import (skip duplicate detection)
-theo import <file> --force
+gza import <file> --force
 ```
 
 ## File Format
@@ -47,7 +47,7 @@ tasks:
     depends_on: 2
 
   - prompt: |
-      Add theo groups command.
+      Add gza groups command.
     type: task
     depends_on: 2
     group: null  # override: no group for this task
@@ -97,7 +97,7 @@ tasks:
     depends_on: 2             # depends on "Second task"
 ```
 
-On import, theo:
+On import, gza:
 1. Creates all tasks in order
 2. Maps local indices to actual task IDs
 3. Sets `depends_on` to the real IDs
@@ -106,10 +106,10 @@ Example: if "First task" gets ID #47, then "Second task" will have `depends_on: 
 
 ## Duplicate Detection
 
-By default, `theo import` checks for duplicate tasks based on prompt content and group. If a matching pending task exists, it's skipped:
+By default, `gza import` checks for duplicate tasks based on prompt content and group. If a matching pending task exists, it's skipped:
 
 ```
-$ theo import tasks.yaml
+$ gza import tasks.yaml
 Importing 5 tasks...
   ✓ Created: Design schema changes (#47)
   - Skipped: Implement schema (duplicate of #48)
@@ -125,7 +125,7 @@ Use `--force` to skip duplicate detection and create all tasks.
 Preview what would be imported without creating tasks:
 
 ```
-$ theo import tasks.yaml --dry-run
+$ gza import tasks.yaml --dry-run
 Would import 5 tasks:
   1. [plan] Design schema changes (group: task-chaining)
   2. [implement] Implement schema (depends on #1, review: true)
@@ -184,7 +184,7 @@ tasks:
 ```
 
 ```bash
-$ theo import specs/auth-feature.tasks.yaml
+$ gza import specs/auth-feature.tasks.yaml
 Importing 5 tasks...
   ✓ Created: Design auth system (#50, plan)
   ✓ Created: Implement core session (#51, depends on #50)
@@ -193,7 +193,7 @@ Importing 5 tasks...
   ✓ Created: Add login UI (#54, depends on #52)
 Imported 5 tasks
 
-$ theo status auth-feature
+$ gza status auth-feature
 Group: auth-feature
   ○ 50. Design auth system                    pending (plan)
   ○ 51. Implement core session                pending (blocked by #50)
@@ -215,11 +215,11 @@ Import validates the following before creating any tasks:
 If validation fails, no tasks are created and the error is reported:
 
 ```
-$ theo import tasks.yaml
+$ gza import tasks.yaml
 Error: Spec file not found: specs/missing.md
   Referenced by: file-level default
 
-$ theo import tasks.yaml
+$ gza import tasks.yaml
 Error: Invalid depends_on: 5 (only 3 tasks in file)
   Task 2: "Implement schema changes"
 ```
@@ -228,4 +228,4 @@ Error: Invalid depends_on: 5 (only 3 tasks in file)
 
 1. **Append-only**: Import only creates new tasks. There's no update/sync capability since tasks lack a stable external ID to match on. Re-running import with `--force` creates duplicates.
 
-2. **No export**: While `theo export <group>` could generate YAML from existing tasks, the complexity (converting IDs back to local indices, deciding what to include) isn't worth it for the limited use case. Task structures are typically project-specific.
+2. **No export**: While `gza export <group>` could generate YAML from existing tasks, the complexity (converting IDs back to local indices, deciding what to include) isn't worth it for the limited use case. Task structures are typically project-specific.

@@ -5,14 +5,14 @@ A straightforward workflow for quick fixes or small features.
 ## Add a task
 
 ```bash
-$ theo add "Fix the login button not responding on mobile devices"
+$ gza add "Fix the login button not responding on mobile devices"
 Created task: 20260108-fix-the-login-button
 ```
 
 ## View pending tasks
 
 ```bash
-$ theo next
+$ gza next
 Pending tasks:
 
   1. 20260108-fix-the-login-button
@@ -22,7 +22,7 @@ Pending tasks:
 ## Run the task (foreground)
 
 ```bash
-$ theo work
+$ gza work
 Running task: 20260108-fix-the-login-button
 ...
 Task completed in 3m 42s (12 turns, $0.08)
@@ -32,7 +32,7 @@ Branch: feature/fix-the-login-button
 ## View the execution log
 
 ```bash
-$ theo log -t 20260108-fix-the-login-button
+$ gza log -t 20260108-fix-the-login-button
 
 Task: 20260108-fix-the-login-button
 Status: completed
@@ -49,13 +49,13 @@ Summary:
 For the full conversation:
 
 ```bash
-$ theo log -t 20260108-fix-the-login-button --turns
+$ gza log -t 20260108-fix-the-login-button --turns
 ```
 
 ## Check unmerged work
 
 ```bash
-$ theo unmerged
+$ gza unmerged
 Unmerged branches:
 
   20260108-fix-the-login-button
@@ -67,7 +67,7 @@ Unmerged branches:
 ## Create a PR
 
 ```bash
-$ theo pr 20260108-fix-the-login-button
+$ gza pr 20260108-fix-the-login-button
 Creating PR for task: 20260108-fix-the-login-button
 
 PR created: https://github.com/myorg/myapp/pull/142
@@ -78,5 +78,5 @@ PR created: https://github.com/myorg/myapp/pull/142
 To create a draft PR with a custom title:
 
 ```bash
-$ theo pr 20260108-fix-the-login-button --draft --title "fix: mobile login button touch handling"
+$ gza pr 20260108-fix-the-login-button --draft --title "fix: mobile login button touch handling"
 ```

@@ -1,4 +1,4 @@
-"""Git operations for Theo."""
+"""Git operations for Gza."""
 
 import subprocess
 from pathlib import Path

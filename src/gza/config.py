@@ -1,4 +1,4 @@
-"""Configuration for Theo."""
+"""Configuration for Gza."""
 
 import os
 import sys
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-APP_NAME = "theo"
+APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 
 
@@ -96,7 +96,7 @@ class Config:
 
     def __post_init__(self):
         if not self.docker_image:
-            self.docker_image = f"{self.project_name}-theo"
+            self.docker_image = f"{self.project_name}-gza"
 
         # Set default branch strategy if not provided
         if self.branch_strategy is None:
@@ -162,7 +162,7 @@ class Config:
 
     @classmethod
     def load(cls, project_dir: Path) -> "Config":
-        """Load config from theo.yaml in project root.
+        """Load config from gza.yaml in project root.
 
         Raises ConfigError if config file is missing or project_name is not set.
         """
@@ -171,7 +171,7 @@ class Config:
         if not config_path.exists():
             raise ConfigError(
                 f"Configuration file not found: {config_path}\n"
-                f"Run 'theo init' to create one."
+                f"Run 'gza init' to create one."
             )
 
         with open(config_path) as f:
@@ -201,38 +201,38 @@ class Config:
 
         # Environment variables override file config
         use_docker = data.get("use_docker", DEFAULT_USE_DOCKER)
-        if os.getenv("THEO_USE_DOCKER"):
-            use_docker = os.getenv("THEO_USE_DOCKER").lower() != "false"
+        if os.getenv("GZA_USE_DOCKER"):
+            use_docker = os.getenv("GZA_USE_DOCKER").lower() != "false"
 
         timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
-        if os.getenv("THEO_TIMEOUT_MINUTES"):
-            timeout_minutes = int(os.getenv("THEO_TIMEOUT_MINUTES"))
+        if os.getenv("GZA_TIMEOUT_MINUTES"):
+            timeout_minutes = int(os.getenv("GZA_TIMEOUT_MINUTES"))
 
         branch_mode = data.get("branch_mode", DEFAULT_BRANCH_MODE)
-        if os.getenv("THEO_BRANCH_MODE"):
-            branch_mode = os.getenv("THEO_BRANCH_MODE")
+        if os.getenv("GZA_BRANCH_MODE"):
+            branch_mode = os.getenv("GZA_BRANCH_MODE")
 
         # max_turns: check defaults section first, then top-level
         max_turns = defaults.get("max_turns") or data.get("max_turns", DEFAULT_MAX_TURNS)
-        if os.getenv("THEO_MAX_TURNS"):
-            max_turns = int(os.getenv("THEO_MAX_TURNS"))
+        if os.getenv("GZA_MAX_TURNS"):
+            max_turns = int(os.getenv("GZA_MAX_TURNS"))
 
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
-        if os.getenv("THEO_WORKTREE_DIR"):
-            worktree_dir = os.getenv("THEO_WORKTREE_DIR")
+        if os.getenv("GZA_WORKTREE_DIR"):
+            worktree_dir = os.getenv("GZA_WORKTREE_DIR")
 
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
-        if os.getenv("THEO_WORK_COUNT"):
-            work_count = int(os.getenv("THEO_WORK_COUNT"))
+        if os.getenv("GZA_WORK_COUNT"):
+            work_count = int(os.getenv("GZA_WORK_COUNT"))
 
         provider = data.get("provider", DEFAULT_PROVIDER)
-        if os.getenv("THEO_PROVIDER"):
-            provider = os.getenv("THEO_PROVIDER")
+        if os.getenv("GZA_PROVIDER"):
+            provider = os.getenv("GZA_PROVIDER")
 
         # model: check defaults section first, then top-level
         model = defaults.get("model") or data.get("model", "")
-        if os.getenv("THEO_MODEL"):
-            model = os.getenv("THEO_MODEL")
+        if os.getenv("GZA_MODEL"):
+            model = os.getenv("GZA_MODEL")
 
         # Parse task_types configuration
         task_types = {}
@@ -301,7 +301,7 @@ class Config:
 
     @classmethod
     def validate(cls, project_dir: Path) -> tuple[bool, list[str], list[str]]:
-        """Validate theo.yaml configuration file.
+        """Validate gza.yaml configuration file.
 
         Returns:
             Tuple of (is_valid, list of error messages, list of warning messages)

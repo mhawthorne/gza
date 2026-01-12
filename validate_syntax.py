@@ -16,10 +16,10 @@ def validate_file(filepath: Path) -> bool:
         return False
 
 def main():
-    """Validate all Python files in src/theo and tests."""
+    """Validate all Python files in src/gza and tests."""
     files_to_check = [
-        Path("src/theo/runner.py"),
-        Path("src/theo/db.py"),
+        Path("src/gza/runner.py"),
+        Path("src/gza/db.py"),
         Path("tests/test_db.py"),
         Path("tests/test_cli.py"),
     ]
