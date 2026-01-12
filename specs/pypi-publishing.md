@@ -189,17 +189,43 @@ pip install --index-url https://test.pypi.org/simple/ theo
 
 ## Version Management
 
-Follow semantic versioning:
+### Automated Versioning with hatch-vcs
+
+Use `hatch-vcs` to derive versions automatically from git tags. This eliminates manual version management and enables snapshot releases.
+
+**How it works:**
+- Tag a commit with `v0.1.0` → that commit builds as version `0.1.0`
+- Commits after the tag → build as `0.1.0.dev1+gABCDEF` (dev release with commit hash)
+- No manual version editing in `pyproject.toml`
+
+**Configuration in pyproject.toml:**
+
+```toml
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+dynamic = ["version"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/theo/_version.py"
+```
+
+**Workflow:**
+- For stable releases: create a git tag (`git tag v0.2.0`) and publish
+- For snapshot releases: CI can publish on every commit (or weekly) with auto-generated dev versions
+- Dev versions sort before the next stable release, so `pip install theo` always gets the latest stable
+
+### Semantic Versioning
+
+Follow semantic versioning for tagged releases:
 - `0.1.0` → `0.1.1`: Bug fixes
 - `0.1.0` → `0.2.0`: New features, backwards compatible
 - `0.1.0` → `1.0.0`: Breaking changes or stable release
-
-Consider using `hatch version` for version bumps:
-
-```bash
-hatch version minor  # 0.1.0 → 0.2.0
-hatch version patch  # 0.1.0 → 0.1.1
-```
 
 ## Post-Publish Verification
 
@@ -251,6 +277,17 @@ tasks:
       Test: pip install --index-url https://test.pypi.org/simple/ theo
     type: task
     depends_on: 4
+
+  - prompt: |
+      Set up hatch-vcs for automated git-based versioning.
+      1. Add hatch-vcs to build-system.requires
+      2. Add dynamic = ["version"] to [project] and remove static version
+      3. Add [tool.hatch.version] with source = "vcs"
+      4. Add [tool.hatch.build.hooks.vcs] to generate src/theo/_version.py
+      5. Create initial git tag (v0.1.0) if none exists
+      6. Verify: python -m build should produce correct version in wheel filename
+    type: implement
+    depends_on: 1
 ```
 
 ## Design Decisions

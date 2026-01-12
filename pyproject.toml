@@ -1,6 +1,6 @@
 [project]
-name = "theo"
-version = "0.1.0"
+name = "gza"
+version = "0.0.1"
 description = "A coding AI agent runner for Claude Code"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,7 @@ dev = [
 ]
 
 [project.scripts]
-theo = "theo.cli:main"
+gza = "theo.cli:main"
 
 [build-system]
 requires = ["hatchling"]
