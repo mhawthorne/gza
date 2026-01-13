@@ -1,6 +1,6 @@
 [project]
 name = "gza-agent"
-version = "0.0.1"
+dynamic = ["version"]
 description = "A coding AI agent runner for Claude Code"
 readme = "README.md"
 license = "MIT"
@@ -42,11 +42,17 @@ dev = [
 gza = "gza.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gza"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/gza/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
