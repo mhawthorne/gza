@@ -60,8 +60,10 @@ When renaming a field across the codebase:
 
 ## Important Guidelines
 
-- **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
+- **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, `*_SETUP.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
 - **Do NOT create README files** unless explicitly requested.
+- **Do NOT create setup/how-to docs in project root**. If you must document something for developers (e.g., release process, setup instructions), place it in `docs/internal/` - never in the project root.
+- **Do NOT create one-off utility scripts** in the project root (e.g., `check_syntax.py`, `validate_*.py`, `verify_*.py`). Use existing tools like `uv run pytest` or `uv run python -m py_compile <file>` instead.
 
 ## Creating Tasks from Conversations
 
