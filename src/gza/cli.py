@@ -2017,6 +2017,44 @@ def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
     return 0
 
 
+class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Custom help formatter that sorts subcommands alphabetically."""
+
+    def _iter_indented_subactions(self, action):
+        """Override to sort subactions alphabetically by their command name."""
+        try:
+            # Get the subactions (subcommands)
+            subactions = action._get_subactions()
+        except AttributeError:
+            # If no _get_subactions, fall back to default behavior
+            subactions = super()._iter_indented_subactions(action)
+        else:
+            # Sort subcommands alphabetically by their metavar (command name)
+            subactions = sorted(subactions, key=lambda x: x.metavar if x.metavar else "")
+
+        # Yield sorted subactions with indentation
+        for subaction in subactions:
+            yield subaction
+
+    def _metavar_formatter(self, action, default_metavar):
+        """Override to sort choices alphabetically in usage string."""
+        if action.metavar is not None:
+            result = action.metavar
+        elif action.choices is not None:
+            # Sort choices alphabetically
+            choice_strs = sorted(str(choice) for choice in action.choices)
+            result = '{%s}' % ','.join(choice_strs)
+        else:
+            result = default_metavar
+
+        def format(tuple_size):
+            if isinstance(result, tuple):
+                return result
+            else:
+                return (result, ) * tuple_size
+        return format
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add common arguments to a subparser."""
     parser.add_argument(
@@ -2028,7 +2066,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Gza - AI agent task runner")
+    parser = argparse.ArgumentParser(
+        description="Gza - AI agent task runner",
+        formatter_class=SortingHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # work command

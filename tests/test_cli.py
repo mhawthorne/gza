@@ -1330,3 +1330,58 @@ class TestPsCommand:
 
         # Cleanup
         registry.remove("w-test-ps")
+
+
+class TestHelpOutput:
+    """Tests for CLI help output."""
+
+    def test_commands_displayed_alphabetically(self):
+        """Help output should display commands in alphabetical order."""
+        result = subprocess.run(
+            ["uv", "run", "gza", "--help"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+
+        # Extract the commands section from help output
+        help_text = result.stdout
+
+        # Find where the commands list starts (after "positional arguments:" or "{")
+        # Commands are typically shown as "{command1,command2,...}"
+        import re
+
+        # Look for the commands in the help output
+        # They appear in a format like: {add,delete,edit,...}
+        commands_match = re.search(r'\{([^}]+)\}', help_text)
+        if not commands_match:
+            # Alternative: commands listed line by line
+            # Extract command names from lines that look like "  command_name  description"
+            command_lines = []
+            in_commands_section = False
+            for line in help_text.split('\n'):
+                if 'positional arguments:' in line or '{' in line:
+                    in_commands_section = True
+                    continue
+                if in_commands_section and line.strip() and not line.startswith(' ' * 10):
+                    # Extract command name (first word after leading spaces)
+                    parts = line.strip().split()
+                    if parts and not parts[0].startswith('-'):
+                        command_lines.append(parts[0])
+                if in_commands_section and line and not line.startswith(' '):
+                    # End of commands section
+                    break
+
+            # Check if commands are sorted
+            if command_lines:
+                sorted_commands = sorted(command_lines)
+                assert command_lines == sorted_commands, f"Commands not in alphabetical order. Got: {command_lines}, Expected: {sorted_commands}"
+        else:
+            # Commands are in {cmd1,cmd2,...} format
+            commands_str = commands_match.group(1)
+            commands = [cmd.strip() for cmd in commands_str.split(',')]
+
+            # Verify commands are in alphabetical order
+            sorted_commands = sorted(commands)
+            assert commands == sorted_commands, f"Commands not in alphabetical order. Got: {commands}, Expected: {sorted_commands}"
