@@ -170,6 +170,31 @@ class Git:
         result = self._run("ls-remote", "--heads", remote, branch, check=False)
         return bool(result.stdout.strip())
 
+    def needs_push(self, branch: str, remote: str = "origin") -> bool:
+        """Check if a local branch has commits that need to be pushed.
+
+        Args:
+            branch: The branch name to check
+            remote: The remote name (default: origin)
+
+        Returns:
+            True if local branch is ahead of remote (or remote doesn't exist)
+        """
+        # Check if remote branch exists
+        if not self.remote_branch_exists(branch, remote):
+            return True
+
+        # Compare local and remote commits
+        result = self._run(
+            "rev-list", "--count", f"{remote}/{branch}..{branch}", check=False
+        )
+        if result.returncode != 0:
+            # If comparison fails, assume we need to push
+            return True
+
+        count = int(result.stdout.strip())
+        return count > 0
+
     def push_branch(self, branch: str, remote: str = "origin", set_upstream: bool = True) -> None:
         """Push a branch to the remote.
 

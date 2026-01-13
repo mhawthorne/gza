@@ -666,9 +666,9 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print(f"PR already exists: {existing_pr}")
         return 0
 
-    # Ensure branch is pushed to remote
+    # Ensure branch is pushed to remote (push if remote doesn't exist or is behind)
     try:
-        if not git.remote_branch_exists(task.branch):
+        if git.needs_push(task.branch):
             print(f"Pushing branch '{task.branch}' to origin...")
             git.push_branch(task.branch)
     except GitError as e:
@@ -699,7 +699,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print(f"✓ Created PR: {pr.url}")
         return 0
     except GitHubError as e:
-        print(f"Error creating PR: {e}")
+        print(f"Error creating PR:\n{e}")
         return 1
 
 
