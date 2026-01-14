@@ -64,7 +64,31 @@ Unmerged branches:
     Files changed: 3
 ```
 
-## Create a PR
+## Merge the work
+
+You have two options for getting your changes into main:
+
+### Option A: Merge directly
+
+For quick fixes or solo projects, merge directly:
+
+```bash
+$ gza merge 20260108-fix-the-login-button
+Merging task: 20260108-fix-the-login-button
+  Branch: feature/fix-the-login-button → main
+
+Merged 2 commits into main.
+```
+
+To squash commits into a single commit:
+
+```bash
+$ gza merge 20260108-fix-the-login-button --squash
+```
+
+### Option B: Create a PR (optional)
+
+For team projects or when you want code review, create a PR instead:
 
 ```bash
 $ gza pr 20260108-fix-the-login-button
@@ -80,3 +104,5 @@ To create a draft PR with a custom title:
 ```bash
 $ gza pr 20260108-fix-the-login-button --draft --title "fix: mobile login button touch handling"
 ```
+
+Then merge via GitHub's UI when ready.
