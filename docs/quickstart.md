@@ -5,7 +5,7 @@ Get up and running with Gza in a few steps.
 ## 1. Install Gza
 
 ```bash
-pip install gza
+pip install gza-agent
 ```
 
 ## 2. Initialize your project
