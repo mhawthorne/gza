@@ -62,13 +62,27 @@ class Git:
             self._run("branch", "-D", branch, check=False)
         self._run("checkout", "-b", branch)
 
-    def has_changes(self, path: str = ".") -> bool:
-        """Check if there are uncommitted changes or untracked files."""
+    def has_changes(self, path: str = ".", include_untracked: bool = True) -> bool:
+        """Check if there are uncommitted changes or untracked files.
+
+        Args:
+            path: Path to check for changes (default: ".")
+            include_untracked: Whether to consider untracked files as changes (default: True)
+
+        Returns:
+            True if there are staged, unstaged, or (optionally) untracked changes
+        """
         staged = self._run("diff", "--cached", "--quiet", "--", path, check=False)
         unstaged = self._run("diff", "--quiet", "--", path, check=False)
+
+        has_tracked_changes = staged.returncode != 0 or unstaged.returncode != 0
+
+        if not include_untracked:
+            return has_tracked_changes
+
         untracked = self._run("ls-files", "--others", "--exclude-standard", "--", path, check=False)
         has_untracked = bool(untracked.stdout.strip())
-        return staged.returncode != 0 or unstaged.returncode != 0 or has_untracked
+        return has_tracked_changes or has_untracked
 
     def add(self, path: str = ".") -> None:
         """Stage changes."""

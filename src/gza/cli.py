@@ -519,8 +519,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         print(f"Error: Branch '{task.branch}' is already merged into {current_branch}")
         return 1
 
-    # Check for uncommitted changes
-    if git.has_changes():
+    # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)
+    if git.has_changes(include_untracked=False):
         print("Error: You have uncommitted changes. Please commit or stash them first.")
         return 1
 
