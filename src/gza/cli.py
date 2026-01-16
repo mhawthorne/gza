@@ -2058,8 +2058,9 @@ class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add common arguments to a subparser."""
     parser.add_argument(
-        "project_dir",
-        nargs="?",
+        "--project",
+        "-C",
+        dest="project_dir",
         default=".",
         help="Target project directory (default: current directory)",
     )
@@ -2436,7 +2437,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Handle project_dir for commands that have positional args before it
+    # Validate and resolve project_dir
     if hasattr(args, 'project_dir'):
         args.project_dir = Path(args.project_dir).resolve()
         if not args.project_dir.is_dir():
