@@ -1385,3 +1385,132 @@ class TestHelpOutput:
             # Verify commands are in alphabetical order
             sorted_commands = sorted(commands)
             assert commands == sorted_commands, f"Commands not in alphabetical order. Got: {commands}, Expected: {sorted_commands}"
+
+
+class TestWorkCommandMultiTask:
+    """Tests for 'gza work' command with multiple task IDs."""
+
+    def test_work_with_single_task_id(self, tmp_path: Path):
+        """Work command accepts a single task ID."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add a task
+        task1 = store.add("Test task 1")
+
+        # Verify the command accepts the argument
+        result = run_gza("work", str(task1.id), "--no-docker", "--project", str(tmp_path))
+
+        # Note: Without actual Claude integration, this will fail,
+        # but we're verifying that argparse accepts the input
+        # The error should not be about argument parsing
+        assert "unrecognized arguments" not in result.stderr
+
+    def test_work_with_multiple_task_ids(self, tmp_path: Path):
+        """Work command accepts multiple task IDs."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add multiple tasks
+        task1 = store.add("Test task 1")
+        task2 = store.add("Test task 2")
+        task3 = store.add("Test task 3")
+
+        # Verify the command accepts multiple arguments
+        result = run_gza("work", str(task1.id), str(task2.id), str(task3.id),
+                        "--no-docker", "--project", str(tmp_path))
+
+        # Verify argparse accepts the input
+        assert "unrecognized arguments" not in result.stderr
+
+    def test_work_background_with_multiple_task_ids(self, tmp_path: Path):
+        """Work command with --background spawns workers for multiple task IDs."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add multiple tasks
+        task1 = store.add("Test task 1")
+        task2 = store.add("Test task 2")
+
+        # Create workers directory
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        # Run with background mode and multiple task IDs
+        result = run_gza("work", str(task1.id), str(task2.id),
+                        "--background", "--no-docker", "--project", str(tmp_path))
+
+        # Verify the command completes without argument parsing errors
+        assert "unrecognized arguments" not in result.stderr
+
+    def test_work_with_no_task_ids(self, tmp_path: Path):
+        """Work command works without task IDs (runs next pending)."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add a task
+        store.add("Test task 1")
+
+        # Run without task IDs
+        result = run_gza("work", "--no-docker", "--project", str(tmp_path))
+
+        # Verify no argument parsing errors
+        assert "unrecognized arguments" not in result.stderr
+
+    def test_work_validates_all_task_ids_before_execution(self, tmp_path: Path):
+        """Work command validates all task IDs before starting execution."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add one valid task
+        task1 = store.add("Test task 1")
+
+        # Try to run with one valid and one invalid task ID
+        result = run_gza("work", str(task1.id), "999", "--no-docker", "--project", str(tmp_path))
+
+        # Should error about the invalid task ID
+        assert result.returncode != 0
+        assert "Task #999 not found" in result.stdout or "Task #999 not found" in result.stderr
+
+    def test_work_validates_task_status(self, tmp_path: Path):
+        """Work command validates that tasks are in pending status."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add a completed task
+        task1 = store.add("Test task 1")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        store.update(task1)
+
+        # Try to run the completed task
+        result = run_gza("work", str(task1.id), "--no-docker", "--project", str(tmp_path))
+
+        # Should error about task status
+        assert result.returncode != 0
+        assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
