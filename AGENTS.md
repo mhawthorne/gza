@@ -9,13 +9,15 @@ A coding AI agent runner for Claude Code.
 ## Usage
 
 ```
-gza init [project_dir]     # Generate new gza.yaml with defaults
-gza work [project_dir]     # Run the next pending task
-gza next [project_dir]     # List upcoming pending tasks
-gza history [project_dir]  # List recent completed/failed tasks
-gza stats [project_dir]    # Show cost and usage statistics
-gza validate [project_dir] # Validate gza.yaml configuration
+gza init [--project DIR]     # Generate new gza.yaml with defaults
+gza work [--project DIR]     # Run the next pending task
+gza next [--project DIR]     # List upcoming pending tasks
+gza history [--project DIR]  # List recent completed/failed tasks
+gza stats [--project DIR]    # Show cost and usage statistics
+gza validate [--project DIR] # Validate gza.yaml configuration
 ```
+
+The `--project` (or `-C`) option specifies the target project directory and can be used with any command. If not specified, the current directory is used.
 
 Options for `init`:
 - `--force` - Overwrite existing gza.yaml file

@@ -53,7 +53,7 @@ class TestHistoryCommand:
             {"prompt": "Test task 3", "status": "pending"},
         ])
 
-        result = run_gza("history", str(tmp_path))
+        result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Test task 1" in result.stdout
@@ -63,7 +63,7 @@ class TestHistoryCommand:
     def test_history_with_no_tasks(self, tmp_path: Path):
         """History command handles missing database gracefully."""
         setup_config(tmp_path)
-        result = run_gza("history", str(tmp_path))
+        result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
@@ -73,7 +73,7 @@ class TestHistoryCommand:
         # Create empty database
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("history", str(tmp_path))
+        result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
@@ -90,7 +90,7 @@ class TestNextCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "First pending task" in result.stdout
@@ -103,7 +103,7 @@ class TestNextCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
@@ -115,25 +115,25 @@ class TestAddCommand:
     def test_add_with_inline_prompt(self, tmp_path: Path):
         """Add command with inline prompt creates a task."""
         setup_config(tmp_path)
-        result = run_gza("add", "Test inline task", str(tmp_path))
+        result = run_gza("add", "Test inline task", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task was added
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
         assert "Test inline task" in result.stdout
 
     def test_add_explore_task(self, tmp_path: Path):
         """Add command with --explore flag creates explore task."""
         setup_config(tmp_path)
-        result = run_gza("add", "--explore", "Explore the codebase", str(tmp_path))
+        result = run_gza("add", "--explore", "Explore the codebase", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task type is shown
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
         assert "[explore]" in result.stdout
 
 
@@ -146,7 +146,7 @@ class TestShowCommand:
             {"prompt": "A detailed task prompt", "status": "pending"},
         ])
 
-        result = run_gza("show", "1", str(tmp_path))
+        result = run_gza("show", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task #1" in result.stdout
@@ -157,7 +157,7 @@ class TestShowCommand:
         """Show command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("show", "999", str(tmp_path))
+        result = run_gza("show", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -172,20 +172,20 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "1", "--force", str(tmp_path))
+        result = run_gza("delete", "1", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
 
         # Verify task was deleted
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
         assert "No pending tasks" in result.stdout
 
     def test_delete_nonexistent_task(self, tmp_path: Path):
         """Delete command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("delete", "999", "--force", str(tmp_path))
+        result = run_gza("delete", "999", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -200,14 +200,14 @@ class TestRetryCommand:
             {"prompt": "Original task", "status": "completed", "task_type": "implement"},
         ])
 
-        result = run_gza("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task #2" in result.stdout
         assert "retry of #1" in result.stdout
 
         # Verify new task was created with same prompt
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
         assert "Original task" in result.stdout
 
     def test_retry_failed_task(self, tmp_path: Path):
@@ -216,7 +216,7 @@ class TestRetryCommand:
             {"prompt": "Failed task", "status": "failed"},
         ])
 
-        result = run_gza("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task #2" in result.stdout
@@ -228,7 +228,7 @@ class TestRetryCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_gza("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Can only retry completed or failed" in result.stdout
@@ -237,7 +237,7 @@ class TestRetryCommand:
         """Retry command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("retry", "999", str(tmp_path))
+        result = run_gza("retry", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -264,7 +264,7 @@ class TestRetryCommand:
         store.update(task)
 
         # Retry the task
-        result = run_gza("retry", "1", str(tmp_path))
+        result = run_gza("retry", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -286,7 +286,7 @@ class TestConfigRequirements:
 
     def test_missing_config_file(self, tmp_path: Path):
         """Commands fail when gza.yaml is missing."""
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Configuration file not found" in result.stderr
@@ -297,7 +297,7 @@ class TestConfigRequirements:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("timeout_minutes: 5\n")
 
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_name" in result.stderr
@@ -308,7 +308,7 @@ class TestConfigRequirements:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_key: value\n")
 
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         # Should succeed
         assert result.returncode == 0
@@ -323,14 +323,14 @@ class TestValidateCommand:
     def test_validate_valid_config(self, tmp_path: Path):
         """Validate command succeeds with valid config."""
         setup_config(tmp_path)
-        result = run_gza("validate", str(tmp_path))
+        result = run_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "valid" in result.stdout.lower()
 
     def test_validate_missing_config(self, tmp_path: Path):
         """Validate command fails with missing config."""
-        result = run_gza("validate", str(tmp_path))
+        result = run_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -340,7 +340,7 @@ class TestValidateCommand:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("timeout_minutes: 5\n")
 
-        result = run_gza("validate", str(tmp_path))
+        result = run_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_name" in result.stdout
@@ -351,7 +351,7 @@ class TestValidateCommand:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_field: value\n")
 
-        result = run_gza("validate", str(tmp_path))
+        result = run_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 0  # Unknown keys don't fail validation
         assert "unknown_field" in result.stdout
@@ -363,7 +363,7 @@ class TestInitCommand:
 
     def test_init_creates_config(self, tmp_path: Path):
         """Init command creates config in project root."""
-        result = run_gza("init", str(tmp_path))
+        result = run_gza("init", "--project", str(tmp_path))
 
         assert result.returncode == 0
         config_path = tmp_path / "gza.yaml"
@@ -378,7 +378,7 @@ class TestInitCommand:
         """Init command does not overwrite existing config without --force."""
         setup_config(tmp_path, project_name="original")
 
-        result = run_gza("init", str(tmp_path))
+        result = run_gza("init", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "already exists" in result.stdout
@@ -391,7 +391,7 @@ class TestInitCommand:
         """Init command overwrites existing config with --force."""
         setup_config(tmp_path, project_name="original")
 
-        result = run_gza("init", "--force", str(tmp_path))
+        result = run_gza("init", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -415,19 +415,19 @@ class TestImportCommand:
   status: completed
 """)
 
-        result = run_gza("import", str(tmp_path))
+        result = run_gza("import", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Imported 2 tasks" in result.stdout
 
         # Verify tasks were imported
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
         assert "Task from YAML" in result.stdout
 
     def test_import_no_yaml(self, tmp_path: Path):
         """Import command handles missing tasks.yaml."""
         setup_config(tmp_path)
-        result = run_gza("import", str(tmp_path))
+        result = run_gza("import", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -466,7 +466,7 @@ class TestLogCommand:
         }
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task completed successfully!" in result.stdout
@@ -509,7 +509,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "This was parsed from JSONL!" in result.stdout
@@ -551,7 +551,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "error_max_turns" in result.stdout
@@ -573,7 +573,7 @@ class TestLogCommand:
         task.log_file = ".gza/logs/nonexistent.log"
         store.update(task)
 
-        result = run_gza("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
@@ -604,7 +604,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         # Should show formatted entries instead of failing
         assert result.returncode == 0
@@ -620,7 +620,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_gza("log", "--task", "999", str(tmp_path))
+        result = run_gza("log", "--task", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Task 999 not found" in result.stdout
@@ -634,7 +634,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_gza("log", "--task", "not-a-number", str(tmp_path))
+        result = run_gza("log", "--task", "not-a-number", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not a valid task ID" in result.stdout
@@ -661,7 +661,7 @@ class TestLogCommand:
         log_data = {"type": "result", "result": "Slug lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--slug", "20260108-test-slug", str(tmp_path))
+        result = run_gza("log", "--slug", "20260108-test-slug", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Slug lookup works!" in result.stdout
@@ -688,7 +688,7 @@ class TestLogCommand:
         log_data = {"type": "result", "result": "Partial match works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--slug", "partial-slug", str(tmp_path))
+        result = run_gza("log", "--slug", "partial-slug", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Partial match works!" in result.stdout
@@ -702,7 +702,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_gza("log", "--slug", "nonexistent-slug", str(tmp_path))
+        result = run_gza("log", "--slug", "nonexistent-slug", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "No task found matching slug" in result.stdout
@@ -748,7 +748,7 @@ class TestLogCommand:
         log_data = {"type": "result", "result": "Worker lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--worker", worker_id, str(tmp_path))
+        result = run_gza("log", "--worker", worker_id, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Worker lookup works!" in result.stdout
@@ -766,7 +766,7 @@ class TestLogCommand:
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("log", "--worker", "w-nonexistent", str(tmp_path))
+        result = run_gza("log", "--worker", "w-nonexistent", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Worker 'w-nonexistent' not found" in result.stdout
@@ -792,7 +792,7 @@ class TestLogCommand:
         log_file = log_dir / "test-startup-error.log"
         log_file.write_text("exec /usr/local/bin/docker-entrypoint.sh: argument list too long")
 
-        result = run_gza("log", "--task", "1", str(tmp_path))
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         # Should detect startup failure and display the error
         assert result.returncode == 1
@@ -805,7 +805,7 @@ class TestLogCommand:
         """Log command requires --task, --slug, or --worker flag."""
         setup_config(tmp_path)
 
-        result = run_gza("log", "123", str(tmp_path))
+        result = run_gza("log", "123", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "one of the arguments --task/-t --slug/-s --worker/-w is required" in result.stderr
@@ -824,7 +824,7 @@ class TestPrCommand:
         from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_gza("pr", "999", str(tmp_path))
+        result = run_gza("pr", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -835,7 +835,7 @@ class TestPrCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_gza("pr", "1", str(tmp_path))
+        result = run_gza("pr", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not completed" in result.stdout
@@ -855,7 +855,7 @@ class TestPrCommand:
         task.has_commits = True
         store.update(task)
 
-        result = run_gza("pr", "1", str(tmp_path))
+        result = run_gza("pr", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no branch" in result.stdout
@@ -875,7 +875,7 @@ class TestPrCommand:
         task.has_commits = False
         store.update(task)
 
-        result = run_gza("pr", "1", str(tmp_path))
+        result = run_gza("pr", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no commits" in result.stdout
@@ -901,7 +901,7 @@ class TestGroupsCommand:
         task3.completed_at = datetime.now(timezone.utc)
         store.update(task3)
 
-        result = run_gza("groups", str(tmp_path))
+        result = run_gza("groups", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "group-a" in result.stdout
@@ -915,7 +915,7 @@ class TestGroupsCommand:
         from gza.db import SqliteTaskStore
         SqliteTaskStore(db_path)
 
-        result = run_gza("groups", str(tmp_path))
+        result = run_gza("groups", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -939,7 +939,7 @@ class TestStatusCommand:
         store.update(task1)
         store.add("Second task", group="test-group", depends_on=task1.id)
 
-        result = run_gza("status", "test-group", str(tmp_path))
+        result = run_gza("status", "test-group", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "test-group" in result.stdout
@@ -962,7 +962,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.group is None
 
-        result = run_gza("edit", str(task.id), "--group", "new-group", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--group", "new-group", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -982,7 +982,7 @@ class TestEditCommand:
         task = store.add("Test task", group="old-group")
         assert task.group == "old-group"
 
-        result = run_gza("edit", str(task.id), "--group", "", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--group", "", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1002,7 +1002,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.create_review is False
 
-        result = run_gza("edit", str(task.id), "--review", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--review", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1028,7 +1028,7 @@ class TestNextCommandWithDependencies:
         task2 = store.add("Blocked task", depends_on=task1.id)
         task3 = store.add("Independent task")
 
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Should show task1 or task3, but not task2
@@ -1047,7 +1047,7 @@ class TestNextCommandWithDependencies:
         task1 = store.add("First task")
         task2 = store.add("Blocked task", depends_on=task1.id)
 
-        result = run_gza("next", "--all", str(tmp_path))
+        result = run_gza("next", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "First task" in result.stdout
@@ -1068,7 +1068,7 @@ class TestNextCommandWithDependencies:
         store.add("Blocked task 2", depends_on=task1.id)
         store.add("Independent task")
 
-        result = run_gza("next", str(tmp_path))
+        result = run_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Should mention 2 blocked tasks
@@ -1081,7 +1081,7 @@ class TestAddCommandWithChaining:
     def test_add_with_type_plan(self, tmp_path: Path):
         """Add command can create plan tasks."""
         setup_config(tmp_path)
-        result = run_gza("add", "--type", "plan", "Create a plan", str(tmp_path))
+        result = run_gza("add", "--type", "plan", "Create a plan", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -1089,14 +1089,14 @@ class TestAddCommandWithChaining:
     def test_add_with_type_implement(self, tmp_path: Path):
         """Add command can create implement tasks."""
         setup_config(tmp_path)
-        result = run_gza("add", "--type", "implement", "Implement feature", str(tmp_path))
+        result = run_gza("add", "--type", "implement", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
     def test_add_with_type_review(self, tmp_path: Path):
         """Add command can create review tasks."""
         setup_config(tmp_path)
-        result = run_gza("add", "--type", "review", "Review implementation", str(tmp_path))
+        result = run_gza("add", "--type", "review", "Review implementation", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1111,7 +1111,7 @@ class TestAddCommandWithChaining:
 
         task1 = store.add("First task")
 
-        result = run_gza("add", "--based-on", str(task1.id), "Follow-up task", str(tmp_path))
+        result = run_gza("add", "--based-on", str(task1.id), "Follow-up task", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1130,7 +1130,7 @@ class TestAddCommandWithChaining:
         spec_file.parent.mkdir(parents=True, exist_ok=True)
         spec_file.write_text("# Feature Spec\n\nThis is a test spec.")
 
-        result = run_gza("add", "--spec", "specs/feature.md", "Implement feature", str(tmp_path))
+        result = run_gza("add", "--spec", "specs/feature.md", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -1148,7 +1148,7 @@ class TestAddCommandWithChaining:
         """Add command with --spec fails if file doesn't exist."""
         setup_config(tmp_path)
 
-        result = run_gza("add", "--spec", "nonexistent.md", "Implement feature", str(tmp_path))
+        result = run_gza("add", "--spec", "nonexistent.md", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: Spec file not found: nonexistent.md" in result.stdout
