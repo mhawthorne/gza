@@ -680,8 +680,12 @@ def _run_non_code_task(
         worktree_report_dir.mkdir(parents=True, exist_ok=True)
         worktree_report_path = worktree_path / report_path.relative_to(config.project_dir)
 
+        # For Docker containers, use /workspace-relative path instead of host worktree path
+        # The container only has /workspace mounted, so we need to use a path inside that
+        container_report_path = Path("/workspace") / report_path.relative_to(config.project_dir)
+
         # Run provider in the worktree
-        prompt = build_prompt(task, config, store, worktree_report_path, git)
+        prompt = build_prompt(task, config, store, container_report_path, git)
         resume_session_id = task.session_id if resume else None
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=resume_session_id)
