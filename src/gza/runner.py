@@ -511,18 +511,33 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         if result.error_type == "max_turns":
             print(f"Task failed: max turns of {config.max_turns} exceeded")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code == 124:
             print(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code != 0:
             print(f"Task failed: {provider.name} exited with code {exit_code}")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
@@ -532,6 +547,11 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             # Check exit code - if Claude succeeded but made no changes, that's a failure
             print("No changes made")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
@@ -552,16 +572,19 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         print("")
         print("=== Done ===")
         print_stats(stats, has_commits=True)
-        print(f"changes committed to branch: {branch_name}")
+        print(f"Task ID: {task.id}")
+        print(f"Branch: {branch_name}")
         print("")
-        print("to view logs:")
-        print(f"gza log {task.task_id}")
+        print("Next steps:")
+        print(f"  gza pr {task.id}              # create a PR")
+        print(f"  gza retry {task.id}           # retry from scratch")
+        print(f"  gza resume {task.id}          # resume from where it left off")
         print("")
-        print("to review changes:")
-        print(f"git diff {default_branch}...{branch_name} --")
+        print("To review changes:")
+        print(f"  git diff {default_branch}...{branch_name} --")
         print("")
-        print("to merge:")
-        print(f"git merge --squash {branch_name}")
+        print("To merge:")
+        print(f"  git merge --squash {branch_name}")
 
         _cleanup_worktree(git, worktree_path)
 
@@ -678,18 +701,33 @@ def _run_non_code_task(
         if result.error_type == "max_turns":
             print(f"Task failed: max turns of {config.max_turns} exceeded")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code == 124:
             print(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code != 0:
             print(f"Task failed: {provider.name} exited with code {exit_code}")
             print_stats(stats, has_commits=False)
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
             _cleanup_worktree(git, worktree_path)
             return 0
@@ -725,6 +763,7 @@ def _run_non_code_task(
         print("")
         print(f"=== {task_type_display} Complete ===")
         print_stats(stats, has_commits=False)
+        print(f"Task ID: {task.id}")
         print(f"Report: {report_file_relative}")
         print("")
 
@@ -734,6 +773,11 @@ def _run_non_code_task(
         elif task.task_type == "plan":
             print("To implement this plan, add a task with:")
             print(f"  gza add --type implement --based-on {task.id}")
+
+        print("")
+        print("Next steps:")
+        print(f"  gza retry {task.id}           # retry from scratch")
+        print(f"  gza resume {task.id}          # resume from where it left off")
 
         # Cleanup worktree
         _cleanup_worktree(git, worktree_path)

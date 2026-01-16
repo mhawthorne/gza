@@ -52,7 +52,7 @@ git diff --name-only --diff-filter=U
 echo ""
 
 echo "Invoking Claude Code to resolve conflicts..."
-claude -p "Resolve the merge conflicts. For each conflicted file:
+claude "Resolve the merge conflicts. For each conflicted file:
 1. Read the file to see the conflict markers
 2. Understand what both sides are trying to add
 3. Combine both changes appropriately (usually keeping both additions)
