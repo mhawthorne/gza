@@ -604,12 +604,30 @@ def cmd_merge(args: argparse.Namespace) -> int:
         print("Error: You have uncommitted changes. Please commit or stash them first.")
         return 1
 
-    # Perform the merge
+    # Check for conflicting flags
+    if args.rebase and args.squash:
+        print("Error: Cannot use --rebase and --squash together")
+        return 1
+
+    # Perform the merge or rebase
     try:
-        merge_type = "squash merging" if args.squash else "merging"
-        print(f"Merging '{task.branch}' into '{current_branch}'...")
-        git.merge(task.branch, squash=args.squash)
-        print(f"✓ Successfully merged {task.branch}")
+        if args.rebase:
+            # For rebase: checkout the task branch, rebase onto current, then fast-forward merge
+            print(f"Rebasing '{task.branch}' onto '{current_branch}'...")
+            git.checkout(task.branch)
+            git.rebase(current_branch)
+            print(f"✓ Successfully rebased {task.branch}")
+
+            # Switch back and fast-forward merge
+            git.checkout(current_branch)
+            git.merge(task.branch, squash=False)
+            print(f"✓ Fast-forwarded {current_branch} to {task.branch}")
+        else:
+            # Regular merge or squash merge
+            merge_type = "squash merging" if args.squash else "merging"
+            print(f"Merging '{task.branch}' into '{current_branch}'...")
+            git.merge(task.branch, squash=args.squash)
+            print(f"✓ Successfully merged {task.branch}")
 
         # Delete branch if requested
         if args.delete:
@@ -622,13 +640,23 @@ def cmd_merge(args: argparse.Namespace) -> int:
         return 0
 
     except GitError as e:
-        print(f"Error merging branch: {e}")
-        print("\nAborting merge and restoring clean state...")
+        operation = "rebase" if args.rebase else "merge"
+        print(f"Error during {operation}: {e}")
+        print(f"\nAborting {operation} and restoring clean state...")
         try:
-            git.merge_abort()
-            print("✓ Merge aborted, working directory restored")
+            if args.rebase:
+                git.rebase_abort()
+                # Try to switch back to original branch
+                try:
+                    git.checkout(current_branch)
+                except GitError:
+                    pass  # Best effort to return to original branch
+                print("✓ Rebase aborted, working directory restored")
+            else:
+                git.merge_abort()
+                print("✓ Merge aborted, working directory restored")
         except GitError as abort_error:
-            print(f"Warning: Could not abort merge: {abort_error}")
+            print(f"Warning: Could not abort {operation}: {abort_error}")
         return 1
 
 
@@ -2277,6 +2305,11 @@ def main() -> int:
         "--squash",
         action="store_true",
         help="Perform a squash merge instead of a regular merge",
+    )
+    merge_parser.add_argument(
+        "--rebase",
+        action="store_true",
+        help="Rebase the task's branch onto current branch instead of merging",
     )
     add_common_args(merge_parser)
 
