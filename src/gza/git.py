@@ -288,6 +288,17 @@ class Git:
         args.append(branch)
         self._run(*args)
 
+    def merge_abort(self) -> None:
+        """Abort a merge in progress and restore clean state.
+
+        This is called after a failed merge to clean up the working directory
+        and return to the state before the merge was attempted.
+
+        Raises:
+            GitError: If aborting the merge fails
+        """
+        self._run("merge", "--abort")
+
     def delete_branch(self, branch: str, force: bool = False) -> None:
         """Delete a local branch.
 

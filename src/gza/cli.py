@@ -508,7 +508,12 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     except GitError as e:
         print(f"Error merging branch: {e}")
-        print("\nMerge failed. You may need to resolve conflicts manually.")
+        print("\nAborting merge and restoring clean state...")
+        try:
+            git.merge_abort()
+            print("✓ Merge aborted, working directory restored")
+        except GitError as abort_error:
+            print(f"Warning: Could not abort merge: {abort_error}")
         return 1
 
 
