@@ -552,6 +552,200 @@ class TestClaudeErrorTypeExtraction:
         assert result.exit_code == 0
 
 
+class TestClaudeToolLogging:
+    """Tests for enhanced Claude provider tool logging."""
+
+    def test_logs_glob_pattern(self, tmp_path, capsys):
+        """Should log Glob tool with pattern details."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate Claude's stream-json output with Glob tool call
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Glob",
+                            "input": {"pattern": "**/*.py"}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ Glob **/*.py" in captured.out
+
+    def test_logs_todowrite_summary(self, tmp_path, capsys):
+        """Should log TodoWrite tool with todos summary."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate Claude's stream-json output with TodoWrite tool call
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "TodoWrite",
+                            "input": {
+                                "todos": [
+                                    {"content": "Task 1", "status": "pending", "activeForm": "Working on task 1"},
+                                    {"content": "Task 2", "status": "in_progress", "activeForm": "Working on task 2"},
+                                    {"content": "Task 3", "status": "completed", "activeForm": "Completed task 3"},
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ TodoWrite 3 todos (pending: 1, in_progress: 1, completed: 1)" in captured.out
+
+    def test_logs_todowrite_empty_list(self, tmp_path, capsys):
+        """Should log TodoWrite with empty todos list."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate Claude's stream-json output with empty TodoWrite
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "TodoWrite",
+                            "input": {"todos": []}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ TodoWrite 0 todos" in captured.out
+
+    def test_logs_file_path_tools(self, tmp_path, capsys):
+        """Should still log file path for file-related tools."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate Claude's stream-json output with Read tool call
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/workspace/test.py"}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ Read /workspace/test.py" in captured.out
+
+
 class TestGetImageCreatedTime:
     """Tests for Docker image timestamp retrieval."""
 
