@@ -315,6 +315,28 @@ class Git:
         """
         self._run("merge", "--abort")
 
+    def rebase(self, branch: str) -> None:
+        """Rebase the current branch onto another branch.
+
+        Args:
+            branch: The branch to rebase onto
+
+        Raises:
+            GitError: If the rebase fails
+        """
+        self._run("rebase", branch)
+
+    def rebase_abort(self) -> None:
+        """Abort a rebase in progress and restore clean state.
+
+        This is called after a failed rebase to clean up the working directory
+        and return to the state before the rebase was attempted.
+
+        Raises:
+            GitError: If aborting the rebase fails
+        """
+        self._run("rebase", "--abort")
+
     def delete_branch(self, branch: str, force: bool = False) -> None:
         """Delete a local branch.
 
