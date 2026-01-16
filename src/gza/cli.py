@@ -526,8 +526,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     # Perform the merge
     try:
+        merge_type = "squash merging" if args.squash else "merging"
         print(f"Merging '{task.branch}' into '{current_branch}'...")
-        git.merge(task.branch, squash=False)
+        git.merge(task.branch, squash=args.squash)
         print(f"✓ Successfully merged {task.branch}")
 
         # Delete branch if requested
@@ -2171,6 +2172,11 @@ def main() -> int:
         "--delete",
         action="store_true",
         help="Delete the branch after successful merge",
+    )
+    merge_parser.add_argument(
+        "--squash",
+        action="store_true",
+        help="Perform a squash merge instead of a regular merge",
     )
     add_common_args(merge_parser)
 

@@ -1514,3 +1514,51 @@ class TestWorkCommandMultiTask:
         # Should error about task status
         assert result.returncode != 0
         assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
+
+
+class TestMergeCommand:
+    """Tests for 'gza merge' command."""
+
+    def test_merge_accepts_squash_flag(self, tmp_path: Path):
+        """Merge command accepts --squash flag."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test merge task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-merge"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-merge")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Test that --squash flag is accepted
+        result = run_gza("merge", str(task.id), "--squash", "--project", str(tmp_path))
+
+        # Verify the command doesn't fail due to argument parsing
+        assert "unrecognized arguments" not in result.stderr
+        # The merge should succeed or fail based on git operations, not argument parsing
+        assert result.returncode == 0 or "Error merging" in result.stdout
