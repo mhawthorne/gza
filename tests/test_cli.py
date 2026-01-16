@@ -280,6 +280,106 @@ class TestRetryCommand:
         assert new_task.based_on == 1
         assert new_task.status == "pending"
 
+    def test_retry_with_background_flag(self, tmp_path: Path):
+        """Retry command with --background spawns a worker for the new task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a failed task
+        task = store.add("Failed task to retry")
+        task.status = "failed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create workers directory
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        # Run retry with background mode
+        result = run_gza("retry", "1", "--background", "--no-docker", "--project", str(tmp_path))
+
+        # Verify the command completes successfully
+        assert result.returncode == 0
+        assert "Created task #2" in result.stdout
+        assert "Started worker" in result.stdout
+
+        # Verify new task was created
+        new_task = store.get(2)
+        assert new_task is not None
+        assert new_task.prompt == "Failed task to retry"
+        assert new_task.status == "pending"
+        assert new_task.based_on == 1
+
+
+class TestResumeCommand:
+    """Tests for 'gza resume' command."""
+
+    def test_resume_with_background_flag(self, tmp_path: Path):
+        """Resume command with --background spawns a worker to resume the task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a failed task with a session ID
+        task = store.add("Failed task to resume")
+        task.status = "failed"
+        task.session_id = "test-session-123"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create workers directory
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        # Run resume with background mode
+        result = run_gza("resume", "1", "--background", "--no-docker", "--project", str(tmp_path))
+
+        # Verify the command completes successfully
+        assert result.returncode == 0
+        assert "Started worker" in result.stdout
+        assert "(resuming)" in result.stdout
+
+    def test_resume_without_session_id_fails(self, tmp_path: Path):
+        """Resume command fails for tasks without session ID."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a failed task without session ID
+        task = store.add("Failed task without session")
+        task.status = "failed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Try to resume
+        result = run_gza("resume", "1", "--project", str(tmp_path))
+
+        # Verify it fails with helpful message
+        assert result.returncode == 1
+        assert "has no session ID" in result.stdout
+        assert "gza retry" in result.stdout
+
+    def test_resume_non_failed_task_fails(self, tmp_path: Path):
+        """Resume command fails for non-failed tasks."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Pending task", "status": "pending"},
+        ])
+
+        result = run_gza("resume", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Can only resume failed tasks" in result.stdout
+
 
 class TestConfigRequirements:
     """Tests for gza.yaml configuration requirements."""

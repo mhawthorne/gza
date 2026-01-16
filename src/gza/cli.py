@@ -147,11 +147,12 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     # Run the task normally
     exit_code = 1
     try:
+        resume = hasattr(args, 'resume') and args.resume
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
-            exit_code = run(config, task_id=args.task_ids[0])
+            exit_code = run(config, task_id=args.task_ids[0], resume=resume)
         else:
-            exit_code = run(config)
+            exit_code = run(config, resume=resume)
 
         # Update worker status on completion
         if worker_id:
@@ -164,6 +165,85 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         print(f"Worker error: {e}")
         if worker_id:
             registry.mark_completed(worker_id, exit_code=1, status="failed")
+        return 1
+
+
+def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, task_id: int) -> int:
+    """Spawn a background worker to resume a failed task.
+
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+        task_id: Task ID to resume
+
+    Returns:
+        0 on success, 1 on error
+    """
+    # Initialize worker registry
+    registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
+
+    # Get task (validation already done in cmd_resume)
+    task = store.get(task_id)
+    if not task:
+        print(f"Error: Task #{task_id} not found")
+        return 1
+
+    # Build command for worker subprocess
+    cmd = [
+        sys.executable, "-m", "gza",
+        "work",
+        "--worker-mode",
+        "--resume",
+        str(task_id),
+    ]
+
+    if args.no_docker:
+        cmd.append("--no-docker")
+
+    # Add project directory
+    cmd.append(str(config.project_dir.absolute()))
+
+    # Spawn detached process
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+
+        # Generate worker ID
+        worker_id = registry.generate_worker_id()
+
+        # Register worker
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=proc.pid,
+            task_id=task.id,
+            task_slug=None,  # Will be set when runner starts
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,  # Will be set when runner starts
+            worktree=None,  # Will be set when runner starts
+        )
+        registry.register(worker)
+
+        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"  Task: #{task.id} (resuming)")
+        if task.prompt:
+            prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
+            print(f"  Prompt: {prompt_display}")
+        print()
+        print(f"Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error spawning background worker: {e}")
         return 1
 
 
@@ -1825,6 +1905,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
 def cmd_retry(args: argparse.Namespace) -> int:
     """Retry a failed or completed task by creating a new pending task."""
     config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
     store = get_store(config)
 
     # Get the original task
@@ -1850,6 +1933,14 @@ def cmd_retry(args: argparse.Namespace) -> int:
     )
 
     print(f"✓ Created task #{new_task.id} (retry of #{args.task_id})")
+
+    # Handle background mode - spawn worker to run the new task
+    if args.background:
+        # Create a temporary args object for the worker with the new task_id
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [new_task.id]
+        return _spawn_background_worker(worker_args, config, task_id=new_task.id)
+
     return 0
 
 
@@ -1874,6 +1965,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")
         print("Use 'gza retry' to start fresh instead")
         return 1
+
+    # Handle background mode
+    if args.background:
+        return _spawn_background_resume_worker(args, config, args.task_id)
 
     # Resume the task
     print(f"=== Resuming Task #{args.task_id} ===")
@@ -2142,6 +2237,11 @@ def main() -> int:
         action="store_true",
         help=argparse.SUPPRESS,  # Internal flag for background workers
     )
+    work_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=argparse.SUPPRESS,  # Internal flag for resume mode
+    )
 
     # next command
     next_parser = subparsers.add_parser("next", help="List upcoming pending tasks")
@@ -2380,6 +2480,16 @@ def main() -> int:
         type=int,
         help="Task ID to retry",
     )
+    retry_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --background)",
+    )
+    retry_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
     add_common_args(retry_parser)
 
     # resume command
@@ -2393,6 +2503,11 @@ def main() -> int:
         "--no-docker",
         action="store_true",
         help="Run Claude directly instead of in Docker",
+    )
+    resume_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
     )
     add_common_args(resume_parser)
 
