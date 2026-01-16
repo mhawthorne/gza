@@ -59,8 +59,16 @@ Output ONLY the markdown release notes, no additional commentary."
 echo "Generating release notes from $FROM_TAG to $TO_TAG..."
 echo ""
 
+# Create output directory if it doesn't exist
+OUTPUT_DIR="docs/release-notes"
+mkdir -p "$OUTPUT_DIR"
+
+# Sanitize the tag name for use as a filename (replace / with -)
+OUTPUT_FILE="$OUTPUT_DIR/${TO_TAG//\//-}.md"
+
 if command -v claude &> /dev/null; then
-    echo "$PROMPT" | claude --print
+    echo "$PROMPT" | claude --print > "$OUTPUT_FILE"
+    echo "Release notes written to: $OUTPUT_FILE"
 else
     echo "Error: 'claude' CLI not found. Install it with: npm install -g @anthropic-ai/claude-code"
     exit 1
