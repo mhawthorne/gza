@@ -205,9 +205,25 @@ class ClaudeProvider(Provider):
                         if content.get("type") == "tool_use":
                             tool_name = content.get("name", "unknown")
                             tool_input = content.get("input", {})
+
                             # Extract file path for file-related tools
                             file_path = tool_input.get("file_path") or tool_input.get("path")
-                            if file_path:
+
+                            # Enhanced logging for specific tools
+                            if tool_name == "Glob":
+                                pattern = tool_input.get("pattern", "")
+                                print(f"  → {tool_name} {pattern}")
+                            elif tool_name == "TodoWrite":
+                                todos = tool_input.get("todos", [])
+                                todos_summary = f"{len(todos)} todos"
+                                # Show status breakdown if available
+                                if todos:
+                                    pending = sum(1 for t in todos if t.get("status") == "pending")
+                                    in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
+                                    completed = sum(1 for t in todos if t.get("status") == "completed")
+                                    todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
+                                print(f"  → {tool_name} {todos_summary}")
+                            elif file_path:
                                 print(f"  → {tool_name} {file_path}")
                             else:
                                 print(f"  → {tool_name}")
