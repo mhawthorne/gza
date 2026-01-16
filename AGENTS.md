@@ -4,7 +4,7 @@ A coding AI agent runner for Claude Code.
 
 ## Quick Reference
 
-When the user asks to "add a task" or "create a task", use `uv run gza add "..."` - do NOT edit `etc/todo.txt` or other manual todo files.
+**Task Management - CRITICAL**: When the user mentions "task", "gza task", "add a task", "create a task", or asks to track/remember something for later, ALWAYS use `uv run gza add "..."`. NEVER edit `etc/todo.txt` or any other files manually for task tracking.
 
 ## Usage
 
