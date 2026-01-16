@@ -25,30 +25,34 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
-def _spawn_background_worker(args: argparse.Namespace, config: Config) -> int:
-    """Spawn a background worker process."""
+def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int = None) -> int:
+    """Spawn a background worker process.
+
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+        task_id: Specific task ID to run (optional)
+    """
     # Initialize worker registry
     registry = WorkerRegistry(config.workers_path)
 
     # Get task to run (either specific or next pending)
     store = get_store(config)
-    if hasattr(args, 'task_id') and args.task_id:
-        task = store.get(args.task_id)
+    if task_id:
+        task = store.get(task_id)
         if not task:
-            print(f"Error: Task #{args.task_id} not found")
+            print(f"Error: Task #{task_id} not found")
             return 1
 
         if task.status != "pending":
-            print(f"Error: Task #{args.task_id} is not pending (status: {task.status})")
+            print(f"Error: Task #{task_id} is not pending (status: {task.status})")
             return 1
 
         # Check if task is blocked
         is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
         if is_blocked:
-            print(f"Error: Task #{args.task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
             return 1
-
-        task_id = args.task_id
     else:
         # Atomically claim next task
         task = store.claim_next_pending_task()
@@ -143,8 +147,9 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     # Run the task normally
     exit_code = 1
     try:
-        if hasattr(args, 'task_id') and args.task_id:
-            exit_code = run(config, task_id=args.task_id)
+        if hasattr(args, 'task_ids') and args.task_ids:
+            # Worker mode only runs one task at a time
+            exit_code = run(config, task_id=args.task_ids[0])
         else:
             exit_code = run(config)
 
@@ -166,7 +171,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     """Spawn N background workers in parallel.
 
     Args:
-        args: Command-line arguments including count and task_id
+        args: Command-line arguments including count and task_ids
         config: Configuration object
 
     Returns:
@@ -175,11 +180,22 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     # Determine how many workers to spawn
     count = args.count if args.count is not None else 1
 
-    # If a specific task_id is provided, only spawn 1 worker for that task
-    if hasattr(args, 'task_id') and args.task_id:
+    # If specific task_ids are provided, spawn one worker per task ID
+    if hasattr(args, 'task_ids') and args.task_ids:
         if count > 1:
-            print("Warning: --count is ignored when a specific task ID is provided")
-        return _spawn_background_worker(args, config)
+            print("Warning: --count is ignored when specific task IDs are provided")
+
+        # Spawn one worker per task ID
+        spawned_count = 0
+        for task_id in args.task_ids:
+            result = _spawn_background_worker(args, config, task_id=task_id)
+            if result == 0:
+                spawned_count += 1
+
+        if len(args.task_ids) > 1:
+            print(f"\n=== Spawned {spawned_count} background worker(s) for {len(args.task_ids)} task(s) ===")
+
+        return 0
 
     # Spawn N workers - each will atomically claim a pending task
     # If there are fewer pending tasks than requested, some spawns will
@@ -203,7 +219,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Run the next pending task(s) or a specific task."""
+    """Run the next pending task(s) or specific tasks."""
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
@@ -224,24 +240,26 @@ def cmd_run(args: argparse.Namespace) -> int:
     store = get_store(config)
     task_id_for_registration = None
 
-    # Check if a specific task ID was provided
-    if hasattr(args, 'task_id') and args.task_id:
-        task = store.get(args.task_id)
-        if not task:
-            print(f"Error: Task #{args.task_id} not found")
-            return 1
+    # Check if specific task IDs were provided
+    if hasattr(args, 'task_ids') and args.task_ids:
+        # Validate all task IDs first
+        for task_id in args.task_ids:
+            task = store.get(task_id)
+            if not task:
+                print(f"Error: Task #{task_id} not found")
+                return 1
 
-        if task.status != "pending":
-            print(f"Error: Task #{args.task_id} is not pending (status: {task.status})")
-            return 1
+            if task.status != "pending":
+                print(f"Error: Task #{task_id} is not pending (status: {task.status})")
+                return 1
 
-        # Check if task is blocked by a dependency
-        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
-        if is_blocked:
-            print(f"Error: Task #{args.task_id} is blocked by task #{blocking_id} ({blocking_status})")
-            return 1
+            # Check if task is blocked by a dependency
+            is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+            if is_blocked:
+                print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+                return 1
 
-        task_id_for_registration = args.task_id
+        task_id_for_registration = args.task_ids[0]
     else:
         # For loop mode, we'll register with the first task we're about to run
         next_task = store.get_next_pending()
@@ -273,12 +291,28 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         # Run the task(s)
-        if hasattr(args, 'task_id') and args.task_id:
-            # Run the specific task
-            result = run(config, task_id=args.task_id)
-            registry.mark_completed(worker_id, exit_code=result,
-                                   status="completed" if result == 0 else "failed")
-            return result
+        if hasattr(args, 'task_ids') and args.task_ids:
+            # Run the specific tasks
+            tasks_completed = 0
+            for task_id in args.task_ids:
+                result = run(config, task_id=task_id)
+                if result != 0:
+                    if tasks_completed == 0:
+                        # First task failed
+                        registry.mark_completed(worker_id, exit_code=result, status="failed")
+                        return result
+                    else:
+                        # We completed some tasks before failure
+                        print(f"\nCompleted {tasks_completed} task(s) before task #{task_id} failed")
+                        registry.mark_completed(worker_id, exit_code=result, status="failed")
+                        return result
+                tasks_completed += 1
+
+            # All tasks completed successfully
+            if tasks_completed > 1:
+                print(f"\n=== Completed {tasks_completed} tasks ===")
+            registry.mark_completed(worker_id, exit_code=0, status="completed")
+            return 0
 
         # Determine how many tasks to run
         count = args.count if args.count is not None else config.work_count
@@ -2079,12 +2113,12 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # work command
-    work_parser = subparsers.add_parser("work", help="Run the next pending task or a specific task")
+    work_parser = subparsers.add_parser("work", help="Run the next pending task or specific tasks")
     work_parser.add_argument(
-        "task_id",
-        nargs="?",
+        "task_ids",
+        nargs="*",
         type=int,
-        help="Specific task ID to run (optional)",
+        help="Specific task ID(s) to run (optional, can specify multiple)",
     )
     add_common_args(work_parser)
     work_parser.add_argument(
