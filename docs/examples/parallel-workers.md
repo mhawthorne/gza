@@ -79,4 +79,4 @@ Background workers:
 - Update status in `.gza/workers/<worker_id>.json`
 - Clean up automatically on completion
 
-See [specs/concurrent-work.md](../../specs/concurrent-work.md) for full documentation.
+See the [Configuration Reference](../configuration.md) for all worker options.

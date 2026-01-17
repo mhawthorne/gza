@@ -8,7 +8,22 @@ Get up and running with Gza in a few steps.
 pip install gza-agent
 ```
 
-## 2. Initialize your project
+## 2. Set up authentication
+
+Gza needs credentials for your AI provider. For Claude, either:
+
+- **OAuth (recommended):** Run `claude login` to authenticate interactively
+- **API key:** Set `ANTHROPIC_API_KEY` in your shell or in `~/.gza/.env`
+
+Credentials are checked in this order (highest priority first):
+1. Project `.env` file
+2. Shell environment variables
+3. `~/.gza/.env` file
+4. OAuth credentials (`~/.claude/`)
+
+See [Configuration](configuration.md#provider-credentials) for Gemini setup.
+
+## 3. Initialize your project
 
 In your project directory, run:
 
@@ -18,7 +33,7 @@ gza init
 
 This creates a `gza.yaml` configuration file with sensible defaults. You can customize it later—see [Configuration](configuration.md) for details.
 
-## 3. Add and run a task
+## 4. Add and run a task
 
 ```bash
 # Add a task

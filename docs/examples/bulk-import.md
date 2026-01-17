@@ -92,4 +92,4 @@ tasks:
     branch_type: feature              # Optional: branch type hint
 ```
 
-See [specs/task-import.md](../../specs/task-import.md) for full documentation.
+See the [Configuration Reference](../configuration.md#import) for all import options.

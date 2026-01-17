@@ -115,6 +115,29 @@ All `gza.yaml` options can be overridden via environment variables:
 | `GZA_PROVIDER` | `provider` | Override AI provider |
 | `GZA_MODEL` | `model` | Override model name |
 
+### Providers and Models
+
+Gza supports multiple AI providers for task execution:
+
+| Provider | Status | Description |
+|----------|--------|-------------|
+| `claude` | **Supported** | Claude Code CLI (default) |
+| `gemini` | *Experimental* | Gemini CLI - partially implemented, coming soon |
+
+Set your provider in `gza.yaml`:
+
+```yaml
+provider: claude
+model: claude-sonnet-4-5  # optional: override the default model
+```
+
+Or via environment variable:
+
+```bash
+export GZA_PROVIDER=claude
+export GZA_MODEL=claude-sonnet-4-5
+```
+
 ### Provider Credentials
 
 **Claude:**
@@ -141,7 +164,15 @@ Environment variables can be set in `.env` files:
 | Location | Scope |
 |----------|-------|
 | `~/.gza/.env` | User-level (applies to all projects) |
-| `.env` | Project-level (overrides user-level) |
+| `.env` | Project-level (overrides everything) |
+
+**Precedence order** (highest to lowest):
+
+1. **Project `.env`** - Overrides all other sources
+2. **Shell environment** - Variables exported in your shell
+3. **`~/.gza/.env`** - Only sets values not already defined
+
+This means if you have `ANTHROPIC_API_KEY` set in your shell, you don't need `~/.gza/.env` at all. The home `.env` file uses `setdefault` behavior, so it won't override existing environment variables.
 
 **Format:**
 
@@ -155,25 +186,31 @@ GZA_TIMEOUT_MINUTES=15
 
 ## Command-Line Arguments
 
-### Global
+### Global Options
+
+All commands support these options:
+
+| Option | Description |
+|--------|-------------|
+| `--project`, `-C` | Target project directory (default: current directory) |
+| `--help`, `-h` | Show help for command |
 
 ```bash
-gza <command> [project_dir]
+gza <command> [options]
+gza -C /path/to/project <command>
 ```
-
-- `project_dir` - Target project directory (default: current directory)
 
 ### work
 
 Run tasks from the queue.
 
 ```bash
-gza work [task_id] [options]
+gza work [task_id...] [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Specific task ID to run |
+| `task_id` | Specific task ID(s) to run (can specify multiple) |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--count N`, `-c N` | Number of tasks to run before stopping |
 | `--background`, `-b` | Run worker in background |
@@ -325,8 +362,99 @@ gza stop [worker_id] [options]
 Validate configuration.
 
 ```bash
-gza validate [project_dir]
+gza validate
 ```
+
+### show
+
+Show details of a specific task.
+
+```bash
+gza show <task_id>
+```
+
+### resume
+
+Resume a failed task from where it left off. The AI continues with the existing conversation context.
+
+```bash
+gza resume <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--background`, `-b` | Run worker in background |
+
+### retry
+
+Retry a failed or completed task from scratch. Starts a fresh conversation.
+
+```bash
+gza retry <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--background`, `-b` | Run worker in background |
+
+### merge
+
+Merge a completed task's branch into the current branch.
+
+```bash
+gza merge <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--squash` | Squash commits into a single commit |
+| `--rebase` | Rebase onto current branch instead of merging |
+| `--delete` | Delete the branch after successful merge |
+
+### unmerged
+
+List tasks with branches that haven't been merged to main.
+
+```bash
+gza unmerged
+```
+
+### groups
+
+List all task groups with their task counts.
+
+```bash
+gza groups
+```
+
+---
+
+## Task Lifecycle
+
+Tasks move through these states:
+
+```
+pending → in_progress → completed
+                     ↘ failed
+```
+
+| State | Description |
+|-------|-------------|
+| `pending` | Task is queued and waiting to run |
+| `in_progress` | A worker is currently executing the task |
+| `completed` | Task finished successfully |
+| `failed` | Task encountered an error or timed out |
+
+**Recovering from failures:**
+
+- Use `gza resume <task_id>` to continue from where the task left off (preserves conversation context)
+- Use `gza retry <task_id>` to start completely fresh
+
+**Dependencies:**
+
+Tasks with `depends_on` set will remain pending until their dependency completes. Use `gza status <group>` to see dependency chains.
 
 ---
 
@@ -393,4 +521,101 @@ task_types:
     max_turns: 20
   review:
     max_turns: 15
+```
+
+---
+
+## Troubleshooting
+
+### Task stuck in "in_progress"
+
+If a worker crashed or was killed, tasks may be stuck in `in_progress` state:
+
+```bash
+# Check for running workers
+gza ps
+
+# If no workers are running but task shows in_progress, the worker crashed
+# Resume or retry the task:
+gza resume <task_id>
+# or
+gza retry <task_id>
+```
+
+### "No pending tasks" but tasks exist
+
+Tasks with unmet dependencies won't be picked up. Check:
+
+```bash
+gza next          # Shows pending tasks and their dependencies
+gza status <group>  # Shows dependency chain status
+```
+
+### Claude Code not found
+
+Gza requires Claude Code CLI to be installed:
+
+```bash
+# Install Claude Code
+npm install -g @anthropic-ai/claude-code
+
+# Verify installation
+claude --version
+
+# Authenticate
+claude login
+```
+
+### API key not working
+
+Check credential precedence:
+
+```bash
+# See what's set
+echo $ANTHROPIC_API_KEY
+
+# Check .env files
+cat .env
+cat ~/.gza/.env
+```
+
+Project `.env` overrides shell variables, which override `~/.gza/.env`.
+
+### Docker permission errors
+
+On Linux, your user may need to be in the docker group:
+
+```bash
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
+### Task times out before completion
+
+Increase the timeout in `gza.yaml`:
+
+```yaml
+timeout_minutes: 30  # default is 10
+```
+
+Or per-task-type:
+
+```yaml
+task_types:
+  implement:
+    timeout_minutes: 45
+```
+
+### Worker won't stop
+
+If `gza stop` doesn't work, force kill:
+
+```bash
+gza stop <worker_id> --force
+```
+
+Or stop all workers:
+
+```bash
+gza stop --all --force
 ```
