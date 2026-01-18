@@ -6,7 +6,7 @@ git push origin v0.1.0
 
 # Create a GitHub release (this triggers the automated publish):
 ```bash
-gh release create v0.1.0 --title "v0.1.0" --notes "Release notes here"
+gh release create v0.1.0 --title "v0.1.0" --notes-file $notes_file
 ```
 
 # show all commits between 2 tags:
