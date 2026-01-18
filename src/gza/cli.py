@@ -1285,11 +1285,13 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"Task: {prompt_display}")
         print(f"ID: {task.id} | Slug: {task.task_id}")
         print(f"Status: {task.status}")
+        print(f"Log: {log_path}")
         if task.branch:
             print(f"Branch: {task.branch}")
     elif worker:
         print(f"Worker: {worker.worker_id}")
         print(f"Status: {'running' if is_running else 'completed'}")
+        print(f"Log: {log_path}")
     print("=" * 70)
     print()
 
