@@ -157,7 +157,7 @@ branch_strategy:
   pattern: "user/{project}-{slug}"
   default_type: feature
 ```
-- `user/gza-add-user-auth`
+- `user/gza-task-add-user-auth`
 
 ## Implementation Tasks
 
