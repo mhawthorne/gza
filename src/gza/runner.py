@@ -14,6 +14,7 @@ from .providers import get_provider, Provider, RunResult
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
 PLAN_DIR = f".{APP_NAME}/plans"
 REVIEW_DIR = f".{APP_NAME}/reviews"
+SUMMARY_DIR = f".{APP_NAME}/summaries"
 
 
 def format_duration(seconds: float) -> str:
@@ -128,7 +129,7 @@ def _task_id_exists(task_id: str, log_path: Path | None, git: Git | None, projec
     return False
 
 
-def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path: Path | None = None, git: Git | None = None) -> str:
+def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path: Path | None = None, summary_path: Path | None = None, git: Git | None = None) -> str:
     """Build the prompt for Claude."""
     base_prompt = f"Complete this task: {task.prompt}"
 
@@ -187,6 +188,19 @@ Your review should include:
 
 End your review with a clear verdict line like:
 Verdict: APPROVED"""
+    elif task.task_type in ("task", "implement"):
+        if summary_path:
+            base_prompt += f"""
+
+When you complete this task, write a summary of what you accomplished to:
+  {summary_path}
+
+The summary should describe:
+- What was accomplished
+- Files changed
+- Any notable decisions or trade-offs made"""
+        else:
+            base_prompt += "\n\nWhen you are done, report what you accomplished."
     else:
         base_prompt += "\n\nWhen you are done, report what you accomplished."
 
@@ -490,11 +504,21 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
     config.log_path.mkdir(parents=True, exist_ok=True)
     log_file = config.log_path / f"{task.task_id}.log"
 
+    # Setup summary directory and path for task/implement types
+    summary_dir = config.project_dir / SUMMARY_DIR
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_filename = f"{task.task_id}.md"
+    summary_path = summary_dir / summary_filename
+    summary_file_relative = str(summary_path.relative_to(config.project_dir))
+
+    # For Docker containers, use /workspace-relative path instead of host worktree path
+    container_summary_path = Path("/workspace") / summary_path.relative_to(config.project_dir)
+
     # Run provider in the worktree
     if resume:
         prompt = "Continue from where you left off. The task was interrupted due to max_turns limit."
     else:
-        prompt = build_prompt(task, config, store, report_path=None, git=git)
+        prompt = build_prompt(task, config, store, report_path=None, summary_path=container_summary_path, git=git)
 
     try:
         result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
@@ -560,11 +584,17 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         worktree_git.add(".")
         worktree_git.commit(f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}")
 
+        # Read output content from summary file if it exists
+        output_content = None
+        if summary_path.exists():
+            output_content = summary_path.read_text()
+
         # Mark completed
         store.mark_completed(
             task,
             branch=branch_name,
             log_file=str(log_file.relative_to(config.project_dir)),
+            output_content=output_content,
             has_commits=True,
             stats=stats,
         )
