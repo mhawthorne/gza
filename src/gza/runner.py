@@ -512,13 +512,17 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
     summary_file_relative = str(summary_path.relative_to(config.project_dir))
 
     # For Docker containers, use /workspace-relative path instead of host worktree path
-    container_summary_path = Path("/workspace") / summary_path.relative_to(config.project_dir)
+    # For native mode, use the actual worktree path
+    if config.use_docker:
+        prompt_summary_path = Path("/workspace") / summary_path.relative_to(config.project_dir)
+    else:
+        prompt_summary_path = summary_path
 
     # Run provider in the worktree
     if resume:
         prompt = "Continue from where you left off. The task was interrupted due to max_turns limit."
     else:
-        prompt = build_prompt(task, config, store, report_path=None, summary_path=container_summary_path, git=git)
+        prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
     try:
         result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
@@ -712,10 +716,14 @@ def _run_non_code_task(
 
         # For Docker containers, use /workspace-relative path instead of host worktree path
         # The container only has /workspace mounted, so we need to use a path inside that
-        container_report_path = Path("/workspace") / report_path.relative_to(config.project_dir)
+        # For native mode, use the actual worktree path
+        if config.use_docker:
+            prompt_report_path = Path("/workspace") / report_path.relative_to(config.project_dir)
+        else:
+            prompt_report_path = worktree_report_path
 
         # Run provider in the worktree
-        prompt = build_prompt(task, config, store, container_report_path, git)
+        prompt = build_prompt(task, config, store, prompt_report_path, git)
         resume_session_id = task.session_id if resume else None
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=resume_session_id)
