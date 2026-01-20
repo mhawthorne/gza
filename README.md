@@ -4,7 +4,7 @@
 
 AI agent task runner. Queue coding tasks, let Claude work through them autonomously in parallel in isolated Docker containers, get git branches with completed work.
 
-Gza isn't built for the "run for hours, build a large system, get smarter along the way" approach, like [Ralph](https://github.com/snarktank/ralph)). It's for the "identify 20 tasks, fire them off before bed, merge them when you wake up" workflow.
+Gza isn't built for the "run for hours, build a large system, get smarter along the way" approach, like [Ralph](https://github.com/snarktank/ralph). It's for the "identify 20 tasks, fire them off before bed, merge them when you wake up" workflow.
 
 ## Supported Providers
 
