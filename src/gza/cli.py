@@ -514,7 +514,9 @@ def cmd_history(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    recent = store.get_history(limit=10)
+    # Determine the limit: None for --all, otherwise use --limit/-n value
+    limit = None if args.all else args.limit
+    recent = store.get_history(limit=limit)
     if not recent:
         print("No completed or failed tasks")
         return 0
@@ -2286,6 +2288,18 @@ def main() -> int:
     # history command
     history_parser = subparsers.add_parser("history", help="List recent completed/failed tasks")
     add_common_args(history_parser)
+    history_parser.add_argument(
+        "--limit",
+        "-n",
+        type=int,
+        default=10,
+        help="Number of recent tasks to show (default: 10)",
+    )
+    history_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all completed/failed tasks (no limit)",
+    )
 
     # unmerged command
     unmerged_parser = subparsers.add_parser("unmerged", help="List tasks with unmerged work")

@@ -433,18 +433,27 @@ class SqliteTaskStore:
             cur = conn.execute(query)
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_history(self, limit: int = 10) -> list[Task]:
+    def get_history(self, limit: int | None = 10) -> list[Task]:
         """Get completed/failed tasks, most recent first."""
         with self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE status IN ('completed', 'failed', 'unmerged')
-                ORDER BY completed_at DESC, id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
+            if limit is None:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE status IN ('completed', 'failed', 'unmerged')
+                    ORDER BY completed_at DESC, id DESC
+                    """
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE status IN ('completed', 'failed', 'unmerged')
+                    ORDER BY completed_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_unmerged(self) -> list[Task]:
