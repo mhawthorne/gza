@@ -223,6 +223,20 @@ class ClaudeProvider(Provider):
                                     completed = sum(1 for t in todos if t.get("status") == "completed")
                                     todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
                                 print(f"  → {tool_name} {todos_summary}")
+                                # Print each todo with status icon and truncated content
+                                status_icons = {
+                                    "pending": "○",
+                                    "in_progress": "◐",
+                                    "completed": "●"
+                                }
+                                for todo in todos:
+                                    status = todo.get("status", "pending")
+                                    icon = status_icons.get(status, "○")
+                                    content = todo.get("content", "")
+                                    # Truncate to 60 chars
+                                    if len(content) > 60:
+                                        content = content[:57] + "..."
+                                    print(f"      {icon} {content}")
                             elif file_path:
                                 print(f"  → {tool_name} {file_path}")
                             else:
