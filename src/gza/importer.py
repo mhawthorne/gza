@@ -108,9 +108,9 @@ def _parse_task(
 
     # Optional fields
     task_type = data.get("type", "task")
-    if task_type not in ("task", "explore", "plan", "implement", "review"):
+    if task_type not in ("task", "explore", "plan", "implement", "review", "improve"):
         errors.append(ValidationError(
-            f"Invalid task type '{task_type}'. Must be: task, explore, plan, implement, review",
+            f"Invalid task type '{task_type}'. Must be: task, explore, plan, implement, review, improve",
             task_index=index
         ))
 

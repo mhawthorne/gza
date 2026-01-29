@@ -28,6 +28,7 @@ Ask the user what they want to accomplish. Use AskUserQuestion to gather:
    - `plan` - Planning and design work that produces a specification
    - `implement` - Code implementation based on clear requirements
    - `review` - Code review or quality assessment
+   - `improve` - Address review feedback on an implementation (use `gza improve <impl-id>`)
 
 3. **Additional context** (optional):
    - Should this be grouped with related tasks? (--group NAME)
@@ -101,6 +102,13 @@ uv run gza add --type implement --review "add JWT authentication to the API endp
 uv run gza add --group metrics --type plan "design metrics collection system"
 uv run gza add --group metrics --type implement --depends-on 12 "implement metrics collector"
 uv run gza add --group metrics --type implement --depends-on 13 "add metrics export to CSV/JSON"
+```
+
+**Improve workflow (addressing review feedback):**
+```bash
+# After a review requests changes, create an improve task
+uv run gza improve 29  # where 29 is the implementation task ID
+uv run gza improve 29 --review  # auto-create review after improvements
 ```
 
 ## Important notes
