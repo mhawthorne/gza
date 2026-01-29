@@ -457,6 +457,117 @@ class TestValidateCommand:
         assert "unknown_field" in result.stdout
         assert "Warning" in result.stdout
 
+    def test_validate_docker_volumes_must_be_list(self, tmp_path: Path):
+        """Validate rejects docker_volumes that isn't a list."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: test\ndocker_volumes: /path:/mount\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "docker_volumes" in result.stdout
+        assert "must be a list" in result.stdout
+
+    def test_validate_docker_volumes_entries_must_be_strings(self, tmp_path: Path):
+        """Validate rejects non-string docker_volumes entries."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: test\ndocker_volumes:\n  - 123\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "docker_volumes[0]" in result.stdout
+        assert "must be a string" in result.stdout
+
+    def test_validate_docker_volumes_valid(self, tmp_path: Path):
+        """Validate accepts valid docker_volumes configuration."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "docker_volumes:\n"
+            "  - /host/data:/data:ro\n"
+            "  - /host/models:/models\n"
+        )
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "valid" in result.stdout.lower()
+
+    def test_validate_docker_volumes_missing_colon_warning(self, tmp_path: Path):
+        """Validate warns about docker_volumes entries without colons."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "docker_volumes:\n"
+            "  - /just/a/path\n"
+        )
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 0  # Warning, not error
+        assert "docker_volumes[0]" in result.stdout
+        assert "missing colon separator" in result.stdout
+
+    def test_validate_docker_volumes_unknown_mode_warning(self, tmp_path: Path):
+        """Validate warns about unknown docker_volumes modes."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "docker_volumes:\n"
+            "  - /host:/container:xyz\n"
+        )
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 0  # Warning, not error
+        assert "docker_volumes[0]" in result.stdout
+        assert "unknown mode 'xyz'" in result.stdout
+
+
+class TestConfigEnvVars:
+    """Tests for environment variable overrides in config."""
+
+    def test_gza_docker_volumes_env_var(self, tmp_path: Path):
+        """GZA_DOCKER_VOLUMES environment variable overrides config."""
+        from gza.config import Config
+        import os
+
+        setup_config(tmp_path)
+
+        # Set environment variable
+        env = os.environ.copy()
+        env["GZA_DOCKER_VOLUMES"] = "/host1:/data:ro,/host2:/models"
+
+        # Use subprocess to load config with env vars
+        import subprocess
+        result = subprocess.run(
+            ["uv", "run", "python", "-c",
+             "from gza.config import Config; "
+             f"from pathlib import Path; "
+             f"c = Config.load(Path('{tmp_path}')); "
+             "print(','.join(c.docker_volumes))"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        volumes = result.stdout.strip()
+        assert "/host1:/data:ro" in volumes
+        assert "/host2:/models" in volumes
+
+    def test_docker_volumes_tilde_expansion(self, tmp_path: Path):
+        """Docker volumes should expand tilde in source paths."""
+        from gza.config import Config
+        from pathlib import Path as PathLib
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "docker_volumes:\n"
+            "  - ~/data:/container/data\n"
+            "  - ~/models:/models:ro\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        # Tilde should be expanded in source paths
+        assert len(config.docker_volumes) == 2
+        for volume in config.docker_volumes:
+            assert "~" not in volume.split(":")[0]
+            assert str(PathLib.home()) in volume.split(":")[0]
+
 
 class TestInitCommand:
     """Tests for 'gza init' command."""

@@ -184,6 +184,106 @@ class TestBuildDockerCmd:
 
         assert "-e" not in cmd
 
+    def test_mounts_custom_volumes(self, tmp_path):
+        """Should mount custom docker volumes."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        custom_volumes = [
+            "/host/datasets:/datasets:ro",
+            "/host/models:/models",
+        ]
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_volumes=custom_volumes
+        )
+
+        # Verify custom volumes are present
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        volume_mounts = [cmd[i + 1] for i in v_indices]
+
+        assert "/host/datasets:/datasets:ro" in volume_mounts
+        assert "/host/models:/models" in volume_mounts
+
+    def test_custom_volumes_added_after_standard_mounts(self, tmp_path):
+        """Custom volumes should be added after workspace and config mounts."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        custom_volumes = ["/custom:/custom"]
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_volumes=custom_volumes
+        )
+
+        # Find all -v flags and their mounts
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        volume_mounts = [cmd[i + 1] for i in v_indices]
+
+        # Workspace and config should come before custom
+        assert len(volume_mounts) >= 3
+        assert volume_mounts[0] == f"{tmp_path}:/workspace"
+        assert ".testconfig" in volume_mounts[1]
+        assert "/custom:/custom" in volume_mounts
+
+    def test_custom_volumes_with_none(self, tmp_path):
+        """Should handle docker_volumes=None gracefully."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_volumes=None
+        )
+
+        # Should only have workspace and config mounts
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        assert len(v_indices) == 2
+
+    def test_custom_volumes_with_empty_list(self, tmp_path):
+        """Should handle docker_volumes=[] gracefully."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_volumes=[]
+        )
+
+        # Should only have workspace and config mounts
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        assert len(v_indices) == 2
+
 
 class TestDockerfileTemplate:
     """Tests for Dockerfile generation."""

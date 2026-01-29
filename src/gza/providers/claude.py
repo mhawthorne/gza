@@ -121,7 +121,7 @@ class ClaudeProvider(Provider):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
-        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes)
+        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes)
         cmd.extend(["claude", "-p", "-", "--output-format", "stream-json", "--verbose"])
 
         if resume_session_id:

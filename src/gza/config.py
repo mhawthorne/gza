@@ -83,6 +83,7 @@ class Config:
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
     docker_image: str = ""
+    docker_volumes: list[str] = field(default_factory=list)
     timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
     branch_mode: str = DEFAULT_BRANCH_MODE  # "single" or "multi"
     max_turns: int = DEFAULT_MAX_TURNS
@@ -180,7 +181,7 @@ class Config:
         # Validate and warn about unknown keys
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "timeout_minutes", "branch_mode", "max_turns",
+            "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "worktree_dir", "work_count", "provider", "model",
             "defaults", "task_types", "branch_strategy"
         }
@@ -233,6 +234,25 @@ class Config:
         model = defaults.get("model") or data.get("model", "")
         if os.getenv("GZA_MODEL"):
             model = os.getenv("GZA_MODEL")
+
+        # docker_volumes: can be overridden by environment variable
+        docker_volumes = data.get("docker_volumes", [])
+        if os.getenv("GZA_DOCKER_VOLUMES"):
+            # Parse comma-separated volumes
+            docker_volumes = [v.strip() for v in os.getenv("GZA_DOCKER_VOLUMES").split(",") if v.strip()]
+
+        # Expand tilde in volume paths
+        expanded_volumes = []
+        for volume in docker_volumes:
+            # Split on first colon to separate source:dest[:mode]
+            parts = volume.split(":", 1)
+            if parts:
+                # Expand tilde in source path
+                parts[0] = os.path.expanduser(parts[0])
+                expanded_volumes.append(":".join(parts))
+            else:
+                expanded_volumes.append(volume)
+        docker_volumes = expanded_volumes
 
         # Parse task_types configuration
         task_types = {}
@@ -287,6 +307,7 @@ class Config:
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
             use_docker=use_docker,
             docker_image=data.get("docker_image", ""),
+            docker_volumes=docker_volumes,
             timeout_minutes=timeout_minutes,
             branch_mode=branch_mode,
             max_turns=max_turns,
@@ -339,7 +360,7 @@ class Config:
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "timeout_minutes", "branch_mode", "max_turns", "claude_args",
+            "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns", "claude_args",
             "worktree_dir", "work_count", "provider", "model", "defaults", "task_types",
             "branch_strategy"
         }
@@ -365,6 +386,31 @@ class Config:
 
         if "docker_image" in data and not isinstance(data["docker_image"], str):
             errors.append("'docker_image' must be a string")
+
+        if "docker_volumes" in data:
+            if not isinstance(data["docker_volumes"], list):
+                errors.append("'docker_volumes' must be a list")
+            else:
+                for i, volume in enumerate(data["docker_volumes"]):
+                    if not isinstance(volume, str):
+                        errors.append(f"'docker_volumes[{i}]' must be a string")
+                    elif ":" not in volume:
+                        warnings.append(
+                            f"'docker_volumes[{i}]' missing colon separator "
+                            "(expected 'source:dest' or 'source:dest:mode')"
+                        )
+                    else:
+                        parts = volume.split(":")
+                        if len(parts) < 2:
+                            warnings.append(
+                                f"'docker_volumes[{i}]' should have format "
+                                "'source:dest' or 'source:dest:mode'"
+                            )
+                        elif len(parts) == 3 and parts[2] not in ["ro", "rw", "z", "Z"]:
+                            warnings.append(
+                                f"'docker_volumes[{i}]' has unknown mode '{parts[2]}' "
+                                "(common modes: ro, rw, z, Z)"
+                            )
 
         if "timeout_minutes" in data:
             if not isinstance(data["timeout_minutes"], int):

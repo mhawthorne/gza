@@ -122,6 +122,7 @@ def build_docker_cmd(
     docker_config: DockerConfig,
     work_dir: Path,
     timeout_minutes: int,
+    docker_volumes: list[str] | None = None,
 ) -> list[str]:
     """Build the base Docker run command.
 
@@ -129,6 +130,7 @@ def build_docker_cmd(
         docker_config: Docker configuration
         work_dir: Working directory to mount
         timeout_minutes: Timeout in minutes
+        docker_volumes: Optional list of custom volume mounts (e.g., ["/host:/container:ro"])
 
     Returns:
         List of command arguments (without the actual CLI command)
@@ -144,6 +146,11 @@ def build_docker_cmd(
     if docker_config.config_dir:
         cmd.insert(-2, "-v")
         cmd.insert(-2, f"{Path.home()}/{docker_config.config_dir}:/home/gza/{docker_config.config_dir}")
+
+    # Add custom volume mounts
+    if docker_volumes:
+        for volume in docker_volumes:
+            cmd.extend(["-v", volume])
 
     # Pass environment variables if set
     for env_var in docker_config.env_vars:

@@ -20,6 +20,7 @@ The main configuration file is `gza.yaml` in your project root directory.
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
 | `docker_image` | String | `{project_name}-gza` | Custom Docker image name |
+| `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
 | `timeout_minutes` | Integer | `10` | Maximum time per task in minutes |
 | `branch_mode` | String | `multi` | Branch strategy: `single` or `multi` |
 | `max_turns` | Integer | `50` | Maximum conversation turns per task |
@@ -79,6 +80,40 @@ branch_strategy:
 | `fix` | fix, bug, error, crash, broken, issue |
 | `chore` | chore, update, upgrade, bump, deps, dependencies |
 | `feature` | feat, feature, add, implement, create, new |
+
+### Docker Volume Mounts
+
+Mount additional directories or files from the host into the Docker container using `docker_volumes`. This is useful for providing access to datasets, model files, or other resources.
+
+```yaml
+docker_volumes:
+  - "~/datasets:/datasets:ro"          # Tilde expanded automatically
+  - "/Users/x/models:/models"
+  - "/tmp/cache:/cache"
+```
+
+**Volume format:** Each volume uses Docker's standard volume syntax:
+- `source:destination` - Mount `source` from host to `destination` in container
+- `source:destination:mode` - Add mode flags like `ro` (read-only) or `rw` (read-write)
+
+**Common mount modes:**
+- `ro` - Read-only mount (recommended for input data)
+- `rw` - Read-write mount (default if omitted)
+- `z` - SELinux label sharing (for container isolation)
+- `Z` - SELinux exclusive label (for single container)
+
+**Environment variable override:**
+```bash
+# Override config with comma-separated volumes
+export GZA_DOCKER_VOLUMES="~/data:/data:ro,~/models:/models"
+gza work
+```
+
+**Notes:**
+- Volumes are only used when `use_docker: true`
+- Tilde (`~`) in source paths is automatically expanded to your home directory
+- The workspace is always mounted at `/workspace` automatically
+- Config validation warns about common syntax errors but doesn't block invalid formats
 
 ### Task Types Configuration
 
@@ -506,6 +541,11 @@ use_docker: true
 timeout_minutes: 15
 max_turns: 80
 work_count: 3
+
+# Custom volume mounts (optional)
+docker_volumes:
+  - "/Users/x/datasets:/datasets:ro"
+  - "/Users/x/models:/models"
 
 # AI provider
 provider: claude
