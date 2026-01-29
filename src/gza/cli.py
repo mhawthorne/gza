@@ -1532,7 +1532,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         task_type = "task"
 
     # Validate task type
-    valid_types = ["task", "explore", "plan", "implement", "review"]
+    valid_types = ["task", "explore", "plan", "implement", "review", "improve"]
     if task_type not in valid_types:
         print(f"Error: Invalid task type '{task_type}'. Must be one of: {', '.join(valid_types)}")
         return 1
@@ -1973,6 +1973,61 @@ def cmd_retry(args: argparse.Namespace) -> int:
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [new_task.id]
         return _spawn_background_worker(worker_args, config, task_id=new_task.id)
+
+    return 0
+
+
+def cmd_improve(args: argparse.Namespace) -> int:
+    """Create an improve task based on an implementation task and its most recent review."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    impl_task = store.get(args.impl_task_id)
+    if not impl_task:
+        print(f"Error: Task #{args.impl_task_id} not found")
+        return 1
+
+    # Validate that it's an implementation task
+    if impl_task.task_type != "implement":
+        print(f"Error: Task #{args.impl_task_id} is a {impl_task.task_type} task. Provide the implementation task ID:")
+        # Find if there's an implementation task this review depends on
+        if impl_task.task_type == "review" and impl_task.depends_on:
+            dep_task = store.get(impl_task.depends_on)
+            if dep_task and dep_task.task_type == "implement":
+                print(f"  gza improve {impl_task.depends_on}")
+        return 1
+
+    # Find the most recent review task for this implementation
+    review_tasks = store.get_reviews_for_task(impl_task.id)
+
+    if not review_tasks:
+        print(f"Error: Task #{impl_task.id} has no review. Run a review first:")
+        print(f"  gza add --type review --depends-on {impl_task.id}")
+        return 1
+
+    # Already sorted by created_at DESC
+    review_task = review_tasks[0]
+
+    # Warn if the review is not completed
+    if review_task.status != "completed":
+        print(f"Warning: Review #{review_task.id} is {review_task.status}. The improve task will be blocked until it completes.")
+
+    # Create improve task
+    prompt = f"Improve implementation based on review #{review_task.id}"
+    improve_task = store.add(
+        prompt=prompt,
+        task_type="improve",
+        depends_on=review_task.id,  # Block until review complete, provides context
+        based_on=impl_task.id,  # Provides branch reference
+        same_branch=True,  # Continue on implementation's branch
+        group=impl_task.group,  # Inherit group from implementation
+        create_review=args.review if hasattr(args, 'review') and args.review else False,
+    )
+
+    print(f"✓ Created improve task #{improve_task.id}")
+    print(f"  Based on: implementation #{impl_task.id}")
+    print(f"  Review: #{review_task.id}")
+    print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
 
     return 0
 
@@ -2430,7 +2485,7 @@ def main() -> int:
     )
     add_parser.add_argument(
         "--type",
-        choices=["task", "explore", "plan", "implement", "review"],
+        choices=["task", "explore", "plan", "implement", "review", "improve"],
         help="Set task type (default: task)",
     )
     add_parser.add_argument(
@@ -2566,6 +2621,20 @@ def main() -> int:
     )
     add_common_args(resume_parser)
 
+    # improve command
+    improve_parser = subparsers.add_parser("improve", help="Create an improve task based on implementation and review")
+    improve_parser.add_argument(
+        "impl_task_id",
+        type=int,
+        help="Implementation task ID to improve",
+    )
+    improve_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Auto-create review task on completion",
+    )
+    add_common_args(improve_parser)
+
     # show command
     show_parser = subparsers.add_parser("show", help="Show details of a specific task")
     show_parser.add_argument(
@@ -2682,6 +2751,8 @@ def main() -> int:
             return cmd_delete(args)
         elif args.command == "retry":
             return cmd_retry(args)
+        elif args.command == "improve":
+            return cmd_improve(args)
         elif args.command == "resume":
             return cmd_resume(args)
         elif args.command == "show":

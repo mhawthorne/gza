@@ -512,3 +512,85 @@ class TestTaskResume:
 
         retrieved = store.get(new_task.id)
         assert retrieved.session_id == "new-session-456"
+
+
+class TestGetReviewsForTask:
+    """Tests for get_reviews_for_task method."""
+
+    def test_get_reviews_for_task_returns_matching_reviews(self, tmp_path: Path):
+        """Test that get_reviews_for_task returns reviews that depend on the given task."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create an implementation task
+        impl_task = store.add("Add feature", task_type="implement")
+
+        # Create review tasks that depend on it
+        review1 = store.add("First review", task_type="review", depends_on=impl_task.id)
+        review2 = store.add("Second review", task_type="review", depends_on=impl_task.id)
+
+        # Create unrelated review
+        other_impl = store.add("Other feature", task_type="implement")
+        other_review = store.add("Other review", task_type="review", depends_on=other_impl.id)
+
+        # Get reviews for impl_task
+        reviews = store.get_reviews_for_task(impl_task.id)
+
+        assert len(reviews) == 2
+        review_ids = [r.id for r in reviews]
+        assert review1.id in review_ids
+        assert review2.id in review_ids
+        assert other_review.id not in review_ids
+
+    def test_get_reviews_for_task_ordered_by_created_at_desc(self, tmp_path: Path):
+        """Test that reviews are returned in descending order by created_at."""
+        import time
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+
+        # Create reviews with small delays to ensure different timestamps
+        time.sleep(0.01)
+        review1 = store.add("First review", task_type="review", depends_on=impl_task.id)
+        time.sleep(0.01)
+        review2 = store.add("Second review", task_type="review", depends_on=impl_task.id)
+        time.sleep(0.01)
+        review3 = store.add("Third review", task_type="review", depends_on=impl_task.id)
+
+        reviews = store.get_reviews_for_task(impl_task.id)
+
+        # Most recent should be first
+        assert reviews[0].id == review3.id
+        assert reviews[1].id == review2.id
+        assert reviews[2].id == review1.id
+
+    def test_get_reviews_for_task_returns_empty_when_no_reviews(self, tmp_path: Path):
+        """Test that an empty list is returned when no reviews exist."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+
+        reviews = store.get_reviews_for_task(impl_task.id)
+
+        assert reviews == []
+
+    def test_get_reviews_for_task_excludes_non_review_dependents(self, tmp_path: Path):
+        """Test that only review tasks are returned, not other types that depend on the task."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+
+        # Create a review task
+        review = store.add("Review", task_type="review", depends_on=impl_task.id)
+
+        # Create an improve task that also depends on the implementation
+        improve = store.add("Improve", task_type="improve", depends_on=impl_task.id)
+
+        reviews = store.get_reviews_for_task(impl_task.id)
+
+        assert len(reviews) == 1
+        assert reviews[0].id == review.id

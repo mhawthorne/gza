@@ -84,6 +84,10 @@ uv run gza add --type implement --review "add dark mode toggle"
 
 # Task chaining - implementation based on a plan
 uv run gza add --type implement --based-on 5 "implement the approach from task #5"
+
+# Improve task to address review feedback
+uv run gza improve 29  # where 29 is the implementation task ID
+uv run gza improve 29 --review  # auto-create a review after improvements
 ```
 
 Tips for good task descriptions:

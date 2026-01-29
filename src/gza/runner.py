@@ -188,7 +188,7 @@ Your review should include:
 
 End your review with a clear verdict line like:
 Verdict: APPROVED"""
-    elif task.task_type in ("task", "implement"):
+    elif task.task_type in ("task", "implement", "improve"):
         if summary_path:
             base_prompt += f"""
 
@@ -225,6 +225,28 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
 def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: Path, git: Git | None) -> str:
     """Build context by walking the depends_on and based_on chain."""
     context_parts = []
+
+    # For improve tasks, include review feedback and original plan
+    if task.task_type == "improve":
+        # Get the review we're addressing
+        if task.depends_on:
+            review_task = store.get(task.depends_on)
+            if review_task and review_task.task_type == "review":
+                review_content = _get_task_output(review_task, project_dir)
+                if review_content:
+                    context_parts.append("## Review feedback to address:\n")
+                    context_parts.append(review_content)
+
+        # Get the original plan (via based_on chain)
+        if task.based_on:
+            impl_task = store.get(task.based_on)
+            if impl_task and impl_task.based_on:
+                plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
+                if plan_task:
+                    plan_content = _get_task_output(plan_task, project_dir)
+                    if plan_content:
+                        context_parts.append("\n## Original plan:\n")
+                        context_parts.append(plan_content)
 
     # For implement tasks, include plan from based_on chain
     if task.task_type == "implement" and task.based_on:
@@ -429,14 +451,19 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         # Resume uses the existing branch from the failed task
         branch_name = task.branch
         print(f"    Resuming on existing branch: {branch_name}")
-    elif task.same_branch and task.depends_on:
-        # Use the branch from the dependency task
-        dep_task = store.get(task.depends_on)
-        if dep_task and dep_task.branch:
-            branch_name = dep_task.branch
-            print(f"    Using existing branch from task #{dep_task.id}: {branch_name}")
+    elif task.same_branch:
+        # Use the branch from based_on task (for improve tasks) or depends_on task (fallback)
+        source_task = None
+        if task.based_on:
+            source_task = store.get(task.based_on)
+        elif task.depends_on:
+            source_task = store.get(task.depends_on)
+
+        if source_task and source_task.branch:
+            branch_name = source_task.branch
+            print(f"    Using existing branch from task #{source_task.id}: {branch_name}")
         else:
-            print(f"Error: Task #{task.id} has same_branch=True but dependency task has no branch")
+            print(f"Error: Task #{task.id} has same_branch=True but source task has no branch")
             return 1
     elif config.branch_mode == "single":
         branch_name = f"{config.project_name}/gza-work"

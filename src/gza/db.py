@@ -15,7 +15,7 @@ class Task:
     id: int | None  # None for unsaved tasks
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged
-    task_type: str = "task"  # task, explore, plan, implement, review
+    task_type: str = "task"  # task, explore, plan, implement, review, improve
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
     log_file: str | None = None
@@ -472,6 +472,19 @@ class SqliteTaskStore:
         """Get all tasks."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC")
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def get_reviews_for_task(self, task_id: int) -> list[Task]:
+        """Get all review tasks that depend on the given task, ordered by created_at DESC."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE task_type = 'review' AND depends_on = ?
+                ORDER BY created_at DESC
+                """,
+                (task_id,),
+            )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_stats(self) -> dict:
