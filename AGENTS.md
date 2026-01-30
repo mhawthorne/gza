@@ -8,6 +8,8 @@ A coding AI agent runner for Claude Code.
 
 ## Usage
 
+To run gza commands, use either `bin/gza` or `uv run gza`:
+
 ```
 gza init [--project DIR]     # Generate new gza.yaml with defaults
 gza work [--project DIR]     # Run the next pending task
@@ -62,6 +64,7 @@ When renaming a field across the codebase:
 
 ## Important Guidelines
 
+- **Do NOT delete git branches** unless explicitly asked to. Branches should be preserved for history and reference.
 - **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, `*_SETUP.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
 - **Do NOT create README files** unless explicitly requested.
 - **Do NOT create setup/how-to docs in project root**. If you must document something for developers (e.g., release process, setup instructions), place it in `docs/internal/` - never in the project root.
