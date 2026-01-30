@@ -254,16 +254,17 @@ class Git:
         result = self._run("diff", "--stat", revision_range, check=False)
         return result.stdout.strip()
 
-    def is_merged(self, branch: str, into: str | None = None) -> bool:
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         """Check if a branch has been merged into another branch.
 
-        Uses git cherry to detect if the branch's changes have been applied,
-        which works correctly for squash merges (where commit SHAs differ but
-        the patch content is the same).
+        By default, uses git diff to check if the branch has any changes not in
+        the target branch. This correctly detects squash merges where multiple
+        commits are combined into one.
 
         Args:
             branch: The branch to check
             into: The target branch (defaults to default branch)
+            use_cherry: Use git cherry instead of git diff (legacy method)
 
         Returns:
             True if the branch has been merged into the target
@@ -275,16 +276,23 @@ class Git:
         if not self.branch_exists(branch):
             return True  # Branch deleted, assume merged
 
-        # Use git cherry to detect if commits have been applied (works with squash merges)
-        # git cherry shows - for commits already in target, + for commits not in target
-        result = self._run("cherry", into, branch, check=False)
-        if result.returncode != 0:
-            return False
+        if use_cherry:
+            # Legacy method: Use git cherry to detect if commits have been applied
+            # git cherry shows - for commits already in target, + for commits not in target
+            result = self._run("cherry", into, branch, check=False)
+            if result.returncode != 0:
+                return False
 
-        # If all lines start with -, all commits have been merged
-        # If there's no output, the branches are identical (also merged)
-        lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
-        return all(line.startswith("-") for line in lines)
+            # If all lines start with -, all commits have been merged
+            # If there's no output, the branches are identical (also merged)
+            lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+            return all(line.startswith("-") for line in lines)
+        else:
+            # Diff-based method: Check if branch has any changes not in target
+            # Three-dot syntax shows changes on branch since merge-base
+            # If no diff, the branch is effectively merged
+            result = self._run("diff", f"{into}...{branch}", "--quiet", check=False)
+            return result.returncode == 0  # 0 = no diff = merged
 
     def merge(self, branch: str, squash: bool = False) -> None:
         """Merge a branch into the current branch.
