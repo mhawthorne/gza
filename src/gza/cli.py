@@ -718,6 +718,54 @@ def cmd_merge(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Show diff for a task's branch against the current branch."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    # Get the task
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    if not task.branch:
+        print(f"Error: Task #{task.id} has no branch")
+        return 1
+
+    # Get current branch
+    current_branch = git.current_branch()
+
+    # Check if branch exists
+    if not git.branch_exists(task.branch):
+        print(f"Error: Branch '{task.branch}' does not exist")
+        return 1
+
+    # Get the diff
+    try:
+        # Use three-dot notation like merge does to show changes on task branch
+        revision_range = f"{current_branch}...{task.branch}"
+
+        if args.stat:
+            # Show only the stat summary
+            diff_output = git.get_diff_stat(revision_range)
+        else:
+            # Show full diff
+            diff_output = git.get_diff(revision_range)
+
+        if not diff_output:
+            print(f"No differences between '{current_branch}' and '{task.branch}'")
+            return 0
+
+        print(diff_output)
+        return 0
+
+    except GitError as e:
+        print(f"Error getting diff: {e}")
+        return 1
+
+
 def _generate_pr_content(
     task: DbTask,
     commit_log: str,
@@ -2496,6 +2544,20 @@ def main() -> int:
     )
     add_common_args(merge_parser)
 
+    # diff command
+    diff_parser = subparsers.add_parser("diff", help="Show diff for a task's branch against current branch")
+    diff_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to show diff for",
+    )
+    diff_parser.add_argument(
+        "--stat",
+        action="store_true",
+        help="Show only diff statistics instead of full diff",
+    )
+    add_common_args(diff_parser)
+
     # pr command
     pr_parser = subparsers.add_parser("pr", help="Create GitHub PR from completed task")
     pr_parser.add_argument(
@@ -2864,6 +2926,8 @@ def main() -> int:
             return cmd_unmerged(args)
         elif args.command == "merge":
             return cmd_merge(args)
+        elif args.command == "diff":
+            return cmd_diff(args)
         elif args.command == "pr":
             return cmd_pr(args)
         elif args.command == "stats":
