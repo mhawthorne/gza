@@ -556,18 +556,58 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         print("No unmerged tasks")
         return 0
 
+    # Group tasks by branch
+    branch_groups: dict[str, list] = {}
     for task in unmerged:
-        date_str = f"({task.completed_at.strftime('%Y-%m-%d %H:%M')})" if task.completed_at else ""
-        type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
-        prompt_display = task.prompt[:50] + "..." if len(task.prompt) > 50 else task.prompt
-        print(f"⚡ [#{task.id}] {date_str} {prompt_display}{type_label}")
         if task.branch:
-            print(f"    branch: {task.branch}")
-        if task.report_file:
-            print(f"    report: {task.report_file}")
-        stats_str = format_stats(task)
+            if task.branch not in branch_groups:
+                branch_groups[task.branch] = []
+            branch_groups[task.branch].append(task)
+
+    # Display grouped by branch
+    for branch, tasks in branch_groups.items():
+        # Sort tasks by created_at to find the root task (earliest)
+        tasks_sorted = sorted(tasks, key=lambda t: t.created_at if t.created_at else datetime.min)
+
+        # Find the root implementation task and any improve tasks that reference it
+        root_task = None
+        improve_tasks = []
+
+        # First pass: identify the root implementation task
+        for task in tasks_sorted:
+            if task.task_type == "implement":
+                root_task = task
+                break
+
+        # If no implement task, use the earliest task as root
+        if not root_task:
+            root_task = tasks_sorted[0]
+
+        # Second pass: find improve tasks that are based on the root task
+        for task in tasks_sorted:
+            if task.task_type == "improve" and task.based_on == root_task.id:
+                improve_tasks.append(task)
+
+        # Build the display line
+        prompt_display = root_task.prompt[:50] + "..." if len(root_task.prompt) > 50 else root_task.prompt
+
+        # Add improve task references if any
+        if improve_tasks:
+            improve_ids = ", ".join(f"#{t.id}" for t in improve_tasks)
+            print(f"⚡ [#{root_task.id}] {prompt_display} (improved by {improve_ids})")
+        else:
+            date_str = f"({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})" if root_task.completed_at else ""
+            print(f"⚡ [#{root_task.id}] {date_str} {prompt_display}")
+
+        print(f"    branch: {branch}")
+
+        if root_task.report_file:
+            print(f"    report: {root_task.report_file}")
+
+        stats_str = format_stats(root_task)
         if stats_str:
             print(f"    stats: {stats_str}")
+
     return 0
 
 
