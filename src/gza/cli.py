@@ -2444,6 +2444,84 @@ def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
     return 0
 
 
+def cmd_claude_install_skills(args: argparse.Namespace) -> int:
+    """Install Claude Code skills from gza package to project."""
+    from .skills_utils import (
+        get_available_skills,
+        get_skill_description,
+        copy_skill,
+    )
+
+    # Handle --list flag
+    if args.list:
+        available = get_available_skills()
+        if not available:
+            print("No skills available")
+            return 0
+
+        print("Available skills:")
+        for skill in available:
+            desc = get_skill_description(skill)
+            print(f"  {skill:20} - {desc}")
+        return 0
+
+    # Determine which skills to install
+    available = get_available_skills()
+
+    if args.skills:
+        # Validate requested skills exist
+        skills_to_install = []
+        for skill in args.skills:
+            if skill not in available:
+                print(f"Error: Skill '{skill}' not found")
+                print(f"Available skills: {', '.join(available)}")
+                return 1
+            skills_to_install.append(skill)
+    else:
+        # Install all skills
+        skills_to_install = available
+
+    if not skills_to_install:
+        print("No skills to install")
+        return 0
+
+    # Create target directory
+    target_dir = args.project_dir / '.claude' / 'skills'
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Install skills
+    print(f"Installing {len(skills_to_install)} skill(s) to {target_dir}...")
+
+    installed = 0
+    skipped = 0
+    failed = 0
+
+    for skill in skills_to_install:
+        success, message = copy_skill(skill, target_dir, args.force)
+
+        if success:
+            print(f"  ✓ {skill}")
+            installed += 1
+        elif "already exists" in message:
+            print(f"  ⊘ {skill} ({message})")
+            skipped += 1
+        else:
+            print(f"  ✗ {skill} ({message})")
+            failed += 1
+
+    # Print summary
+    print()
+    if failed > 0:
+        print(f"Installed {installed} skill(s), {skipped} skipped, {failed} failed")
+        return 1
+    elif skipped > 0:
+        print(f"Installed {installed} skill(s) ({skipped} skipped)")
+    else:
+        print(f"Installed {installed} skill(s)")
+
+    return 0
+
+
 class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """Custom help formatter that sorts subcommands alphabetically."""
 
@@ -2971,6 +3049,28 @@ def main() -> int:
     )
     add_common_args(stop_parser)
 
+    # claude-install-skills command
+    claude_install_parser = subparsers.add_parser(
+        "claude-install-skills",
+        help="Install gza Claude Code skills to project",
+    )
+    claude_install_parser.add_argument(
+        "skills",
+        nargs="*",
+        help="Specific skills to install (installs all if not specified)",
+    )
+    claude_install_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing skills",
+    )
+    claude_install_parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List available skills without installing",
+    )
+    add_common_args(claude_install_parser)
+
     args = parser.parse_args()
 
     # Validate and resolve project_dir
@@ -3029,6 +3129,8 @@ def main() -> int:
             return cmd_ps(args)
         elif args.command == "stop":
             return cmd_stop(args)
+        elif args.command == "claude-install-skills":
+            return cmd_claude_install_skills(args)
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

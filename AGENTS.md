@@ -11,12 +11,13 @@ A coding AI agent runner for Claude Code.
 To run gza commands, use either `bin/gza` or `uv run gza`:
 
 ```
-gza init [--project DIR]     # Generate new gza.yaml with defaults
-gza work [--project DIR]     # Run the next pending task
-gza next [--project DIR]     # List upcoming pending tasks
-gza history [--project DIR]  # List recent completed/failed tasks
-gza stats [--project DIR]    # Show cost and usage statistics
-gza validate [--project DIR] # Validate gza.yaml configuration
+gza init [--project DIR]              # Generate new gza.yaml with defaults
+gza work [--project DIR]              # Run the next pending task
+gza next [--project DIR]              # List upcoming pending tasks
+gza history [--project DIR]           # List recent completed/failed tasks
+gza stats [--project DIR]             # Show cost and usage statistics
+gza validate [--project DIR]          # Validate gza.yaml configuration
+gza claude-install-skills [SKILLS...] # Install gza Claude Code skills to project
 ```
 
 The `--project` (or `-C`) option specifies the target project directory and can be used with any command. If not specified, the current directory is used.
@@ -26,6 +27,32 @@ Options for `init`:
 
 Options for `stats`:
 - `--last N` - Show last N tasks (default: 5)
+
+## Installing Claude Code Skills
+
+Gza provides custom Claude Code skills that enhance the agent's ability to work with gza tasks. Install them with:
+
+```bash
+# List available skills
+gza claude-install-skills --list
+
+# Install all skills
+gza claude-install-skills
+
+# Install specific skills
+gza claude-install-skills gza-task-add gza-task-info
+
+# Force overwrite existing skills
+gza claude-install-skills --force
+```
+
+Available skills:
+- `gza-task-add`: Create well-formed gza tasks with appropriate types and groups
+- `gza-task-info`: Gather comprehensive info about specific gza tasks including status, branch, commits, and logs
+- `rebase`: Rebase current branch on main with interactive conflict resolution
+- `review-docs`: Review documentation for accuracy, completeness, and missing information
+
+The skills are installed to `.claude/skills/` in your project directory.
 
 ## Architecture
 
