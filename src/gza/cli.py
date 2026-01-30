@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import Config, ConfigError
-from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, Task as DbTask
+from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask
 from .git import Git, GitError
 from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
@@ -1771,6 +1771,53 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"✓ Converted task #{task.id} to {new_type}")
         return 0
 
+    # Handle non-interactive prompt editing
+    if hasattr(args, 'prompt_file') and args.prompt_file is not None:
+        if hasattr(args, 'prompt') and args.prompt is not None:
+            print("Error: Cannot use both --prompt-file and --prompt")
+            return 1
+        try:
+            with open(args.prompt_file, 'r') as f:
+                new_prompt = f.read().strip()
+        except FileNotFoundError:
+            print(f"Error: File not found: {args.prompt_file}")
+            return 1
+        except Exception as e:
+            print(f"Error reading file: {e}")
+            return 1
+
+        errors = validate_prompt(new_prompt)
+        if errors:
+            print("Validation errors:")
+            for error in errors:
+                print(f"  - {error}")
+            return 1
+
+        task.prompt = new_prompt
+        store.update(task)
+        print(f"✓ Updated task #{task.id}")
+        return 0
+
+    if hasattr(args, 'prompt') and args.prompt is not None:
+        # Handle stdin (-) or direct prompt text
+        if args.prompt == '-':
+            import sys
+            new_prompt = sys.stdin.read().strip()
+        else:
+            new_prompt = args.prompt
+
+        errors = validate_prompt(new_prompt)
+        if errors:
+            print("Validation errors:")
+            for error in errors:
+                print(f"  - {error}")
+            return 1
+
+        task.prompt = new_prompt
+        store.update(task)
+        print(f"✓ Updated task #{task.id}")
+        return 0
+
     if edit_task_interactive(store, task):
         print(f"✓ Updated task #{task.id}")
         return 0
@@ -2024,7 +2071,10 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(f"Error: Cannot delete in-progress task")
         return 1
 
-    if not args.force:
+    # Support both --force (deprecated) and --yes/-y
+    skip_confirmation = args.force or args.yes
+
+    if not skip_confirmation:
         prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
         confirm = input(f"Delete task #{task.id}: {prompt_display}? [y/N] ")
         if confirm.lower() != 'y':
@@ -2741,6 +2791,16 @@ def main() -> int:
         action="store_true",
         help="Enable automatic review task creation on completion",
     )
+    edit_parser.add_argument(
+        "--prompt-file",
+        metavar="FILE",
+        help="Read new prompt from file (for non-interactive use)",
+    )
+    edit_parser.add_argument(
+        "--prompt",
+        metavar="TEXT",
+        help="Set new prompt directly, or use '-' to read from stdin",
+    )
     add_common_args(edit_parser)
 
     # delete command
@@ -2752,6 +2812,11 @@ def main() -> int:
     )
     delete_parser.add_argument(
         "--force", "-f",
+        action="store_true",
+        help="Skip confirmation prompt (deprecated, use --yes/-y)",
+    )
+    delete_parser.add_argument(
+        "--yes", "-y",
         action="store_true",
         help="Skip confirmation prompt",
     )

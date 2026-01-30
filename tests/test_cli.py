@@ -7,13 +7,14 @@ from pathlib import Path
 import pytest
 
 
-def run_gza(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run_gza(*args: str, cwd: Path | None = None, stdin_input: str | None = None) -> subprocess.CompletedProcess:
     """Run gza command and return result."""
     return subprocess.run(
         ["uv", "run", "gza", *args],
         capture_output=True,
         text=True,
         cwd=cwd,
+        input=stdin_input,
     )
 
 
@@ -189,6 +190,36 @@ class TestDeleteCommand:
 
         assert result.returncode == 1
         assert "not found" in result.stdout
+
+    def test_delete_with_yes_flag(self, tmp_path: Path):
+        """Delete command with --yes removes task without confirmation."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task to delete", "status": "pending"},
+        ])
+
+        result = run_gza("delete", "1", "--yes", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Deleted task" in result.stdout
+
+        # Verify task was deleted
+        result = run_gza("next", "--project", str(tmp_path))
+        assert "No pending tasks" in result.stdout
+
+    def test_delete_with_y_flag(self, tmp_path: Path):
+        """Delete command with -y removes task without confirmation."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task to delete", "status": "pending"},
+        ])
+
+        result = run_gza("delete", "1", "-y", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Deleted task" in result.stdout
+
+        # Verify task was deleted
+        result = run_gza("next", "--project", str(tmp_path))
+        assert "No pending tasks" in result.stdout
 
 
 class TestRetryCommand:
@@ -1220,6 +1251,127 @@ class TestEditCommand:
         # Verify create_review was enabled
         updated = store.get(task.id)
         assert updated.create_review is True
+
+    def test_edit_with_prompt_file(self, tmp_path: Path):
+        """Edit command can update prompt from file."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Original prompt text")
+
+        # Create a file with new prompt
+        prompt_file = tmp_path / "new_prompt.txt"
+        prompt_file.write_text("New prompt text from file")
+
+        result = run_gza("edit", str(task.id), "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Updated task" in result.stdout
+
+        # Verify prompt was updated
+        updated = store.get(task.id)
+        assert updated.prompt == "New prompt text from file"
+
+    def test_edit_with_prompt_file_not_found(self, tmp_path: Path):
+        """Edit command handles missing file gracefully."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Original prompt text")
+
+        result = run_gza("edit", str(task.id), "--prompt-file", "/nonexistent/file.txt", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout.lower()
+
+    def test_edit_with_prompt_text(self, tmp_path: Path):
+        """Edit command can update prompt from command line."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Original prompt text")
+
+        result = run_gza("edit", str(task.id), "--prompt", "New prompt from command line", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Updated task" in result.stdout
+
+        # Verify prompt was updated
+        updated = store.get(task.id)
+        assert updated.prompt == "New prompt from command line"
+
+    def test_edit_with_prompt_validation_error(self, tmp_path: Path):
+        """Edit command validates prompt length."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Original prompt text")
+
+        # Try to set a prompt that's too short
+        result = run_gza("edit", str(task.id), "--prompt", "short", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Validation" in result.stdout or "too short" in result.stdout.lower()
+
+        # Verify prompt was NOT updated
+        updated = store.get(task.id)
+        assert updated.prompt == "Original prompt text"
+
+    def test_edit_prompt_and_prompt_file_conflict(self, tmp_path: Path):
+        """Edit command rejects both --prompt and --prompt-file."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Original prompt text")
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("File content")
+
+        result = run_gza("edit", str(task.id), "--prompt", "text", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Cannot use both" in result.stdout
+
+    def test_edit_with_prompt_from_stdin(self, tmp_path: Path):
+        """Edit command can read prompt from stdin using --prompt -."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Original prompt text")
+
+        stdin_content = "New prompt from stdin input"
+        result = run_gza("edit", str(task.id), "--prompt", "-", "--project", str(tmp_path), stdin_input=stdin_content)
+
+        assert result.returncode == 0
+        assert "Updated task" in result.stdout
+
+        # Verify prompt was updated
+        updated = store.get(task.id)
+        assert updated.prompt == "New prompt from stdin input"
 
 
 class TestNextCommandWithDependencies:
