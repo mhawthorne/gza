@@ -672,8 +672,20 @@ def cmd_merge(args: argparse.Namespace) -> int:
             # Regular merge or squash merge
             merge_type = "squash merging" if args.squash else "merging"
             print(f"Merging '{task.branch}' into '{current_branch}'...")
-            git.merge(task.branch, squash=args.squash)
-            print(f"✓ Successfully merged {task.branch}")
+
+            # For squash merge, create a commit message from the task
+            commit_message = None
+            if args.squash:
+                # Get a concise summary of the task
+                task_summary = task.prompt[:72] if len(task.prompt) > 72 else task.prompt
+                commit_message = f"Squash merge: {task_summary}\n\nTask #{task.id}: {task.prompt}"
+
+            git.merge(task.branch, squash=args.squash, commit_message=commit_message)
+
+            if args.squash:
+                print(f"✓ Successfully squash merged {task.branch} and created commit")
+            else:
+                print(f"✓ Successfully merged {task.branch}")
 
         # Delete branch if requested
         if args.delete:
