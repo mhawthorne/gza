@@ -2248,3 +2248,121 @@ class TestImproveCommand:
         assert "Warning: Review #2 is pending" in result.stdout
         assert "blocked until it completes" in result.stdout
         assert "Created improve task #3" in result.stdout
+
+
+class TestReviewCommand:
+    """Tests for the 'gza review' command."""
+
+    def test_review_creates_task_for_completed_implementation(self, tmp_path: Path):
+        """Review command creates a review task for a completed implementation."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task
+        impl_task = store.add("Add user authentication", task_type="implement", group="auth-feature")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-user-authentication"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Run review command
+        result = run_gza("review", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created review task #2" in result.stdout
+        assert "Implementation: #1" in result.stdout
+        assert "Group: auth-feature" in result.stdout
+
+        # Verify the review task was created with correct fields
+        review_task = store.get(2)
+        assert review_task is not None
+        assert review_task.task_type == "review"
+        assert review_task.depends_on == 1  # implementation task
+        assert review_task.group == "auth-feature"  # inherited from implementation
+
+    def test_review_fails_on_non_implementation_task(self, tmp_path: Path):
+        """Review command fails if task is not an implementation task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a plan task
+        plan_task = store.add("Plan authentication system", task_type="plan")
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(timezone.utc)
+        store.update(plan_task)
+
+        # Run review command
+        result = run_gza("review", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "is a plan task, not an implementation task" in result.stdout
+
+    def test_review_fails_on_non_completed_task(self, tmp_path: Path):
+        """Review command fails if implementation is not completed."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a pending implementation task
+        impl_task = store.add("Add feature", task_type="implement")
+        # Leave status as 'pending'
+
+        # Run review command
+        result = run_gza("review", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "is pending. Can only review completed tasks" in result.stdout
+
+    def test_review_nonexistent_task(self, tmp_path: Path):
+        """Review command fails gracefully for nonexistent task."""
+        setup_config(tmp_path)
+
+        result = run_gza("review", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Task #999 not found" in result.stdout
+
+    def test_review_inherits_based_on_from_implementation(self, tmp_path: Path):
+        """Review task inherits based_on from implementation to find plan."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a plan task
+        plan_task = store.add("Plan feature", task_type="plan")
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(timezone.utc)
+        store.update(plan_task)
+
+        # Create implementation based on plan
+        impl_task = store.add("Implement feature", task_type="implement", based_on=plan_task.id)
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-implement-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Run review command
+        result = run_gza("review", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created review task #3" in result.stdout
+
+        # Verify the review task inherited based_on
+        review_task = store.get(3)
+        assert review_task is not None
+        assert review_task.based_on == 1  # plan task
+        assert review_task.depends_on == 2  # implementation task

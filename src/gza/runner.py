@@ -332,9 +332,24 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     Returns:
         Exit code from running the review task.
     """
-    # Create review task
-    review_prompt = f"Review the implementation from task #{completed_task.id}"
-    if completed_task.prompt:
+    # Create review task with slug derived from implementation task
+    # Extract slug from the completed task's task_id (format: YYYYMMDD-slug or YYYYMMDD-slug-N)
+    if completed_task.task_id:
+        # Remove date prefix (YYYYMMDD-) and any retry suffix (-N)
+        parts = completed_task.task_id.split('-', 1)
+        if len(parts) == 2:
+            slug = parts[1]  # Everything after the date
+            # Remove retry suffix if present
+            slug = re.sub(r'-\d+$', '', slug)
+            review_prompt = f"review {slug}"
+        else:
+            # Fallback if task_id format is unexpected
+            review_prompt = f"Review the implementation from task #{completed_task.id}"
+    else:
+        # Fallback if task_id is not set
+        review_prompt = f"Review the implementation from task #{completed_task.id}"
+
+    if not review_prompt.startswith("review ") and completed_task.prompt:
         review_prompt += f": {completed_task.prompt[:100]}"
 
     review_task = store.add(

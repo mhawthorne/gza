@@ -2088,6 +2088,57 @@ def cmd_improve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    """Create a review task for an implementation task and optionally run it."""
+    config = Config.load(args.project_dir)
+    if args.no_docker:
+        config.use_docker = False
+
+    store = get_store(config)
+
+    # Get the implementation task
+    impl_task = store.get(args.task_id)
+    if not impl_task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    # Validate that it's an implementation task
+    if impl_task.task_type != "implement":
+        print(f"Error: Task #{args.task_id} is a {impl_task.task_type} task, not an implementation task")
+        return 1
+
+    # Check if task is completed
+    if impl_task.status != "completed":
+        print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks.")
+        return 1
+
+    # Create review task with improved prompt
+    review_prompt = f"Review the implementation from task #{impl_task.id}"
+    if impl_task.prompt:
+        review_prompt += f": {impl_task.prompt[:100]}"
+
+    review_task = store.add(
+        prompt=review_prompt,
+        task_type="review",
+        depends_on=impl_task.id,
+        group=impl_task.group,
+        based_on=impl_task.based_on,  # Inherit based_on to find plan
+    )
+
+    print(f"✓ Created review task #{review_task.id}")
+    print(f"  Implementation: #{impl_task.id}")
+    if impl_task.group:
+        print(f"  Group: {impl_task.group}")
+
+    # If --run flag is set, run the review task immediately
+    if hasattr(args, 'run') and args.run:
+        print(f"\nRunning review task #{review_task.id}...")
+        from .runner import run
+        return run(config, task_id=review_task.id)
+
+    return 0
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     """Resume a failed task from where it left off."""
     config = Config.load(args.project_dir)
@@ -2696,6 +2747,25 @@ def main() -> int:
     )
     add_common_args(improve_parser)
 
+    # review command
+    review_parser = subparsers.add_parser("review", help="Create and optionally run a review task for an implementation")
+    review_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Implementation task ID to review",
+    )
+    review_parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Run the review task immediately after creating it",
+    )
+    review_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only used with --run)",
+    )
+    add_common_args(review_parser)
+
     # show command
     show_parser = subparsers.add_parser("show", help="Show details of a specific task")
     show_parser.add_argument(
@@ -2814,6 +2884,8 @@ def main() -> int:
             return cmd_retry(args)
         elif args.command == "improve":
             return cmd_improve(args)
+        elif args.command == "review":
+            return cmd_review(args)
         elif args.command == "resume":
             return cmd_resume(args)
         elif args.command == "show":
