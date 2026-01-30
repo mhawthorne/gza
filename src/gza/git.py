@@ -308,12 +308,13 @@ class Git:
             # If trees match, merging would be a no-op - branch is effectively merged
             return merged_tree == target_tree
 
-    def merge(self, branch: str, squash: bool = False) -> None:
+    def merge(self, branch: str, squash: bool = False, commit_message: str | None = None) -> None:
         """Merge a branch into the current branch.
 
         Args:
             branch: The branch to merge
             squash: Use squash merge (default: False, uses --no-ff)
+            commit_message: Commit message for squash merge (required if squash=True)
 
         Raises:
             GitError: If the merge fails
@@ -325,6 +326,12 @@ class Git:
             args.append("--no-ff")
         args.append(branch)
         self._run(*args)
+
+        # Auto-commit after squash merge
+        if squash:
+            if not commit_message:
+                raise ValueError("commit_message is required for squash merge")
+            self.commit(commit_message)
 
     def merge_abort(self) -> None:
         """Abort a merge in progress and restore clean state.

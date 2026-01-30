@@ -1861,6 +1861,170 @@ class TestMergeCommand:
         assert result.returncode == 1
         assert "Cannot use --rebase and --squash together" in result.stdout
 
+    def test_squash_merge_creates_commit(self, tmp_path: Path):
+        """Squash merge creates a commit, not just staged changes."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Get the commit count before merge
+        commits_before = git._run("rev-list", "--count", "HEAD")
+        commit_count_before = int(commits_before.stdout.strip())
+
+        # Create a task with a branch
+        task = store.add("Add feature X")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-squash"
+        store.update(task)
+
+        # Create the branch and add multiple commits
+        git._run("checkout", "-b", "feature/test-squash")
+        (tmp_path / "feature1.txt").write_text("feature content 1")
+        git._run("add", "feature1.txt")
+        git._run("commit", "-m", "Add feature part 1")
+        (tmp_path / "feature2.txt").write_text("feature content 2")
+        git._run("add", "feature2.txt")
+        git._run("commit", "-m", "Add feature part 2")
+        git._run("checkout", "main")
+
+        # Perform squash merge
+        result = run_gza("merge", str(task.id), "--squash", "--project", str(tmp_path))
+
+        # Verify the merge succeeded
+        assert result.returncode == 0
+        assert "Successfully squash merged" in result.stdout
+
+        # Verify a commit was created (not just staged changes)
+        commits_after = git._run("rev-list", "--count", "HEAD")
+        commit_count_after = int(commits_after.stdout.strip())
+        assert commit_count_after == commit_count_before + 1, "Expected one new commit"
+
+        # Verify no staged changes remain
+        staged_result = git._run("diff", "--cached", "--quiet", check=False)
+        assert staged_result.returncode == 0, "Expected no staged changes after squash merge"
+
+        # Verify the feature files are present
+        assert (tmp_path / "feature1.txt").exists()
+        assert (tmp_path / "feature2.txt").exists()
+
+    def test_squash_merge_commit_message_includes_task_info(self, tmp_path: Path):
+        """Squash merge commit message includes task information."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a descriptive prompt
+        task_prompt = "Implement user authentication with JWT tokens"
+        task = store.add(task_prompt)
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/auth"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/auth")
+        (tmp_path / "auth.txt").write_text("authentication code")
+        git._run("add", "auth.txt")
+        git._run("commit", "-m", "Add auth")
+        git._run("checkout", "main")
+
+        # Perform squash merge
+        result = run_gza("merge", str(task.id), "--squash", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        # Get the commit message
+        log_result = git._run("log", "-1", "--pretty=%B")
+        commit_message = log_result.stdout.strip()
+
+        # Verify the commit message contains task information
+        assert f"Task #{task.id}" in commit_message, "Commit message should include task ID"
+        assert task_prompt in commit_message, "Commit message should include task prompt"
+        assert "Squash merge" in commit_message, "Commit message should indicate squash merge"
+
+    def test_branch_shows_as_merged_after_squash(self, tmp_path: Path):
+        """Branch shows as merged in 'gza unmerged' after squash merge completes."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Add cool feature")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/cool"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/cool")
+        (tmp_path / "cool.txt").write_text("cool feature")
+        git._run("add", "cool.txt")
+        git._run("commit", "-m", "Add cool feature")
+        git._run("checkout", "main")
+
+        # Verify branch is not merged before squash using git directly
+        is_merged_before = git.is_merged(task.branch, "main")
+        assert not is_merged_before, "Branch should not be merged before squash merge"
+
+        # Perform squash merge
+        result = run_gza("merge", str(task.id), "--squash", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        # Verify branch now shows as merged using git directly
+        is_merged_after = git.is_merged(task.branch, "main")
+        assert is_merged_after, "Branch should be detected as merged after squash merge"
+
+        # Verify the cool.txt file is present in main
+        assert (tmp_path / "cool.txt").exists(), "Feature file should exist in main after merge"
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
