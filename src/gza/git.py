@@ -24,7 +24,8 @@ class Git:
             text=True,
         )
         if check and result.returncode != 0:
-            raise GitError(f"git {' '.join(args)} failed: {result.stderr}")
+            error_output = result.stderr or result.stdout
+            raise GitError(f"git {' '.join(args)} failed:\n{error_output}")
         return result
 
     def current_branch(self) -> str:
