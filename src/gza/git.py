@@ -255,6 +255,18 @@ class Git:
         result = self._run("diff", "--stat", revision_range, check=False)
         return result.stdout.strip()
 
+    def get_diff(self, revision_range: str) -> str:
+        """Get full diff output for a revision range.
+
+        Args:
+            revision_range: The revision range (e.g., "main...feature")
+
+        Returns:
+            The full diff output as a string
+        """
+        result = self._run("diff", revision_range, check=False)
+        return result.stdout.strip()
+
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         """Check if a branch has been merged into another branch.
 
