@@ -547,9 +547,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     # Get completed tasks with branches and check if merged
     history = store.get_history(limit=100)
     unmerged = []
+    use_cherry = getattr(args, 'commits_only', False)
     for task in history:
         if task.status == "completed" and task.branch and task.has_commits:
-            if not git.is_merged(task.branch, default_branch):
+            if not git.is_merged(task.branch, default_branch, use_cherry=use_cherry):
                 unmerged.append(task)
 
     if not unmerged:
@@ -2399,6 +2400,11 @@ def main() -> int:
     # unmerged command
     unmerged_parser = subparsers.add_parser("unmerged", help="List tasks with unmerged work")
     add_common_args(unmerged_parser)
+    unmerged_parser.add_argument(
+        "--commits-only",
+        action="store_true",
+        help="Use commit-based detection (git cherry) instead of diff-based detection",
+    )
 
     # merge command
     merge_parser = subparsers.add_parser("merge", help="Merge a task's branch into current branch")
