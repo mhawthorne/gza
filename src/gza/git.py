@@ -363,3 +363,18 @@ class Git:
             args.append("-d")
         args.append(branch)
         self._run(*args)
+
+    def count_commits_ahead(self, branch: str, base: str) -> int:
+        """Count how many commits a branch is ahead of base.
+
+        Args:
+            branch: The branch to check
+            base: The base branch to compare against
+
+        Returns:
+            Number of commits that branch is ahead of base
+        """
+        result = self._run("rev-list", "--count", f"{base}..{branch}", check=False)
+        if result.returncode != 0:
+            return 0
+        return int(result.stdout.strip())

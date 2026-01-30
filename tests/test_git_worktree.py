@@ -1,7 +1,7 @@
 """Tests for Git worktree operations with upstream tracking."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 from gza.git import Git, GitError
 
@@ -74,3 +74,51 @@ class TestWorktreeAdd:
 
             # Verify it still returns the path
             assert result == worktree_path
+
+
+class TestCountCommitsAhead:
+    """Test count_commits_ahead method."""
+
+    def test_count_commits_ahead_returns_count(self, tmp_path: Path):
+        """Test that count_commits_ahead returns the commit count."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="5\n", stderr="")
+
+            count = git.count_commits_ahead("feature-branch", "main")
+
+            # Verify correct git command was called
+            mock_run.assert_called_once_with("rev-list", "--count", "main..feature-branch", check=False)
+            assert count == 5
+
+    def test_count_commits_ahead_returns_zero_on_error(self, tmp_path: Path):
+        """Test that count_commits_ahead returns 0 on git error."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="fatal: bad revision")
+
+            count = git.count_commits_ahead("nonexistent-branch", "main")
+
+            assert count == 0
+
+    def test_count_commits_ahead_zero_commits(self, tmp_path: Path):
+        """Test that count_commits_ahead returns 0 when branches are equal."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="0\n", stderr="")
+
+            count = git.count_commits_ahead("feature-branch", "main")
+
+            assert count == 0

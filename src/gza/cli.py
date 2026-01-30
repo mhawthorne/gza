@@ -600,7 +600,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             date_str = f"({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})" if root_task.completed_at else ""
             print(f"⚡ [#{root_task.id}] {date_str} {prompt_display}")
 
-        print(f"    branch: {branch}")
+        # Show branch with commit count
+        commit_count = git.count_commits_ahead(branch, default_branch)
+        commits_label = "commit" if commit_count == 1 else "commits"
+        print(f"    branch: {branch} ({commit_count} {commits_label})")
 
         if root_task.report_file:
             print(f"    report: {root_task.report_file}")
