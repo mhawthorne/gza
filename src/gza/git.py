@@ -258,14 +258,16 @@ class Git:
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         """Check if a branch has been merged into another branch.
 
-        By default, uses git diff to check if the branch has any changes not in
-        the target branch. This correctly detects squash merges where multiple
-        commits are combined into one.
+        By default, uses git merge-tree to simulate a merge and compare the
+        resulting tree with the target branch's tree. If they're identical,
+        merging the branch would be a no-op, meaning all changes are already
+        in the target. This correctly handles squash merges, rebases, and
+        branches that diverged but have equivalent content.
 
         Args:
             branch: The branch to check
             into: The target branch (defaults to default branch)
-            use_cherry: Use git cherry instead of git diff (legacy method)
+            use_cherry: Use git cherry instead of merge-tree (legacy method)
 
         Returns:
             True if the branch has been merged into the target
@@ -289,11 +291,22 @@ class Git:
             lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
             return all(line.startswith("-") for line in lines)
         else:
-            # Diff-based method: Check if branch has any changes not in target
-            # Three-dot syntax shows changes on branch since merge-base
-            # If no diff, the branch is effectively merged
-            result = self._run("diff", f"{into}...{branch}", "--quiet", check=False)
-            return result.returncode == 0  # 0 = no diff = merged
+            # Merge-tree method: Simulate a merge and compare trees
+            # If the merged tree equals the target's tree, the branch adds nothing
+            result = self._run("merge-tree", "--write-tree", into, branch, check=False)
+            if result.returncode != 0:
+                # merge-tree failed (likely conflicts), branch is not cleanly merged
+                return False
+
+            merged_tree = result.stdout.strip()
+            # Get the target branch's tree
+            target_tree_result = self._run("rev-parse", f"{into}^{{tree}}", check=False)
+            if target_tree_result.returncode != 0:
+                return False
+
+            target_tree = target_tree_result.stdout.strip()
+            # If trees match, merging would be a no-op - branch is effectively merged
+            return merged_tree == target_tree
 
     def merge(self, branch: str, squash: bool = False) -> None:
         """Merge a branch into the current branch.

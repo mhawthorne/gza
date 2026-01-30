@@ -8,8 +8,8 @@ import pytest
 from gza.git import Git
 
 
-class TestIsMergedDiffBased:
-    """Test diff-based merge detection (default behavior)."""
+class TestIsMergedMergeTreeBased:
+    """Test merge-tree based merge detection (default behavior)."""
 
     def test_merged_branch_detected(self, tmp_path: Path):
         """Test that a merged branch is correctly detected."""
@@ -18,18 +18,19 @@ class TestIsMergedDiffBased:
         git = Git(repo_dir)
 
         with patch.object(git, '_run') as mock_run:
-            # Branch exists
+            # Branch exists, merge-tree produces same tree as main
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0),  # diff --quiet (no diff = merged)
+                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
             ]
 
             result = git.is_merged("feature-branch", "main")
 
             assert result is True
-            # Verify diff command was called with three-dot syntax
+            # Verify merge-tree was called
             calls = [str(call) for call in mock_run.call_args_list]
-            assert any("main...feature-branch" in call and "--quiet" in call for call in calls)
+            assert any("merge-tree" in call and "--write-tree" in call for call in calls)
 
     def test_unmerged_branch_detected(self, tmp_path: Path):
         """Test that an unmerged branch is correctly detected."""
@@ -38,10 +39,11 @@ class TestIsMergedDiffBased:
         git = Git(repo_dir)
 
         with patch.object(git, '_run') as mock_run:
-            # Branch exists
+            # Branch exists, merge-tree produces different tree than main
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=1),  # diff --quiet (diff exists = not merged)
+                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="different789"),  # rev-parse main^{tree}
             ]
 
             result = git.is_merged("feature-branch", "main")
@@ -71,10 +73,11 @@ class TestIsMergedDiffBased:
         git = Git(repo_dir)
 
         with patch.object(git, '_run') as mock_run:
-            # Branch exists but has no diff from main (squash merged)
+            # Branch exists, merge-tree shows same result as main (content merged)
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0),  # diff --quiet (no diff = merged)
+                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
             ]
 
             result = git.is_merged("squashed-branch", "main")
@@ -91,15 +94,48 @@ class TestIsMergedDiffBased:
              patch.object(git, 'default_branch', return_value='main') as mock_default:
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0),  # diff --quiet
+                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
             ]
 
             git.is_merged("feature-branch")
 
             mock_default.assert_called_once()
-            # Verify diff was called with 'main'
-            calls = [str(call) for call in mock_run.call_args_list]
-            assert any("main...feature-branch" in call for call in calls)
+
+    def test_merge_tree_conflict_returns_false(self, tmp_path: Path):
+        """Test that merge-tree conflict (non-zero exit) returns False."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # branch_exists
+                MagicMock(returncode=1, stdout="", stderr="conflict"),  # merge-tree failed
+            ]
+
+            result = git.is_merged("feature-branch", "main")
+
+            assert result is False
+
+    def test_diverged_branch_with_same_content_is_merged(self, tmp_path: Path):
+        """Test that a diverged branch with equivalent content is detected as merged."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            # Branch diverged from main but merging would produce same tree
+            # (e.g., changes were cherry-picked or squash-merged separately)
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # branch_exists
+                MagicMock(returncode=0, stdout="same_tree_hash"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="same_tree_hash"),  # rev-parse main^{tree}
+            ]
+
+            result = git.is_merged("diverged-branch", "main")
+
+            assert result is True
 
 
 class TestIsMergedCherryBased:
@@ -194,12 +230,13 @@ class TestIsMergedBothMethods:
         git = Git(repo_dir)
 
         with patch.object(git, '_run') as mock_run:
-            # Test diff-based
+            # Test merge-tree based
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0),  # diff --quiet
+                MagicMock(returncode=0, stdout="same_tree"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="same_tree"),  # rev-parse main^{tree}
             ]
-            diff_result = git.is_merged("feature-branch", "main")
+            merge_tree_result = git.is_merged("feature-branch", "main")
 
             # Test cherry-based
             mock_run.side_effect = [
@@ -208,7 +245,7 @@ class TestIsMergedBothMethods:
             ]
             cherry_result = git.is_merged("feature-branch", "main", use_cherry=True)
 
-            assert diff_result is True
+            assert merge_tree_result is True
             assert cherry_result is True
 
     def test_unmerged_detected_by_both(self, tmp_path: Path):
@@ -218,12 +255,13 @@ class TestIsMergedBothMethods:
         git = Git(repo_dir)
 
         with patch.object(git, '_run') as mock_run:
-            # Test diff-based
+            # Test merge-tree based
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=1),  # diff --quiet (has diff)
+                MagicMock(returncode=0, stdout="merged_tree"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="main_tree"),  # rev-parse main^{tree} (different)
             ]
-            diff_result = git.is_merged("feature-branch", "main")
+            merge_tree_result = git.is_merged("feature-branch", "main")
 
             # Test cherry-based
             mock_run.side_effect = [
@@ -232,5 +270,5 @@ class TestIsMergedBothMethods:
             ]
             cherry_result = git.is_merged("feature-branch", "main", use_cherry=True)
 
-            assert diff_result is False
+            assert merge_tree_result is False
             assert cherry_result is False
