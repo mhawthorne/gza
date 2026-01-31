@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 def run_gza(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -52,8 +53,7 @@ class TestClaudeInstallSkillsCommand:
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
         assert (skills_dir / "gza-task-info" / "SKILL.md").exists()
         assert (skills_dir / "rebase" / "SKILL.md").exists()
-        # review-docs uses lowercase skill.md
-        assert (skills_dir / "review-docs" / "skill.md").exists()
+        assert (skills_dir / "review-docs" / "SKILL.md").exists()
 
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
@@ -141,3 +141,181 @@ class TestClaudeInstallSkillsCommand:
         skills_dir = project_dir / ".claude" / "skills"
         assert skills_dir.exists()
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
+
+
+class TestSkillContentValidation:
+    """Tests to validate skill content format and structure."""
+
+    def test_all_skills_use_uppercase_skill_md(self):
+        """All skills must use SKILL.md (uppercase) naming convention."""
+        from gza.skills_utils import get_skills_source_path
+
+        skills_path = get_skills_source_path()
+        if not skills_path.exists():
+            pytest.skip("Skills directory not found")
+
+        for skill_dir in skills_path.iterdir():
+            if not skill_dir.is_dir():
+                continue
+
+            skill_file = skill_dir / "SKILL.md"
+            lowercase_file = skill_dir / "skill.md"
+
+            # Check that SKILL.md exists
+            assert skill_file.exists(), f"Skill {skill_dir.name} must have SKILL.md (uppercase)"
+
+            # Check that skill.md (lowercase) does not exist (unless on case-insensitive filesystem)
+            # On case-insensitive filesystems, SKILL.md and skill.md are the same file
+            if lowercase_file.exists() and lowercase_file.samefile(skill_file):
+                continue  # Same file, OK
+            assert not lowercase_file.exists(), f"Skill {skill_dir.name} should not have lowercase skill.md"
+
+    def test_all_skills_have_valid_yaml_frontmatter(self):
+        """All skills must have valid YAML frontmatter."""
+        from gza.skills_utils import get_skills_source_path, get_available_skills
+
+        skills_path = get_skills_source_path()
+        available_skills = get_available_skills()
+
+        for skill_name in available_skills:
+            skill_file = skills_path / skill_name / "SKILL.md"
+            content = skill_file.read_text()
+
+            # Check it starts with frontmatter
+            assert content.startswith("---"), f"Skill {skill_name} must start with YAML frontmatter"
+
+            # Extract frontmatter
+            lines = content.split("\n")
+            frontmatter_lines = []
+            in_frontmatter = False
+            for i, line in enumerate(lines):
+                if i == 0 and line.strip() == "---":
+                    in_frontmatter = True
+                    continue
+                if in_frontmatter:
+                    if line.strip() == "---":
+                        break
+                    frontmatter_lines.append(line)
+
+            frontmatter_text = "\n".join(frontmatter_lines)
+
+            # Parse as YAML
+            try:
+                frontmatter = yaml.safe_load(frontmatter_text)
+            except yaml.YAMLError as e:
+                pytest.fail(f"Skill {skill_name} has invalid YAML frontmatter: {e}")
+
+            assert isinstance(frontmatter, dict), f"Skill {skill_name} frontmatter must be a dictionary"
+
+    def test_all_skills_have_required_fields(self):
+        """All skills must have required frontmatter fields."""
+        from gza.skills_utils import get_skills_source_path, get_available_skills
+
+        skills_path = get_skills_source_path()
+        available_skills = get_available_skills()
+        required_fields = ["name", "description", "allowed-tools", "version"]
+
+        for skill_name in available_skills:
+            skill_file = skills_path / skill_name / "SKILL.md"
+            content = skill_file.read_text()
+
+            # Extract and parse frontmatter
+            lines = content.split("\n")
+            frontmatter_lines = []
+            in_frontmatter = False
+            for i, line in enumerate(lines):
+                if i == 0 and line.strip() == "---":
+                    in_frontmatter = True
+                    continue
+                if in_frontmatter:
+                    if line.strip() == "---":
+                        break
+                    frontmatter_lines.append(line)
+
+            frontmatter_text = "\n".join(frontmatter_lines)
+            frontmatter = yaml.safe_load(frontmatter_text)
+
+            # Check required fields
+            for field in required_fields:
+                assert field in frontmatter, f"Skill {skill_name} missing required field '{field}'"
+                assert frontmatter[field], f"Skill {skill_name} has empty '{field}' field"
+
+    def test_all_skills_have_valid_allowed_tools_format(self):
+        """All skills must have properly formatted allowed-tools field."""
+        from gza.skills_utils import get_skills_source_path, get_available_skills
+
+        skills_path = get_skills_source_path()
+        available_skills = get_available_skills()
+
+        for skill_name in available_skills:
+            skill_file = skills_path / skill_name / "SKILL.md"
+            content = skill_file.read_text()
+
+            # Extract and parse frontmatter
+            lines = content.split("\n")
+            frontmatter_lines = []
+            in_frontmatter = False
+            for i, line in enumerate(lines):
+                if i == 0 and line.strip() == "---":
+                    in_frontmatter = True
+                    continue
+                if in_frontmatter:
+                    if line.strip() == "---":
+                        break
+                    frontmatter_lines.append(line)
+
+            frontmatter_text = "\n".join(frontmatter_lines)
+            frontmatter = yaml.safe_load(frontmatter_text)
+
+            # Check allowed-tools format
+            allowed_tools = frontmatter.get("allowed-tools")
+            assert allowed_tools, f"Skill {skill_name} missing allowed-tools"
+
+            # Should be a string (comma-separated list of tools)
+            # e.g., "Read, Glob, Grep, Bash(git:*)"
+            assert isinstance(allowed_tools, str), f"Skill {skill_name} allowed-tools must be a string"
+            assert len(allowed_tools.strip()) > 0, f"Skill {skill_name} allowed-tools cannot be empty"
+
+            # Basic format check: should contain at least one tool name
+            # Valid tool names include: Read, Write, Edit, Glob, Grep, Bash, etc.
+            valid_tool_pattern = any(
+                tool in allowed_tools
+                for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "AskUserQuestion", "WebFetch"]
+            )
+            assert valid_tool_pattern, f"Skill {skill_name} allowed-tools should contain valid tool names"
+
+    def test_all_skills_have_semantic_versions(self):
+        """All skills must have semantic version numbers."""
+        from gza.skills_utils import get_skills_source_path, get_available_skills
+        import re
+
+        skills_path = get_skills_source_path()
+        available_skills = get_available_skills()
+
+        # Semantic versioning pattern: MAJOR.MINOR.PATCH
+        semver_pattern = re.compile(r"^\d+\.\d+\.\d+$")
+
+        for skill_name in available_skills:
+            skill_file = skills_path / skill_name / "SKILL.md"
+            content = skill_file.read_text()
+
+            # Extract and parse frontmatter
+            lines = content.split("\n")
+            frontmatter_lines = []
+            in_frontmatter = False
+            for i, line in enumerate(lines):
+                if i == 0 and line.strip() == "---":
+                    in_frontmatter = True
+                    continue
+                if in_frontmatter:
+                    if line.strip() == "---":
+                        break
+                    frontmatter_lines.append(line)
+
+            frontmatter_text = "\n".join(frontmatter_lines)
+            frontmatter = yaml.safe_load(frontmatter_text)
+
+            version = frontmatter.get("version")
+            assert version, f"Skill {skill_name} missing version field"
+            assert isinstance(version, str), f"Skill {skill_name} version must be a string"
+            assert semver_pattern.match(version), f"Skill {skill_name} version '{version}' must follow semantic versioning (e.g., 1.0.0)"

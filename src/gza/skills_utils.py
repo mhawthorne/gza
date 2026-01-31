@@ -1,9 +1,15 @@
-"""Utilities for managing Claude Code skills."""
+"""Utilities for managing Claude Code skills.
+
+Skill Naming Convention:
+    All skills must use SKILL.md (uppercase) as the skill definition filename.
+    This ensures consistency across all skills and simplifies discovery.
+"""
 
 import importlib.resources
 import shutil
+import tempfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 def get_skills_source_path() -> Path:
@@ -21,7 +27,7 @@ def get_skills_source_path() -> Path:
 def get_available_skills() -> List[str]:
     """List available skill names from the bundled skills.
 
-    A skill is valid if it's a directory containing a SKILL.md or skill.md file.
+    A skill is valid if it's a directory containing a SKILL.md file (uppercase).
 
     Returns:
         Sorted list of skill names.
@@ -34,11 +40,44 @@ def get_available_skills() -> List[str]:
 
     for item in skills_path.iterdir():
         if item.is_dir():
-            # Check for SKILL.md or skill.md
-            if (item / 'SKILL.md').exists() or (item / 'skill.md').exists():
+            # Only check for SKILL.md (uppercase) - this is the convention
+            if (item / 'SKILL.md').exists():
                 skills.append(item.name)
 
     return sorted(skills)
+
+
+def _parse_skill_frontmatter(skill_name: str, field: str) -> str:
+    """Extract a field from a skill's SKILL.md frontmatter.
+
+    Args:
+        skill_name: Name of the skill.
+        field: Field name to extract from frontmatter.
+
+    Returns:
+        The field value from the SKILL.md frontmatter, or empty string if not found.
+    """
+    skills_path = get_skills_source_path()
+    skill_path = skills_path / skill_name
+    skill_file = skill_path / 'SKILL.md'
+
+    if not skill_file.exists():
+        return ""
+
+    try:
+        content = skill_file.read_text()
+        # Parse frontmatter for field
+        if content.startswith('---'):
+            lines = content.split('\n')
+            for line in lines[1:]:
+                if line.strip() == '---':
+                    break
+                if line.startswith(f'{field}:'):
+                    return line.split(f'{field}:', 1)[1].strip()
+    except Exception:
+        pass
+
+    return ""
 
 
 def get_skill_description(skill_name: str) -> str:
@@ -50,31 +89,27 @@ def get_skill_description(skill_name: str) -> str:
     Returns:
         The description line from the SKILL.md frontmatter, or empty string if not found.
     """
-    skills_path = get_skills_source_path()
-    skill_path = skills_path / skill_name
+    return _parse_skill_frontmatter(skill_name, 'description')
 
-    # Try both SKILL.md and skill.md
-    for filename in ['SKILL.md', 'skill.md']:
-        skill_file = skill_path / filename
-        if skill_file.exists():
-            try:
-                content = skill_file.read_text()
-                # Parse frontmatter for description
-                if content.startswith('---'):
-                    lines = content.split('\n')
-                    for line in lines[1:]:
-                        if line.strip() == '---':
-                            break
-                        if line.startswith('description:'):
-                            return line.split('description:', 1)[1].strip()
-            except Exception:
-                pass
 
-    return ""
+def get_skill_version(skill_name: str) -> Optional[str]:
+    """Extract the version from a skill's SKILL.md file.
+
+    Args:
+        skill_name: Name of the skill.
+
+    Returns:
+        The version from the SKILL.md frontmatter, or None if not found.
+    """
+    version = _parse_skill_frontmatter(skill_name, 'version')
+    return version if version else None
 
 
 def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[bool, str]:
-    """Copy a skill from the package to the target directory.
+    """Copy a skill from the package to the target directory atomically.
+
+    Uses a temporary directory and atomic rename to prevent partial state
+    if the copy operation fails mid-operation.
 
     Args:
         skill_name: Name of the skill to copy.
@@ -99,16 +134,35 @@ def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[
     if target.exists() and not force:
         return False, "already exists, use --force to overwrite"
 
-    # Remove target if it exists and force is True
-    if target.exists() and force:
-        try:
-            shutil.rmtree(target)
-        except Exception as e:
-            return False, f"failed to remove existing: {e}"
-
-    # Copy the skill
+    # Use a temporary directory in the same parent directory as target
+    # to ensure atomic rename works (must be on same filesystem)
+    temp_dir = None
     try:
-        shutil.copytree(source, target)
+        # Create temp directory in the target's parent directory
+        temp_dir = tempfile.mkdtemp(dir=target_dir, prefix=f".tmp_{skill_name}_")
+        temp_path = Path(temp_dir) / skill_name
+
+        # Copy to temporary location first
+        shutil.copytree(source, temp_path)
+
+        # Remove existing target if force is True
+        if target.exists() and force:
+            try:
+                shutil.rmtree(target)
+            except Exception as e:
+                return False, f"failed to remove existing: {e}"
+
+        # Atomically rename temp to target
+        # This is atomic on most filesystems (POSIX rename)
+        temp_path.rename(target)
+
         return True, "installed"
     except Exception as e:
         return False, f"copy failed: {e}"
+    finally:
+        # Clean up temp directory if it still exists
+        if temp_dir and Path(temp_dir).exists():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass  # Best effort cleanup
