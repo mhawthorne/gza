@@ -2449,6 +2449,7 @@ def cmd_claude_install_skills(args: argparse.Namespace) -> int:
     from .skills_utils import (
         get_available_skills,
         get_skill_description,
+        get_skill_version,
         copy_skill,
     )
 
@@ -2462,7 +2463,9 @@ def cmd_claude_install_skills(args: argparse.Namespace) -> int:
         print("Available skills:")
         for skill in available:
             desc = get_skill_description(skill)
-            print(f"  {skill:20} - {desc}")
+            version = get_skill_version(skill)
+            version_str = f" (v{version})" if version else ""
+            print(f"  {skill:20} - {desc}{version_str}")
         return 0
 
     # Determine which skills to install

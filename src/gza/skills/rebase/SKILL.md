@@ -2,6 +2,7 @@
 name: rebase
 description: Rebase current branch on main, with interactive conflict resolution. Use when rebasing, merging, or resolving git conflicts.
 allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run python -m py_compile:*)
+version: 1.0.0
 ---
 
 # Rebase on Main

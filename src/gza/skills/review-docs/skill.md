@@ -2,6 +2,7 @@
 name: review-docs
 description: Review documentation for accuracy, completeness, and missing information that users may need
 allowed-tools: Read, Glob, Grep, Bash(ls:*), Bash(uv run *--help*)
+version: 1.0.0
 ---
 
 # Documentation Review Skill
