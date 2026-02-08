@@ -49,8 +49,6 @@ gza claude-install-skills --force
 Available skills:
 - `gza-task-add`: Create well-formed gza tasks with appropriate types and groups
 - `gza-task-info`: Gather comprehensive info about specific gza tasks including status, branch, commits, and logs
-- `rebase`: Rebase current branch on main with interactive conflict resolution
-- `review-docs`: Review documentation for accuracy, completeness, and missing information
 
 The skills are installed to `.claude/skills/` in your project directory.
 
