@@ -2,7 +2,7 @@
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import APP_NAME, Config
@@ -208,7 +208,20 @@ The summary should describe:
 
 
 def _get_task_output(task: Task, project_dir: Path) -> str | None:
-    """Get task output content, preferring DB over filesystem."""
+    """Get task output content, preferring DB over filesystem.
+
+    Auto-sync: If report_file exists and is newer than completed_at,
+    read from disk instead of DB (allows users to edit plans).
+    """
+    # Check if file has been modified after task completion
+    if task.report_file and task.completed_at:
+        path = project_dir / task.report_file
+        if path.exists():
+            file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            # If file is newer than task completion, read from file
+            if file_mtime > task.completed_at:
+                return path.read_text()
+
     # Prefer DB content (works in distributed mode)
     if task.output_content:
         return task.output_content
