@@ -672,13 +672,27 @@ def cmd_merge(args: argparse.Namespace) -> int:
         print("Error: Cannot use --rebase and --squash together")
         return 1
 
+    # Validate --remote flag
+    if hasattr(args, 'remote') and args.remote and not args.rebase:
+        print("Error: --remote requires --rebase")
+        return 1
+
     # Perform the merge or rebase
     try:
         if args.rebase:
-            # For rebase: checkout the task branch, rebase onto current, then fast-forward merge
-            print(f"Rebasing '{task.branch}' onto '{current_branch}'...")
+            # Determine the target branch to rebase onto
+            rebase_target = current_branch
+            if hasattr(args, 'remote') and args.remote:
+                # Fetch from origin first
+                print(f"Fetching from origin...")
+                git.fetch("origin")
+                print("✓ Fetched from origin")
+                rebase_target = f"origin/{current_branch}"
+
+            # For rebase: checkout the task branch, rebase onto target, then fast-forward merge
+            print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
             git.checkout(task.branch)
-            git.rebase(current_branch)
+            git.rebase(rebase_target)
             print(f"✓ Successfully rebased {task.branch}")
 
             # Switch back and fast-forward merge
@@ -2882,6 +2896,11 @@ def main() -> int:
         "--rebase",
         action="store_true",
         help="Rebase the task's branch onto current branch instead of merging",
+    )
+    merge_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Fetch from origin and rebase against origin/<target-branch> (requires --rebase)",
     )
     merge_parser.add_argument(
         "--mark-only",

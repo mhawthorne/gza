@@ -57,6 +57,17 @@ class Git:
         result = self._run("pull", "--ff-only", check=False)
         return result.returncode == 0
 
+    def fetch(self, remote: str = "origin") -> None:
+        """Fetch latest changes from remote.
+
+        Args:
+            remote: The remote to fetch from (default: origin)
+
+        Raises:
+            GitError: If the fetch fails
+        """
+        self._run("fetch", remote)
+
     def create_branch(self, branch: str, force: bool = False) -> None:
         """Create and checkout a new branch."""
         if force:
