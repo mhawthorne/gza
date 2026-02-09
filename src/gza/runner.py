@@ -661,7 +661,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         print(f"  git diff {default_branch}...{branch_name} --")
         print("")
         print("To merge:")
-        print(f"  git merge --squash {branch_name}")
+        print(f"  gza merge {task.id}  # or: git merge --squash {branch_name}")
 
         _cleanup_worktree(git, worktree_path)
 
