@@ -210,7 +210,13 @@ class ClaudeProvider(Provider):
                             file_path = tool_input.get("file_path") or tool_input.get("path")
 
                             # Enhanced logging for specific tools
-                            if tool_name == "Glob":
+                            if tool_name == "Bash":
+                                command = tool_input.get("command", "")
+                                # Truncate to 80 chars
+                                if len(command) > 80:
+                                    command = command[:77] + "..."
+                                print(f"  → {tool_name} {command}")
+                            elif tool_name == "Glob":
                                 pattern = tool_input.get("pattern", "")
                                 print(f"  → {tool_name} {pattern}")
                             elif tool_name == "TodoWrite":
