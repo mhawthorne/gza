@@ -2905,3 +2905,200 @@ class TestDiffCommand:
 
         # Should run successfully (even if no staged changes)
         assert result.returncode == 0
+
+
+class TestCleanCommand:
+    """Tests for 'gza clean' command."""
+
+    def test_clean_default_behavior(self, tmp_path: Path):
+        """Clean command deletes files older than 30 days by default."""
+        import time
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        # Create logs and workers directories
+        logs_dir = tmp_path / ".gza" / "logs"
+        workers_dir = tmp_path / ".gza" / "workers"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        workers_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create old files (35 days old)
+        old_log = logs_dir / "old_log.txt"
+        old_worker = workers_dir / "old_worker.json"
+        old_log.write_text("old log content")
+        old_worker.write_text("old worker content")
+
+        # Set mtime to 35 days ago
+        old_time = (datetime.now(timezone.utc) - timedelta(days=35)).timestamp()
+        old_log.touch()
+        old_worker.touch()
+        old_log.chmod(0o644)
+        old_worker.chmod(0o644)
+        # Use os.utime to set modification time
+        import os
+        os.utime(old_log, (old_time, old_time))
+        os.utime(old_worker, (old_time, old_time))
+
+        # Create recent files (10 days old)
+        recent_log = logs_dir / "recent_log.txt"
+        recent_worker = workers_dir / "recent_worker.json"
+        recent_log.write_text("recent log content")
+        recent_worker.write_text("recent worker content")
+
+        recent_time = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+        recent_log.touch()
+        recent_worker.touch()
+        os.utime(recent_log, (recent_time, recent_time))
+        os.utime(recent_worker, (recent_time, recent_time))
+
+        # Run clean command
+        result = run_gza("clean", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Deleted files older than 30 days" in result.stdout
+        assert "Logs: 1 files" in result.stdout
+        assert "Workers: 1 files" in result.stdout
+
+        # Verify old files were deleted
+        assert not old_log.exists()
+        assert not old_worker.exists()
+
+        # Verify recent files were kept
+        assert recent_log.exists()
+        assert recent_worker.exists()
+
+    def test_clean_with_custom_days(self, tmp_path: Path):
+        """Clean command respects custom --days value."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create file 8 days old
+        log_file = logs_dir / "log.txt"
+        log_file.write_text("content")
+
+        old_time = (datetime.now(timezone.utc) - timedelta(days=8)).timestamp()
+        os.utime(log_file, (old_time, old_time))
+
+        # Run with --days 7 (should delete 8-day-old file)
+        result = run_gza("clean", "--days", "7", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Deleted files older than 7 days" in result.stdout
+        assert not log_file.exists()
+
+    def test_clean_dry_run_mode(self, tmp_path: Path):
+        """Clean command with --dry-run shows what would be deleted without deleting."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create old file
+        old_log = logs_dir / "old_log.txt"
+        old_log.write_text("old content")
+
+        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        os.utime(old_log, (old_time, old_time))
+
+        # Run with --dry-run
+        result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Dry run: would delete files older than 30 days" in result.stdout
+        assert "old_log.txt" in result.stdout
+
+        # Verify file was NOT deleted
+        assert old_log.exists()
+
+    def test_clean_empty_directories(self, tmp_path: Path):
+        """Clean command handles empty directories without errors."""
+        setup_config(tmp_path)
+
+        # Create empty directories
+        logs_dir = tmp_path / ".gza" / "logs"
+        workers_dir = tmp_path / ".gza" / "workers"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        workers_dir.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("clean", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Logs: 0 files" in result.stdout
+        assert "Workers: 0 files" in result.stdout
+
+    def test_clean_nonexistent_directories(self, tmp_path: Path):
+        """Clean command handles nonexistent directories without errors."""
+        setup_config(tmp_path)
+
+        # Don't create .gza directories
+        result = run_gza("clean", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Logs: 0 files" in result.stdout
+        assert "Workers: 0 files" in result.stdout
+
+    def test_clean_mixed_old_and_new_files(self, tmp_path: Path):
+        """Clean command correctly handles mixed old and new files."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create multiple old and new files
+        for i in range(3):
+            old_file = logs_dir / f"old_{i}.txt"
+            old_file.write_text(f"old content {i}")
+            old_time = (datetime.now(timezone.utc) - timedelta(days=35 + i)).timestamp()
+            os.utime(old_file, (old_time, old_time))
+
+            new_file = logs_dir / f"new_{i}.txt"
+            new_file.write_text(f"new content {i}")
+            new_time = (datetime.now(timezone.utc) - timedelta(days=5 + i)).timestamp()
+            os.utime(new_file, (new_time, new_time))
+
+        result = run_gza("clean", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Logs: 3 files" in result.stdout
+
+        # Verify old files deleted, new files kept
+        for i in range(3):
+            assert not (logs_dir / f"old_{i}.txt").exists()
+            assert (logs_dir / f"new_{i}.txt").exists()
+
+    def test_clean_only_files_not_directories(self, tmp_path: Path):
+        """Clean command only deletes files, not directories."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create an old subdirectory
+        old_subdir = logs_dir / "old_subdir"
+        old_subdir.mkdir()
+
+        # Set directory mtime to old
+        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        os.utime(old_subdir, (old_time, old_time))
+
+        result = run_gza("clean", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Verify subdirectory was NOT deleted
+        assert old_subdir.exists()

@@ -1154,9 +1154,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=args.days)
     cutoff_timestamp = cutoff_time.timestamp()
 
-    # Track deleted files
+    # Track deleted files and errors
     deleted_logs = []
     deleted_workers = []
+    errors = []
 
     # Clean logs directory
     if config.log_path.exists():
@@ -1166,8 +1167,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     if args.dry_run:
                         deleted_logs.append(log_file)
                     else:
-                        log_file.unlink()
-                        deleted_logs.append(log_file)
+                        try:
+                            log_file.unlink()
+                            deleted_logs.append(log_file)
+                        except OSError as e:
+                            errors.append((log_file, e))
 
     # Clean workers directory
     if config.workers_path.exists():
@@ -1177,8 +1181,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     if args.dry_run:
                         deleted_workers.append(worker_file)
                     else:
-                        worker_file.unlink()
-                        deleted_workers.append(worker_file)
+                        try:
+                            worker_file.unlink()
+                            deleted_workers.append(worker_file)
+                        except OSError as e:
+                            errors.append((worker_file, e))
 
     # Report results
     if args.dry_run:
@@ -1202,6 +1209,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
         print(f"Deleted files older than {args.days} days:")
         print(f"  - Logs: {len(deleted_logs)} files")
         print(f"  - Workers: {len(deleted_workers)} files")
+
+        # Report any errors
+        if errors:
+            print()
+            print(f"Errors ({len(errors)} files):")
+            for file, error in errors:
+                print(f"  - {file.name}: {error}", file=sys.stderr)
 
     return 0
 

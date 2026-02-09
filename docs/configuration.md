@@ -342,6 +342,41 @@ gza delete <task_id> [options]
 |--------|-------------|
 | `--force`, `-f` | Skip confirmation prompt |
 
+### clean
+
+Delete old log and worker files to free up disk space.
+
+```bash
+gza clean [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--days N` | Delete files older than N days (default: 30) |
+| `--dry-run` | Show what would be deleted without actually deleting |
+
+**Example usage:**
+
+```bash
+# Preview what would be deleted (default: 30 days)
+gza clean --dry-run
+
+# Delete files older than 30 days
+gza clean
+
+# Delete files older than 7 days
+gza clean --days 7
+
+# Preview deletion with custom threshold
+gza clean --days 60 --dry-run
+```
+
+The clean command removes files from:
+- `.gza/logs/` - Task execution logs
+- `.gza/workers/` - Worker metadata files
+
+Files are deleted based on their modification time. The `--dry-run` flag is recommended before running the actual deletion to preview which files will be removed.
+
 ### import
 
 Import tasks from a YAML file.
