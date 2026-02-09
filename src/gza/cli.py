@@ -738,6 +738,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
 def cmd_diff(args: argparse.Namespace) -> int:
     """Run git diff with colored output and pager support."""
     config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
 
     # Build git diff command
     git_cmd = ["git", "diff"]
@@ -745,9 +747,29 @@ def cmd_diff(args: argparse.Namespace) -> int:
     # Add --color=always to force colored output
     git_cmd.append("--color=always")
 
+    # Process arguments - check if first arg is a task ID
+    diff_args = args.diff_args if hasattr(args, 'diff_args') and args.diff_args else []
+
+    if diff_args and diff_args[0].isdigit():
+        # First argument is a numeric task ID
+        task_id = int(diff_args[0])
+        task = store.get(task_id)
+
+        if not task:
+            print(f"Error: Task #{task_id} not found")
+            return 1
+
+        if not task.branch:
+            print(f"Error: Task #{task_id} has no branch")
+            return 1
+
+        # Replace task ID with branch diff range
+        default_branch = git.default_branch()
+        diff_args = [f"{default_branch}...{task.branch}"] + diff_args[1:]
+
     # Add any additional arguments passed to gza diff
-    if hasattr(args, 'diff_args') and args.diff_args:
-        git_cmd.extend(args.diff_args)
+    if diff_args:
+        git_cmd.extend(diff_args)
 
     # Check if stdout is a TTY (not redirected/piped)
     use_pager = sys.stdout.isatty()
@@ -2794,12 +2816,12 @@ def main() -> int:
 
     # diff command
     diff_parser = subparsers.add_parser("diff", help="Run git diff with colored output and pager support")
+    add_common_args(diff_parser)
     diff_parser.add_argument(
         "diff_args",
         nargs="*",
-        help="Arguments to pass to git diff",
+        help="Arguments to pass to git diff (use -- before options like --stat)",
     )
-    add_common_args(diff_parser)
 
     # pr command
     pr_parser = subparsers.add_parser("pr", help="Create GitHub PR from completed task")

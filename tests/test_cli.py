@@ -2788,8 +2788,120 @@ class TestDiffCommand:
         # Make changes
         (tmp_path / "file.txt").write_text("modified")
 
-        # Run diff with --stat
-        result = run_gza("diff", "--stat", "--project", str(tmp_path))
+        # Run diff with --stat (using -- separator for pass-through args)
+        result = run_gza("diff", "--project", str(tmp_path), "--", "--stat")
 
         assert result.returncode == 0
         assert "file.txt" in result.stdout
+
+    def test_diff_with_task_id(self, tmp_path: Path):
+        """Diff command resolves task ID to branch diff."""
+        from gza.git import Git
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create and checkout task branch
+        git._run("checkout", "-b", "task-1-test")
+        (tmp_path / "file.txt").write_text("modified")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Task changes")
+
+        # Return to main
+        git._run("checkout", "main")
+
+        # Create task in database with branch
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Test task", task_type="task")
+        task.branch = "task-1-test"
+        store.update(task)
+
+        # Run diff with task ID
+        result = run_gza("diff", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Should show the diff between main and task branch
+        assert "file.txt" in result.stdout
+        assert "modified" in result.stdout or "initial" in result.stdout
+
+    def test_diff_with_task_id_not_found(self, tmp_path: Path):
+        """Diff command shows error when task ID not found."""
+        from gza.git import Git
+
+        setup_config(tmp_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+
+        # Create empty database
+        setup_db_with_tasks(tmp_path, [])
+
+        # Run diff with non-existent task ID
+        result = run_gza("diff", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: Task #999 not found" in result.stdout
+
+    def test_diff_with_task_id_no_branch(self, tmp_path: Path):
+        """Diff command shows error when task has no branch."""
+        from gza.git import Git
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+
+        # Create task without branch
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Test task", task_type="task")
+        # Don't set task.branch
+
+        # Run diff with task ID that has no branch
+        result = run_gza("diff", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: Task #1 has no branch" in result.stdout
+
+    def test_diff_with_non_numeric_argument(self, tmp_path: Path):
+        """Diff command passes non-numeric arguments through to git diff."""
+        from gza.git import Git
+
+        setup_config(tmp_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Make changes
+        (tmp_path / "file.txt").write_text("modified")
+
+        # Run diff with --cached (using -- separator for pass-through args)
+        result = run_gza("diff", "--project", str(tmp_path), "--", "--cached")
+
+        # Should run successfully (even if no staged changes)
+        assert result.returncode == 0
