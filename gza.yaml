@@ -1,7 +1,48 @@
-project_name: gza
-use_docker: true
-timeout_minutes: 10
-max_turns: 70
-branch_strategy:
-  pattern: "{date}/{slug}"
-  default_type: feature
+# Gza Configuration
+
+# Project name (required) - used for branch prefixes and Docker image naming
+project_name: workspace
+
+# Branch naming strategy (default: monorepo)
+# Options: monorepo, conventional, simple, or custom pattern dict
+# branch_strategy: monorepo  # Default: {project}/{task_id}
+
+# All settings below show default values and are commented out.
+# Uncomment and modify any setting you want to change.
+
+# Path to tasks file (relative to project directory) - deprecated, using SQLite now
+# tasks_file: tasks.yaml
+
+# Directory for log files (relative to project directory)
+# log_dir: .gza/logs
+
+# Whether to run Claude in Docker container
+# use_docker: true
+
+# Custom Docker image name (defaults to <project_name>-gza)
+# docker_image: ""
+
+# Maximum time per task in minutes
+# timeout_minutes: 10
+
+# Branch mode: "single" (reuse one branch) or "multi" (create branch per task)
+# branch_mode: multi
+
+# Maximum conversation turns per task
+# max_turns: 50
+
+# Directory for git worktrees (isolates task execution from main checkout)
+# worktree_dir: /tmp/gza-worktrees
+
+# Number of tasks to run in a single work session (default: 1)
+# work_count: 1
+
+# Arguments passed to Claude Code
+# claude_args:
+#   - --allowedTools
+#   - Read
+#   - Write
+#   - Edit
+#   - Glob
+#   - Grep
+#   - Bash

@@ -137,6 +137,80 @@ class TestAddCommand:
         result = run_gza("next", "--project", str(tmp_path))
         assert "[explore]" in result.stdout
 
+    def test_add_with_prompt_file(self, tmp_path: Path):
+        """Add command can read prompt from file."""
+        setup_config(tmp_path)
+
+        # Create a file with prompt text
+        prompt_file = tmp_path / "task_prompt.txt"
+        prompt_file.write_text("Task prompt from file")
+
+        result = run_gza("add", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify task was added with correct prompt
+        result = run_gza("next", "--project", str(tmp_path))
+        assert "Task prompt from file" in result.stdout
+
+    def test_add_with_prompt_file_not_found(self, tmp_path: Path):
+        """Add command handles missing file gracefully."""
+        setup_config(tmp_path)
+
+        result = run_gza("add", "--prompt-file", "/nonexistent/file.txt", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout.lower()
+
+    def test_add_prompt_and_prompt_file_conflict(self, tmp_path: Path):
+        """Add command rejects both prompt argument and --prompt-file."""
+        setup_config(tmp_path)
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("File content")
+
+        result = run_gza("add", "inline prompt", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Cannot use both" in result.stdout
+
+    def test_add_prompt_file_and_edit_conflict(self, tmp_path: Path):
+        """Add command rejects both --prompt-file and --edit."""
+        setup_config(tmp_path)
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("File content")
+
+        result = run_gza("add", "--prompt-file", str(prompt_file), "--edit", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Cannot use both" in result.stdout
+
+    def test_add_with_prompt_file_and_options(self, tmp_path: Path):
+        """Add command with --prompt-file works with other options."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+
+        # Create a file with prompt text
+        prompt_file = tmp_path / "task_prompt.txt"
+        prompt_file.write_text("Implement feature X")
+
+        result = run_gza("add", "--prompt-file", str(prompt_file), "--type", "implement", "--group", "features", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify task was added with correct attributes
+        store = SqliteTaskStore(db_path)
+        task = store.get(1)
+        assert task is not None
+        assert task.prompt == "Implement feature X"
+        assert task.task_type == "implement"
+        assert task.group == "features"
+
 
 class TestShowCommand:
     """Tests for 'gza show' command."""
