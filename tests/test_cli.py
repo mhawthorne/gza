@@ -2177,6 +2177,149 @@ class TestMergeCommand:
         # Verify the cool.txt file is present in main
         assert (tmp_path / "cool.txt").exists(), "Feature file should exist in main after merge"
 
+    def test_mark_only_deletes_branch_and_marks_merged(self, tmp_path: Path):
+        """--mark-only flag deletes branch and marks task as merged."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test mark-only")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/mark-only"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/mark-only")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Verify branch exists
+        assert git.branch_exists("feature/mark-only")
+        assert not git.is_merged("feature/mark-only", "main")
+
+        # Run merge with --mark-only
+        result = run_gza("merge", str(task.id), "--mark-only", "--project", str(tmp_path))
+
+        # Verify success
+        assert result.returncode == 0
+        assert "Marked task #1 as merged" in result.stdout
+        assert "branch will now be detected as merged" in result.stdout
+
+        # Verify branch was deleted
+        assert not git.branch_exists("feature/mark-only")
+
+        # Verify is_merged now returns True (because branch is deleted)
+        assert git.is_merged("feature/mark-only", "main")
+
+    def test_mark_only_rejects_conflicting_flags(self, tmp_path: Path):
+        """--mark-only flag rejects conflicting flags."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test conflicting flags")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Test --mark-only with --rebase
+        result = run_gza("merge", str(task.id), "--mark-only", "--rebase", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "cannot be used with --rebase, --squash, or --delete" in result.stdout
+
+        # Test --mark-only with --squash
+        result = run_gza("merge", str(task.id), "--mark-only", "--squash", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "cannot be used with --rebase, --squash, or --delete" in result.stdout
+
+        # Test --mark-only with --delete
+        result = run_gza("merge", str(task.id), "--mark-only", "--delete", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "cannot be used with --rebase, --squash, or --delete" in result.stdout
+
+    def test_mark_only_requires_completed_task(self, tmp_path: Path):
+        """--mark-only flag requires task to be completed."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with pending status
+        task = store.add("Test pending task")
+        task.branch = "feature/pending"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/pending")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Try to mark-only a pending task
+        result = run_gza("merge", str(task.id), "--mark-only", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "not completed or unmerged" in result.stdout
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
