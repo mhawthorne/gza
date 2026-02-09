@@ -2740,128 +2740,11 @@ class TestReviewCommand:
 class TestDiffCommand:
     """Tests for 'gza diff' command."""
 
-    def test_diff_shows_changes(self, tmp_path: Path):
-        """Diff command shows changes on task branch."""
-        from gza.db import SqliteTaskStore
+    def test_diff_runs_git_diff(self, tmp_path: Path):
+        """Diff command runs git diff with colored output."""
         from gza.git import Git
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test diff task")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-diff"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-diff")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Run diff command
-        result = run_gza("diff", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "feature.txt" in result.stdout
-        assert "feature content" in result.stdout
-
-    def test_diff_stat_shows_summary(self, tmp_path: Path):
-        """Diff command with --stat shows only statistics."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test diff stat task")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-diff-stat"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-diff-stat")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Run diff command with --stat
-        result = run_gza("diff", str(task.id), "--stat", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "feature.txt" in result.stdout
-        # Full diff content should not be present
-        assert "feature content" not in result.stdout
-
-    def test_diff_fails_for_nonexistent_task(self, tmp_path: Path):
-        """Diff command fails for task that doesn't exist."""
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        result = run_gza("diff", "999", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "not found" in result.stdout
-
-    def test_diff_fails_for_task_without_branch(self, tmp_path: Path):
-        """Diff command fails for task without a branch."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Create a task without a branch
-        task = store.add("Task without branch")
-
-        result = run_gza("diff", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "has no branch" in result.stdout
-
-    def test_diff_fails_for_nonexistent_branch(self, tmp_path: Path):
-        """Diff command fails if task branch doesn't exist."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -2874,25 +2757,22 @@ class TestDiffCommand:
         git._run("add", "file.txt")
         git._run("commit", "-m", "Initial commit")
 
-        # Create a task with a non-existent branch
-        task = store.add("Task with missing branch")
-        task.branch = "nonexistent/branch"
-        store.update(task)
+        # Make changes to file
+        (tmp_path / "file.txt").write_text("modified")
 
-        result = run_gza("diff", str(task.id), "--project", str(tmp_path))
+        # Run diff command - should show the changes
+        # We redirect to avoid pager issues in tests
+        result = run_gza("diff", "--project", str(tmp_path))
 
-        assert result.returncode == 1
-        assert "does not exist" in result.stdout
+        assert result.returncode == 0
+        # Should show the diff (contains color codes when forced with --color=always)
+        assert "file.txt" in result.stdout
 
-    def test_diff_shows_no_differences_message(self, tmp_path: Path):
-        """Diff command shows message when branches are identical."""
-        from gza.db import SqliteTaskStore
+    def test_diff_with_stat_argument(self, tmp_path: Path):
+        """Diff command passes --stat to git diff."""
         from gza.git import Git
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -2900,22 +2780,16 @@ class TestDiffCommand:
         git._run("config", "user.name", "Test User")
         git._run("config", "user.email", "test@example.com")
 
-        # Create initial commit on main
+        # Create initial commit
         (tmp_path / "file.txt").write_text("initial")
         git._run("add", "file.txt")
         git._run("commit", "-m", "Initial commit")
 
-        # Create a task with a branch that has no changes
-        task = store.add("Task with identical branch")
-        task.branch = "feature/no-changes"
-        store.update(task)
+        # Make changes
+        (tmp_path / "file.txt").write_text("modified")
 
-        # Create the branch with no additional commits
-        git._run("checkout", "-b", "feature/no-changes")
-        git._run("checkout", "main")
-
-        # Run diff command
-        result = run_gza("diff", str(task.id), "--project", str(tmp_path))
+        # Run diff with --stat
+        result = run_gza("diff", "--stat", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "No differences" in result.stdout
+        assert "file.txt" in result.stdout

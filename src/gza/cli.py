@@ -736,51 +736,113 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
-    """Show diff for a task's branch against the current branch."""
+    """Run git diff with colored output and pager support."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
-    git = Git(config.project_dir)
 
-    # Get the task
-    task = store.get(args.task_id)
-    if not task:
-        print(f"Error: Task #{args.task_id} not found")
-        return 1
+    # Build git diff command
+    git_cmd = ["git", "diff"]
 
-    if not task.branch:
-        print(f"Error: Task #{task.id} has no branch")
-        return 1
+    # Add --color=always to force colored output
+    git_cmd.append("--color=always")
 
-    # Get current branch
-    current_branch = git.current_branch()
+    # Add any additional arguments passed to gza diff
+    if hasattr(args, 'diff_args') and args.diff_args:
+        git_cmd.extend(args.diff_args)
 
-    # Check if branch exists
-    if not git.branch_exists(task.branch):
-        print(f"Error: Branch '{task.branch}' does not exist")
-        return 1
+    # Check if stdout is a TTY (not redirected/piped)
+    use_pager = sys.stdout.isatty()
 
-    # Get the diff
     try:
-        # Use three-dot notation like merge does to show changes on task branch
-        revision_range = f"{current_branch}...{task.branch}"
+        if use_pager:
+            # Determine which pager to use
+            pager = _get_pager(config.project_dir)
 
-        if args.stat:
-            # Show only the stat summary
-            diff_output = git.get_diff_stat(revision_range)
+            # Run git diff and pipe to pager
+            git_proc = subprocess.Popen(
+                git_cmd,
+                cwd=config.project_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            pager_proc = subprocess.Popen(
+                pager,
+                stdin=git_proc.stdout,
+                cwd=config.project_dir,
+                shell=True,
+            )
+
+            # Close git's stdout in parent to allow git_proc to receive SIGPIPE
+            git_proc.stdout.close()
+
+            # Wait for pager to finish
+            pager_proc.wait()
+            git_proc.wait()
+
+            # Return git's exit code if it failed, otherwise pager's
+            if git_proc.returncode != 0:
+                # Print any stderr from git
+                if git_proc.stderr:
+                    stderr = git_proc.stderr.read().decode()
+                    if stderr:
+                        print(stderr, file=sys.stderr, end='')
+                return git_proc.returncode
+            return pager_proc.returncode
         else:
-            # Show full diff
-            diff_output = git.get_diff(revision_range)
+            # No pager - output directly (for redirection/piping)
+            result = subprocess.run(
+                git_cmd,
+                cwd=config.project_dir,
+                check=False,
+            )
+            return result.returncode
 
-        if not diff_output:
-            print(f"No differences between '{current_branch}' and '{task.branch}'")
-            return 0
-
-        print(diff_output)
-        return 0
-
-    except GitError as e:
-        print(f"Error getting diff: {e}")
+    except Exception as e:
+        print(f"Error running git diff: {e}", file=sys.stderr)
         return 1
+
+
+def _get_pager(repo_dir: Path) -> str:
+    """Determine which pager to use for git diff output.
+
+    Checks in order:
+    1. $GIT_PAGER environment variable
+    2. git config core.pager
+    3. $PAGER environment variable
+    4. Falls back to 'less'
+
+    Args:
+        repo_dir: Path to git repository
+
+    Returns:
+        The pager command to use
+    """
+    # Check $GIT_PAGER
+    git_pager = os.environ.get('GIT_PAGER')
+    if git_pager:
+        return git_pager
+
+    # Check git config core.pager
+    try:
+        result = subprocess.run(
+            ["git", "config", "core.pager"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+
+    # Check $PAGER
+    pager = os.environ.get('PAGER')
+    if pager:
+        return pager
+
+    # Default to 'less'
+    return 'less'
 
 
 def _generate_pr_content(
@@ -2731,16 +2793,11 @@ def main() -> int:
     add_common_args(merge_parser)
 
     # diff command
-    diff_parser = subparsers.add_parser("diff", help="Show diff for a task's branch against current branch")
+    diff_parser = subparsers.add_parser("diff", help="Run git diff with colored output and pager support")
     diff_parser.add_argument(
-        "task_id",
-        type=int,
-        help="Task ID to show diff for",
-    )
-    diff_parser.add_argument(
-        "--stat",
-        action="store_true",
-        help="Show only diff statistics instead of full diff",
+        "diff_args",
+        nargs="*",
+        help="Arguments to pass to git diff",
     )
     add_common_args(diff_parser)
 
