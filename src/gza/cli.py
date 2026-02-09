@@ -640,6 +640,23 @@ def cmd_merge(args: argparse.Namespace) -> int:
     current_branch = git.current_branch()
     default_branch = git.default_branch()
 
+    # Handle --mark-only flag
+    if args.mark_only:
+        # Check for conflicting flags
+        if args.rebase or args.squash or args.delete:
+            print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
+            return 1
+
+        # Delete the branch to mark it as merged (is_merged returns True for deleted branches)
+        try:
+            git.delete_branch(task.branch, force=True)
+            print(f"✓ Marked task #{task.id} as merged by deleting branch '{task.branch}'")
+            print("Note: The branch will now be detected as merged by gza")
+            return 0
+        except GitError as e:
+            print(f"Error: Could not delete branch '{task.branch}': {e}")
+            return 1
+
     # Check if branch already merged
     if git.is_merged(task.branch, current_branch):
         print(f"Error: Branch '{task.branch}' is already merged into {current_branch}")
@@ -2672,6 +2689,11 @@ def main() -> int:
         "--rebase",
         action="store_true",
         help="Rebase the task's branch onto current branch instead of merging",
+    )
+    merge_parser.add_argument(
+        "--mark-only",
+        action="store_true",
+        help="Mark the branch as merged without performing actual merge (deletes the branch)",
     )
     add_common_args(merge_parser)
 
