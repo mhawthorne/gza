@@ -1693,6 +1693,39 @@ def cmd_add(args: argparse.Namespace) -> int:
             print(f"Error: Task #{depends_on} not found")
             return 1
 
+    # Handle --prompt-file argument
+    if hasattr(args, 'prompt_file') and args.prompt_file is not None:
+        if args.prompt:
+            print("Error: Cannot use both --prompt-file and prompt argument")
+            return 1
+        if args.edit:
+            print("Error: Cannot use both --prompt-file and --edit")
+            return 1
+        try:
+            with open(args.prompt_file, 'r') as f:
+                prompt_text = f.read().strip()
+        except FileNotFoundError:
+            print(f"Error: File not found: {args.prompt_file}")
+            return 1
+        except Exception as e:
+            print(f"Error reading file: {e}")
+            return 1
+
+        # Create task with prompt from file
+        task = store.add(
+            prompt_text,
+            task_type=task_type,
+            based_on=based_on,
+            group=group,
+            depends_on=depends_on,
+            create_review=create_review,
+            same_branch=same_branch,
+            spec=spec,
+            task_type_hint=branch_type,
+        )
+        print(f"✓ Added task #{task.id}")
+        return 0
+
     if args.edit or not args.prompt:
         # Interactive mode with $EDITOR
         task = add_task_interactive(
@@ -2856,6 +2889,11 @@ def main() -> int:
         "--spec",
         metavar="FILE",
         help="Path to spec file for task context",
+    )
+    add_parser.add_argument(
+        "--prompt-file",
+        metavar="FILE",
+        help="Read prompt from file (for non-interactive use)",
     )
     add_common_args(add_parser)
 
