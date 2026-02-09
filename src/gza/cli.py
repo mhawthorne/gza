@@ -863,8 +863,8 @@ def _get_pager(repo_dir: Path) -> str:
     if pager:
         return pager
 
-    # Default to 'less'
-    return 'less'
+    # Default to 'less -R' (-R interprets ANSI color codes)
+    return 'less -R'
 
 
 def _generate_pr_content(

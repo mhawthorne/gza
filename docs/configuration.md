@@ -514,11 +514,14 @@ Configuration is resolved in the following order (highest to lowest priority):
 |------|---------|
 | `gza.yaml` | Main configuration file |
 | `.env` | Project-specific environment variables |
+| `.gza/` | Local state directory (add to `.gitignore`) |
 | `.gza/gza.db` | SQLite task database |
 | `.gza/logs/` | Task execution logs |
 | `.gza/workers/` | Worker metadata |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |
 | `etc/Dockerfile.gemini` | Generated Docker image for Gemini |
+
+> **Note:** The `.gza/` directory contains machine-specific state and should be added to `.gitignore`. Run `echo ".gza/" >> .gitignore` after initializing your project.
 
 ### Home Directory
 

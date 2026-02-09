@@ -33,6 +33,12 @@ gza init
 
 This creates a `gza.yaml` configuration file with sensible defaults. You can customize it later—see [Configuration](configuration.md) for details.
 
+**Recommended:** Add `.gza/` to your `.gitignore`. This directory contains local state (database, logs, worker files) that shouldn't be committed:
+
+```bash
+echo ".gza/" >> .gitignore
+```
+
 ## 4. Add and run a task
 
 ```bash
