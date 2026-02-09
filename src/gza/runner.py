@@ -553,12 +553,17 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
     summary_path = summary_dir / summary_filename
     summary_file_relative = str(summary_path.relative_to(config.project_dir))
 
+    # Create summary directory structure in worktree
+    worktree_summary_dir = worktree_path / summary_dir.relative_to(config.project_dir)
+    worktree_summary_dir.mkdir(parents=True, exist_ok=True)
+    worktree_summary_path = worktree_path / summary_path.relative_to(config.project_dir)
+
     # For Docker containers, use /workspace-relative path instead of host worktree path
     # For native mode, use the actual worktree path
     if config.use_docker:
         prompt_summary_path = Path("/workspace") / summary_path.relative_to(config.project_dir)
     else:
-        prompt_summary_path = summary_path
+        prompt_summary_path = worktree_summary_path
 
     # Run provider in the worktree
     if resume:
@@ -630,9 +635,13 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         worktree_git.add(".")
         worktree_git.commit(f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}")
 
-        # Read output content from summary file if it exists
+        # Copy summary file from worktree to main project directory
         output_content = None
-        if summary_path.exists():
+        if worktree_summary_path.exists():
+            # Ensure target directory exists
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            # Copy summary content from worktree to project dir
+            summary_path.write_text(worktree_summary_path.read_text())
             output_content = summary_path.read_text()
 
         # Mark completed
