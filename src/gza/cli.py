@@ -1144,6 +1144,82 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Delete old log and worker files."""
+    from datetime import timedelta
+
+    config = Config.load(args.project_dir)
+
+    # Calculate cutoff time
+    cutoff_time = datetime.now(timezone.utc) - timedelta(days=args.days)
+    cutoff_timestamp = cutoff_time.timestamp()
+
+    # Track deleted files and errors
+    deleted_logs = []
+    deleted_workers = []
+    errors = []
+
+    # Clean logs directory
+    if config.log_path.exists():
+        for log_file in config.log_path.iterdir():
+            if log_file.is_file():
+                if log_file.stat().st_mtime < cutoff_timestamp:
+                    if args.dry_run:
+                        deleted_logs.append(log_file)
+                    else:
+                        try:
+                            log_file.unlink()
+                            deleted_logs.append(log_file)
+                        except OSError as e:
+                            errors.append((log_file, e))
+
+    # Clean workers directory
+    if config.workers_path.exists():
+        for worker_file in config.workers_path.iterdir():
+            if worker_file.is_file():
+                if worker_file.stat().st_mtime < cutoff_timestamp:
+                    if args.dry_run:
+                        deleted_workers.append(worker_file)
+                    else:
+                        try:
+                            worker_file.unlink()
+                            deleted_workers.append(worker_file)
+                        except OSError as e:
+                            errors.append((worker_file, e))
+
+    # Report results
+    if args.dry_run:
+        print(f"Dry run: would delete files older than {args.days} days")
+        print()
+        if deleted_logs:
+            print(f"Logs ({len(deleted_logs)} files):")
+            for log_file in deleted_logs:
+                print(f"  - {log_file.name}")
+        else:
+            print("Logs: no files to delete")
+
+        print()
+        if deleted_workers:
+            print(f"Workers ({len(deleted_workers)} files):")
+            for worker_file in deleted_workers:
+                print(f"  - {worker_file.name}")
+        else:
+            print("Workers: no files to delete")
+    else:
+        print(f"Deleted files older than {args.days} days:")
+        print(f"  - Logs: {len(deleted_logs)} files")
+        print(f"  - Workers: {len(deleted_workers)} files")
+
+        # Report any errors
+        if errors:
+            print()
+            print(f"Errors ({len(errors)} files):")
+            for file, error in errors:
+                print(f"  - {file.name}: {error}", file=sys.stderr)
+
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Generate a new gza.yaml configuration file with defaults."""
     from .config import (
@@ -2856,6 +2932,22 @@ def main() -> int:
     validate_parser = subparsers.add_parser("validate", help="Validate gza.yaml configuration")
     add_common_args(validate_parser)
 
+    # clean command
+    clean_parser = subparsers.add_parser("clean", help="Delete old log and worker files")
+    clean_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Delete files older than N days (default: 30)",
+    )
+    clean_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted without actually deleting",
+    )
+    add_common_args(clean_parser)
+
     # init command
     init_parser = subparsers.add_parser("init", help="Generate new gza.yaml with defaults")
     add_common_args(init_parser)
@@ -3241,6 +3333,8 @@ def main() -> int:
             return cmd_stats(args)
         elif args.command == "validate":
             return cmd_validate(args)
+        elif args.command == "clean":
+            return cmd_clean(args)
         elif args.command == "init":
             return cmd_init(args)
         elif args.command == "log":
