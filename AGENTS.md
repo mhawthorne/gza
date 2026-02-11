@@ -116,6 +116,14 @@ uv run gza add --type implement --based-on 5 "implement the approach from task #
 # Improve task to address review feedback
 uv run gza improve 29  # where 29 is the implementation task ID
 uv run gza improve 29 --review  # auto-create a review after improvements
+
+# Create and run a review task (with optional PR posting)
+uv run gza review 42 --run          # creates review, runs it, auto-posts to PR if exists
+uv run gza review 42 --run --no-pr  # creates review, runs it, skips PR posting
+uv run gza review 42 --run --pr     # creates review, runs it, errors if no PR found
+
+# Create a pull request (caches PR number for future reviews)
+uv run gza pr 42                    # creates PR from implementation task #42
 ```
 
 Tips for good task descriptions:
@@ -124,6 +132,71 @@ Tips for good task descriptions:
 - For multi-step work, create a `--type plan` task first
 - Use `--review` flag for significant changes that warrant code review
 - Use `gza edit <id>` to update a task's prompt instead of deleting and recreating
+
+## Review and PR Workflow
+
+Gza supports automated code review and PR integration:
+
+### Review Tasks
+
+Reviews automatically post to PRs when available:
+
+```bash
+# Create and run review (auto-posts to PR if exists)
+gza review <task-id> --run
+
+# Skip PR posting
+gza review <task-id> --run --no-pr
+
+# Require PR to exist
+gza review <task-id> --run --pr
+```
+
+### How it Works
+
+1. **PR Creation**: When you create a PR with `gza pr`, the PR number is cached in the task
+2. **Review Execution**: When you run `gza review --run`, the review completes and outputs to `.gza/reviews/{task-id}.md`
+3. **Auto-Posting**: If a PR exists for the implementation task, the review is automatically posted as a PR comment
+4. **PR Discovery**: Gza finds PRs via:
+   - Cached `pr_number` field (fastest)
+   - Branch lookup via `gh pr view` (fallback)
+
+### Improve Task Commits
+
+Improve task commits include `Gza-Review: #<id>` trailers for traceability:
+
+```
+Improve implementation based on review #30
+
+Address input validation issues identified in code review.
+
+Task ID: 20260211-improve-authentication
+Gza-Review: #30
+```
+
+### Full Workflow Example
+
+```bash
+# 1. Create and implement a plan
+gza add --type plan "Design feature X"
+gza work
+
+gza add --type implement --based-on 1 --review "Implement per plan"
+gza work    # Implements code
+gza work    # Runs auto-created review
+
+# 2. Create PR (stores PR number)
+gza pr 2
+
+# 3. Run review (auto-posts to PR)
+gza review 2 --run
+
+# 4. If changes requested, iterate
+gza improve 2
+gza work    # Commits include "Gza-Review: #3" trailer
+
+gza review 2 --run  # New review auto-posts to PR
+```
 
 ## Development
 

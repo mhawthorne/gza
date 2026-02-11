@@ -660,7 +660,17 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
 
         # Commit changes in worktree
         worktree_git.add(".")
-        worktree_git.commit(f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}")
+
+        # Build commit message with trailer for improve tasks
+        commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
+
+        # Add review trailer for improve tasks
+        if task.task_type == "improve" and task.depends_on:
+            review_task = store.get(task.depends_on)
+            if review_task and review_task.task_type == "review":
+                commit_message += f"\nGza-Review: #{review_task.id}"
+
+        worktree_git.commit(commit_message)
 
         # Copy summary file from worktree to main project directory
         output_content = None
