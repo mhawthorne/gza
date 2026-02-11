@@ -74,6 +74,9 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     if args.no_docker:
         cmd.append("--no-docker")
 
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        cmd.extend(["--max-turns", str(args.max_turns)])
+
     # Add project directory
     cmd.append(str(config.project_dir.absolute()))
 
@@ -201,6 +204,9 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ta
     if args.no_docker:
         cmd.append("--no-docker")
 
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        cmd.extend(["--max-turns", str(args.max_turns)])
+
     # Add project directory
     cmd.append(str(config.project_dir.absolute()))
 
@@ -303,6 +309,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
+
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_turns = args.max_turns
 
     # Handle background mode
     if args.background:
@@ -2319,6 +2329,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if hasattr(args, 'no_docker') and args.no_docker:
         config.use_docker = False
 
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_turns = args.max_turns
+
     store = get_store(config)
 
     # Get the original task
@@ -2466,6 +2480,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
+
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_turns = args.max_turns
 
     store = get_store(config)
 
@@ -2840,6 +2858,12 @@ def main() -> int:
         action="store_true",
         help=argparse.SUPPRESS,  # Internal flag for resume mode
     )
+    work_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
 
     # next command
     next_parser = subparsers.add_parser("next", help="List upcoming pending tasks")
@@ -3170,6 +3194,12 @@ def main() -> int:
         action="store_true",
         help="Run worker in background (detached mode)",
     )
+    retry_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
     add_common_args(retry_parser)
 
     # resume command
@@ -3188,6 +3218,12 @@ def main() -> int:
         "--background", "-b",
         action="store_true",
         help="Run worker in background (detached mode)",
+    )
+    resume_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
     )
     add_common_args(resume_parser)
 
