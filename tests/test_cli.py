@@ -2087,6 +2087,100 @@ class TestMergeCommand:
         assert result.returncode == 1
         assert "Cannot use --rebase and --squash together" in result.stdout
 
+    def test_merge_remote_requires_rebase(self, tmp_path: Path):
+        """Merge command rejects --remote without --rebase."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test remote without rebase")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-remote"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/test-remote")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Test that --remote without --rebase is rejected
+        result = run_gza("merge", str(task.id), "--remote", "--project", str(tmp_path))
+
+        # Verify the command fails with appropriate error message
+        assert result.returncode == 1
+        assert "--remote requires --rebase" in result.stdout
+
+    def test_merge_rebase_with_remote(self, tmp_path: Path):
+        """Merge command accepts --rebase --remote together."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo with a remote
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create a bare repo to use as remote
+        remote_path = tmp_path / "remote.git"
+        remote_path.mkdir()
+        git._run("init", "--bare", str(remote_path))
+
+        # Add remote and push
+        git._run("remote", "add", "origin", str(remote_path))
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+        git._run("push", "-u", "origin", "main")
+
+        # Create a task with a branch
+        task = store.add("Test rebase with remote")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-remote-rebase"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-remote-rebase")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Test that --rebase --remote flags work together
+        result = run_gza("merge", str(task.id), "--rebase", "--remote", "--project", str(tmp_path))
+
+        # Verify the command doesn't fail due to argument parsing
+        assert "unrecognized arguments" not in result.stderr
+        # Should either succeed or fail gracefully (not due to flag validation)
+        assert "--remote requires --rebase" not in result.stdout
+
     def test_squash_merge_creates_commit(self, tmp_path: Path):
         """Squash merge creates a commit, not just staged changes."""
         from gza.db import SqliteTaskStore
