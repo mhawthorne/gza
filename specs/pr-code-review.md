@@ -1,370 +1,371 @@
 # PR Code Review Integration
 
+**Status**: ✅ Implemented via `gza review` auto-posting (not separate command)
+
 ## Overview
 
-This spec describes how to submit code review results as comments on GitHub Pull Requests, enabling a complete automated workflow from planning through implementation, review, and PR feedback.
+This spec describes how code review results are automatically posted as comments on GitHub Pull Requests, enabling a complete automated workflow from planning through implementation, review, and PR feedback.
 
-## Motivation
+## Implementation Summary
 
-The current workflow supports:
-1. Planning tasks that produce `.gza/plans/{task_id}.md`
-2. Implementation tasks that create branches with code changes
-3. Review tasks that produce `.gza/reviews/{task_id}.md` with verdicts
-4. PR creation via `gza pr <task_id>`
+Reviews automatically post to PRs when:
+1. Review task completes successfully (`gza review <task-id> --run`)
+2. Implementation task has an associated PR
+3. GitHub CLI is available and authenticated
+4. `--no-pr` flag is not set
 
-However, review results exist only as local files. To complete the feedback loop:
-- Reviewers should see AI review results directly on the PR
-- Review verdicts (APPROVED, CHANGES_REQUESTED, NEEDS_DISCUSSION) should be visible in GitHub
-- The workflow should support iterative review cycles
+The implementation integrates PR posting directly into `gza review` rather than creating a separate `gza pr-review` command, reducing cognitive overhead and command proliferation.
 
-## Target Workflow
+## Current Workflow
 
-```
+```bash
+# Create and implement a plan
 gza add --type plan "Design feature X"
 gza work                                      # Produces plan
-# Human reviews/approves plan
 
+# Implement with auto-review
 gza add --type implement --based-on 1 --review "Implement per plan"
 gza work                                      # Implements code
 gza work                                      # Runs auto-created review
 
-gza pr <implement_task_id>                    # Creates PR, stores PR number
-gza pr-review <review_task_id>                # Submits review to PR as comment
+# Create PR (stores PR number for future reviews)
+gza pr <implement_task_id>                    # Creates PR, caches PR number
+
+# Review posts automatically to PR
+gza review <implement_task_id> --run          # Creates review, runs it, auto-posts to PR
 
 # Iteration (if changes requested):
-gza add --type implement --based-on 1 --same-branch "Address review feedback"
-gza work
-gza add --type review --based-on <new_impl_task_id>
-gza work
-gza pr-review <new_review_task_id>            # Updates PR with new review
+gza improve <implement_task_id>               # Creates improve task on same branch
+gza work                                      # Addresses review feedback (commits include review trailer)
+gza review <implement_task_id> --run          # New review auto-posts to PR
 ```
 
-## Schema Changes
+## Flags
 
-Add field to track PR association:
+- `gza review <task-id>` - creates review, auto-posts to PR if one exists
+- `gza review <task-id> --no-pr` - creates review, never posts to PR
+- `gza review <task-id> --pr` - creates review, errors if no PR found (requires PR)
+
+## Schema Changes (v5 → v6)
+
+✅ Implemented
+
+Added field to track PR association:
 
 ```python
 @dataclass
 class Task:
     # ... existing fields ...
-    pr_number: int | None = None    # GitHub PR number (set after PR creation)
+    pr_number: int | None = None    # GitHub PR number
 ```
 
-SQL migration:
+Migration:
 
-```sql
--- Migration v5 → v6
+```python
+MIGRATION_V5_TO_V6 = """
 ALTER TABLE tasks ADD COLUMN pr_number INTEGER;
+"""
 ```
 
 ## GitHub Wrapper Extensions
 
-New methods in `github.py`:
+✅ Implemented
+
+Added methods to `github.py`:
 
 ```python
 class GitHub:
-    # ... existing methods ...
-
     def get_pr_number(self, branch: str) -> int | None:
         """Get PR number for a branch, or None if no PR exists."""
-        result = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "number", "-q", ".number"],
-            capture_output=True,
-            text=True,
-        )
+        result = self._run("pr", "view", branch, "--json", "number", "-q", ".number", check=False)
         if result.returncode == 0 and result.stdout.strip():
-            return int(result.stdout.strip())
+            try:
+                return int(result.stdout.strip())
+            except ValueError:
+                return None
         return None
 
     def add_pr_comment(self, pr_number: int, body: str) -> None:
         """Add a comment to a PR."""
-        subprocess.run(
-            ["gh", "pr", "comment", str(pr_number), "--body", body],
-            check=True,
-        )
-
-    def submit_pr_review(
-        self,
-        pr_number: int,
-        body: str,
-        event: str = "COMMENT",  # APPROVE, REQUEST_CHANGES, COMMENT
-    ) -> None:
-        """Submit a formal PR review."""
-        subprocess.run(
-            ["gh", "pr", "review", str(pr_number), "--body", body, f"--{event.lower().replace('_', '-')}"],
-            check=True,
-        )
+        self._run("pr", "comment", str(pr_number), "--body", body)
 ```
+
+**Note**: We use `add_pr_comment()` instead of formal PR reviews (`gh pr review`) because:
+- Comments are simpler and less invasive
+- They don't affect PR merge requirements
+- Avoids confusion about whether AI approval counts for PR merging
 
 ## CLI Changes
 
 ### Modified: `gza pr`
 
-Update `cmd_pr()` to store the PR number after creation:
+✅ Implemented
+
+Updated `cmd_pr()` to cache PR number after creation:
 
 ```python
-def cmd_pr(task_id: str, draft: bool = False) -> None:
-    # ... existing validation ...
+def cmd_pr(args: argparse.Namespace) -> int:
+    # ... existing validation and PR creation ...
 
-    pr_url = github.create_pr(title=title, body=body, head=branch, draft=draft)
-    pr_number = github.get_pr_number(branch)
-
-    if pr_number:
-        task.pr_number = pr_number
+    # Cache PR number in task
+    if pr.number:
+        task.pr_number = pr.number
         store.update(task)
-
-    print(f"Created PR: {pr_url}")
 ```
 
-### New: `gza pr-review`
+### Modified: `gza review`
 
-Submit a review task's output to its associated PR:
+✅ Implemented - Auto-posting integrated into existing command
+
+Updated `cmd_review()` to auto-post reviews to PRs:
 
 ```bash
-gza pr-review <review_task_id> [--pr <pr_number>]
+gza review <task_id> [--run] [--no-pr] [--pr]
 ```
 
 Arguments:
-- `<review_task_id>`: ID of a completed review task
-- `--pr <pr_number>`: Optional explicit PR number (auto-detected from task chain if omitted)
+- `<task_id>`: Implementation task ID to review
+- `--run`: Run the review task immediately (existing flag)
+- `--no-pr`: Skip PR posting even if PR exists
+- `--pr`: Require PR to exist (error if not found)
 
 Implementation:
 
 ```python
-@app.command(name="pr-review")
-def cmd_pr_review(
-    review_task_id: str,
-    pr_number: int | None = typer.Option(None, "--pr", help="PR number (auto-detected if omitted)"),
+def cmd_review(args: argparse.Namespace) -> int:
+    # ... existing review task creation ...
+
+    # If --run flag is set, run the review task immediately
+    if hasattr(args, 'run') and args.run:
+        print(f"\nRunning review task #{review_task.id}...")
+        from .runner import run
+        exit_code = run(config, task_id=review_task.id)
+
+        # After successful review, post to PR if applicable
+        if exit_code == 0 and not args.no_pr:
+            _post_review_to_pr(review_task, impl_task, store, config.project_dir, required=args.pr)
+
+        return exit_code
+```
+
+### Helper Function
+
+```python
+def _post_review_to_pr(
+    review_task: DbTask,
+    impl_task: DbTask,
+    store: SqliteTaskStore,
+    project_dir: Path,
+    required: bool = False,
 ) -> None:
-    """Submit a review task's output as a PR comment."""
-    store = get_store()
-    github = GitHub()
+    """Post a review task's output to its associated PR."""
+    gh = GitHub()
 
-    # Validate review task
-    task = store.get_by_task_id(review_task_id)
-    if not task:
-        error(f"Task not found: {review_task_id}")
+    # Check gh is available
+    if not gh.is_available():
+        if required:
+            print("Error: GitHub CLI not available, cannot post review")
+        else:
+            print("Info: GitHub CLI not available, skipping PR comment")
+        return
 
-    if task.task_type != "review":
-        error(f"Task {review_task_id} is not a review task (type: {task.task_type})")
+    # Find PR number (cached or via branch lookup)
+    pr_number = None
+    if impl_task.pr_number:
+        pr_number = impl_task.pr_number
+        print(f"Found PR #{pr_number} (cached)")
+    elif impl_task.branch:
+        pr_number = gh.get_pr_number(impl_task.branch)
+        if pr_number:
+            print(f"Found PR #{pr_number} for branch {impl_task.branch}")
+            # Cache it for future use
+            impl_task.pr_number = pr_number
+            store.update(impl_task)
 
-    if task.status != "completed":
-        error(f"Review task not completed (status: {task.status})")
+    if not pr_number:
+        if required:
+            print(f"Error: No PR found for task #{impl_task.id}")
+        else:
+            print(f"Info: No PR found for task #{impl_task.id}, skipping PR comment")
+        return
 
-    # Get review content
-    review_content = _get_task_output(task)
+    # Get review content and post
+    from .runner import _get_task_output
+    review_content = _get_task_output(review_task, project_dir)
     if not review_content:
-        error("Review task has no output content")
+        print(f"Warning: Review task #{review_task.id} has no output content")
+        return
 
-    # Find PR number
-    if pr_number is None:
-        pr_number = _find_pr_for_review(task, store)
+    comment_body = f"""## 🤖 Automated Code Review
 
-    if pr_number is None:
-        error("Could not determine PR number. Use --pr to specify explicitly.")
-
-    # Parse verdict from review content
-    verdict = _parse_review_verdict(review_content)
-
-    # Format comment
-    comment_body = _format_pr_review_comment(review_content, task)
-
-    # Submit to GitHub
-    if verdict == "APPROVED":
-        github.submit_pr_review(pr_number, comment_body, "APPROVE")
-    elif verdict == "CHANGES_REQUESTED":
-        github.submit_pr_review(pr_number, comment_body, "REQUEST_CHANGES")
-    else:
-        github.add_pr_comment(pr_number, comment_body)
-
-    print(f"Submitted review to PR #{pr_number}")
-```
-
-### Helper Functions
-
-```python
-def _find_pr_for_review(review_task: Task, store: TaskStore) -> int | None:
-    """Walk task chain to find associated PR number."""
-    # Review task -> implement task -> PR
-    if review_task.based_on:
-        impl_task = store.get(review_task.based_on)
-        if impl_task and impl_task.pr_number:
-            return impl_task.pr_number
-
-    # Also check depends_on chain
-    if review_task.depends_on:
-        dep_task = store.get(review_task.depends_on)
-        if dep_task and dep_task.pr_number:
-            return dep_task.pr_number
-
-    return None
-
-
-def _parse_review_verdict(content: str) -> str:
-    """Extract verdict from review content."""
-    content_upper = content.upper()
-    if "VERDICT: APPROVED" in content_upper or "**APPROVED**" in content_upper:
-        return "APPROVED"
-    elif "VERDICT: CHANGES_REQUESTED" in content_upper or "CHANGES REQUESTED" in content_upper:
-        return "CHANGES_REQUESTED"
-    elif "VERDICT: NEEDS_DISCUSSION" in content_upper or "NEEDS DISCUSSION" in content_upper:
-        return "NEEDS_DISCUSSION"
-    return "COMMENT"
-
-
-def _format_pr_review_comment(content: str, task: Task) -> str:
-    """Format review content for PR comment."""
-    return f"""## Automated Code Review
-
-**Task ID:** {task.task_id}
+**Review Task**: #{review_task.id}
+**Implementation Task**: #{impl_task.id}
 
 ---
 
-{content}
+{review_content}
 
 ---
-*Generated by gza review task*
+
+*Generated by `gza review` task*
 """
+
+    try:
+        gh.add_pr_comment(pr_number, comment_body)
+        print(f"✓ Posted review to PR #{pr_number}")
+    except GitHubError as e:
+        print(f"Warning: Failed to post review to PR: {e}")
 ```
 
-## Optional: Auto-Submit on PR Creation
+## Additional Features
 
-Add flag to `gza pr` for automatic review submission:
+### Improve Task Commit Trailers
 
-```bash
-gza pr <task_id> --submit-review
+✅ Implemented
+
+Improve task commits now include `Gza-Review:` trailer for traceability:
+
+```
+Improve implementation based on review #30
+
+Address input validation issues identified in code review.
+
+Task ID: 20260211-improve-authentication
+Gza-Review: #30
 ```
 
-When `--submit-review` is set:
-1. Create the PR as normal
-2. Find any completed review tasks linked to this implement task
-3. Automatically submit them as PR comments
-
-```python
-@app.command()
-def cmd_pr(
-    task_id: str,
-    draft: bool = False,
-    submit_review: bool = typer.Option(False, "--submit-review", help="Auto-submit linked reviews"),
-) -> None:
-    # ... existing PR creation ...
-
-    if submit_review:
-        review_tasks = store.get_reviews_for_task(task.id)
-        for review_task in review_tasks:
-            if review_task.status == "completed":
-                _submit_review_to_pr(review_task, pr_number, github, store)
-```
-
-## Optional: Plan Commitment to Git
-
-For teams that want plans tracked in version control:
-
-```bash
-gza plan-commit <plan_task_id> [--branch <branch>]
-```
-
-This would:
-1. Create a branch (or use specified branch)
-2. Commit the plan file
-3. Push to remote
-
-However, this may be over-engineering. Plans in `.gza/plans/` are already accessible, and forcing them into git adds ceremony without clear benefit. Leaving as optional/future.
+This allows searching for commits addressing specific reviews via `git log --grep "Gza-Review: #30"`.
 
 ## Database Query Additions
 
+✅ Already implemented
+
+The `get_reviews_for_task()` method already exists in the task store:
+
 ```python
-class TaskStore:
-    # ... existing methods ...
-
-    def get_reviews_for_task(self, task_id: int) -> list[Task]:
-        """Get all review tasks that reference this task."""
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE task_type = 'review'
-                  AND (based_on = ? OR depends_on = ?)
-                ORDER BY created_at DESC
-                """,
-                (task_id, task_id),
-            )
-            return [self._row_to_task(row) for row in cur.fetchall()]
-
-    def update_pr_number(self, task: Task, pr_number: int) -> None:
-        """Set the PR number for a task."""
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET pr_number = ? WHERE id = ?",
-                (pr_number, task.id),
-            )
-        task.pr_number = pr_number
+def get_reviews_for_task(self, task_id: int) -> list[Task]:
+    """Get all review tasks that depend on the given task, ordered by created_at DESC."""
+    with self._connect() as conn:
+        cur = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE task_type = 'review' AND depends_on = ?
+            ORDER BY created_at DESC
+            """,
+            (task_id,),
+        )
+        return [self._row_to_task(row) for row in cur.fetchall()]
 ```
+
+PR number updates handled via standard `store.update(task)` method.
 
 ## Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
-| Review task not completed | Error: "Review task not completed" |
-| No review content | Error: "Review task has no output content" |
-| PR not found for branch | Error with suggestion to use `--pr` flag |
-| gh CLI not authenticated | Error: "GitHub CLI not authenticated" |
+| Review task not completed | Review runs first, then posts |
+| No review content | Warning: "Review task has no output content" |
+| PR not found (default) | Info message, continues without error |
+| PR not found (--pr flag) | Error: "No PR found for task #X" |
+| gh CLI not available (default) | Info message, continues without error |
+| gh CLI not available (--pr flag) | Error: "GitHub CLI not available" |
 | PR already has this review | Allow duplicate (GitHub handles display) |
+| Multiple reviews per PR | Each review creates separate comment |
 
 ## Testing
 
-### Unit Tests
+### Recommended Unit Tests
 
 ```python
-def test_pr_review_requires_completed_task():
-    """pr-review fails if review task not completed."""
+def test_review_posts_to_pr_when_exists():
+    """Review auto-posts to PR when PR number is cached."""
 
-def test_pr_review_requires_review_type():
-    """pr-review fails if task is not type=review."""
+def test_review_discovers_pr_via_branch():
+    """Review discovers PR via branch when pr_number not cached."""
 
-def test_pr_review_finds_pr_from_chain():
-    """pr-review auto-detects PR from based_on task."""
+def test_review_skips_pr_when_none_exists():
+    """Review continues without error when no PR exists."""
 
-def test_pr_review_uses_explicit_pr():
-    """--pr flag overrides auto-detection."""
+def test_review_no_pr_flag():
+    """--no-pr flag prevents PR posting."""
 
-def test_parse_verdict_approved():
-    """Parses APPROVED verdict from review content."""
+def test_review_pr_flag_errors_when_missing():
+    """--pr flag errors if no PR found."""
 
-def test_parse_verdict_changes_requested():
-    """Parses CHANGES_REQUESTED verdict from review content."""
+def test_improve_commit_includes_review_trailer():
+    """Improve task commits include Gza-Review trailer."""
 
-def test_submit_review_flag_on_pr():
-    """--submit-review on gza pr auto-submits linked reviews."""
+def test_get_pr_number_success():
+    """GitHub.get_pr_number returns PR number when PR exists."""
+
+def test_get_pr_number_no_pr():
+    """GitHub.get_pr_number returns None when no PR exists."""
+
+def test_add_pr_comment_success():
+    """GitHub.add_pr_comment posts comment successfully."""
+
+def test_gza_pr_caches_pr_number():
+    """gza pr command caches PR number after creation."""
 ```
 
 ### Integration Tests
 
 ```python
-def test_full_workflow_with_pr_review(github_mock):
-    """End-to-end: plan -> implement -> review -> pr -> pr-review."""
+def test_full_workflow_with_auto_review_posting():
+    """End-to-end: plan -> implement -> pr -> review (auto-posts)."""
 ```
 
-## Implementation Order
+## Implementation Status
 
-1. **Schema migration**: Add `pr_number` column
-2. **GitHub wrapper**: Add `get_pr_number()`, `add_pr_comment()`, `submit_pr_review()`
-3. **Update `cmd_pr()`**: Store PR number after creation
-4. **Add `cmd_pr_review()`**: New command with verdict parsing
-5. **Add helper functions**: `_find_pr_for_review()`, `_parse_review_verdict()`, `_format_pr_review_comment()`
-6. **Tests**: Unit and integration tests
-7. **Optional**: `--submit-review` flag on `gza pr`
+✅ All core features implemented:
 
-## Open Questions
+1. ✅ **Schema migration v5 → v6**: Added `pr_number` column
+2. ✅ **GitHub wrapper**: Added `get_pr_number()`, `add_pr_comment()`
+3. ✅ **Update `cmd_pr()`**: Caches PR number after creation
+4. ✅ **Update `cmd_review()`**: Auto-posts review to PR when `--run` is used
+5. ✅ **Add helper function**: `_post_review_to_pr()` with PR discovery logic
+6. ✅ **Review trailers**: Improve task commits include `Gza-Review: #X`
+7. ⏳ **Tests**: Unit and integration tests (recommended, not yet implemented)
+8. ⏳ **Documentation**: Update AGENTS.md and examples (in progress)
 
-1. **Multiple reviews per PR**: Should we track which reviews have been submitted to avoid duplicates?
-   - Suggestion: Allow duplicates. GitHub UI handles multiple comments fine, and it's simpler.
+## Design Decisions
 
-2. **Review updates**: If a review is re-run, should it update the existing comment or add a new one?
-   - Suggestion: Add new comment. Preserves history and avoids complexity.
+1. **Multiple reviews per PR**: ✅ Allow duplicates
+   - Each review iteration creates a separate comment
+   - Preserves history of review progression
+   - Simple implementation, no duplicate tracking needed
 
-3. **PR review vs PR comment**: GitHub distinguishes between "review" (with approval status) and "comment" (just text). Should `NEEDS_DISCUSSION` use review or comment?
-   - Suggestion: Use comment for `NEEDS_DISCUSSION` since it's not actionable.
+2. **Review updates**: ✅ Add new comment
+   - Don't update/replace previous comments
+   - Preserves history and avoids complexity
+   - Users can see evolution of reviews on PR
 
-4. **Storing plan in PR description**: Should plans be included in PR body for visibility?
-   - Suggestion: Optional. Could add `--include-plan` flag to `gza pr`.
+3. **PR review vs PR comment**: ✅ Use comments only
+   - Don't use formal GitHub reviews (approve/request-changes events)
+   - AI reviews shouldn't affect PR merge requirements
+   - Simpler implementation, less intrusive
+   - Verdict still visible in comment body
+
+4. **Auto-post by default**: ✅ Yes, with opt-out
+   - Reviews auto-post to PR when one exists
+   - Use `--no-pr` to skip posting
+   - Use `--pr` to require PR (error if missing)
+   - More intuitive workflow, less friction
+
+## Future Enhancements (Out of Scope)
+
+1. **Formal PR reviews**: Use `gh pr review` with approve/request-changes events
+   - Would make AI reviews affect PR merge requirements
+   - Can be added as opt-in feature if users request it
+
+2. **Review comment updates**: Update existing PR comment instead of adding new one
+   - Complex: requires tracking comment IDs
+   - Current approach (multiple comments) is simpler
+
+3. **Line-level PR comments**: Post specific findings as line comments
+   - Requires parsing review output for file/line references
+   - Much more complex GitHub API interaction
+
+4. **Review summary in PR description**: Include review verdict in PR description
+   - Would require PR description updates
+   - Current approach (comment) is simpler

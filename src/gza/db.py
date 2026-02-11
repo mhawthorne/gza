@@ -37,6 +37,7 @@ class Task:
     task_type_hint: str | None = None  # Explicit branch type hint (e.g., "fix", "feature")
     output_content: str | None = None  # Actual content of report/plan/review (for persistence)
     session_id: str | None = None  # Claude session ID for resume capability
+    pr_number: int | None = None  # GitHub PR number
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -56,7 +57,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -91,7 +92,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_type_hint TEXT,
     output_content TEXT,
     -- New field for task resume (v5)
-    session_id TEXT
+    session_id TEXT,
+    -- New field for PR tracking (v6)
+    pr_number INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -125,6 +128,11 @@ ALTER TABLE tasks ADD COLUMN output_content TEXT;
 # Migration from v4 to v5
 MIGRATION_V4_TO_V5 = """
 ALTER TABLE tasks ADD COLUMN session_id TEXT;
+"""
+
+# Migration from v5 to v6
+MIGRATION_V5_TO_V6 = """
+ALTER TABLE tasks ADD COLUMN pr_number INTEGER;
 """
 
 
@@ -202,7 +210,20 @@ class SqliteTaskStore:
                             except sqlite3.OperationalError:
                                 # Column might already exist
                                 pass
+                    current_version = 5
                     conn.execute("UPDATE schema_version SET version = ?", (5,))
+
+                if current_version < 6:
+                    # Run migration v5 -> v6
+                    for stmt in MIGRATION_V5_TO_V6.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (6,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -240,6 +261,7 @@ class SqliteTaskStore:
             task_type_hint=row["task_type_hint"] if "task_type_hint" in row.keys() else None,
             output_content=row["output_content"] if "output_content" in row.keys() else None,
             session_id=row["session_id"] if "session_id" in row.keys() else None,
+            pr_number=row["pr_number"] if "pr_number" in row.keys() else None,
         )
 
     # === Task CRUD ===
@@ -309,7 +331,8 @@ class SqliteTaskStore:
                     create_review = ?,
                     same_branch = ?,
                     output_content = ?,
-                    session_id = ?
+                    session_id = ?,
+                    pr_number = ?
                 WHERE id = ?
                 """,
                 (
@@ -334,6 +357,7 @@ class SqliteTaskStore:
                     1 if task.same_branch else 0,
                     task.output_content,
                     task.session_id,
+                    task.pr_number,
                     task.id,
                 ),
             )

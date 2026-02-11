@@ -93,3 +93,32 @@ class GitHub:
             data = json.loads(result.stdout)
             return data.get("url")
         return None
+
+    def get_pr_number(self, branch: str) -> int | None:
+        """Get PR number for a branch, or None if no PR exists.
+
+        Args:
+            branch: Branch name to check
+
+        Returns:
+            PR number if PR exists, None otherwise
+        """
+        result = self._run("pr", "view", branch, "--json", "number", "-q", ".number", check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                return int(result.stdout.strip())
+            except ValueError:
+                return None
+        return None
+
+    def add_pr_comment(self, pr_number: int, body: str) -> None:
+        """Add a comment to a PR.
+
+        Args:
+            pr_number: PR number
+            body: Comment body (markdown)
+
+        Raises:
+            GitHubError: If comment fails
+        """
+        self._run("pr", "comment", str(pr_number), "--body", body)
