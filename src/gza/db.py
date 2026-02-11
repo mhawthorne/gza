@@ -642,6 +642,7 @@ class SqliteTaskStore:
         log_file: str | None = None,
         has_commits: bool = False,
         stats: TaskStats | None = None,
+        branch: str | None = None,
     ) -> None:
         """Mark a task as failed."""
         task.status = "failed"
@@ -649,6 +650,8 @@ class SqliteTaskStore:
         task.has_commits = has_commits
         if log_file:
             task.log_file = log_file
+        if branch:
+            task.branch = branch
         if stats:
             task.duration_seconds = stats.duration_seconds
             task.num_turns = stats.num_turns

@@ -457,13 +457,15 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         pass  # May fail if offline, continue anyway
 
     # Generate task_id - checks for collisions with existing branches/logs
-    task.task_id = generate_task_id(
-        task.prompt,
-        existing_id=task.task_id,  # None for fresh tasks, set for retries
-        log_path=config.log_path,
-        git=git,
-        project_name=config.project_name,
-    )
+    # For resume, keep the existing task_id (don't regenerate)
+    if not resume:
+        task.task_id = generate_task_id(
+            task.prompt,
+            existing_id=task.task_id,  # None for fresh tasks, set for retries
+            log_path=config.log_path,
+            git=git,
+            project_name=config.project_name,
+        )
 
     prompt_display = task.prompt[:80] + "..." if len(task.prompt) > 80 else task.prompt
     print(f"=== Task: {prompt_display} ===")
@@ -479,6 +481,18 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         # Resume uses the existing branch from the failed task
         branch_name = task.branch
         print(f"    Resuming on existing branch: {branch_name}")
+    elif resume:
+        # Resume but branch wasn't saved - derive from task_id using branch naming strategy
+        from gza.branch_naming import generate_branch_name
+        branch_name = generate_branch_name(
+            pattern=config.branch_strategy.pattern,
+            project_name=config.project_name,
+            task_id=task.task_id,
+            prompt=task.prompt,
+            default_type=config.branch_strategy.default_type,
+            explicit_type=task.task_type_hint,
+        )
+        print(f"    Resuming on branch: {branch_name}")
     elif task.same_branch:
         # Use the branch from based_on task (for improve tasks) or depends_on task (fallback)
         source_task = None
@@ -604,7 +618,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             print("Next steps:")
             print(f"  gza retry {task.id}           # retry from scratch")
             print(f"  gza resume {task.id}          # resume from where it left off")
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code == 124:
@@ -615,7 +629,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             print("Next steps:")
             print(f"  gza retry {task.id}           # retry from scratch")
             print(f"  gza resume {task.id}          # resume from where it left off")
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code != 0:
@@ -626,7 +640,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             print("Next steps:")
             print(f"  gza retry {task.id}           # retry from scratch")
             print(f"  gza resume {task.id}          # resume from where it left off")
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             _cleanup_worktree(git, worktree_path)
             return 0
 
@@ -640,7 +654,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             print("Next steps:")
             print(f"  gza retry {task.id}           # retry from scratch")
             print(f"  gza resume {task.id}          # resume from where it left off")
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             _cleanup_worktree(git, worktree_path)
             return 0
 
