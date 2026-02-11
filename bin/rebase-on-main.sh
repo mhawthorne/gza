@@ -29,14 +29,36 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 
-echo "Fetching latest from $REMOTE..."
-git fetch $REMOTE $MAIN_BRANCH
+# Ask user which base to rebase against
+echo ""
+echo "Rebase $CURRENT_BRANCH onto:"
+echo "  1) $REMOTE/$MAIN_BRANCH (remote - default)"
+echo "  2) $MAIN_BRANCH (local)"
+echo ""
+read -p "Choose [1-2] (default: 1): " CHOICE
 
-echo "Rebasing $CURRENT_BRANCH onto $REMOTE/$MAIN_BRANCH..."
+case "$CHOICE" in
+    2)
+        REBASE_TARGET="$MAIN_BRANCH"
+        echo "Using local $MAIN_BRANCH"
+        ;;
+    1|"")
+        REBASE_TARGET="$REMOTE/$MAIN_BRANCH"
+        echo "Fetching latest from $REMOTE..."
+        git fetch $REMOTE $MAIN_BRANCH
+        ;;
+    *)
+        echo -e "${RED}Invalid choice. Exiting.${NC}"
+        exit 1
+        ;;
+esac
+
+echo "Rebasing $CURRENT_BRANCH onto $REBASE_TARGET..."
 
 # Attempt rebase
-if git rebase $REMOTE/$MAIN_BRANCH; then
+if git rebase $REBASE_TARGET; then
     echo -e "${GREEN}Rebase completed successfully!${NC}"
+    echo "Rebased $CURRENT_BRANCH onto $REBASE_TARGET"
     echo ""
     echo "To push the rebased branch:"
     echo "  git push --force-with-lease"

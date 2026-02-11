@@ -15,13 +15,19 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 1. Check for uncommitted changes - if any exist, stop and ask the user to commit or stash them
 2. Show the current branch name
 
-### Step 2: Fetch and attempt rebase
+### Step 2: Choose rebase target
 
-1. Run `git fetch origin main`
-2. Run `git rebase origin/main`
+1. Prompt the user to choose between:
+   - `origin/main` (remote - default) - Use when you want to rebase against the latest remote changes
+   - `main` (local) - Use when you have local merged changes that haven't been pushed yet
+
+### Step 3: Fetch and attempt rebase
+
+1. If rebasing against `origin/main`, run `git fetch origin main`
+2. Run `git rebase <chosen-target>`
 3. If rebase succeeds with no conflicts, report success and show the push command
 
-### Step 3: Resolve conflicts (if any)
+### Step 4: Resolve conflicts (if any)
 
 For each conflicted file:
 
@@ -38,15 +44,15 @@ For each conflicted file:
 
 Repeat for each conflicted file.
 
-### Step 4: Continue the rebase
+### Step 5: Continue the rebase
 
 After all conflicts are resolved:
 
 1. Run `git rebase --continue`
-2. If more conflicts appear (from subsequent commits), repeat Step 3
+2. If more conflicts appear (from subsequent commits), repeat Step 4
 3. Continue until rebase completes
 
-### Step 5: Final summary
+### Step 6: Final summary
 
 Show:
 - "Rebase completed successfully!"
