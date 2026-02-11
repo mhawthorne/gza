@@ -29,7 +29,7 @@ project_name: gza
 # branch_mode: multi
 
 # Maximum conversation turns per task
-# max_turns: 50
+max_turns: 100
 
 # Directory for git worktrees (isolates task execution from main checkout)
 # worktree_dir: /tmp/gza-worktrees
