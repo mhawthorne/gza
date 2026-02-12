@@ -2626,7 +2626,8 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     if hasattr(args, 'run') and args.run:
         print(f"\nRunning review task #{review_task.id}...")
-        return run(config, task_id=review_task.id)
+        open_after = hasattr(args, 'open') and args.open
+        return run(config, task_id=review_task.id, open_after=open_after)
 
     return 0
 
@@ -3480,6 +3481,11 @@ def main() -> int:
         "--pr",
         action="store_true",
         help="Require PR to exist (error if not found)",
+    )
+    review_parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the review file in $EDITOR after the review task completes (only used with --run)",
     )
     add_common_args(review_parser)
 

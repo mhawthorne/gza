@@ -592,7 +592,7 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     return run(config, task_id=review_task.id)
 
 
-def run(config: Config, task_id: int | None = None, resume: bool = False) -> int:
+def run(config: Config, task_id: int | None = None, resume: bool = False, open_after: bool = False) -> int:
     """Run Gza on the next pending task or a specific task.
 
     Uses git worktrees to isolate task execution from the main working directory.
@@ -602,6 +602,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         config: Configuration object
         task_id: Optional specific task ID to run. If None, runs next pending task.
         resume: If True, resume from previous session using stored session_id.
+        open_after: If True, open the report file in $EDITOR after completion (for review tasks).
     """
     load_dotenv(config.project_dir)
 
@@ -683,7 +684,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
 
     # For explore, plan, and review tasks, run in project dir without creating a branch
     if task.task_type in ("explore", "plan", "review"):
-        return _run_non_code_task(task, config, store, provider, git, resume=resume)
+        return _run_non_code_task(task, config, store, provider, git, resume=resume, open_after=open_after)
 
     # Determine branch name based on resume, same_branch, and branch_mode
     if resume and task.branch:
@@ -958,8 +959,19 @@ def _run_non_code_task(
     provider: Provider,
     git: Git | None = None,
     resume: bool = False,
+    open_after: bool = False,
 ) -> int:
-    """Run a non-code task (explore, plan, review) in a worktree (no branch creation)."""
+    """Run a non-code task (explore, plan, review) in a worktree (no branch creation).
+
+    Args:
+        task: Task to run
+        config: Configuration object
+        store: Task store
+        provider: AI provider
+        git: Git instance for the main repository
+        resume: If True, resume from previous session
+        open_after: If True, open the report file in $EDITOR after completion
+    """
     if resume:
         console.print(f"    Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
 
@@ -1147,6 +1159,23 @@ Once you've verified and updated the todo list, continue from where you left off
             (f"gza retry {task.id}", "retry from scratch"),
             (f"gza resume {task.id}", "resume from where it left off"),
         ])
+
+        # Open review file in $EDITOR if requested
+        if open_after and task.task_type == "review" and report_path.exists():
+            import os
+            import subprocess
+
+            editor = os.environ.get("EDITOR")
+            if editor:
+                try:
+                    console.print(f"\nOpening review in {editor}...")
+                    subprocess.run([editor, str(report_path)], check=True)
+                except subprocess.CalledProcessError as e:
+                    console.print(f"[yellow]Warning: Failed to open editor: {e}[/yellow]")
+                except FileNotFoundError:
+                    console.print(f"[yellow]Warning: Editor '{editor}' not found[/yellow]")
+            else:
+                console.print("[yellow]Warning: $EDITOR not set, skipping auto-open[/yellow]")
 
         return 0
 
