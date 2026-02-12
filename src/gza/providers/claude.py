@@ -227,7 +227,7 @@ class ClaudeProvider(Provider):
                             console.print()
 
                         # Print turn info with color
-                        console.print(f"  [turn {turn_count}, {token_str}, {runtime_str}]", style=OUTPUT_COLORS["turn_info"])
+                        console.print(f"  | Turn {turn_count} | {token_str} | {runtime_str} |", style=OUTPUT_COLORS["turn_info"])
 
                     for content in message.get("content", []):
                         if content.get("type") == "tool_use":

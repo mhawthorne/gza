@@ -6,6 +6,8 @@ project_name: gza
 # Branch naming strategy (default: monorepo)
 # Options: monorepo, conventional, simple, or custom pattern dict
 # branch_strategy: monorepo  # Default: {project}/{task_id}
+branch_strategy:
+  pattern: "{date}-{slug}"
 
 # All settings below show default values and are commented out.
 # Uncomment and modify any setting you want to change.
