@@ -2538,6 +2538,192 @@ class TestMergeCommand:
         assert result.returncode == 1
         assert "not completed or unmerged" in result.stdout
 
+    def test_merge_accepts_multiple_task_ids(self, tmp_path: Path):
+        """Merge command accepts multiple task IDs."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create first task with a branch
+        task1 = store.add("Test merge task 1")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        task1.branch = "feature/test-1"
+        store.update(task1)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-1")
+        (tmp_path / "feature1.txt").write_text("feature 1 content")
+        git._run("add", "feature1.txt")
+        git._run("commit", "-m", "Add feature 1")
+        git._run("checkout", "main")
+
+        # Create second task with a branch
+        task2 = store.add("Test merge task 2")
+        task2.status = "completed"
+        task2.completed_at = datetime.now(timezone.utc)
+        task2.branch = "feature/test-2"
+        store.update(task2)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-2")
+        (tmp_path / "feature2.txt").write_text("feature 2 content")
+        git._run("add", "feature2.txt")
+        git._run("commit", "-m", "Add feature 2")
+        git._run("checkout", "main")
+
+        # Test merging both tasks
+        result = run_gza("merge", str(task1.id), str(task2.id), "--project", str(tmp_path))
+
+        # Verify the command succeeds
+        assert result.returncode == 0
+        assert "Successfully merged 2 task(s)" in result.stdout
+        assert f"#{task1.id}" in result.stdout
+        assert f"#{task2.id}" in result.stdout
+
+    def test_merge_stops_on_first_failure(self, tmp_path: Path):
+        """Merge command stops on first failure and reports which tasks were merged."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create first task with a branch (will succeed)
+        task1 = store.add("Test merge task 1")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        task1.branch = "feature/test-1"
+        store.update(task1)
+
+        git._run("checkout", "-b", "feature/test-1")
+        (tmp_path / "feature1.txt").write_text("feature 1 content")
+        git._run("add", "feature1.txt")
+        git._run("commit", "-m", "Add feature 1")
+        git._run("checkout", "main")
+
+        # Create second task that will fail (no branch)
+        task2 = store.add("Test merge task 2 - no branch")
+        task2.status = "completed"
+        task2.completed_at = datetime.now(timezone.utc)
+        store.update(task2)
+
+        # Create third task with a branch (won't be processed)
+        task3 = store.add("Test merge task 3")
+        task3.status = "completed"
+        task3.completed_at = datetime.now(timezone.utc)
+        task3.branch = "feature/test-3"
+        store.update(task3)
+
+        git._run("checkout", "-b", "feature/test-3")
+        (tmp_path / "feature3.txt").write_text("feature 3 content")
+        git._run("add", "feature3.txt")
+        git._run("commit", "-m", "Add feature 3")
+        git._run("checkout", "main")
+
+        # Test merging all three tasks
+        result = run_gza("merge", str(task1.id), str(task2.id), str(task3.id), "--project", str(tmp_path))
+
+        # Verify the command fails
+        assert result.returncode == 1
+
+        # Verify task 1 was merged successfully
+        assert "Successfully merged 1 task(s)" in result.stdout
+        assert f"#{task1.id}" in result.stdout
+
+        # Verify it stopped at task 2
+        assert f"Stopped at task #{task2.id}" in result.stdout
+
+        # Verify task 3 is listed as not processed
+        assert f"#{task3.id}" in result.stdout
+        assert "Remaining tasks not processed" in result.stdout
+
+    def test_merge_multiple_with_squash(self, tmp_path: Path):
+        """Merge command with --squash flag works with multiple tasks."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create first task with a branch
+        task1 = store.add("Test squash merge 1")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        task1.branch = "feature/squash-1"
+        store.update(task1)
+
+        git._run("checkout", "-b", "feature/squash-1")
+        (tmp_path / "feature1.txt").write_text("feature 1 content")
+        git._run("add", "feature1.txt")
+        git._run("commit", "-m", "Add feature 1")
+        git._run("checkout", "main")
+
+        # Create second task with a branch
+        task2 = store.add("Test squash merge 2")
+        task2.status = "completed"
+        task2.completed_at = datetime.now(timezone.utc)
+        task2.branch = "feature/squash-2"
+        store.update(task2)
+
+        git._run("checkout", "-b", "feature/squash-2")
+        (tmp_path / "feature2.txt").write_text("feature 2 content")
+        git._run("add", "feature2.txt")
+        git._run("commit", "-m", "Add feature 2")
+        git._run("checkout", "main")
+
+        # Test squash merging both tasks
+        result = run_gza("merge", str(task1.id), str(task2.id), "--squash", "--project", str(tmp_path))
+
+        # Verify the command succeeds
+        assert result.returncode == 0
+        assert "Successfully merged 2 task(s)" in result.stdout
+        assert "squash merged" in result.stdout
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
