@@ -548,6 +548,38 @@ def format_stats(task: DbTask) -> str:
     return " | ".join(parts) if parts else ""
 
 
+def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
+    """Extract verdict from a review file.
+
+    Args:
+        config: Configuration object
+        review_task: Review task
+
+    Returns:
+        Verdict string ('APPROVED', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
+    """
+    # First try output_content (cached in DB)
+    if review_task.output_content:
+        content = review_task.output_content
+    # Then try reading from report_file
+    elif review_task.report_file:
+        review_path = config.project_dir / review_task.report_file
+        if not review_path.exists():
+            return None
+        content = review_path.read_text()
+    else:
+        return None
+
+    # Look for verdict pattern: **Verdict: APPROVED** or Verdict: CHANGES_REQUESTED
+    import re
+    # Match both **Verdict: XXX** and Verdict: XXX patterns
+    match = re.search(r'\*{0,2}Verdict:\s*(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    return None
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
     config = Config.load(args.project_dir)
@@ -630,16 +662,32 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             if task.task_type == "improve" and task.based_on == root_task.id:
                 improve_tasks.append(task)
 
+        # Check for review status
+        review_status = None
+        reviews = store.get_reviews_for_task(root_task.id)
+        if reviews:
+            # Get the most recent review (first in the list, as they're ordered by created_at DESC)
+            latest_review = reviews[0]
+            verdict = get_review_verdict(config, latest_review)
+            if verdict == "APPROVED":
+                review_status = "✓ approved"
+            elif verdict == "CHANGES_REQUESTED":
+                review_status = "⚠ changes requested"
+            elif verdict == "NEEDS_DISCUSSION":
+                review_status = "💬 needs discussion"
+
         # Build the display line
         prompt_display = root_task.prompt[:50] + "..." if len(root_task.prompt) > 50 else root_task.prompt
 
         # Add improve task references if any
         if improve_tasks:
             improve_ids = ", ".join(f"#{t.id}" for t in improve_tasks)
-            print(f"⚡ [#{root_task.id}] {prompt_display} (improved by {improve_ids})")
+            suffix = f" [{review_status}]" if review_status else ""
+            print(f"⚡ [#{root_task.id}] {prompt_display} (improved by {improve_ids}){suffix}")
         else:
             date_str = f"({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})" if root_task.completed_at else ""
-            print(f"⚡ [#{root_task.id}] {date_str} {prompt_display}")
+            suffix = f" [{review_status}]" if review_status else ""
+            print(f"⚡ [#{root_task.id}] {date_str} {prompt_display}{suffix}")
 
         # Show branch with commit count
         commit_count = git.count_commits_ahead(branch, default_branch)
