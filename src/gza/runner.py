@@ -872,9 +872,17 @@ def _run_non_code_task(
             # Copy report content from worktree to project dir
             report_path.write_text(worktree_report_path.read_text())
         else:
-            # Report file was not created - task likely failed to write output
-            print(f"Warning: Report file not created by provider")
+            # Report file was not created - task failed to write output
+            print(f"Task failed: Report file not created by provider")
             print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
+            print(f"Task ID: {task.id}")
+            print("")
+            print("Next steps:")
+            print(f"  gza retry {task.id}           # retry from scratch")
+            print(f"  gza resume {task.id}          # resume from where it left off")
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            _cleanup_worktree(git, worktree_path)
+            return 0
 
         # Read output content for storage in DB
         output_content = None
