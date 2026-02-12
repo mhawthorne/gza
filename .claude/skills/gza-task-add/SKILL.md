@@ -2,6 +2,8 @@
 name: gza-task-add
 description: Create a well-formed gza task with appropriate type, group, and prompt
 allowed-tools: Read, Bash(uv run gza add:*), AskUserQuestion
+version: 1.0.0
+public: true
 ---
 
 # Add Gza Task
