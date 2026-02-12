@@ -32,6 +32,43 @@ OUTPUT_COLORS = {
     "todo_item": "dim",
 }
 
+# Claude pricing per million tokens (input, output)
+# https://www.anthropic.com/pricing
+CLAUDE_PRICING = {
+    "claude-sonnet-4": (3.00, 15.00),
+    "claude-opus-4": (15.00, 75.00),
+    "claude-3-5-sonnet": (3.00, 15.00),
+    "claude-3-opus": (15.00, 75.00),
+    "claude-3-haiku": (0.25, 1.25),
+}
+
+# Default pricing when model is unknown (Sonnet)
+DEFAULT_PRICING = (3.00, 15.00)
+
+
+def get_pricing_for_model(model: str) -> tuple[float, float]:
+    """Get (input, output) pricing per million tokens for a model."""
+    if not model:
+        return DEFAULT_PRICING
+    # Try exact match first
+    if model in CLAUDE_PRICING:
+        return CLAUDE_PRICING[model]
+    # Try prefix match
+    for model_prefix, pricing in CLAUDE_PRICING.items():
+        if model.startswith(model_prefix):
+            return pricing
+    return DEFAULT_PRICING
+
+
+def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> float:
+    """Calculate estimated cost in USD based on token counts and model."""
+    input_price, output_price = get_pricing_for_model(model)
+    cost = (
+        (input_tokens * input_price / 1_000_000) +
+        (output_tokens * output_price / 1_000_000)
+    )
+    return round(cost, 4)
+
 console = Console()
 
 
@@ -144,7 +181,9 @@ class ClaudeProvider(Provider):
         cmd.extend(config.claude_args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
-        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, stdin_input=prompt)
+        return self._run_with_output_parsing(
+            cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
+        )
 
     def _run_direct(
         self,
@@ -167,7 +206,9 @@ class ClaudeProvider(Provider):
         cmd.extend(config.claude_args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
-        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt)
+        return self._run_with_output_parsing(
+            cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
+        )
 
     def _run_with_output_parsing(
         self,
@@ -176,6 +217,7 @@ class ClaudeProvider(Provider):
         timeout_minutes: int,
         cwd: Path | None = None,
         stdin_input: str | None = None,
+        model: str = "",
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
 
@@ -222,12 +264,20 @@ class ClaudeProvider(Provider):
                         else:
                             token_str = f"{total_tokens} tokens"
 
+                        # Calculate estimated cost
+                        cost = calculate_cost(
+                            data["total_input_tokens"],
+                            data["total_output_tokens"],
+                            model,
+                        )
+                        cost_str = f"${cost:.2f}"
+
                         # Add blank line before turn (except first turn)
                         if turn_count > 1:
                             console.print()
 
                         # Print turn info with color
-                        console.print(f"  | Turn {turn_count} | {token_str} | {runtime_str} |", style=OUTPUT_COLORS["turn_info"])
+                        console.print(f"| Turn {turn_count} | {token_str} | {cost_str} | {runtime_str} |", style=OUTPUT_COLORS["turn_info"])
 
                     for content in message.get("content", []):
                         if content.get("type") == "tool_use":
@@ -243,10 +293,10 @@ class ClaudeProvider(Provider):
                                 # Truncate to 80 chars
                                 if len(command) > 80:
                                     command = command[:77] + "..."
-                                console.print(f"  → {tool_name} {command}", style=OUTPUT_COLORS["tool_use"])
+                                console.print(f"→ {tool_name} {command}", style=OUTPUT_COLORS["tool_use"])
                             elif tool_name == "Glob":
                                 pattern = tool_input.get("pattern", "")
-                                console.print(f"  → {tool_name} {pattern}", style=OUTPUT_COLORS["tool_use"])
+                                console.print(f"→ {tool_name} {pattern}", style=OUTPUT_COLORS["tool_use"])
                             elif tool_name == "TodoWrite":
                                 todos = tool_input.get("todos", [])
                                 todos_summary = f"{len(todos)} todos"
@@ -256,7 +306,7 @@ class ClaudeProvider(Provider):
                                     in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
                                     completed = sum(1 for t in todos if t.get("status") == "completed")
                                     todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
-                                console.print(f"  → {tool_name} {todos_summary}", style=OUTPUT_COLORS["tool_use"])
+                                console.print(f"→ {tool_name} {todos_summary}", style=OUTPUT_COLORS["tool_use"])
                                 # Print each todo with status icon and truncated content
                                 status_icons = {
                                     "pending": "○",
@@ -270,7 +320,7 @@ class ClaudeProvider(Provider):
                                     # Truncate to 60 chars
                                     if len(content) > 60:
                                         content = content[:57] + "..."
-                                    console.print(f"      {icon} {content}", style=OUTPUT_COLORS["todo_item"])
+                                    console.print(f"  {icon} {content}", style=OUTPUT_COLORS["todo_item"])
                             elif tool_name == "Edit":
                                 # Enhanced logging for Edit tool
                                 parts = [tool_name]
@@ -310,16 +360,16 @@ class ClaudeProvider(Provider):
                                     preview = preview.replace("\r", "\\r").replace("\t", "\\t")
                                     parts.append(f'"{preview}"')
 
-                                console.print(f"  → {' '.join(parts)}", style=OUTPUT_COLORS["tool_use"])
+                                console.print(f"→ {' '.join(parts)}", style=OUTPUT_COLORS["tool_use"])
                             elif file_path:
-                                console.print(f"  → {tool_name} {file_path}", style=OUTPUT_COLORS["tool_use"])
+                                console.print(f"→ {tool_name} {file_path}", style=OUTPUT_COLORS["tool_use"])
                             else:
-                                console.print(f"  → {tool_name}", style=OUTPUT_COLORS["tool_use"])
+                                console.print(f"→ {tool_name}", style=OUTPUT_COLORS["tool_use"])
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:
                                 first_line = text.split("\n")[0][:80]
-                                console.print(f"  {first_line}", style=OUTPUT_COLORS["assistant_text"])
+                                console.print(first_line, style=OUTPUT_COLORS["assistant_text"])
 
                 elif event_type == "result":
                     data["result"] = event

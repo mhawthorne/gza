@@ -384,7 +384,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         if hasattr(args, 'task_ids') and args.task_ids:
             # Run the specific tasks
             tasks_completed = 0
+            task_separator = "\n" + "-" * 32 + "\n"
             for task_id in args.task_ids:
+                if tasks_completed > 0:
+                    print(task_separator)
                 result = run(config, task_id=task_id)
                 if result != 0:
                     if tasks_completed == 0:
@@ -409,7 +412,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         # Run tasks in a loop
         tasks_completed = 0
+        task_separator = "\n" + "-" * 32 + "\n"
         for i in range(count):
+            if tasks_completed > 0:
+                print(task_separator)
             result = run(config)
 
             # If run returns non-zero, it means something went wrong or no tasks left
