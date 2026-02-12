@@ -621,6 +621,8 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         stats_str = format_stats(root_task)
         if stats_str:
             print(f"    stats: {stats_str}")
+            
+        print()
 
     return 0
 

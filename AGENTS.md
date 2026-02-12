@@ -100,6 +100,7 @@ Signs you're violating this:
 
 ## Important Guidelines
 
+- **Do NOT commit until tests pass** - Run `uv run pytest tests/ -v` before committing. Only commit once all tests pass. The exception is the automatic checkpoint commit made when a task fails - that commit preserves work-in-progress for debugging.
 - **Do NOT delete git branches** unless explicitly asked to. Branches should be preserved for history and reference.
 - **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, `*_SETUP.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
 - **Do NOT create README files** unless explicitly requested.

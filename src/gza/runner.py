@@ -189,6 +189,9 @@ Your review should include:
 End your review with a clear verdict line like:
 Verdict: APPROVED"""
     elif task.task_type in ("task", "implement", "improve"):
+        base_prompt += """
+
+IMPORTANT: Run unit tests before committing (`uv run pytest tests/ -v`). Only commit once all tests pass."""
         if summary_path:
             base_prompt += f"""
 

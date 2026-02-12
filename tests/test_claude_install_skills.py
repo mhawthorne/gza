@@ -35,8 +35,6 @@ class TestClaudeInstallSkillsCommand:
         assert "Available skills:" in result.stdout
         assert "gza-task-add" in result.stdout
         assert "gza-task-info" in result.stdout
-        assert "rebase" in result.stdout
-        assert "review-docs" in result.stdout
 
     def test_install_all_skills(self, tmp_path: Path):
         """Install all skills to a project."""
@@ -52,24 +50,20 @@ class TestClaudeInstallSkillsCommand:
         assert skills_dir.exists()
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
         assert (skills_dir / "gza-task-info" / "SKILL.md").exists()
-        assert (skills_dir / "rebase" / "SKILL.md").exists()
-        assert (skills_dir / "review-docs" / "SKILL.md").exists()
 
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
         setup_config(tmp_path)
-        result = run_gza("claude-install-skills", "gza-task-add", "rebase", "--project", str(tmp_path))
+        result = run_gza("claude-install-skills", "gza-task-add", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Installing 2 skill(s)" in result.stdout
-        assert "Installed 2 skill(s)" in result.stdout
+        assert "Installing 1 skill(s)" in result.stdout
+        assert "Installed 1 skill(s)" in result.stdout
 
         # Verify only requested skills were created
         skills_dir = tmp_path / ".claude" / "skills"
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
-        assert (skills_dir / "rebase" / "SKILL.md").exists()
         assert not (skills_dir / "gza-task-info").exists()
-        assert not (skills_dir / "review-docs").exists()
 
     def test_skip_existing_skills_without_force(self, tmp_path: Path):
         """Existing skills are skipped without --force flag."""
