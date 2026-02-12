@@ -2451,8 +2451,8 @@ def cmd_retry(args: argparse.Namespace) -> int:
         worker_args.task_ids = [new_task.id]
         return _spawn_background_worker(worker_args, config, task_id=new_task.id)
 
-    # Handle autorun mode - run the new task immediately
-    if hasattr(args, 'autorun') and args.autorun:
+    # Handle run mode - run the new task immediately
+    if hasattr(args, 'run') and args.run:
         print(f"\nRunning task #{new_task.id}...")
         return run(config, task_id=new_task.id)
 
@@ -2462,6 +2462,13 @@ def cmd_retry(args: argparse.Namespace) -> int:
 def cmd_improve(args: argparse.Namespace) -> int:
     """Create an improve task based on an implementation task and its most recent review."""
     config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_turns = args.max_turns
+
     store = get_store(config)
 
     impl_task = store.get(args.impl_task_id)
@@ -2511,6 +2518,17 @@ def cmd_improve(args: argparse.Namespace) -> int:
     print(f"  Review: #{review_task.id}")
     print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
 
+    # Handle background mode - spawn worker to run the improve task
+    if hasattr(args, 'background') and args.background:
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [improve_task.id]
+        return _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+
+    # Handle run mode - run the improve task immediately
+    if hasattr(args, 'run') and args.run:
+        print(f"\nRunning improve task #{improve_task.id}...")
+        return run(config, task_id=improve_task.id)
+
     return 0
 
 
@@ -2556,10 +2574,15 @@ def cmd_review(args: argparse.Namespace) -> int:
     if impl_task.group:
         print(f"  Group: {impl_task.group}")
 
-    # If --run or --autorun flag is set, run the review task immediately
+    # Handle background mode - spawn worker to run the review task
+    if hasattr(args, 'background') and args.background:
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [review_task.id]
+        return _spawn_background_worker(worker_args, config, task_id=review_task.id)
+
+    # If --run flag is set, run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
-    should_run = (hasattr(args, 'run') and args.run) or (hasattr(args, 'autorun') and args.autorun)
-    if should_run:
+    if hasattr(args, 'run') and args.run:
         print(f"\nRunning review task #{review_task.id}...")
         return run(config, task_id=review_task.id)
 
@@ -2596,12 +2619,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if args.background:
         return _spawn_background_resume_worker(args, config, args.task_id)
 
-    # Handle autorun mode or default behavior (resume runs by default)
-    if hasattr(args, 'autorun') and args.autorun:
-        print(f"=== Resuming Task #{args.task_id} ===")
-        return run(config, task_id=args.task_id, resume=True)
-
-    # Resume the task (default behavior)
+    # Resume the task (always runs - --run flag exists for consistency with other commands)
     print(f"=== Resuming Task #{args.task_id} ===")
     return run(config, task_id=args.task_id, resume=True)
 
@@ -3309,9 +3327,9 @@ def main() -> int:
         help="Run worker in background (detached mode)",
     )
     retry_parser.add_argument(
-        "--autorun",
+        "--run",
         action="store_true",
-        help="Automatically run the newly created task after creation",
+        help="Run the newly created task immediately after creation",
     )
     retry_parser.add_argument(
         "--max-turns",
@@ -3339,9 +3357,9 @@ def main() -> int:
         help="Run worker in background (detached mode)",
     )
     resume_parser.add_argument(
-        "--autorun",
+        "--run",
         action="store_true",
-        help="Automatically run the task after setting it to resume",
+        help="Run the task immediately (resume runs by default, this flag is for consistency)",
     )
     resume_parser.add_argument(
         "--max-turns",
@@ -3363,6 +3381,27 @@ def main() -> int:
         action="store_true",
         help="Auto-create review task on completion",
     )
+    improve_parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Run the improve task immediately after creating it",
+    )
+    improve_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    improve_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --run or --background)",
+    )
+    improve_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
     add_common_args(improve_parser)
 
     # review command
@@ -3378,14 +3417,14 @@ def main() -> int:
         help="Run the review task immediately after creating it",
     )
     review_parser.add_argument(
-        "--autorun",
+        "--background", "-b",
         action="store_true",
-        help="Automatically run the newly created review task (alias for --run)",
+        help="Run worker in background (detached mode)",
     )
     review_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help="Run Claude directly instead of in Docker (only used with --run or --autorun)",
+        help="Run Claude directly instead of in Docker (only used with --run or --background)",
     )
     review_parser.add_argument(
         "--no-pr",
