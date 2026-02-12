@@ -624,11 +624,31 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
             git._run("branch", "-D", branch_name, check=False)
 
         try:
-            # Create worktree with new branch based on origin/default_branch (or local if fetch failed)
-            base_ref = f"origin/{default_branch}"
-            result = git._run("rev-parse", "--verify", base_ref, check=False)
-            if result.returncode != 0:
-                base_ref = default_branch  # Fall back to local branch
+            # Create worktree with new branch based on the most up-to-date ref
+            # Compare local main vs origin/main and use whichever is ahead
+            base_ref = default_branch
+            origin_ref = f"origin/{default_branch}"
+
+            # Check if origin ref exists
+            origin_exists = git._run("rev-parse", "--verify", origin_ref, check=False).returncode == 0
+
+            if origin_exists:
+                # Compare local vs origin - use whichever is ahead
+                local_ahead = git.count_commits_ahead(default_branch, origin_ref)
+                origin_ahead = git.count_commits_ahead(origin_ref, default_branch)
+
+                if origin_ahead > 0 and local_ahead == 0:
+                    # Origin is strictly ahead, use it
+                    base_ref = origin_ref
+                elif local_ahead > 0 and origin_ahead == 0:
+                    # Local is strictly ahead, use it
+                    base_ref = default_branch
+                elif local_ahead > 0 and origin_ahead > 0:
+                    # Diverged - prefer local to include unpushed changes
+                    base_ref = default_branch
+                else:
+                    # Same commit, use either (default to local)
+                    base_ref = default_branch
 
             console.print(f"Creating worktree: {worktree_path}")
             git.worktree_add(worktree_path, branch_name, base_ref)
