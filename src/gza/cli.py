@@ -588,10 +588,12 @@ def cmd_history(args: argparse.Namespace) -> int:
     # Determine the limit: None for --all, otherwise use --limit/-n value
     limit = None if args.all else args.limit
     status = getattr(args, 'status', None)
-    recent = store.get_history(limit=limit, status=status)
+    task_type = getattr(args, 'type', None)
+    recent = store.get_history(limit=limit, status=status, task_type=task_type)
     if not recent:
         status_msg = f" with status '{status}'" if status else ""
-        print(f"No completed or failed tasks{status_msg}")
+        type_msg = f" with type '{task_type}'" if task_type else ""
+        print(f"No completed or failed tasks{status_msg}{type_msg}")
         return 0
 
     for task in recent:
@@ -3216,6 +3218,12 @@ def main() -> int:
         type=str,
         choices=["completed", "failed", "unmerged"],
         help="Filter tasks by status (e.g., completed, failed, unmerged)",
+    )
+    history_parser.add_argument(
+        "--type",
+        type=str,
+        choices=["task", "explore", "plan", "implement", "review", "improve"],
+        help="Filter tasks by task_type (e.g., task, explore, plan, implement, review, improve)",
     )
 
     # unmerged command
