@@ -698,6 +698,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
         print(f"Branch: {branch_name}")
         print("")
         print("Next steps:")
+        print(f"  gza review {task.id}          # create and run a review")
         print(f"  gza merge {task.id}           # merge branch for task")
         print(f"  gza pr {task.id}              # create a PR")
         print(f"  gza retry {task.id}           # retry from scratch")
