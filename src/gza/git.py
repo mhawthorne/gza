@@ -331,6 +331,28 @@ class Git:
             # If trees match, merging would be a no-op - branch is effectively merged
             return merged_tree == target_tree
 
+    def can_merge(self, branch: str, into: str | None = None) -> bool:
+        """Check if a branch can be merged cleanly (no conflicts).
+
+        Uses git merge-tree to simulate a merge without touching the worktree.
+
+        Args:
+            branch: The branch to check
+            into: The target branch (defaults to default branch)
+
+        Returns:
+            True if the branch can be merged without conflicts
+        """
+        if into is None:
+            into = self.default_branch()
+
+        if not self.branch_exists(branch):
+            return False
+
+        # git merge-tree returns 0 for clean merge, 1 for conflicts
+        result = self._run("merge-tree", "--write-tree", into, branch, check=False)
+        return result.returncode == 0
+
     def merge(self, branch: str, squash: bool = False, commit_message: str | None = None) -> None:
         """Merge a branch into the current branch.
 

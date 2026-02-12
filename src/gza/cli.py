@@ -621,7 +621,11 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         stats_str = format_stats(root_task)
         if stats_str:
             print(f"    stats: {stats_str}")
-            
+
+        # Show merge status at the end
+        if not git.can_merge(branch, default_branch):
+            print(f"    ⚠️  has conflicts")
+
         print()
 
     return 0
@@ -758,6 +762,79 @@ def cmd_merge(args: argparse.Namespace) -> int:
                 print("✓ Merge aborted, working directory restored")
         except GitError as abort_error:
             print(f"Warning: Could not abort {operation}: {abort_error}")
+        return 1
+
+
+def cmd_rebase(args: argparse.Namespace) -> int:
+    """Rebase a task's branch onto a target branch."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    # Get the task
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    # Validate task state
+    if task.status not in ("completed", "unmerged", "running"):
+        print(f"Error: Task #{task.id} is not completed, unmerged, or running (status: {task.status})")
+        return 1
+
+    if not task.branch:
+        print(f"Error: Task #{task.id} has no branch")
+        return 1
+
+    # Check if branch exists
+    if not git.branch_exists(task.branch):
+        print(f"Error: Branch '{task.branch}' does not exist")
+        return 1
+
+    # Get current branch and determine rebase target
+    current_branch = git.current_branch()
+    default_branch = git.default_branch()
+
+    # Determine rebase target: use --onto if provided, else current branch
+    rebase_target = getattr(args, 'onto', None) or current_branch
+
+    # Handle --remote flag
+    if hasattr(args, 'remote') and args.remote:
+        print(f"Fetching from origin...")
+        git.fetch("origin")
+        print("✓ Fetched from origin")
+        rebase_target = f"origin/{rebase_target}"
+
+    # Check for uncommitted changes
+    if git.has_changes(include_untracked=False):
+        print("Error: You have uncommitted changes. Please commit or stash them first.")
+        return 1
+
+    # Perform the rebase
+    try:
+        print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
+        git.checkout(task.branch)
+        git.rebase(rebase_target)
+        print(f"✓ Successfully rebased {task.branch} onto {rebase_target}")
+
+        # Switch back to original branch
+        git.checkout(current_branch)
+        print(f"✓ Switched back to {current_branch}")
+
+        return 0
+
+    except GitError as e:
+        print(f"Error during rebase: {e}")
+        print(f"\nAborting rebase and restoring clean state...")
+        try:
+            git.rebase_abort()
+            try:
+                git.checkout(current_branch)
+            except GitError:
+                pass  # Best effort to return to original branch
+            print("✓ Rebase aborted, working directory restored")
+        except GitError as abort_error:
+            print(f"Warning: Could not abort rebase: {abort_error}")
         return 1
 
 
@@ -2959,6 +3036,24 @@ def main() -> int:
     )
     add_common_args(merge_parser)
 
+    # rebase command
+    rebase_parser = subparsers.add_parser("rebase", help="Rebase a task's branch onto a target branch")
+    rebase_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to rebase",
+    )
+    rebase_parser.add_argument(
+        "--onto",
+        help="Branch to rebase onto (defaults to current branch)",
+    )
+    rebase_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Fetch from origin and rebase against origin/<target-branch>",
+    )
+    add_common_args(rebase_parser)
+
     # diff command
     diff_parser = subparsers.add_parser("diff", help="Run git diff with colored output and pager support")
     add_common_args(diff_parser)
@@ -3431,6 +3526,8 @@ def main() -> int:
             return cmd_unmerged(args)
         elif args.command == "merge":
             return cmd_merge(args)
+        elif args.command == "rebase":
+            return cmd_rebase(args)
         elif args.command == "diff":
             return cmd_diff(args)
         elif args.command == "pr":
