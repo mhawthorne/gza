@@ -46,6 +46,10 @@ def info_line(label: str, value: str) -> None
 | Commands | Cyan |
 | Comments | Dim |
 | Checkmarks | Green |
+| Turn info (turn/tokens/runtime) | Blue |
+| Assistant text | Green |
+| Tool use | Magenta |
+| Todo items | Dim |
 
 ### 3. Files to Modify
 
@@ -88,9 +92,57 @@ Same structure but with:
 - Dimmed comments
 - Colored/bold stats values
 
-### 5. Scope
+### 5. Conversation Output Coloring
 
-Focus on `gza work` output only (runner.py). Other CLI commands can be updated in a follow-up task if desired.
+Add rich output coloring to the live conversation stream in `src/gza/providers/claude.py`. Define output types mapped to colors in a dictionary:
+
+```python
+# Output type to color mapping
+OUTPUT_COLORS = {
+    "turn_info": "blue",        # Turn count, token count, runtime
+    "assistant_text": "green",  # Claude's text responses
+    "tool_use": "magenta",      # Tool calls (→ Edit, → Bash, etc.)
+    "todo_item": "dim",         # Individual todo items under TodoWrite
+}
+```
+
+**Changes to claude.py:**
+1. Add the `OUTPUT_COLORS` dictionary at module level
+2. Add task runtime to the turn info line (requires tracking start time)
+3. Use rich markup for coloring:
+   - Turn info line: `[blue]  [turn {n}, {tokens}, {runtime}][/blue]`
+   - Tool use: `[magenta]  → {tool_name} {details}[/magenta]`
+   - Assistant text: `[green]  {first_line}[/green]`
+   - Todo items: `[dim]      {icon} {content}[/dim]`
+4. Add a blank line between turns (before each turn info line, except the first)
+
+**Example output transformation:**
+
+Before:
+```
+  [turn 1, 5k tokens]
+  First, let me read the file...
+  → Read /path/to/file.py
+  [turn 2, 12k tokens]
+  Now I'll make the changes...
+  → Edit /path/to/file.py (+3 lines)
+```
+
+After:
+```
+  [turn 1, 5k tokens, 0m 23s]
+  First, let me read the file...
+  → Read /path/to/file.py
+
+  [turn 2, 12k tokens, 1m 05s]
+  Now I'll make the changes...
+  → Edit /path/to/file.py (+3 lines)
+```
+(with blue for turn info, green for text, magenta for tool use)
+
+### 6. Scope
+
+Focus on `gza work` output only (runner.py and providers/claude.py). Other CLI commands can be updated in a follow-up task if desired.
 
 ## Verification
 
