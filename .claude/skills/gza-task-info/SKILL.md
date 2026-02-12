@@ -2,6 +2,8 @@
 name: gza-task-info
 description: Gather comprehensive info about a specific gza task including status, branch, commits, and logs
 allowed-tools: Read, Bash(sqlite3:*), Bash(git:*)
+version: 1.0.0
+public: true
 ---
 
 # Gza Task Info

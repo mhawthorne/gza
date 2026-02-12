@@ -2793,7 +2793,7 @@ def cmd_claude_install_skills(args: argparse.Namespace) -> int:
 
     # Handle --list flag
     if args.list:
-        available = get_available_skills()
+        available = get_available_skills(public_only=True)
         if not available:
             print("No skills available")
             return 0
@@ -2807,10 +2807,11 @@ def cmd_claude_install_skills(args: argparse.Namespace) -> int:
         return 0
 
     # Determine which skills to install
-    available = get_available_skills()
+    # Default to public skills only
+    available = get_available_skills(public_only=True)
 
     if args.skills:
-        # Validate requested skills exist
+        # When specific skills are requested, check against public skills
         skills_to_install = []
         for skill in args.skills:
             if skill not in available:
@@ -2819,7 +2820,7 @@ def cmd_claude_install_skills(args: argparse.Namespace) -> int:
                 return 1
             skills_to_install.append(skill)
     else:
-        # Install all skills
+        # Install all public skills
         skills_to_install = available
 
     if not skills_to_install:

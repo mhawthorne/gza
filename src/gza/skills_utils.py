@@ -24,10 +24,14 @@ def get_skills_source_path() -> Path:
     return Path(str(ref))
 
 
-def get_available_skills() -> List[str]:
+def get_available_skills(public_only: bool = False) -> List[str]:
     """List available skill names from the bundled skills.
 
     A skill is valid if it's a directory containing a SKILL.md file (uppercase).
+
+    Args:
+        public_only: If True, only return skills with 'public: true' in frontmatter.
+                     Defaults to False (return all skills).
 
     Returns:
         Sorted list of skill names.
@@ -42,6 +46,9 @@ def get_available_skills() -> List[str]:
         if item.is_dir():
             # Only check for SKILL.md (uppercase) - this is the convention
             if (item / 'SKILL.md').exists():
+                # If filtering by public status, check the frontmatter
+                if public_only and not get_skill_public(item.name):
+                    continue
                 skills.append(item.name)
 
     return sorted(skills)
@@ -103,6 +110,20 @@ def get_skill_version(skill_name: str) -> Optional[str]:
     """
     version = _parse_skill_frontmatter(skill_name, 'version')
     return version if version else None
+
+
+def get_skill_public(skill_name: str) -> bool:
+    """Extract the public field from a skill's SKILL.md file.
+
+    Args:
+        skill_name: Name of the skill.
+
+    Returns:
+        True if the skill has 'public: true' in frontmatter, False otherwise.
+        Defaults to False when the field is omitted.
+    """
+    public = _parse_skill_frontmatter(skill_name, 'public')
+    return public.lower() == 'true' if public else False
 
 
 def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[bool, str]:
