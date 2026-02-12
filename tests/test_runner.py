@@ -7,7 +7,8 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
-from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task, post_review_to_pr
+from gza.providers import RunResult
+from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task, _run_non_code_task, post_review_to_pr
 
 
 class TestBuildPrompt:
@@ -248,8 +249,12 @@ class TestReviewTaskSlugGeneration:
             gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review
 
-    def test_auto_review_calls_pr_posting_on_success(self, tmp_path: Path):
-        """Test that _create_and_run_review_task calls post_review_to_pr on successful completion."""
+    def test_auto_review_delegates_to_run(self, tmp_path: Path):
+        """Test that _create_and_run_review_task delegates PR posting to run().
+
+        PR posting now happens in _run_non_code_task (called by run()), not in
+        _create_and_run_review_task itself. This test verifies the delegation.
+        """
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -268,28 +273,17 @@ class TestReviewTaskSlugGeneration:
         config.project_dir = tmp_path
         config.log_path = tmp_path / "logs"
 
-        # Track if post_review_to_pr was called
-        pr_post_called = []
+        # Track that run() was called with the review task
+        run_calls = []
 
         def mock_run(config, task_id):
-            # Mark the review task as completed
-            review_task = store.get(task_id)
-            review_task.status = "completed"
-            store.update(review_task)
+            run_calls.append(task_id)
             return 0  # Success
-
-        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
-            pr_post_called.append({
-                'review_id': review_task.id,
-                'impl_id': impl_task.id,
-                'required': required
-            })
 
         import gza.runner
         original_run = gza.runner.run
-        original_post_review = gza.runner.post_review_to_pr
+
         gza.runner.run = mock_run
-        gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
             # Call _create_and_run_review_task
@@ -298,21 +292,56 @@ class TestReviewTaskSlugGeneration:
             # Verify success
             assert exit_code == 0
 
-            # Verify post_review_to_pr was called
-            assert len(pr_post_called) == 1
-            assert pr_post_called[0]['review_id'] == 2  # The created review task
-            assert pr_post_called[0]['impl_id'] == 1   # The implementation task
-            assert pr_post_called[0]['required'] is False  # Default behavior
+            # Verify run() was called with the review task id
+            assert len(run_calls) == 1
+            assert run_calls[0] == 2  # The created review task
         finally:
             gza.runner.run = original_run
-            gza.runner.post_review_to_pr = original_post_review
 
-    def test_auto_review_skips_pr_posting_on_failure(self, tmp_path: Path):
-        """Test that _create_and_run_review_task skips PR posting if review fails."""
+    def test_auto_review_returns_run_exit_code(self, tmp_path: Path):
+        """Test that _create_and_run_review_task returns the exit code from run()."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        # Create a completed implementation task with a PR
+        # Create a completed implementation task
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        store.update(impl_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        def mock_run_failure(config, task_id):
+            return 1  # Failure
+
+        import gza.runner
+        original_run = gza.runner.run
+        gza.runner.run = mock_run_failure
+
+        try:
+            # Call _create_and_run_review_task
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            # Verify failure code is returned
+            assert exit_code == 1
+        finally:
+            gza.runner.run = original_run
+
+
+class TestRunNonCodeTaskPRPosting:
+    """Tests for _run_non_code_task PR posting behavior."""
+
+    def test_run_non_code_task_posts_to_pr_for_review(self, tmp_path: Path):
+        """Test that _run_non_code_task calls post_review_to_pr for completed review tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task
         impl_task = store.add(
             prompt="Add user authentication",
             task_type="implement",
@@ -323,38 +352,155 @@ class TestReviewTaskSlugGeneration:
         impl_task.pr_number = 123
         store.update(impl_task)
 
+        # Create a review task that depends on it
+        review_task = store.add(
+            prompt="Review the implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.task_id = "20260212-review-the-implementation"
+        store.update(review_task)
+
+        # Setup config
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+
+        # Create review directory structure
+        review_dir = tmp_path / ".gza" / "reviews"
+        review_dir.mkdir(parents=True, exist_ok=True)
 
         # Track if post_review_to_pr was called
         pr_post_called = []
 
-        def mock_run(config, task_id):
-            # Mark the review task as failed
-            review_task = store.get(task_id)
-            review_task.status = "failed"
-            store.update(review_task)
-            return 1  # Failure
+        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
+            pr_post_called.append({
+                'review_id': review_task.id,
+                'impl_id': impl_task.id,
+                'required': required
+            })
+
+        # Mock provider
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_result = RunResult(
+            exit_code=0,
+            duration_seconds=10.0,
+            num_turns=5,
+            cost_usd=0.05,
+            session_id="test-session",
+            error_type=None,
+        )
+        mock_provider.run.return_value = mock_result
+
+        # Mock git
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        # Create worktree directory and report file (simulating provider writing it)
+        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_review_dir = worktree_path / ".gza" / "reviews"
+        worktree_review_dir.mkdir(parents=True, exist_ok=True)
+        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+        report_file.write_text("# Review\n\nLooks good!")
+
+        import gza.runner
+        original_post_review = gza.runner.post_review_to_pr
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
+
+        try:
+            # Call _run_non_code_task
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+            # Verify success
+            assert exit_code == 0
+
+            # Verify post_review_to_pr was called
+            assert len(pr_post_called) == 1
+            assert pr_post_called[0]['review_id'] == review_task.id
+            assert pr_post_called[0]['impl_id'] == impl_task.id
+            assert pr_post_called[0]['required'] is False
+        finally:
+            gza.runner.post_review_to_pr = original_post_review
+
+    def test_run_non_code_task_skips_pr_posting_for_explore(self, tmp_path: Path):
+        """Test that _run_non_code_task does NOT call post_review_to_pr for explore tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create an explore task
+        explore_task = store.add(
+            prompt="Explore the codebase",
+            task_type="explore",
+        )
+        explore_task.task_id = "20260212-explore-the-codebase"
+        store.update(explore_task)
+
+        # Setup config
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+
+        # Create exploration directory structure
+        explore_dir = tmp_path / ".gza" / "explorations"
+        explore_dir.mkdir(parents=True, exist_ok=True)
+
+        # Track if post_review_to_pr was called
+        pr_post_called = []
 
         def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
             pr_post_called.append(True)
 
+        # Mock provider
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_result = RunResult(
+            exit_code=0,
+            duration_seconds=10.0,
+            num_turns=5,
+            cost_usd=0.05,
+            session_id="test-session",
+            error_type=None,
+        )
+        mock_provider.run.return_value = mock_result
+
+        # Mock git
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        # Create worktree directory and report file
+        worktree_path = config.worktree_path / f"{explore_task.task_id}-explore"
+        worktree_explore_dir = worktree_path / ".gza" / "explorations"
+        worktree_explore_dir.mkdir(parents=True, exist_ok=True)
+        report_file = worktree_explore_dir / f"{explore_task.task_id}.md"
+        report_file.write_text("# Exploration\n\nFindings here.")
+
         import gza.runner
-        original_run = gza.runner.run
         original_post_review = gza.runner.post_review_to_pr
-        gza.runner.run = mock_run
         gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
-            # Call _create_and_run_review_task
-            exit_code = _create_and_run_review_task(impl_task, config, store)
+            # Call _run_non_code_task
+            exit_code = _run_non_code_task(
+                explore_task, config, store, mock_provider, mock_git, resume=False
+            )
 
-            # Verify failure
-            assert exit_code == 1
+            # Verify success
+            assert exit_code == 0
 
-            # Verify post_review_to_pr was NOT called (review failed)
+            # Verify post_review_to_pr was NOT called (not a review task)
             assert len(pr_post_called) == 0
         finally:
-            gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review

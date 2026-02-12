@@ -2557,18 +2557,11 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"  Group: {impl_task.group}")
 
     # If --run or --autorun flag is set, run the review task immediately
+    # Note: PR posting happens in _run_non_code_task, no need to do it here
     should_run = (hasattr(args, 'run') and args.run) or (hasattr(args, 'autorun') and args.autorun)
     if should_run:
         print(f"\nRunning review task #{review_task.id}...")
-        exit_code = run(config, task_id=review_task.id)
-
-        # After successful review, post to PR if applicable
-        if exit_code == 0 and not args.no_pr:
-            # Reload the review task to get updated status
-            review_task = store.get(review_task.id)
-            post_review_to_pr(review_task, impl_task, store, config.project_dir, required=args.pr)
-
-        return exit_code
+        return run(config, task_id=review_task.id)
 
     return 0
 

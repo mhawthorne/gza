@@ -472,15 +472,8 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     print(f"Running review task...")
 
     # Run the review task immediately
-    exit_code = run(config, task_id=review_task.id)
-
-    # After successful review, post to PR if applicable (same behavior as cmd_review --run)
-    if exit_code == 0:
-        # Reload the review task to get updated status
-        review_task = store.get(review_task.id)
-        post_review_to_pr(review_task, completed_task, store, config.project_dir, required=False)
-
-    return exit_code
+    # Note: PR posting happens in _run_non_code_task, no need to do it here
+    return run(config, task_id=review_task.id)
 
 
 def run(config: Config, task_id: int | None = None, resume: bool = False) -> int:
@@ -1002,6 +995,12 @@ def _run_non_code_task(
             has_commits=False,
             stats=stats,
         )
+
+        # For review tasks, post to PR if applicable
+        if task.task_type == "review" and task.depends_on:
+            impl_task = store.get(task.depends_on)
+            if impl_task:
+                post_review_to_pr(task, impl_task, store, config.project_dir, required=False)
 
         print("")
         print(f"=== {task_type_display} Complete ===")
