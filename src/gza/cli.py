@@ -1298,77 +1298,168 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    """Delete old log and worker files."""
+    """Archive or delete old log and worker files."""
     from datetime import timedelta
+    import shutil
 
     config = Config.load(args.project_dir)
 
+    # Determine default days based on mode
+    if args.purge and args.days == 30:
+        # User didn't specify --days, use purge default
+        days = 365
+    else:
+        days = args.days
+
     # Calculate cutoff time
-    cutoff_time = datetime.now(timezone.utc) - timedelta(days=args.days)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
-    # Track deleted files and errors
-    deleted_logs = []
-    deleted_workers = []
-    errors = []
+    if args.purge:
+        # Purge mode: delete files from archives directory
+        archives_dir = config.project_dir / ".gza" / "archives"
 
-    # Clean logs directory
-    if config.log_path.exists():
-        for log_file in config.log_path.iterdir():
-            if log_file.is_file():
-                if log_file.stat().st_mtime < cutoff_timestamp:
-                    if args.dry_run:
-                        deleted_logs.append(log_file)
-                    else:
-                        try:
-                            log_file.unlink()
+        # Track deleted files and errors
+        deleted_logs = []
+        deleted_workers = []
+        errors = []
+
+        # Delete from archives/logs
+        archives_logs_dir = archives_dir / "logs"
+        if archives_logs_dir.exists():
+            for log_file in archives_logs_dir.iterdir():
+                if log_file.is_file():
+                    if log_file.stat().st_mtime < cutoff_timestamp:
+                        if args.dry_run:
                             deleted_logs.append(log_file)
-                        except OSError as e:
-                            errors.append((log_file, e))
+                        else:
+                            try:
+                                log_file.unlink()
+                                deleted_logs.append(log_file)
+                            except OSError as e:
+                                errors.append((log_file, e))
 
-    # Clean workers directory
-    if config.workers_path.exists():
-        for worker_file in config.workers_path.iterdir():
-            if worker_file.is_file():
-                if worker_file.stat().st_mtime < cutoff_timestamp:
-                    if args.dry_run:
-                        deleted_workers.append(worker_file)
-                    else:
-                        try:
-                            worker_file.unlink()
+        # Delete from archives/workers
+        archives_workers_dir = archives_dir / "workers"
+        if archives_workers_dir.exists():
+            for worker_file in archives_workers_dir.iterdir():
+                if worker_file.is_file():
+                    if worker_file.stat().st_mtime < cutoff_timestamp:
+                        if args.dry_run:
                             deleted_workers.append(worker_file)
-                        except OSError as e:
-                            errors.append((worker_file, e))
+                        else:
+                            try:
+                                worker_file.unlink()
+                                deleted_workers.append(worker_file)
+                            except OSError as e:
+                                errors.append((worker_file, e))
 
-    # Report results
-    if args.dry_run:
-        print(f"Dry run: would delete files older than {args.days} days")
-        print()
-        if deleted_logs:
-            print(f"Logs ({len(deleted_logs)} files):")
-            for log_file in deleted_logs:
-                print(f"  - {log_file.name}")
-        else:
-            print("Logs: no files to delete")
-
-        print()
-        if deleted_workers:
-            print(f"Workers ({len(deleted_workers)} files):")
-            for worker_file in deleted_workers:
-                print(f"  - {worker_file.name}")
-        else:
-            print("Workers: no files to delete")
-    else:
-        print(f"Deleted files older than {args.days} days:")
-        print(f"  - Logs: {len(deleted_logs)} files")
-        print(f"  - Workers: {len(deleted_workers)} files")
-
-        # Report any errors
-        if errors:
+        # Report results
+        if args.dry_run:
+            print(f"Dry run: would purge archived files older than {days} days")
             print()
-            print(f"Errors ({len(errors)} files):")
-            for file, error in errors:
-                print(f"  - {file.name}: {error}", file=sys.stderr)
+            if deleted_logs:
+                print(f"Archived logs ({len(deleted_logs)} files):")
+                for log_file in deleted_logs:
+                    print(f"  - {log_file.name}")
+            else:
+                print("Archived logs: no files to purge")
+
+            print()
+            if deleted_workers:
+                print(f"Archived workers ({len(deleted_workers)} files):")
+                for worker_file in deleted_workers:
+                    print(f"  - {worker_file.name}")
+            else:
+                print("Archived workers: no files to purge")
+        else:
+            print(f"Purged archived files older than {days} days:")
+            print(f"  - Archived logs: {len(deleted_logs)} files")
+            print(f"  - Archived workers: {len(deleted_workers)} files")
+
+            # Report any errors
+            if errors:
+                print()
+                print(f"Errors ({len(errors)} files):")
+                for file, error in errors:
+                    print(f"  - {file.name}: {error}", file=sys.stderr)
+
+    else:
+        # Archive mode: move files to archives directory
+        archives_dir = config.project_dir / ".gza" / "archives"
+
+        # Track archived files and errors
+        archived_logs = []
+        archived_workers = []
+        errors = []
+
+        # Archive logs
+        if config.log_path.exists():
+            archives_logs_dir = archives_dir / "logs"
+            for log_file in config.log_path.iterdir():
+                if log_file.is_file():
+                    if log_file.stat().st_mtime < cutoff_timestamp:
+                        if args.dry_run:
+                            archived_logs.append(log_file)
+                        else:
+                            try:
+                                # Create archive directory if needed
+                                archives_logs_dir.mkdir(parents=True, exist_ok=True)
+                                # Move file to archive
+                                dest = archives_logs_dir / log_file.name
+                                shutil.move(str(log_file), str(dest))
+                                archived_logs.append(log_file)
+                            except OSError as e:
+                                errors.append((log_file, e))
+
+        # Archive workers
+        if config.workers_path.exists():
+            archives_workers_dir = archives_dir / "workers"
+            for worker_file in config.workers_path.iterdir():
+                if worker_file.is_file():
+                    if worker_file.stat().st_mtime < cutoff_timestamp:
+                        if args.dry_run:
+                            archived_workers.append(worker_file)
+                        else:
+                            try:
+                                # Create archive directory if needed
+                                archives_workers_dir.mkdir(parents=True, exist_ok=True)
+                                # Move file to archive
+                                dest = archives_workers_dir / worker_file.name
+                                shutil.move(str(worker_file), str(dest))
+                                archived_workers.append(worker_file)
+                            except OSError as e:
+                                errors.append((worker_file, e))
+
+        # Report results
+        if args.dry_run:
+            print(f"Dry run: would archive files older than {days} days")
+            print()
+            if archived_logs:
+                print(f"Logs ({len(archived_logs)} files):")
+                for log_file in archived_logs:
+                    print(f"  - {log_file.name}")
+            else:
+                print("Logs: no files to archive")
+
+            print()
+            if archived_workers:
+                print(f"Workers ({len(archived_workers)} files):")
+                for worker_file in archived_workers:
+                    print(f"  - {worker_file.name}")
+            else:
+                print("Workers: no files to archive")
+        else:
+            print(f"Archived files older than {days} days:")
+            print(f"  - Logs: {len(archived_logs)} files")
+            print(f"  - Workers: {len(archived_workers)} files")
+
+            # Report any errors
+            if errors:
+                print()
+                print(f"Errors ({len(errors)} files):")
+                for file, error in errors:
+                    print(f"  - {file.name}: {error}", file=sys.stderr)
 
     return 0
 
@@ -3162,18 +3253,23 @@ def main() -> int:
     add_common_args(validate_parser)
 
     # clean command
-    clean_parser = subparsers.add_parser("clean", help="Delete old log and worker files")
+    clean_parser = subparsers.add_parser("clean", help="Archive or delete old log and worker files")
     clean_parser.add_argument(
         "--days",
         type=int,
         default=30,
         metavar="N",
-        help="Delete files older than N days (default: 30)",
+        help="Archive files older than N days (default: 30), or delete archived files if --purge (default: 365)",
+    )
+    clean_parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="Delete archived files instead of archiving (requires --days, default: 365)",
     )
     clean_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be deleted without actually deleting",
+        help="Show what would be archived/deleted without actually doing it",
     )
     add_common_args(clean_parser)
 
