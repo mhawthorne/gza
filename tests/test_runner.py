@@ -7,8 +7,20 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
+from gza.git import Git
 from gza.providers import RunResult
-from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task, _run_non_code_task, post_review_to_pr, run
+from gza.runner import (
+    build_prompt,
+    SUMMARY_DIR,
+    WIP_DIR,
+    _create_and_run_review_task,
+    _run_non_code_task,
+    _save_wip_changes,
+    _restore_wip_changes,
+    _squash_wip_commits,
+    post_review_to_pr,
+    run,
+)
 
 
 class TestBuildPrompt:
@@ -582,6 +594,10 @@ class TestResumeVerificationPrompt:
             mock_worktree_git.has_changes.return_value = True
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
+            # Mock _run for WIP functions (squash, restore)
+            mock_log_result = Mock()
+            mock_log_result.stdout = "WIP: gza task interrupted"
+            mock_worktree_git._run.return_value = mock_log_result
 
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
@@ -732,3 +748,221 @@ class TestResumeVerificationPrompt:
 
         # Verify it includes the normal task prompt
         assert "Complete this task: Implement feature Y" in prompt
+
+
+class TestWIPFunctionality:
+    """Tests for WIP (Work In Progress) save/restore functionality."""
+
+    def test_save_wip_changes_creates_commit_and_diff(self, tmp_path: Path):
+        """Test that _save_wip_changes creates both a WIP commit and a diff backup."""
+        # Setup
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+
+        # Create a mock git repo
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / "test.txt").write_text("test content")
+
+        # Initialize git repo
+        git = Git(worktree_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+
+        # Create config
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        # Save WIP changes
+        _save_wip_changes(task, git, config, "test-branch")
+
+        # Verify WIP commit was created
+        log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+        assert log == "WIP: gza task interrupted"
+
+        # Verify diff backup was created
+        wip_file = tmp_path / WIP_DIR / "20260212-test-task.diff"
+        assert wip_file.exists()
+        diff_content = wip_file.read_text()
+        assert "test.txt" in diff_content
+
+    def test_save_wip_changes_with_no_changes(self, tmp_path: Path):
+        """Test that _save_wip_changes does nothing when there are no changes."""
+        # Setup
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+
+        # Create a git repo with initial commit
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        git = Git(worktree_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (worktree_path / "initial.txt").write_text("initial")
+        git.add(".")
+        git.commit("Initial commit")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        # Save WIP changes (should do nothing)
+        _save_wip_changes(task, git, config, "test-branch")
+
+        # Verify no new commit was created
+        log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+        assert log == "Initial commit"
+
+        # Verify no WIP diff was created
+        wip_file = tmp_path / WIP_DIR / "20260212-test-task.diff"
+        assert not wip_file.exists()
+
+    def test_restore_wip_changes_finds_wip_commit(self, tmp_path: Path):
+        """Test that _restore_wip_changes detects existing WIP commit."""
+        # Setup
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+
+        # Create a git repo with WIP commit
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        git = Git(worktree_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (worktree_path / "test.txt").write_text("test")
+        git.add(".")
+        git.commit("WIP: gza task interrupted\n\nTask ID: 20260212-test-task")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        # Restore WIP changes (should detect existing commit)
+        _restore_wip_changes(task, git, config, "test-branch")
+
+        # Verify commit is still there (not modified)
+        log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+        assert log == "WIP: gza task interrupted"
+
+    def test_restore_wip_changes_applies_diff_backup(self, tmp_path: Path):
+        """Test that _restore_wip_changes applies diff backup when no WIP commit exists."""
+        # Setup
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+
+        # Create a git repo
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        git = Git(worktree_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (worktree_path / "initial.txt").write_text("initial")
+        git.add(".")
+        git.commit("Initial commit")
+
+        # Create a WIP diff backup
+        wip_dir = tmp_path / WIP_DIR
+        wip_dir.mkdir(parents=True)
+        wip_file = wip_dir / "20260212-test-task.diff"
+        diff_content = """diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..9daeafb
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++test
+"""
+        wip_file.write_text(diff_content)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        # Restore WIP changes
+        _restore_wip_changes(task, git, config, "test-branch")
+
+        # Verify diff was applied and committed
+        log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+        assert log == "WIP: restored from diff"
+
+    def test_squash_wip_commits(self, tmp_path: Path):
+        """Test that _squash_wip_commits squashes WIP commits."""
+        # Setup
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+
+        # Create a git repo with multiple WIP commits
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        git = Git(worktree_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+
+        # Initial commit
+        (worktree_path / "initial.txt").write_text("initial")
+        git.add(".")
+        git.commit("Initial commit")
+
+        # WIP commit 1
+        (worktree_path / "wip1.txt").write_text("wip1")
+        git.add(".")
+        git.commit("WIP: first attempt")
+
+        # WIP commit 2
+        (worktree_path / "wip2.txt").write_text("wip2")
+        git.add(".")
+        git.commit("WIP: second attempt")
+
+        # Verify we have 3 commits
+        log_before = git._run("log", "--oneline").stdout.strip().split("\n")
+        assert len(log_before) == 3
+
+        # Squash WIP commits
+        _squash_wip_commits(git, task)
+
+        # Verify we're back to 1 commit with changes staged
+        log_after = git._run("log", "--oneline").stdout.strip().split("\n")
+        assert len(log_after) == 1
+        assert log_after[0].endswith("Initial commit")
+
+        # Verify changes are staged
+        assert git.has_changes(".", include_untracked=False)
+
+    def test_squash_wip_commits_with_no_wip_commits(self, tmp_path: Path):
+        """Test that _squash_wip_commits does nothing when there are no WIP commits."""
+        # Setup
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+
+        # Create a git repo with normal commits
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        git = Git(worktree_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+
+        (worktree_path / "test.txt").write_text("test")
+        git.add(".")
+        git.commit("Normal commit")
+
+        # Squash WIP commits (should do nothing)
+        _squash_wip_commits(git, task)
+
+        # Verify commit is unchanged
+        log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+        assert log == "Normal commit"

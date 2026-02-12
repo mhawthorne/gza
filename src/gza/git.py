@@ -15,13 +15,23 @@ class Git:
     def __init__(self, repo_dir: Path):
         self.repo_dir = repo_dir
 
-    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        """Run a git command."""
+    def _run(self, *args: str, check: bool = True, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+        """Run a git command.
+
+        Args:
+            *args: Git command arguments
+            check: If True, raise GitError on non-zero exit code
+            stdin: Optional bytes to pass as stdin to the command
+
+        Returns:
+            CompletedProcess result
+        """
         result = subprocess.run(
             ["git", *args],
             cwd=self.repo_dir,
             capture_output=True,
             text=True,
+            input=stdin.decode() if stdin else None,
         )
         if check and result.returncode != 0:
             error_output = result.stderr or result.stdout
