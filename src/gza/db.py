@@ -747,6 +747,11 @@ def edit_prompt(
 
     template = TASK_TEMPLATE_HEADER + "\n".join(options) + "\n"
 
+    # Provide default prompt for implement tasks with based_on
+    # This makes the slug unique by including the task ID
+    if not initial_content and task_type == "implement" and based_on:
+        initial_content = f"Implement the plan from task #{based_on}"
+
     content = template + "\n" + initial_content
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:

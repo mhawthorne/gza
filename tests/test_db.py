@@ -594,3 +594,150 @@ class TestGetReviewsForTask:
 
         assert len(reviews) == 1
         assert reviews[0].id == review.id
+
+
+class TestEditPromptDefaultContent:
+    """Tests for edit_prompt default content generation."""
+
+    def test_edit_prompt_provides_default_for_implement_with_based_on(self, tmp_path: Path, monkeypatch):
+        """Test that edit_prompt provides a default prompt for implement tasks with based_on."""
+        from gza.db import edit_prompt
+        import subprocess
+
+        # Mock subprocess.run to capture what would be written to the editor
+        editor_content = []
+
+        def mock_run(cmd):
+            # Read the temporary file that was passed to the editor
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                editor_content.append(f.read())
+            # Return success
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run)
+
+        # Call edit_prompt with implement type and based_on
+        # Note: This will still try to open editor, but our mock will capture the content
+        # We need to also write back to the file so it doesn't return None
+        def mock_run_with_write(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                content = f.read()
+                editor_content.append(content)
+            # Verify the default prompt is present
+            assert "Implement the plan from task #42" in content
+            # Return success without modifying the file
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run_with_write)
+
+        result = edit_prompt(
+            initial_content="",
+            task_type="implement",
+            based_on=42,
+        )
+
+        # Verify the default prompt was included in the editor
+        assert len(editor_content) == 1
+        assert "Implement the plan from task #42" in editor_content[0]
+
+        # Verify the result includes the default
+        assert result == "Implement the plan from task #42"
+
+    def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
+        """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
+        from gza.db import edit_prompt
+        import subprocess
+
+        editor_content = []
+
+        def mock_run(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                content = f.read()
+                editor_content.append(content)
+            # Don't write anything back (simulate empty editor)
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run)
+
+        result = edit_prompt(
+            initial_content="",
+            task_type="plan",  # Not implement
+            based_on=42,
+        )
+
+        # Verify no default prompt was added for plan type
+        assert len(editor_content) == 1
+        assert "Implement the plan from task #42" not in editor_content[0]
+
+        # Verify empty result since editor was "empty"
+        assert result is None
+
+    def test_edit_prompt_no_default_for_implement_without_based_on(self, tmp_path: Path, monkeypatch):
+        """Test that edit_prompt does not provide default for implement tasks without based_on."""
+        from gza.db import edit_prompt
+        import subprocess
+
+        editor_content = []
+
+        def mock_run(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                content = f.read()
+                editor_content.append(content)
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run)
+
+        result = edit_prompt(
+            initial_content="",
+            task_type="implement",
+            based_on=None,  # No based_on
+        )
+
+        # Verify no default prompt was added
+        assert len(editor_content) == 1
+        assert "Implement the plan from task #" not in editor_content[0]
+        assert result is None
+
+    def test_edit_prompt_preserves_custom_initial_content(self, tmp_path: Path, monkeypatch):
+        """Test that edit_prompt does not override custom initial_content."""
+        from gza.db import edit_prompt
+        import subprocess
+
+        editor_content = []
+        custom_content = "Custom implementation task"
+
+        def mock_run(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                content = f.read()
+                editor_content.append(content)
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run)
+
+        result = edit_prompt(
+            initial_content=custom_content,
+            task_type="implement",
+            based_on=42,
+        )
+
+        # Verify custom content is present, not the default
+        assert len(editor_content) == 1
+        assert custom_content in editor_content[0]
+        # The default should NOT be added when initial_content is provided
+        # (it's already in the content area, not overwritten)
+        assert result == custom_content
