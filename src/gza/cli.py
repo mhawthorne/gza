@@ -1329,22 +1329,48 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"Recent Tasks (last {len(recent)})")
     print("=" * 50)
 
+    # Import get_terminal_width
+    from .console import get_terminal_width
+
+    # Calculate available width (80% of terminal)
+    terminal_width = get_terminal_width()
+    table_width = int(terminal_width * 0.8)
+
+    # Fixed column widths
+    status_width = 8
+    id_width = 6
+    type_width = 10
+    cost_width = 8
+    turns_width = 6
+    time_width = 8
+    len_width = 5
+
+    # Calculate remaining space for prompt column
+    fixed_width = status_width + id_width + type_width + cost_width + turns_width + time_width + len_width + 7  # 7 spaces between columns
+    prompt_width = max(20, table_width - fixed_width)  # At least 20 chars for prompt
+
     # Table header
-    print(f"{'Status':<8} {'Cost':>8} {'Turns':>6} {'Time':>8}  Description")
-    print("-" * 50)
+    print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Turns':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
+    print("-" * table_width)
 
     for task in recent:
         status = "✓" if task.status == "completed" else "✗"
+        id_str = f"#{task.id}" if task.id is not None else "-"
+        type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
         turns_str = str(task.num_turns) if task.num_turns is not None else "-"
         time_str = format_duration(task.duration_seconds) if task.duration_seconds else "-"
 
-        # Truncate description to fit
-        desc = task.prompt
-        if len(desc) > 40:
-            desc = desc[:37] + "..."
+        # Calculate prompt length
+        prompt_len = len(task.prompt)
+        len_str = str(prompt_len)
 
-        print(f"{status:<8} {cost_str:>8} {turns_str:>6} {time_str:>8}  {desc}")
+        # Truncate prompt to fit calculated width
+        prompt = task.prompt
+        if len(prompt) > prompt_width:
+            prompt = prompt[:prompt_width - 3] + "..."
+
+        print(f"{status:<{status_width}} {id_str:>{id_width}} {type_str:<{type_width}} {cost_str:>{cost_width}} {turns_str:>{turns_width}} {time_str:>{time_width}} {len_str:>{len_width}}  {prompt}")
 
     print()
     print(f"Total for shown: ${sum(t.cost_usd or 0 for t in recent):.2f}")
