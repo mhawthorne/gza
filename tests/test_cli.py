@@ -3401,7 +3401,7 @@ class TestCleanCommand:
     """Tests for 'gza clean' command."""
 
     def test_clean_default_behavior(self, tmp_path: Path):
-        """Clean command deletes files older than 30 days by default."""
+        """Clean command archives files older than 30 days by default."""
         import time
         from datetime import datetime, timedelta, timezone
 
@@ -3446,13 +3446,16 @@ class TestCleanCommand:
         result = run_gza("clean", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Deleted files older than 30 days" in result.stdout
+        assert "Archived files older than 30 days" in result.stdout
         assert "Logs: 1 files" in result.stdout
         assert "Workers: 1 files" in result.stdout
 
-        # Verify old files were deleted
+        # Verify old files were moved to archives
         assert not old_log.exists()
         assert not old_worker.exists()
+        archives_dir = tmp_path / ".gza" / "archives"
+        assert (archives_dir / "logs" / "old_log.txt").exists()
+        assert (archives_dir / "workers" / "old_worker.json").exists()
 
         # Verify recent files were kept
         assert recent_log.exists()
@@ -3475,15 +3478,18 @@ class TestCleanCommand:
         old_time = (datetime.now(timezone.utc) - timedelta(days=8)).timestamp()
         os.utime(log_file, (old_time, old_time))
 
-        # Run with --days 7 (should delete 8-day-old file)
+        # Run with --days 7 (should archive 8-day-old file)
         result = run_gza("clean", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Deleted files older than 7 days" in result.stdout
+        assert "Archived files older than 7 days" in result.stdout
         assert not log_file.exists()
+        # Verify file was archived
+        archives_dir = tmp_path / ".gza" / "archives"
+        assert (archives_dir / "logs" / "log.txt").exists()
 
     def test_clean_dry_run_mode(self, tmp_path: Path):
-        """Clean command with --dry-run shows what would be deleted without deleting."""
+        """Clean command with --dry-run shows what would be archived without archiving."""
         import os
         from datetime import datetime, timedelta, timezone
 
@@ -3503,11 +3509,13 @@ class TestCleanCommand:
         result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Dry run: would delete files older than 30 days" in result.stdout
+        assert "Dry run: would archive files older than 30 days" in result.stdout
         assert "old_log.txt" in result.stdout
 
-        # Verify file was NOT deleted
+        # Verify file was NOT archived
         assert old_log.exists()
+        archives_dir = tmp_path / ".gza" / "archives"
+        assert not (archives_dir / "logs" / "old_log.txt").exists()
 
     def test_clean_empty_directories(self, tmp_path: Path):
         """Clean command handles empty directories without errors."""
@@ -3563,13 +3571,15 @@ class TestCleanCommand:
         assert result.returncode == 0
         assert "Logs: 3 files" in result.stdout
 
-        # Verify old files deleted, new files kept
+        # Verify old files archived, new files kept
+        archives_dir = tmp_path / ".gza" / "archives"
         for i in range(3):
             assert not (logs_dir / f"old_{i}.txt").exists()
+            assert (archives_dir / "logs" / f"old_{i}.txt").exists()
             assert (logs_dir / f"new_{i}.txt").exists()
 
     def test_clean_only_files_not_directories(self, tmp_path: Path):
-        """Clean command only deletes files, not directories."""
+        """Clean command only archives files, not directories."""
         import os
         from datetime import datetime, timedelta, timezone
 
@@ -3590,8 +3600,156 @@ class TestCleanCommand:
 
         assert result.returncode == 0
 
-        # Verify subdirectory was NOT deleted
+        # Verify subdirectory was NOT archived
         assert old_subdir.exists()
+
+    def test_clean_second_run_is_noop(self, tmp_path: Path):
+        """Second run of clean should be a no-op (only checks source dirs)."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create old file
+        old_log = logs_dir / "old_log.txt"
+        old_log.write_text("old content")
+        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        os.utime(old_log, (old_time, old_time))
+
+        # First run - archives the file
+        result1 = run_gza("clean", "--project", str(tmp_path))
+        assert result1.returncode == 0
+        assert "Logs: 1 files" in result1.stdout
+
+        # Second run - should find nothing to archive
+        result2 = run_gza("clean", "--project", str(tmp_path))
+        assert result2.returncode == 0
+        assert "Logs: 0 files" in result2.stdout
+
+    def test_clean_purge_mode(self, tmp_path: Path):
+        """Clean with --purge deletes archived files older than N days."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        # Create archives directory with old files
+        archives_logs_dir = tmp_path / ".gza" / "archives" / "logs"
+        archives_workers_dir = tmp_path / ".gza" / "archives" / "workers"
+        archives_logs_dir.mkdir(parents=True, exist_ok=True)
+        archives_workers_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create very old archived files (400 days old)
+        old_archived_log = archives_logs_dir / "old_archived.txt"
+        old_archived_worker = archives_workers_dir / "old_archived.json"
+        old_archived_log.write_text("old archived content")
+        old_archived_worker.write_text("old archived content")
+
+        very_old_time = (datetime.now(timezone.utc) - timedelta(days=400)).timestamp()
+        os.utime(old_archived_log, (very_old_time, very_old_time))
+        os.utime(old_archived_worker, (very_old_time, very_old_time))
+
+        # Create recent archived files (100 days old)
+        recent_archived_log = archives_logs_dir / "recent_archived.txt"
+        recent_archived_log.write_text("recent archived content")
+        recent_time = (datetime.now(timezone.utc) - timedelta(days=100)).timestamp()
+        os.utime(recent_archived_log, (recent_time, recent_time))
+
+        # Run purge with default days (365)
+        result = run_gza("clean", "--purge", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Purged archived files older than 365 days" in result.stdout
+        assert "Archived logs: 1 files" in result.stdout
+        assert "Archived workers: 1 files" in result.stdout
+
+        # Verify very old files were deleted
+        assert not old_archived_log.exists()
+        assert not old_archived_worker.exists()
+
+        # Verify recent archived files were kept
+        assert recent_archived_log.exists()
+
+    def test_clean_purge_with_custom_days(self, tmp_path: Path):
+        """Clean --purge respects custom --days value."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        # Create archives directory
+        archives_logs_dir = tmp_path / ".gza" / "archives" / "logs"
+        archives_logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create archived file 200 days old
+        archived_log = archives_logs_dir / "archived.txt"
+        archived_log.write_text("archived content")
+        old_time = (datetime.now(timezone.utc) - timedelta(days=200)).timestamp()
+        os.utime(archived_log, (old_time, old_time))
+
+        # Run purge with --days 180 (should delete 200-day-old file)
+        result = run_gza("clean", "--purge", "--days", "180", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Purged archived files older than 180 days" in result.stdout
+        assert not archived_log.exists()
+
+    def test_clean_purge_dry_run(self, tmp_path: Path):
+        """Clean --purge --dry-run shows what would be deleted without deleting."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        # Create archives directory
+        archives_logs_dir = tmp_path / ".gza" / "archives" / "logs"
+        archives_logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create old archived file
+        old_archived = archives_logs_dir / "old_archived.txt"
+        old_archived.write_text("old archived content")
+        old_time = (datetime.now(timezone.utc) - timedelta(days=400)).timestamp()
+        os.utime(old_archived, (old_time, old_time))
+
+        # Run purge with --dry-run
+        result = run_gza("clean", "--purge", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Dry run: would purge archived files older than 365 days" in result.stdout
+        assert "old_archived.txt" in result.stdout
+
+        # Verify file was NOT deleted
+        assert old_archived.exists()
+
+    def test_clean_purge_second_run_is_noop(self, tmp_path: Path):
+        """Second run of clean --purge should be a no-op (only checks archives dir)."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        # Create archives directory
+        archives_logs_dir = tmp_path / ".gza" / "archives" / "logs"
+        archives_logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create old archived file
+        old_archived = archives_logs_dir / "old_archived.txt"
+        old_archived.write_text("old archived content")
+        old_time = (datetime.now(timezone.utc) - timedelta(days=400)).timestamp()
+        os.utime(old_archived, (old_time, old_time))
+
+        # First purge run - deletes the file
+        result1 = run_gza("clean", "--purge", "--project", str(tmp_path))
+        assert result1.returncode == 0
+        assert "Archived logs: 1 files" in result1.stdout
+
+        # Second purge run - should find nothing to delete
+        result2 = run_gza("clean", "--purge", "--project", str(tmp_path))
+        assert result2.returncode == 0
+        assert "Archived logs: 0 files" in result2.stdout
 
 
 class TestMaxTurnsFlag:
