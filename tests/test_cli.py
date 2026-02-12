@@ -141,6 +141,70 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert "No completed or failed tasks with status 'failed'" in result.stdout
 
+    def test_history_filter_by_task_type(self, tmp_path: Path):
+        """History command filters by task_type."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
+            {"prompt": "Explore task", "status": "completed", "task_type": "explore"},
+            {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
+            {"prompt": "Implement task", "status": "completed", "task_type": "implement"},
+            {"prompt": "Review task", "status": "completed", "task_type": "review"},
+            {"prompt": "Improve task", "status": "completed", "task_type": "improve"},
+        ])
+
+        result = run_gza("history", "--type", "implement", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement task" in result.stdout
+        assert "Regular task" not in result.stdout
+        assert "Explore task" not in result.stdout
+        assert "Plan task" not in result.stdout
+        assert "Review task" not in result.stdout
+        assert "Improve task" not in result.stdout
+
+    def test_history_filter_by_multiple_types(self, tmp_path: Path):
+        """History command filters by task_type for different types."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
+            {"prompt": "Explore task 1", "status": "completed", "task_type": "explore"},
+            {"prompt": "Explore task 2", "status": "completed", "task_type": "explore"},
+            {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
+        ])
+
+        result = run_gza("history", "--type", "explore", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Explore task 1" in result.stdout
+        assert "Explore task 2" in result.stdout
+        assert "Regular task" not in result.stdout
+        assert "Plan task" not in result.stdout
+
+    def test_history_filter_by_status_and_type(self, tmp_path: Path):
+        """History command filters by both status and task_type."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Completed implement", "status": "completed", "task_type": "implement"},
+            {"prompt": "Failed implement", "status": "failed", "task_type": "implement"},
+            {"prompt": "Completed plan", "status": "completed", "task_type": "plan"},
+        ])
+
+        result = run_gza("history", "--status", "completed", "--type", "implement", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Completed implement" in result.stdout
+        assert "Failed implement" not in result.stdout
+        assert "Completed plan" not in result.stdout
+
+    def test_history_filter_by_type_no_matching_tasks(self, tmp_path: Path):
+        """History command handles no tasks matching type filter."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
+        ])
+
+        result = run_gza("history", "--type", "review", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No completed or failed tasks with type 'review'" in result.stdout
+
 
 class TestNextCommand:
     """Tests for 'gza next' command."""

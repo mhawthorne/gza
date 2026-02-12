@@ -457,22 +457,32 @@ class SqliteTaskStore:
             cur = conn.execute(query)
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_history(self, limit: int | None = 10, status: str | None = None) -> list[Task]:
+    def get_history(self, limit: int | None = 10, status: str | None = None, task_type: str | None = None) -> list[Task]:
         """Get completed/failed tasks, most recent first.
 
         Args:
             limit: Maximum number of tasks to return (None for all)
             status: Filter by specific status (e.g., 'completed', 'failed', 'unmerged')
                    If None, returns all completed/failed/unmerged tasks
+            task_type: Filter by specific task_type (e.g., 'task', 'explore', 'plan', 'implement', 'review', 'improve')
+                      If None, returns all task types
         """
         with self._connect() as conn:
-            # Build WHERE clause based on status filter
+            # Build WHERE clause based on status and task_type filters
+            where_clauses = []
+            params = []
+
             if status:
-                where_clause = "WHERE status = ?"
-                params = [status]
+                where_clauses.append("status = ?")
+                params.append(status)
             else:
-                where_clause = "WHERE status IN ('completed', 'failed', 'unmerged')"
-                params = []
+                where_clauses.append("status IN ('completed', 'failed', 'unmerged')")
+
+            if task_type:
+                where_clauses.append("task_type = ?")
+                params.append(task_type)
+
+            where_clause = "WHERE " + " AND ".join(where_clauses)
 
             # Add LIMIT clause if specified
             if limit is None:
