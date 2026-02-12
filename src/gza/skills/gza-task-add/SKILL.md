@@ -64,6 +64,7 @@ Common flag combinations:
 - Grouped tasks: `uv run gza add --group auth --type implement "add login endpoint"`
 - Dependent task: `uv run gza add --depends-on 5 "build on task 5's foundation"`
 - Based-on task: `uv run gza add --type implement --based-on 5 "implement the approach from task #5"`
+- Based-on with default prompt: `uv run gza add --type implement --based-on 5` (opens editor with default: "Implement the plan from task #5")
 
 ### Step 5: Confirm success
 
