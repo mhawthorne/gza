@@ -17,6 +17,7 @@ DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
 PLAN_DIR = f".{APP_NAME}/plans"
 REVIEW_DIR = f".{APP_NAME}/reviews"
 SUMMARY_DIR = f".{APP_NAME}/summaries"
+WIP_DIR = f".{APP_NAME}/wip"
 
 
 # format_duration logic is now in console.stats_line
@@ -331,6 +332,140 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
     )
 
 
+def _save_wip_changes(
+    task: Task,
+    worktree_git: Git,
+    config: Config,
+    branch_name: str,
+) -> None:
+    """Save WIP changes when task fails or is interrupted.
+
+    This does two things:
+    1. Commits any uncommitted changes with --no-verify
+    2. Backs up the diff to .gza/wip/<task-id>.diff
+
+    Args:
+        task: The task that failed/was interrupted
+        worktree_git: Git instance for the worktree
+        config: Configuration object
+        branch_name: Name of the branch with the WIP changes
+    """
+    # Check if there are any changes to save
+    if not worktree_git.has_changes("."):
+        return
+
+    # Create WIP directory
+    wip_dir = config.project_dir / WIP_DIR
+    wip_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get the diff for backup
+    worktree_git.add(".")
+    diff = worktree_git._run("diff", "--cached", check=False).stdout
+
+    # Save diff to backup file
+    if task.task_id and diff:
+        wip_file = wip_dir / f"{task.task_id}.diff"
+        wip_file.write_text(diff)
+        console.print(f"[yellow]Saved WIP diff to: {wip_file.relative_to(config.project_dir)}[/yellow]")
+
+    # Commit changes with --no-verify
+    try:
+        worktree_git._run("commit", "--no-verify", "-m", f"WIP: gza task interrupted\n\nTask ID: {task.task_id}")
+        console.print(f"[yellow]Saved WIP commit on branch: {branch_name}[/yellow]")
+    except GitError as e:
+        # If commit fails, that's okay - we have the diff backup
+        console.print(f"[yellow]Warning: Could not create WIP commit: {e}[/yellow]")
+
+
+def _restore_wip_changes(
+    task: Task,
+    worktree_git: Git,
+    config: Config,
+    branch_name: str,
+) -> None:
+    """Restore WIP changes when resuming a task.
+
+    Checks if the branch has a WIP commit. If not, tries to apply the
+    stored diff from .gza/wip/<task-id>.diff.
+
+    Args:
+        task: The task being resumed
+        worktree_git: Git instance for the worktree
+        config: Configuration object
+        branch_name: Name of the branch to restore WIP changes to
+    """
+    if not task.task_id:
+        return
+
+    # Check if the last commit is a WIP commit
+    try:
+        last_commit_msg = worktree_git._run("log", "-1", "--pretty=%B", check=False).stdout.strip()
+        if last_commit_msg.startswith("WIP: gza task interrupted"):
+            console.print("[green]Found WIP commit on branch - resuming from there[/green]")
+            return
+    except GitError:
+        pass
+
+    # No WIP commit found - try to apply stored diff
+    wip_dir = config.project_dir / WIP_DIR
+    wip_file = wip_dir / f"{task.task_id}.diff"
+
+    if wip_file.exists():
+        diff_content = wip_file.read_text()
+        if diff_content.strip():
+            console.print(f"[yellow]WIP commit not found - applying stored diff from {wip_file.relative_to(config.project_dir)}[/yellow]")
+            try:
+                # Apply the diff
+                result = worktree_git._run("apply", "--cached", stdin=diff_content.encode(), check=False)
+                if result.returncode == 0:
+                    # Commit the restored changes
+                    worktree_git._run("commit", "--no-verify", "-m", f"WIP: restored from diff\n\nTask ID: {task.task_id}")
+                    console.print("[green]Successfully restored WIP changes from diff[/green]")
+                else:
+                    console.print(f"[yellow]Warning: Could not apply WIP diff: {result.stderr}[/yellow]")
+            except GitError as e:
+                console.print(f"[yellow]Warning: Could not apply WIP diff: {e}[/yellow]")
+
+
+def _squash_wip_commits(
+    worktree_git: Git,
+    task: Task,
+) -> None:
+    """Squash WIP commits into the final commit.
+
+    If there are WIP commits on the branch, this will squash them
+    into the final task commit before marking the task complete.
+
+    Args:
+        worktree_git: Git instance for the worktree
+        task: The task being completed
+    """
+    # Check if there are any WIP commits to squash
+    try:
+        # Look for WIP commits in the recent history
+        log_output = worktree_git._run("log", "-10", "--pretty=%s", check=False).stdout.strip()
+        if not log_output:
+            return
+
+        commit_messages = log_output.split("\n")
+        wip_count = sum(1 for msg in commit_messages if msg.startswith("WIP:"))
+
+        if wip_count == 0:
+            return
+
+        console.print(f"[yellow]Found {wip_count} WIP commit(s) - squashing into final commit[/yellow]")
+
+        # Use git reset --soft to squash commits
+        # Reset back to before the WIP commits, keeping all changes staged
+        worktree_git._run("reset", "--soft", f"HEAD~{wip_count}")
+
+        console.print("[green]WIP commits squashed successfully[/green]")
+
+    except GitError as e:
+        # If squashing fails, log but continue - the WIP commits will remain
+        console.print(f"[yellow]Warning: Could not squash WIP commits: {e}[/yellow]")
+
+
 def post_review_to_pr(
     review_task: Task,
     impl_task: Task,
@@ -639,6 +774,10 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
     # Create a Git instance for the worktree
     worktree_git = Git(worktree_path)
 
+    # Restore WIP changes if resuming
+    if resume:
+        _restore_wip_changes(task, worktree_git, config, branch_name)
+
     # Mark task in progress (unless resuming, in which case already set)
     if not resume:
         store.mark_in_progress(task)
@@ -694,6 +833,8 @@ Once you've verified and updated the todo list, continue from where you left off
 
         # Handle failures - check error_type first, then exit codes
         if result.error_type == "max_turns":
+            # Save WIP changes before marking failed
+            _save_wip_changes(task, worktree_git, config, branch_name)
             error_message(f"Task failed: max turns of {config.max_turns} exceeded")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
@@ -704,6 +845,8 @@ Once you've verified and updated the todo list, continue from where you left off
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             return 0
         elif exit_code == 124:
+            # Save WIP changes before marking failed
+            _save_wip_changes(task, worktree_git, config, branch_name)
             error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
@@ -714,6 +857,8 @@ Once you've verified and updated the todo list, continue from where you left off
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             return 0
         elif exit_code != 0:
+            # Save WIP changes before marking failed
+            _save_wip_changes(task, worktree_git, config, branch_name)
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
@@ -727,6 +872,7 @@ Once you've verified and updated the todo list, continue from where you left off
         # For regular tasks: require code changes
         if not worktree_git.has_changes("."):
             # Check exit code - if Claude succeeded but made no changes, that's a failure
+            # Note: No need to save WIP here since there are no changes
             error_message("No changes made")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
@@ -736,6 +882,9 @@ Once you've verified and updated the todo list, continue from where you left off
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
             return 0
+
+        # Squash any WIP commits before creating final commit
+        _squash_wip_commits(worktree_git, task)
 
         # Commit changes in worktree
         worktree_git.add(".")
