@@ -25,6 +25,23 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+def format_elapsed_time(seconds: float) -> str:
+    """Format elapsed time in a human-readable format.
+
+    Args:
+        seconds: Elapsed time in seconds
+
+    Returns:
+        Formatted time string (e.g., '2m 30s' or '45s')
+    """
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    else:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+
+
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int = None) -> int:
     """Spawn a background worker process.
 
@@ -379,6 +396,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, cleanup_handler)
     signal.signal(signal.SIGTERM, cleanup_handler)
 
+    # Track elapsed time for the work session
+    start_time = time.time()
+
     try:
         # Run the task(s)
         if hasattr(args, 'task_ids') and args.task_ids:
@@ -403,7 +423,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
             # All tasks completed successfully
             if tasks_completed > 1:
-                print(f"\n=== Completed {tasks_completed} tasks ===")
+                elapsed = format_elapsed_time(time.time() - start_time)
+                print(f"\n=== Completed {tasks_completed} tasks in {elapsed} ===")
             registry.mark_completed(worker_id, exit_code=0, status="completed")
             return 0
 
@@ -436,11 +457,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 from .db import SqliteTaskStore
                 store = SqliteTaskStore(config.db_path)
                 if not store.get_next_pending():
-                    print(f"\nCompleted {tasks_completed} task(s). No more pending tasks.")
+                    elapsed = format_elapsed_time(time.time() - start_time)
+                    print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")
                     break
 
         if tasks_completed > 1:
-            print(f"\n=== Completed {tasks_completed} tasks ===")
+            elapsed = format_elapsed_time(time.time() - start_time)
+            print(f"\n=== Completed {tasks_completed} tasks in {elapsed} ===")
 
         # Clean up worker registration on normal exit
         registry.mark_completed(worker_id, exit_code=0, status="completed")
