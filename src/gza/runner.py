@@ -702,7 +702,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
-            _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code == 124:
             error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
@@ -713,7 +712,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
-            _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code != 0:
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
@@ -724,7 +722,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
-            _cleanup_worktree(git, worktree_path)
             return 0
 
         # For regular tasks: require code changes
@@ -738,7 +735,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
-            _cleanup_worktree(git, worktree_path)
             return 0
 
         # Commit changes in worktree
@@ -792,8 +788,6 @@ Once you've verified and updated the todo list, continue from where you left off
         console.print("To merge:")
         console.print(f"  [cyan]gza merge {task.id}[/cyan]  [dim]# or: git merge --squash {branch_name}[/dim]")
 
-        _cleanup_worktree(git, worktree_path)
-
         # Auto-create and run review task if requested
         if task.create_review:
             return _create_and_run_review_task(task, config, store)
@@ -802,11 +796,9 @@ Once you've verified and updated the todo list, continue from where you left off
 
     except GitError as e:
         error_message(f"Git error: {e}")
-        _cleanup_worktree(git, worktree_path)
         return 1
     except KeyboardInterrupt:
         console.print("\nInterrupted")
-        _cleanup_worktree(git, worktree_path)
         return 130
 
 
@@ -912,7 +904,6 @@ Once you've verified and updated the todo list, continue from where you left off
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=resume_session_id)
         except KeyboardInterrupt:
             console.print("\nInterrupted")
-            _cleanup_worktree(git, worktree_path)
             return 130
 
         exit_code = result.exit_code
@@ -933,7 +924,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
-            _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code == 124:
             error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
@@ -944,7 +934,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
-            _cleanup_worktree(git, worktree_path)
             return 0
         elif exit_code != 0:
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
@@ -955,7 +944,6 @@ Once you've verified and updated the todo list, continue from where you left off
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
-            _cleanup_worktree(git, worktree_path)
             return 0
 
         # Copy report file from worktree to main project directory
@@ -1011,19 +999,8 @@ Once you've verified and updated the todo list, continue from where you left off
             (f"gza resume {task.id}", "resume from where it left off"),
         ])
 
-        # Cleanup worktree
-        _cleanup_worktree(git, worktree_path)
         return 0
 
     except GitError as e:
         error_message(f"Git error: {e}")
-        _cleanup_worktree(git, worktree_path)
         return 1
-
-
-def _cleanup_worktree(git: Git, worktree_path: Path) -> None:
-    """Clean up a worktree, ignoring errors."""
-    try:
-        git.worktree_remove(worktree_path, force=True)
-    except GitError:
-        pass

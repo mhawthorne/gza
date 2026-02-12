@@ -561,7 +561,6 @@ class TestResumeVerificationPrompt:
         # Mock provider and git
         with patch('gza.runner.get_provider') as mock_get_provider, \
              patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner._cleanup_worktree'), \
              patch('gza.runner.load_dotenv'):
 
             mock_provider = Mock()
