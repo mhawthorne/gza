@@ -457,27 +457,41 @@ class SqliteTaskStore:
             cur = conn.execute(query)
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_history(self, limit: int | None = 10) -> list[Task]:
-        """Get completed/failed tasks, most recent first."""
+    def get_history(self, limit: int | None = 10, status: str | None = None) -> list[Task]:
+        """Get completed/failed tasks, most recent first.
+
+        Args:
+            limit: Maximum number of tasks to return (None for all)
+            status: Filter by specific status (e.g., 'completed', 'failed', 'unmerged')
+                   If None, returns all completed/failed/unmerged tasks
+        """
         with self._connect() as conn:
-            if limit is None:
-                cur = conn.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE status IN ('completed', 'failed', 'unmerged')
-                    ORDER BY completed_at DESC, id DESC
-                    """
-                )
+            # Build WHERE clause based on status filter
+            if status:
+                where_clause = "WHERE status = ?"
+                params = [status]
             else:
-                cur = conn.execute(
-                    """
+                where_clause = "WHERE status IN ('completed', 'failed', 'unmerged')"
+                params = []
+
+            # Add LIMIT clause if specified
+            if limit is None:
+                query = f"""
                     SELECT * FROM tasks
-                    WHERE status IN ('completed', 'failed', 'unmerged')
+                    {where_clause}
+                    ORDER BY completed_at DESC, id DESC
+                """
+                cur = conn.execute(query, params)
+            else:
+                query = f"""
+                    SELECT * FROM tasks
+                    {where_clause}
                     ORDER BY completed_at DESC, id DESC
                     LIMIT ?
-                    """,
-                    (limit,),
-                )
+                """
+                params.append(limit)
+                cur = conn.execute(query, params)
+
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_unmerged(self) -> list[Task]:

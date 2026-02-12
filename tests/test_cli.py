@@ -79,6 +79,68 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
 
+    def test_history_filter_by_completed_status(self, tmp_path: Path):
+        """History command filters by completed status."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Completed task 1", "status": "completed"},
+            {"prompt": "Completed task 2", "status": "completed"},
+            {"prompt": "Failed task", "status": "failed"},
+            {"prompt": "Unmerged task", "status": "unmerged"},
+        ])
+
+        result = run_gza("history", "--status", "completed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Completed task 1" in result.stdout
+        assert "Completed task 2" in result.stdout
+        assert "Failed task" not in result.stdout
+        assert "Unmerged task" not in result.stdout
+
+    def test_history_filter_by_failed_status(self, tmp_path: Path):
+        """History command filters by failed status."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Completed task", "status": "completed"},
+            {"prompt": "Failed task 1", "status": "failed"},
+            {"prompt": "Failed task 2", "status": "failed"},
+            {"prompt": "Unmerged task", "status": "unmerged"},
+        ])
+
+        result = run_gza("history", "--status", "failed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failed task 1" in result.stdout
+        assert "Failed task 2" in result.stdout
+        assert "Completed task" not in result.stdout
+        assert "Unmerged task" not in result.stdout
+
+    def test_history_filter_by_unmerged_status(self, tmp_path: Path):
+        """History command filters by unmerged status."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Completed task", "status": "completed"},
+            {"prompt": "Failed task", "status": "failed"},
+            {"prompt": "Unmerged task 1", "status": "unmerged"},
+            {"prompt": "Unmerged task 2", "status": "unmerged"},
+        ])
+
+        result = run_gza("history", "--status", "unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Unmerged task 1" in result.stdout
+        assert "Unmerged task 2" in result.stdout
+        assert "Completed task" not in result.stdout
+        assert "Failed task" not in result.stdout
+
+    def test_history_filter_with_no_matching_tasks(self, tmp_path: Path):
+        """History command handles no tasks matching filter."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Completed task", "status": "completed"},
+        ])
+
+        result = run_gza("history", "--status", "failed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No completed or failed tasks with status 'failed'" in result.stdout
+
 
 class TestNextCommand:
     """Tests for 'gza next' command."""
