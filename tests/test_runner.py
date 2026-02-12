@@ -7,7 +7,7 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
-from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task
+from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task, post_review_to_pr
 
 
 class TestBuildPrompt:
@@ -140,10 +140,16 @@ class TestReviewTaskSlugGeneration:
         def mock_run(config, task_id):
             return 0
 
-        # Temporarily replace run function
+        # Mock post_review_to_pr to avoid GitHub CLI dependency
+        def mock_post_review_to_pr(*args, **kwargs):
+            pass
+
+        # Temporarily replace run and post_review_to_pr functions
         import gza.runner
         original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
             # Call _create_and_run_review_task
@@ -158,6 +164,7 @@ class TestReviewTaskSlugGeneration:
             assert review_task.prompt == "review add-docker-volumes"
         finally:
             gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
 
     def test_review_task_handles_retry_suffix(self, tmp_path: Path):
         """Test that review task slug handles retry suffix in implementation task_id."""
@@ -180,9 +187,14 @@ class TestReviewTaskSlugGeneration:
         def mock_run(config, task_id):
             return 0
 
+        def mock_post_review_to_pr(*args, **kwargs):
+            pass
+
         import gza.runner
         original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
             _create_and_run_review_task(impl_task, config, store)
@@ -193,6 +205,7 @@ class TestReviewTaskSlugGeneration:
             assert review_task.prompt == "review fix-authentication-bug"
         finally:
             gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
 
     def test_review_task_fallback_without_task_id(self, tmp_path: Path):
         """Test that review task falls back gracefully if task_id is not set."""
@@ -215,9 +228,14 @@ class TestReviewTaskSlugGeneration:
         def mock_run(config, task_id):
             return 0
 
+        def mock_post_review_to_pr(*args, **kwargs):
+            pass
+
         import gza.runner
         original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
             _create_and_run_review_task(impl_task, config, store)
@@ -228,3 +246,115 @@ class TestReviewTaskSlugGeneration:
             assert "Review the implementation from task #1" in review_task.prompt
         finally:
             gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
+
+    def test_auto_review_calls_pr_posting_on_success(self, tmp_path: Path):
+        """Test that _create_and_run_review_task calls post_review_to_pr on successful completion."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task with a PR
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.branch = "gza/20260211-add-user-authentication"
+        impl_task.pr_number = 123
+        store.update(impl_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        # Track if post_review_to_pr was called
+        pr_post_called = []
+
+        def mock_run(config, task_id):
+            # Mark the review task as completed
+            review_task = store.get(task_id)
+            review_task.status = "completed"
+            store.update(review_task)
+            return 0  # Success
+
+        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
+            pr_post_called.append({
+                'review_id': review_task.id,
+                'impl_id': impl_task.id,
+                'required': required
+            })
+
+        import gza.runner
+        original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
+        gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
+
+        try:
+            # Call _create_and_run_review_task
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            # Verify success
+            assert exit_code == 0
+
+            # Verify post_review_to_pr was called
+            assert len(pr_post_called) == 1
+            assert pr_post_called[0]['review_id'] == 2  # The created review task
+            assert pr_post_called[0]['impl_id'] == 1   # The implementation task
+            assert pr_post_called[0]['required'] is False  # Default behavior
+        finally:
+            gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
+
+    def test_auto_review_skips_pr_posting_on_failure(self, tmp_path: Path):
+        """Test that _create_and_run_review_task skips PR posting if review fails."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task with a PR
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.branch = "gza/20260211-add-user-authentication"
+        impl_task.pr_number = 123
+        store.update(impl_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        # Track if post_review_to_pr was called
+        pr_post_called = []
+
+        def mock_run(config, task_id):
+            # Mark the review task as failed
+            review_task = store.get(task_id)
+            review_task.status = "failed"
+            store.update(review_task)
+            return 1  # Failure
+
+        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
+            pr_post_called.append(True)
+
+        import gza.runner
+        original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
+        gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
+
+        try:
+            # Call _create_and_run_review_task
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            # Verify failure
+            assert exit_code == 1
+
+            # Verify post_review_to_pr was NOT called (review failed)
+            assert len(pr_post_called) == 0
+        finally:
+            gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
