@@ -1,5 +1,7 @@
 """Rich console output helpers for gza."""
 
+import shutil
+
 from rich.console import Console
 from rich.table import Table
 
@@ -7,6 +9,18 @@ from .db import TaskStats
 
 # Shared console instance for all output
 console = Console()
+
+
+def get_terminal_width() -> int:
+    """Get the current terminal width.
+
+    Returns:
+        Terminal width in characters, defaulting to 80 if unable to determine.
+    """
+    try:
+        return shutil.get_terminal_size().columns
+    except (AttributeError, ValueError, OSError):
+        return 80
 
 
 def task_header(prompt: str, task_id: str, task_type: str) -> None:
