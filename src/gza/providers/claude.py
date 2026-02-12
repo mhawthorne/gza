@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from rich.console import Console
 
 from .base import (
     Provider,
@@ -19,6 +22,17 @@ from .base import (
 
 if TYPE_CHECKING:
     from ..config import Config
+
+
+# Output color scheme for conversation stream
+OUTPUT_COLORS = {
+    "turn_info": "blue",
+    "assistant_text": "green",
+    "tool_use": "magenta",
+    "todo_item": "dim",
+}
+
+console = Console()
 
 
 def _get_docker_config(image_name: str) -> DockerConfig:
@@ -177,6 +191,7 @@ class ClaudeProvider(Provider):
                     # Track unique message IDs as turn proxy
                     if "seen_msg_ids" not in data:
                         data["seen_msg_ids"] = set()
+                        data["start_time"] = time.time()
                     if msg_id and msg_id not in data["seen_msg_ids"]:
                         data["seen_msg_ids"].add(msg_id)
                         turn_count = len(data["seen_msg_ids"])
@@ -191,6 +206,13 @@ class ClaudeProvider(Provider):
                         data["total_input_tokens"] += usage.get("cache_read_input_tokens", 0)
                         data["total_output_tokens"] += usage.get("output_tokens", 0)
 
+                        # Calculate runtime
+                        elapsed_seconds = int(time.time() - data["start_time"])
+                        if elapsed_seconds >= 60:
+                            runtime_str = f"{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
+                        else:
+                            runtime_str = f"{elapsed_seconds}s"
+
                         # Display live stats
                         total_tokens = data["total_input_tokens"] + data["total_output_tokens"]
                         if total_tokens > 1_000_000:
@@ -199,7 +221,13 @@ class ClaudeProvider(Provider):
                             token_str = f"{total_tokens // 1000}k tokens"
                         else:
                             token_str = f"{total_tokens} tokens"
-                        print(f"  [turn {turn_count}, {token_str}]")
+
+                        # Add blank line before turn (except first turn)
+                        if turn_count > 1:
+                            console.print()
+
+                        # Print turn info with color
+                        console.print(f"  [turn {turn_count}, {token_str}, {runtime_str}]", style=OUTPUT_COLORS["turn_info"])
 
                     for content in message.get("content", []):
                         if content.get("type") == "tool_use":
@@ -215,10 +243,10 @@ class ClaudeProvider(Provider):
                                 # Truncate to 80 chars
                                 if len(command) > 80:
                                     command = command[:77] + "..."
-                                print(f"  → {tool_name} {command}")
+                                console.print(f"  → {tool_name} {command}", style=OUTPUT_COLORS["tool_use"])
                             elif tool_name == "Glob":
                                 pattern = tool_input.get("pattern", "")
-                                print(f"  → {tool_name} {pattern}")
+                                console.print(f"  → {tool_name} {pattern}", style=OUTPUT_COLORS["tool_use"])
                             elif tool_name == "TodoWrite":
                                 todos = tool_input.get("todos", [])
                                 todos_summary = f"{len(todos)} todos"
@@ -228,7 +256,7 @@ class ClaudeProvider(Provider):
                                     in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
                                     completed = sum(1 for t in todos if t.get("status") == "completed")
                                     todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
-                                print(f"  → {tool_name} {todos_summary}")
+                                console.print(f"  → {tool_name} {todos_summary}", style=OUTPUT_COLORS["tool_use"])
                                 # Print each todo with status icon and truncated content
                                 status_icons = {
                                     "pending": "○",
@@ -242,7 +270,7 @@ class ClaudeProvider(Provider):
                                     # Truncate to 60 chars
                                     if len(content) > 60:
                                         content = content[:57] + "..."
-                                    print(f"      {icon} {content}")
+                                    console.print(f"      {icon} {content}", style=OUTPUT_COLORS["todo_item"])
                             elif tool_name == "Edit":
                                 # Enhanced logging for Edit tool
                                 parts = [tool_name]
@@ -282,16 +310,16 @@ class ClaudeProvider(Provider):
                                     preview = preview.replace("\r", "\\r").replace("\t", "\\t")
                                     parts.append(f'"{preview}"')
 
-                                print(f"  → {' '.join(parts)}")
+                                console.print(f"  → {' '.join(parts)}", style=OUTPUT_COLORS["tool_use"])
                             elif file_path:
-                                print(f"  → {tool_name} {file_path}")
+                                console.print(f"  → {tool_name} {file_path}", style=OUTPUT_COLORS["tool_use"])
                             else:
-                                print(f"  → {tool_name}")
+                                console.print(f"  → {tool_name}", style=OUTPUT_COLORS["tool_use"])
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:
                                 first_line = text.split("\n")[0][:80]
-                                print(f"  {first_line}")
+                                console.print(f"  {first_line}", style=OUTPUT_COLORS["assistant_text"])
 
                 elif event_type == "result":
                     data["result"] = event
