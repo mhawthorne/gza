@@ -87,6 +87,17 @@ When renaming a field across the codebase:
 2. Check both `tasks.py` and `db.py` for Task-related changes
 3. Update tests in bulk, not one test method at a time
 
+## Code Reuse
+
+**Single code path principle**: When the same behavior is needed in multiple places, implement it once and call it from all locations. Don't copy logic.
+
+Example: If `--run` means "create then immediately execute", it should call the same execution path as `gza work`, not duplicate the post-completion logic (PR posting, auto-review, etc.). Otherwise bugs appear where one path works and another doesn't.
+
+Signs you're violating this:
+- Copy-pasting code between functions
+- Adding "if task_type == X" checks in multiple places for the same behavior
+- Post-completion hooks that only run from some entry points
+
 ## Important Guidelines
 
 - **Do NOT delete git branches** unless explicitly asked to. Branches should be preserved for history and reference.
