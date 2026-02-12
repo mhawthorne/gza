@@ -668,7 +668,16 @@ def run(config: Config, task_id: int | None = None, resume: bool = False) -> int
 
     # Run provider in the worktree
     if resume:
-        prompt = "Continue from where you left off. The task was interrupted due to max_turns limit."
+        prompt = """IMPORTANT: Before continuing, verify your todo list against the actual state of the files.
+
+The task was interrupted (max turns, timeout, etc.) and your todo list may show steps as in_progress that were never actually completed. Please:
+
+1. Review your todo list from the previous session
+2. For each item marked as in_progress or completed, verify by checking the actual code/files
+3. Update the todo list to reflect what is actually complete vs incomplete
+4. Mark any steps that weren't actually finished as pending before continuing
+
+Once you've verified and updated the todo list, continue from where you left off."""
     else:
         prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
@@ -885,7 +894,19 @@ def _run_non_code_task(
             prompt_report_path = worktree_report_path
 
         # Run provider in the worktree
-        prompt = build_prompt(task, config, store, prompt_report_path, git)
+        if resume:
+            prompt = """IMPORTANT: Before continuing, verify your todo list against the actual state of the files.
+
+The task was interrupted (max turns, timeout, etc.) and your todo list may show steps as in_progress that were never actually completed. Please:
+
+1. Review your todo list from the previous session
+2. For each item marked as in_progress or completed, verify by checking the actual code/files
+3. Update the todo list to reflect what is actually complete vs incomplete
+4. Mark any steps that weren't actually finished as pending before continuing
+
+Once you've verified and updated the todo list, continue from where you left off."""
+        else:
+            prompt = build_prompt(task, config, store, prompt_report_path, git)
         resume_session_id = task.session_id if resume else None
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=resume_session_id)

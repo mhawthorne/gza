@@ -1,14 +1,14 @@
 """Tests for runner module."""
 
 from pathlib import Path
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock, patch
 
 import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.providers import RunResult
-from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task, _run_non_code_task, post_review_to_pr
+from gza.runner import build_prompt, SUMMARY_DIR, _create_and_run_review_task, _run_non_code_task, post_review_to_pr, run
 
 
 class TestBuildPrompt:
@@ -504,3 +504,232 @@ class TestRunNonCodeTaskPRPosting:
             assert len(pr_post_called) == 0
         finally:
             gza.runner.post_review_to_pr = original_post_review
+
+
+class TestResumeVerificationPrompt:
+    """Tests for resume verification prompt injection."""
+
+    def test_resume_code_task_includes_verification_prompt(self, tmp_path: Path):
+        """Test that resuming a code task includes todo list verification instructions."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a failed task with session_id
+        task = store.add(
+            prompt="Implement feature X",
+            task_type="implement",
+        )
+        task.task_id = "20260212-implement-feature-x"
+        task.branch = "gza/20260212-implement-feature-x"
+        task.session_id = "test-session-123"
+        store.mark_failed(task, log_file="logs/test.log", stats=None)
+
+        # Setup config
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+
+        # Mock provider to capture the prompt
+        captured_prompts = []
+
+        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None):
+            captured_prompts.append({
+                'prompt': prompt,
+                'resume_session_id': resume_session_id
+            })
+            return RunResult(
+                exit_code=0,
+                duration_seconds=10.0,
+                num_turns=5,
+                cost_usd=0.05,
+                session_id="test-session-123",
+                error_type=None,
+            )
+
+        # Mock provider and git
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner._cleanup_worktree'), \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            # Mock Git
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = True
+            mock_git.worktree_add = Mock()
+
+            # Mock has_changes to return True
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            # Create worktree directory
+            worktree_path = config.worktree_path / task.task_id
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            # Create summary file in worktree
+            summary_dir = worktree_path / ".gza" / "summaries"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            summary_file = summary_dir / f"{task.task_id}.md"
+            summary_file.write_text("# Summary\n\nCompleted the task.")
+
+            # Run with resume=True
+            result = run(config, task_id=task.id, resume=True)
+
+            # Verify success
+            assert result == 0
+
+            # Verify prompt was captured
+            assert len(captured_prompts) == 1
+            prompt = captured_prompts[0]['prompt']
+            resume_session_id = captured_prompts[0]['resume_session_id']
+
+            # Verify verification instructions are in the prompt
+            assert "verify your todo list against the actual state" in prompt.lower()
+            assert "review your todo list from the previous session" in prompt.lower()
+            assert "verify by checking the actual code/files" in prompt.lower()
+            assert "update the todo list to reflect what is actually complete" in prompt.lower()
+            assert "continue from where you left off" in prompt.lower()
+
+            # Verify resume_session_id was passed
+            assert resume_session_id == "test-session-123"
+
+    def test_resume_non_code_task_includes_verification_prompt(self, tmp_path: Path):
+        """Test that resuming a non-code task includes todo list verification instructions."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a failed review task with session_id
+        impl_task = store.add(
+            prompt="Implement feature X",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260212-implement-feature-x"
+        impl_task.branch = "gza/20260212-implement-feature-x"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature X",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.task_id = "20260212-review-feature-x"
+        review_task.session_id = "test-session-456"
+        store.mark_failed(review_task, log_file="logs/test.log", stats=None)
+
+        # Setup config
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+
+        # Mock provider to capture the prompt
+        captured_prompts = []
+
+        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None):
+            captured_prompts.append({
+                'prompt': prompt,
+                'resume_session_id': resume_session_id
+            })
+            return RunResult(
+                exit_code=0,
+                duration_seconds=10.0,
+                num_turns=5,
+                cost_usd=0.05,
+                session_id="test-session-456",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run = mock_provider_run
+
+        # Mock git
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.worktree_remove = Mock()
+
+        # Create worktree directory and report file
+        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        review_dir = worktree_path / ".gza" / "reviews"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        report_file = review_dir / f"{review_task.task_id}.md"
+        report_file.write_text("# Review\n\nLooks good!")
+
+        # Mock post_review_to_pr to avoid GitHub CLI dependency
+        with patch('gza.runner.post_review_to_pr'):
+            # Call _run_non_code_task with resume=True
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=True
+            )
+
+        # Verify success
+        assert exit_code == 0
+
+        # Verify prompt was captured
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]['prompt']
+        resume_session_id = captured_prompts[0]['resume_session_id']
+
+        # Verify verification instructions are in the prompt
+        assert "verify your todo list against the actual state" in prompt.lower()
+        assert "review your todo list from the previous session" in prompt.lower()
+        assert "verify by checking the actual code/files" in prompt.lower()
+        assert "update the todo list to reflect what is actually complete" in prompt.lower()
+        assert "continue from where you left off" in prompt.lower()
+
+        # Verify resume_session_id was passed
+        assert resume_session_id == "test-session-456"
+
+    def test_normal_run_does_not_include_verification_prompt(self, tmp_path: Path):
+        """Test that normal (non-resume) runs use the standard prompt without verification."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a pending task
+        task = store.add(
+            prompt="Implement feature Y",
+            task_type="implement",
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        # Build normal prompt (not resume)
+        prompt = build_prompt(task, config, store, summary_path=Path("/workspace/.gza/summaries/test.md"))
+
+        # Verify it does NOT include verification instructions
+        assert "verify your todo list" not in prompt.lower()
+        assert "review your todo list from the previous session" not in prompt.lower()
+
+        # Verify it includes the normal task prompt
+        assert "Complete this task: Implement feature Y" in prompt
