@@ -968,6 +968,8 @@ Once you've verified and updated the todo list, continue from where you left off
         error_message(f"Git error: {e}")
         return 1
     except KeyboardInterrupt:
+        # Save WIP changes before returning
+        _save_wip_changes(task, worktree_git, config, branch_name)
         console.print("\nInterrupted")
         return 130
 
