@@ -23,6 +23,28 @@ def get_terminal_width() -> int:
         return 80
 
 
+def format_duration(seconds: float, verbose: bool = False) -> str:
+    """Format duration in human-readable form.
+
+    Args:
+        seconds: Duration in seconds
+        verbose: If True, include hours for long durations
+
+    Returns:
+        Formatted duration string (e.g., '2m 30s', '1h 23m', or '45s')
+    """
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600 or not verbose:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        return f"{hours}h {mins}m"
+
+
 def task_header(prompt: str, task_id: str, task_type: str) -> None:
     """Print a styled task header with prompt, ID, and type."""
     # Truncate prompt if too long
@@ -37,14 +59,7 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
     parts = []
 
     if stats.duration_seconds is not None:
-        # Format duration
-        seconds = stats.duration_seconds
-        if seconds < 60:
-            duration_str = f"{seconds:.1f}s"
-        else:
-            minutes = int(seconds // 60)
-            secs = seconds % 60
-            duration_str = f"{minutes}m {secs:.0f}s"
+        duration_str = format_duration(stats.duration_seconds)
         parts.append(f"[dim]Runtime:[/dim] [bold]{duration_str}[/bold]")
 
     if stats.num_turns is not None:
