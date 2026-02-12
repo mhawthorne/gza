@@ -243,6 +243,46 @@ class ClaudeProvider(Provider):
                                     if len(content) > 60:
                                         content = content[:57] + "..."
                                     print(f"      {icon} {content}")
+                            elif tool_name == "Edit":
+                                # Enhanced logging for Edit tool
+                                parts = [tool_name]
+                                if file_path:
+                                    parts.append(file_path)
+
+                                # Calculate line count changes
+                                old_string = tool_input.get("old_string", "")
+                                new_string = tool_input.get("new_string", "")
+                                old_lines = old_string.count("\n") + (1 if old_string else 0)
+                                new_lines = new_string.count("\n") + (1 if new_string else 0)
+
+                                # Show line count delta
+                                if old_lines > 0 or new_lines > 0:
+                                    added = max(0, new_lines - old_lines)
+                                    removed = max(0, old_lines - new_lines)
+                                    if added > 0 and removed > 0:
+                                        parts.append(f"(+{added}/-{removed} lines)")
+                                    elif added > 0:
+                                        parts.append(f"(+{added} lines)")
+                                    elif removed > 0:
+                                        parts.append(f"(-{removed} lines)")
+
+                                # Show replace_all indicator
+                                if tool_input.get("replace_all"):
+                                    parts.append("[replace_all]")
+
+                                # Show truncated preview of old_string
+                                if old_string:
+                                    # Get first line of old_string, truncate if needed
+                                    first_line = old_string.split("\n")[0]
+                                    if len(first_line) > 40:
+                                        preview = first_line[:37] + "..."
+                                    else:
+                                        preview = first_line
+                                    # Escape newlines and quotes for display
+                                    preview = preview.replace("\r", "\\r").replace("\t", "\\t")
+                                    parts.append(f'"{preview}"')
+
+                                print(f"  → {' '.join(parts)}")
                             elif file_path:
                                 print(f"  → {tool_name} {file_path}")
                             else:
