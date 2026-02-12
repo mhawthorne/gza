@@ -419,8 +419,8 @@ class TestRetryCommand:
         assert new_task.status == "pending"
         assert new_task.based_on == 1
 
-    def test_retry_with_autorun_flag(self, tmp_path: Path):
-        """Retry command with --autorun attempts to run the newly created task."""
+    def test_retry_with_run_flag(self, tmp_path: Path):
+        """Retry command with --run attempts to run the newly created task."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -434,8 +434,8 @@ class TestRetryCommand:
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
 
-        # Run retry with --autorun flag (will fail due to missing API key, but we can verify it tries)
-        result = run_gza("retry", "1", "--autorun", "--no-docker", "--project", str(tmp_path))
+        # Run retry with --run flag (will fail due to missing API key, but we can verify it tries)
+        result = run_gza("retry", "1", "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the new task was created
         assert "Created task #2" in result.stdout
@@ -513,8 +513,8 @@ class TestResumeCommand:
         assert result.returncode == 1
         assert "Can only resume failed tasks" in result.stdout
 
-    def test_resume_with_autorun_flag(self, tmp_path: Path):
-        """Resume command with --autorun attempts to resume the task."""
+    def test_resume_with_run_flag(self, tmp_path: Path):
+        """Resume command with --run attempts to resume the task (same as default behavior)."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -529,8 +529,8 @@ class TestResumeCommand:
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
 
-        # Run resume with --autorun flag (will fail due to missing API key, but we can verify it tries)
-        result = run_gza("resume", "1", "--autorun", "--no-docker", "--project", str(tmp_path))
+        # Run resume with --run flag (will fail due to missing API key, but we can verify it tries)
+        result = run_gza("resume", "1", "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command attempts to resume
         assert "Resuming Task #1" in result.stdout
@@ -3066,8 +3066,8 @@ class TestReviewCommand:
         assert review_task.based_on == 1  # plan task
         assert review_task.depends_on == 2  # implementation task
 
-    def test_review_with_autorun_flag(self, tmp_path: Path):
-        """Review command with --autorun runs the review task immediately."""
+    def test_review_with_run_flag(self, tmp_path: Path):
+        """Review command with --run runs the review task immediately."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -3081,8 +3081,8 @@ class TestReviewCommand:
         impl_task.completed_at = datetime.now(timezone.utc)
         store.update(impl_task)
 
-        # Run review command with --autorun flag
-        result = run_gza("review", "1", "--autorun", "--no-docker", "--project", str(tmp_path))
+        # Run review command with --run flag
+        result = run_gza("review", "1", "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the review task was created and run attempted
         assert "Created review task #2" in result.stdout
