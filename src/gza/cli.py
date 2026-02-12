@@ -631,16 +631,19 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_merge(args: argparse.Namespace) -> int:
-    """Merge a task's branch into the current branch."""
-    config = Config.load(args.project_dir)
-    store = get_store(config)
-    git = Git(config.project_dir)
-
+def _merge_single_task(
+    task_id: int,
+    config: Config,
+    store,
+    git: Git,
+    args: argparse.Namespace,
+    current_branch: str,
+) -> int:
+    """Merge a single task's branch. Returns 0 on success, 1 on failure."""
     # Get the task
-    task = store.get(args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     # Validate task state
@@ -651,10 +654,6 @@ def cmd_merge(args: argparse.Namespace) -> int:
     if not task.branch:
         print(f"Error: Task #{task.id} has no branch")
         return 1
-
-    # Get current and default branches
-    current_branch = git.current_branch()
-    default_branch = git.default_branch()
 
     # Handle --mark-only flag
     if args.mark_only:
@@ -763,6 +762,43 @@ def cmd_merge(args: argparse.Namespace) -> int:
         except GitError as abort_error:
             print(f"Warning: Could not abort {operation}: {abort_error}")
         return 1
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    """Merge task branches into the current branch."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    # Get current branch once
+    current_branch = git.current_branch()
+
+    # Track success/failure
+    merged_tasks = []
+    failed_task_id = None
+
+    # Merge each task in sequence
+    for task_id in args.task_ids:
+        result = _merge_single_task(task_id, config, store, git, args, current_branch)
+
+        if result != 0:
+            # Merge failed, stop processing
+            failed_task_id = task_id
+            break
+
+        merged_tasks.append(task_id)
+
+    # Report results
+    if merged_tasks:
+        print(f"\n✓ Successfully merged {len(merged_tasks)} task(s): {', '.join(f'#{tid}' for tid in merged_tasks)}")
+
+    if failed_task_id is not None:
+        remaining = [tid for tid in args.task_ids if tid not in merged_tasks and tid != failed_task_id]
+        if remaining:
+            print(f"⚠ Stopped at task #{failed_task_id}. Remaining tasks not processed: {', '.join(f'#{tid}' for tid in remaining)}")
+        return 1
+
+    return 0
 
 
 def cmd_rebase(args: argparse.Namespace) -> int:
@@ -2996,11 +3032,13 @@ def main() -> int:
     )
 
     # merge command
-    merge_parser = subparsers.add_parser("merge", help="Merge a task's branch into current branch")
+    merge_parser = subparsers.add_parser("merge", help="Merge task branches into current branch")
     merge_parser.add_argument(
-        "task_id",
+        "task_ids",
         type=int,
-        help="Task ID to merge",
+        nargs="+",
+        metavar="task_id",
+        help="Task ID(s) to merge",
     )
     merge_parser.add_argument(
         "--delete",
