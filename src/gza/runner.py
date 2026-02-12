@@ -276,6 +276,13 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
         if task.depends_on:
             impl_task = store.get(task.depends_on)
             if impl_task:
+                # Include spec file content if the implementation task has a spec field
+                if impl_task.spec:
+                    spec_path = project_dir / impl_task.spec
+                    if spec_path.exists():
+                        spec_content = spec_path.read_text()
+                        context_parts.append(f"## Specification\n\nThe following specification file ({impl_task.spec}) provides context for this implementation:\n\n{spec_content}")
+
                 # Get diff if we have a branch
                 if impl_task.branch and git:
                     try:
