@@ -1,0 +1,78 @@
+"""Rich console output helpers for gza."""
+
+from rich.console import Console
+from rich.table import Table
+
+from .db import TaskStats
+
+# Shared console instance for all output
+console = Console()
+
+
+def task_header(prompt: str, task_id: str, task_type: str) -> None:
+    """Print a styled task header with prompt, ID, and type."""
+    # Truncate prompt if too long
+    prompt_display = prompt[:80] + "..." if len(prompt) > 80 else prompt
+    console.print(f"[bold cyan]=== Task: {prompt_display} ===[/bold cyan]")
+    console.print(f"    ID: [dim]{task_id}[/dim]")
+    console.print(f"    Type: [magenta]{task_type}[/magenta]")
+
+
+def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
+    """Print task statistics in a formatted line."""
+    parts = []
+
+    if stats.duration_seconds is not None:
+        # Format duration
+        seconds = stats.duration_seconds
+        if seconds < 60:
+            duration_str = f"{seconds:.1f}s"
+        else:
+            minutes = int(seconds // 60)
+            secs = seconds % 60
+            duration_str = f"{minutes}m {secs:.0f}s"
+        parts.append(f"[dim]Runtime:[/dim] [bold]{duration_str}[/bold]")
+
+    if stats.num_turns is not None:
+        parts.append(f"[dim]Turns:[/dim] [bold]{stats.num_turns}[/bold]")
+
+    if stats.cost_usd is not None:
+        parts.append(f"[dim]Cost:[/dim] [bold]${stats.cost_usd:.4f}[/bold]")
+
+    if has_commits is not None:
+        commit_value = "[green]yes[/green]" if has_commits else "no"
+        parts.append(f"[dim]Commits:[/dim] {commit_value}")
+
+    if parts:
+        console.print(f"Stats: {' | '.join(parts)}")
+
+
+def success_message(title: str) -> None:
+    """Print a success header."""
+    console.print(f"[bold green]=== {title} ===[/bold green]")
+
+
+def error_message(message: str) -> None:
+    """Print an error message."""
+    console.print(f"[bold red]{message}[/bold red]")
+
+
+def warning_message(message: str) -> None:
+    """Print a warning message."""
+    console.print(f"[yellow]{message}[/yellow]")
+
+
+def info_line(label: str, value: str) -> None:
+    """Print an info line with label and value."""
+    console.print(f"{label}: {value}")
+
+
+def next_steps(commands: list[tuple[str, str]]) -> None:
+    """Print a list of next step commands with comments.
+
+    Args:
+        commands: List of (command, comment) tuples
+    """
+    console.print("\nNext steps:")
+    for command, comment in commands:
+        console.print(f"  [cyan]{command}[/cyan]           [dim]{comment}[/dim]")
