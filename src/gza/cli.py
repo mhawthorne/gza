@@ -1811,7 +1811,19 @@ def _format_log_entry(entry: dict) -> str | None:
                     parts.append(f"[tool: {name}] {path}")
                 elif name == "Grep":
                     pattern = tool_input.get("pattern", "")
-                    parts.append(f"[tool: {name}] {pattern}")
+                    path = tool_input.get("path", "")
+                    glob = tool_input.get("glob", "")
+                    type_filter = tool_input.get("type", "")
+
+                    # Format: pattern [path] (filter)
+                    output = f"[tool: {name}] {pattern}"
+                    if path:
+                        output += f" [{path}]"
+                    if glob:
+                        output += f" (glob: {glob})"
+                    elif type_filter:
+                        output += f" (type: {type_filter})"
+                    parts.append(output)
                 elif name == "Glob":
                     pattern = tool_input.get("pattern", "")
                     parts.append(f"[tool: {name}] {pattern}")
@@ -2167,7 +2179,20 @@ def _display_conversation_turns(entries: list[dict]) -> None:
                             cmd = cmd[:77] + "..."
                         print(f"     Command: {cmd}")
                     elif tool_name == "Grep":
-                        print(f"     Pattern: {tool_input.get('pattern', 'unknown')}")
+                        pattern = tool_input.get('pattern', 'unknown')
+                        path = tool_input.get('path', '')
+                        glob = tool_input.get('glob', '')
+                        type_filter = tool_input.get('type', '')
+
+                        # Format: pattern [path] (filter)
+                        output = f"     Pattern: {pattern}"
+                        if path:
+                            output += f" [{path}]"
+                        if glob:
+                            output += f" (glob: {glob})"
+                        elif type_filter:
+                            output += f" (type: {type_filter})"
+                        print(output)
                     elif tool_name == "Glob":
                         print(f"     Pattern: {tool_input.get('pattern', 'unknown')}")
                     elif tool_name == "Write":
