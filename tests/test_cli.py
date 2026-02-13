@@ -4179,3 +4179,173 @@ This requires team discussion.
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
         assert "⚠ changes requested" not in result.stdout
+
+
+class TestCleanupCommand:
+    """Tests for 'gza cleanup' command."""
+
+    def test_cleanup_dry_run(self, tmp_path: Path):
+        """Cleanup command dry run works."""
+        from gza.config import Config
+        from gza.workers import WorkerRegistry
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        # Create some worker metadata files
+        registry = WorkerRegistry(config.workers_path)
+        worker1 = registry.generate_worker_id()
+        worker_meta = {
+            "worker_id": worker1,
+            "pid": 99999,  # Non-existent PID
+            "task_id": None,
+            "task_slug": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "status": "running",
+            "log_file": None,
+            "worktree": None,
+            "is_background": True,
+        }
+        from gza.workers import WorkerMetadata
+        registry.register(WorkerMetadata.from_dict(worker_meta))
+
+        # Create some old log files
+        log_dir = config.log_path
+        log_dir.mkdir(parents=True, exist_ok=True)
+        old_log = log_dir / "20200101-old-task.log"
+        old_log.write_text("old log content")
+        # Set modification time to 60 days ago
+        import time
+        old_time = time.time() - (60 * 24 * 60 * 60)
+        import os
+        os.utime(old_log, (old_time, old_time))
+
+        result = run_gza("cleanup", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Dry run" in result.stdout
+        # The old log should still exist after dry run
+        assert old_log.exists()
+
+    def test_cleanup_logs_only(self, tmp_path: Path):
+        """Cleanup command with --logs flag works."""
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        # Create some old log files
+        log_dir = config.log_path
+        log_dir.mkdir(parents=True, exist_ok=True)
+        old_log = log_dir / "20200101-old-task.log"
+        old_log.write_text("old log content")
+        new_log = log_dir / "20260101-new-task.log"
+        new_log.write_text("new log content")
+
+        # Set modification time for old log to 60 days ago
+        import time
+        import os
+        old_time = time.time() - (60 * 24 * 60 * 60)
+        os.utime(old_log, (old_time, old_time))
+
+        result = run_gza("cleanup", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Logs cleaned" in result.stdout
+        assert not old_log.exists()
+        assert new_log.exists()
+
+    def test_cleanup_workers(self, tmp_path: Path):
+        """Cleanup command cleans up stale worker metadata."""
+        from gza.config import Config
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        # Create a stale worker (PID doesn't exist)
+        registry = WorkerRegistry(config.workers_path)
+        worker_id = registry.generate_worker_id()
+        worker_meta = WorkerMetadata(
+            worker_id=worker_id,
+            pid=99999,  # Non-existent PID
+            task_id=None,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+            is_background=True,
+        )
+        registry.register(worker_meta)
+
+        # Verify worker file exists
+        worker_file = config.workers_path / f"{worker_id}.json"
+        assert worker_file.exists()
+
+        result = run_gza("cleanup", "--workers", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "worker metadata cleaned" in result.stdout.lower()
+        # Worker metadata should be cleaned up
+        assert not worker_file.exists()
+
+    def test_cleanup_keep_unmerged_logs(self, tmp_path: Path):
+        """Cleanup command with --keep-unmerged keeps logs for unmerged tasks."""
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+        import os
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (tmp_path / "README.md").write_text("# Test")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        # Create an unmerged task
+        store = SqliteTaskStore(config.db_path)
+        unmerged_task = store.add("Unmerged feature", task_type="implement")
+        unmerged_task.status = "completed"
+        unmerged_task.task_id = "20200101-unmerged"
+        unmerged_task.branch = "feature/unmerged"
+        unmerged_task.has_commits = True
+        unmerged_task.completed_at = datetime.now(timezone.utc)
+        store.update(unmerged_task)
+
+        # Create branch for unmerged task
+        git._run("checkout", "-b", "feature/unmerged")
+        (tmp_path / "feature.txt").write_text("unmerged feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add unmerged feature")
+        git._run("checkout", "master")
+
+        # Create logs for both tasks
+        log_dir = config.log_path
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        unmerged_log = log_dir / "20200101-unmerged.log"
+        unmerged_log.write_text("unmerged log")
+
+        merged_log = log_dir / "20200102-merged.log"
+        merged_log.write_text("merged log")
+
+        # Set both logs to old timestamps
+        old_time = time.time() - (60 * 24 * 60 * 60)
+        os.utime(unmerged_log, (old_time, old_time))
+        os.utime(merged_log, (old_time, old_time))
+
+        result = run_gza("cleanup", "--logs", "--days", "30", "--keep-unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Unmerged task log should be kept
+        assert unmerged_log.exists()
+        # Merged task log should be removed
+        assert not merged_log.exists()

@@ -1453,6 +1453,163 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """Clean up stale worktrees, old logs, and stale worker metadata."""
+    from datetime import timedelta
+    import shutil
+
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    days = args.days
+    cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_timestamp = cutoff_time.timestamp()
+
+    # Track what was cleaned
+    cleaned_worktrees = []
+    cleaned_logs = []
+    cleaned_workers = 0
+    errors = []
+
+    # 1. Clean up stale worktrees
+    if args.worktrees or not (args.logs or args.workers):
+        worktree_dir = config.worktree_path
+        if worktree_dir.exists():
+            try:
+                for worktree_path in worktree_dir.iterdir():
+                    if not worktree_path.is_dir():
+                        continue
+
+                    # Check if worktree still exists in git's worktree list
+                    worktrees = git.worktree_list()
+                    worktree_paths = {Path(wt.get("path")) for wt in worktrees}
+
+                    should_remove = False
+                    reason = ""
+
+                    if worktree_path not in worktree_paths:
+                        # Worktree not in git's list - stale
+                        should_remove = True
+                        reason = "not in git worktree list"
+                    else:
+                        # Check if worktree is old
+                        if worktree_path.stat().st_mtime < cutoff_timestamp:
+                            should_remove = True
+                            reason = f"older than {days} days"
+
+                    if should_remove:
+                        if args.dry_run:
+                            cleaned_worktrees.append((worktree_path.name, reason))
+                        else:
+                            try:
+                                # Try to remove via git worktree remove
+                                git.worktree_remove(worktree_path, force=True)
+                                cleaned_worktrees.append((worktree_path.name, reason))
+                            except GitError:
+                                # If git fails, try direct removal
+                                try:
+                                    shutil.rmtree(worktree_path)
+                                    cleaned_worktrees.append((worktree_path.name, reason))
+                                except OSError as e:
+                                    errors.append((worktree_path.name, e))
+            except Exception as e:
+                errors.append((str(worktree_dir), e))
+
+    # 2. Clean up old log files
+    if args.logs or not (args.worktrees or args.workers):
+        if config.log_path.exists():
+            # Get list of unmerged tasks if --keep-unmerged is set
+            unmerged_task_ids = set()
+            if args.keep_unmerged:
+                try:
+                    # Check completed tasks with branches for unmerged work
+                    default_branch = git.default_branch()
+                    history = store.get_history(limit=200)
+                    for task in history:
+                        if task.status == "completed" and task.branch and task.has_commits:
+                            try:
+                                if not git.is_merged(task.branch, default_branch):
+                                    if task.task_id:
+                                        unmerged_task_ids.add(task.task_id)
+                            except Exception:
+                                # Branch might not exist anymore, skip
+                                pass
+                except Exception as e:
+                    print(f"Warning: Could not fetch unmerged tasks: {e}", file=sys.stderr)
+
+            for log_file in config.log_path.iterdir():
+                if not log_file.is_file():
+                    continue
+
+                # Check if this log is for an unmerged task
+                if args.keep_unmerged:
+                    # Extract task_id from log filename (format: YYYYMMDD-slug.log or task-id.log)
+                    task_id = log_file.stem
+                    if task_id in unmerged_task_ids:
+                        continue
+
+                # Check age
+                if log_file.stat().st_mtime < cutoff_timestamp:
+                    if args.dry_run:
+                        cleaned_logs.append(log_file.name)
+                    else:
+                        try:
+                            log_file.unlink()
+                            cleaned_logs.append(log_file.name)
+                        except OSError as e:
+                            errors.append((log_file.name, e))
+
+    # 3. Clean up stale worker metadata
+    if args.workers or not (args.worktrees or args.logs):
+        registry = WorkerRegistry(config.workers_path)
+        if args.dry_run:
+            # Count stale workers for dry run
+            stale_count = sum(1 for w in registry.list_all(include_completed=True) if w.status == "stale")
+            cleaned_workers = stale_count
+        else:
+            cleaned_workers = registry.cleanup_stale()
+
+    # Report results
+    if args.dry_run:
+        print(f"Dry run: would clean up resources")
+        print()
+    else:
+        print(f"Cleanup completed")
+        print()
+
+    if args.worktrees or not (args.logs or args.workers):
+        if cleaned_worktrees:
+            print(f"Worktrees cleaned: {len(cleaned_worktrees)}")
+            for name, reason in cleaned_worktrees:
+                print(f"  - {name} ({reason})")
+        else:
+            print("Worktrees: nothing to clean")
+        print()
+
+    if args.logs or not (args.worktrees or args.workers):
+        if cleaned_logs:
+            print(f"Logs cleaned: {len(cleaned_logs)}")
+            if args.keep_unmerged:
+                print(f"  (kept logs for unmerged tasks)")
+        else:
+            print("Logs: nothing to clean")
+        print()
+
+    if args.workers or not (args.worktrees or args.logs):
+        print(f"Stale worker metadata cleaned: {cleaned_workers}")
+        print()
+
+    # Report errors
+    if errors:
+        print(f"Errors ({len(errors)} items):")
+        for item, error in errors:
+            print(f"  - {item}: {error}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Archive or delete old log and worker files."""
     from datetime import timedelta
@@ -3453,6 +3610,42 @@ def main() -> int:
     validate_parser = subparsers.add_parser("validate", help="Validate gza.yaml configuration")
     add_common_args(validate_parser)
 
+    # cleanup command
+    cleanup_parser = subparsers.add_parser("cleanup", help="Clean up stale worktrees, old logs, and worker metadata")
+    cleanup_parser.add_argument(
+        "--worktrees",
+        action="store_true",
+        help="Only clean up stale worktrees",
+    )
+    cleanup_parser.add_argument(
+        "--logs",
+        action="store_true",
+        help="Only clean up old log files",
+    )
+    cleanup_parser.add_argument(
+        "--workers",
+        action="store_true",
+        help="Only clean up stale worker metadata",
+    )
+    cleanup_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Remove worktrees/logs older than N days (default: 30)",
+    )
+    cleanup_parser.add_argument(
+        "--keep-unmerged",
+        action="store_true",
+        help="Keep logs for tasks that are still unmerged",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be cleaned without actually doing it",
+    )
+    add_common_args(cleanup_parser)
+
     # clean command
     clean_parser = subparsers.add_parser("clean", help="Archive or delete old log and worker files")
     clean_parser.add_argument(
@@ -3926,6 +4119,8 @@ def main() -> int:
             return cmd_stats(args)
         elif args.command == "validate":
             return cmd_validate(args)
+        elif args.command == "cleanup":
+            return cmd_cleanup(args)
         elif args.command == "clean":
             return cmd_clean(args)
         elif args.command == "init":
