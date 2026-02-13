@@ -978,6 +978,71 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_checkout(args: argparse.Namespace) -> int:
+    """Checkout a task's branch, removing any stale worktree if needed."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    # Resolve task ID or branch name
+    task = None
+    branch = None
+
+    if args.task_id_or_branch.isdigit():
+        # It's a task ID
+        task = store.get(int(args.task_id_or_branch))
+        if not task:
+            print(f"Error: Task #{args.task_id_or_branch} not found")
+            return 1
+        if not task.branch:
+            print(f"Error: Task #{task.id} has no branch")
+            return 1
+        branch = task.branch
+    else:
+        # It's a branch name
+        branch = args.task_id_or_branch
+
+    # Check if branch exists
+    if not git.branch_exists(branch):
+        print(f"Error: Branch '{branch}' does not exist locally")
+        return 1
+
+    # Check if branch is checked out in a worktree
+    worktrees = git.worktree_list()
+    worktree_path = None
+    for wt in worktrees:
+        wt_branch = wt.get("branch", "")
+        # Branch is stored as refs/heads/branch-name
+        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
+            worktree_path = Path(wt["path"])
+            break
+
+    if worktree_path:
+        # Check if worktree has uncommitted changes
+        worktree_git = Git(worktree_path)
+        if worktree_git.has_changes(include_untracked=True):
+            print(f"Error: Worktree at {worktree_path} has uncommitted changes")
+            print()
+            print("Options:")
+            print(f"  1. cd {worktree_path} and commit or discard changes")
+            print(f"  2. Use --force to remove the worktree anyway (loses changes)")
+            return 1
+
+        # Remove the worktree
+        print(f"Removing stale worktree at {worktree_path}...")
+        git.worktree_remove(worktree_path, force=args.force)
+        print(f"✓ Removed worktree")
+
+    # Checkout the branch
+    try:
+        git.checkout(branch)
+        print(f"✓ Checked out '{branch}'")
+        return 0
+    except GitError as e:
+        print(f"Error checking out branch: {e}")
+        return 1
+
+
 def cmd_diff(args: argparse.Namespace) -> int:
     """Run git diff with colored output and pager support."""
     config = Config.load(args.project_dir)
@@ -3339,6 +3404,19 @@ def main() -> int:
     )
     add_common_args(rebase_parser)
 
+    # checkout command
+    checkout_parser = subparsers.add_parser("checkout", help="Checkout a task's branch, removing stale worktree if needed")
+    checkout_parser.add_argument(
+        "task_id_or_branch",
+        help="Task ID or branch name to checkout",
+    )
+    checkout_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force removal of worktree even if it has uncommitted changes",
+    )
+    add_common_args(checkout_parser)
+
     # diff command
     diff_parser = subparsers.add_parser("diff", help="Run git diff with colored output and pager support")
     add_common_args(diff_parser)
@@ -3844,6 +3922,8 @@ def main() -> int:
             return cmd_merge(args)
         elif args.command == "rebase":
             return cmd_rebase(args)
+        elif args.command == "checkout":
+            return cmd_checkout(args)
         elif args.command == "diff":
             return cmd_diff(args)
         elif args.command == "pr":
