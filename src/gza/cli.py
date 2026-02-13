@@ -2038,7 +2038,8 @@ def _tail_log_file(log_path: Path, args: argparse.Namespace, registry: WorkerReg
 
         # Follow mode - watch for new lines
         last_size = log_path.stat().st_size
-        last_line_count = sum(1 for _ in open(log_path))
+        with open(log_path) as f:
+            last_line_count = sum(1 for _ in f)
 
         while True:
             time.sleep(0.5)
