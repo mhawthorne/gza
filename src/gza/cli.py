@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import Config, ConfigError
-from .console import console
+from .console import console, format_duration
 from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask
 from .git import Git, GitError
 from .github import GitHub, GitHubError
@@ -24,23 +24,6 @@ from .workers import WorkerMetadata, WorkerRegistry
 def get_store(config: Config) -> SqliteTaskStore:
     """Get the SQLite task store."""
     return SqliteTaskStore(config.db_path)
-
-
-def format_elapsed_time(seconds: float) -> str:
-    """Format elapsed time in a human-readable format.
-
-    Args:
-        seconds: Elapsed time in seconds
-
-    Returns:
-        Formatted time string (e.g., '2m 30s' or '45s')
-    """
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    else:
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m {secs}s"
 
 
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int = None) -> int:
@@ -424,7 +407,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
             # All tasks completed successfully
             if tasks_completed > 1:
-                elapsed = format_elapsed_time(time.time() - start_time)
+                elapsed = format_duration(time.time() - start_time)
                 print(f"\n=== Completed {tasks_completed} tasks in {elapsed} ===")
             registry.mark_completed(worker_id, exit_code=0, status="completed")
             return 0
@@ -458,12 +441,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 from .db import SqliteTaskStore
                 store = SqliteTaskStore(config.db_path)
                 if not store.get_next_pending():
-                    elapsed = format_elapsed_time(time.time() - start_time)
+                    elapsed = format_duration(time.time() - start_time)
                     print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")
                     break
 
         if tasks_completed > 1:
-            elapsed = format_elapsed_time(time.time() - start_time)
+            elapsed = format_duration(time.time() - start_time)
             print(f"\n=== Completed {tasks_completed} tasks in {elapsed} ===")
 
         # Clean up worker registration on normal exit
@@ -1372,20 +1355,6 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
 
-def format_duration(seconds: float) -> str:
-    """Format duration in human-readable form."""
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    elif seconds < 3600:
-        mins = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{mins}m {secs}s"
-    else:
-        hours = int(seconds // 3600)
-        mins = int((seconds % 3600) // 60)
-        return f"{hours}h {mins}m"
-
-
 def cmd_stats(args: argparse.Namespace) -> int:
     """Show cost and usage statistics."""
     config = Config.load(args.project_dir)
@@ -1404,7 +1373,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print("=" * 50)
     print(f"  Tasks:        {stats['completed']} completed, {stats['failed']} failed")
     print(f"  Total cost:   ${stats['total_cost']:.2f}")
-    print(f"  Total time:   {format_duration(stats['total_duration'])}")
+    print(f"  Total time:   {format_duration(stats['total_duration'], verbose=True)}")
     print(f"  Total turns:  {stats['total_turns']}")
     if tasks_with_cost:
         print(f"  Avg cost:     ${avg_cost:.2f}/task")
@@ -1447,7 +1416,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
         type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
         turns_str = str(task.num_turns) if task.num_turns is not None else "-"
-        time_str = format_duration(task.duration_seconds) if task.duration_seconds else "-"
+        time_str = format_duration(task.duration_seconds, verbose=True) if task.duration_seconds else "-"
 
         # Calculate prompt length
         prompt_len = len(task.prompt)
@@ -2036,7 +2005,7 @@ def cmd_log(args: argparse.Namespace) -> int:
     if log_data:
         if "duration_ms" in log_data:
             duration_sec = log_data["duration_ms"] / 1000
-            print(f"Duration: {format_duration(duration_sec)}")
+            print(f"Duration: {format_duration(duration_sec, verbose=True)}")
         if "num_turns" in log_data:
             print(f"Turns: {log_data['num_turns']}")
         if "total_cost_usd" in log_data:
