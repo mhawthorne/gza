@@ -652,7 +652,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             branch_groups[task.branch].append(task)
 
     # Define task separator (same style as gza work logs)
-    task_separator = "-" * 32
+    task_separator = "\n" + "-"*32 + "\n"
 
     # Display grouped by branch
     first_task = True
