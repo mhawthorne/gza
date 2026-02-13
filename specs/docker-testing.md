@@ -25,13 +25,13 @@ docker run -it --env-file ~/.env gza-test
 From PyPI (production):
 
 ```bash
-uv pip install --system gza
+uv pip install --system gza-agent
 ```
 
 From TestPyPI:
 
 ```bash
-uv pip install --system --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ gza
+uv pip install --system --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ gza-agent
 ```
 
 The `--extra-index-url` is needed because TestPyPI won't have dependencies like `pyyaml`.

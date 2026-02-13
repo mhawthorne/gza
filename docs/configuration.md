@@ -131,7 +131,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `task`, `explore`, `plan`, `implement`, `review`
+Valid task types: `task`, `explore`, `plan`, `implement`, `review`, `improve`
 
 ---
 
@@ -249,6 +249,7 @@ gza work [task_id...] [options]
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--count N`, `-c N` | Number of tasks to run before stopping |
 | `--background`, `-b` | Run worker in background |
+| `--max-turns N` | Override max_turns setting for this run |
 
 ### add
 
@@ -262,7 +263,7 @@ gza add [prompt] [options]
 |--------|-------------|
 | `prompt` | Task prompt (opens $EDITOR if not provided) |
 | `--edit`, `-e` | Open $EDITOR to write the prompt |
-| `--type TYPE` | Set task type: `task`\|`explore`\|`plan`\|`implement`\|`review` |
+| `--type TYPE` | Set task type: `task`\|`explore`\|`plan`\|`implement`\|`review`\|`improve` |
 | `--branch-type TYPE` | Set branch type hint for naming |
 | `--explore` | Create explore task (shorthand) |
 | `--group NAME` | Set task group |
@@ -271,6 +272,7 @@ gza add [prompt] [options]
 | `--review` | Auto-create review task on completion |
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
+| `--prompt-file FILE` | Read prompt from file (for non-interactive use) |
 
 ### edit
 
@@ -286,6 +288,9 @@ gza edit <task_id> [options]
 | `--based-on ID` | Set dependency |
 | `--explore` | Convert to explore task |
 | `--task` | Convert to regular task |
+| `--review` | Enable automatic review task creation on completion |
+| `--prompt TEXT` | Set new prompt directly (use `-` for stdin) |
+| `--prompt-file FILE` | Read new prompt from file |
 
 ### log
 
@@ -297,13 +302,15 @@ gza log <identifier> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--task`, `-t` | Look up by task ID |
-| `--slug`, `-s` | Look up by task slug |
-| `--worker`, `-w` | Look up by worker ID |
+| `--task`, `-t` | Look up by task ID (mutually exclusive with -s, -w) |
+| `--slug`, `-s` | Look up by task slug (mutually exclusive with -t, -w) |
+| `--worker`, `-w` | Look up by worker ID (mutually exclusive with -t, -s) |
 | `--turns` | Show full conversation turns |
 | `--follow`, `-f` | Follow log in real-time |
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
+
+**Note:** One of `--task`, `--slug`, or `--worker` is required.
 
 ### stats
 
@@ -340,11 +347,12 @@ gza delete <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--force`, `-f` | Skip confirmation prompt |
+| `--yes`, `-y` | Skip confirmation prompt |
+| `--force`, `-f` | Deprecated alias for `--yes` |
 
 ### clean
 
-Delete old log and worker files to free up disk space.
+Archive old log and worker files to free up disk space. By default, files are moved to `.gza/archive/` rather than deleted.
 
 ```bash
 gza clean [options]
@@ -352,30 +360,34 @@ gza clean [options]
 
 | Option | Description |
 |--------|-------------|
-| `--days N` | Delete files older than N days (default: 30) |
-| `--dry-run` | Show what would be deleted without actually deleting |
+| `--days N` | Archive files older than N days (default: 30) |
+| `--purge` | Delete archived files instead of archiving (default threshold: 365 days) |
+| `--dry-run` | Show what would be archived/deleted without doing it |
 
 **Example usage:**
 
 ```bash
-# Preview what would be deleted (default: 30 days)
+# Preview what would be archived (default: 30 days)
 gza clean --dry-run
 
-# Delete files older than 30 days
+# Archive files older than 30 days
 gza clean
 
-# Delete files older than 7 days
+# Archive files older than 7 days
 gza clean --days 7
 
-# Preview deletion with custom threshold
-gza clean --days 60 --dry-run
+# Delete files from archive older than 365 days
+gza clean --purge
+
+# Delete archived files older than 60 days
+gza clean --purge --days 60
 ```
 
-The clean command removes files from:
+The clean command archives files from:
 - `.gza/logs/` - Task execution logs
 - `.gza/workers/` - Worker metadata files
 
-Files are deleted based on their modification time. The `--dry-run` flag is recommended before running the actual deletion to preview which files will be removed.
+Files are moved to `.gza/archive/` based on their modification time. Use `--purge` to permanently delete archived files.
 
 ### import
 
@@ -455,6 +467,8 @@ gza resume <task_id> [options]
 |--------|-------------|
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--background`, `-b` | Run worker in background |
+| `--run` | Run immediately (default behavior, for consistency) |
+| `--max-turns N` | Override max_turns setting for this run |
 
 ### retry
 
@@ -466,22 +480,27 @@ gza retry <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--no-docker` | Run Claude directly instead of in Docker |
+| `--no-docker` | Run Claude directly instead of in Docker (only with --background) |
 | `--background`, `-b` | Run worker in background |
+| `--run` | Run the task immediately after creation |
+| `--max-turns N` | Override max_turns setting for this run |
 
 ### merge
 
 Merge a completed task's branch into the current branch.
 
 ```bash
-gza merge <task_id> [options]
+gza merge <task_id> [task_id...] [options]
 ```
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Task ID(s) to merge (can specify multiple) |
 | `--squash` | Squash commits into a single commit |
 | `--rebase` | Rebase onto current branch instead of merging |
 | `--delete` | Delete the branch after successful merge |
+| `--remote` | Fetch from origin and rebase against remote (requires --rebase) |
+| `--mark-only` | Mark branch as merged without performing actual merge (deletes branch) |
 
 ### unmerged
 
@@ -497,6 +516,165 @@ List all task groups with their task counts.
 
 ```bash
 gza groups
+```
+
+### history
+
+List recent completed or failed tasks.
+
+```bash
+gza history [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--limit N`, `-n N` | Number of tasks to show (default: 10) |
+| `--all` | Show all tasks (no limit) |
+| `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
+| `--type TYPE` | Filter by task type: `task`, `explore`, `plan`, `implement`, `review`, `improve` |
+
+### checkout
+
+Checkout a task's branch, removing any stale worktree if needed.
+
+```bash
+gza checkout <task_id_or_branch> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id_or_branch` | Task ID or branch name to checkout |
+| `--force`, `-f` | Force removal of worktree even if it has uncommitted changes |
+
+### diff
+
+Show git diff for a task's changes with colored output and pager support.
+
+```bash
+gza diff [task_id] [diff_args...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Task ID to diff (optional, uses current branch if omitted) |
+| `diff_args` | Arguments passed to git diff (use `--` before options like `--stat`) |
+
+### rebase
+
+Rebase a task's branch onto a target branch.
+
+```bash
+gza rebase <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--onto BRANCH` | Branch to rebase onto (defaults to current branch) |
+| `--remote` | Fetch from origin and rebase against remote target branch |
+| `--force`, `-f` | Force remove worktree even if it has uncommitted changes |
+
+### cleanup
+
+Clean up stale worktrees, old logs, and worker metadata.
+
+```bash
+gza cleanup [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--worktrees` | Only clean up stale worktrees |
+| `--logs` | Only clean up old log files |
+| `--workers` | Only clean up stale worker metadata |
+| `--days N` | Remove items older than N days (default: 30) |
+| `--keep-unmerged` | Keep logs for tasks that are still unmerged |
+| `--dry-run` | Show what would be cleaned without doing it |
+
+### improve
+
+Create an improve task to address review feedback on an implementation.
+
+```bash
+gza improve <impl_task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `impl_task_id` | Implementation task ID to improve |
+| `--review` | Auto-create review task on completion |
+| `--run` | Run the improve task immediately |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+
+The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
+
+### review
+
+Create and optionally run a review task for an implementation.
+
+```bash
+gza review <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Implementation task ID to review |
+| `--run` | Run the review task immediately after creating it |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--no-pr` | Do not post review to PR even if one exists |
+| `--pr` | Require PR to exist (error if not found) |
+| `--open` | Open the review file in $EDITOR after completion (with --run) |
+
+When `--run` is used and a PR exists for the implementation task, the review is automatically posted as a PR comment.
+
+### next
+
+List upcoming pending tasks.
+
+```bash
+gza next [options]
+```
+
+Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
+
+---
+
+## Task Types
+
+Gza supports several task types, each with distinct behavior:
+
+| Type | Purpose | Output Location |
+|------|---------|-----------------|
+| `task` | General work (default) | Code changes on branch |
+| `explore` | Research and investigation | `.gza/explorations/{task_id}.md` |
+| `plan` | Design and architecture | `.gza/plans/{task_id}.md` |
+| `implement` | Build per a plan | Code changes on branch |
+| `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
+| `improve` | Address review feedback | Code changes on same branch |
+
+**Typical workflow:**
+
+1. `plan` - Design the approach, saved to `.gza/plans/`
+2. `implement --based-on <plan_id> --review` - Build per plan, auto-create review
+3. `review` runs automatically, saved to `.gza/reviews/`
+4. If changes requested: `improve <impl_id>` addresses feedback on same branch
+
+**Per-type configuration:**
+
+Override settings for specific task types in `gza.yaml`:
+
+```yaml
+task_types:
+  explore:
+    model: claude-sonnet-4-5
+    max_turns: 20
+  plan:
+    model: claude-opus-4
+    max_turns: 30
+  review:
+    max_turns: 15
 ```
 
 ---

@@ -1,5 +1,7 @@
 # Beads Integration
 
+> **Status: Aspirational** - This spec describes a potential future integration. The beads integration has not been implemented.
+
 ## Overview
 
 This spec explores replacing gza's homegrown task concept with [beads](https://github.com/anthropics/beads), a distributed git-backed graph issue tracker designed for AI agents.

@@ -6,7 +6,14 @@ A straightforward workflow for quick fixes or small features.
 
 ```bash
 $ gza add "Fix the login button not responding on mobile devices"
-Created task: 20260108-fix-the-login-button
+Created task #1: 20260108-fix-the-login-button
+```
+
+Or open your editor to write a longer prompt:
+
+```bash
+$ gza add
+# Opens $EDITOR
 ```
 
 ## View pending tasks
@@ -15,26 +22,30 @@ Created task: 20260108-fix-the-login-button
 $ gza next
 Pending tasks:
 
-  1. 20260108-fix-the-login-button
+  #1 20260108-fix-the-login-button
      Fix the login button not responding on mobile devices
 ```
 
-## Run the task (foreground)
+## Run the task
 
 ```bash
-$ gza work
-Running task: 20260108-fix-the-login-button
+$ gza work 1
+=== Task: Fix the login button... ===
+    ID: #1 20260108-fix-the-login-button
 ...
-Task completed in 3m 42s (12 turns, $0.08)
+=== Done ===
+Stats: Runtime: 3m 42s | Turns: 12 | Cost: $0.08
 Branch: feature/fix-the-login-button
 ```
+
+> **Tip:** If you don't provide a task ID, `gza work` runs the next pending task.
 
 ## View the execution log
 
 ```bash
-$ gza log -t 20260108-fix-the-login-button
+$ gza log -t 1
 
-Task: 20260108-fix-the-login-button
+Task #1: 20260108-fix-the-login-button
 Status: completed
 Duration: 3m 42s
 Turns: 12
@@ -49,7 +60,7 @@ Summary:
 For the full conversation:
 
 ```bash
-$ gza log -t 20260108-fix-the-login-button --turns
+$ gza log -t 1 --turns
 ```
 
 ## Check unmerged work
@@ -58,10 +69,10 @@ $ gza log -t 20260108-fix-the-login-button --turns
 $ gza unmerged
 Unmerged branches:
 
-  20260108-fix-the-login-button
-    Branch: feature/fix-the-login-button
-    Commits: 2 ahead of main
-    Files changed: 3
+  #1 20260108-fix-the-login-button
+     Branch: feature/fix-the-login-button
+     Commits: 2 ahead of main
+     Files changed: 3
 ```
 
 ## Merge the work
@@ -73,8 +84,8 @@ You have two options for getting your changes into main:
 For quick fixes or solo projects, merge directly:
 
 ```bash
-$ gza merge 20260108-fix-the-login-button
-Merging task: 20260108-fix-the-login-button
+$ gza merge 1
+Merging task #1: 20260108-fix-the-login-button
   Branch: feature/fix-the-login-button → main
 
 Merged 2 commits into main.
@@ -83,16 +94,16 @@ Merged 2 commits into main.
 To squash commits into a single commit:
 
 ```bash
-$ gza merge 20260108-fix-the-login-button --squash
+$ gza merge 1 --squash
 ```
 
-### Option B: Create a PR (optional)
+### Option B: Create a PR
 
 For team projects or when you want code review, create a PR instead:
 
 ```bash
-$ gza pr 20260108-fix-the-login-button
-Creating PR for task: 20260108-fix-the-login-button
+$ gza pr 1
+Creating PR for task #1: 20260108-fix-the-login-button
 
 PR created: https://github.com/myorg/myapp/pull/142
   Title: Fix the login button not responding on mobile devices
@@ -102,7 +113,7 @@ PR created: https://github.com/myorg/myapp/pull/142
 To create a draft PR with a custom title:
 
 ```bash
-$ gza pr 20260108-fix-the-login-button --draft --title "fix: mobile login button touch handling"
+$ gza pr 1 --draft --title "fix: mobile login button touch handling"
 ```
 
 Then merge via GitHub's UI when ready.

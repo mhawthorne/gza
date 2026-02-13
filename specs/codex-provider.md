@@ -1,5 +1,7 @@
 # OpenAI Codex Provider
 
+> **Status: Aspirational** - This spec describes a planned provider integration. The Codex provider has not been implemented yet.
+
 Add support for OpenAI's Codex CLI as an alternative coding agent provider.
 
 ## Overview

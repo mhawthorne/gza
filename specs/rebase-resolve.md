@@ -1,5 +1,7 @@
 # Rebase with Auto-Resolve
 
+> **Status: Aspirational** - This spec describes a planned feature. The `--resolve` flag for `gza rebase` has not been implemented yet.
+
 ## Overview
 
 Add a `--resolve` flag to `gza rebase` that automatically resolves merge conflicts using AI, making rebasing a non-interactive, one-shot operation.

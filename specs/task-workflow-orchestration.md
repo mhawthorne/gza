@@ -1,5 +1,7 @@
 # Task Workflow Orchestration
 
+> **Status: Aspirational** - This spec describes planned features. Commands like `gza dashboard`, `gza advance`, `gza summary`, and `gza changelog` have not been implemented yet.
+
 ## Overview
 
 This spec describes a higher-level workflow system for managing gza tasks from creation through completion and merge. It covers:

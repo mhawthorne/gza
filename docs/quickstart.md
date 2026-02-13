@@ -2,10 +2,22 @@
 
 Get up and running with Gza in a few steps.
 
-## 1. Install Gza
+## Prerequisites
+
+- **Docker** - Tasks run in isolated containers by default. [Install Docker](https://docs.docker.com/get-docker/)
+- **Node.js** - Required for Claude Code CLI. [Install Node.js](https://nodejs.org/)
+
+## 1. Install Gza and Claude Code
 
 ```bash
+# Install Gza
 pip install gza-agent
+
+# Install Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+
+# Verify Claude Code installation
+claude --version
 ```
 
 ## 2. Set up authentication
