@@ -10,6 +10,28 @@ from .db import TaskStats
 # Shared console instance for all output
 console = Console()
 
+# Display truncation constants
+MAX_PROMPT_DISPLAY_SHORT = 50
+MAX_PROMPT_DISPLAY = 60
+MAX_PR_TITLE_LENGTH = 72
+MAX_PR_BODY_LENGTH = 500
+
+
+def truncate(text: str, max_len: int, suffix: str = '...') -> str:
+    """Truncate text to max_len, adding suffix if truncated.
+
+    Args:
+        text: Text to truncate
+        max_len: Maximum length including suffix
+        suffix: Suffix to add when truncating (default: '...')
+
+    Returns:
+        Original text if within max_len, otherwise truncated text with suffix
+    """
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - len(suffix)] + suffix
+
 
 def get_terminal_width() -> int:
     """Get the current terminal width.

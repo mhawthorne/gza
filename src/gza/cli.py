@@ -11,7 +11,15 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import Config, ConfigError
-from .console import console, format_duration
+from .console import (
+    console,
+    format_duration,
+    truncate,
+    MAX_PROMPT_DISPLAY_SHORT,
+    MAX_PROMPT_DISPLAY,
+    MAX_PR_TITLE_LENGTH,
+    MAX_PR_BODY_LENGTH,
+)
 from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask
 from .git import Git, GitError
 from .github import GitHub, GitHubError
@@ -112,7 +120,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         print(f"Started worker {worker_id} (PID {proc.pid})")
         print(f"  Task: #{task.id}")
         if task.prompt:
-            prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
+            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
             print(f"  Prompt: {prompt_display}")
         print()
         print(f"Use 'gza ps' to view running workers")
@@ -241,7 +249,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ta
         print(f"Started worker {worker_id} (PID {proc.pid})")
         print(f"  Task: #{task.id} (resuming)")
         if task.prompt:
-            prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
+            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
             print(f"  Prompt: {prompt_display}")
         print()
         print(f"Use 'gza ps' to view running workers")
@@ -489,7 +497,7 @@ def cmd_next(args: argparse.Namespace) -> int:
             type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
             # Get first line only, then truncate
             first_line = task.prompt.split('\n')[0].strip()
-            prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
+            prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
             print(f"{i}. (#{task.id}) {type_label}{prompt_display}")
     else:
         if not show_all:
@@ -502,7 +510,7 @@ def cmd_next(args: argparse.Namespace) -> int:
         for i, (task, blocking_id) in enumerate(blocked, len(runnable) + 1):
             type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
             first_line = task.prompt.split('\n')[0].strip()
-            prompt_display = first_line[:60] + "..." if len(first_line) > 60 else first_line
+            prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
             print(f"{i}. (#{task.id}) {type_label}{prompt_display} (blocked by #{blocking_id})")
 
     # Show blocked count at the bottom (only if not showing all)
@@ -584,7 +592,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         status_icon = "✓" if task.status == "completed" else "✗"
         date_str = f"({task.completed_at.strftime('%Y-%m-%d %H:%M')})" if task.completed_at else ""
         type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
-        prompt_display = task.prompt[:50] + "..." if len(task.prompt) > 50 else task.prompt
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         print(f"{status_icon} [#{task.id}] {date_str} {prompt_display}{type_label}")
         if task.branch:
             print(f"    branch: {task.branch}")
@@ -686,7 +694,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # Build the display line with colorization
         # Get first line of prompt, truncated to 50 chars
         first_line = root_task.prompt.split('\n')[0]
-        prompt_display = first_line[:50] + "..." if len(first_line) > 50 else first_line
+        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
@@ -810,7 +818,7 @@ def _merge_single_task(
             commit_message = None
             if args.squash:
                 # Get a concise summary of the task
-                task_summary = task.prompt[:72] if len(task.prompt) > 72 else task.prompt
+                task_summary = truncate(task.prompt, MAX_PR_TITLE_LENGTH)
                 commit_message = f"Squash merge: {task_summary}\n\nTask #{task.id}: {task.prompt}"
 
             git.merge(task.branch, squash=args.squash, commit_message=commit_message)
@@ -1235,11 +1243,11 @@ def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
 
     if not title:
         # Use task_id or first line of prompt
-        title = task.task_id or task.prompt.split("\n")[0][:72]
+        title = task.task_id or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
 
     body = "\n".join(body_lines).strip()
     if not body:
-        body = f"Task: {task.prompt[:500]}"
+        body = f"Task: {truncate(task.prompt, MAX_PR_BODY_LENGTH)}"
 
     return title, body
 
@@ -1252,11 +1260,11 @@ def _fallback_pr_content(task: DbTask, commit_log: str) -> tuple[str, str]:
         parts = task.task_id.split("-")[1:]  # Remove date prefix
         title = " ".join(parts).capitalize()
     else:
-        title = task.prompt.split("\n")[0][:72]
+        title = truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
 
     body = f"""## Task Prompt
 
-> {task.prompt[:500].replace(chr(10), chr(10) + '> ')}
+> {truncate(task.prompt, MAX_PR_BODY_LENGTH).replace(chr(10), chr(10) + '> ')}
 
 ## Commits
 ```
@@ -1328,7 +1336,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
     # Generate or use provided title/body
     if args.title:
         title = args.title
-        body = f"## Summary\n{task.prompt[:500]}"
+        body = f"## Summary\n{truncate(task.prompt, MAX_PR_BODY_LENGTH)}"
     else:
         print("Generating PR description...")
         title, body = _generate_pr_content(task, commit_log, diff_stat)
@@ -2538,7 +2546,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
         # Get first line of prompt
         first_line = task.prompt.split('\n')[0].strip()
-        prompt_display = first_line[:50] + "..." if len(first_line) > 50 else first_line
+        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
 
         # Status display
         status_display = task.status
@@ -2606,8 +2614,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
                 if task.task_id:
                     task_display = task.task_id
                 else:
-                    prompt = task.prompt[:25] + "..." if len(task.prompt) > 25 else task.prompt
-                    task_display = prompt
+                    task_display = truncate(task.prompt, 25)
 
         # Calculate duration
         started = datetime.fromisoformat(worker.started_at)
@@ -2711,7 +2718,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
     skip_confirmation = args.force or args.yes
 
     if not skip_confirmation:
-        prompt_display = task.prompt[:60] + "..." if len(task.prompt) > 60 else task.prompt
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
         confirm = input(f"Delete task #{task.id}: {prompt_display}? [y/N] ")
         if confirm.lower() != 'y':
             print("Cancelled")
