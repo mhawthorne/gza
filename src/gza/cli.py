@@ -1319,14 +1319,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
     gh = GitHub()
 
-    # Check gh CLI is available
-    if not gh.is_available():
-        print("Error: GitHub CLI (gh) is not installed or not authenticated")
-        print("Install: https://cli.github.com/")
-        print("Auth: gh auth login")
-        return 1
-
-    # Get the task
+    # Get the task first (validate task exists and state before checking gh)
     task = store.get(args.task_id)
     if not task:
         print(f"Error: Task #{args.task_id} not found")
@@ -1343,6 +1336,13 @@ def cmd_pr(args: argparse.Namespace) -> int:
 
     if not task.has_commits:
         print(f"Error: Task #{task.id} has no commits")
+        return 1
+
+    # Check gh CLI is available (after task validation so tests can run without gh)
+    if not gh.is_available():
+        print("Error: GitHub CLI (gh) is not installed or not authenticated")
+        print("Install: https://cli.github.com/")
+        print("Auth: gh auth login")
         return 1
 
     default_branch = git.default_branch()

@@ -66,8 +66,10 @@ mkdir -p "$OUTPUT_DIR"
 # Sanitize the tag name for use as a filename (replace / with -)
 OUTPUT_FILE="$OUTPUT_DIR/${TO_TAG//\//-}.md"
 
+CLAUDE_MODEL="haiku"
+
 if command -v claude &> /dev/null; then
-    echo "$PROMPT" | claude --print > "$OUTPUT_FILE"
+    echo "$PROMPT" | claude --model $CLAUDE_MODEL --print > "$OUTPUT_FILE"
     echo "Release notes written to: $OUTPUT_FILE"
 else
     echo "Error: 'claude' CLI not found. Install it with: npm install -g @anthropic-ai/claude-code"
