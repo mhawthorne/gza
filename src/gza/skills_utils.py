@@ -11,6 +11,8 @@ import tempfile
 from pathlib import Path
 from typing import List, Tuple, Optional
 
+from .console import console
+
 
 def get_skills_source_path() -> Path:
     """Get the path to bundled skills directory.
@@ -81,8 +83,8 @@ def _parse_skill_frontmatter(skill_name: str, field: str) -> str:
                     break
                 if line.startswith(f'{field}:'):
                     return line.split(f'{field}:', 1)[1].strip()
-    except Exception:
-        pass
+    except (OSError, UnicodeDecodeError) as e:
+        console.print(f"[yellow]Warning: Failed to read skill frontmatter for '{skill_name}': {e}[/yellow]")
 
     return ""
 
@@ -170,7 +172,7 @@ def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[
         if target.exists() and force:
             try:
                 shutil.rmtree(target)
-            except Exception as e:
+            except OSError as e:
                 return False, f"failed to remove existing: {e}"
 
         # Atomically rename temp to target
@@ -178,12 +180,12 @@ def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[
         temp_path.rename(target)
 
         return True, "installed"
-    except Exception as e:
+    except (OSError, shutil.Error) as e:
         return False, f"copy failed: {e}"
     finally:
         # Clean up temp directory if it still exists
         if temp_dir and Path(temp_dir).exists():
             try:
                 shutil.rmtree(temp_dir)
-            except Exception:
-                pass  # Best effort cleanup
+            except OSError as e:
+                console.print(f"[yellow]Warning: Failed to clean up temporary directory {temp_dir}: {e}[/yellow]")
