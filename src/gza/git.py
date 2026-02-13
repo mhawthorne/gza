@@ -179,7 +179,7 @@ class Git:
         """
         result = self._run("worktree", "list", "--porcelain")
         worktrees = []
-        current = {}
+        current: dict[str, str] = {}
         for line in result.stdout.strip().split("\n"):
             if not line:
                 if current:

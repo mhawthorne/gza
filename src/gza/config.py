@@ -108,7 +108,7 @@ class Config:
                 default_type="feature"
             )
 
-    def get_model_for_task_type(self, task_type: str) -> str:
+    def get_model_for_task_type(self, task_type: str) -> str | None:
         """Get the model for a given task type, falling back to defaults.
 
         Args:
@@ -123,7 +123,7 @@ class Config:
         # Fall back to default model
         return self.model
 
-    def get_max_turns_for_task_type(self, task_type: str) -> int:
+    def get_max_turns_for_task_type(self, task_type: str) -> int | None:
         """Get the max_turns for a given task type, falling back to defaults.
 
         Args:
@@ -204,12 +204,14 @@ class Config:
 
         # Environment variables override file config
         use_docker = data.get("use_docker", DEFAULT_USE_DOCKER)
-        if os.getenv("GZA_USE_DOCKER"):
-            use_docker = os.getenv("GZA_USE_DOCKER").lower() != "false"
+        env_use_docker = os.getenv("GZA_USE_DOCKER")
+        if env_use_docker:
+            use_docker = env_use_docker.lower() != "false"
 
         timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
-        if os.getenv("GZA_TIMEOUT_MINUTES"):
-            timeout_minutes = int(os.getenv("GZA_TIMEOUT_MINUTES"))
+        env_timeout = os.getenv("GZA_TIMEOUT_MINUTES")
+        if env_timeout:
+            timeout_minutes = int(env_timeout)
 
         branch_mode = data.get("branch_mode", DEFAULT_BRANCH_MODE)
         if os.getenv("GZA_BRANCH_MODE"):
@@ -217,16 +219,18 @@ class Config:
 
         # max_turns: check defaults section first, then top-level
         max_turns = defaults.get("max_turns") or data.get("max_turns", DEFAULT_MAX_TURNS)
-        if os.getenv("GZA_MAX_TURNS"):
-            max_turns = int(os.getenv("GZA_MAX_TURNS"))
+        env_max_turns = os.getenv("GZA_MAX_TURNS")
+        if env_max_turns:
+            max_turns = int(env_max_turns)
 
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
         if os.getenv("GZA_WORKTREE_DIR"):
             worktree_dir = os.getenv("GZA_WORKTREE_DIR")
 
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
-        if os.getenv("GZA_WORK_COUNT"):
-            work_count = int(os.getenv("GZA_WORK_COUNT"))
+        env_work_count = os.getenv("GZA_WORK_COUNT")
+        if env_work_count:
+            work_count = int(env_work_count)
 
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
         if os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH"):
@@ -243,9 +247,10 @@ class Config:
 
         # docker_volumes: can be overridden by environment variable
         docker_volumes = data.get("docker_volumes", [])
-        if os.getenv("GZA_DOCKER_VOLUMES"):
+        env_docker_volumes = os.getenv("GZA_DOCKER_VOLUMES")
+        if env_docker_volumes:
             # Parse comma-separated volumes
-            docker_volumes = [v.strip() for v in os.getenv("GZA_DOCKER_VOLUMES").split(",") if v.strip()]
+            docker_volumes = [v.strip() for v in env_docker_volumes.split(",") if v.strip()]
 
         # Expand tilde in volume paths
         expanded_volumes = []
@@ -335,8 +340,8 @@ class Config:
             Tuple of (is_valid, list of error messages, list of warning messages)
         """
         config_path = cls.config_path(project_dir)
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         # Check if file exists
         if not config_path.exists():

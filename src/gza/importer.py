@@ -291,7 +291,8 @@ def import_tasks(
             )
 
             # Track mapping for future dependencies
-            index_to_id[i] = task.id
+            if task.id is not None:
+                index_to_id[i] = task.id
 
             results.append(ImportResult(task=task, local_index=i))
             prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt

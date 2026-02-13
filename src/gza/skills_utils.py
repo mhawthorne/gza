@@ -39,7 +39,7 @@ def get_available_skills(public_only: bool = False) -> List[str]:
         Sorted list of skill names.
     """
     skills_path = get_skills_source_path()
-    skills = []
+    skills: list[str] = []
 
     if not skills_path.exists():
         return skills

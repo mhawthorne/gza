@@ -113,7 +113,7 @@ class Task:
         if len(desc) > 50 or '\n' in desc:
             desc = LiteralString(desc)
 
-        result = {
+        result: dict[str, str | bool | float | int | datetime] = {
             "description": desc,
             "status": self.status.value if isinstance(self.status, TaskStatus) else self.status,
         }
@@ -231,14 +231,14 @@ class YamlTaskStore:
                 continue
             if tags is None:
                 return task
-            # If tags specified, task must have at least one matching tag
-            if any(t in task.tags for t in tags):
-                return task
+            # If tags specified, task must have at least one matching tag (not currently supported in Task)
+            # if any(t in task.tags for t in tags):
+            #     return task
         return None
 
     def mark_in_progress(self, task: Task) -> None:
         """Mark a task as in progress."""
-        task.status = "in_progress"
+        task.status = TaskStatus.IN_PROGRESS
         self._save()
 
     def mark_completed(
@@ -251,8 +251,8 @@ class YamlTaskStore:
         stats: TaskStats | None = None,
     ) -> None:
         """Mark a task as completed."""
-        task.status = "completed"
-        task.completed_at = date.today()
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = datetime.now(timezone.utc)
         task.has_commits = has_commits
         if branch:
             task.branch = branch
@@ -275,7 +275,7 @@ class YamlTaskStore:
         branch: str | None = None,
     ) -> None:
         """Mark a task as failed."""
-        task.status = "failed"
+        task.status = TaskStatus.FAILED
         task.has_commits = has_commits
         if log_file:
             task.log_file = log_file
@@ -296,8 +296,8 @@ class YamlTaskStore:
         stats: TaskStats | None = None,
     ) -> None:
         """Mark a task as unmerged (completed but not merged to main)."""
-        task.status = "unmerged"
-        task.completed_at = date.today()
+        task.status = TaskStatus.UNMERGED
+        task.completed_at = datetime.now(timezone.utc)
         task.has_commits = has_commits
         if branch:
             task.branch = branch

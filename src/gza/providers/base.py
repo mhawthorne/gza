@@ -6,9 +6,10 @@ import os
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..config import APP_NAME
 
@@ -243,6 +244,7 @@ class RunResult:
     output_tokens: int | None = None
     error_type: str | None = None  # e.g., "max_turns" when turn limit exceeded
     session_id: str | None = None  # Claude session ID for resume capability
+    _accumulated_data: dict[str, Any] | None = None  # Internal data for parsing
 
 
 class Provider(ABC):
@@ -271,6 +273,7 @@ class Provider(ABC):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        resume_session_id: str | None = None,
     ) -> RunResult:
         """Run the provider to execute a task.
 
@@ -279,6 +282,7 @@ class Provider(ABC):
             prompt: The task prompt
             log_file: Path to write logs
             work_dir: Working directory for execution
+            resume_session_id: Optional session ID to resume from
 
         Returns:
             RunResult with exit code and statistics
@@ -291,7 +295,7 @@ class Provider(ABC):
         log_file: Path,
         timeout_minutes: int,
         cwd: Path | None = None,
-        parse_output: callable = None,
+        parse_output: Callable[[str, dict[str, Any]], None] | None = None,
         stdin_input: str | None = None,
     ) -> RunResult:
         """Run command with output to both console and log file.
@@ -331,18 +335,19 @@ class Provider(ABC):
             )
 
             # Write stdin if provided
-            if stdin_input:
+            if stdin_input and process.stdin:
                 process.stdin.write(stdin_input)
                 process.stdin.close()
 
-            for line in process.stdout:
-                log.write(line)
-                line = line.strip()
-                if not line:
-                    continue
+            if process.stdout:
+                for line in process.stdout:
+                    log.write(line)
+                    line = line.strip()
+                    if not line:
+                        continue
 
-                if parse_output:
-                    parse_output(line, accumulated_data, log)
+                    if parse_output:
+                        parse_output(line, accumulated_data, log)
 
             process.wait()
 

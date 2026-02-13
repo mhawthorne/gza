@@ -75,7 +75,7 @@ def cleanup_worktree_for_branch(git: Git, branch: str, force: bool = False) -> P
     return None
 
 
-def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int = None) -> int:
+def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None) -> int:
     """Spawn a background worker process.
 
     Args:
@@ -109,6 +109,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         if not task:
             print("No pending tasks found")
             return 0
+        assert task.id is not None
         task_id = task.id
 
     # Build command for worker subprocess
@@ -1130,7 +1131,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
             )
 
             # Close git's stdout in parent to allow git_proc to receive SIGPIPE
-            git_proc.stdout.close()
+            if git_proc.stdout:
+                git_proc.stdout.close()
 
             # Wait for pager to finish
             pager_proc.wait()
@@ -2515,7 +2517,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
     if args.edit or not args.prompt:
         # Interactive mode with $EDITOR
-        task = add_task_interactive(
+        new_task = add_task_interactive(
             store,
             task_type=task_type,
             based_on=based_on,
@@ -2861,10 +2863,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return 0
 
     # Stop specific worker
-    worker = registry.get(args.worker_id)
-    if not worker:
+    maybe_worker = registry.get(args.worker_id)
+    if not maybe_worker:
         print(f"Error: Worker {args.worker_id} not found")
         return 1
+    worker = maybe_worker
 
     if worker.status != "running":
         print(f"Worker {args.worker_id} is not running (status: {worker.status})")
@@ -2964,6 +2967,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     # Handle background mode - spawn worker to run the new task
     if args.background:
         # Create a temporary args object for the worker with the new task_id
+        assert new_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [new_task.id]
         return _spawn_background_worker(worker_args, config, task_id=new_task.id)
@@ -3004,6 +3008,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         return 1
 
     # Find the most recent review task for this implementation
+    assert impl_task.id is not None
     review_tasks = store.get_reviews_for_task(impl_task.id)
 
     if not review_tasks:
@@ -3037,6 +3042,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     # Handle background mode - spawn worker to run the improve task
     if hasattr(args, 'background') and args.background:
+        assert improve_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [improve_task.id]
         return _spawn_background_worker(worker_args, config, task_id=improve_task.id)
@@ -3093,6 +3099,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     # Handle background mode - spawn worker to run the review task
     if hasattr(args, 'background') and args.background:
+        assert review_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [review_task.id]
         return _spawn_background_worker(worker_args, config, task_id=review_task.id)
