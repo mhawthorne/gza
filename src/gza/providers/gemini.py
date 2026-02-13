@@ -207,7 +207,10 @@ class GeminiProvider(Provider):
         if config.model:
             cmd.extend(["-m", config.model])
 
-        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, config.model, cwd=work_dir)
+        return self._run_with_output_parsing(
+            cmd, log_file, config.timeout_minutes, config.model, cwd=work_dir,
+            chat_text_display_length=config.chat_text_display_length,
+        )
 
     def _run_with_output_parsing(
         self,
@@ -216,10 +219,11 @@ class GeminiProvider(Provider):
         timeout_minutes: int,
         model: str,
         cwd: Path | None = None,
+        chat_text_display_length: int = 0,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
 
-        def parse_gemini_output(line: str, data: dict) -> None:
+        def parse_gemini_output(line: str, data: dict, log_handle=None) -> None:
             try:
                 event = json.loads(line)
                 event_type = event.get("type")
@@ -234,8 +238,16 @@ class GeminiProvider(Provider):
                     if event.get("role") == "assistant":
                         content = event.get("content", "")
                         if content and not event.get("delta"):
-                            first_line = content.split("\n")[0][:80]
-                            print(f"  {first_line}")
+                            # Display text to console (configurable length, 0 = unlimited)
+                            if chat_text_display_length == 0:
+                                # Show full text
+                                print(f"  {content}")
+                            else:
+                                # Truncate to first line and max length
+                                first_line = content.split("\n")[0]
+                                if len(first_line) > chat_text_display_length:
+                                    first_line = first_line[:chat_text_display_length - 3] + "..."
+                                print(f"  {first_line}")
 
                 elif event_type == "tool_use":
                     tool_name = event.get("tool_name", "unknown")

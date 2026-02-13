@@ -185,6 +185,7 @@ class ClaudeProvider(Provider):
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
+            chat_text_display_length=config.chat_text_display_length,
         )
 
     def _run_direct(
@@ -210,6 +211,7 @@ class ClaudeProvider(Provider):
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
+            chat_text_display_length=config.chat_text_display_length,
         )
 
     def _run_with_output_parsing(
@@ -220,10 +222,11 @@ class ClaudeProvider(Provider):
         cwd: Path | None = None,
         stdin_input: str | None = None,
         model: str = "",
+        chat_text_display_length: int = 0,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
 
-        def parse_claude_output(line: str, data: dict) -> None:
+        def parse_claude_output(line: str, data: dict, log_handle=None) -> None:
             try:
                 event = json.loads(line)
                 event_type = event.get("type")
@@ -372,8 +375,16 @@ class ClaudeProvider(Provider):
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:
-                                first_line = text.split("\n")[0][:80]
-                                console.print(first_line, style=OUTPUT_COLORS["assistant_text"])
+                                # Display text to console (configurable length, 0 = unlimited)
+                                if chat_text_display_length == 0:
+                                    # Show full text
+                                    console.print(text, style=OUTPUT_COLORS["assistant_text"])
+                                else:
+                                    # Truncate to first line and max length
+                                    first_line = text.split("\n")[0]
+                                    if len(first_line) > chat_text_display_length:
+                                        first_line = first_line[:chat_text_display_length - 3] + "..."
+                                    console.print(first_line, style=OUTPUT_COLORS["assistant_text"])
 
                 elif event_type == "result":
                     data["result"] = event

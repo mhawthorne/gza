@@ -304,8 +304,9 @@ class Provider(ABC):
             timeout_minutes: Timeout in minutes
             cwd: Working directory
             parse_output: Optional callback to parse each line of output.
-                         Called with (line: str, accumulated_data: dict).
+                         Called with (line: str, accumulated_data: dict, log_handle).
                          The callback should update accumulated_data in place.
+                         log_handle can be used to write additional formatted output.
             stdin_input: Optional string to pass to stdin
 
         Returns:
@@ -341,7 +342,7 @@ class Provider(ABC):
                     continue
 
                 if parse_output:
-                    parse_output(line, accumulated_data)
+                    parse_output(line, accumulated_data, log)
 
             process.wait()
 

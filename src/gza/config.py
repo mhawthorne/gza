@@ -27,6 +27,7 @@ DEFAULT_MAX_TURNS = 50
 DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
 DEFAULT_PROVIDER = "claude"  # "claude" or "gemini"
+DEFAULT_CHAT_TEXT_DISPLAY_LENGTH = 0  # 0 means unlimited (show all)
 DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
 DEFAULT_CLAUDE_ARGS = [
     "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash",
@@ -94,6 +95,7 @@ class Config:
     model: str = ""  # Provider-specific model name (optional)
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
     branch_strategy: BranchStrategy | None = None  # Branch naming strategy
+    chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
 
     def __post_init__(self):
         if not self.docker_image:
@@ -226,6 +228,10 @@ class Config:
         if os.getenv("GZA_WORK_COUNT"):
             work_count = int(os.getenv("GZA_WORK_COUNT"))
 
+        chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
+        if os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH"):
+            chat_text_display_length = int(os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH"))
+
         provider = data.get("provider", DEFAULT_PROVIDER)
         if os.getenv("GZA_PROVIDER"):
             provider = os.getenv("GZA_PROVIDER")
@@ -318,6 +324,7 @@ class Config:
             model=model,
             task_types=task_types,
             branch_strategy=branch_strategy,
+            chat_text_display_length=chat_text_display_length,
         )
 
     @classmethod
