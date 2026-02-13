@@ -233,8 +233,9 @@ class Config:
             work_count = int(env_work_count)
 
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
-        if os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH"):
-            chat_text_display_length = int(os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH"))
+        env_chat_text_display_length = os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH")
+        if env_chat_text_display_length:
+            chat_text_display_length = int(env_chat_text_display_length)
 
         provider = data.get("provider", DEFAULT_PROVIDER)
         if os.getenv("GZA_PROVIDER"):

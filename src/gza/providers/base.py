@@ -295,7 +295,7 @@ class Provider(ABC):
         log_file: Path,
         timeout_minutes: int,
         cwd: Path | None = None,
-        parse_output: Callable[[str, dict[str, Any]], None] | None = None,
+        parse_output: Callable[[str, dict[str, Any], Any], None] | None = None,
         stdin_input: str | None = None,
     ) -> RunResult:
         """Run command with output to both console and log file.

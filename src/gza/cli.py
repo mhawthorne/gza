@@ -1513,10 +1513,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     cutoff_timestamp = cutoff_time.timestamp()
 
     # Track what was cleaned
-    cleaned_worktrees = []
-    cleaned_logs = []
+    cleaned_worktrees: list[tuple[str, str]] = []
+    cleaned_logs: list[str] = []
     cleaned_workers = 0
-    errors = []
+    errors: list[tuple[str, Exception]] = []
 
     # 1. Clean up stale worktrees
     if args.worktrees or not (args.logs or args.workers):
@@ -1529,7 +1529,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
                     # Check if worktree still exists in git's worktree list
                     worktrees = git.worktree_list()
-                    worktree_paths = {Path(wt.get("path")) for wt in worktrees}
+                    worktree_paths = {Path(wt["path"]) for wt in worktrees if wt.get("path")}
 
                     should_remove = False
                     reason = ""
