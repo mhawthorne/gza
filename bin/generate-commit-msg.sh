@@ -34,8 +34,10 @@ Output ONLY the commit message, no explanations or markdown formatting."
 echo "Generating commit message..."
 echo ""
 
+CLAUDE_MODEL="haiku"
+
 if command -v claude &> /dev/null; then
-    echo "$PROMPT" | claude --print
+    echo "$PROMPT" | claude --model $CLAUDE_MODEL --print
 else
     echo "Error: 'claude' CLI not found. Install it with: npm install -g @anthropic-ai/claude-code"
     exit 1
