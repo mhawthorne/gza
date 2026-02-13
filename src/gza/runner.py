@@ -680,7 +680,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             project_name=config.project_name,
         )
 
-    task_header(task.prompt, task.task_id, task.task_type)
+    task_header(task.prompt, task.task_id or "", task.task_type)
 
     # For explore, plan, and review tasks, run in project dir without creating a branch
     if task.task_type in ("explore", "plan", "review"):
@@ -694,6 +694,8 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     elif resume:
         # Resume but branch wasn't saved - derive from task_id using branch naming strategy
         from gza.branch_naming import generate_branch_name
+        assert config.branch_strategy is not None
+        assert task.task_id is not None
         branch_name = generate_branch_name(
             pattern=config.branch_strategy.pattern,
             project_name=config.project_name,
@@ -722,6 +724,8 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     else:  # multi
         # Use branch naming strategy
         from gza.branch_naming import generate_branch_name
+        assert config.branch_strategy is not None
+        assert task.task_id is not None
         branch_name = generate_branch_name(
             pattern=config.branch_strategy.pattern,
             project_name=config.project_name,
@@ -732,6 +736,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         )
 
     # Create worktree path
+    assert task.task_id is not None
     worktree_path = config.worktree_path / task.task_id
 
     # Handle branch and worktree creation
@@ -994,7 +999,7 @@ def _run_non_code_task(
         resume: If True, resume from previous session
         open_after: If True, open the report file in $EDITOR after completion
     """
-    if resume:
+    if resume and task.session_id:
         console.print(f"    Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
 
     # Mark task in progress
@@ -1024,6 +1029,7 @@ def _run_non_code_task(
     report_file_relative = str(report_path.relative_to(config.project_dir))
 
     # Create worktree in /tmp for Docker compatibility on macOS
+    assert task.task_id is not None
     worktree_path = config.worktree_path / f"{task.task_id}-{task.task_type}"
 
     try:
@@ -1031,7 +1037,7 @@ def _run_non_code_task(
         default_branch = git.default_branch() if git else "main"
 
         # Remove existing worktree if it exists
-        if worktree_path.exists():
+        if worktree_path.exists() and git:
             git.worktree_remove(worktree_path, force=True)
 
         # For review tasks with depends_on, check if we should run on the implementation branch
@@ -1046,14 +1052,16 @@ def _run_non_code_task(
         # Default to origin/default_branch or local default_branch
         if not base_ref:
             base_ref = f"origin/{default_branch}"
-            result = git._run("rev-parse", "--verify", base_ref, check=False)
-            if result.returncode != 0:
-                base_ref = default_branch  # Fall back to local branch
+            if git:
+                git_result = git._run("rev-parse", "--verify", base_ref, check=False)
+                if git_result.returncode != 0:
+                    base_ref = default_branch  # Fall back to local branch
 
         # Create worktree without creating a new branch (use --detach to check out HEAD)
         # This creates a worktree in detached HEAD state based on the specified ref
         console.print(f"Creating worktree: {worktree_path}")
-        git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
+        if git:
+            git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
 
         # Create report directory structure in worktree
         worktree_report_dir = worktree_path / report_dir.relative_to(config.project_dir)
@@ -1081,10 +1089,9 @@ The task was interrupted (max turns, timeout, etc.) and your todo list may show 
 
 Once you've verified and updated the todo list, continue from where you left off."""
         else:
-            prompt = build_prompt(task, config, store, prompt_report_path, git)
-        resume_session_id = task.session_id if resume else None
+            prompt = build_prompt(task, config, store, report_path=prompt_report_path, git=git)
         try:
-            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=resume_session_id)
+            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
         except KeyboardInterrupt:
             console.print("\nInterrupted")
             return 130

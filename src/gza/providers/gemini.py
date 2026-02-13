@@ -44,6 +44,8 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
             pricing = prices
             break
 
+    if pricing is None:
+        pricing = GEMINI_PRICING["default"]
     input_price, output_price = pricing
     cost = (input_tokens * input_price / 1_000_000) + (output_tokens * output_price / 1_000_000)
     return round(cost, 6)
@@ -149,8 +151,10 @@ class GeminiProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        resume_session_id: str | None = None,
     ) -> RunResult:
         """Run Gemini to execute a task."""
+        # Note: Gemini doesn't currently support session resumption
         if config.use_docker:
             return self._run_docker(config, prompt, log_file, work_dir)
         return self._run_direct(config, prompt, log_file, work_dir)

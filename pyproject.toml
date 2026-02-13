@@ -37,6 +37,8 @@ dev = [
     "pytest>=8.0",
     "build>=1.0",
     "twine>=5.0",
+    "mypy>=1.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -62,3 +64,10 @@ testpaths = ["tests"]
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+strict_optional = true
+warn_unused_ignores = true
+files = ["src/gza"]

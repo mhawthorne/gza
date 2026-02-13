@@ -289,7 +289,10 @@ class SqliteTaskStore:
                 (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint),
             )
             task_id = cur.lastrowid
-            return self.get(task_id)
+            assert task_id is not None
+            result = self.get(task_id)
+            assert result is not None
+            return result
 
     def get(self, task_id: int) -> Task | None:
         """Get a task by ID."""
@@ -499,7 +502,7 @@ class SqliteTaskStore:
                     ORDER BY completed_at DESC, id DESC
                     LIMIT ?
                 """
-                params.append(limit)
+                params.append(str(limit))
                 cur = conn.execute(query, params)
 
             return [self._row_to_task(row) for row in cur.fetchall()]
