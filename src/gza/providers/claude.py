@@ -29,7 +29,9 @@ OUTPUT_COLORS = {
     "turn_info": "blue",
     "assistant_text": "green",
     "tool_use": "magenta",
-    "todo_item": "dim",
+    "todo_pending": "white",
+    "todo_in_progress": "yellow",
+    "todo_completed": "green",
 }
 
 # Claude pricing per million tokens (input, output)
@@ -320,7 +322,9 @@ class ClaudeProvider(Provider):
                                     # Truncate to 60 chars
                                     if len(content) > 60:
                                         content = content[:57] + "..."
-                                    console.print(f"  {icon} {content}", style=OUTPUT_COLORS["todo_item"])
+                                    # Use status-based color for better visibility
+                                    color = OUTPUT_COLORS.get(f"todo_{status}", "white")
+                                    console.print(f"  {icon} {content}", style=color)
                             elif tool_name == "Edit":
                                 # Enhanced logging for Edit tool
                                 parts = [tool_name]
