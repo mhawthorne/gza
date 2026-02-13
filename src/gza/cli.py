@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import Config, ConfigError
+from .console import console
 from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask
 from .git import Git, GitError
 from .github import GitHub, GitHubError
@@ -629,8 +630,18 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 unmerged.append(task)
 
     if not unmerged:
-        print("No unmerged tasks")
+        console.print("No unmerged tasks")
         return 0
+
+    # Task type to color mapping (consistent with gza work)
+    TYPE_COLORS = {
+        "plan": "cyan",
+        "implement": "magenta",
+        "review": "blue",
+        "improve": "yellow",
+        "explore": "green",
+        "task": "white",
+    }
 
     # Group tasks by branch
     branch_groups: dict[str, list] = {}
@@ -640,8 +651,17 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 branch_groups[task.branch] = []
             branch_groups[task.branch].append(task)
 
+    # Define task separator (same style as gza work logs)
+    task_separator = "-" * 32
+
     # Display grouped by branch
+    first_task = True
     for branch, tasks in branch_groups.items():
+        # Add separator between tasks (not before first task)
+        if not first_task:
+            console.print(task_separator)
+        first_task = False
+
         # Sort tasks by created_at to find the root task (earliest)
         tasks_sorted = sorted(tasks, key=lambda t: t.created_at if t.created_at else datetime.min)
 
@@ -666,6 +686,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         # Check for review status
         review_status = None
+        review_status_color = None
         reviews = store.get_reviews_for_task(root_task.id)
         if reviews:
             # Get the most recent review (first in the list, as they're ordered by created_at DESC)
@@ -673,41 +694,43 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             verdict = get_review_verdict(config, latest_review)
             if verdict == "APPROVED":
                 review_status = "✓ approved"
+                review_status_color = "green"
             elif verdict == "CHANGES_REQUESTED":
                 review_status = "⚠ changes requested"
+                review_status_color = "yellow"
             elif verdict == "NEEDS_DISCUSSION":
                 review_status = "💬 needs discussion"
+                review_status_color = "blue"
 
-        # Build the display line
+        # Build the display line with colorization
         prompt_display = root_task.prompt[:50] + "..." if len(root_task.prompt) > 50 else root_task.prompt
+        task_color = TYPE_COLORS.get(root_task.task_type, "white")
 
         # Add improve task references if any
         if improve_tasks:
-            improve_ids = ", ".join(f"#{t.id}" for t in improve_tasks)
-            suffix = f" [{review_status}]" if review_status else ""
-            print(f"⚡ [#{root_task.id}] {prompt_display} (improved by {improve_ids}){suffix}")
+            improve_ids = ", ".join(f"[dim]#{t.id}[/dim]" for t in improve_tasks)
+            suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
+            console.print(f"[{task_color}]⚡ [[dim]#{root_task.id}[/dim]] {prompt_display} (improved by {improve_ids}){suffix}[/{task_color}]")
         else:
-            date_str = f"({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})" if root_task.completed_at else ""
-            suffix = f" [{review_status}]" if review_status else ""
-            print(f"⚡ [#{root_task.id}] {date_str} {prompt_display}{suffix}")
+            date_str = f"([dim]{root_task.completed_at.strftime('%Y-%m-%d %H:%M')}[/dim])" if root_task.completed_at else ""
+            suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
+            console.print(f"[{task_color}]⚡ [[dim]#{root_task.id}[/dim]] {date_str} {prompt_display}{suffix}[/{task_color}]")
 
         # Show branch with commit count
         commit_count = git.count_commits_ahead(branch, default_branch)
         commits_label = "commit" if commit_count == 1 else "commits"
-        print(f"    branch: {branch} ({commit_count} {commits_label})")
+        console.print(f"    branch: [blue]{branch}[/blue] ([dim]{commit_count} {commits_label}[/dim])")
 
         if root_task.report_file:
-            print(f"    report: {root_task.report_file}")
+            console.print(f"    report: [dim]{root_task.report_file}[/dim]")
 
         stats_str = format_stats(root_task)
         if stats_str:
-            print(f"    stats: {stats_str}")
+            console.print(f"    stats: [dim]{stats_str}[/dim]")
 
         # Show merge status at the end
         if not git.can_merge(branch, default_branch):
-            print(f"    ⚠️  has conflicts")
-
-        print()
+            console.print("    [yellow]⚠️  has conflicts[/yellow]")
 
     return 0
 
