@@ -633,14 +633,12 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         console.print("No unmerged tasks")
         return 0
 
-    # Task type to color mapping (consistent with gza work)
-    TYPE_COLORS = {
-        "plan": "cyan",
-        "implement": "magenta",
-        "review": "blue",
-        "improve": "yellow",
-        "explore": "green",
-        "task": "white",
+    # Configurable colors for unmerged output
+    UNMERGED_COLORS = {
+        "task_id": "#cccccc",      # light gray for task ID and date
+        "prompt": "#ff99cc",       # pink for prompt text
+        "stats": "#6699ff",        # lighter blue for stats
+        "branch": "#6699ff",       # lighter blue for branch name
     }
 
     # Group tasks by branch
@@ -703,34 +701,36 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 review_status_color = "blue"
 
         # Build the display line with colorization
-        prompt_display = root_task.prompt[:50] + "..." if len(root_task.prompt) > 50 else root_task.prompt
-        task_color = TYPE_COLORS.get(root_task.task_type, "white")
+        # Get first line of prompt, truncated to 50 chars
+        first_line = root_task.prompt.split('\n')[0]
+        prompt_display = first_line[:50] + "..." if len(first_line) > 50 else first_line
+
+        c = UNMERGED_COLORS  # shorthand
+        suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
 
         # Add improve task references if any
         if improve_tasks:
-            improve_ids = ", ".join(f"[dim]#{t.id}[/dim]" for t in improve_tasks)
-            suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
-            console.print(f"[{task_color}]⚡ [[dim]#{root_task.id}[/dim]] {prompt_display} (improved by {improve_ids}){suffix}[/{task_color}]")
+            improve_ids = ", ".join(f"[{c['task_id']}]#{t.id}[/{c['task_id']}]" for t in improve_tasks)
+            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] [{c['prompt']}]{prompt_display}[/{c['prompt']}] (improved by {improve_ids}){suffix}")
         else:
-            date_str = f"([dim]{root_task.completed_at.strftime('%Y-%m-%d %H:%M')}[/dim])" if root_task.completed_at else ""
-            suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
-            console.print(f"[{task_color}]⚡ [[dim]#{root_task.id}[/dim]] {date_str} {prompt_display}{suffix}[/{task_color}]")
+            date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
+            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
 
         # Show branch with commit count
         commit_count = git.count_commits_ahead(branch, default_branch)
         commits_label = "commit" if commit_count == 1 else "commits"
-        console.print(f"    branch: [blue]{branch}[/blue] ([dim]{commit_count} {commits_label}[/dim])")
+        console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}])")
 
         if root_task.report_file:
-            console.print(f"    report: [dim]{root_task.report_file}[/dim]")
+            console.print(f"report: [{c['task_id']}]{root_task.report_file}[/{c['task_id']}]")
 
         stats_str = format_stats(root_task)
         if stats_str:
-            console.print(f"    stats: [dim]{stats_str}[/dim]")
+            console.print(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
 
         # Show merge status at the end
         if not git.can_merge(branch, default_branch):
-            console.print("    [yellow]⚠️  has conflicts[/yellow]")
+            console.print("[yellow]⚠️  has conflicts[/yellow]")
 
     return 0
 
