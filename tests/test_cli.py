@@ -2851,6 +2851,370 @@ class TestMergeCommand:
         assert "squash merged" in result.stdout
 
 
+class TestCheckoutCommand:
+    """Tests for 'gza checkout' command."""
+
+    def test_checkout_removes_clean_worktree(self, tmp_path: Path):
+        """Checkout command removes clean worktree before checking out branch."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test checkout task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-checkout"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/test-checkout")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create a worktree for the branch
+        worktree_path = tmp_path / "worktrees" / "test-checkout"
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), "feature/test-checkout")
+
+        # Verify worktree exists
+        assert worktree_path.exists()
+
+        # Checkout the branch by task ID - should remove worktree first
+        result = run_gza("checkout", str(task.id), "--project", str(tmp_path))
+
+        # Verify success
+        assert result.returncode == 0
+        assert "Removing stale worktree" in result.stdout
+        assert "Removed worktree" in result.stdout
+        assert "Checked out" in result.stdout
+
+    def test_checkout_fails_with_dirty_worktree(self, tmp_path: Path):
+        """Checkout command fails if worktree has uncommitted changes."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test checkout with dirty worktree")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-dirty"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/test-dirty")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create a worktree for the branch
+        worktree_path = tmp_path / "worktrees" / "test-dirty"
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), "feature/test-dirty")
+
+        # Add uncommitted changes to the worktree
+        (worktree_path / "uncommitted.txt").write_text("uncommitted")
+
+        # Checkout should fail due to dirty worktree
+        result = run_gza("checkout", str(task.id), "--project", str(tmp_path))
+
+        # Verify failure
+        assert result.returncode == 1
+        assert "uncommitted changes" in result.stdout
+
+    def test_checkout_force_removes_dirty_worktree(self, tmp_path: Path):
+        """Checkout --force removes worktree even with uncommitted changes."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test checkout force")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-force"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/test-force")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create a worktree for the branch
+        worktree_path = tmp_path / "worktrees" / "test-force"
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), "feature/test-force")
+
+        # Add uncommitted changes to the worktree
+        (worktree_path / "uncommitted.txt").write_text("uncommitted")
+
+        # Checkout with --force should succeed
+        result = run_gza("checkout", str(task.id), "--force", "--project", str(tmp_path))
+
+        # Verify success
+        assert result.returncode == 0
+        assert "Removed worktree" in result.stdout
+        assert "Checked out" in result.stdout
+
+
+class TestRebaseCommand:
+    """Tests for 'gza rebase' command."""
+
+    def test_rebase_removes_clean_worktree(self, tmp_path: Path):
+        """Rebase command removes clean worktree before rebasing."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test rebase with worktree")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-rebase-wt"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-rebase-wt")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create a worktree for the branch
+        worktree_path = tmp_path / "worktrees" / "test-rebase-wt"
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), "feature/test-rebase-wt")
+
+        # Verify worktree exists
+        assert worktree_path.exists()
+
+        # Rebase should remove worktree first, then succeed
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        # Verify success
+        assert result.returncode == 0
+        assert "Removing stale worktree" in result.stdout
+        assert "Removed worktree" in result.stdout
+        assert "Successfully rebased" in result.stdout
+
+    def test_rebase_fails_with_dirty_worktree(self, tmp_path: Path):
+        """Rebase command fails if worktree has uncommitted changes."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test rebase with dirty worktree")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-rebase-dirty"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-rebase-dirty")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create a worktree for the branch
+        worktree_path = tmp_path / "worktrees" / "test-rebase-dirty"
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), "feature/test-rebase-dirty")
+
+        # Add uncommitted changes to the worktree
+        (worktree_path / "uncommitted.txt").write_text("uncommitted")
+
+        # Rebase should fail due to dirty worktree
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        # Verify failure
+        assert result.returncode == 1
+        assert "uncommitted changes" in result.stdout
+
+    def test_rebase_force_removes_dirty_worktree(self, tmp_path: Path):
+        """Rebase --force removes worktree even with uncommitted changes."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test rebase force")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-rebase-force"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-rebase-force")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create a worktree for the branch
+        worktree_path = tmp_path / "worktrees" / "test-rebase-force"
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), "feature/test-rebase-force")
+
+        # Add uncommitted changes to the worktree
+        (worktree_path / "uncommitted.txt").write_text("uncommitted")
+
+        # Rebase with --force should succeed
+        result = run_gza("rebase", str(task.id), "--force", "--project", str(tmp_path))
+
+        # Verify success
+        assert result.returncode == 0
+        assert "Removed worktree" in result.stdout
+        assert "Successfully rebased" in result.stdout
+
+    def test_rebase_without_worktree(self, tmp_path: Path):
+        """Rebase works normally when no worktree exists."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test rebase no worktree")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-rebase-nowt"
+        store.update(task)
+
+        # Create the branch and add a commit (no worktree)
+        git._run("checkout", "-b", "feature/test-rebase-nowt")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Rebase should work normally
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        # Verify success (no worktree messages)
+        assert result.returncode == 0
+        assert "Removing stale worktree" not in result.stdout
+        assert "Successfully rebased" in result.stdout
+
+
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
 

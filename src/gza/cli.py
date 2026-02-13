@@ -34,6 +34,47 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+def cleanup_worktree_for_branch(git: Git, branch: str, force: bool = False) -> Path | None:
+    """Clean up worktree if branch is checked out in one.
+
+    Args:
+        git: Git instance for the main repository
+        branch: Branch name to check for worktree
+        force: If True, remove worktree even with uncommitted changes
+
+    Returns:
+        Path to cleaned worktree, or None if no worktree found
+
+    Raises:
+        ValueError: If worktree has uncommitted changes and force=False
+    """
+    worktrees = git.worktree_list()
+    worktree_path = None
+    for wt in worktrees:
+        wt_branch = wt.get("branch", "")
+        # Branch is stored as refs/heads/branch-name
+        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
+            worktree_path = Path(wt["path"])
+            break
+
+    if worktree_path:
+        # Check if worktree has uncommitted changes
+        worktree_git = Git(worktree_path)
+        if worktree_git.has_changes(include_untracked=True) and not force:
+            raise ValueError(
+                f"Worktree at {worktree_path} has uncommitted changes.\n"
+                f"\nOptions:\n"
+                f"  1. cd {worktree_path} and commit or discard changes\n"
+                f"  2. Use --force to remove the worktree anyway (loses changes)"
+            )
+
+        # Remove the worktree
+        git.worktree_remove(worktree_path, force=force)
+        return worktree_path
+
+    return None
+
+
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int = None) -> int:
     """Spawn a background worker process.
 
@@ -941,6 +982,17 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         print("Error: You have uncommitted changes. Please commit or stash them first.")
         return 1
 
+    # Clean up worktree if branch is checked out in one
+    try:
+        force = getattr(args, 'force', False)
+        worktree_path = cleanup_worktree_for_branch(git, task.branch, force=force)
+        if worktree_path:
+            print(f"Removing stale worktree at {worktree_path}...")
+            print(f"✓ Removed worktree")
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+
     # Perform the rebase
     try:
         print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
@@ -998,31 +1050,15 @@ def cmd_checkout(args: argparse.Namespace) -> int:
         print(f"Error: Branch '{branch}' does not exist locally")
         return 1
 
-    # Check if branch is checked out in a worktree
-    worktrees = git.worktree_list()
-    worktree_path = None
-    for wt in worktrees:
-        wt_branch = wt.get("branch", "")
-        # Branch is stored as refs/heads/branch-name
-        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
-            worktree_path = Path(wt["path"])
-            break
-
-    if worktree_path:
-        # Check if worktree has uncommitted changes
-        worktree_git = Git(worktree_path)
-        if worktree_git.has_changes(include_untracked=True):
-            print(f"Error: Worktree at {worktree_path} has uncommitted changes")
-            print()
-            print("Options:")
-            print(f"  1. cd {worktree_path} and commit or discard changes")
-            print(f"  2. Use --force to remove the worktree anyway (loses changes)")
-            return 1
-
-        # Remove the worktree
-        print(f"Removing stale worktree at {worktree_path}...")
-        git.worktree_remove(worktree_path, force=args.force)
-        print(f"✓ Removed worktree")
+    # Clean up worktree if branch is checked out in one
+    try:
+        worktree_path = cleanup_worktree_for_branch(git, branch, force=args.force)
+        if worktree_path:
+            print(f"Removing stale worktree at {worktree_path}...")
+            print(f"✓ Removed worktree")
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
 
     # Checkout the branch
     try:
@@ -3559,6 +3595,11 @@ def main() -> int:
         "--remote",
         action="store_true",
         help="Fetch from origin and rebase against origin/<target-branch>",
+    )
+    rebase_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force remove worktree even if it has uncommitted changes",
     )
     add_common_args(rebase_parser)
 
