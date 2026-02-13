@@ -2,7 +2,7 @@
 name = "gza-agent"
 dynamic = ["version"]
 description = "A coding AI agent runner for Claude Code"
-readme = "README.md"
+readme = "README_PYPI.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
