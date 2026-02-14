@@ -39,6 +39,11 @@ max_turns: 100
 # Number of tasks to run in a single work session (default: 1)
 # work_count: 1
 
+# Model overrides per task type
+task_types:
+  review:
+    model: claude-3-5-haiku-latest
+
 # Arguments passed to Claude Code
 # claude_args:
 #   - --allowedTools
