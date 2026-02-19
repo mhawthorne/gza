@@ -24,7 +24,7 @@ def get_downstream_tasks(task_id: int) -> list[tuple]:
             WHERE t.based_on = d.id OR t.depends_on = d.id
         )
         SELECT t.id, t.based_on, t.depends_on, t.status, t.task_type,
-               t.started_at, t.completed_at, t.num_turns, t.session_id, substr(t.prompt, 1, 60)
+               t.started_at, t.completed_at, t.num_turns, t.session_id, t.prompt
         FROM tasks t
         WHERE t.id IN downstream
         ORDER BY t.id
@@ -39,6 +39,8 @@ def get_downstream_tasks(task_id: int) -> list[tuple]:
 def main():
     parser = argparse.ArgumentParser(description="Show all tasks downstream of a given task ID")
     parser.add_argument("task_id", type=int, help="Root task ID")
+    parser.add_argument("--show-prompt", action="store_true", help="Show task prompts on a separate line")
+    parser.add_argument("--prompt-truncation", type=int, default=None, help="Truncate prompts to N chars (0 or negative for full prompt)")
     args = parser.parse_args()
 
     db_path = get_db_path()
@@ -51,8 +53,9 @@ def main():
         print(f"No tasks found for task #{args.task_id}")
         return 1
 
-    print(f"{'ID':>4}  {'Based':>5}  {'Deps':>5}  {'Status':<10}  {'Type':<12}  {'Started':<17}  {'Completed':<17}  {'Turns':>5}  {'Session ID':<40}  Prompt")
-    print("-" * 190)
+    header = f"{'ID':>4}  {'Based':>5}  {'Deps':>5}  {'Status':<10}  {'Type':<12}  {'Started':<17}  {'Completed':<17}  {'Turns':>5}  {'Session ID':<40}"
+    print(header)
+    print("-" * len(header))
     for row in rows:
         id_, based_on, depends_on, status, task_type, started_at, completed_at, num_turns, session_id, prompt = row
         based_str = str(based_on) if based_on else "-"
@@ -62,7 +65,17 @@ def main():
         completed_str = completed_at[:16] if completed_at else "-"
         turns_str = str(num_turns) if num_turns else "-"
         session_str = session_id if session_id else "-"
-        print(f"{id_:>4}  {based_str:>5}  {deps_str:>5}  {status:<10}  {task_type:<12}  {started_str:<17}  {completed_str:<17}  {turns_str:>5}  {session_str:<40}  {prompt}")
+        print(f"{id_:>4}  {based_str:>5}  {deps_str:>5}  {status:<10}  {task_type:<12}  {started_str:<17}  {completed_str:<17}  {turns_str:>5}  {session_str:<40}")
+        if args.show_prompt and prompt:
+            truncate_len = args.prompt_truncation if args.prompt_truncation is not None else len(header)
+            if truncate_len > 0:
+                display_prompt = prompt.split('\n')[0]
+                if len(display_prompt) > truncate_len:
+                    display_prompt = display_prompt[:truncate_len]
+            else:
+                display_prompt = prompt
+            print(display_prompt)
+            print()
 
     return 0
 

@@ -17,7 +17,7 @@
 | 5 | Add review trailer to commits | ❌ NOT DONE | No `Gza-Review:` trailer generation in `src/gza/runner.py` |
 | 6 | Update/remove pr-code-review.md | ❌ NOT DONE | Spec unchanged from original state |
 | 7 | Add tests | ❌ NOT DONE | No new tests for PR integration |
-| 8 | Update documentation | ❌ NOT DONE | `AGENTS.md` doesn't document `--no-pr` or `--pr` flags |
+| 8 | Update documentation | ❌ NOT DONE | `AGENTS.md` doesn't document `--no-pr` or `--pr` flags |`
 
 ### Detailed Findings
 
