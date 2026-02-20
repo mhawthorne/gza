@@ -27,7 +27,7 @@ sqlite3 .gza/gza.db "SELECT * FROM tasks WHERE id = <ID>;"
 This will show:
 - id, prompt, status, task_type, task_id (slug)
 - branch, log_file, report_file
-- has_commits, duration_seconds, num_turns, cost_usd
+- has_commits, duration_seconds, num_turns_reported, num_turns_computed, cost_usd
 - created_at, started_at, completed_at
 - group, depends_on, based_on, spec
 - create_review, same_branch, task_type_hint

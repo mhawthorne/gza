@@ -346,9 +346,9 @@ class CodexProvider(Provider):
         accumulated = getattr(result, "_accumulated_data", {})
 
         if accumulated:
-            # Set num_turns from turn_count
+            # Set num_turns_reported from turn_count
             if "turn_count" in accumulated:
-                result.num_turns = accumulated["turn_count"]
+                result.num_turns_reported = accumulated["turn_count"]
 
             # Set token counts
             if "input_tokens" in accumulated:

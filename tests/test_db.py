@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 7
+        assert version == 8
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 7
+        assert version == 8
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -512,6 +512,137 @@ class TestTaskResume:
 
         retrieved = store.get(new_task.id)
         assert retrieved.session_id == "new-session-456"
+
+
+class TestNumTurnsFields:
+    """Tests for num_turns_reported and num_turns_computed fields."""
+
+    def test_num_turns_reported_stored_and_retrieved(self, tmp_path: Path):
+        """Test that num_turns_reported is stored and retrieved correctly."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        stats = TaskStats(
+            duration_seconds=42.0,
+            num_turns_reported=10,
+            num_turns_computed=8,
+            cost_usd=0.15,
+        )
+        store.mark_completed(task, has_commits=False, stats=stats)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.num_turns_reported == 10
+        assert retrieved.num_turns_computed == 8
+
+    def test_num_turns_fields_default_to_none(self, tmp_path: Path):
+        """Test that num_turns fields default to None when not set."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.num_turns_reported is None
+        assert retrieved.num_turns_computed is None
+
+    def test_get_stats_aggregates_num_turns_reported(self, tmp_path: Path):
+        """Test that get_stats sums num_turns_reported correctly."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task1 = store.add(prompt="Task 1")
+        store.mark_completed(task1, has_commits=False, stats=TaskStats(num_turns_reported=5))
+
+        task2 = store.add(prompt="Task 2")
+        store.mark_completed(task2, has_commits=False, stats=TaskStats(num_turns_reported=7))
+
+        stats = store.get_stats()
+        assert stats["total_turns"] == 12
+
+    def test_migration_v7_to_v8_adds_columns(self, tmp_path: Path):
+        """Test that migration from v7 to v8 adds num_turns_reported and num_turns_computed."""
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v7 database manually (without the new columns)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (7)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT
+            )
+        """)
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at, num_turns) VALUES (?, ?, ?, ?)",
+            ("Old task with turns", "completed", now, 15),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version updated to 8
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 8
+
+        # Verify old task migrated: num_turns_reported populated from num_turns
+        task = store.get(1)
+        assert task is not None
+        assert task.num_turns_reported == 15
+        assert task.num_turns_computed is None
+
+        # Verify new tasks can store both fields
+        new_task = store.add(prompt="New task")
+        from gza.db import TaskStats
+        store.mark_completed(new_task, has_commits=False, stats=TaskStats(
+            num_turns_reported=3,
+            num_turns_computed=2,
+        ))
+        retrieved = store.get(new_task.id)
+        assert retrieved.num_turns_reported == 3
+        assert retrieved.num_turns_computed == 2
 
 
 class TestGetReviewsForTask:

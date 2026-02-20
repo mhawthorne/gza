@@ -84,8 +84,11 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
         duration_str = format_duration(stats.duration_seconds)
         parts.append(f"[dim]Runtime:[/dim] [bold]{duration_str}[/bold]")
 
-    if stats.num_turns is not None:
-        parts.append(f"[dim]Turns:[/dim] [bold]{stats.num_turns}[/bold]")
+    if stats.num_turns_reported is not None:
+        turns_display = str(stats.num_turns_reported)
+        if stats.num_turns_computed is not None and stats.num_turns_computed != stats.num_turns_reported:
+            turns_display += f" (computed: {stats.num_turns_computed})"
+        parts.append(f"[dim]Turns:[/dim] [bold]{turns_display}[/bold]")
 
     if stats.cost_usd is not None:
         parts.append(f"[dim]Cost:[/dim] [bold]${stats.cost_usd:.4f}[/bold]")

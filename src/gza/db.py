@@ -23,7 +23,8 @@ class Task:
     based_on: int | None = None  # Reference to parent task id
     has_commits: bool | None = None
     duration_seconds: float | None = None
-    num_turns: int | None = None
+    num_turns_reported: int | None = None  # Turn count reported by the provider
+    num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
     created_at: datetime | None = None
     started_at: datetime | None = None
@@ -54,12 +55,13 @@ class Task:
 class TaskStats:
     """Statistics from a task run."""
     duration_seconds: float | None = None
-    num_turns: int | None = None
+    num_turns_reported: int | None = None  # Turn count reported by the provider
+    num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -78,7 +80,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     based_on INTEGER REFERENCES tasks(id),
     has_commits INTEGER,
     duration_seconds REAL,
-    num_turns INTEGER,
+    num_turns INTEGER,  -- kept for backward compat; use num_turns_reported instead
+    num_turns_reported INTEGER,
+    num_turns_computed INTEGER,
     cost_usd REAL,
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -100,6 +104,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- New fields for per-task model/provider overrides (v7)
     model TEXT,
     provider TEXT
+    -- num_turns_reported and num_turns_computed added inline above (v8)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -144,6 +149,13 @@ ALTER TABLE tasks ADD COLUMN pr_number INTEGER;
 MIGRATION_V6_TO_V7 = """
 ALTER TABLE tasks ADD COLUMN model TEXT;
 ALTER TABLE tasks ADD COLUMN provider TEXT;
+"""
+
+# Migration from v7 to v8
+MIGRATION_V7_TO_V8 = """
+ALTER TABLE tasks ADD COLUMN num_turns_reported INTEGER;
+ALTER TABLE tasks ADD COLUMN num_turns_computed INTEGER;
+UPDATE tasks SET num_turns_reported = num_turns WHERE num_turns IS NOT NULL;
 """
 
 
@@ -247,7 +259,20 @@ class SqliteTaskStore:
                             except sqlite3.OperationalError:
                                 # Column might already exist
                                 pass
+                    current_version = 7
                     conn.execute("UPDATE schema_version SET version = ?", (7,))
+
+                if current_version < 8:
+                    # Run migration v7 -> v8
+                    for stmt in MIGRATION_V7_TO_V8.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (8,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -272,7 +297,8 @@ class SqliteTaskStore:
             based_on=row["based_on"],
             has_commits=bool(row["has_commits"]) if row["has_commits"] is not None else None,
             duration_seconds=row["duration_seconds"],
-            num_turns=row["num_turns"],
+            num_turns_reported=row["num_turns_reported"] if "num_turns_reported" in row.keys() else None,
+            num_turns_computed=row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
             cost_usd=row["cost_usd"],
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
@@ -352,7 +378,8 @@ class SqliteTaskStore:
                     based_on = ?,
                     has_commits = ?,
                     duration_seconds = ?,
-                    num_turns = ?,
+                    num_turns_reported = ?,
+                    num_turns_computed = ?,
                     cost_usd = ?,
                     started_at = ?,
                     completed_at = ?,
@@ -379,7 +406,8 @@ class SqliteTaskStore:
                     task.based_on,
                     1 if task.has_commits else (0 if task.has_commits is False else None),
                     task.duration_seconds,
-                    task.num_turns,
+                    task.num_turns_reported,
+                    task.num_turns_computed,
                     task.cost_usd,
                     task.started_at.isoformat() if task.started_at else None,
                     task.completed_at.isoformat() if task.completed_at else None,
@@ -581,7 +609,7 @@ class SqliteTaskStore:
                     COUNT(*) FILTER (WHERE status = 'pending') as pending,
                     SUM(cost_usd) as total_cost,
                     SUM(duration_seconds) as total_duration,
-                    SUM(num_turns) as total_turns
+                    SUM(num_turns_reported) as total_turns
                 FROM tasks
                 """
             )
@@ -715,7 +743,8 @@ class SqliteTaskStore:
             task.output_content = output_content
         if stats:
             task.duration_seconds = stats.duration_seconds
-            task.num_turns = stats.num_turns
+            task.num_turns_reported = stats.num_turns_reported
+            task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
         self.update(task)
 
@@ -737,7 +766,8 @@ class SqliteTaskStore:
             task.branch = branch
         if stats:
             task.duration_seconds = stats.duration_seconds
-            task.num_turns = stats.num_turns
+            task.num_turns_reported = stats.num_turns_reported
+            task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
         self.update(task)
 
@@ -759,7 +789,8 @@ class SqliteTaskStore:
             task.log_file = log_file
         if stats:
             task.duration_seconds = stats.duration_seconds
-            task.num_turns = stats.num_turns
+            task.num_turns_reported = stats.num_turns_reported
+            task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
         self.update(task)
 

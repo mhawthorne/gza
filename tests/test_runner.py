@@ -402,7 +402,7 @@ class TestRunNonCodeTaskPRPosting:
         mock_result = RunResult(
             exit_code=0,
             duration_seconds=10.0,
-            num_turns=5,
+            num_turns_reported=5,
             cost_usd=0.05,
             session_id="test-session",
             error_type=None,
@@ -480,7 +480,7 @@ class TestRunNonCodeTaskPRPosting:
         mock_result = RunResult(
             exit_code=0,
             duration_seconds=10.0,
-            num_turns=5,
+            num_turns_reported=5,
             cost_usd=0.05,
             session_id="test-session",
             error_type=None,
@@ -564,7 +564,7 @@ class TestResumeVerificationPrompt:
             return RunResult(
                 exit_code=0,
                 duration_seconds=10.0,
-                num_turns=5,
+                num_turns_reported=5,
                 cost_usd=0.05,
                 session_id="test-session-123",
                 error_type=None,
@@ -676,7 +676,7 @@ class TestResumeVerificationPrompt:
             return RunResult(
                 exit_code=0,
                 duration_seconds=10.0,
-                num_turns=5,
+                num_turns_reported=5,
                 cost_usd=0.05,
                 session_id="test-session-456",
                 error_type=None,

@@ -364,7 +364,8 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
     """Convert a provider RunResult to TaskStats for storage."""
     return TaskStats(
         duration_seconds=result.duration_seconds,
-        num_turns=result.num_turns,
+        num_turns_reported=result.num_turns_reported,
+        num_turns_computed=result.num_turns_computed,
         cost_usd=result.cost_usd,
     )
 
