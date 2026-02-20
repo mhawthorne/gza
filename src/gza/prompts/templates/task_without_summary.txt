@@ -1,0 +1,4 @@
+
+IMPORTANT: Run unit tests before committing (`uv run pytest tests/ -v`). Only commit once all tests pass.
+
+When you are done, report what you accomplished.

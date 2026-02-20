@@ -1,0 +1,4 @@
+This is an exploration/research task. Write your findings and recommendations to:
+  {report_path}
+
+Structure the report with clear sections and actionable recommendations.

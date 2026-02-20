@@ -10,6 +10,7 @@ from .console import console, task_header, stats_line, success_message, error_me
 from .db import SqliteTaskStore, Task, TaskStats
 from .git import Git, GitError
 from .github import GitHub, GitHubError
+from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 
 
@@ -151,83 +152,7 @@ def _task_id_exists(task_id: str, log_path: Path | None, git: Git | None, projec
 
 def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path: Path | None = None, summary_path: Path | None = None, git: Git | None = None) -> str:
     """Build the prompt for Claude."""
-    base_prompt = f"Complete this task: {task.prompt}"
-
-    # Include spec file content if specified
-    if task.spec:
-        spec_path = config.project_dir / task.spec
-        if spec_path.exists():
-            spec_content = spec_path.read_text()
-            base_prompt += f"\n\n## Specification\n\nThe following specification file ({task.spec}) provides context for this task:\n\n{spec_content}"
-
-    # Add context from based_on chain (walk up the chain to find plan tasks)
-    if task.based_on or task.task_type in ("implement", "review"):
-        context = _build_context_from_chain(task, store, config.project_dir, git)
-        if context:
-            base_prompt += "\n\n" + context
-
-    # Task type-specific instructions
-    if task.task_type == "explore":
-        if report_path:
-            base_prompt += f"""
-
-This is an exploration/research task. Write your findings and recommendations to:
-  {report_path}
-
-Structure the report with clear sections and actionable recommendations."""
-    elif task.task_type == "plan":
-        if report_path:
-            base_prompt += f"""
-
-This is a planning task. Write your design/architecture plan to:
-  {report_path}
-
-Structure the plan with clear sections covering:
-- Overview of the approach
-- Key design decisions
-- Implementation steps
-- Potential risks or considerations"""
-    elif task.task_type == "review":
-        # Check for REVIEW.md in project root for custom review guidelines
-        review_md_path = config.project_dir / "REVIEW.md"
-        if review_md_path.exists():
-            review_guidelines = review_md_path.read_text()
-            base_prompt += f"\n\n## Review Guidelines\n\n{review_guidelines}"
-
-        if report_path:
-            base_prompt += f"""
-
-This is a review task. Write your review to:
-  {report_path}
-
-Your review should include:
-- Assessment of whether the implementation matches the plan
-- Code quality observations
-- Potential issues or improvements
-- Final verdict: APPROVED, CHANGES_REQUESTED, or NEEDS_DISCUSSION
-
-End your review with a clear verdict line like:
-Verdict: APPROVED"""
-    elif task.task_type in ("task", "implement", "improve"):
-        base_prompt += """
-
-IMPORTANT: Run unit tests before committing (`uv run pytest tests/ -v`). Only commit once all tests pass."""
-        if summary_path:
-            base_prompt += f"""
-
-When you complete this task, write a summary of what you accomplished to:
-  {summary_path}
-
-The summary should describe:
-- What was accomplished
-- Files changed
-- Any notable decisions or trade-offs made"""
-        else:
-            base_prompt += "\n\nWhen you are done, report what you accomplished."
-    else:
-        base_prompt += "\n\nWhen you are done, report what you accomplished."
-
-    return base_prompt
+    return PromptBuilder().build(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
 
 
 def _get_task_output(task: Task, project_dir: Path) -> str | None:
@@ -877,16 +802,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
     # Run provider in the worktree
     if resume:
-        prompt = """IMPORTANT: Before continuing, verify your todo list against the actual state of the files.
-
-The task was interrupted (max turns, timeout, etc.) and your todo list may show steps as in_progress that were never actually completed. Please:
-
-1. Review your todo list from the previous session
-2. For each item marked as in_progress or completed, verify by checking the actual code/files
-3. Update the todo list to reflect what is actually complete vs incomplete
-4. Mark any steps that weren't actually finished as pending before continuing
-
-Once you've verified and updated the todo list, continue from where you left off."""
+        prompt = PromptBuilder().resume_prompt()
     else:
         prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
@@ -1122,16 +1038,7 @@ def _run_non_code_task(
 
         # Run provider in the worktree
         if resume:
-            prompt = """IMPORTANT: Before continuing, verify your todo list against the actual state of the files.
-
-The task was interrupted (max turns, timeout, etc.) and your todo list may show steps as in_progress that were never actually completed. Please:
-
-1. Review your todo list from the previous session
-2. For each item marked as in_progress or completed, verify by checking the actual code/files
-3. Update the todo list to reflect what is actually complete vs incomplete
-4. Mark any steps that weren't actually finished as pending before continuing
-
-Once you've verified and updated the todo list, continue from where you left off."""
+            prompt = PromptBuilder().resume_prompt()
         else:
             prompt = build_prompt(task, config, store, report_path=prompt_report_path, git=git)
         try:

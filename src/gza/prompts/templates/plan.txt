@@ -1,0 +1,8 @@
+This is a planning task. Write your design/architecture plan to:
+  {report_path}
+
+Structure the plan with clear sections covering:
+- Overview of the approach
+- Key design decisions
+- Implementation steps
+- Potential risks or considerations
