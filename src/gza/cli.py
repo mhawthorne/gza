@@ -658,10 +658,22 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     history = store.get_history(limit=100)
     unmerged = []
     use_cherry = getattr(args, 'commits_only', False)
+    include_all = getattr(args, 'all', False)
     for task in history:
-        if task.status == "completed" and task.branch and task.has_commits:
+        if include_all:
+            # Include completed and failed tasks; check git directly for commits
+            if task.status not in ("completed", "failed") or not task.branch:
+                continue
+            if not git.branch_exists(task.branch):
+                continue
+            if git.count_commits_ahead(task.branch, default_branch) == 0:
+                continue
             if not git.is_merged(task.branch, default_branch, use_cherry=use_cherry):
                 unmerged.append(task)
+        else:
+            if task.status == "completed" and task.branch and task.has_commits:
+                if not git.is_merged(task.branch, default_branch, use_cherry=use_cherry):
+                    unmerged.append(task)
 
     if not unmerged:
         console.print("No unmerged tasks")
@@ -3670,6 +3682,11 @@ def main() -> int:
         "--commits-only",
         action="store_true",
         help="Use commit-based detection (git cherry) instead of diff-based detection",
+    )
+    unmerged_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include failed tasks and check git directly for commits instead of trusting has_commits",
     )
 
     # merge command
