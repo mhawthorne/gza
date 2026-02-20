@@ -329,6 +329,8 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
         num_turns_reported=result.num_turns_reported,
         num_turns_computed=result.num_turns_computed,
         cost_usd=result.cost_usd,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
     )
 
 

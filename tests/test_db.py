@@ -380,7 +380,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         conn.commit()
         conn.close()
 
-        # Open with SqliteTaskStore - should auto-migrate to v7
+        # Open with SqliteTaskStore - should auto-migrate to v9
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 8
+        assert version == 9
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -490,7 +490,7 @@ class TestTaskResume:
         conn.commit()
         conn.close()
 
-        # Open with SqliteTaskStore - should auto-migrate to v7
+        # Open with SqliteTaskStore - should auto-migrate to v9
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 8
+        assert version == 9
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -620,12 +620,12 @@ class TestNumTurnsFields:
         # Open with SqliteTaskStore to trigger migration
         store = SqliteTaskStore(db_path)
 
-        # Check schema version updated to 8
+        # Check schema version updated to 9
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 8
+        assert version == 9
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -643,6 +643,192 @@ class TestNumTurnsFields:
         retrieved = store.get(new_task.id)
         assert retrieved.num_turns_reported == 3
         assert retrieved.num_turns_computed == 2
+
+
+class TestTokenCountFields:
+    """Tests for input_tokens and output_tokens fields."""
+
+    def test_token_counts_stored_and_retrieved(self, tmp_path: Path):
+        """Test that input_tokens and output_tokens are stored and retrieved correctly."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        stats = TaskStats(
+            duration_seconds=30.0,
+            num_turns_reported=5,
+            cost_usd=0.10,
+            input_tokens=12345,
+            output_tokens=6789,
+        )
+        store.mark_completed(task, has_commits=False, stats=stats)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.input_tokens == 12345
+        assert retrieved.output_tokens == 6789
+
+    def test_token_counts_default_to_none(self, tmp_path: Path):
+        """Test that token count fields default to None when not set."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.input_tokens is None
+        assert retrieved.output_tokens is None
+
+    def test_token_counts_persisted_on_failure(self, tmp_path: Path):
+        """Test that token counts are persisted when a task fails."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        stats = TaskStats(input_tokens=500, output_tokens=200)
+        store.mark_failed(task, log_file="logs/test.log", stats=stats)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "failed"
+        assert retrieved.input_tokens == 500
+        assert retrieved.output_tokens == 200
+
+    def test_token_counts_persisted_on_unmerged(self, tmp_path: Path):
+        """Test that token counts are persisted when a task is marked unmerged."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        stats = TaskStats(input_tokens=300, output_tokens=100)
+        store.mark_unmerged(task, branch="test/branch", stats=stats)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "unmerged"
+        assert retrieved.input_tokens == 300
+        assert retrieved.output_tokens == 100
+
+    def test_get_stats_aggregates_token_counts(self, tmp_path: Path):
+        """Test that get_stats sums input_tokens and output_tokens correctly."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task1 = store.add(prompt="Task 1")
+        store.mark_completed(task1, has_commits=False, stats=TaskStats(
+            input_tokens=1000, output_tokens=500,
+        ))
+
+        task2 = store.add(prompt="Task 2")
+        store.mark_completed(task2, has_commits=False, stats=TaskStats(
+            input_tokens=2000, output_tokens=800,
+        ))
+
+        # Task with no token counts (should be treated as 0)
+        task3 = store.add(prompt="Task 3")
+        store.mark_completed(task3, has_commits=False, stats=TaskStats())
+
+        stats = store.get_stats()
+        assert stats["total_input_tokens"] == 3000
+        assert stats["total_output_tokens"] == 1300
+
+    def test_get_stats_token_counts_zero_when_no_data(self, tmp_path: Path):
+        """Test that get_stats returns 0 for token counts when no tasks have them."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        stats = store.get_stats()
+        assert stats["total_input_tokens"] == 0
+        assert stats["total_output_tokens"] == 0
+
+    def test_migration_v8_to_v9_adds_token_columns(self, tmp_path: Path):
+        """Test that migration from v8 to v9 adds input_tokens and output_tokens columns."""
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v8 database manually (without the token count columns)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (8)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT
+            )
+        """)
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at, cost_usd) VALUES (?, ?, ?, ?)",
+            ("Old task", "completed", now, 0.05),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version updated to 9
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 9
+
+        # Verify old task can be retrieved with NULL token counts
+        task = store.get(1)
+        assert task is not None
+        assert task.input_tokens is None
+        assert task.output_tokens is None
+
+        # Verify new tasks can store token counts
+        from gza.db import TaskStats
+        new_task = store.add(prompt="New task")
+        store.mark_completed(new_task, has_commits=False, stats=TaskStats(
+            input_tokens=10000,
+            output_tokens=5000,
+            cost_usd=0.10,
+        ))
+        retrieved = store.get(new_task.id)
+        assert retrieved.input_tokens == 10000
+        assert retrieved.output_tokens == 5000
 
 
 class TestGetReviewsForTask:

@@ -747,6 +747,68 @@ class TestClaudeErrorTypeExtraction:
         assert result.num_turns_reported == 1
         assert result.num_turns_computed == 1  # Deduplicated
 
+    def test_stores_token_counts_from_usage(self, tmp_path):
+        """Should accumulate input and output token counts from assistant messages."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate two assistant messages with different token types
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_001",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_creation_input_tokens": 50,
+                        "cache_read_input_tokens": 20,
+                        "output_tokens": 75,
+                    },
+                },
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_002",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 200,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 10,
+                        "output_tokens": 100,
+                    },
+                },
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 2,
+                "total_cost_usd": 0.10,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        # input_tokens = (100 + 50 + 20) + (200 + 0 + 10) = 170 + 210 = 380
+        assert result.input_tokens == 380
+        # output_tokens = 75 + 100 = 175
+        assert result.output_tokens == 175
+
 
 class TestClaudeToolLogging:
     """Tests for enhanced Claude provider tool logging."""

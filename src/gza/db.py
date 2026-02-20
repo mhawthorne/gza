@@ -26,6 +26,8 @@ class Task:
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
+    input_tokens: int | None = None   # Total input tokens (including cache tokens)
+    output_tokens: int | None = None  # Total output tokens
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -58,10 +60,12 @@ class TaskStats:
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
+    input_tokens: int | None = None   # Total input tokens (including cache tokens)
+    output_tokens: int | None = None  # Total output tokens
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -103,8 +107,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     pr_number INTEGER,
     -- New fields for per-task model/provider overrides (v7)
     model TEXT,
-    provider TEXT
+    provider TEXT,
     -- num_turns_reported and num_turns_computed added inline above (v8)
+    -- Raw token counts for cost recalculation (v9)
+    input_tokens INTEGER,
+    output_tokens INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -156,6 +163,12 @@ MIGRATION_V7_TO_V8 = """
 ALTER TABLE tasks ADD COLUMN num_turns_reported INTEGER;
 ALTER TABLE tasks ADD COLUMN num_turns_computed INTEGER;
 UPDATE tasks SET num_turns_reported = num_turns WHERE num_turns IS NOT NULL;
+"""
+
+# Migration from v8 to v9
+MIGRATION_V8_TO_V9 = """
+ALTER TABLE tasks ADD COLUMN input_tokens INTEGER;
+ALTER TABLE tasks ADD COLUMN output_tokens INTEGER;
 """
 
 
@@ -272,7 +285,20 @@ class SqliteTaskStore:
                             except sqlite3.OperationalError:
                                 # Column might already exist
                                 pass
+                    current_version = 8
                     conn.execute("UPDATE schema_version SET version = ?", (8,))
+
+                if current_version < 9:
+                    # Run migration v8 -> v9
+                    for stmt in MIGRATION_V8_TO_V9.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (9,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -300,6 +326,8 @@ class SqliteTaskStore:
             num_turns_reported=row["num_turns_reported"] if "num_turns_reported" in row.keys() else None,
             num_turns_computed=row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
             cost_usd=row["cost_usd"],
+            input_tokens=row["input_tokens"] if "input_tokens" in row.keys() else None,
+            output_tokens=row["output_tokens"] if "output_tokens" in row.keys() else None,
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
@@ -381,6 +409,8 @@ class SqliteTaskStore:
                     num_turns_reported = ?,
                     num_turns_computed = ?,
                     cost_usd = ?,
+                    input_tokens = ?,
+                    output_tokens = ?,
                     started_at = ?,
                     completed_at = ?,
                     "group" = ?,
@@ -409,6 +439,8 @@ class SqliteTaskStore:
                     task.num_turns_reported,
                     task.num_turns_computed,
                     task.cost_usd,
+                    task.input_tokens,
+                    task.output_tokens,
                     task.started_at.isoformat() if task.started_at else None,
                     task.completed_at.isoformat() if task.completed_at else None,
                     task.group,
@@ -609,7 +641,9 @@ class SqliteTaskStore:
                     COUNT(*) FILTER (WHERE status = 'pending') as pending,
                     SUM(cost_usd) as total_cost,
                     SUM(duration_seconds) as total_duration,
-                    SUM(num_turns_reported) as total_turns
+                    SUM(num_turns_reported) as total_turns,
+                    SUM(input_tokens) as total_input_tokens,
+                    SUM(output_tokens) as total_output_tokens
                 FROM tasks
                 """
             )
@@ -621,6 +655,8 @@ class SqliteTaskStore:
                 "total_cost": row["total_cost"] or 0,
                 "total_duration": row["total_duration"] or 0,
                 "total_turns": row["total_turns"] or 0,
+                "total_input_tokens": row["total_input_tokens"] or 0,
+                "total_output_tokens": row["total_output_tokens"] or 0,
             }
 
     def search(self, query: str) -> list[Task]:
@@ -746,6 +782,8 @@ class SqliteTaskStore:
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
+            task.input_tokens = stats.input_tokens
+            task.output_tokens = stats.output_tokens
         self.update(task)
 
     def mark_failed(
@@ -769,6 +807,8 @@ class SqliteTaskStore:
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
+            task.input_tokens = stats.input_tokens
+            task.output_tokens = stats.output_tokens
         self.update(task)
 
     def mark_unmerged(
@@ -792,6 +832,8 @@ class SqliteTaskStore:
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
+            task.input_tokens = stats.input_tokens
+            task.output_tokens = stats.output_tokens
         self.update(task)
 
 

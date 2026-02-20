@@ -421,4 +421,10 @@ class ClaudeProvider(Provider):
         if seen_msg_ids:
             result.num_turns_computed = len(seen_msg_ids)
 
+        # Store accumulated token counts
+        if "total_input_tokens" in accumulated_data:
+            result.input_tokens = accumulated_data["total_input_tokens"]
+        if "total_output_tokens" in accumulated_data:
+            result.output_tokens = accumulated_data["total_output_tokens"]
+
         return result
