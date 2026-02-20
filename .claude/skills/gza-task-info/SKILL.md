@@ -1,7 +1,7 @@
 ---
 name: gza-task-info
 description: Gather comprehensive info about a specific gza task including status, branch, commits, and logs
-allowed-tools: Read, Bash(sqlite3:*), Bash(git:*)
+allowed-tools: Read, Bash(sqlite3:*), Bash(git:*), Bash(uv:*)
 version: 1.0.0
 public: true
 ---
@@ -64,22 +64,17 @@ If the task has a branch field set, gather git information:
 
 ### Step 4: Show log file (if exists)
 
-If the task has a log_file field:
+Use the `gza log` command to view the task's execution log by task ID:
 
-1. **Check if log file exists:**
-   ```bash
-   ls -lh <log_file>
-   ```
+```bash
+uv run gza log <task-id> --task
+```
 
-2. **Show the tail of the log (last 50-100 lines) to see how it ended:**
-   ```bash
-   tail -100 <log_file>
-   ```
-
-   Or if you want to focus on the end:
-   ```bash
-   tail -50 <log_file>
-   ```
+Options:
+- `--turns` — show the full conversation turns instead of just the summary
+- `--tail N` — show only the last N lines (e.g., `--tail 50`)
+- `--follow` / `-f` — follow the log in real-time (useful for in_progress tasks)
+- `--raw` — show raw JSON lines instead of formatted output
 
 ### Step 5: Show report file (if exists)
 
