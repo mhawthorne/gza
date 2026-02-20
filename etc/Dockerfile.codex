@@ -1,15 +1,21 @@
 FROM node:20-slim
 
-# Install CA certificates (required for HTTPS connections)
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the CLI tool globally
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN cp /root/.local/bin/uv /usr/local/bin/uv
+
 RUN npm install -g @openai/codex
 
-# Create gza user for isolation
 RUN useradd -m -s /bin/bash gza
 USER gza
 WORKDIR /home/gza
 
-# Default command
 CMD ["codex"]

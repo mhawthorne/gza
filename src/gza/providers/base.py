@@ -17,22 +17,28 @@ if TYPE_CHECKING:
     from ..config import Config
 
 
-# Base Dockerfile template - providers customize the npm package and command
+# Dockerfile template with all common dependencies
 DOCKERFILE_TEMPLATE = """\
 FROM node:20-slim
 
-# Install CA certificates (required for HTTPS connections)
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \\
+    ca-certificates \\
+    curl \\
+    git \\
+    python3 \\
+    python3-pip \\
+    python3-venv \\
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the CLI tool globally
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN cp /root/.local/bin/uv /usr/local/bin/uv
+
 RUN npm install -g {npm_package}
 
-# Create gza user for isolation
 RUN useradd -m -s /bin/bash gza
 USER gza
 WORKDIR /home/gza
 
-# Default command
 CMD ["{cli_command}"]
 """
 
@@ -148,8 +154,19 @@ def build_docker_cmd(
 
     # Mount config directory if specified (for OAuth credentials)
     if docker_config.config_dir:
+        config_dir = Path.home() / docker_config.config_dir
         cmd.insert(-2, "-v")
-        cmd.insert(-2, f"{Path.home()}/{docker_config.config_dir}:/home/gza/{docker_config.config_dir}")
+        cmd.insert(-2, f"{config_dir}:/home/gza/{docker_config.config_dir}")
+        # Also mount the config file (e.g., ~/.claude.json) if it exists
+        # Docker Desktop can't share individual files, so copy it into the config dir
+        config_file = Path.home() / f"{docker_config.config_dir}.json"
+        if config_file.exists():
+            import shutil
+            config_dir.mkdir(parents=True, exist_ok=True)
+            dest = config_dir / f"{docker_config.config_dir}.json"
+            shutil.copy2(config_file, dest)
+            cmd.insert(-2, "-v")
+            cmd.insert(-2, f"{dest}:/home/gza/{docker_config.config_dir}.json")
 
     # Add custom volume mounts
     if docker_volumes:
@@ -204,7 +221,17 @@ def verify_docker_credentials(
         cmd = ["docker", "run", "--rm"]
         # Mount config directory if specified (for OAuth credentials)
         if docker_config.config_dir:
-            cmd.extend(["-v", f"{Path.home()}/{docker_config.config_dir}:/home/gza/{docker_config.config_dir}"])
+            config_dir = Path.home() / docker_config.config_dir
+            cmd.extend(["-v", f"{config_dir}:/home/gza/{docker_config.config_dir}"])
+            # Also mount the config file (e.g., ~/.claude.json) if it exists
+            # Docker Desktop can't share individual files, so copy it into the config dir
+            config_file = Path.home() / f"{docker_config.config_dir}.json"
+            if config_file.exists():
+                import shutil
+                config_dir.mkdir(parents=True, exist_ok=True)
+                dest = config_dir / f"{docker_config.config_dir}.json"
+                shutil.copy2(config_file, dest)
+                cmd.extend(["-v", f"{dest}:/home/gza/{docker_config.config_dir}.json"])
         for env_var in docker_config.env_vars:
             if os.getenv(env_var):
                 cmd.extend(["-e", env_var])

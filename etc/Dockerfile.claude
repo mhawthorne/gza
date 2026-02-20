@@ -1,28 +1,21 @@
 FROM node:20-slim
 
-# Install Python and common build tools
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    git \
     python3 \
     python3-pip \
     python3-venv \
-    curl \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install the CLI tool globally
-RUN npm install -g @anthropic-ai/claude-code
-
-# Create gza user for isolation
-RUN useradd -m -s /bin/bash gza
-
-# Copy uv to gza user's path
 RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
+RUN npm install -g @anthropic-ai/claude-code
+
+RUN useradd -m -s /bin/bash gza
 USER gza
 WORKDIR /home/gza
 
-# Default command
 CMD ["claude"]
