@@ -2,6 +2,7 @@
 
 import os
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +56,42 @@ PLAN_DIR = f".{APP_NAME}/plans"
 REVIEW_DIR = f".{APP_NAME}/reviews"
 SUMMARY_DIR = f".{APP_NAME}/summaries"
 WIP_DIR = f".{APP_NAME}/wip"
+BACKUP_DIR = f".{APP_NAME}/backups"
+
+
+def backup_database(db_path: Path, project_dir: Path) -> None:
+    """Create an hourly backup of the SQLite database if one doesn't exist yet.
+
+    Checks if a backup for the current hour already exists. If not, creates
+    a timestamped backup using SQLite's backup API (safe for concurrent access).
+
+    Backup filename format: gza-YYYYMMDDHH.db (e.g., gza-2026021414.db)
+
+    Args:
+        db_path: Path to the source SQLite database
+        project_dir: Project directory (used to locate the backups folder)
+    """
+    if not db_path.exists():
+        return
+
+    backup_dir = project_dir / BACKUP_DIR
+    hour_stamp = datetime.now().strftime("%Y%m%d%H")
+    backup_path = backup_dir / f"gza-{hour_stamp}.db"
+
+    if backup_path.exists():
+        return
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    source = sqlite3.connect(str(db_path))
+    try:
+        dest = sqlite3.connect(str(backup_path))
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
 
 
 # format_duration logic is now in console.stats_line
@@ -642,6 +679,9 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         open_after: If True, open the report file in $EDITOR after completion (for review tasks).
     """
     load_dotenv(config.project_dir)
+
+    # Create hourly backup before running
+    backup_database(config.db_path, config.project_dir)
 
     # Load tasks from SQLite
     store = SqliteTaskStore(config.db_path)

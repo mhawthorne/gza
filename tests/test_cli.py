@@ -4426,6 +4426,60 @@ class TestCleanCommand:
         assert result2.returncode == 0
         assert "Archived logs: 0 files" in result2.stdout
 
+    def test_clean_deletes_old_backups(self, tmp_path: Path):
+        """Clean command deletes old backup files from .gza/backups/."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        backups_dir = tmp_path / ".gza" / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create an old backup file (35 days old)
+        old_backup = backups_dir / "gza-2026011400.db"
+        old_backup.write_bytes(b"old backup data")
+        old_time = (datetime.now(timezone.utc) - timedelta(days=35)).timestamp()
+        os.utime(old_backup, (old_time, old_time))
+
+        # Create a recent backup file (1 day old)
+        recent_backup = backups_dir / "gza-2026021900.db"
+        recent_backup.write_bytes(b"recent backup data")
+        recent_time = (datetime.now(timezone.utc) - timedelta(days=1)).timestamp()
+        os.utime(recent_backup, (recent_time, recent_time))
+
+        result = run_gza("clean", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Backups deleted: 1 files" in result.stdout
+
+        # Old backup should be deleted
+        assert not old_backup.exists()
+        # Recent backup should be kept
+        assert recent_backup.exists()
+
+    def test_clean_dry_run_shows_backups(self, tmp_path: Path):
+        """Clean --dry-run shows old backup files that would be deleted."""
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        setup_config(tmp_path)
+
+        backups_dir = tmp_path / ".gza" / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+
+        old_backup = backups_dir / "gza-2026010100.db"
+        old_backup.write_bytes(b"old backup")
+        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        os.utime(old_backup, (old_time, old_time))
+
+        result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "gza-2026010100.db" in result.stdout
+        # File should NOT have been deleted (dry run)
+        assert old_backup.exists()
+
 
 class TestMaxTurnsFlag:
     """Tests for --max-turns flag on work, retry, and resume commands."""
