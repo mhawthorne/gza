@@ -222,13 +222,13 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         return 1
 
 
-def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, task_id: int) -> int:
-    """Spawn a background worker to resume a failed task.
+def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: int) -> int:
+    """Spawn a background worker to run a resume task.
 
     Args:
         args: Command-line arguments
         config: Configuration object
-        task_id: Task ID to resume
+        new_task_id: ID of the new resume task (created by cmd_resume)
 
     Returns:
         0 on success, 1 on error
@@ -237,10 +237,10 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ta
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
 
-    # Get task (validation already done in cmd_resume)
-    task = store.get(task_id)
+    # Get the new resume task
+    task = store.get(new_task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task #{new_task_id} not found")
         return 1
 
     # Build command for worker subprocess
@@ -249,7 +249,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ta
         "work",
         "--worker-mode",
         "--resume",
-        str(task_id),
+        str(new_task_id),
     ]
 
     if args.no_docker:
@@ -3228,13 +3228,37 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print("Use 'gza retry' to start fresh instead")
         return 1
 
+    # Create a new task (like retry) to track this resumed run.
+    # The original task stays failed with its stats preserved.
+    new_task = store.add(
+        prompt=task.prompt,
+        task_type=task.task_type,
+        group=task.group,
+        spec=task.spec,
+        depends_on=task.depends_on,
+        create_review=task.create_review,
+        same_branch=task.same_branch,
+        task_type_hint=task.task_type_hint,
+        based_on=args.task_id,  # Track resume lineage (points to failed task)
+        model=task.model,
+        provider=task.provider,
+    )
+
+    # Copy session_id and branch from original task so the resumed run
+    # continues the Claude Code session and uses the same branch.
+    assert new_task.id is not None
+    new_task.session_id = task.session_id
+    new_task.branch = task.branch
+    store.update(new_task)
+
+    print(f"✓ Created task #{new_task.id} (resume of #{args.task_id})")
+
     # Handle background mode
     if args.background:
-        return _spawn_background_resume_worker(args, config, args.task_id)
+        return _spawn_background_resume_worker(args, config, new_task.id)
 
-    # Resume the task (always runs - --run flag exists for consistency with other commands)
-    print(f"=== Resuming Task #{args.task_id} ===")
-    return run(config, task_id=args.task_id, resume=True)
+    # Run the new resume task
+    return run(config, task_id=new_task.id, resume=True)
 
 
 def cmd_show(args: argparse.Namespace) -> int:
