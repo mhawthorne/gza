@@ -578,7 +578,7 @@ class TestResumeCommand:
     """Tests for 'gza resume' command."""
 
     def test_resume_with_background_flag(self, tmp_path: Path):
-        """Resume command with --background spawns a worker to resume the task."""
+        """Resume command with --background creates a new task and spawns a worker."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -602,8 +602,19 @@ class TestResumeCommand:
 
         # Verify the command completes successfully
         assert result.returncode == 0
+        # Verify new task was created
+        assert "Created task #2 (resume of #1)" in result.stdout
         assert "Started worker" in result.stdout
         assert "(resuming)" in result.stdout
+
+        # Verify original task still failed and new task was created
+        original = store.get(1)
+        assert original is not None
+        assert original.status == "failed"
+        new_task = store.get(2)
+        assert new_task is not None
+        assert new_task.based_on == 1
+        assert new_task.session_id == "test-session-123"
 
     def test_resume_without_session_id_fails(self, tmp_path: Path):
         """Resume command fails for tasks without session ID."""
@@ -640,7 +651,7 @@ class TestResumeCommand:
         assert "Can only resume failed tasks" in result.stdout
 
     def test_resume_with_run_flag(self, tmp_path: Path):
-        """Resume command with --run attempts to resume the task (same as default behavior)."""
+        """Resume command with --run creates a new task and attempts to run it."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -658,8 +669,65 @@ class TestResumeCommand:
         # Run resume with --run flag (will fail due to missing API key, but we can verify it tries)
         result = run_gza("resume", "1", "--run", "--no-docker", "--project", str(tmp_path))
 
-        # Verify the command attempts to resume
-        assert "Resuming Task #1" in result.stdout
+        # Verify the command creates a new task
+        assert "Created task #2 (resume of #1)" in result.stdout
+
+        # Verify original task stays failed and new task was created
+        original = store.get(1)
+        assert original is not None
+        assert original.status == "failed"
+        new_task = store.get(2)
+        assert new_task is not None
+        assert new_task.based_on == 1
+        assert new_task.session_id == "test-session-123"
+
+    def test_resume_creates_new_task_preserves_original(self, tmp_path: Path):
+        """Resume creates a new pending task, leaving original task as failed."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a failed task with session ID, log, and stats
+        task = store.add("Implement feature X")
+        task.status = "failed"
+        task.session_id = "session-abc-123"
+        task.task_type = "implement"
+        task.num_turns = 42
+        task.cost_usd = 1.50
+        task.duration_seconds = 300.0
+        task.log_file = ".gza/logs/20260101-implement-feature-x.log"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Run resume (will fail trying to run due to missing API key/git, but task should be created)
+        result = run_gza("resume", "1", "--no-docker", "--project", str(tmp_path))
+
+        # Verify output
+        assert "Created task #2 (resume of #1)" in result.stdout
+
+        # Verify original task stays failed with stats preserved
+        original = store.get(1)
+        assert original is not None
+        assert original.status == "failed"
+        assert original.num_turns == 42
+        assert original.cost_usd == 1.50
+        assert original.duration_seconds == 300.0
+        assert original.log_file == ".gza/logs/20260101-implement-feature-x.log"
+
+        # Verify new task has the right properties
+        new_task = store.get(2)
+        assert new_task is not None
+        assert new_task.prompt == "Implement feature X"
+        assert new_task.task_type == "implement"
+        assert new_task.based_on == 1
+        assert new_task.session_id == "session-abc-123"
+        # New task starts with no stats
+        assert new_task.num_turns is None
+        assert new_task.cost_usd is None
+        assert new_task.log_file is None
 
 
 class TestConfigRequirements:

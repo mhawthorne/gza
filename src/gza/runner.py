@@ -457,6 +457,7 @@ def _restore_wip_changes(
     worktree_git: Git,
     config: Config,
     branch_name: str,
+    original_task_id: str | None = None,
 ) -> None:
     """Restore WIP changes when resuming a task.
 
@@ -468,8 +469,10 @@ def _restore_wip_changes(
         worktree_git: Git instance for the worktree
         config: Configuration object
         branch_name: Name of the branch to restore WIP changes to
+        original_task_id: Optional task_id of the original failed task (for
+            finding the WIP diff file when resuming via a new task).
     """
-    if not task.task_id:
+    if not task.task_id and not original_task_id:
         return
 
     # Check if the last commit is a WIP commit
@@ -481,11 +484,18 @@ def _restore_wip_changes(
     except GitError:
         pass
 
-    # No WIP commit found - try to apply stored diff
+    # No WIP commit found - try to apply stored diff.
+    # When resuming via a new task, the WIP diff was saved with the original
+    # task's id, so check that first, then fall back to the new task's id.
     wip_dir = config.project_dir / WIP_DIR
-    wip_file = wip_dir / f"{task.task_id}.diff"
+    wip_file = None
+    for candidate_id in filter(None, [original_task_id, task.task_id]):
+        candidate = wip_dir / f"{candidate_id}.diff"
+        if candidate.exists():
+            wip_file = candidate
+            break
 
-    if wip_file.exists():
+    if wip_file and wip_file.exists():
         diff_content = wip_file.read_text()
         if diff_content.strip():
             console.print(f"[yellow]WIP commit not found - applying stored diff from {wip_file.relative_to(config.project_dir)}[/yellow]")
@@ -695,14 +705,14 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
         # Resume mode validation
         if resume:
-            if task.status != "failed":
+            if task.status not in ("failed", "pending"):
                 error_message(f"Error: Can only resume failed tasks (task is {task.status})")
                 return 1
             if not task.session_id:
                 error_message(f"Error: Task #{task_id} has no session ID (cannot resume)")
                 console.print("Use 'gza retry' to start fresh instead")
                 return 1
-            # Reset task to in_progress
+            # Mark task as in_progress
             store.mark_in_progress(task)
         else:
             # Check if task is blocked by dependencies
@@ -755,11 +765,12 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         pass  # May fail if offline, continue anyway
 
     # Generate task_id - checks for collisions with existing branches/logs
-    # For resume, keep the existing task_id (don't regenerate)
-    if not resume:
+    # Always generate when task_id is not set (new tasks, including new resume tasks).
+    # Keep existing task_id only when resuming a task that already has one assigned.
+    if task.task_id is None:
         task.task_id = generate_task_id(
             task.prompt,
-            existing_id=task.task_id,  # None for fresh tasks, set for retries
+            existing_id=None,
             log_path=config.log_path,
             git=git,
             project_name=config.project_name,
@@ -887,7 +898,14 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
     # Restore WIP changes if resuming
     if resume:
-        _restore_wip_changes(task, worktree_git, config, branch_name)
+        # When resuming via a new task (based_on points to the original failed task),
+        # the WIP diff file was saved under the original task's task_id.
+        original_task_id = None
+        if task.based_on:
+            original_task = store.get(task.based_on)
+            if original_task:
+                original_task_id = original_task.task_id
+        _restore_wip_changes(task, worktree_git, config, branch_name, original_task_id=original_task_id)
 
     # Mark task in progress (unless resuming, in which case already set)
     if not resume:
