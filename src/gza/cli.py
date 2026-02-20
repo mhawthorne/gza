@@ -938,6 +938,41 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_tests() -> bool:
+    """Run the project's test suite. Returns True if tests pass."""
+    result = subprocess.run(
+        ["uv", "run", "pytest"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def invoke_claude_resolve(branch: str, target: str) -> bool:
+    """Invoke Claude to resolve rebase conflicts.
+
+    Returns True if conflicts were resolved, False if Claude aborted.
+    """
+    cmd = [
+        "claude",
+        "-p", "/gza-rebase --auto",
+        "--allowedTools", "Bash(git add:*)",
+        "--allowedTools", "Bash(git rebase --continue:*)",
+        "--allowedTools", "Bash(uv run python -m py_compile:*)",
+        "--allowedTools", "Edit",
+        "--allowedTools", "Read",
+        "--allowedTools", "Glob",
+        "--allowedTools", "Grep",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check if rebase completed (no longer in rebase state)
+    rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
+
+    return not rebase_in_progress
+
+
 def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
@@ -1008,18 +1043,49 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         return 0
 
     except GitError as e:
-        print(f"Error during rebase: {e}")
-        print(f"\nAborting rebase and restoring clean state...")
-        try:
-            git.rebase_abort()
+        # Check if --resolve flag is set
+        if not getattr(args, 'resolve', False):
+            # Original behavior: abort and return error
+            print(f"Error during rebase: {e}")
+            print(f"\nAborting rebase and restoring clean state...")
             try:
-                git.checkout(current_branch)
-            except GitError:
-                pass  # Best effort to return to original branch
-            print("✓ Rebase aborted, working directory restored")
-        except GitError as abort_error:
-            print(f"Warning: Could not abort rebase: {abort_error}")
-        return 1
+                git.rebase_abort()
+                try:
+                    git.checkout(current_branch)
+                except GitError:
+                    pass  # Best effort to return to original branch
+                print("✓ Rebase aborted, working directory restored")
+            except GitError as abort_error:
+                print(f"Warning: Could not abort rebase: {abort_error}")
+            return 1
+
+        # --resolve: invoke Claude to fix conflicts
+        print("Conflicts detected. Invoking Claude to resolve...")
+        resolved = invoke_claude_resolve(task.branch, rebase_target)
+
+        if not resolved:
+            print("Could not resolve conflicts automatically.")
+            git.rebase_abort()
+            git.checkout(current_branch)
+            return 1
+
+        # Force push the resolved branch
+        print(f"Pushing {task.branch}...")
+        git.push_force_with_lease(task.branch)
+
+        # Run tests
+        print("Running tests...")
+        tests_passed = run_tests()
+
+        # Always checkout main at the end
+        git.checkout(default_branch)
+
+        if not tests_passed:
+            print(f"Tests failed. Branch '{task.branch}' is rebased but needs fixes.")
+            return 1
+
+        print(f"✓ Successfully rebased and tested {task.branch}")
+        return 0
 
 
 def cmd_checkout(args: argparse.Namespace) -> int:
@@ -3607,6 +3673,11 @@ def main() -> int:
         "--force", "-f",
         action="store_true",
         help="Force remove worktree even if it has uncommitted changes",
+    )
+    rebase_parser.add_argument(
+        "--resolve",
+        action="store_true",
+        help="Auto-resolve conflicts using AI (non-interactive)",
     )
     add_common_args(rebase_parser)
 

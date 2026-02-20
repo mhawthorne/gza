@@ -247,6 +247,18 @@ class Git:
         args.extend([remote, branch])
         self._run(*args)
 
+    def push_force_with_lease(self, branch: str, remote: str = "origin") -> None:
+        """Force push a branch with lease protection.
+
+        Args:
+            branch: The branch to push
+            remote: The remote name (default: origin)
+
+        Raises:
+            GitError: If the force push fails
+        """
+        self._run("push", "--force-with-lease", remote, branch)
+
     def get_log(self, revision_range: str, oneline: bool = True) -> str:
         """Get git log output for a revision range.
 

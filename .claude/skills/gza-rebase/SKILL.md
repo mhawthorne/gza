@@ -61,9 +61,25 @@ Show:
 - Number of conflicts resolved
 - The command to push: `git push --force-with-lease`
 
+## Non-interactive mode (--auto)
+
+When invoked with `--auto`:
+- Always rebase against `main` (local)
+- Resolve conflicts using best judgment without asking for confirmation
+- If unsure about any resolution, abort immediately with `git rebase --abort`
+- Log each resolution decision for transparency
+- Check Python syntax after each resolution using `uv run python -m py_compile`
+- Attempt to preserve both changes when possible (most conflicts are additive)
+- Use confidence-based resolution:
+  - **High confidence**: Both sides adding new code (imports, functions, tests) - keep both
+  - **Medium confidence**: Both sides modifying same area but different lines - attempt merge
+  - **Low confidence**: Same lines modified differently - abort with clear explanation
+- After resolving all conflicts, continue the rebase until completion
+- Report final status: success or specific reason for aborting
+
 ## Important notes
 
-- **Never force-push automatically** - always let the user do this manually
-- **Always ask before resolving ambiguous conflicts** - if the intent isn't clear, ask
+- **Never force-push automatically** - always let the user do this manually (except in --auto mode, which is called by automation)
+- **Always ask before resolving ambiguous conflicts** - if the intent isn't clear, ask (except in --auto mode)
 - **Preserve both changes when possible** - most conflicts in this project are additive (both sides adding new code)
 - **Check Python syntax after each resolution** - catch errors early
