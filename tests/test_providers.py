@@ -10,6 +10,7 @@ from gza.config import Config
 from gza.providers import (
     get_provider,
     ClaudeProvider,
+    CodexProvider,
     GeminiProvider,
     DockerConfig,
 )
@@ -48,6 +49,17 @@ class TestGetProvider:
         provider = get_provider(config)
         assert isinstance(provider, GeminiProvider)
         assert provider.name == "Gemini"
+
+    def test_returns_codex_when_configured(self, tmp_path):
+        """Should return Codex provider when configured."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="codex",
+        )
+        provider = get_provider(config)
+        assert isinstance(provider, CodexProvider)
+        assert provider.name == "Codex"
 
     def test_raises_for_unknown_provider(self, tmp_path):
         """Should raise ValueError for unknown provider."""
@@ -1037,3 +1049,260 @@ class TestEnsureDockerImage:
                 result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is False
+
+
+class TestCodexProvider:
+    """Tests for Codex provider."""
+
+    def test_codex_docker_config(self):
+        """Codex should have correct Docker config."""
+        from gza.providers.codex import _get_docker_config
+
+        config = _get_docker_config("my-project-gza")
+
+        assert config.image_name == "my-project-gza"
+        assert config.npm_package == "@openai/codex"
+        assert config.cli_command == "codex"
+        assert config.config_dir == ".codex"
+        assert "OPENAI_API_KEY" in config.env_vars
+
+    def test_check_credentials_with_api_key(self):
+        """Codex should check for OPENAI_API_KEY."""
+        provider = CodexProvider()
+
+        with patch.object(Path, "home", return_value=Path("/nonexistent")):
+            with patch.dict(os.environ, {}, clear=True):
+                assert provider.check_credentials() is False
+
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+                assert provider.check_credentials() is True
+
+    def test_check_credentials_with_config_dir(self, tmp_path):
+        """Codex should check for ~/.codex directory."""
+        provider = CodexProvider()
+
+        with patch.object(Path, "home", return_value=tmp_path):
+            with patch.dict(os.environ, {}, clear=True):
+                assert provider.check_credentials() is False
+
+            (tmp_path / ".codex").mkdir()
+            assert provider.check_credentials() is True
+
+    def test_routes_to_docker_when_enabled(self, tmp_path):
+        """Codex should route to Docker when use_docker is True."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=True,
+        )
+        provider = CodexProvider()
+
+        with patch.object(provider, "_run_docker") as mock_docker:
+            with patch.object(provider, "_run_direct") as mock_direct:
+                mock_docker.return_value = MagicMock(exit_code=0)
+                provider.run(config, "test prompt", tmp_path / "log.txt", tmp_path)
+
+                mock_docker.assert_called_once()
+                mock_direct.assert_not_called()
+
+    def test_routes_to_direct_when_disabled(self, tmp_path):
+        """Codex should route to direct when use_docker is False."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=False,
+        )
+        provider = CodexProvider()
+
+        with patch.object(provider, "_run_docker") as mock_docker:
+            with patch.object(provider, "_run_direct") as mock_direct:
+                mock_direct.return_value = MagicMock(exit_code=0)
+                provider.run(config, "test prompt", tmp_path / "log.txt", tmp_path)
+
+                mock_direct.assert_called_once()
+                mock_docker.assert_not_called()
+
+
+class TestCodexCostCalculation:
+    """Tests for Codex cost calculation."""
+
+    def test_default_pricing(self):
+        """Should use default pricing for unknown models."""
+        from gza.providers.codex import calculate_cost
+
+        # 1M input tokens at $2.50, 1M output tokens at $10.00
+        cost = calculate_cost(1_000_000, 1_000_000, "unknown-model")
+        assert cost == pytest.approx(12.50, rel=0.01)
+
+    def test_gpt_5_2_codex_pricing(self):
+        """Should use correct pricing for gpt-5.2-codex."""
+        from gza.providers.codex import calculate_cost
+
+        # 1M input at $2.50, 1M output at $10.00
+        cost = calculate_cost(1_000_000, 1_000_000, "gpt-5.2-codex")
+        assert cost == pytest.approx(12.50, rel=0.01)
+
+    def test_o3_pricing(self):
+        """Should use correct pricing for o3."""
+        from gza.providers.codex import calculate_cost
+
+        # 1M input at $10.00, 1M output at $40.00
+        cost = calculate_cost(1_000_000, 1_000_000, "o3")
+        assert cost == pytest.approx(50.00, rel=0.01)
+
+    def test_small_token_counts(self):
+        """Should handle small token counts correctly."""
+        from gza.providers.codex import calculate_cost
+
+        # 1000 input tokens, 500 output tokens with default pricing
+        cost = calculate_cost(1000, 500, "gpt-5.2-codex")
+        # 1000 * 2.50/1M + 500 * 10/1M = 0.0025 + 0.005 = 0.0075
+        assert cost == pytest.approx(0.0075, rel=0.01)
+
+    def test_zero_tokens(self):
+        """Should handle zero tokens."""
+        from gza.providers.codex import calculate_cost
+
+        cost = calculate_cost(0, 0, "gpt-5.2-codex")
+        assert cost == 0.0
+
+
+class TestCodexOutputParsing:
+    """Tests for Codex output parsing."""
+
+    def test_parses_turn_events(self, tmp_path):
+        """Should parse turn.started and turn.completed events."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate Codex's JSON output
+        json_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread_123"}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1000, "output_tokens": 500, "cached_input_tokens": 200}
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.num_turns == 1
+        assert result.input_tokens == 1000
+        assert result.output_tokens == 500
+        assert result.session_id == "thread_123"
+
+    def test_parses_command_execution(self, tmp_path, capsys):
+        """Should log command execution items."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "command_execution", "command": "ls -la"}
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ Bash ls -la" in captured.out
+
+    def test_parses_agent_messages(self, tmp_path, capsys):
+        """Should log agent message items."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "I will help you with that task."}
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "I will help you with that task." in captured.out
+
+    def test_tracks_max_turns_exceeded(self, tmp_path):
+        """Should track when max_turns is exceeded."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate exceeding max_turns (set to 2)
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",  # Third turn exceeds limit
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+                max_turns=2,  # Set max_turns to 2
+            )
+
+        assert result.num_turns == 3
+        assert result.error_type == "max_turns"

@@ -1,6 +1,6 @@
 # Docker Configuration
 
-Gza runs AI providers (Claude, Gemini) in Docker containers by default for isolation and reproducibility. This document explains how to customize the Docker environment for your project's needs.
+Gza runs AI providers (Claude, Gemini, Codex) in Docker containers by default for isolation and reproducibility. This document explains how to customize the Docker environment for your project's needs.
 
 ## Default Behavior
 
@@ -144,6 +144,7 @@ use_docker: false
 |------|---------|
 | `etc/Dockerfile.claude` | Custom Dockerfile for Claude provider |
 | `etc/Dockerfile.gemini` | Custom Dockerfile for Gemini provider |
+| `etc/Dockerfile.codex` | Custom Dockerfile for Codex provider |
 
 ## Troubleshooting
 
@@ -168,3 +169,48 @@ gza work
 ### macOS file sharing
 
 On macOS, Docker needs access to the directories gza uses. The default `/tmp/gza-worktrees` path is accessible. If you change `worktree_dir` in `gza.yaml`, ensure Docker can access it via Docker Desktop > Settings > Resources > File Sharing.
+
+## Codex Support
+
+OpenAI's Codex CLI (`@openai/codex`) is supported as an alternative provider.
+
+### Authentication
+
+Codex supports two authentication methods in Docker, with automatic fallback:
+
+1. **OAuth** (preferred): Run `codex login` on host. Credentials in `~/.codex/auth.json` are mounted into the container. Uses ChatGPT pricing (typically cheaper).
+2. **API Key** (fallback): Set `CODEX_API_KEY` in `~/.gza/.env`. Uses standard OpenAI API pricing.
+
+Gza automatically detects which method to use:
+- If `~/.codex/auth.json` exists → mounts `~/.codex` for OAuth
+- Otherwise → passes `CODEX_API_KEY` env var
+
+### Docker Configuration
+
+Both auth methods work in Docker. OAuth requires the `~/.codex` directory to be writable (Codex caches model info).
+
+For OAuth with Docker on macOS, you may need to add `~/.codex` to Docker Desktop's file sharing:
+
+1. Open Docker Desktop > Settings > Resources > File Sharing
+2. Add your `~/.codex` directory (e.g., `/Users/yourname/.codex`)
+3. Restart Docker Desktop
+
+### Dockerfile
+
+The auto-generated `etc/Dockerfile.codex`:
+
+```dockerfile
+FROM node:20-slim
+
+RUN npm install -g @openai/codex
+
+RUN useradd -m -s /bin/bash gza
+USER gza
+WORKDIR /home/gza
+
+CMD ["codex"]
+```
+
+### Git Repository Requirement
+
+Unlike Claude, Codex requires running inside a git repository. Gza handles this automatically since it always operates in git worktrees, but be aware of this if testing manually.

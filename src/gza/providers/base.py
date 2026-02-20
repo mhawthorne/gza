@@ -366,10 +366,12 @@ class Provider(ABC):
 def get_provider(config: Config) -> Provider:
     """Get the appropriate provider based on config."""
     from .claude import ClaudeProvider
+    from .codex import CodexProvider
     from .gemini import GeminiProvider
 
     providers = {
         "claude": ClaudeProvider,
+        "codex": CodexProvider,
         "gemini": GeminiProvider,
     }
 

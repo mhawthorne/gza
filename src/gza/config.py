@@ -463,8 +463,8 @@ class Config:
         if "provider" in data:
             if not isinstance(data["provider"], str):
                 errors.append("'provider' must be a string")
-            elif data["provider"] not in ("claude", "gemini"):
-                errors.append("'provider' must be either 'claude' or 'gemini'")
+            elif data["provider"] not in ("claude", "codex", "gemini"):
+                errors.append("'provider' must be one of: 'claude', 'codex', 'gemini'")
 
         if "model" in data and not isinstance(data["model"], str):
             errors.append("'model' must be a string")
