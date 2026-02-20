@@ -1767,6 +1767,205 @@ class TestAddCommandWithChaining:
         assert "Error: Spec file not found: nonexistent.md" in result.stdout
 
 
+class TestAddCommandWithModelAndProvider:
+    """Tests for 'gza add' command with --model and --provider flags."""
+
+    def test_add_with_model_flag(self, tmp_path: Path):
+        """Add command with --model flag stores model override."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza("add", "--model", "claude-3-5-haiku-latest", "Test task with model", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify model was set
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Test task with model"), None)
+        assert task is not None
+        assert task.model == "claude-3-5-haiku-latest"
+
+    def test_add_with_provider_flag(self, tmp_path: Path):
+        """Add command with --provider flag stores provider override."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza("add", "--provider", "gemini", "Test task with provider", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify provider was set
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Test task with provider"), None)
+        assert task is not None
+        assert task.provider == "gemini"
+
+    def test_add_with_both_model_and_provider(self, tmp_path: Path):
+        """Add command with both --model and --provider flags works."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza(
+            "add",
+            "--model", "claude-opus-4",
+            "--provider", "claude",
+            "Test task with both",
+            "--project", str(tmp_path)
+        )
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify both were set
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Test task with both"), None)
+        assert task is not None
+        assert task.model == "claude-opus-4"
+        assert task.provider == "claude"
+
+
+class TestEditCommandWithModelAndProvider:
+    """Tests for 'gza edit' command with --model and --provider flags."""
+
+    def test_edit_with_model_flag(self, tmp_path: Path):
+        """Edit command can set model override."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a task
+        task = store.add("Test task")
+        assert task.model is None
+
+        # Edit to add model
+        result = run_gza("edit", str(task.id), "--model", "claude-3-5-haiku-latest", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Set model override" in result.stdout
+
+        # Verify model was set
+        task = store.get(task.id)
+        assert task is not None
+        assert task.model == "claude-3-5-haiku-latest"
+
+    def test_edit_with_provider_flag(self, tmp_path: Path):
+        """Edit command can set provider override."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a task
+        task = store.add("Test task")
+        assert task.provider is None
+
+        # Edit to add provider
+        result = run_gza("edit", str(task.id), "--provider", "gemini", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Set provider override" in result.stdout
+
+        # Verify provider was set
+        task = store.get(task.id)
+        assert task is not None
+        assert task.provider == "gemini"
+
+
+class TestGetEffectiveConfigForTask:
+    """Tests for get_effective_config_for_task helper function."""
+
+    def test_task_model_overrides_config(self, tmp_path: Path):
+        """Task-specific model takes priority over config model."""
+        from gza.config import Config
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.model = "claude-3-5-sonnet-latest"
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+            model="claude-3-5-haiku-latest",
+        )
+
+        model, provider = get_effective_config_for_task(task, config)
+        assert model == "claude-3-5-haiku-latest"
+
+    def test_task_type_model_overrides_default(self, tmp_path: Path):
+        """Task-type model takes priority over default config model."""
+        from gza.config import Config, TaskTypeConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.model = "claude-3-5-sonnet-latest"
+        config.task_types = {
+            "review": TaskTypeConfig(model="claude-3-5-haiku-latest")
+        }
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+            task_type="review",
+        )
+
+        model, provider = get_effective_config_for_task(task, config)
+        assert model == "claude-3-5-haiku-latest"
+
+    def test_default_config_model_used(self, tmp_path: Path):
+        """Default config model is used when no overrides."""
+        from gza.config import Config
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.model = "claude-3-5-sonnet-latest"
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+        )
+
+        model, provider = get_effective_config_for_task(task, config)
+        assert model == "claude-3-5-sonnet-latest"
+
+    def test_task_provider_overrides_config(self, tmp_path: Path):
+        """Task-specific provider takes priority over config provider."""
+        from gza.config import Config
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.provider = "claude"
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+            provider="gemini",
+        )
+
+        model, provider = get_effective_config_for_task(task, config)
+        assert provider == "gemini"
+
+
 class TestBuildPromptWithSpec:
     """Tests for build_prompt with spec file content."""
 

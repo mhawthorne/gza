@@ -2455,6 +2455,8 @@ def cmd_add(args: argparse.Namespace) -> int:
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     spec = args.spec if hasattr(args, 'spec') and args.spec else None
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
+    model = args.model if hasattr(args, 'model') and args.model else None
+    provider = args.provider if hasattr(args, 'provider') and args.provider else None
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -2511,6 +2513,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             same_branch=same_branch,
             spec=spec,
             task_type_hint=branch_type,
+            model=model,
+            provider=provider,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -2527,10 +2531,12 @@ def cmd_add(args: argparse.Namespace) -> int:
             create_review=create_review,
             same_branch=same_branch,
             task_type_hint=branch_type,
+            model=model,
+            provider=provider,
         )
-        if not task:
+        if not new_task:
             return 1
-        print(f"✓ Added task #{task.id}")
+        print(f"✓ Added task #{new_task.id}")
         return 0
     else:
         # Inline prompt
@@ -2544,6 +2550,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             same_branch=same_branch,
             spec=spec,
             task_type_hint=branch_type,
+            model=model,
+            provider=provider,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -2593,6 +2601,20 @@ def cmd_edit(args: argparse.Namespace) -> int:
         task.create_review = True
         store.update(task)
         print(f"✓ Enabled automatic review task creation for task #{task.id}")
+        return 0
+
+    # Handle --model flag
+    if hasattr(args, 'model') and args.model is not None:
+        task.model = args.model
+        store.update(task)
+        print(f"✓ Set model override to '{args.model}' for task #{task.id}")
+        return 0
+
+    # Handle --provider flag
+    if hasattr(args, 'provider') and args.provider is not None:
+        task.provider = args.provider
+        store.update(task)
+        print(f"✓ Set provider override to '{args.provider}' for task #{task.id}")
         return 0
 
     if args.explore and args.task:
@@ -3840,6 +3862,17 @@ def main() -> int:
         metavar="FILE",
         help="Read prompt from file (for non-interactive use)",
     )
+    add_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override model for this task (e.g., claude-3-5-haiku-latest)",
+    )
+    add_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        choices=["claude", "codex", "gemini"],
+        help="Override provider for this task (claude, codex, or gemini)",
+    )
     add_common_args(add_parser)
 
     # edit command
@@ -3886,6 +3919,17 @@ def main() -> int:
         "--prompt",
         metavar="TEXT",
         help="Set new prompt directly, or use '-' to read from stdin",
+    )
+    edit_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Set model override for this task",
+    )
+    edit_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        choices=["claude", "codex", "gemini"],
+        help="Set provider override for this task",
     )
     add_common_args(edit_parser)
 

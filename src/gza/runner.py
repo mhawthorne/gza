@@ -13,6 +13,43 @@ from .github import GitHub, GitHubError
 from .providers import get_provider, Provider, RunResult
 
 
+def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str]:
+    """Get the effective model and provider for a task based on priority order.
+
+    Priority order for model selection:
+    1. Task-specific model (task.model)
+    2. Task-type config (task_types.<type>.model)
+    3. Default config (config.model)
+    4. Environment variable (GZA_MODEL)
+
+    Priority order for provider selection:
+    1. Task-specific provider (task.provider)
+    2. Default config (config.provider)
+    3. Environment variable (GZA_PROVIDER)
+
+    Args:
+        task: The task to get config for
+        config: The base configuration
+
+    Returns:
+        Tuple of (model, provider) where model can be None
+    """
+    # Get effective model
+    model = None
+    if task.model:
+        # Task-specific model (highest priority)
+        model = task.model
+    else:
+        # Fall back to task-type or default model
+        model = config.get_model_for_task_type(task.task_type)
+        # Environment variable override is already applied in config
+
+    # Get effective provider
+    provider = task.provider if task.provider else config.provider
+
+    return model, provider
+
+
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
 PLAN_DIR = f".{APP_NAME}/plans"
 REVIEW_DIR = f".{APP_NAME}/reviews"
@@ -606,20 +643,6 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     """
     load_dotenv(config.project_dir)
 
-    # Get the configured provider
-    provider = get_provider(config)
-
-    if not provider.check_credentials():
-        error_message(f"Error: No {provider.name} credentials found")
-        console.print(f"  {provider.credential_setup_hint}")
-        return 1
-
-    # Verify credentials work before proceeding
-    console.print(f"Verifying {provider.name} credentials...")
-    if not provider.verify_credentials(config):
-        return 1
-    console.print("[green]Credentials verified ✓[/green]")
-
     # Load tasks from SQLite
     store = SqliteTaskStore(config.db_path)
 
@@ -656,6 +679,29 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         console.print("No pending tasks found")
         return 0
 
+    # Get effective model and provider for this task
+    effective_model, effective_provider = get_effective_config_for_task(task, config)
+
+    # Create a modified config with task-specific settings
+    from copy import copy
+    task_config = copy(config)
+    task_config.model = effective_model or ""
+    task_config.provider = effective_provider
+
+    # Get the provider for this task
+    provider = get_provider(task_config)
+
+    if not provider.check_credentials():
+        error_message(f"Error: No {provider.name} credentials found")
+        console.print(f"  {provider.credential_setup_hint}")
+        return 1
+
+    # Verify credentials work before proceeding
+    console.print(f"Verifying {provider.name} credentials...")
+    if not provider.verify_credentials(task_config):
+        return 1
+    console.print("[green]Credentials verified ✓[/green]")
+
     # Setup git on the main repo (for worktree operations)
     git = Git(config.project_dir)
     default_branch = git.default_branch()
@@ -682,7 +728,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
     # For explore, plan, and review tasks, run in project dir without creating a branch
     if task.task_type in ("explore", "plan", "review"):
-        return _run_non_code_task(task, config, store, provider, git, resume=resume, open_after=open_after)
+        return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
 
     # Determine branch name based on resume, same_branch, and branch_mode
     if resume and task.branch:
@@ -845,7 +891,7 @@ Once you've verified and updated the todo list, continue from where you left off
         prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
     try:
-        result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
+        result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
