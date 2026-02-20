@@ -731,6 +731,30 @@ class TestRemoteOperations:
 
             mock_run.assert_called_once_with("push", "-u", "upstream", "feature")
 
+    def test_push_force_with_lease_default_remote(self, tmp_path: Path):
+        """Test force push with lease using default remote."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            git.push_force_with_lease("feature")
+
+            mock_run.assert_called_once_with("push", "--force-with-lease", "origin", "feature")
+
+    def test_push_force_with_lease_custom_remote(self, tmp_path: Path):
+        """Test force push with lease using custom remote."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            git.push_force_with_lease("feature", remote="upstream")
+
+            mock_run.assert_called_once_with("push", "--force-with-lease", "upstream", "feature")
+
 
 class TestMergeOperations:
     """Tests for merge operations."""

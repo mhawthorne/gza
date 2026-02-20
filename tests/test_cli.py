@@ -3214,6 +3214,54 @@ class TestRebaseCommand:
         assert "Removing stale worktree" not in result.stdout
         assert "Successfully rebased" in result.stdout
 
+    def test_rebase_resolve_flag_accepted(self, tmp_path: Path):
+        """Rebase command accepts --resolve flag."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+        from unittest.mock import patch, MagicMock
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test rebase with resolve")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-resolve"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-resolve")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Mock the conflict resolution since we're just testing that the flag is accepted
+        # and the basic flow works (we don't want to actually invoke Claude in tests)
+        with patch('gza.cli.invoke_claude_resolve', return_value=False), \
+             patch('gza.cli.run_tests', return_value=True):
+            # This should succeed without conflicts (no --resolve needed, but flag should work)
+            result = run_gza("rebase", str(task.id), "--resolve", "--project", str(tmp_path))
+
+            # Should succeed when there are no conflicts
+            assert result.returncode == 0
+            assert "Successfully rebased" in result.stdout
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
@@ -4713,3 +4761,61 @@ class TestCleanupCommand:
         assert unmerged_log.exists()
         # Merged task log should be removed
         assert not merged_log.exists()
+
+
+class TestRebaseHelpers:
+    """Tests for rebase helper functions."""
+
+    def test_run_tests_returns_true_on_success(self):
+        """Test run_tests returns True when tests pass."""
+        from gza.cli import run_tests
+        from unittest.mock import patch, MagicMock
+
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = run_tests()
+
+            assert result is True
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args[0][0]
+            assert call_args == ["uv", "run", "pytest"]
+
+    def test_run_tests_returns_false_on_failure(self):
+        """Test run_tests returns False when tests fail."""
+        from gza.cli import run_tests
+        from unittest.mock import patch, MagicMock
+
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)
+            result = run_tests()
+
+            assert result is False
+
+    def test_invoke_claude_resolve_returns_true_when_resolved(self):
+        """Test invoke_claude_resolve returns True when conflicts are resolved."""
+        from gza.cli import invoke_claude_resolve
+        from unittest.mock import patch, MagicMock
+
+        with patch('subprocess.run') as mock_run, \
+             patch('pathlib.Path.exists', return_value=False):
+            mock_run.return_value = MagicMock(returncode=0)
+            result = invoke_claude_resolve("feature", "main")
+
+            assert result is True
+            # Verify Claude was invoked with correct arguments
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args[0][0]
+            assert "claude" in call_args
+            assert "/gza-rebase --auto" in call_args
+
+    def test_invoke_claude_resolve_returns_false_when_unresolved(self):
+        """Test invoke_claude_resolve returns False when conflicts remain."""
+        from gza.cli import invoke_claude_resolve
+        from unittest.mock import patch, MagicMock
+
+        with patch('subprocess.run') as mock_run, \
+             patch('pathlib.Path.exists', return_value=True):
+            mock_run.return_value = MagicMock(returncode=0)
+            result = invoke_claude_resolve("feature", "main")
+
+            assert result is False
