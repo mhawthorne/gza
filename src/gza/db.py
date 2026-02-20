@@ -38,6 +38,8 @@ class Task:
     output_content: str | None = None  # Actual content of report/plan/review (for persistence)
     session_id: str | None = None  # Claude session ID for resume capability
     pr_number: int | None = None  # GitHub PR number
+    model: str | None = None  # Per-task model override
+    provider: str | None = None  # Per-task provider override
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -57,7 +59,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -94,7 +96,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- New field for task resume (v5)
     session_id TEXT,
     -- New field for PR tracking (v6)
-    pr_number INTEGER
+    pr_number INTEGER,
+    -- New fields for per-task model/provider overrides (v7)
+    model TEXT,
+    provider TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -133,6 +138,12 @@ ALTER TABLE tasks ADD COLUMN session_id TEXT;
 # Migration from v5 to v6
 MIGRATION_V5_TO_V6 = """
 ALTER TABLE tasks ADD COLUMN pr_number INTEGER;
+"""
+
+# Migration from v6 to v7
+MIGRATION_V6_TO_V7 = """
+ALTER TABLE tasks ADD COLUMN model TEXT;
+ALTER TABLE tasks ADD COLUMN provider TEXT;
 """
 
 
@@ -223,7 +234,20 @@ class SqliteTaskStore:
                             except sqlite3.OperationalError:
                                 # Column might already exist
                                 pass
+                    current_version = 6
                     conn.execute("UPDATE schema_version SET version = ?", (6,))
+
+                if current_version < 7:
+                    # Run migration v6 -> v7
+                    for stmt in MIGRATION_V6_TO_V7.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (7,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -262,6 +286,8 @@ class SqliteTaskStore:
             output_content=row["output_content"] if "output_content" in row.keys() else None,
             session_id=row["session_id"] if "session_id" in row.keys() else None,
             pr_number=row["pr_number"] if "pr_number" in row.keys() else None,
+            model=row["model"] if "model" in row.keys() else None,
+            provider=row["provider"] if "provider" in row.keys() else None,
         )
 
     # === Task CRUD ===
@@ -277,16 +303,18 @@ class SqliteTaskStore:
         create_review: bool = False,
         same_branch: bool = False,
         task_type_hint: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
     ) -> Task:
         """Add a new task."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint),
+                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider),
             )
             task_id = cur.lastrowid
             assert task_id is not None
@@ -335,7 +363,9 @@ class SqliteTaskStore:
                     same_branch = ?,
                     output_content = ?,
                     session_id = ?,
-                    pr_number = ?
+                    pr_number = ?,
+                    model = ?,
+                    provider = ?
                 WHERE id = ?
                 """,
                 (
@@ -361,6 +391,8 @@ class SqliteTaskStore:
                     task.output_content,
                     task.session_id,
                     task.pr_number,
+                    task.model,
+                    task.provider,
                     task.id,
                 ),
             )
@@ -750,6 +782,8 @@ def edit_prompt(
     depends_on: int | None = None,
     create_review: bool = False,
     same_branch: bool = False,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> str | None:
     """Open $EDITOR for the user to enter/edit a prompt.
 
@@ -771,6 +805,10 @@ def edit_prompt(
         options.append("# Create review: yes")
     if same_branch:
         options.append("# Same branch: yes")
+    if model:
+        options.append(f"# Model: {model}")
+    if provider:
+        options.append(f"# Provider: {provider}")
 
     template = TASK_TEMPLATE_HEADER + "\n".join(options) + "\n"
 
@@ -812,6 +850,8 @@ def add_task_interactive(
     create_review: bool = False,
     same_branch: bool = False,
     task_type_hint: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> Task | None:
     """Interactively add a task using $EDITOR.
 
@@ -826,6 +866,8 @@ def add_task_interactive(
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
+            model=model,
+            provider=provider,
         )
 
         if prompt is None:
@@ -846,6 +888,8 @@ def add_task_interactive(
                 create_review=create_review,
                 same_branch=same_branch,
                 task_type_hint=task_type_hint,
+                model=model,
+                provider=provider,
             )
 
         # Show errors and ask what to do
@@ -875,6 +919,8 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             depends_on=task.depends_on,
             create_review=task.create_review,
             same_branch=task.same_branch,
+            model=task.model,
+            provider=task.provider,
         )
 
         if prompt is None:

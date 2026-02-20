@@ -380,7 +380,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         conn.commit()
         conn.close()
 
-        # Open with SqliteTaskStore - should auto-migrate to v6
+        # Open with SqliteTaskStore - should auto-migrate to v7
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 6
+        assert version == 7
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -490,7 +490,7 @@ class TestTaskResume:
         conn.commit()
         conn.close()
 
-        # Open with SqliteTaskStore - should auto-migrate to v6
+        # Open with SqliteTaskStore - should auto-migrate to v7
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 6
+        assert version == 7
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
