@@ -97,6 +97,10 @@ class CodexProvider(Provider):
     def name(self) -> str:
         return "Codex"
 
+    @property
+    def credential_setup_hint(self) -> str:
+        return "Set OPENAI_API_KEY in ~/.gza/.env or run 'codex --login' to authenticate"
+
     def check_credentials(self) -> bool:
         """Check for Codex credentials (OAuth or API key)."""
         codex_config = Path.home() / ".codex"
@@ -186,7 +190,8 @@ class CodexProvider(Provider):
         else:
             cmd.extend([
                 "codex", "exec", "--json",
-                "--sandbox", "workspace-write",
+                "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
+                "-C", "/workspace",  # Set working directory explicitly
                 "-",  # Read prompt from stdin
             ])
 
@@ -217,7 +222,7 @@ class CodexProvider(Provider):
         else:
             cmd.extend([
                 "codex", "exec", "--json",
-                "--sandbox", "workspace-write",
+                "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
                 "-C", str(work_dir),
                 "-",  # Read prompt from stdin
             ])

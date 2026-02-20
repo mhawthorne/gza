@@ -1,0 +1,4 @@
+#!/bin/sh
+
+uv run mypy src/gza/
+uv run pytest tests/ -v

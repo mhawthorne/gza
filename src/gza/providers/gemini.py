@@ -69,6 +69,10 @@ class GeminiProvider(Provider):
     def name(self) -> str:
         return "Gemini"
 
+    @property
+    def credential_setup_hint(self) -> str:
+        return "Set GEMINI_API_KEY or GOOGLE_API_KEY in ~/.gza/.env, or run 'gemini auth' to authenticate"
+
     def check_credentials(self) -> bool:
         """Check for Gemini credentials.
 
@@ -182,7 +186,7 @@ class GeminiProvider(Provider):
         cmd.extend([
             "gemini", "-p", prompt,
             "--output-format", "stream-json",
-            "--allowed-tools", "run_shell_command",
+            "--yolo",  # Auto-approve all tool calls (required for headless operation)
         ])
 
         # Add model if specified
@@ -204,7 +208,7 @@ class GeminiProvider(Provider):
             "timeout", f"{config.timeout_minutes}m",
             "gemini", "-p", prompt,
             "--output-format", "stream-json",
-            "--allowed-tools", "run_shell_command",
+            "--yolo",  # Auto-approve all tool calls (required for headless operation)
         ]
 
         # Add model if specified

@@ -1,0 +1,15 @@
+FROM node:20-slim
+
+# Install CA certificates (required for HTTPS connections)
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Install the CLI tool globally
+RUN npm install -g @openai/codex
+
+# Create gza user for isolation
+RUN useradd -m -s /bin/bash gza
+USER gza
+WORKDIR /home/gza
+
+# Default command
+CMD ["codex"]

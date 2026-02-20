@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 DOCKERFILE_TEMPLATE = """\
 FROM node:20-slim
 
+# Install CA certificates (required for HTTPS connections)
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
 # Install the CLI tool globally
 RUN npm install -g {npm_package}
 
@@ -223,6 +226,31 @@ def verify_docker_credentials(
 
         if result.returncode == 0:
             return True
+
+        # Non-zero exit code without matching error patterns
+        print(f"Error: Credential verification failed (exit code {result.returncode})")
+        if output.strip():
+            # Show last few lines of output for debugging
+            lines = output.strip().split("\n")
+            if len(lines) > 5:
+                print("  Last 5 lines of output:")
+                for line in lines[-5:]:
+                    print(f"    {line}")
+            else:
+                print("  Output:")
+                for line in lines:
+                    print(f"    {line}")
+        else:
+            print("  (no output)")
+
+        # Check if config directory doesn't exist
+        if docker_config.config_dir:
+            config_path = Path.home() / docker_config.config_dir
+            if not config_path.exists():
+                print(f"\n  Hint: {config_path} directory not found")
+                print(f"  You may need to set the API key environment variable or run the login command")
+
+        return False
     except subprocess.TimeoutExpired:
         print("Error: Docker command timed out")
         return False
@@ -255,6 +283,14 @@ class Provider(ABC):
     def name(self) -> str:
         """Provider name for display."""
         ...
+
+    @property
+    def credential_setup_hint(self) -> str:
+        """Return a hint for setting up credentials.
+
+        Override in subclasses to provide provider-specific instructions.
+        """
+        return "Check the provider documentation for credential setup."
 
     @abstractmethod
     def check_credentials(self) -> bool:

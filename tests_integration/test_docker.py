@@ -279,6 +279,9 @@ class TestCodexSmoke:
         # Codex requires running in a git repo (unlike Claude)
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
 
+        # Make directory world-writable so Docker container (gza user) can write
+        tmp_path.chmod(0o777)
+
         config = Config(
             project_dir=tmp_path,
             project_name="smoke-test-codex-oauth",
@@ -311,6 +314,9 @@ class TestCodexSmoke:
 
         # Codex requires running in a git repo (unlike Claude)
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+
+        # Make directory world-writable so Docker container (gza user) can write
+        tmp_path.chmod(0o777)
 
         # Temporarily hide OAuth to force API key auth
         # We do this by patching _has_codex_oauth to return False

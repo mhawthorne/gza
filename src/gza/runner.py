@@ -610,10 +610,8 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     provider = get_provider(config)
 
     if not provider.check_credentials():
-        home_env = Path.home() / f".{APP_NAME}" / ".env"
         error_message(f"Error: No {provider.name} credentials found")
-        console.print(f"  Set ANTHROPIC_API_KEY in {home_env} or {config.project_dir}/.env")
-        console.print("  Or run 'claude login' to authenticate via OAuth")
+        console.print(f"  {provider.credential_setup_hint}")
         return 1
 
     # Verify credentials work before proceeding

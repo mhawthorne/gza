@@ -170,6 +170,21 @@ gza work
 
 On macOS, Docker needs access to the directories gza uses. The default `/tmp/gza-worktrees` path is accessible. If you change `worktree_dir` in `gza.yaml`, ensure Docker can access it via Docker Desktop > Settings > Resources > File Sharing.
 
+## Claude Authentication
+
+Claude Code supports two authentication methods in Docker:
+
+1. **OAuth** (preferred for subscriptions): Run `claude login` on host. Credentials in `~/.claude/` are mounted into the container. Uses your Claude Max subscription.
+2. **API Key** (fallback): Set `ANTHROPIC_API_KEY` in `~/.gza/.env`. Uses pay-per-token API pricing.
+
+**Important:** `ANTHROPIC_API_KEY` takes precedence over OAuth. If both are configured and you want to use your subscription, comment out or remove `ANTHROPIC_API_KEY` from your `.env` files.
+
+For OAuth with Docker on macOS, `~/.claude` is mounted automatically. If you encounter permission issues:
+
+1. Open Docker Desktop > Settings > Resources > File Sharing
+2. Add your `~/.claude` directory (e.g., `/Users/yourname/.claude`)
+3. Restart Docker Desktop
+
 ## Codex Support
 
 OpenAI's Codex CLI (`@openai/codex`) is supported as an alternative provider.

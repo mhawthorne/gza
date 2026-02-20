@@ -182,6 +182,13 @@ export GZA_MODEL=claude-sonnet-4-5
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | API key for Claude (alternative to OAuth) |
 
+Claude supports two authentication methods:
+
+1. **OAuth** (subscription): Run `claude login` on host. Credentials stored in `~/.claude/` are mounted into Docker. Uses your Claude Max subscription.
+2. **API Key**: Set `ANTHROPIC_API_KEY` in `~/.gza/.env`. Uses pay-per-token API pricing.
+
+**Important:** `ANTHROPIC_API_KEY` takes precedence over OAuth. If you have both configured and want to use your subscription, comment out or remove `ANTHROPIC_API_KEY` from your `.env` files.
+
 **Codex:**
 
 | Variable | Description |

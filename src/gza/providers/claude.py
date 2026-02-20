@@ -92,6 +92,10 @@ class ClaudeProvider(Provider):
     def name(self) -> str:
         return "Claude"
 
+    @property
+    def credential_setup_hint(self) -> str:
+        return "Set ANTHROPIC_API_KEY in ~/.gza/.env or run 'claude login' to authenticate via OAuth"
+
     def check_credentials(self) -> bool:
         """Check for Claude credentials (OAuth or API key)."""
         claude_config = Path.home() / ".claude"
