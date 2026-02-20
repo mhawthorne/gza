@@ -1054,27 +1054,41 @@ class TestEnsureDockerImage:
 class TestCodexProvider:
     """Tests for Codex provider."""
 
-    def test_codex_docker_config(self):
-        """Codex should have correct Docker config."""
+    def test_codex_docker_config_with_oauth(self, tmp_path):
+        """Codex should prefer OAuth when ~/.codex/auth.json exists."""
+        from gza.providers.codex import _get_docker_config, _has_codex_oauth
+
+        # When OAuth exists, mount .codex and don't pass API key
+        with patch("gza.providers.codex._has_codex_oauth", return_value=True):
+            config = _get_docker_config("my-project-gza")
+            assert config.image_name == "my-project-gza"
+            assert config.npm_package == "@openai/codex"
+            assert config.cli_command == "codex"
+            assert config.config_dir == ".codex"
+            assert config.env_vars == []
+
+    def test_codex_docker_config_with_api_key(self):
+        """Codex should use CODEX_API_KEY when no OAuth credentials exist."""
         from gza.providers.codex import _get_docker_config
 
-        config = _get_docker_config("my-project-gza")
-
-        assert config.image_name == "my-project-gza"
-        assert config.npm_package == "@openai/codex"
-        assert config.cli_command == "codex"
-        assert config.config_dir == ".codex"
-        assert "OPENAI_API_KEY" in config.env_vars
+        # When no OAuth, use API key
+        with patch("gza.providers.codex._has_codex_oauth", return_value=False):
+            config = _get_docker_config("my-project-gza")
+            assert config.image_name == "my-project-gza"
+            assert config.npm_package == "@openai/codex"
+            assert config.cli_command == "codex"
+            assert config.config_dir is None
+            assert "CODEX_API_KEY" in config.env_vars
 
     def test_check_credentials_with_api_key(self):
-        """Codex should check for OPENAI_API_KEY."""
+        """Codex should check for CODEX_API_KEY."""
         provider = CodexProvider()
 
         with patch.object(Path, "home", return_value=Path("/nonexistent")):
             with patch.dict(os.environ, {}, clear=True):
                 assert provider.check_credentials() is False
 
-            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            with patch.dict(os.environ, {"CODEX_API_KEY": "sk-test"}):
                 assert provider.check_credentials() is True
 
     def test_check_credentials_with_config_dir(self, tmp_path):

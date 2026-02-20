@@ -369,7 +369,7 @@ def get_provider(config: Config) -> Provider:
     from .codex import CodexProvider
     from .gemini import GeminiProvider
 
-    providers = {
+    providers: dict[str, type[ClaudeProvider] | type[CodexProvider] | type[GeminiProvider]] = {
         "claude": ClaudeProvider,
         "codex": CodexProvider,
         "gemini": GeminiProvider,
