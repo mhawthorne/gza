@@ -157,7 +157,8 @@ Gza supports multiple AI providers for task execution:
 | Provider | Status | Description |
 |----------|--------|-------------|
 | `claude` | **Supported** | Claude Code CLI (default) |
-| `gemini` | *Experimental* | Gemini CLI - partially implemented, coming soon |
+| `codex` | **Supported** | OpenAI Codex CLI |
+| `gemini` | *Experimental* | Gemini CLI - partially implemented |
 
 Set your provider in `gza.yaml`:
 
@@ -180,6 +181,16 @@ export GZA_MODEL=claude-sonnet-4-5
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | API key for Claude (alternative to OAuth) |
+
+**Codex:**
+
+| Variable | Description |
+|----------|-------------|
+| `CODEX_API_KEY` | API key for OpenAI Codex (alternative to OAuth) |
+
+Codex authentication priority:
+1. OAuth (`~/.codex/auth.json`) - preferred, uses ChatGPT pricing
+2. `CODEX_API_KEY` - fallback, uses standard OpenAI API pricing
 
 **Gemini:**
 
@@ -732,6 +743,7 @@ Configuration is resolved in the following order (highest to lowest priority):
 | `.gza/logs/` | Task execution logs |
 | `.gza/workers/` | Worker metadata |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |
+| `etc/Dockerfile.codex` | Generated Docker image for Codex |
 | `etc/Dockerfile.gemini` | Generated Docker image for Gemini |
 
 > **Note:** The `.gza/` directory contains machine-specific state and should be added to `.gitignore`. Run `echo ".gza/" >> .gitignore` after initializing your project.
@@ -742,6 +754,7 @@ Configuration is resolved in the following order (highest to lowest priority):
 |------|---------|
 | `~/.gza/.env` | User-level environment variables |
 | `~/.claude/` | Claude OAuth credentials |
+| `~/.codex/` | Codex OAuth credentials |
 | `~/.gemini/` | Gemini OAuth credentials |
 
 ---

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from gza.config import Config
-from gza.providers import ClaudeProvider, GeminiProvider
+from gza.providers import ClaudeProvider, CodexProvider, GeminiProvider
 
 
 # Skip all tests in this module unless explicitly running integration tests
@@ -68,6 +68,22 @@ def has_gemini_credentials() -> bool:
     return gemini_config.is_dir()
 
 
+def has_codex_api_key() -> bool:
+    """Check if Codex API key is available."""
+    return bool(os.getenv("CODEX_API_KEY"))
+
+
+def has_codex_oauth() -> bool:
+    """Check if Codex OAuth credentials are available in ~/.codex."""
+    auth_file = Path.home() / ".codex" / "auth.json"
+    return auth_file.exists()
+
+
+def has_codex_credentials() -> bool:
+    """Check if any Codex credentials are available (OAuth or API key)."""
+    return has_codex_oauth() or has_codex_api_key()
+
+
 def has_docker() -> bool:
     """Check if Docker is available."""
     import subprocess
@@ -102,6 +118,20 @@ def has_gemini_cli() -> bool:
     try:
         result = subprocess.run(
             ["gemini", "--version"],
+            capture_output=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def has_codex_cli() -> bool:
+    """Check if Codex CLI is installed."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["codex", "--version"],
             capture_output=True,
             timeout=10,
         )
@@ -222,6 +252,114 @@ class TestGeminiSmoke:
         )
 
         provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        prompt = "Write the text 'hello world' to a file named result.txt. Do not write anything else."
+
+        result = provider.run(config, prompt, log_file, tmp_path)
+
+        # Check the file was created
+        result_file = tmp_path / "result.txt"
+        assert result_file.exists(), f"result.txt was not created. Exit code: {result.exit_code}"
+
+        # Check content (lenient - just needs to contain hello or world)
+        content = result_file.read_text().lower()
+        assert "hello" in content or "world" in content, f"Unexpected content: {content}"
+
+
+class TestCodexSmoke:
+    """Smoke tests for Codex provider."""
+
+    @pytest.mark.skipif(not has_codex_oauth(), reason="Codex OAuth (~/.codex/auth.json) not available")
+    @pytest.mark.skipif(not has_docker(), reason="Docker not available")
+    def test_codex_docker_oauth_writes_file(self, tmp_path):
+        """Codex in Docker with OAuth (~/.codex) should be able to write a file."""
+        import subprocess
+
+        # Codex requires running in a git repo (unlike Claude)
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="smoke-test-codex-oauth",
+            provider="codex",
+            use_docker=True,
+            timeout_minutes=2,
+            max_turns=5,
+        )
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        prompt = "Write the text 'hello world' to a file named result.txt. Do not write anything else."
+
+        result = provider.run(config, prompt, log_file, tmp_path)
+
+        # Check the file was created
+        result_file = tmp_path / "result.txt"
+        assert result_file.exists(), f"result.txt was not created. Exit code: {result.exit_code}"
+
+        # Check content (lenient - just needs to contain hello or world)
+        content = result_file.read_text().lower()
+        assert "hello" in content or "world" in content, f"Unexpected content: {content}"
+
+    @pytest.mark.skipif(not has_codex_api_key(), reason="CODEX_API_KEY not available")
+    @pytest.mark.skipif(not has_docker(), reason="Docker not available")
+    def test_codex_docker_api_key_writes_file(self, tmp_path, monkeypatch):
+        """Codex in Docker with CODEX_API_KEY (no OAuth) should be able to write a file."""
+        import subprocess
+
+        # Codex requires running in a git repo (unlike Claude)
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+
+        # Temporarily hide OAuth to force API key auth
+        # We do this by patching _has_codex_oauth to return False
+        from gza.providers import codex as codex_module
+        monkeypatch.setattr(codex_module, "_has_codex_oauth", lambda: False)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="smoke-test-codex-apikey",
+            provider="codex",
+            use_docker=True,
+            timeout_minutes=2,
+            max_turns=5,
+        )
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        prompt = "Write the text 'hello world' to a file named result.txt. Do not write anything else."
+
+        result = provider.run(config, prompt, log_file, tmp_path)
+
+        # Check the file was created
+        result_file = tmp_path / "result.txt"
+        assert result_file.exists(), f"result.txt was not created. Exit code: {result.exit_code}"
+
+        # Check content (lenient - just needs to contain hello or world)
+        content = result_file.read_text().lower()
+        assert "hello" in content or "world" in content, f"Unexpected content: {content}"
+
+    @pytest.mark.skipif(not has_codex_credentials(), reason="Codex credentials not available")
+    @pytest.mark.skipif(not has_codex_cli(), reason="Codex CLI not installed")
+    def test_codex_direct_writes_file(self, tmp_path):
+        """Codex direct (no Docker) should be able to write a file."""
+        import subprocess
+
+        # Codex requires running in a git repo (unlike Claude)
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="smoke-test-codex",
+            provider="codex",
+            use_docker=False,
+            timeout_minutes=2,
+            max_turns=5,
+        )
+
+        provider = CodexProvider()
         log_file = tmp_path / "test.log"
 
         prompt = "Write the text 'hello world' to a file named result.txt. Do not write anything else."

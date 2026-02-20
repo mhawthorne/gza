@@ -56,14 +56,37 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
     return round(cost, 4)
 
 
-def _get_docker_config(image_name: str) -> DockerConfig:
-    """Get Docker configuration for Codex."""
+def _has_codex_oauth() -> bool:
+    """Check if OAuth credentials exist in ~/.codex."""
+    auth_file = Path.home() / ".codex" / "auth.json"
+    return auth_file.exists()
+
+
+def _get_docker_config(image_name: str, use_oauth: bool = True) -> DockerConfig:
+    """Get Docker configuration for Codex.
+
+    Auth priority: OAuth (~/.codex) if available, otherwise CODEX_API_KEY.
+    OAuth is preferred as it uses ChatGPT pricing (typically cheaper).
+
+    Args:
+        image_name: Docker image name to use.
+        use_oauth: If True and OAuth credentials exist, mount ~/.codex.
+                   If False, force API key auth (don't mount ~/.codex).
+    """
+    # Prefer OAuth if credentials exist, otherwise use API key
+    if use_oauth and _has_codex_oauth():
+        config_dir = ".codex"
+        env_vars = []  # Don't need API key when using OAuth
+    else:
+        config_dir = None
+        env_vars = ["CODEX_API_KEY"]
+
     return DockerConfig(
         image_name=image_name,
         npm_package="@openai/codex",
         cli_command="codex",
-        config_dir=".codex",
-        env_vars=["OPENAI_API_KEY"],
+        config_dir=config_dir,
+        env_vars=env_vars,
     )
 
 
@@ -79,7 +102,7 @@ class CodexProvider(Provider):
         codex_config = Path.home() / ".codex"
         if codex_config.is_dir():
             return True
-        if os.getenv("OPENAI_API_KEY"):
+        if os.getenv("CODEX_API_KEY"):
             return True
         return False
 
@@ -101,7 +124,7 @@ class CodexProvider(Provider):
             error_patterns=["Invalid API key", "authentication", "unauthorized"],
             error_message=(
                 "Error: Invalid or missing Codex credentials\n"
-                "  Run 'codex login' or set OPENAI_API_KEY in .env"
+                "  Run 'codex login' or set CODEX_API_KEY in .env"
             ),
         )
 
@@ -117,7 +140,7 @@ class CodexProvider(Provider):
             output = result.stdout + result.stderr
             if "Invalid API key" in output or "authentication" in output.lower() or "unauthorized" in output.lower():
                 print("Error: Invalid or missing Codex credentials")
-                print("  Run 'codex login' or set OPENAI_API_KEY in .env")
+                print("  Run 'codex login' or set CODEX_API_KEY in .env")
                 return False
             if result.returncode == 0:
                 return True
