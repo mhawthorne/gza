@@ -24,6 +24,7 @@ from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, va
 from .git import Git, GitError
 from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
+from .prompts import PromptBuilder
 from .runner import run, post_review_to_pr
 from .tasks import YamlTaskStore, Task as YamlTask
 from .workers import WorkerMetadata, WorkerRegistry
@@ -1288,28 +1289,11 @@ def _generate_pr_content(
     import subprocess
 
     # Build a prompt for Claude
-    prompt = f"""Generate a GitHub pull request title and description for this completed task.
-
-Task prompt:
-{task.prompt}
-
-Commits on branch:
-{commit_log}
-
-Files changed:
-{diff_stat}
-
-Format your response EXACTLY like this (no markdown code fences):
-TITLE: <concise PR title, max 72 chars>
-
-BODY:
-## Summary
-<2-3 sentences describing what was done and why>
-
-## Changes
-<bullet points of key changes>
-
-Output ONLY in the format above, nothing else."""
+    prompt = PromptBuilder().pr_description_prompt(
+        task_prompt=task.prompt,
+        commit_log=commit_log,
+        diff_stat=diff_stat,
+    )
 
     try:
         result = subprocess.run(
@@ -3137,7 +3121,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         print(f"Warning: Review #{review_task.id} is {review_task.status}. The improve task will be blocked until it completes.")
 
     # Create improve task
-    prompt = f"Improve implementation based on review #{review_task.id}"
+    prompt = PromptBuilder().improve_task_prompt(review_task.id)
     improve_task = store.add(
         prompt=prompt,
         task_type="improve",
@@ -3192,10 +3176,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks.")
         return 1
 
-    # Create review task with improved prompt
-    review_prompt = f"Review the implementation from task #{impl_task.id}"
-    if impl_task.prompt:
-        review_prompt += f": {impl_task.prompt[:100]}"
+    # Create review task
+    review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
 
     review_task = store.add(
         prompt=review_prompt,

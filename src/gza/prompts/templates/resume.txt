@@ -1,0 +1,10 @@
+IMPORTANT: Before continuing, verify your todo list against the actual state of the files.
+
+The task was interrupted (max turns, timeout, etc.) and your todo list may show steps as in_progress that were never actually completed. Please:
+
+1. Review your todo list from the previous session
+2. For each item marked as in_progress or completed, verify by checking the actual code/files
+3. Update the todo list to reflect what is actually complete vs incomplete
+4. Mark any steps that weren't actually finished as pending before continuing
+
+Once you've verified and updated the todo list, continue from where you left off.

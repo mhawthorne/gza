@@ -1,0 +1,11 @@
+This is a review task. Write your review to:
+  {report_path}
+
+Your review should include:
+- Assessment of whether the implementation matches the plan
+- Code quality observations
+- Potential issues or improvements
+- Final verdict: APPROVED, CHANGES_REQUESTED, or NEEDS_DISCUSSION
+
+End your review with a clear verdict line like:
+Verdict: APPROVED

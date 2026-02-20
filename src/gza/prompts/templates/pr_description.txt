@@ -1,0 +1,22 @@
+Generate a GitHub pull request title and description for this completed task.
+
+Task prompt:
+{task_prompt}
+
+Commits on branch:
+{commit_log}
+
+Files changed:
+{diff_stat}
+
+Format your response EXACTLY like this (no markdown code fences):
+TITLE: <concise PR title, max 72 chars>
+
+BODY:
+## Summary
+<2-3 sentences describing what was done and why>
+
+## Changes
+<bullet points of key changes>
+
+Output ONLY in the format above, nothing else.

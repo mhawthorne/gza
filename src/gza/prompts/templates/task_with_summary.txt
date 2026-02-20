@@ -1,0 +1,10 @@
+
+IMPORTANT: Run unit tests before committing (`uv run pytest tests/ -v`). Only commit once all tests pass.
+
+When you complete this task, write a summary of what you accomplished to:
+  {summary_path}
+
+The summary should describe:
+- What was accomplished
+- Files changed
+- Any notable decisions or trade-offs made
