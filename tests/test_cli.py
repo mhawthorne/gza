@@ -695,7 +695,7 @@ class TestResumeCommand:
         task.status = "failed"
         task.session_id = "session-abc-123"
         task.task_type = "implement"
-        task.num_turns = 42
+        task.num_turns_reported = 42
         task.cost_usd = 1.50
         task.duration_seconds = 300.0
         task.log_file = ".gza/logs/20260101-implement-feature-x.log"
@@ -712,7 +712,7 @@ class TestResumeCommand:
         original = store.get(1)
         assert original is not None
         assert original.status == "failed"
-        assert original.num_turns == 42
+        assert original.num_turns_reported == 42
         assert original.cost_usd == 1.50
         assert original.duration_seconds == 300.0
         assert original.log_file == ".gza/logs/20260101-implement-feature-x.log"
@@ -725,7 +725,7 @@ class TestResumeCommand:
         assert new_task.based_on == 1
         assert new_task.session_id == "session-abc-123"
         # New task starts with no stats
-        assert new_task.num_turns is None
+        assert new_task.num_turns_reported is None
         assert new_task.cost_usd is None
         assert new_task.log_file is None
 

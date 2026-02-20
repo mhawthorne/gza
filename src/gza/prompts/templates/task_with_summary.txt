@@ -1,5 +1,5 @@
 
-IMPORTANT: Run unit tests before committing (`uv run pytest tests/ -v`). Only commit once all tests pass.
+Run unit tests before completing your task (uv run pytest tests/ -v). Ensure all tests pass before finishing.
 
 When you complete this task, write a summary of what you accomplished to:
   {summary_path}

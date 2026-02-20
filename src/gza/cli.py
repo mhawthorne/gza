@@ -3121,6 +3121,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         print(f"Warning: Review #{review_task.id} is {review_task.status}. The improve task will be blocked until it completes.")
 
     # Create improve task
+    assert review_task.id is not None
     prompt = PromptBuilder().improve_task_prompt(review_task.id)
     improve_task = store.add(
         prompt=prompt,
@@ -3177,6 +3178,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         return 1
 
     # Create review task
+    assert impl_task.id is not None
     review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
 
     review_task = store.add(

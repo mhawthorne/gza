@@ -71,3 +71,8 @@ ignore_missing_imports = true
 strict_optional = true
 warn_unused_ignores = true
 files = ["src/gza"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
