@@ -13,6 +13,8 @@ from gza.runner import (
     build_prompt,
     SUMMARY_DIR,
     WIP_DIR,
+    BACKUP_DIR,
+    backup_database,
     _create_and_run_review_task,
     _run_non_code_task,
     _save_wip_changes,
@@ -966,3 +968,89 @@ index 0000000..9daeafb
         # Verify commit is unchanged
         log = git._run("log", "-1", "--pretty=%s").stdout.strip()
         assert log == "Normal commit"
+
+
+class TestBackupDatabase:
+    """Tests for backup_database function."""
+
+    def test_creates_backup_when_none_exists(self, tmp_path: Path):
+        """backup_database creates a backup file for the current hour."""
+        import sqlite3
+
+        # Create a source database
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)")
+        conn.close()
+
+        backup_database(db_path, tmp_path)
+
+        backup_dir = tmp_path / BACKUP_DIR
+        assert backup_dir.exists()
+
+        from datetime import datetime
+        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        backup_file = backup_dir / f"gza-{hour_stamp}.db"
+        assert backup_file.exists()
+        assert backup_file.stat().st_size > 0
+
+    def test_skips_backup_when_current_hour_exists(self, tmp_path: Path):
+        """backup_database does not create a second backup in the same hour."""
+        import sqlite3
+        from datetime import datetime
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)")
+        conn.close()
+
+        backup_dir = tmp_path / BACKUP_DIR
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        existing_backup = backup_dir / f"gza-{hour_stamp}.db"
+        existing_backup.write_bytes(b"placeholder")
+        original_mtime = existing_backup.stat().st_mtime
+
+        backup_database(db_path, tmp_path)
+
+        # File should not have been replaced
+        assert existing_backup.stat().st_mtime == original_mtime
+        assert existing_backup.read_bytes() == b"placeholder"
+
+    def test_skips_backup_when_db_does_not_exist(self, tmp_path: Path):
+        """backup_database does nothing when the source database is missing."""
+        db_path = tmp_path / ".gza" / "gza.db"
+
+        # Should not raise and should not create any backup dir
+        backup_database(db_path, tmp_path)
+
+        backup_dir = tmp_path / BACKUP_DIR
+        assert not backup_dir.exists()
+
+    def test_backup_is_valid_sqlite_database(self, tmp_path: Path):
+        """The created backup is a valid SQLite database with the same content."""
+        import sqlite3
+        from datetime import datetime
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items VALUES (1, 'hello')")
+        conn.commit()
+        conn.close()
+
+        backup_database(db_path, tmp_path)
+
+        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        backup_path = tmp_path / BACKUP_DIR / f"gza-{hour_stamp}.db"
+        assert backup_path.exists()
+
+        backup_conn = sqlite3.connect(str(backup_path))
+        rows = backup_conn.execute("SELECT id, name FROM items").fetchall()
+        backup_conn.close()
+
+        assert rows == [(1, "hello")]

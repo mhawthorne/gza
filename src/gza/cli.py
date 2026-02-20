@@ -1816,6 +1816,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         # Track archived files and errors
         archived_logs = []
         archived_workers = []
+        deleted_backups = []
         errors = []
 
         # Archive logs
@@ -1856,6 +1857,21 @@ def cmd_clean(args: argparse.Namespace) -> int:
                             except OSError as e:
                                 errors.append((worker_file, e))
 
+        # Delete old backups
+        backups_dir = config.project_dir / ".gza" / "backups"
+        if backups_dir.exists():
+            for backup_file in backups_dir.iterdir():
+                if backup_file.is_file():
+                    if backup_file.stat().st_mtime < cutoff_timestamp:
+                        if args.dry_run:
+                            deleted_backups.append(backup_file)
+                        else:
+                            try:
+                                backup_file.unlink()
+                                deleted_backups.append(backup_file)
+                            except OSError as e:
+                                errors.append((backup_file, e))
+
         # Report results
         if args.dry_run:
             print(f"Dry run: would archive files older than {days} days")
@@ -1874,10 +1890,19 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     print(f"  - {worker_file.name}")
             else:
                 print("Workers: no files to archive")
+
+            print()
+            if deleted_backups:
+                print(f"Backups ({len(deleted_backups)} files):")
+                for backup_file in deleted_backups:
+                    print(f"  - {backup_file.name}")
+            else:
+                print("Backups: no files to delete")
         else:
             print(f"Archived files older than {days} days:")
             print(f"  - Logs: {len(archived_logs)} files")
             print(f"  - Workers: {len(archived_workers)} files")
+            print(f"  - Backups deleted: {len(deleted_backups)} files")
 
             # Report any errors
             if errors:
