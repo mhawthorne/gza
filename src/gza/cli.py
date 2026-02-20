@@ -575,8 +575,8 @@ def format_stats(task: DbTask) -> str:
             mins = int(task.duration_seconds // 60)
             secs = int(task.duration_seconds % 60)
             parts.append(f"{mins}m{secs}s")
-    if task.num_turns is not None:
-        parts.append(f"{task.num_turns} turns")
+    if task.num_turns_reported is not None:
+        parts.append(f"{task.num_turns_reported} turns")
     if task.cost_usd is not None:
         parts.append(f"${task.cost_usd:.4f}")
     return " | ".join(parts) if parts else ""
@@ -1527,7 +1527,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
         id_str = f"#{task.id}" if task.id is not None else "-"
         type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
-        turns_str = str(task.num_turns) if task.num_turns is not None else "-"
+        turns_str = str(task.num_turns_reported) if task.num_turns_reported is not None else "-"
         time_str = format_duration(task.duration_seconds, verbose=True) if task.duration_seconds else "-"
 
         # Calculate prompt length
@@ -3420,7 +3420,7 @@ def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
         task.report_file = yaml_task.report_file
         task.has_commits = yaml_task.has_commits
         task.duration_seconds = yaml_task.duration_seconds
-        task.num_turns = yaml_task.num_turns
+        task.num_turns_reported = yaml_task.num_turns_reported
         task.cost_usd = yaml_task.cost_usd
         if yaml_task.completed_at:
             if isinstance(yaml_task.completed_at, datetime):

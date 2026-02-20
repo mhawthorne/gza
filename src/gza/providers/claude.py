@@ -402,10 +402,11 @@ class ClaudeProvider(Provider):
         )
 
         # Extract stats and error info from result event
-        result_data = getattr(result, "_accumulated_data", {}).get("result", {})
+        accumulated_data = getattr(result, "_accumulated_data", {}) or {}
+        result_data = accumulated_data.get("result", {})
         if result_data:
             if "num_turns" in result_data:
-                result.num_turns = result_data["num_turns"]
+                result.num_turns_reported = result_data["num_turns"]
             if "total_cost_usd" in result_data:
                 result.cost_usd = result_data["total_cost_usd"]
             if "session_id" in result_data:
@@ -414,5 +415,10 @@ class ClaudeProvider(Provider):
             subtype = result_data.get("subtype", "")
             if subtype == "error_max_turns":
                 result.error_type = "max_turns"
+
+        # Store our internally computed turn count (unique assistant message IDs)
+        seen_msg_ids = accumulated_data.get("seen_msg_ids", set())
+        if seen_msg_ids:
+            result.num_turns_computed = len(seen_msg_ids)
 
         return result

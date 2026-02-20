@@ -623,7 +623,7 @@ class TestClaudeErrorTypeExtraction:
             )
 
         assert result.error_type == "max_turns"
-        assert result.num_turns == 60
+        assert result.num_turns_reported == 60
         assert result.cost_usd == 1.35
         assert result.exit_code == 0  # Preserves actual exit code
 
@@ -660,8 +660,92 @@ class TestClaudeErrorTypeExtraction:
             )
 
         assert result.error_type is None
-        assert result.num_turns == 5
+        assert result.num_turns_reported == 5
         assert result.exit_code == 0
+
+    def test_stores_computed_turn_count(self, tmp_path):
+        """Should store num_turns_computed from unique assistant message IDs."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Simulate Claude output with 2 distinct assistant message IDs
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 100, "output_tokens": 50}},
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_002", "content": [], "usage": {"input_tokens": 200, "output_tokens": 80}},
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 3,  # Provider reports 3 but we computed 2 unique messages
+                "total_cost_usd": 0.10,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.num_turns_reported == 3
+        assert result.num_turns_computed == 2
+
+    def test_computed_turn_count_deduplicates_same_message_id(self, tmp_path):
+        """Should deduplicate repeated assistant message IDs in computed count."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Same message ID appears twice - should only count once
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 100, "output_tokens": 50}},
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 10, "output_tokens": 5}},
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.num_turns_reported == 1
+        assert result.num_turns_computed == 1  # Deduplicated
 
 
 class TestClaudeToolLogging:
@@ -1217,7 +1301,7 @@ class TestCodexOutputParsing:
                 timeout_minutes=30,
             )
 
-        assert result.num_turns == 1
+        assert result.num_turns_reported == 1
         assert result.input_tokens == 1000
         assert result.output_tokens == 500
         assert result.session_id == "thread_123"
@@ -1318,5 +1402,5 @@ class TestCodexOutputParsing:
                 max_turns=2,  # Set max_turns to 2
             )
 
-        assert result.num_turns == 3
+        assert result.num_turns_reported == 3
         assert result.error_type == "max_turns"

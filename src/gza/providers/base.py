@@ -293,7 +293,8 @@ class RunResult:
     """Result from running a code generation provider."""
     exit_code: int
     duration_seconds: float = 0.0
-    num_turns: int | None = None
+    num_turns_reported: int | None = None  # Turn count reported by the provider (e.g., Claude's result event)
+    num_turns_computed: int | None = None  # Turn count computed internally (e.g., by counting unique message IDs)
     cost_usd: float | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None

@@ -297,7 +297,7 @@ class GeminiProvider(Provider):
             # Get tool calls as proxy for turns
             tool_calls = stats.get("tool_calls")
             if tool_calls is not None:
-                result.num_turns = tool_calls
+                result.num_turns_reported = tool_calls
 
             # Calculate cost from tokens
             if input_tokens is not None and output_tokens is not None:
