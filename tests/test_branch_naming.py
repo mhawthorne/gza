@@ -258,6 +258,35 @@ branch_strategy: simple
         assert config.branch_strategy.pattern == "{slug}"
         assert config.branch_strategy.default_type == "feature"
 
+    def test_preset_date_slug(self, tmp_path):
+        """Test loading date_slug preset."""
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("""
+project_name: test
+branch_strategy: date_slug
+""")
+        config = Config.load(tmp_path)
+        assert config.branch_strategy.pattern == "{date}-{slug}"
+        assert config.branch_strategy.default_type == "feature"
+
+    def test_preset_date_slug_generates_correct_branch(self, tmp_path):
+        """Test that date_slug preset generates correct branch names."""
+        from gza.branch_naming import generate_branch_name
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("""
+project_name: test
+branch_strategy: date_slug
+""")
+        config = Config.load(tmp_path)
+        name = generate_branch_name(
+            pattern=config.branch_strategy.pattern,
+            project_name="test",
+            task_id="20260220-add-feature",
+            prompt="Add feature",
+            default_type=config.branch_strategy.default_type,
+        )
+        assert name == "20260220-add-feature"
+
     def test_custom_pattern(self, tmp_path):
         """Test loading custom pattern."""
         config_file = tmp_path / "gza.yaml"
@@ -291,6 +320,17 @@ branch_strategy: invalid_preset
 """)
         with pytest.raises(ConfigError, match="Unknown branch_strategy preset"):
             Config.load(tmp_path)
+
+    def test_validate_accepts_date_slug_preset(self, tmp_path):
+        """Test that validate() accepts date_slug as a valid preset."""
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("""
+project_name: test
+branch_strategy: date_slug
+""")
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert is_valid
+        assert errors == []
 
     def test_custom_without_pattern(self, tmp_path):
         """Test that custom dict without pattern raises error."""
