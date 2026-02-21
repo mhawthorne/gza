@@ -297,10 +297,15 @@ class Config:
                         pattern="{slug}",
                         default_type="feature"
                     )
+                elif bs_data == "date_slug":
+                    branch_strategy = BranchStrategy(
+                        pattern="{date}-{slug}",
+                        default_type="feature"
+                    )
                 else:
                     raise ConfigError(
                         f"Unknown branch_strategy preset: '{bs_data}'\n"
-                        f"Valid presets are: monorepo, conventional, simple\n"
+                        f"Valid presets are: monorepo, conventional, simple, date_slug\n"
                         f"Or use a dict with 'pattern' key for custom patterns."
                     )
             # Handle custom pattern dict
@@ -515,7 +520,7 @@ class Config:
             bs_data = data["branch_strategy"]
             if isinstance(bs_data, str):
                 # Validate preset names
-                valid_presets = {"monorepo", "conventional", "simple"}
+                valid_presets = {"monorepo", "conventional", "simple", "date_slug"}
                 if bs_data not in valid_presets:
                     errors.append(
                         f"'branch_strategy' preset '{bs_data}' is invalid. "
