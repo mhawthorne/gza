@@ -5615,3 +5615,177 @@ class TestForceCompleteCommand:
         assert updated_task is not None
         assert updated_task.branch == "gza/1-task-with-branch"
         assert updated_task.status == "completed"
+
+
+class TestMarkCompletedCommand:
+    """Tests for 'gza mark-completed' command."""
+
+    def _setup_git_repo(self, tmp_path: Path):
+        """Initialize a minimal git repo in tmp_path."""
+        from gza.git import Git
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+        return git
+
+    def test_mark_completed_nonexistent_task(self, tmp_path: Path):
+        """mark-completed errors on a nonexistent task."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("mark-completed", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout
+
+    def test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
+        """mark-completed warns when task status is not failed."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a branch for the task
+        git._run("checkout", "-b", "gza/1-test-task")
+        git._run("checkout", "main")
+
+        task = store.add("Pending task")
+        task.status = "pending"
+        task.branch = "gza/1-test-task"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning" in result.stdout
+        assert "not in failed status" in result.stdout
+
+    def test_mark_completed_errors_if_no_branch_on_task(self, tmp_path: Path):
+        """mark-completed errors when task has no branch set."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task without branch", "status": "failed"},
+        ])
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no branch" in result.stdout
+
+    def test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
+        """mark-completed errors when git branch does not exist."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        self._setup_git_repo(tmp_path)
+
+        task = store.add("Failed task")
+        task.status = "failed"
+        task.branch = "gza/1-nonexistent-branch"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "does not exist" in result.stdout
+
+    def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
+        """mark-completed sets status='unmerged' when branch has commits."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create branch with a commit
+        git._run("checkout", "-b", "gza/1-task-with-commits")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        task = store.add("Failed task with commits")
+        task.status = "failed"
+        task.branch = "gza/1-task-with-commits"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "unmerged" in result.stdout
+
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "unmerged"
+        assert updated.has_commits is True
+
+    def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
+        """mark-completed sets status='completed' when branch has no commits."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create branch with NO commits beyond main
+        git._run("checkout", "-b", "gza/1-empty-branch")
+        git._run("checkout", "main")
+
+        task = store.add("Failed task no commits")
+        task.status = "failed"
+        task.branch = "gza/1-empty-branch"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No commits found" in result.stdout
+        assert "completed" in result.stdout
+
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "completed"
+        assert updated.has_commits is False
+
+    def test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
+        """mark-completed does not warn when task is in failed status."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        git._run("checkout", "-b", "gza/1-failed-branch")
+        git._run("checkout", "main")
+
+        task = store.add("Failed task")
+        task.status = "failed"
+        task.branch = "gza/1-failed-branch"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning" not in result.stdout
