@@ -1012,16 +1012,6 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_tests() -> bool:
-    """Run the project's test suite. Returns True if tests pass."""
-    result = subprocess.run(
-        ["uv", "run", "pytest"],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
 def invoke_claude_resolve(branch: str, target: str, config: Config) -> bool:
     """Invoke Claude to resolve rebase conflicts using ClaudeProvider.
 
@@ -1148,18 +1138,10 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         print(f"Pushing {task.branch}...")
         git.push_force_with_lease(task.branch)
 
-        # Run tests
-        print("Running tests...")
-        tests_passed = run_tests()
-
         # Always checkout main at the end
         git.checkout(default_branch)
 
-        if not tests_passed:
-            print(f"Tests failed. Branch '{task.branch}' is rebased but needs fixes.")
-            return 1
-
-        print(f"✓ Successfully rebased and tested {task.branch}")
+        print(f"✓ Successfully rebased {task.branch}")
         return 0
 
 

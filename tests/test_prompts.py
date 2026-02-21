@@ -26,7 +26,7 @@ class TestPromptBuilderBuild:
         assert "Complete this task: Do something useful" in result
 
     def test_build_task_type_with_summary(self, tmp_path: Path):
-        """Test that task type includes unit test and summary instructions."""
+        """Test that task type includes summary instructions."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement feature X", task_type="task")
@@ -37,7 +37,6 @@ class TestPromptBuilderBuild:
         summary_path = Path("/workspace/.gza/summaries/test.md")
         result = PromptBuilder().build(task, config, store, summary_path=summary_path)
 
-        assert "uv run pytest tests/ -v" in result
         assert str(summary_path) in result
         assert "What was accomplished" in result
         assert "Files changed" in result
@@ -53,7 +52,6 @@ class TestPromptBuilderBuild:
 
         result = PromptBuilder().build(task, config, store, summary_path=None)
 
-        assert "uv run pytest tests/ -v" in result
         assert "report what you accomplished" in result
         assert "write a summary" not in result.lower()
 
@@ -73,7 +71,7 @@ class TestPromptBuilderBuild:
         assert "write a summary" in result.lower()
 
     def test_build_improve_type_with_summary(self, tmp_path: Path):
-        """Test that improve type includes unit test and summary instructions."""
+        """Test that improve type includes summary instructions."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Improve the code", task_type="improve")
@@ -84,7 +82,6 @@ class TestPromptBuilderBuild:
         summary_path = Path("/workspace/.gza/summaries/improve-test.md")
         result = PromptBuilder().build(task, config, store, summary_path=summary_path)
 
-        assert "uv run pytest tests/ -v" in result
         assert str(summary_path) in result
 
     def test_build_explore_type_with_report_path(self, tmp_path: Path):
