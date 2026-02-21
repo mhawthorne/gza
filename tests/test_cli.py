@@ -4899,6 +4899,7 @@ class TestUnmergedReviewStatus:
         task.completed_at = datetime.now(timezone.utc)
         task.branch = "feature/test"
         task.has_commits = True
+        task.merge_status = "unmerged"
         task.task_id = "20260212-add-feature"
         store.update(task)
 
@@ -4954,6 +4955,7 @@ Code looks good!
         task.completed_at = datetime.now(timezone.utc)
         task.branch = "feature/test"
         task.has_commits = True
+        task.merge_status = "unmerged"
         task.task_id = "20260212-add-feature"
         store.update(task)
 
@@ -5009,6 +5011,7 @@ Verdict: CHANGES_REQUESTED"""
         task.completed_at = datetime.now(timezone.utc)
         task.branch = "feature/test"
         task.has_commits = True
+        task.merge_status = "unmerged"
         task.task_id = "20260212-add-feature"
         store.update(task)
 
@@ -5109,6 +5112,7 @@ This requires team discussion.
         task.completed_at = datetime.now(timezone.utc)
         task.branch = "feature/test"
         task.has_commits = True
+        task.merge_status = "unmerged"
         task.task_id = "20260212-add-feature"
         store.update(task)
 
@@ -5162,8 +5166,8 @@ class TestUnmergedAllFlag:
         git._run("commit", "-m", "Initial commit")
         return git
 
-    def test_all_flag_includes_failed_tasks_with_commits(self, tmp_path: Path):
-        """--all includes failed tasks that have unmerged commits on their branch."""
+    def test_all_flag_includes_failed_tasks_with_merge_status_unmerged(self, tmp_path: Path):
+        """Failed tasks with merge_status='unmerged' appear in gza unmerged (--all is a no-op)."""
         from gza.db import SqliteTaskStore
         from gza.git import Git
 
@@ -5173,11 +5177,12 @@ class TestUnmergedAllFlag:
         store = SqliteTaskStore(db_path)
         git = self._setup_git_repo(tmp_path)
 
-        # Create a failed task with a branch
+        # Create a failed task with merge_status='unmerged'
         task = store.add("Failed but useful task", task_type="implement")
         task.status = "failed"
         task.branch = "feature/failed-branch"
         task.has_commits = False  # has_commits not set (typical for failed tasks)
+        task.merge_status = "unmerged"
         task.task_id = "20260220-failed-task"
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
@@ -5189,12 +5194,12 @@ class TestUnmergedAllFlag:
         git._run("commit", "-m", "Add useful work")
         git._run("checkout", "main")
 
-        # Without --all: failed task should NOT appear
+        # Task appears because merge_status='unmerged' (--all is a no-op now)
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Failed but useful task" not in result.stdout
+        assert "Failed but useful task" in result.stdout
 
-        # With --all: failed task SHOULD appear
+        # --all is a no-op: same result
         result = run_gza("unmerged", "--all", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Failed but useful task" in result.stdout
@@ -5789,3 +5794,279 @@ class TestMarkCompletedCommand:
 
         assert result.returncode == 0
         assert "Warning" not in result.stdout
+
+
+class TestMergeStatusTracking:
+    """Tests for merge_status column tracking."""
+
+    def _setup_git_repo(self, tmp_path: Path):
+        """Set up a minimal git repo for testing."""
+        from gza.git import Git
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+        return git
+
+    def test_merge_sets_merge_status_merged(self, tmp_path: Path):
+        """Successful merge sets merge_status='merged' on the task."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a task with merge_status='unmerged'
+        task = store.add("Add feature")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        # Create the feature branch with a commit
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Run merge
+        result = run_gza("merge", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        # Verify merge_status is 'merged'
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "merged"
+
+    def test_squash_merge_sets_merge_status_merged(self, tmp_path: Path):
+        """Squash merge also sets merge_status='merged'."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Add feature squash")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/squash"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/squash")
+        (tmp_path / "squash.txt").write_text("squash content")
+        git._run("add", "squash.txt")
+        git._run("commit", "-m", "Squash feature")
+        git._run("checkout", "main")
+
+        result = run_gza("merge", str(task.id), "--squash", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "merged"
+
+    def test_mark_only_sets_merge_status_merged(self, tmp_path: Path):
+        """--mark-only flag sets merge_status='merged' in the database."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Mark only test")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/mark-only-status"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/mark-only-status")
+        (tmp_path / "mark.txt").write_text("mark content")
+        git._run("add", "mark.txt")
+        git._run("commit", "-m", "Mark feature")
+        git._run("checkout", "main")
+
+        result = run_gza("merge", str(task.id), "--mark-only", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "merged"
+
+    def test_cmd_unmerged_uses_db_query(self, tmp_path: Path):
+        """gza unmerged uses merge_status='unmerged' DB query instead of git detection."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Task with merge_status='unmerged' (branch exists)
+        task1 = store.add("Unmerged task")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        task1.branch = "feature/unmerged-task"
+        task1.has_commits = True
+        task1.merge_status = "unmerged"
+        store.update(task1)
+
+        git._run("checkout", "-b", "feature/unmerged-task")
+        (tmp_path / "unmerged.txt").write_text("content")
+        git._run("add", "unmerged.txt")
+        git._run("commit", "-m", "Unmerged feature")
+        git._run("checkout", "main")
+
+        # Task with merge_status='merged'
+        task2 = store.add("Merged task")
+        task2.status = "completed"
+        task2.completed_at = datetime.now(timezone.utc)
+        task2.branch = "feature/merged-task"
+        task2.has_commits = True
+        task2.merge_status = "merged"
+        store.update(task2)
+
+        # Task with merge_status=None
+        task3 = store.add("No merge status")
+        task3.status = "completed"
+        task3.completed_at = datetime.now(timezone.utc)
+        task3.has_commits = False
+        store.update(task3)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Unmerged task" in result.stdout
+        assert "Merged task" not in result.stdout
+        assert "No merge status" not in result.stdout
+
+    def test_cmd_history_shows_merged_label(self, tmp_path: Path):
+        """gza history shows [merged] label for tasks with merge_status='merged'."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Merged feature task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.has_commits = True
+        task.merge_status = "merged"
+        store.update(task)
+
+        result = run_gza("history", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "[merged]" in result.stdout
+        assert "Merged feature task" in result.stdout
+
+    def test_cmd_history_shows_lightning_for_unmerged(self, tmp_path: Path):
+        """gza history shows lightning icon for tasks with merge_status='unmerged'."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Unmerged feature")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        result = run_gza("history", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "\u26a1" in result.stdout
+        assert "Unmerged feature" in result.stdout
+        assert "[merged]" not in result.stdout
+
+    def test_cmd_history_no_merge_label_without_merge_status(self, tmp_path: Path):
+        """gza history shows no merge label for tasks without merge_status."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Regular completed task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("history", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "[merged]" not in result.stdout
+        assert "\u2713" in result.stdout
+
+    def test_cmd_show_displays_merge_status(self, tmp_path: Path):
+        """gza show displays Merge Status when merge_status is set."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test show merge status")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.merge_status = "merged"
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Merge Status: merged" in result.stdout
+
+    def test_cmd_show_no_merge_status_line_when_null(self, tmp_path: Path):
+        """gza show does not display Merge Status when merge_status is None."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test show no merge status")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Merge Status" not in result.stdout

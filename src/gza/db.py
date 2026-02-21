@@ -43,6 +43,7 @@ class Task:
     pr_number: int | None = None  # GitHub PR number
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
+    merge_status: str | None = None  # None, 'unmerged', or 'merged'
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -65,7 +66,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -111,7 +112,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- num_turns_reported and num_turns_computed added inline above (v8)
     -- Raw token counts for cost recalculation (v9)
     input_tokens INTEGER,
-    output_tokens INTEGER
+    output_tokens INTEGER,
+    -- Merge status tracking (v10)
+    merge_status TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -119,6 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
 CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
+CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
 """
 
 # Migration from v1 to v2
@@ -169,6 +173,12 @@ UPDATE tasks SET num_turns_reported = num_turns WHERE num_turns IS NOT NULL;
 MIGRATION_V8_TO_V9 = """
 ALTER TABLE tasks ADD COLUMN input_tokens INTEGER;
 ALTER TABLE tasks ADD COLUMN output_tokens INTEGER;
+"""
+
+# Migration from v9 to v10
+MIGRATION_V9_TO_V10 = """
+ALTER TABLE tasks ADD COLUMN merge_status TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
 """
 
 
@@ -300,6 +310,18 @@ class SqliteTaskStore:
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (9,))
 
+                if current_version < 10:
+                    # Run migration v9 -> v10
+                    for stmt in MIGRATION_V9_TO_V10.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column/index might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (10,))
+
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
@@ -342,6 +364,7 @@ class SqliteTaskStore:
             pr_number=row["pr_number"] if "pr_number" in row.keys() else None,
             model=row["model"] if "model" in row.keys() else None,
             provider=row["provider"] if "provider" in row.keys() else None,
+            merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
         )
 
     # === Task CRUD ===
@@ -422,7 +445,8 @@ class SqliteTaskStore:
                     session_id = ?,
                     pr_number = ?,
                     model = ?,
-                    provider = ?
+                    provider = ?,
+                    merge_status = ?
                 WHERE id = ?
                 """,
                 (
@@ -453,6 +477,7 @@ class SqliteTaskStore:
                     task.pr_number,
                     task.model,
                     task.provider,
+                    task.merge_status,
                     task.id,
                 ),
             )
@@ -600,16 +625,24 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_unmerged(self) -> list[Task]:
-        """Get tasks with unmerged status."""
+        """Get tasks with unmerged code (merge_status = 'unmerged')."""
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE status = 'unmerged'
+                WHERE merge_status = 'unmerged'
                 ORDER BY completed_at DESC
                 """
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def set_merge_status(self, task_id: int, merge_status: str | None) -> None:
+        """Set the merge_status for a task."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET merge_status = ? WHERE id = ?",
+                (merge_status, task_id),
+            )
 
     def get_all(self) -> list[Task]:
         """Get all tasks."""
@@ -769,6 +802,8 @@ class SqliteTaskStore:
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         task.has_commits = has_commits
+        if has_commits:
+            task.merge_status = "unmerged"
         if branch:
             task.branch = branch
         if log_file:
@@ -835,6 +870,60 @@ class SqliteTaskStore:
             task.input_tokens = stats.input_tokens
             task.output_tokens = stats.output_tokens
         self.update(task)
+
+
+# === Merge status migration ===
+
+def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
+    """Infer merge_status for existing tasks based on current git state.
+
+    This is used to backfill merge_status for tasks created before the
+    merge_status column was added.
+
+    Args:
+        store: The task store
+        git: A Git instance for the project
+    """
+    from .git import Git as GitClass
+    assert isinstance(git, GitClass)
+
+    with store._connect() as conn:
+        cur = conn.execute(
+            "SELECT id, has_commits, branch FROM tasks WHERE merge_status IS NULL"
+        )
+        rows = cur.fetchall()
+
+    default_branch = git.default_branch()
+
+    for row in rows:
+        task_id = row["id"]
+        has_commits = row["has_commits"]
+        branch = row["branch"]
+
+        if not has_commits:
+            merge_status = None
+        elif not branch:
+            merge_status = None
+        elif not git.branch_exists(branch):
+            # Branch deleted - assume merged
+            merge_status = "merged"
+        else:
+            try:
+                # Check if branch is an ancestor of main (i.e., fully merged)
+                result = git._run(
+                    "merge-base", "--is-ancestor", branch, default_branch, check=False
+                )
+                if result.returncode == 0:
+                    merge_status = "merged"
+                elif git.is_merged(branch, default_branch):
+                    # No diff (squash merged or equivalent content)
+                    merge_status = "merged"
+                else:
+                    merge_status = "unmerged"
+            except Exception:
+                merge_status = "unmerged"
+
+        store.set_merge_status(task_id, merge_status)
 
 
 # === Editor support ===
