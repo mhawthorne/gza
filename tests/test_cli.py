@@ -2624,6 +2624,94 @@ class TestMergeCommand:
         # Should either succeed or fail gracefully (not due to flag validation)
         assert "--remote requires --rebase" not in result.stdout
 
+    def test_merge_resolve_requires_rebase(self, tmp_path: Path):
+        """Merge command rejects --resolve without --rebase."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test resolve without rebase")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-resolve"
+        store.update(task)
+
+        # Create the branch
+        git._run("checkout", "-b", "feature/test-resolve")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Test that --resolve without --rebase is rejected
+        result = run_gza("merge", str(task.id), "--resolve", "--project", str(tmp_path))
+
+        # Verify the command fails with appropriate error message
+        assert result.returncode == 1
+        assert "--resolve requires --rebase" in result.stdout
+
+    def test_merge_resolve_with_rebase_accepted(self, tmp_path: Path):
+        """Merge command accepts --resolve --rebase together."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test resolve with rebase")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-resolve-rebase"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-resolve-rebase")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Test that --resolve --rebase is accepted (flag validation passes)
+        result = run_gza("merge", str(task.id), "--rebase", "--resolve", "--project", str(tmp_path))
+
+        # Verify no flag validation error
+        assert "unrecognized arguments" not in result.stderr
+        assert "--resolve requires --rebase" not in result.stdout
+        # Should either succeed or fail gracefully (git ops), not due to flag validation
+        assert result.returncode == 0 or "Error during rebase" in result.stdout
+
     def test_squash_merge_creates_commit(self, tmp_path: Path):
         """Squash merge creates a commit, not just staged changes."""
         from gza.db import SqliteTaskStore
