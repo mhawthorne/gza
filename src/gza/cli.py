@@ -3189,9 +3189,8 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         store.mark_completed(task, branch=task.branch, has_commits=False)
         print(f"✓ Task #{args.task_id} marked as completed")
     else:
-        # Has commits: set merge_status = 'unmerged'
-        store.mark_unmerged(task, branch=task.branch, has_commits=True)
-        print(f"✓ Task #{args.task_id} marked as unmerged ({commit_count} commit(s) on branch '{task.branch}')")
+        store.mark_completed(task, branch=task.branch, has_commits=True)
+        print(f"✓ Task #{args.task_id} marked as completed ({commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
 
