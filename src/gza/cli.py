@@ -842,6 +842,11 @@ def _merge_single_task(
         print("Error: --remote requires --rebase")
         return 1
 
+    # Validate --resolve flag
+    if getattr(args, 'resolve', False) and not args.rebase:
+        print("Error: --resolve requires --rebase")
+        return 1
+
     # Perform the merge or rebase
     try:
         if args.rebase:
@@ -895,6 +900,39 @@ def _merge_single_task(
 
     except GitError as e:
         operation = "rebase" if args.rebase else "merge"
+
+        if args.rebase and getattr(args, 'resolve', False):
+            # --resolve: invoke Claude to fix conflicts
+            print("Conflicts detected. Invoking Claude to resolve...")
+            resolved = invoke_claude_resolve(task.branch, rebase_target)
+
+            if not resolved:
+                print("Could not resolve conflicts automatically.")
+                try:
+                    git.rebase_abort()
+                    try:
+                        git.checkout(current_branch)
+                    except GitError:
+                        pass
+                except GitError as abort_error:
+                    print(f"Warning: Could not abort rebase: {abort_error}")
+                return 1
+
+            # Switch back and fast-forward merge
+            git.checkout(current_branch)
+            git.merge(task.branch, squash=False)
+            print(f"✓ Fast-forwarded {current_branch} to {task.branch}")
+
+            # Delete branch if requested
+            if args.delete:
+                try:
+                    git.delete_branch(task.branch)
+                    print(f"✓ Deleted branch {task.branch}")
+                except GitError as del_error:
+                    print(f"Warning: Could not delete branch: {del_error}")
+
+            return 0
+
         print(f"Error during {operation}: {e}")
         print(f"\nAborting {operation} and restoring clean state...")
         try:
@@ -3742,6 +3780,11 @@ def main() -> int:
         "--mark-only",
         action="store_true",
         help="Mark the branch as merged without performing actual merge (deletes the branch)",
+    )
+    merge_parser.add_argument(
+        "--resolve",
+        action="store_true",
+        help="Auto-resolve conflicts using AI when rebasing (requires --rebase)",
     )
     add_common_args(merge_parser)
 
