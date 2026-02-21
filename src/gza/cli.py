@@ -3153,6 +3153,49 @@ def cmd_force_complete(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mark_completed(args: argparse.Namespace) -> int:
+    """Mark a failed task as completed, checking git for actual commits."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    # Warn if task wasn't failed (but still proceed)
+    if task.status != "failed":
+        print(f"Warning: Task #{args.task_id} is not in failed status (current status: {task.status}), proceeding anyway")
+
+    # Check that task has a branch
+    if not task.branch:
+        print(f"Error: Task #{args.task_id} has no branch set")
+        return 1
+
+    # Check git for branch existence
+    git = Git(config.project_dir)
+    if not git.branch_exists(task.branch):
+        print(f"Error: Branch '{task.branch}' does not exist")
+        return 1
+
+    # Set has_commits based on actual commits on branch
+    default_branch = git.default_branch()
+    commit_count = git.count_commits_ahead(task.branch, default_branch)
+    has_commits = commit_count > 0
+
+    if not has_commits:
+        # Log if no commits found, but still mark completed
+        print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
+        store.mark_completed(task, branch=task.branch, has_commits=False)
+        print(f"✓ Task #{args.task_id} marked as completed")
+    else:
+        # Has commits: set merge_status = 'unmerged'
+        store.mark_unmerged(task, branch=task.branch, has_commits=True)
+        print(f"✓ Task #{args.task_id} marked as unmerged ({commit_count} commit(s) on branch '{task.branch}')")
+
+    return 0
+
+
 def cmd_improve(args: argparse.Namespace) -> int:
     """Create an improve task based on an implementation task and its most recent review."""
     config = Config.load(args.project_dir)
@@ -4371,6 +4414,18 @@ def main() -> int:
     )
     add_common_args(force_complete_parser)
 
+    # mark-completed command
+    mark_completed_parser = subparsers.add_parser(
+        "mark-completed",
+        help="Mark a failed task as completed, checking git for actual commits on the branch",
+    )
+    mark_completed_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to mark as completed",
+    )
+    add_common_args(mark_completed_parser)
+
     # claude-install-skills command
     claude_install_parser = subparsers.add_parser(
         "claude-install-skills",
@@ -4461,6 +4516,8 @@ def main() -> int:
             return cmd_stop(args)
         elif args.command == "force-complete":
             return cmd_force_complete(args)
+        elif args.command == "mark-completed":
+            return cmd_mark_completed(args)
         elif args.command == "claude-install-skills":
             return cmd_claude_install_skills(args)
     except ConfigError as e:
