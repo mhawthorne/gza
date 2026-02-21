@@ -5295,6 +5295,48 @@ class TestUnmergedAllFlag:
         assert "Deleted branch task" in result.stdout
         assert "branch deleted" in result.stdout
 
+    def test_lazy_migration_backfills_merge_status(self, tmp_path: Path):
+        """Running gza unmerged backfills merge_status for existing tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a task with has_commits=True but merge_status=NULL (pre-migration state)
+        task = store.add("Old task needing migration", task_type="implement")
+        task.status = "completed"
+        task.branch = "feature/old-task"
+        task.has_commits = True
+        task.merge_status = None  # Simulates pre-migration state
+        task.task_id = "20260220-old-task"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create the branch with a real commit (unmerged)
+        git._run("checkout", "-b", "feature/old-task")
+        (tmp_path / "old.txt").write_text("old work")
+        git._run("add", "old.txt")
+        git._run("commit", "-m", "Old work")
+        git._run("checkout", "main")
+
+        # Run gza unmerged - should trigger migration and show the task
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Migrating merge status" in result.stdout
+        assert "Old task needing migration" in result.stdout
+
+        # Verify merge_status was set in the database
+        updated_task = store.get(task.id)
+        assert updated_task.merge_status == "unmerged"
+
+        # Running again should not show migration message
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Migrating merge status" not in result.stdout
+
 
 class TestCleanupCommand:
     """Tests for 'gza cleanup' command."""

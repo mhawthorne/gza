@@ -874,6 +874,15 @@ class SqliteTaskStore:
 
 # === Merge status migration ===
 
+def needs_merge_status_migration(store: "SqliteTaskStore") -> bool:
+    """Check if any tasks need merge_status backfilled."""
+    with store._connect() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE merge_status IS NULL AND has_commits = 1"
+        )
+        return cur.fetchone()[0] > 0
+
+
 def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
     """Infer merge_status for existing tasks based on current git state.
 

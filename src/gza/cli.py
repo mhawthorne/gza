@@ -655,10 +655,17 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 def cmd_unmerged(args: argparse.Namespace) -> int:
     """List tasks with unmerged work on branches."""
+    from gza.db import needs_merge_status_migration, migrate_merge_status
+
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
     default_branch = git.default_branch()
+
+    # Backfill merge_status for existing tasks if needed (one-time migration)
+    if needs_merge_status_migration(store):
+        console.print("[dim]Migrating merge status for existing tasks...[/dim]")
+        migrate_merge_status(store, git)
 
     # Query tasks with merge_status='unmerged' from the database
     # --commits-only and --all flags are kept for backwards compatibility but are no-ops
