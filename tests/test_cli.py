@@ -3117,6 +3117,152 @@ class TestMergeCommand:
         assert "Successfully merged 2 task(s)" in result.stdout
         assert "squash merged" in result.stdout
 
+    def test_merge_no_args_fails(self, tmp_path: Path):
+        """Merge command fails with an error when no task_ids and no --all are given."""
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        result = run_gza("merge", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "either provide task_id(s) or use --all" in result.stdout
+
+    def test_merge_all_flag_merges_all_unmerged_tasks(self, tmp_path: Path):
+        """--all flag finds and merges all unmerged done tasks."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create two completed tasks with branches and commits
+        task1 = store.add("Unmerged task 1")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        task1.branch = "feature/all-1"
+        task1.has_commits = True
+        store.update(task1)
+
+        git._run("checkout", "-b", "feature/all-1")
+        (tmp_path / "all1.txt").write_text("content 1")
+        git._run("add", "all1.txt")
+        git._run("commit", "-m", "Add all 1")
+        git._run("checkout", "main")
+
+        task2 = store.add("Unmerged task 2")
+        task2.status = "completed"
+        task2.completed_at = datetime.now(timezone.utc)
+        task2.branch = "feature/all-2"
+        task2.has_commits = True
+        store.update(task2)
+
+        git._run("checkout", "-b", "feature/all-2")
+        (tmp_path / "all2.txt").write_text("content 2")
+        git._run("add", "all2.txt")
+        git._run("commit", "-m", "Add all 2")
+        git._run("checkout", "main")
+
+        result = run_gza("merge", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Successfully merged 2 task(s)" in result.stdout
+
+    def test_merge_all_flag_no_unmerged_tasks(self, tmp_path: Path):
+        """--all flag reports no tasks when all branches are already merged."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a completed task whose branch is already merged
+        task = store.add("Already merged task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/already-merged"
+        task.has_commits = True
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/already-merged")
+        (tmp_path / "merged.txt").write_text("merged content")
+        git._run("add", "merged.txt")
+        git._run("commit", "-m", "Add merged content")
+        git._run("checkout", "main")
+        git._run("merge", "feature/already-merged")
+
+        result = run_gza("merge", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unmerged done tasks found" in result.stdout
+
+    def test_merge_all_flag_skips_tasks_without_commits(self, tmp_path: Path):
+        """--all flag skips tasks that have no commits (has_commits=False or None)."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Task with has_commits=False should be skipped
+        task_no_commits = store.add("Task with no commits")
+        task_no_commits.status = "completed"
+        task_no_commits.completed_at = datetime.now(timezone.utc)
+        task_no_commits.branch = "feature/no-commits"
+        task_no_commits.has_commits = False
+        store.update(task_no_commits)
+
+        result = run_gza("merge", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unmerged done tasks found" in result.stdout
+
 
 class TestCheckoutCommand:
     """Tests for 'gza checkout' command."""

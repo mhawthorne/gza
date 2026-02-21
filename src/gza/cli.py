@@ -923,12 +923,35 @@ def cmd_merge(args: argparse.Namespace) -> int:
     # Get current branch once
     current_branch = git.current_branch()
 
+    # Determine the list of task IDs to merge
+    task_ids = list(args.task_ids)
+
+    use_all = getattr(args, 'all', False)
+    if use_all:
+        # Find all completed/unmerged tasks with branches not yet merged
+        history = store.get_history(limit=None)
+        seen_ids = set(task_ids)
+        # Process oldest first (history is newest-first, so reverse it)
+        for task in reversed(history):
+            if task.id in seen_ids:
+                continue
+            if task.status in ("completed", "unmerged") and task.branch and task.has_commits:
+                if not git.is_merged(task.branch, current_branch):
+                    task_ids.append(task.id)
+                    seen_ids.add(task.id)
+        if not task_ids:
+            print("No unmerged done tasks found")
+            return 0
+    elif not task_ids:
+        print("Error: either provide task_id(s) or use --all to merge all unmerged done tasks")
+        return 1
+
     # Track success/failure
     merged_tasks = []
     failed_task_id = None
 
     # Merge each task in sequence
-    for task_id in args.task_ids:
+    for task_id in task_ids:
         result = _merge_single_task(task_id, config, store, git, args, current_branch)
 
         if result != 0:
@@ -943,7 +966,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         print(f"\n✓ Successfully merged {len(merged_tasks)} task(s): {', '.join(f'#{tid}' for tid in merged_tasks)}")
 
     if failed_task_id is not None:
-        remaining = [tid for tid in args.task_ids if tid not in merged_tasks and tid != failed_task_id]
+        remaining = [tid for tid in task_ids if tid not in merged_tasks and tid != failed_task_id]
         if remaining:
             print(f"⚠ Stopped at task #{failed_task_id}. Remaining tasks not processed: {', '.join(f'#{tid}' for tid in remaining)}")
         return 1
@@ -3714,9 +3737,14 @@ def main() -> int:
     merge_parser.add_argument(
         "task_ids",
         type=int,
-        nargs="+",
+        nargs="*",
         metavar="task_id",
         help="Task ID(s) to merge",
+    )
+    merge_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Merge all unmerged done tasks (task_ids optional when this flag is used)",
     )
     merge_parser.add_argument(
         "--delete",
