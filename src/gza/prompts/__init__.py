@@ -158,4 +158,10 @@ class PromptBuilder:
         prompt = f"Review the implementation from task #{impl_task_id}"
         if impl_prompt:
             prompt += f": {impl_prompt[:100]}"
+        prompt += (
+            ". The diff shows what changed, but you should use Read/Glob/Grep tools"
+            " to understand the surrounding context of each changed file."
+            " Read the full content of modified files to understand how changes fit"
+            " into the broader codebase."
+        )
         return prompt

@@ -272,10 +272,10 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
                 if impl_task.branch and git:
                     try:
                         default_branch = git.default_branch()
-                        diff_stat = git.get_diff_stat(f"{default_branch}...{impl_task.branch}")
-                        if diff_stat:
+                        diff_content = git.get_diff(f"{default_branch}...{impl_task.branch}")
+                        if diff_content:
                             context_parts.append(f"Implementation branch: {impl_task.branch}")
-                            context_parts.append(f"\nDiff summary:\n{diff_stat}")
+                            context_parts.append(f"\nChanges:\n{diff_content}")
                     except GitError:
                         pass  # Ignore git errors
 
