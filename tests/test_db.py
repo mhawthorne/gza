@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -625,7 +625,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -810,7 +810,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -911,6 +911,206 @@ class TestGetReviewsForTask:
 
         assert len(reviews) == 1
         assert reviews[0].id == review.id
+
+
+class TestMergeStatus:
+    """Tests for merge_status field and related functionality."""
+
+    def test_merge_status_defaults_to_none(self, tmp_path: Path):
+        """New tasks have merge_status=None by default."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        assert task.merge_status is None
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.merge_status is None
+
+    def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
+        """mark_completed with has_commits=True sets merge_status='unmerged'."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=True, branch="feature/test")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.merge_status == "unmerged"
+        assert retrieved.has_commits is True
+
+    def test_mark_completed_without_commits_leaves_merge_status_none(self, tmp_path: Path):
+        """mark_completed with has_commits=False leaves merge_status as None."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=False)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.merge_status is None
+        assert retrieved.has_commits is False
+
+    def test_set_merge_status_updates_field(self, tmp_path: Path):
+        """set_merge_status correctly updates the merge_status field."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=True, branch="feature/test")
+
+        # Verify initial state
+        retrieved = store.get(task.id)
+        assert retrieved.merge_status == "unmerged"
+
+        # Update to merged
+        store.set_merge_status(task.id, "merged")
+
+        retrieved = store.get(task.id)
+        assert retrieved.merge_status == "merged"
+
+    def test_set_merge_status_to_none(self, tmp_path: Path):
+        """set_merge_status can set merge_status back to None."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=True, branch="feature/test")
+        store.set_merge_status(task.id, None)
+
+        retrieved = store.get(task.id)
+        assert retrieved.merge_status is None
+
+    def test_get_unmerged_queries_by_merge_status(self, tmp_path: Path):
+        """get_unmerged returns tasks with merge_status='unmerged'."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task with commits (will have merge_status='unmerged')
+        task1 = store.add(prompt="Task with commits")
+        store.mark_completed(task1, has_commits=True, branch="feature/task1")
+
+        # Task without commits
+        task2 = store.add(prompt="Task without commits")
+        store.mark_completed(task2, has_commits=False)
+
+        # Task merged (set merge_status to 'merged')
+        task3 = store.add(prompt="Merged task")
+        store.mark_completed(task3, has_commits=True, branch="feature/task3")
+        store.set_merge_status(task3.id, "merged")
+
+        unmerged = store.get_unmerged()
+        unmerged_ids = [t.id for t in unmerged]
+
+        assert task1.id in unmerged_ids
+        assert task2.id not in unmerged_ids
+        assert task3.id not in unmerged_ids
+
+    def test_get_unmerged_excludes_merged_tasks(self, tmp_path: Path):
+        """get_unmerged does not return tasks with merge_status='merged'."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=True, branch="feature/test")
+        store.set_merge_status(task.id, "merged")
+
+        unmerged = store.get_unmerged()
+        assert len(unmerged) == 0
+
+    def test_migration_v9_to_v10_adds_merge_status_column(self, tmp_path: Path):
+        """Migration from v9 to v10 adds merge_status column."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v9 database manually (without merge_status column)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (9)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER
+            )
+        """)
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
+            ("Old task", "completed", now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version updated to 10
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 10
+
+        # Verify old task can be retrieved with NULL merge_status
+        task = store.get(1)
+        assert task is not None
+        assert task.merge_status is None
+
+        # Verify new tasks can store merge_status
+        new_task = store.add(prompt="New task")
+        store.mark_completed(new_task, has_commits=True, branch="feature/test")
+        retrieved = store.get(new_task.id)
+        assert retrieved.merge_status == "unmerged"
+
+    def test_merge_status_persists_through_update(self, tmp_path: Path):
+        """merge_status is persisted correctly through the update method."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        task.merge_status = "merged"
+        task.status = "completed"
+        from datetime import datetime, timezone
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.merge_status == "merged"
 
 
 class TestEditPromptDefaultContent:

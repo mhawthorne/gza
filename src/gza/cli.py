@@ -632,11 +632,17 @@ def cmd_history(args: argparse.Namespace) -> int:
         return 0
 
     for task in recent:
-        status_icon = "✓" if task.status == "completed" else "✗"
+        if task.merge_status == "unmerged":
+            status_icon = "⚡"
+        elif task.status == "completed":
+            status_icon = "✓"
+        else:
+            status_icon = "✗"
         date_str = f"({task.completed_at.strftime('%Y-%m-%d %H:%M')})" if task.completed_at else ""
         type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
+        merge_label = " [merged]" if task.merge_status == "merged" else ""
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        print(f"{status_icon} [#{task.id}] {date_str} {prompt_display}{type_label}")
+        print(f"{status_icon} [#{task.id}] {date_str} {prompt_display}{type_label}{merge_label}")
         if task.branch:
             print(f"    branch: {task.branch}")
         if task.report_file:
@@ -649,31 +655,21 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 def cmd_unmerged(args: argparse.Namespace) -> int:
     """List tasks with unmerged work on branches."""
+    from gza.db import needs_merge_status_migration, migrate_merge_status
+
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
     default_branch = git.default_branch()
 
-    # Get completed tasks with branches and check if merged
-    history = store.get_history(limit=100)
-    unmerged = []
-    use_cherry = getattr(args, 'commits_only', False)
-    include_all = getattr(args, 'all', False)
-    for task in history:
-        if include_all:
-            # Include completed and failed tasks; check git directly for commits
-            if task.status not in ("completed", "failed") or not task.branch:
-                continue
-            if not git.branch_exists(task.branch):
-                continue
-            if git.count_commits_ahead(task.branch, default_branch) == 0:
-                continue
-            if not git.is_merged(task.branch, default_branch, use_cherry=use_cherry):
-                unmerged.append(task)
-        else:
-            if task.status == "completed" and task.branch and task.has_commits:
-                if not git.is_merged(task.branch, default_branch, use_cherry=use_cherry):
-                    unmerged.append(task)
+    # Backfill merge_status for existing tasks if needed (one-time migration)
+    if needs_merge_status_migration(store):
+        console.print("[dim]Migrating merge status for existing tasks...[/dim]")
+        migrate_merge_status(store, git)
+
+    # Query tasks with merge_status='unmerged' from the database
+    # --commits-only and --all flags are kept for backwards compatibility but are no-ops
+    unmerged = store.get_unmerged()
 
     if not unmerged:
         console.print("No unmerged tasks")
@@ -762,10 +758,15 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
             console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
 
-        # Show branch with commit count
-        commit_count = git.count_commits_ahead(branch, default_branch)
-        commits_label = "commit" if commit_count == 1 else "commits"
-        console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}])")
+        # Show branch with commit count (branch may no longer exist if deleted)
+        if git.branch_exists(branch):
+            commit_count = git.count_commits_ahead(branch, default_branch)
+            commits_label = "commit" if commit_count == 1 else "commits"
+            console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}])")
+            if not git.can_merge(branch, default_branch):
+                console.print("[yellow]⚠️  has conflicts[/yellow]")
+        else:
+            console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]branch deleted[/{c['task_id']}])")
 
         if root_task.report_file:
             console.print(f"report: [{c['task_id']}]{root_task.report_file}[/{c['task_id']}]")
@@ -773,10 +774,6 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         stats_str = format_stats(root_task)
         if stats_str:
             console.print(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
-
-        # Show merge status at the end
-        if not git.can_merge(branch, default_branch):
-            console.print("[yellow]⚠️  has conflicts[/yellow]")
 
     return 0
 
@@ -815,6 +812,7 @@ def _merge_single_task(
         # Delete the branch to mark it as merged (is_merged returns True for deleted branches)
         try:
             git.delete_branch(task.branch, force=True)
+            store.set_merge_status(task.id, "merged")
             print(f"✓ Marked task #{task.id} as merged by deleting branch '{task.branch}'")
             print("Note: The branch will now be detected as merged by gza")
             return 0
@@ -896,6 +894,7 @@ def _merge_single_task(
             except GitError as e:
                 print(f"Warning: Could not delete branch: {e}")
 
+        store.set_merge_status(task.id, "merged")
         return 0
 
     except GitError as e:
@@ -931,6 +930,7 @@ def _merge_single_task(
                 except GitError as del_error:
                     print(f"Warning: Could not delete branch: {del_error}")
 
+            store.set_merge_status(task.id, "merged")
             return 0
 
         print(f"Error during {operation}: {e}")
@@ -3401,6 +3401,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"Task #{task.id}")
     print("=" * 50)
     print(f"Status: {task.status}")
+    if task.merge_status:
+        print(f"Merge Status: {task.merge_status}")
     print(f"Type: {task.task_type}")
     if task.task_id:
         print(f"Slug: {task.task_id}")
