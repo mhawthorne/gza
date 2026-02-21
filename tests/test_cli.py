@@ -4914,6 +4914,166 @@ This requires team discussion.
         assert "⚠ changes requested" not in result.stdout
 
 
+class TestUnmergedAllFlag:
+    """Tests for 'gza unmerged --all' flag."""
+
+    def _setup_git_repo(self, tmp_path: Path):
+        """Initialize a git repo with an initial commit."""
+        from gza.git import Git
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+        return git
+
+    def test_all_flag_includes_failed_tasks_with_commits(self, tmp_path: Path):
+        """--all includes failed tasks that have unmerged commits on their branch."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a failed task with a branch
+        task = store.add("Failed but useful task", task_type="implement")
+        task.status = "failed"
+        task.branch = "feature/failed-branch"
+        task.has_commits = False  # has_commits not set (typical for failed tasks)
+        task.task_id = "20260220-failed-task"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create the branch with a real commit
+        git._run("checkout", "-b", "feature/failed-branch")
+        (tmp_path / "feature.txt").write_text("useful work")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add useful work")
+        git._run("checkout", "main")
+
+        # Without --all: failed task should NOT appear
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Failed but useful task" not in result.stdout
+
+        # With --all: failed task SHOULD appear
+        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Failed but useful task" in result.stdout
+
+    def test_all_flag_checks_git_directly_ignores_has_commits_false(self, tmp_path: Path):
+        """--all checks git directly, showing tasks even when has_commits=False."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        # Completed task with has_commits=False but actually has commits
+        task = store.add("Completed task with wrong has_commits", task_type="implement")
+        task.status = "completed"
+        task.branch = "feature/wrong-flag"
+        task.has_commits = False  # incorrect flag
+        task.task_id = "20260220-wrong-flag"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create the branch with a real commit
+        git._run("checkout", "-b", "feature/wrong-flag")
+        (tmp_path / "wrong.txt").write_text("work done")
+        git._run("add", "wrong.txt")
+        git._run("commit", "-m", "Do work")
+        git._run("checkout", "main")
+
+        # Without --all: task not shown because has_commits=False
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Completed task with wrong has_commits" not in result.stdout
+
+        # With --all: task shown because git confirms real commits exist
+        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Completed task with wrong has_commits" in result.stdout
+
+    def test_all_flag_excludes_failed_tasks_with_no_commits(self, tmp_path: Path):
+        """--all skips failed tasks whose branch has no commits ahead of default."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a failed task with a branch but no commits ahead of main
+        task = store.add("Failed task no commits", task_type="implement")
+        task.status = "failed"
+        task.branch = "feature/empty-branch"
+        task.has_commits = False
+        task.task_id = "20260220-empty-branch"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create the branch but don't add any commits
+        git._run("checkout", "-b", "feature/empty-branch")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Failed task no commits" not in result.stdout
+
+    def test_all_flag_excludes_failed_tasks_with_deleted_branch(self, tmp_path: Path):
+        """--all skips failed tasks whose branch no longer exists."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        # Create a failed task with a branch that doesn't exist in git
+        task = store.add("Failed task deleted branch", task_type="implement")
+        task.status = "failed"
+        task.branch = "feature/nonexistent-branch"
+        task.has_commits = True
+        task.task_id = "20260220-deleted-branch"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Failed task deleted branch" not in result.stdout
+
+    def test_all_flag_still_excludes_pending_tasks(self, tmp_path: Path):
+        """--all does not include pending or running tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        task = store.add("Pending task", task_type="implement")
+        task.status = "pending"
+        task.branch = "feature/pending-branch"
+        task.has_commits = True
+        store.update(task)
+
+        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Pending task" not in result.stdout
+
+
 class TestCleanupCommand:
     """Tests for 'gza cleanup' command."""
 
