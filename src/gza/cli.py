@@ -961,8 +961,10 @@ def run_tests() -> bool:
     return result.returncode == 0
 
 
-def invoke_claude_resolve(branch: str, target: str) -> bool:
+def invoke_claude_resolve(branch: str, target: str, log_dir: Path) -> bool:
     """Invoke Claude to resolve rebase conflicts.
+
+    Streams Claude output to both console and a log file.
 
     Returns True if conflicts were resolved, False if Claude aborted.
     """
@@ -978,7 +980,28 @@ def invoke_claude_resolve(branch: str, target: str) -> bool:
         "--allowedTools", "Grep",
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_file = log_dir / f"resolve-{timestamp}.log"
+
+    print(f"Logging to: {log_file}")
+
+    with open(log_file, "w") as log:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        if process.stdout:
+            for line in process.stdout:
+                log.write(line)
+                stripped = line.rstrip()
+                if stripped:
+                    print(stripped)
+
+        process.wait()
 
     # Check if rebase completed (no longer in rebase state)
     rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
@@ -1074,7 +1097,8 @@ def cmd_rebase(args: argparse.Namespace) -> int:
 
         # --resolve: invoke Claude to fix conflicts
         print("Conflicts detected. Invoking Claude to resolve...")
-        resolved = invoke_claude_resolve(task.branch, rebase_target)
+        log_dir = config.project_dir / config.log_dir
+        resolved = invoke_claude_resolve(task.branch, rebase_target, log_dir=log_dir)
 
         if not resolved:
             print("Could not resolve conflicts automatically.")
