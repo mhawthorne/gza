@@ -5506,32 +5506,40 @@ class TestRebaseHelpers:
 
             assert result is False
 
-    def test_invoke_claude_resolve_returns_true_when_resolved(self):
+    def test_invoke_claude_resolve_returns_true_when_resolved(self, tmp_path):
         """Test invoke_claude_resolve returns True when conflicts are resolved."""
         from gza.cli import invoke_claude_resolve
         from unittest.mock import patch, MagicMock
 
-        with patch('subprocess.run') as mock_run, \
+        log_dir = tmp_path / ".gza" / "logs"
+        mock_process = MagicMock()
+        mock_process.stdout = iter([])
+        mock_process.returncode = 0
+
+        with patch('subprocess.Popen', return_value=mock_process) as mock_popen, \
              patch('pathlib.Path.exists', return_value=False):
-            mock_run.return_value = MagicMock(returncode=0)
-            result = invoke_claude_resolve("feature", "main")
+            result = invoke_claude_resolve("feature", "main", log_dir=log_dir)
 
             assert result is True
             # Verify Claude was invoked with correct arguments
-            mock_run.assert_called_once()
-            call_args = mock_run.call_args[0][0]
+            mock_popen.assert_called_once()
+            call_args = mock_popen.call_args[0][0]
             assert "claude" in call_args
             assert "/gza-rebase --auto" in call_args
 
-    def test_invoke_claude_resolve_returns_false_when_unresolved(self):
+    def test_invoke_claude_resolve_returns_false_when_unresolved(self, tmp_path):
         """Test invoke_claude_resolve returns False when conflicts remain."""
         from gza.cli import invoke_claude_resolve
         from unittest.mock import patch, MagicMock
 
-        with patch('subprocess.run') as mock_run, \
+        log_dir = tmp_path / ".gza" / "logs"
+        mock_process = MagicMock()
+        mock_process.stdout = iter([])
+        mock_process.returncode = 0
+
+        with patch('subprocess.Popen', return_value=mock_process), \
              patch('pathlib.Path.exists', return_value=True):
-            mock_run.return_value = MagicMock(returncode=0)
-            result = invoke_claude_resolve("feature", "main")
+            result = invoke_claude_resolve("feature", "main", log_dir=log_dir)
 
             assert result is False
 
