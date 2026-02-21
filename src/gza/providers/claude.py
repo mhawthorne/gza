@@ -24,6 +24,21 @@ if TYPE_CHECKING:
     from ..config import Config
 
 
+def _format_tool_param(value: object) -> str:
+    """Format a tool input parameter value for display."""
+    if isinstance(value, str):
+        value = value.replace("\n", "\\n").replace("\r", "\\r")
+        if len(value) > 60:
+            value = value[:57] + "..."
+        return value
+    elif isinstance(value, list):
+        return f"list[{len(value)}]"
+    elif isinstance(value, dict):
+        return "{...}"
+    else:
+        return str(value)
+
+
 # Output color scheme for conversation stream
 OUTPUT_COLORS = {
     "turn_info": "blue",
@@ -375,7 +390,10 @@ class ClaudeProvider(Provider):
                             elif file_path:
                                 console.print(f"→ {tool_name} {file_path}", style=OUTPUT_COLORS["tool_use"])
                             else:
-                                console.print(f"→ {tool_name}", style=OUTPUT_COLORS["tool_use"])
+                                parts = [tool_name]
+                                for k, v in tool_input.items():
+                                    parts.append(f"{k}={_format_tool_param(v)}")
+                                console.print(f"→ {' '.join(parts)}", style=OUTPUT_COLORS["tool_use"])
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:

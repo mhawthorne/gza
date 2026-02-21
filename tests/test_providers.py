@@ -1003,6 +1003,328 @@ class TestClaudeToolLogging:
         captured = capsys.readouterr()
         assert "→ Read /workspace/test.py" in captured.out
 
+    def test_logs_generic_tool_with_string_params(self, tmp_path, capsys):
+        """Should log generic tools with their string parameters."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Skill",
+                            "input": {"skill": "commit", "args": "-m fix"}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ Skill skill=commit args=-m fix" in captured.out
+
+    def test_logs_generic_tool_truncates_long_strings(self, tmp_path, capsys):
+        """Should truncate string parameters longer than 60 chars."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        long_value = "a" * 80
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "SomeTool",
+                            "input": {"param": long_value}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ SomeTool param=" + "a" * 57 + "..." in captured.out
+
+    def test_logs_generic_tool_escapes_newlines(self, tmp_path, capsys):
+        """Should escape newlines in string parameters."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "SomeTool",
+                            "input": {"param": "line1\nline2"}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ SomeTool param=line1\\nline2" in captured.out
+
+    def test_logs_generic_tool_shows_list_length(self, tmp_path, capsys):
+        """Should show list lengths for list parameters."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "SomeTool",
+                            "input": {"items": [1, 2, 3]}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ SomeTool items=list[3]" in captured.out
+
+    def test_logs_generic_tool_shows_dict_indicator(self, tmp_path, capsys):
+        """Should show {...} for dict parameters."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "SomeTool",
+                            "input": {"config": {"key": "value"}}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ SomeTool config={...}" in captured.out
+
+    def test_logs_generic_tool_with_no_params(self, tmp_path, capsys):
+        """Should log tool name only when tool_input is empty."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "SomeTool",
+                            "input": {}
+                        }
+                    ]
+                }
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "→ SomeTool\n" in captured.out
+
+
+class TestFormatToolParam:
+    """Tests for the _format_tool_param helper function."""
+
+    def test_formats_short_string(self):
+        """Should return short strings unchanged (except newline escaping)."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param("hello") == "hello"
+
+    def test_truncates_long_string(self):
+        """Should truncate strings longer than 60 chars."""
+        from gza.providers.claude import _format_tool_param
+        value = "x" * 80
+        result = _format_tool_param(value)
+        assert result == "x" * 57 + "..."
+        assert len(result) == 60
+
+    def test_escapes_newlines(self):
+        """Should escape newlines in strings."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param("line1\nline2") == "line1\\nline2"
+
+    def test_escapes_carriage_returns(self):
+        """Should escape carriage returns in strings."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param("line1\rline2") == "line1\\rline2"
+
+    def test_formats_list(self):
+        """Should show list length."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param([1, 2, 3]) == "list[3]"
+        assert _format_tool_param([]) == "list[0]"
+
+    def test_formats_dict(self):
+        """Should show {...} for dicts."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param({"key": "value"}) == "{...}"
+        assert _format_tool_param({}) == "{...}"
+
+    def test_formats_bool(self):
+        """Should convert booleans to string."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param(True) == "True"
+        assert _format_tool_param(False) == "False"
+
+    def test_formats_int(self):
+        """Should convert integers to string."""
+        from gza.providers.claude import _format_tool_param
+        assert _format_tool_param(42) == "42"
+
 
 class TestGetImageCreatedTime:
     """Tests for Docker image timestamp retrieval."""
