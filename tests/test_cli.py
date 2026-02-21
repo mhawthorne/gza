@@ -3754,8 +3754,7 @@ class TestRebaseCommand:
 
         # Mock the conflict resolution since we're just testing that the flag is accepted
         # and the basic flow works (we don't want to actually invoke Claude in tests)
-        with patch('gza.cli.invoke_claude_resolve', return_value=False), \
-             patch('gza.cli.run_tests', return_value=True):
+        with patch('gza.cli.invoke_claude_resolve', return_value=False):
             # This should succeed without conflicts (no --resolve needed, but flag should work)
             result = run_gza("rebase", str(task.id), "--resolve", "--project", str(tmp_path))
 
@@ -5480,31 +5479,6 @@ class TestCleanupCommand:
 
 class TestRebaseHelpers:
     """Tests for rebase helper functions."""
-
-    def test_run_tests_returns_true_on_success(self):
-        """Test run_tests returns True when tests pass."""
-        from gza.cli import run_tests
-        from unittest.mock import patch, MagicMock
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            result = run_tests()
-
-            assert result is True
-            mock_run.assert_called_once()
-            call_args = mock_run.call_args[0][0]
-            assert call_args == ["uv", "run", "pytest"]
-
-    def test_run_tests_returns_false_on_failure(self):
-        """Test run_tests returns False when tests fail."""
-        from gza.cli import run_tests
-        from unittest.mock import patch, MagicMock
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = MagicMock(returncode=1)
-            result = run_tests()
-
-            assert result is False
 
     def test_invoke_claude_resolve_returns_true_when_resolved(self, tmp_path):
         """Test invoke_claude_resolve returns True when conflicts are resolved."""
