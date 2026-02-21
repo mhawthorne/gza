@@ -3077,6 +3077,26 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_force_complete(args: argparse.Namespace) -> int:
+    """Manually mark a task as completed (for infrastructure failures)."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    if task.status == "completed":
+        print(f"Error: Task #{args.task_id} is already completed")
+        return 1
+
+    old_status = task.status
+    store.mark_completed(task, branch=task.branch if task.branch else None)
+    print(f"✓ Task #{args.task_id} status changed: {old_status} → completed")
+    return 0
+
+
 def cmd_improve(args: argparse.Namespace) -> int:
     """Create an improve task based on an implementation task and its most recent review."""
     config = Config.load(args.project_dir)
@@ -4268,6 +4288,18 @@ def main() -> int:
     )
     add_common_args(stop_parser)
 
+    # force-complete command
+    force_complete_parser = subparsers.add_parser(
+        "force-complete",
+        help="Manually mark a task as completed (for infrastructure failures)",
+    )
+    force_complete_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to force-complete",
+    )
+    add_common_args(force_complete_parser)
+
     # claude-install-skills command
     claude_install_parser = subparsers.add_parser(
         "claude-install-skills",
@@ -4356,6 +4388,8 @@ def main() -> int:
             return cmd_ps(args)
         elif args.command == "stop":
             return cmd_stop(args)
+        elif args.command == "force-complete":
+            return cmd_force_complete(args)
         elif args.command == "claude-install-skills":
             return cmd_claude_install_skills(args)
     except ConfigError as e:
