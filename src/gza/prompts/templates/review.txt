@@ -1,6 +1,8 @@
 This is a review task. Write your review to:
   {report_path}
 
+The diff shows what changed, but you should use Read/Glob/Grep tools to understand the surrounding context of each changed file. Read the full content of modified files to understand how changes fit into the broader codebase.
+
 Your review should include:
 - Assessment of whether the implementation matches the plan
 - Code quality observations

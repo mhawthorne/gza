@@ -333,6 +333,9 @@ class TestPromptBuilderReviewTask:
         assert ":" not in result.split("task #5")[1] if "task #5" in result else True
 
     def test_review_task_prompt_format_without_impl_prompt(self):
-        """Test the exact format when no impl prompt is given."""
+        """Test the format when no impl prompt is given includes file-reading guidance."""
         result = PromptBuilder().review_task_prompt(impl_task_id=3)
-        assert result == "Review the implementation from task #3"
+        assert result.startswith("Review the implementation from task #3")
+        assert "Read" in result
+        assert "Glob" in result
+        assert "Grep" in result
