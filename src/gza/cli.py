@@ -130,7 +130,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         cmd.extend(["--max-turns", str(args.max_turns)])
 
     # Add project directory
-    cmd.append(str(config.project_dir.absolute()))
+    cmd.extend(["--project", str(config.project_dir.absolute())])
 
     # Spawn detached process
     try:
@@ -260,7 +260,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         cmd.extend(["--max-turns", str(args.max_turns)])
 
     # Add project directory
-    cmd.append(str(config.project_dir.absolute()))
+    cmd.extend(["--project", str(config.project_dir.absolute())])
 
     # Spawn detached process
     try:
