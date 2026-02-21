@@ -904,7 +904,7 @@ def _merge_single_task(
         if args.rebase and getattr(args, 'resolve', False):
             # --resolve: invoke Claude to fix conflicts
             print("Conflicts detected. Invoking Claude to resolve...")
-            resolved = invoke_claude_resolve(task.branch, rebase_target)
+            resolved = invoke_claude_resolve(task.branch, rebase_target, config)
 
             if not resolved:
                 print("Could not resolve conflicts automatically.")
@@ -1022,47 +1022,25 @@ def run_tests() -> bool:
     return result.returncode == 0
 
 
-def invoke_claude_resolve(branch: str, target: str, log_dir: Path) -> bool:
-    """Invoke Claude to resolve rebase conflicts.
-
-    Streams Claude output to both console and a log file.
+def invoke_claude_resolve(branch: str, target: str, config: Config) -> bool:
+    """Invoke Claude to resolve rebase conflicts using ClaudeProvider.
 
     Returns True if conflicts were resolved, False if Claude aborted.
     """
-    cmd = [
-        "claude",
-        "-p", "/gza-rebase --auto",
-        "--allowedTools", "Bash(git add:*)",
-        "--allowedTools", "Bash(git rebase --continue:*)",
-        "--allowedTools", "Bash(uv run python -m py_compile:*)",
-        "--allowedTools", "Edit",
-        "--allowedTools", "Read",
-        "--allowedTools", "Glob",
-        "--allowedTools", "Grep",
-    ]
+    from dataclasses import replace
+    from .providers.claude import ClaudeProvider
 
+    # Always run directly (not in Docker) since we need access to the
+    # host's git rebase state on the local filesystem
+    resolve_config = replace(config, use_docker=False)
+
+    log_dir = config.project_dir / config.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_file = log_dir / f"resolve-{timestamp}.log"
 
-    print(f"Logging to: {log_file}")
-
-    with open(log_file, "w") as log:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-
-        if process.stdout:
-            for line in process.stdout:
-                log.write(line)
-                stripped = line.rstrip()
-                if stripped:
-                    print(stripped)
-
-        process.wait()
+    provider = ClaudeProvider()
+    provider.run(resolve_config, "/gza-rebase --auto", log_file, config.project_dir)
 
     # Check if rebase completed (no longer in rebase state)
     rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
@@ -1158,8 +1136,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
 
         # --resolve: invoke Claude to fix conflicts
         print("Conflicts detected. Invoking Claude to resolve...")
-        log_dir = config.project_dir / config.log_dir
-        resolved = invoke_claude_resolve(task.branch, rebase_target, log_dir=log_dir)
+        resolved = invoke_claude_resolve(task.branch, rebase_target, config)
 
         if not resolved:
             print("Could not resolve conflicts automatically.")
