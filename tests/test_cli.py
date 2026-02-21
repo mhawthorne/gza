@@ -5509,37 +5509,34 @@ class TestRebaseHelpers:
     def test_invoke_claude_resolve_returns_true_when_resolved(self, tmp_path):
         """Test invoke_claude_resolve returns True when conflicts are resolved."""
         from gza.cli import invoke_claude_resolve
-        from unittest.mock import patch, MagicMock
+        from gza.config import Config
+        from gza.providers.base import RunResult
+        from unittest.mock import patch
 
-        log_dir = tmp_path / ".gza" / "logs"
-        mock_process = MagicMock()
-        mock_process.stdout = iter([])
-        mock_process.returncode = 0
+        config = Config(project_dir=tmp_path, project_name="test")
 
-        with patch('subprocess.Popen', return_value=mock_process) as mock_popen, \
+        with patch('gza.providers.claude.ClaudeProvider.run', return_value=RunResult(exit_code=0)) as mock_run, \
              patch('pathlib.Path.exists', return_value=False):
-            result = invoke_claude_resolve("feature", "main", log_dir=log_dir)
+            result = invoke_claude_resolve("feature", "main", config)
 
             assert result is True
-            # Verify Claude was invoked with correct arguments
-            mock_popen.assert_called_once()
-            call_args = mock_popen.call_args[0][0]
-            assert "claude" in call_args
-            assert "/gza-rebase --auto" in call_args
+            # Verify ClaudeProvider.run was called with the skill prompt
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args
+            assert "/gza-rebase --auto" in call_args.args or "/gza-rebase --auto" in call_args.kwargs.values()
 
     def test_invoke_claude_resolve_returns_false_when_unresolved(self, tmp_path):
         """Test invoke_claude_resolve returns False when conflicts remain."""
         from gza.cli import invoke_claude_resolve
-        from unittest.mock import patch, MagicMock
+        from gza.config import Config
+        from gza.providers.base import RunResult
+        from unittest.mock import patch
 
-        log_dir = tmp_path / ".gza" / "logs"
-        mock_process = MagicMock()
-        mock_process.stdout = iter([])
-        mock_process.returncode = 0
+        config = Config(project_dir=tmp_path, project_name="test")
 
-        with patch('subprocess.Popen', return_value=mock_process), \
+        with patch('gza.providers.claude.ClaudeProvider.run', return_value=RunResult(exit_code=0)), \
              patch('pathlib.Path.exists', return_value=True):
-            result = invoke_claude_resolve("feature", "main", log_dir=log_dir)
+            result = invoke_claude_resolve("feature", "main", config)
 
             assert result is False
 
