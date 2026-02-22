@@ -5762,7 +5762,8 @@ class TestMarkCompletedCommand:
 
         updated = store.get(1)
         assert updated is not None
-        assert updated.status == "unmerged"
+        assert updated.status == "completed"
+        assert updated.merge_status == "unmerged"
         assert updated.has_commits is True
 
     def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):

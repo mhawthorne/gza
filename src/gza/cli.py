@@ -3190,7 +3190,7 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         print(f"✓ Task #{args.task_id} marked as completed")
     else:
         store.mark_completed(task, branch=task.branch, has_commits=True)
-        print(f"✓ Task #{args.task_id} marked as completed ({commit_count} commit(s) on branch '{task.branch}')")
+        print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
 
