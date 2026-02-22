@@ -2429,6 +2429,132 @@ class TestWorkCommandMultiTask:
         assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
 
 
+class TestBackgroundWorkerCommand:
+    """Tests for background worker subprocess command construction."""
+
+    def test_background_worker_command_uses_project_flag(self, tmp_path: Path):
+        """Background worker subprocess must pass project dir with --project flag, not as positional arg.
+
+        Regression test: _spawn_background_worker was appending the project directory
+        as a bare positional argument, which argparse would try to parse as a task_id
+        (type=int), causing the worker subprocess to crash on startup.
+        """
+        from unittest.mock import patch, MagicMock
+        from gza.db import SqliteTaskStore
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        import argparse
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add a pending task
+        task = store.add("Test background task")
+
+        # Create workers directory
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        config = Config.load(tmp_path)
+
+        # Create args namespace matching what argparse produces
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        # Capture the subprocess command
+        captured_cmd = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        def capture_popen(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+            _spawn_background_worker(args, config, task_id=task.id)
+
+        assert captured_cmd is not None, "subprocess.Popen was not called"
+
+        # The project directory must be preceded by --project flag.
+        # If it appears as a bare positional, argparse will try to parse it
+        # as a task_id (type=int) and the worker subprocess will crash.
+        project_dir_str = str(config.project_dir.absolute())
+        assert project_dir_str in captured_cmd, \
+            f"Project dir {project_dir_str!r} not found in command: {captured_cmd}"
+
+        project_idx = captured_cmd.index(project_dir_str)
+        assert captured_cmd[project_idx - 1] == "--project", \
+            f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
+            f"Full command: {captured_cmd}"
+
+    def test_background_resume_worker_command_uses_project_flag(self, tmp_path: Path):
+        """Background resume worker subprocess must pass project dir with --project flag.
+
+        Same regression as test_background_worker_command_uses_project_flag but
+        for _spawn_background_resume_worker.
+        """
+        from unittest.mock import patch, MagicMock
+        from gza.db import SqliteTaskStore
+        from gza.cli import _spawn_background_resume_worker
+        from gza.config import Config
+        import argparse
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add a pending task
+        task = store.add("Test resume task")
+
+        # Create workers directory
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        config = Config.load(tmp_path)
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        # Capture the subprocess command
+        captured_cmd = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        def capture_popen(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+            _spawn_background_resume_worker(args, config, new_task_id=task.id)
+
+        assert captured_cmd is not None, "subprocess.Popen was not called"
+
+        # The project directory must be preceded by --project flag
+        project_dir_str = str(config.project_dir.absolute())
+        assert project_dir_str in captured_cmd, \
+            f"Project dir {project_dir_str!r} not found in command: {captured_cmd}"
+
+        project_idx = captured_cmd.index(project_dir_str)
+        assert captured_cmd[project_idx - 1] == "--project", \
+            f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
+            f"Full command: {captured_cmd}"
+
+
 class TestMergeCommand:
     """Tests for 'gza merge' command."""
 
