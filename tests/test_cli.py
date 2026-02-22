@@ -2335,6 +2335,39 @@ class TestWorkCommandMultiTask:
         # Verify the command completes without argument parsing errors
         assert "unrecognized arguments" not in result.stderr
 
+    def test_work_background_subprocess_uses_project_flag(self, tmp_path: Path):
+        """Background worker subprocess command uses --project flag, not bare positional arg."""
+        import argparse
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from unittest.mock import patch, MagicMock
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        config = Config.load(tmp_path)
+        args = argparse.Namespace(no_docker=True, max_turns=None)
+
+        with patch("gza.cli.subprocess.Popen") as mock_popen:
+            mock_popen.return_value.pid = 12345
+            _spawn_background_worker(args, config, task_id=task.id)
+
+            assert mock_popen.called
+            cmd = mock_popen.call_args[0][0]
+            # Project dir must be passed with --project flag, not as bare positional
+            project_dir = str(config.project_dir.absolute())
+            assert "--project" in cmd, f"--project flag missing from subprocess cmd: {cmd}"
+            project_idx = cmd.index("--project")
+            assert cmd[project_idx + 1] == project_dir
+
     def test_work_with_no_task_ids(self, tmp_path: Path):
         """Work command works without task IDs (runs next pending)."""
         from gza.db import SqliteTaskStore
