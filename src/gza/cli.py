@@ -662,6 +662,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         stats_str = format_stats(task)
         if stats_str:
             console.print(f"    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
+        print()
     return 0
 
 
