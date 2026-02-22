@@ -102,7 +102,7 @@ Signs you're violating this:
 ## Important Guidelines
 
 - **Do NOT run git commands** - Gza handles all git operations (branching, committing, pushing) automatically after your task completes. Just make the code changes and let gza commit them.
-- **Run tests before finishing** - Run `uv run pytest tests/ -v` before completing your task to verify tests pass.
+- **Run /gza-test-and-fix before completing any task** - You MUST invoke the `/gza-test-and-fix` skill before declaring a task complete. This runs mypy and pytest, automatically fixes any failures in files changed on the current branch, and commits the fixes. Do not mark a task as done until `/gza-test-and-fix` passes cleanly.
 - **Do NOT delete git branches** unless explicitly asked to. Branches should be preserved for history and reference.
 - **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, `*_SETUP.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
 - **Do NOT create README files** unless explicitly requested.
