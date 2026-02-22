@@ -628,28 +628,40 @@ def cmd_history(args: argparse.Namespace) -> int:
     if not recent:
         status_msg = f" with status '{status}'" if status else ""
         type_msg = f" with type '{task_type}'" if task_type else ""
-        print(f"No completed or failed tasks{status_msg}{type_msg}")
+        console.print(f"No completed or failed tasks{status_msg}{type_msg}")
         return 0
 
+    # Configurable colors for history output
+    HISTORY_COLORS = {
+        "task_id": "#cccccc",      # light gray for task ID and date
+        "prompt": "#ff99cc",       # pink for prompt text
+        "branch": "#6699ff",       # lighter blue for branch name
+        "stats": "#6699ff",        # lighter blue for stats
+        "success": "green",        # green for completed (✓)
+        "failure": "red",          # red for failed (✗)
+        "unmerged": "yellow",      # yellow for unmerged (⚡)
+    }
+
+    c = HISTORY_COLORS  # shorthand
     for task in recent:
         if task.merge_status == "unmerged":
-            status_icon = "⚡"
+            status_icon = f"[{c['unmerged']}]⚡[/{c['unmerged']}]"
         elif task.status == "completed":
-            status_icon = "✓"
+            status_icon = f"[{c['success']}]✓[/{c['success']}]"
         else:
-            status_icon = "✗"
-        date_str = f"({task.completed_at.strftime('%Y-%m-%d %H:%M')})" if task.completed_at else ""
+            status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
+        date_str = f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if task.completed_at else ""
         type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
-        merge_label = " [merged]" if task.merge_status == "merged" else ""
+        merge_label = " \[merged]" if task.merge_status == "merged" else ""
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        print(f"{status_icon} [#{task.id}] {date_str} {prompt_display}{type_label}{merge_label}")
+        console.print(f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}")
         if task.branch:
-            print(f"    branch: {task.branch}")
+            console.print(f"    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
         if task.report_file:
-            print(f"    report: {task.report_file}")
+            console.print(f"    report: [{c['task_id']}]{task.report_file}[/{c['task_id']}]")
         stats_str = format_stats(task)
         if stats_str:
-            print(f"    stats: {stats_str}")
+            console.print(f"    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
     return 0
 
 
