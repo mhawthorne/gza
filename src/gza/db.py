@@ -53,6 +53,9 @@ class Task:
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     failure_reason: str | None = None
     skip_learnings: bool = False
+    diff_files_changed: int | None = None  # Files changed vs. main (v13)
+    diff_lines_added: int | None = None    # Lines added vs. main (v13)
+    diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -75,7 +78,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -127,7 +130,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Failure reason tracking (v11)
     failure_reason TEXT,
     -- Skip learnings injection (v12)
-    skip_learnings INTEGER DEFAULT 0
+    skip_learnings INTEGER DEFAULT 0,
+    -- Diff stats vs. main branch (v13)
+    diff_files_changed INTEGER,
+    diff_lines_added INTEGER,
+    diff_lines_removed INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -203,6 +210,13 @@ UPDATE tasks SET failure_reason = 'UNKNOWN' WHERE status = 'failed';
 # Migration from v11 to v12
 MIGRATION_V11_TO_V12 = """
 ALTER TABLE tasks ADD COLUMN skip_learnings INTEGER DEFAULT 0;
+"""
+
+# Migration from v12 to v13
+MIGRATION_V12_TO_V13 = """
+ALTER TABLE tasks ADD COLUMN diff_files_changed INTEGER;
+ALTER TABLE tasks ADD COLUMN diff_lines_added INTEGER;
+ALTER TABLE tasks ADD COLUMN diff_lines_removed INTEGER;
 """
 
 
@@ -399,6 +413,19 @@ class SqliteTaskStore:
                                 # Column might already exist
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (12,))
+                    current_version = 12
+
+                if current_version < 13:
+                    # Run migration v12 -> v13
+                    for stmt in MIGRATION_V12_TO_V13.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (13,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -445,6 +472,9 @@ class SqliteTaskStore:
             merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
             failure_reason=row["failure_reason"] if "failure_reason" in row.keys() else None,
             skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in row.keys() and row["skip_learnings"] is not None else False,
+            diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
+            diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
+            diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
         )
 
     # === Task CRUD ===
@@ -529,7 +559,10 @@ class SqliteTaskStore:
                     provider = ?,
                     merge_status = ?,
                     failure_reason = ?,
-                    skip_learnings = ?
+                    skip_learnings = ?,
+                    diff_files_changed = ?,
+                    diff_lines_added = ?,
+                    diff_lines_removed = ?
                 WHERE id = ?
                 """,
                 (
@@ -563,6 +596,9 @@ class SqliteTaskStore:
                     task.merge_status,
                     task.failure_reason,
                     1 if task.skip_learnings else 0,
+                    task.diff_files_changed,
+                    task.diff_lines_added,
+                    task.diff_lines_removed,
                     task.id,
                 ),
             )
@@ -882,6 +918,9 @@ class SqliteTaskStore:
         output_content: str | None = None,
         has_commits: bool = False,
         stats: TaskStats | None = None,
+        diff_files_changed: int | None = None,
+        diff_lines_added: int | None = None,
+        diff_lines_removed: int | None = None,
     ) -> None:
         """Mark a task as completed."""
         task.status = "completed"
@@ -904,7 +943,30 @@ class SqliteTaskStore:
             task.cost_usd = stats.cost_usd
             task.input_tokens = stats.input_tokens
             task.output_tokens = stats.output_tokens
+        task.diff_files_changed = diff_files_changed
+        task.diff_lines_added = diff_lines_added
+        task.diff_lines_removed = diff_lines_removed
         self.update(task)
+
+    def update_diff_stats(
+        self,
+        task_id: int,
+        files_changed: int | None,
+        lines_added: int | None,
+        lines_removed: int | None,
+    ) -> None:
+        """Update only the diff stats columns for a task."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks SET
+                    diff_files_changed = ?,
+                    diff_lines_added = ?,
+                    diff_lines_removed = ?
+                WHERE id = ?
+                """,
+                (files_changed, lines_added, lines_removed, task_id),
+            )
 
     def mark_failed(
         self,

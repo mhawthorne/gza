@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 12
+        assert version == 13
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 12
+        assert version == 13
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -625,7 +625,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 12
+        assert version == 13
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -810,7 +810,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 12
+        assert version == 13
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1083,7 +1083,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 12
+        assert version == 13
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1477,7 +1477,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 12
+        assert version == 13
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1498,3 +1498,160 @@ class TestFailureReasonTracking:
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
         assert "TEST_FAILURE" in KNOWN_FAILURE_REASONS
         assert "UNKNOWN" in KNOWN_FAILURE_REASONS
+
+
+class TestDiffStats:
+    """Tests for diff stats columns (schema v12)."""
+
+    def test_diff_stats_null_by_default(self, tmp_path: Path):
+        """New tasks have NULL diff stats."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task")
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.diff_files_changed is None
+        assert retrieved.diff_lines_added is None
+        assert retrieved.diff_lines_removed is None
+
+    def test_mark_completed_persists_diff_stats(self, tmp_path: Path):
+        """mark_completed stores diff stats when provided."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task")
+        store.mark_completed(
+            task,
+            has_commits=True,
+            diff_files_changed=5,
+            diff_lines_added=120,
+            diff_lines_removed=34,
+        )
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.diff_files_changed == 5
+        assert retrieved.diff_lines_added == 120
+        assert retrieved.diff_lines_removed == 34
+        assert retrieved.merge_status == "unmerged"
+
+    def test_mark_completed_without_diff_stats_leaves_null(self, tmp_path: Path):
+        """mark_completed without diff stats leaves them as NULL."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=False)
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.diff_files_changed is None
+        assert retrieved.diff_lines_added is None
+        assert retrieved.diff_lines_removed is None
+
+    def test_update_diff_stats(self, tmp_path: Path):
+        """update_diff_stats sets diff columns without touching other fields."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=True)
+
+        assert task.id is not None
+        store.update_diff_stats(task.id, files_changed=3, lines_added=50, lines_removed=10)
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.diff_files_changed == 3
+        assert retrieved.diff_lines_added == 50
+        assert retrieved.diff_lines_removed == 10
+        # Other fields unchanged
+        assert retrieved.status == "completed"
+        assert retrieved.has_commits is True
+
+    def test_update_diff_stats_with_none(self, tmp_path: Path):
+        """update_diff_stats can reset stats to NULL."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task")
+        store.mark_completed(
+            task,
+            has_commits=True,
+            diff_files_changed=5,
+            diff_lines_added=10,
+            diff_lines_removed=2,
+        )
+        assert task.id is not None
+        store.update_diff_stats(task.id, files_changed=None, lines_added=None, lines_removed=None)
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.diff_files_changed is None
+        assert retrieved.diff_lines_added is None
+        assert retrieved.diff_lines_removed is None
+
+    def test_migration_v11_to_v12_adds_diff_columns(self, tmp_path: Path):
+        """Migration from v11 to v12 adds diff stat columns."""
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v11 database (without diff stat columns)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (11)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                failure_reason TEXT
+            )
+        """)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
+            ("Existing task", "completed", now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version updated to 12
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 13
+
+        # Verify existing task has NULL diff stats
+        task = store.get(1)
+        assert task is not None
+        assert task.diff_files_changed is None
+        assert task.diff_lines_added is None
+        assert task.diff_lines_removed is None

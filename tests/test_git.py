@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from gza.git import Git, GitError
+from gza.git import Git, GitError, parse_diff_numstat
 
 
 class TestGitInit:
@@ -1044,3 +1044,92 @@ index abc123..def456 100644
             result = git.count_commits_ahead("feature", "main")
 
             assert result == 0
+
+
+class TestParseDiffNumstat:
+    """Tests for parse_diff_numstat module-level function."""
+
+    def test_empty_output(self):
+        """Empty output returns zeros."""
+        assert parse_diff_numstat("") == (0, 0, 0)
+
+    def test_single_file(self):
+        """Single file with additions and deletions."""
+        output = "12\t3\tpath/to/file.py"
+        assert parse_diff_numstat(output) == (1, 12, 3)
+
+    def test_multiple_files(self):
+        """Multiple files are summed correctly."""
+        output = "12\t3\tpath/to/file.py\n5\t0\tsrc/other.py\n0\t7\tsrc/old.py"
+        files, added, removed = parse_diff_numstat(output)
+        assert files == 3
+        assert added == 17
+        assert removed == 10
+
+    def test_binary_files_skipped(self):
+        """Binary files (- in count columns) are excluded from count."""
+        output = "12\t3\tfile.py\n-\t-\timage.png"
+        files, added, removed = parse_diff_numstat(output)
+        assert files == 1
+        assert added == 12
+        assert removed == 3
+
+    def test_all_binary_files(self):
+        """All binary files results in zeros."""
+        output = "-\t-\timage.png\n-\t-\tfont.woff"
+        assert parse_diff_numstat(output) == (0, 0, 0)
+
+    def test_malformed_lines_skipped(self):
+        """Lines that don't have 3 tab-separated parts are skipped."""
+        output = "12\t3\tfile.py\ngarbage line\n5\t1\tother.py"
+        files, added, removed = parse_diff_numstat(output)
+        assert files == 2
+        assert added == 17
+        assert removed == 4
+
+    def test_only_additions(self):
+        """Files with only additions."""
+        output = "20\t0\tnew_file.py"
+        assert parse_diff_numstat(output) == (1, 20, 0)
+
+
+class TestGetDiffNumstat:
+    """Tests for Git.get_diff_numstat method."""
+
+    def test_get_diff_numstat_calls_git(self, tmp_path: Path):
+        """get_diff_numstat calls git diff --numstat with the given range."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        numstat_output = "12\t3\tfile.py\n5\t0\tother.py"
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=numstat_output, stderr="")
+            result = git.get_diff_numstat("main...feature")
+
+            mock_run.assert_called_once_with("diff", "--numstat", "main...feature", check=False)
+            assert result == numstat_output
+
+    def test_get_diff_numstat_strips_output(self, tmp_path: Path):
+        """get_diff_numstat strips trailing whitespace from output."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="12\t3\tfile.py\n  ", stderr="")
+            result = git.get_diff_numstat("main...feature")
+
+        assert result == "12\t3\tfile.py"
+
+    def test_get_diff_numstat_empty_on_error(self, tmp_path: Path):
+        """get_diff_numstat returns empty string on error."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="error")
+            result = git.get_diff_numstat("main...feature")
+
+        assert result == ""

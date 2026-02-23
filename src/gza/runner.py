@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import APP_NAME, Config
 from .console import console, task_header, stats_line, success_message, error_message, info_line, next_steps
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
-from .git import Git, GitError, cleanup_worktree_for_branch
+from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
@@ -961,6 +961,11 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             summary_path.write_text(worktree_summary_path.read_text())
             output_content = summary_path.read_text()
 
+        # Compute diff stats vs. default branch before marking completed
+        default_branch = worktree_git.default_branch()
+        numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
+        diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
+
         # Mark completed
         store.mark_completed(
             task,
@@ -969,6 +974,9 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             output_content=output_content,
             has_commits=True,
             stats=stats,
+            diff_files_changed=diff_files,
+            diff_lines_added=diff_added,
+            diff_lines_removed=diff_removed,
         )
 
         console.print("")
