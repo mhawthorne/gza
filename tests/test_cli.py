@@ -4251,6 +4251,47 @@ class TestImproveCommand:
         assert "blocked until it completes" in result.stdout
         assert "Created improve task #3" in result.stdout
 
+    def test_improve_prevents_duplicate(self, tmp_path: Path):
+        """Improve command refuses to create a duplicate improve task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Create a completed review task
+        review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        store.update(review_task)
+
+        # Create an existing improve task for the same impl+review pair
+        existing_improve = store.add(
+            "Improve",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        # Run improve command - should fail with duplicate error
+        result = run_gza("improve", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert f"improve task already exists" in result.stdout
+        assert f"#{existing_improve.id}" in result.stdout
+
+        # Verify no new task was created (still only 3 tasks)
+        all_tasks = store.get_all()
+        assert len(all_tasks) == 3
+
 
 class TestReviewCommand:
     """Tests for the 'gza review' command."""
