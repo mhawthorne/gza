@@ -1440,6 +1440,29 @@ class TestPrCommand:
         assert result.returncode == 1
         assert "no commits" in result.stdout
 
+    def test_pr_task_marked_merged_shows_distinct_error(self, tmp_path: Path):
+        """PR command shows a distinct error message for tasks marked merged via --mark-only."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Mark-only merged task")
+        task.status = "completed"
+        task.branch = "feature/mark-only-pr"
+        task.has_commits = True
+        task.merge_status = "merged"
+        store.update(task)
+
+        result = run_gza("pr", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "already marked as merged" in result.stdout
+        # Should NOT say "merged into" since the branch was not actually merged
+        assert "merged into" not in result.stdout
+
 
 class TestGroupsCommand:
     """Tests for 'gza groups' command."""
@@ -3073,8 +3096,8 @@ class TestMergeCommand:
         # Verify the cool.txt file is present in main
         assert (tmp_path / "cool.txt").exists(), "Feature file should exist in main after merge"
 
-    def test_mark_only_deletes_branch_and_marks_merged(self, tmp_path: Path):
-        """--mark-only flag deletes branch and marks task as merged."""
+    def test_mark_only_preserves_branch_and_marks_merged(self, tmp_path: Path):
+        """--mark-only flag sets merge_status without deleting the branch."""
         from gza.db import SqliteTaskStore
         from gza.git import Git
         from datetime import datetime, timezone
@@ -3119,13 +3142,14 @@ class TestMergeCommand:
         # Verify success
         assert result.returncode == 0
         assert "Marked task #1 as merged" in result.stdout
-        assert "branch will now be detected as merged" in result.stdout
 
-        # Verify branch was deleted
-        assert not git.branch_exists("feature/mark-only")
+        # Verify branch was NOT deleted
+        assert git.branch_exists("feature/mark-only")
 
-        # Verify is_merged now returns True (because branch is deleted)
-        assert git.is_merged("feature/mark-only", "main")
+        # Verify merge_status was set in the database
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "merged"
 
     def test_mark_only_rejects_conflicting_flags(self, tmp_path: Path):
         """--mark-only flag rejects conflicting flags."""
