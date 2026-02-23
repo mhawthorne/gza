@@ -3304,7 +3304,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     # Create improve task
     assert review_task.id is not None
-    prompt = PromptBuilder().improve_task_prompt(review_task.id)
+    prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
     improve_task = store.add(
         prompt=prompt,
         task_type="improve",

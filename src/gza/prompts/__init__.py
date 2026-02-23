@@ -142,16 +142,17 @@ class PromptBuilder:
             diff_stat=diff_stat,
         )
 
-    def improve_task_prompt(self, review_id: int) -> str:
+    def improve_task_prompt(self, task_id: int, review_id: int) -> str:
         """Build the prompt for an improve task.
 
         Args:
+            task_id: The ID of the implementation task being improved.
             review_id: The ID of the review task being addressed.
 
         Returns:
             Prompt string for an improve task.
         """
-        return f"Improve implementation based on review #{review_id}"
+        return f"Improve implementation of task #{task_id} based on review #{review_id}"
 
     def review_task_prompt(
         self, impl_task_id: int, impl_prompt: str | None = None
