@@ -21,7 +21,7 @@ from .console import (
     MAX_PR_BODY_LENGTH,
 )
 from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask
-from .git import Git, GitError, cleanup_worktree_for_branch
+from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
 from .prompts import PromptBuilder
@@ -741,12 +741,18 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         else:
             console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]")
 
-        # Show branch with commit count and diff stats (branch may no longer exist if deleted)
+        # Show branch with diff stats (branch may no longer exist if deleted)
         if git.branch_exists(branch):
+            # Use cached diff stats if available; fall back to live git call
+            if root_task.diff_files_changed is not None:
+                files_changed = root_task.diff_files_changed
+                insertions = root_task.diff_lines_added or 0
+                deletions = root_task.diff_lines_removed or 0
+            else:
+                revision_range = f"{default_branch}...{branch}"
+                files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
             commit_count = git.count_commits_ahead(branch, default_branch)
             commits_label = "commit" if commit_count == 1 else "commits"
-            revision_range = f"{default_branch}...{branch}"
-            files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
             diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
             branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
             if diff_str:
@@ -770,6 +776,53 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if stats_str:
             console.print(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
 
+    return 0
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """Refresh cached diff stats for one or all unmerged tasks."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+    default_branch = git.default_branch()
+
+    if hasattr(args, 'task_id') and args.task_id is not None:
+        # Single task by ID
+        task = store.get(args.task_id)
+        if task is None:
+            print(f"Error: Task #{args.task_id} not found")
+            return 1
+        tasks_to_refresh = [task]
+    else:
+        # All unmerged tasks (optionally including failed tasks with branches)
+        all_unmerged = store.get_unmerged()
+        tasks_to_refresh = [t for t in all_unmerged if t.status == "completed"]
+        if getattr(args, 'include_failed', False):
+            all_tasks = store.get_history(limit=None, status='failed')
+            for t in all_tasks:
+                if t.branch and t not in tasks_to_refresh:
+                    tasks_to_refresh.append(t)
+
+    refreshed = 0
+    skipped = 0
+    for task in tasks_to_refresh:
+        if not task.branch:
+            console.print(f"[dim]#{task.id}: no branch, skipping[/dim]")
+            skipped += 1
+            continue
+        if not git.branch_exists(task.branch):
+            console.print(f"[dim]#{task.id} {task.branch}: branch no longer exists, skipping[/dim]")
+            skipped += 1
+            continue
+        revision_range = f"{default_branch}...{task.branch}"
+        numstat_output = git.get_diff_numstat(revision_range)
+        files_changed, lines_added, lines_removed = parse_diff_numstat(numstat_output)
+        assert task.id is not None
+        store.update_diff_stats(task.id, files_changed, lines_added, lines_removed)
+        console.print(f"#{task.id} {task.branch}: +{lines_added} -{lines_removed} in {files_changed} files")
+        refreshed += 1
+
+    console.print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
     return 0
 
 
@@ -3832,6 +3885,24 @@ def main() -> int:
         help="Include failed tasks and check git directly for commits instead of trusting has_commits",
     )
 
+    # refresh command
+    refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
+    add_common_args(refresh_parser)
+    refresh_group = refresh_parser.add_mutually_exclusive_group()
+    refresh_group.add_argument(
+        "task_id",
+        type=int,
+        nargs="?",
+        metavar="task_id",
+        help="Task ID to refresh (omit to refresh all unmerged tasks)",
+    )
+    refresh_parser.add_argument(
+        "--include-failed",
+        action="store_true",
+        dest="include_failed",
+        help="Also refresh failed tasks that have branches",
+    )
+
     # merge command
     merge_parser = subparsers.add_parser("merge", help="Merge task branches into current branch")
     merge_parser.add_argument(
@@ -4527,6 +4598,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
+        elif args.command == "refresh":
+            return cmd_refresh(args)
         elif args.command == "merge":
             return cmd_merge(args)
         elif args.command == "rebase":

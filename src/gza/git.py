@@ -10,6 +10,31 @@ class GitError(Exception):
     pass
 
 
+def parse_diff_numstat(numstat_output: str) -> tuple[int, int, int]:
+    """Parse --numstat output into (files_changed, lines_added, lines_removed).
+
+    Args:
+        numstat_output: Output from 'git diff --numstat'
+
+    Returns:
+        Tuple of (files_changed, lines_added, lines_removed)
+    """
+    files, added, removed = 0, 0, 0
+    for line in numstat_output.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        if parts[0] == "-":  # binary file
+            continue
+        try:
+            added += int(parts[0])
+            removed += int(parts[1])
+            files += 1
+        except ValueError:
+            continue
+    return files, added, removed
+
+
 class Git:
     """Git operations wrapper."""
 
@@ -275,6 +300,18 @@ class Git:
             args.append("--oneline")
         args.append(revision_range)
         result = self._run(*args, check=False)
+        return result.stdout.strip()
+
+    def get_diff_numstat(self, revision_range: str) -> str:
+        """Get diff --numstat output for a revision range.
+
+        Args:
+            revision_range: The revision range (e.g., "main...feature")
+
+        Returns:
+            The diff --numstat output as a string (machine-readable)
+        """
+        result = self._run("diff", "--numstat", revision_range, check=False)
         return result.stdout.strip()
 
     def get_diff_stat(self, revision_range: str) -> str:

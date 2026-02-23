@@ -710,6 +710,7 @@ class TestResumeVerificationPrompt:
             mock_worktree_git.has_changes.return_value = True
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
             # Mock _run for WIP functions (squash, restore)
             mock_log_result = Mock()
             mock_log_result.stdout = "WIP: gza task interrupted"
