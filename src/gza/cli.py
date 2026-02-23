@@ -1130,6 +1130,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         return 1
 
     # Perform the rebase
+    print(f"Rebasing task #{task.id}...")
     try:
         print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
         git.checkout(task.branch)
@@ -1140,6 +1141,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         git.checkout(current_branch)
         print(f"✓ Switched back to {current_branch}")
 
+        print()
         return 0
 
     except GitError as e:
@@ -1157,6 +1159,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
                 print("✓ Rebase aborted, working directory restored")
             except GitError as abort_error:
                 print(f"Warning: Could not abort rebase: {abort_error}")
+            print()
             return 1
 
         # --resolve: invoke Claude to fix conflicts
@@ -1167,6 +1170,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             print("Could not resolve conflicts automatically.")
             git.rebase_abort()
             git.checkout(current_branch)
+            print()
             return 1
 
         # Force push the resolved branch
@@ -1177,6 +1181,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         git.checkout(default_branch)
 
         print(f"✓ Successfully rebased {task.branch}")
+        print()
         return 0
 
 
