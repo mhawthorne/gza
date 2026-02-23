@@ -3912,6 +3912,50 @@ class TestRebaseCommand:
         assert "Removing stale worktree" not in result.stdout
         assert "Successfully rebased" in result.stdout
 
+    def test_rebase_logs_task_id_and_newline(self, tmp_path: Path):
+        """Rebase command logs 'Rebasing task #X...' and ends with a newline."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize a git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit on main
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a task with a branch
+        task = store.add("Test rebase output format")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test-rebase-output"
+        store.update(task)
+
+        # Create the branch and add a commit
+        git._run("checkout", "-b", "feature/test-rebase-output")
+        (tmp_path / "feature.txt").write_text("feature content")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"Rebasing task #{task.id}..." in result.stdout
+        # Output should end with a newline (after trailing whitespace is stripped per line,
+        # the last non-empty content is followed by a blank line)
+        assert result.stdout.endswith("\n")
+
     def test_rebase_resolve_flag_accepted(self, tmp_path: Path):
         """Rebase command accepts --resolve flag."""
         from gza.db import SqliteTaskStore
