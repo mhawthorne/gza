@@ -746,12 +746,18 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_unmerged(self) -> list[Task]:
-        """Get tasks with unmerged code (merge_status = 'unmerged')."""
+        """Get tasks with unmerged code (merge_status = 'unmerged').
+
+        Excludes improve tasks since they use same_branch=True and commit to
+        the implementation task's branch. The branch is merged when the
+        implementation task is merged.
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
                 WHERE merge_status = 'unmerged'
+                AND task_type != 'improve'
                 ORDER BY completed_at DESC
                 """
             )

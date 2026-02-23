@@ -1021,6 +1021,27 @@ class TestMergeStatus:
         unmerged = store.get_unmerged()
         assert len(unmerged) == 0
 
+    def test_get_unmerged_excludes_improve_tasks(self, tmp_path: Path):
+        """get_unmerged does not return improve tasks (they use same_branch=True)."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Regular unmerged task
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl_task, has_commits=True, branch="feature/impl")
+
+        # Improve task with same_branch=True (commits to impl branch)
+        improve_task = store.add(
+            prompt="Improve implementation", task_type="improve", same_branch=True
+        )
+        store.mark_completed(improve_task, has_commits=True, branch="feature/impl")
+
+        unmerged = store.get_unmerged()
+        unmerged_ids = [t.id for t in unmerged]
+
+        assert impl_task.id in unmerged_ids
+        assert improve_task.id not in unmerged_ids
+
     def test_migration_v9_to_v10_adds_merge_status_column(self, tmp_path: Path):
         """Migration from v9 to v10 adds merge_status column."""
         import sqlite3
