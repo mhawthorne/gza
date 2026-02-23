@@ -5590,7 +5590,7 @@ class TestClearReviewState:
 
         assert second.review_cleared_at is not None
         assert first_cleared is not None
-        assert second.review_cleared_at >= first_cleared
+        assert second.review_cleared_at > first_cleared
 
 
 class TestUnmergedAllFlag:

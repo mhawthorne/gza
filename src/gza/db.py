@@ -794,6 +794,12 @@ class SqliteTaskStore:
 
         Called when an improve task completes, to indicate that the previous
         review's feedback has been addressed. Sets review_cleared_at to now.
+
+        Note: This is called whenever an improve task completes with commits.
+        It cannot verify whether the improve task actually addressed the review
+        feedback in a meaningful way — it only records that an improve task ran.
+
+        If task_id does not exist, this is a no-op (no error is raised).
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
@@ -809,13 +815,19 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_reviews_for_task(self, task_id: int) -> list[Task]:
-        """Get all review tasks that depend on the given task, ordered by created_at DESC."""
+        """Get all review tasks that depend on the given task, ordered by completed_at DESC.
+
+        Reviews are ordered by completed_at so that the most recently completed
+        review is first (reviews[0]). Incomplete reviews (completed_at IS NULL) sort
+        last. This ensures the staleness check in cmd_unmerged compares against the
+        review that completed most recently, not merely the one created most recently.
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
                 WHERE task_type = 'review' AND depends_on = ?
-                ORDER BY created_at DESC
+                ORDER BY completed_at DESC NULLS LAST
                 """,
                 (task_id,),
             )

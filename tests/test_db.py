@@ -859,29 +859,70 @@ class TestGetReviewsForTask:
         assert review2.id in review_ids
         assert other_review.id not in review_ids
 
-    def test_get_reviews_for_task_ordered_by_created_at_desc(self, tmp_path: Path):
-        """Test that reviews are returned in descending order by created_at."""
-        import time
+    def test_get_reviews_for_task_ordered_by_completed_at_desc(self, tmp_path: Path):
+        """Test that reviews are returned in descending order by completed_at.
 
+        The most recently *completed* review should be first, regardless of
+        creation order. Incomplete reviews (completed_at IS NULL) sort last.
+        """
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
         impl_task = store.add("Add feature", task_type="implement")
 
-        # Create reviews with small delays to ensure different timestamps
-        time.sleep(0.01)
+        # Create reviews in order
         review1 = store.add("First review", task_type="review", depends_on=impl_task.id)
-        time.sleep(0.01)
         review2 = store.add("Second review", task_type="review", depends_on=impl_task.id)
-        time.sleep(0.01)
         review3 = store.add("Third review", task_type="review", depends_on=impl_task.id)
+
+        # Complete them in reverse order: review3 first (oldest completed_at),
+        # review1 last (newest completed_at). This is opposite of creation order
+        # so we can confirm the sort is by completed_at, not created_at.
+        t1 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        t3 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        review3.completed_at = t1  # completed first (oldest)
+        review3.status = "completed"
+        store.update(review3)
+
+        review2.completed_at = t2
+        review2.status = "completed"
+        store.update(review2)
+
+        review1.completed_at = t3  # completed last (newest)
+        review1.status = "completed"
+        store.update(review1)
 
         reviews = store.get_reviews_for_task(impl_task.id)
 
-        # Most recent should be first
-        assert reviews[0].id == review3.id
-        assert reviews[1].id == review2.id
-        assert reviews[2].id == review1.id
+        # Most recently completed should be first
+        assert reviews[0].id == review1.id  # completed_at = t3 (latest)
+        assert reviews[1].id == review2.id  # completed_at = t2
+        assert reviews[2].id == review3.id  # completed_at = t1 (earliest)
+
+    def test_get_reviews_for_task_incomplete_reviews_sort_last(self, tmp_path: Path):
+        """Test that reviews without completed_at sort after completed reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+
+        completed_review = store.add("Completed review", task_type="review", depends_on=impl_task.id)
+        incomplete_review = store.add("In-progress review", task_type="review", depends_on=impl_task.id)
+
+        # Complete only the first review
+        completed_review.completed_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        completed_review.status = "completed"
+        store.update(completed_review)
+        # incomplete_review has completed_at = NULL
+
+        reviews = store.get_reviews_for_task(impl_task.id)
+
+        assert len(reviews) == 2
+        # Completed review comes first, incomplete (NULL completed_at) comes last
+        assert reviews[0].id == completed_review.id
+        assert reviews[1].id == incomplete_review.id
 
     def test_get_reviews_for_task_returns_empty_when_no_reviews(self, tmp_path: Path):
         """Test that an empty list is returned when no reviews exist."""
@@ -1716,3 +1757,99 @@ class TestDiffStats:
         assert task.diff_files_changed is None
         assert task.diff_lines_added is None
         assert task.diff_lines_removed is None
+
+
+class TestReviewClearedAt:
+    """Tests for review_cleared_at field and clear_review_state (schema v14)."""
+
+    def test_migration_v13_to_v14_adds_review_cleared_at_column(self, tmp_path: Path):
+        """Migration from v13 to v14 adds review_cleared_at column."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v13 database manually (without review_cleared_at column)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (13)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER
+            )
+        """)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
+            ("Existing task", "completed", now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Verify schema version updated to 14
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 14
+
+        # Verify existing task can be retrieved with NULL review_cleared_at
+        task = store.get(1)
+        assert task is not None
+        assert task.review_cleared_at is None
+
+        # Verify the column is readable and writable on new tasks
+        new_task = store.add(prompt="New task", task_type="implement")
+        assert new_task.id is not None
+        assert new_task.review_cleared_at is None
+
+        store.clear_review_state(new_task.id)
+        updated = store.get(new_task.id)
+        assert updated is not None
+        assert updated.review_cleared_at is not None
+
+    def test_clear_review_state_on_nonexistent_task_is_graceful(self, tmp_path: Path):
+        """clear_review_state does not raise when task_id does not exist."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Should not raise any exception
+        store.clear_review_state(99999)
