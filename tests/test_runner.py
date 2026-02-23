@@ -183,6 +183,52 @@ class TestBuildPrompt:
         assert "Project Learnings" not in prompt
         assert "Complete this task: One-off experimental task" in prompt
 
+    def test_build_prompt_learnings_include_preamble(self, tmp_path: Path):
+        """Test that learnings injection includes the 'Accumulated Project Learnings' preamble."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Implement feature Y", task_type="task")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        gza_dir = tmp_path / ".gza"
+        gza_dir.mkdir(parents=True, exist_ok=True)
+        (gza_dir / "learnings.md").write_text("- Always use pytest fixtures\n")
+
+        prompt = build_prompt(task, config, store)
+
+        assert "## Accumulated Project Learnings" in prompt
+        assert "Always use pytest fixtures" in prompt
+
+    def test_build_prompt_learnings_unreadable_file_does_not_crash(self, tmp_path: Path):
+        """Test that an unreadable learnings.md doesn't crash prompt building."""
+        import os
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Implement feature Z", task_type="task")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        gza_dir = tmp_path / ".gza"
+        gza_dir.mkdir(parents=True, exist_ok=True)
+        learnings_path = gza_dir / "learnings.md"
+        learnings_path.write_text("- Some learning\n")
+        # Make file unreadable
+        os.chmod(learnings_path, 0o000)
+
+        try:
+            prompt = build_prompt(task, config, store)
+            # Should not crash; learnings simply omitted
+            assert "Some learning" not in prompt
+            assert "Complete this task: Implement feature Z" in prompt
+        finally:
+            os.chmod(learnings_path, 0o644)
+
 
 class TestSummaryDirectory:
     """Tests for summary directory constant."""
