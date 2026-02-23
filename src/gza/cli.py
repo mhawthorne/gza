@@ -748,15 +748,17 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 files_changed = root_task.diff_files_changed
                 insertions = root_task.diff_lines_added or 0
                 deletions = root_task.diff_lines_removed or 0
+                diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
+                branch_detail = f"[{c['task_id']}]{diff_str}[/{c['task_id']}]" if diff_str else f"[{c['task_id']}]cached stats[/{c['task_id']}]"
             else:
                 revision_range = f"{default_branch}...{branch}"
                 files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
-            commit_count = git.count_commits_ahead(branch, default_branch)
-            commits_label = "commit" if commit_count == 1 else "commits"
-            diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
-            branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
-            if diff_str:
-                branch_detail += f", [{c['task_id']}]{diff_str}[/{c['task_id']}]"
+                commit_count = git.count_commits_ahead(branch, default_branch)
+                commits_label = "commit" if commit_count == 1 else "commits"
+                diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
+                branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
+                if diff_str:
+                    branch_detail += f", [{c['task_id']}]{diff_str}[/{c['task_id']}]"
             console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ({branch_detail})")
             if not git.can_merge(branch, default_branch):
                 console.print("[yellow]⚠️  has conflicts[/yellow]")
@@ -786,11 +788,11 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
     default_branch = git.default_branch()
 
-    if hasattr(args, 'task_id') and args.task_id is not None:
+    if args.task_id is not None:
         # Single task by ID
         task = store.get(args.task_id)
         if task is None:
-            print(f"Error: Task #{args.task_id} not found")
+            console.print(f"[red]Error: Task #{args.task_id} not found[/red]", err=True)
             return 1
         tasks_to_refresh = [task]
     else:
@@ -3896,11 +3898,11 @@ def main() -> int:
         metavar="task_id",
         help="Task ID to refresh (omit to refresh all unmerged tasks)",
     )
-    refresh_parser.add_argument(
+    refresh_group.add_argument(
         "--include-failed",
         action="store_true",
         dest="include_failed",
-        help="Also refresh failed tasks that have branches",
+        help="Also refresh failed tasks that have branches (cannot be used with task_id)",
     )
 
     # merge command

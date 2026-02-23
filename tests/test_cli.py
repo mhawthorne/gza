@@ -5661,6 +5661,38 @@ class TestUnmergedImprovedDisplay:
         assert "LOC" in result.stdout
         assert "files" in result.stdout
 
+    def test_unmerged_uses_cached_diff_stats(self, tmp_path: Path):
+        """gza unmerged uses cached diff stats from DB when available (no live git call)."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Cached stats task", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/cached"
+        task.merge_status = "unmerged"
+        # Pre-populate cached diff stats
+        task.diff_files_changed = 5
+        task.diff_lines_added = 42
+        task.diff_lines_removed = 7
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/cached")
+        (tmp_path / "cached.txt").write_text("some content\n")
+        git._run("add", "cached.txt")
+        git._run("commit", "-m", "Cached stats commit")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        # Cached stats should be displayed in +N/-N LOC, N files format
+        assert "+42/-7 LOC, 5 files" in result.stdout
+
     def test_unmerged_review_shown_on_own_line(self, tmp_path: Path):
         """Review status appears on its own 'review:' line."""
         from gza.db import SqliteTaskStore
