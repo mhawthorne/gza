@@ -1,12 +1,19 @@
 """SQLite-based task storage."""
 
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+# Known failure reason categories
+KNOWN_FAILURE_REASONS = {"MAX_TURNS", "TEST_FAILURE", "UNKNOWN"}
+
+_FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
 
 @dataclass
@@ -44,6 +51,7 @@ class Task:
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
+    failure_reason: str | None = None
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -66,7 +74,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -114,7 +122,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     input_tokens INTEGER,
     output_tokens INTEGER,
     -- Merge status tracking (v10)
-    merge_status TEXT
+    merge_status TEXT,
+    -- Failure reason tracking (v11)
+    failure_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -180,6 +190,41 @@ MIGRATION_V9_TO_V10 = """
 ALTER TABLE tasks ADD COLUMN merge_status TEXT;
 CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
 """
+
+# Migration from v10 to v11
+MIGRATION_V10_TO_V11 = """
+ALTER TABLE tasks ADD COLUMN failure_reason TEXT;
+UPDATE tasks SET failure_reason = 'UNKNOWN' WHERE status = 'failed';
+"""
+
+
+def extract_failure_reason(log_file_path: Path) -> str:
+    """Scan a log file for failure reason markers.
+
+    Looks for the pattern [GZA_FAILURE:REASON] and returns the last match.
+    Validates against the known set; returns 'UNKNOWN' if no valid match found.
+
+    Args:
+        log_file_path: Path to the log file to scan.
+
+    Returns:
+        A failure reason string from KNOWN_FAILURE_REASONS.
+    """
+    if not log_file_path.exists():
+        return "UNKNOWN"
+
+    try:
+        content = log_file_path.read_text(errors="replace")
+    except OSError:
+        return "UNKNOWN"
+
+    last_reason = None
+    for match in _FAILURE_MARKER_RE.finditer(content):
+        reason = match.group(1)
+        if reason in KNOWN_FAILURE_REASONS:
+            last_reason = reason
+
+    return last_reason if last_reason is not None else "UNKNOWN"
 
 
 class SqliteTaskStore:
@@ -321,6 +366,19 @@ class SqliteTaskStore:
                                 # Column/index might already exist
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (10,))
+                    current_version = 10
+
+                if current_version < 11:
+                    # Run migration v10 -> v11
+                    for stmt in MIGRATION_V10_TO_V11.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (11,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -365,6 +423,7 @@ class SqliteTaskStore:
             model=row["model"] if "model" in row.keys() else None,
             provider=row["provider"] if "provider" in row.keys() else None,
             merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
+            failure_reason=row["failure_reason"] if "failure_reason" in row.keys() else None,
         )
 
     # === Task CRUD ===
@@ -446,7 +505,8 @@ class SqliteTaskStore:
                     pr_number = ?,
                     model = ?,
                     provider = ?,
-                    merge_status = ?
+                    merge_status = ?,
+                    failure_reason = ?
                 WHERE id = ?
                 """,
                 (
@@ -478,6 +538,7 @@ class SqliteTaskStore:
                     task.model,
                     task.provider,
                     task.merge_status,
+                    task.failure_reason,
                     task.id,
                 ),
             )
@@ -828,6 +889,7 @@ class SqliteTaskStore:
         has_commits: bool = False,
         stats: TaskStats | None = None,
         branch: str | None = None,
+        failure_reason: str | None = None,
     ) -> None:
         """Mark a task as failed."""
         task.status = "failed"
@@ -844,6 +906,7 @@ class SqliteTaskStore:
             task.cost_usd = stats.cost_usd
             task.input_tokens = stats.input_tokens
             task.output_tokens = stats.output_tokens
+        task.failure_reason = failure_reason if failure_reason is not None else "UNKNOWN"
         self.update(task)
 
     def mark_unmerged(

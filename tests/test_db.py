@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 10
+        assert version == 11
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 10
+        assert version == 11
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -625,7 +625,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 10
+        assert version == 11
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -810,7 +810,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 10
+        assert version == 11
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1083,7 +1083,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 10
+        assert version == 11
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1258,3 +1258,243 @@ class TestEditPromptDefaultContent:
         # The default should NOT be added when initial_content is provided
         # (it's already in the content area, not overwritten)
         assert result == custom_content
+
+
+class TestFailureReasonTracking:
+    """Tests for failure_reason field and extract_failure_reason function."""
+
+    def test_failure_reason_defaults_to_none_for_pending_task(self, tmp_path: Path):
+        """New tasks have failure_reason=None."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        assert task.failure_reason is None
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.failure_reason is None
+
+    def test_mark_failed_sets_unknown_by_default(self, tmp_path: Path):
+        """mark_failed sets failure_reason='UNKNOWN' when not specified."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_failed(task, log_file="logs/test.log")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "failed"
+        assert retrieved.failure_reason == "UNKNOWN"
+
+    def test_mark_failed_stores_provided_failure_reason(self, tmp_path: Path):
+        """mark_failed stores a specified failure_reason."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_failed(task, log_file="logs/test.log", failure_reason="MAX_TURNS")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.failure_reason == "MAX_TURNS"
+
+    def test_mark_failed_stores_test_failure_reason(self, tmp_path: Path):
+        """mark_failed stores TEST_FAILURE reason."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_failed(task, log_file="logs/test.log", failure_reason="TEST_FAILURE")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.failure_reason == "TEST_FAILURE"
+
+    def test_extract_failure_reason_returns_unknown_for_missing_file(self, tmp_path: Path):
+        """extract_failure_reason returns UNKNOWN when log file doesn't exist."""
+        from gza.db import extract_failure_reason
+
+        result = extract_failure_reason(tmp_path / "nonexistent.log")
+        assert result == "UNKNOWN"
+
+    def test_extract_failure_reason_returns_unknown_for_empty_file(self, tmp_path: Path):
+        """extract_failure_reason returns UNKNOWN for empty log file."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "empty.log"
+        log_file.write_text("")
+
+        result = extract_failure_reason(log_file)
+        assert result == "UNKNOWN"
+
+    def test_extract_failure_reason_detects_max_turns(self, tmp_path: Path):
+        """extract_failure_reason detects MAX_TURNS marker."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Some output\n[GZA_FAILURE:MAX_TURNS]\nEnd of output")
+
+        result = extract_failure_reason(log_file)
+        assert result == "MAX_TURNS"
+
+    def test_extract_failure_reason_detects_test_failure(self, tmp_path: Path):
+        """extract_failure_reason detects TEST_FAILURE marker."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Some output\n[GZA_FAILURE:TEST_FAILURE]\nFinal message")
+
+        result = extract_failure_reason(log_file)
+        assert result == "TEST_FAILURE"
+
+    def test_extract_failure_reason_returns_last_match(self, tmp_path: Path):
+        """extract_failure_reason returns the last matching marker."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            "First attempt\n[GZA_FAILURE:MAX_TURNS]\n"
+            "Retry attempt\n[GZA_FAILURE:TEST_FAILURE]\nFinal"
+        )
+
+        result = extract_failure_reason(log_file)
+        assert result == "TEST_FAILURE"
+
+    def test_extract_failure_reason_ignores_unknown_categories(self, tmp_path: Path):
+        """extract_failure_reason ignores markers with unknown categories."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Output\n[GZA_FAILURE:SOME_UNKNOWN_REASON]\nEnd")
+
+        result = extract_failure_reason(log_file)
+        assert result == "UNKNOWN"
+
+    def test_extract_failure_reason_unknown_falls_back_to_known_if_mixed(self, tmp_path: Path):
+        """extract_failure_reason uses last known marker even if unknown ones follow."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            "Output\n[GZA_FAILURE:TEST_FAILURE]\n[GZA_FAILURE:BOGUS_REASON]\nEnd"
+        )
+
+        # BOGUS_REASON is not known, so last *known* match is TEST_FAILURE
+        result = extract_failure_reason(log_file)
+        assert result == "TEST_FAILURE"
+
+    def test_extract_failure_reason_returns_unknown_without_marker(self, tmp_path: Path):
+        """extract_failure_reason returns UNKNOWN when no marker is found."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Task ran for a while but didn't write any failure marker\n")
+
+        result = extract_failure_reason(log_file)
+        assert result == "UNKNOWN"
+
+    def test_failure_reason_persisted_through_update(self, tmp_path: Path):
+        """failure_reason is correctly persisted through the update method."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        task.failure_reason = "MAX_TURNS"
+        task.status = "failed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.failure_reason == "MAX_TURNS"
+
+    def test_migration_v10_to_v11_adds_failure_reason_column(self, tmp_path: Path):
+        """Migration from v10 to v11 adds failure_reason column and backfills failed tasks."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+
+        # Create a v10 database manually (without failure_reason column)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (10)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT
+            )
+        """)
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
+            ("Failed task", "failed", now),
+        )
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
+            ("Pending task", "pending", now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Check schema version updated to 11
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 11
+
+        # Verify existing failed task was backfilled with 'UNKNOWN'
+        failed_task = store.get(1)
+        assert failed_task is not None
+        assert failed_task.status == "failed"
+        assert failed_task.failure_reason == "UNKNOWN"
+
+        # Verify pending task was NOT backfilled
+        pending_task = store.get(2)
+        assert pending_task is not None
+        assert pending_task.status == "pending"
+        assert pending_task.failure_reason is None
+
+    def test_known_failure_reasons_set(self):
+        """KNOWN_FAILURE_REASONS contains expected values."""
+        from gza.db import KNOWN_FAILURE_REASONS
+
+        assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
+        assert "TEST_FAILURE" in KNOWN_FAILURE_REASONS
+        assert "UNKNOWN" in KNOWN_FAILURE_REASONS
