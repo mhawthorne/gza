@@ -5325,8 +5325,8 @@ class TestUnmergedAllFlag:
         git._run("commit", "-m", "Initial commit")
         return git
 
-    def test_all_flag_includes_failed_tasks_with_merge_status_unmerged(self, tmp_path: Path):
-        """Failed tasks with merge_status='unmerged' appear in gza unmerged (--all is a no-op)."""
+    def test_all_flag_excludes_failed_tasks(self, tmp_path: Path):
+        """Failed tasks are excluded from gza unmerged (only completed tasks shown)."""
         from gza.db import SqliteTaskStore
         from gza.git import Git
 
@@ -5340,7 +5340,7 @@ class TestUnmergedAllFlag:
         task = store.add("Failed but useful task", task_type="implement")
         task.status = "failed"
         task.branch = "feature/failed-branch"
-        task.has_commits = False  # has_commits not set (typical for failed tasks)
+        task.has_commits = False
         task.merge_status = "unmerged"
         task.task_id = "20260220-failed-task"
         task.completed_at = datetime.now(timezone.utc)
@@ -5353,15 +5353,16 @@ class TestUnmergedAllFlag:
         git._run("commit", "-m", "Add useful work")
         git._run("checkout", "main")
 
-        # Task appears because merge_status='unmerged' (--all is a no-op now)
+        # Failed task is excluded from unmerged output
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Failed but useful task" in result.stdout
+        assert "Failed but useful task" not in result.stdout
+        assert "No unmerged tasks" in result.stdout
 
         # --all is a no-op: same result
         result = run_gza("unmerged", "--all", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Failed but useful task" in result.stdout
+        assert "Failed but useful task" not in result.stdout
 
     def test_all_flag_is_noop_with_merge_status(self, tmp_path: Path):
         """--all flag is a no-op since we now use merge_status from the database."""
@@ -5495,6 +5496,224 @@ class TestUnmergedAllFlag:
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
+
+
+class TestUnmergedImprovedDisplay:
+    """Tests for improved unmerged display (diff stats, review prominence, completed-only)."""
+
+    def _setup_git_repo(self, tmp_path: Path):
+        """Initialize a git repo with an initial commit."""
+        from gza.git import Git
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+        return git
+
+    def test_unmerged_excludes_failed_tasks(self, tmp_path: Path):
+        """Failed tasks with merge_status='unmerged' are excluded from unmerged output."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a failed task
+        failed_task = store.add("Failed task", task_type="implement")
+        failed_task.status = "failed"
+        failed_task.branch = "feature/failed"
+        failed_task.merge_status = "unmerged"
+        failed_task.completed_at = datetime.now(timezone.utc)
+        store.update(failed_task)
+
+        # Create a completed task
+        completed_task = store.add("Completed task", task_type="implement")
+        completed_task.status = "completed"
+        completed_task.branch = "feature/completed"
+        completed_task.merge_status = "unmerged"
+        completed_task.completed_at = datetime.now(timezone.utc)
+        store.update(completed_task)
+
+        git._run("checkout", "-b", "feature/completed")
+        (tmp_path / "new.txt").write_text("work")
+        git._run("add", "new.txt")
+        git._run("commit", "-m", "Add work")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Completed task" in result.stdout
+        assert "Failed task" not in result.stdout
+
+    def test_unmerged_shows_diff_stats(self, tmp_path: Path):
+        """Unmerged output shows diff stats (files, LOC added/removed)."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("line1\nline2\nline3\n")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        # Diff stats should be shown in branch line
+        assert "LOC" in result.stdout
+        assert "files" in result.stdout
+
+    def test_unmerged_review_shown_on_own_line(self, tmp_path: Path):
+        """Review status appears on its own 'review:' line."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        review = store.add("Review feature", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.depends_on = task.id
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        # Review should be on its own line starting with "review:"
+        assert "review:" in result.stdout
+        assert "✓ approved" in result.stdout
+
+    def test_unmerged_shows_no_review_when_missing(self, tmp_path: Path):
+        """Unmerged output shows 'no review' when no review exists."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "review:" in result.stdout
+        assert "no review" in result.stdout
+
+    def test_unmerged_always_shows_completion_time(self, tmp_path: Path):
+        """Completion time is shown even for tasks with improve tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Root task", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime(2026, 2, 12, 10, 30, tzinfo=__import__('datetime').timezone.utc)
+        task.branch = "feature/test"
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        improve = store.add("Improve root task", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime.now(timezone.utc)
+        improve.branch = "feature/test"
+        improve.based_on = task.id
+        improve.merge_status = "unmerged"
+        store.update(improve)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        # Completion date should appear
+        assert "2026-02-12" in result.stdout
+
+
+class TestFailureReasonField:
+    """Tests for the failure_reason field on Task."""
+
+    def test_failure_reason_persisted(self, tmp_path: Path):
+        """failure_reason field is saved and loaded from the database."""
+        from gza.db import SqliteTaskStore
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task")
+        task.status = "failed"
+        task.failure_reason = "Claude returned exit code 1"
+        store.update(task)
+
+        loaded = store.get(task.id)
+        assert loaded is not None
+        assert loaded.failure_reason == "Claude returned exit code 1"
+
+    def test_failure_reason_defaults_to_none(self, tmp_path: Path):
+        """failure_reason defaults to None for new tasks."""
+        from gza.db import SqliteTaskStore
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task")
+        assert task.failure_reason is None
+
+        loaded = store.get(task.id)
+        assert loaded is not None
+        assert loaded.failure_reason is None
 
 
 class TestCleanupCommand:
