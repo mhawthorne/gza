@@ -4508,6 +4508,103 @@ class TestReviewCommand:
         assert "Created review task #2" in result.stdout
         assert "Running review task" not in result.stdout
 
+    def test_review_prevents_duplicate_pending_review(self, tmp_path: Path):
+        """Review command warns and exits if a pending review already exists."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Create an existing pending review task
+        assert impl_task.id is not None
+        existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
+        # Leave status as 'pending' (default)
+
+        # Attempt to create another review
+        result = run_gza("review", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Warning: A review task already exists" in result.stdout
+        assert f"#{existing_review.id}" in result.stdout
+        assert "pending" in result.stdout
+
+        # Verify no additional review task was created
+        reviews = store.get_reviews_for_task(impl_task.id)
+        assert len(reviews) == 1
+
+    def test_review_prevents_duplicate_in_progress_review(self, tmp_path: Path):
+        """Review command warns and exits if an in_progress review already exists."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Create an existing in_progress review task
+        assert impl_task.id is not None
+        existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
+        existing_review.status = "in_progress"
+        store.update(existing_review)
+
+        # Attempt to create another review
+        result = run_gza("review", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Warning: A review task already exists" in result.stdout
+        assert f"#{existing_review.id}" in result.stdout
+        assert "in_progress" in result.stdout
+
+        # Verify no additional review task was created
+        reviews = store.get_reviews_for_task(impl_task.id)
+        assert len(reviews) == 1
+
+    def test_review_allows_new_review_after_completed_review(self, tmp_path: Path):
+        """Review command allows creating a new review if existing review is completed."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed implementation task
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Create an existing completed review task
+        assert impl_task.id is not None
+        existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
+        existing_review.status = "completed"
+        existing_review.completed_at = datetime.now(timezone.utc)
+        store.update(existing_review)
+
+        # Create another review (should succeed after improvements)
+        result = run_gza("review", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created review task" in result.stdout
+
+        # Verify a new review task was created
+        reviews = store.get_reviews_for_task(impl_task.id)
+        assert len(reviews) == 2
+
 
 class TestDiffCommand:
     """Tests for 'gza diff' command."""

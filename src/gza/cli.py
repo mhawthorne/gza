@@ -3374,8 +3374,18 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks.")
         return 1
 
-    # Create review task
+    # Check for existing non-completed review tasks to prevent duplicates
     assert impl_task.id is not None
+    existing_reviews = store.get_reviews_for_task(impl_task.id)
+    active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
+    if active_reviews:
+        review = active_reviews[0]
+        print(f"Warning: A review task already exists for implementation #{impl_task.id}")
+        print(f"  Existing review: #{review.id} (status: {review.status})")
+        print(f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
+        return 1
+
+    # Create review task
     review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
 
     review_task = store.add(
