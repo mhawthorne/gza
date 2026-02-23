@@ -1276,6 +1276,173 @@ class TestClaudeToolLogging:
         assert "→ SomeTool\n" in captured.out
 
 
+class TestTurnTimestampLogging:
+    """Tests for timestamp logging at the start of each turn in the log file."""
+
+    def test_logs_timestamp_to_log_file_on_new_turn(self, tmp_path):
+        """Should write a turn timestamp line to the log file when a new turn starts."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 100, "output_tokens": 50}},
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        assert "--- Turn 1 at " in log_content
+
+    def test_logs_timestamp_for_each_turn(self, tmp_path):
+        """Should write a timestamp line for each new turn."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 100, "output_tokens": 50}},
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_002", "content": [], "usage": {"input_tokens": 200, "output_tokens": 80}},
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 2,
+                "total_cost_usd": 0.10,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        assert "--- Turn 1 at " in log_content
+        assert "--- Turn 2 at " in log_content
+
+    def test_timestamp_format_matches_expected_pattern(self, tmp_path):
+        """Timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
+        import json
+        import re
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 100, "output_tokens": 50}},
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        # Pattern: "--- Turn 1 at 2026-02-23 12:34:56 PST ---"
+        pattern = r"--- Turn 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
+
+    def test_no_duplicate_timestamps_for_same_message_id(self, tmp_path):
+        """Should not log extra timestamps when the same message ID is repeated."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        # Same message ID repeated
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 100, "output_tokens": 50}},
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_001", "content": [], "usage": {"input_tokens": 10, "output_tokens": 5}},
+            }) + "\n",
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": 1,
+                "total_cost_usd": 0.05,
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        # Only one Turn 1 timestamp, no Turn 2
+        assert log_content.count("--- Turn ") == 1
+        assert "--- Turn 2 at " not in log_content
+
+
 class TestFormatToolParam:
     """Tests for the _format_tool_param helper function."""
 

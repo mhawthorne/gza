@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -295,6 +296,12 @@ class ClaudeProvider(Provider):
                             model,
                         )
                         cost_str = f"${cost:.2f}"
+
+                        # Log timestamp to log file at start of each turn
+                        if log_handle:
+                            timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                            log_handle.write(f"--- Turn {turn_count} at {timestamp_str} ---\n")
+                            log_handle.flush()
 
                         # Add blank line before turn (except first turn)
                         if turn_count > 1:
