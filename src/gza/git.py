@@ -498,3 +498,44 @@ class Git:
         if result.returncode != 0:
             return 0
         return int(result.stdout.strip())
+
+
+def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) -> Path | None:
+    """Clean up worktree if branch is checked out in one.
+
+    Args:
+        git: Git instance for the main repository
+        branch: Branch name to check for worktree
+        force: If True, remove worktree even with uncommitted changes
+
+    Returns:
+        Path to cleaned worktree, or None if no worktree found
+
+    Raises:
+        ValueError: If worktree has uncommitted changes and force=False
+    """
+    worktrees = git.worktree_list()
+    worktree_path = None
+    for wt in worktrees:
+        wt_branch = wt.get("branch", "")
+        # Branch is stored as refs/heads/branch-name
+        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
+            worktree_path = Path(wt["path"])
+            break
+
+    if worktree_path:
+        # Check if worktree has uncommitted changes
+        worktree_git = Git(worktree_path)
+        if worktree_git.has_changes(include_untracked=True) and not force:
+            raise ValueError(
+                f"Worktree at {worktree_path} has uncommitted changes.\n"
+                f"\nOptions:\n"
+                f"  1. cd {worktree_path} and commit or discard changes\n"
+                f"  2. Use --force to remove the worktree anyway (loses changes)"
+            )
+
+        # Remove the worktree
+        git.worktree_remove(worktree_path, force=force)
+        return worktree_path
+
+    return None
