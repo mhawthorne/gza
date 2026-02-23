@@ -3073,8 +3073,8 @@ class TestMergeCommand:
         # Verify the cool.txt file is present in main
         assert (tmp_path / "cool.txt").exists(), "Feature file should exist in main after merge"
 
-    def test_mark_only_deletes_branch_and_marks_merged(self, tmp_path: Path):
-        """--mark-only flag deletes branch and marks task as merged."""
+    def test_mark_only_preserves_branch_and_marks_merged(self, tmp_path: Path):
+        """--mark-only flag sets merge_status without deleting the branch."""
         from gza.db import SqliteTaskStore
         from gza.git import Git
         from datetime import datetime, timezone
@@ -3119,13 +3119,14 @@ class TestMergeCommand:
         # Verify success
         assert result.returncode == 0
         assert "Marked task #1 as merged" in result.stdout
-        assert "branch will now be detected as merged" in result.stdout
 
-        # Verify branch was deleted
-        assert not git.branch_exists("feature/mark-only")
+        # Verify branch was NOT deleted
+        assert git.branch_exists("feature/mark-only")
 
-        # Verify is_merged now returns True (because branch is deleted)
-        assert git.is_merged("feature/mark-only", "main")
+        # Verify merge_status was set in the database
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "merged"
 
     def test_mark_only_rejects_conflicting_flags(self, tmp_path: Path):
         """--mark-only flag rejects conflicting flags."""

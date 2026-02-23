@@ -859,16 +859,9 @@ def _merge_single_task(
             print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
             return 1
 
-        # Delete the branch to mark it as merged (is_merged returns True for deleted branches)
-        try:
-            git.delete_branch(task.branch, force=True)
-            store.set_merge_status(task.id, "merged")
-            print(f"✓ Marked task #{task.id} as merged by deleting branch '{task.branch}'")
-            print("Note: The branch will now be detected as merged by gza")
-            return 0
-        except GitError as e:
-            print(f"Error: Could not delete branch '{task.branch}': {e}")
-            return 1
+        store.set_merge_status(task.id, "merged")
+        print(f"✓ Marked task #{task.id} as merged (branch '{task.branch}' preserved)")
+        return 0
 
     # Check if branch already merged
     if git.is_merged(task.branch, current_branch):
@@ -1024,7 +1017,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             if task.id in seen_ids:
                 continue
             if task.status in ("completed", "unmerged") and task.branch and task.has_commits:
-                if not git.is_merged(task.branch, current_branch):
+                if task.merge_status != "merged" and not git.is_merged(task.branch, current_branch):
                     task_ids.append(task.id)
                     seen_ids.add(task.id)
         if not task_ids:
@@ -1509,7 +1502,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
     default_branch = git.default_branch()
 
     # Check branch is not already merged
-    if git.is_merged(task.branch, default_branch):
+    if task.merge_status == "merged" or git.is_merged(task.branch, default_branch):
         print(f"Error: Branch '{task.branch}' is already merged into {default_branch}")
         return 1
 
@@ -1736,7 +1729,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                     for task in history:
                         if task.status == "completed" and task.branch and task.has_commits:
                             try:
-                                if not git.is_merged(task.branch, default_branch):
+                                if task.merge_status != "merged" and not git.is_merged(task.branch, default_branch):
                                     if task.task_id:
                                         unmerged_task_ids.add(task.task_id)
                             except Exception:
