@@ -39,6 +39,7 @@ Review the combined output and identify actionable items:
 - Note any recently failed tasks — these may need to be retried or their errors investigated
 - Note recently completed tasks that produced branches (candidates for merging or PR creation)
 - Note completed plan/explore tasks whose output hasn't been acted on yet
+- For tasks that show `report: <path>`, include the report filename in the summary so the user can easily open it (e.g., "Plan report: `.gza/plans/20260115-design-feature-x.md`")
 
 **From `gza unmerged`:**
 - Each branch listed here represents completed work that hasn't been merged to main
@@ -72,7 +73,7 @@ Based on the analysis, provide a prioritized list of specific, actionable sugges
 - "Review and merge branch X before starting dependent task Y"
 
 **General workflow suggestions:**
-- If history shows a completed plan task, suggest creating an implement task based on it
+- If history shows a completed plan task, suggest creating an implement task based on it, and mention its report file path so the user can review it (e.g., "Review the plan at `.gza/plans/20260115-design-feature-x.md`, then run `gza add --type implement --based-on <id> '...'`")
 - If there are many unmerged branches, suggest a merge/cleanup session
 - If no pending tasks exist, suggest reviewing completed work or adding new tasks
 
@@ -82,7 +83,7 @@ Present the summary in three clearly labeled sections:
 
 ```
 ## Recent Activity
-[Key highlights from gza history — 3-5 most notable items]
+[Key highlights from gza history — 3-5 most notable items, including report filenames for plan/explore/review tasks]
 
 ## Unmerged Work
 [List of branches/tasks with unmerged commits, if any]
