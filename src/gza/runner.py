@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import APP_NAME, Config
 from .console import console, task_header, stats_line, success_message, error_message, info_line, next_steps
-from .db import SqliteTaskStore, Task, TaskStats
+from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
 from .git import Git, GitError
 from .github import GitHub, GitHubError
 from .prompts import PromptBuilder
@@ -889,7 +889,10 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
+            # Check log for agent-written marker; fall back to MAX_TURNS (provider-detected)
+            detected = extract_failure_reason(log_file)
+            failure_reason = detected if detected != "UNKNOWN" else "MAX_TURNS"
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:
             # Save WIP changes before marking failed
@@ -901,7 +904,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
             return 0
         elif exit_code != 0:
             # Save WIP changes before marking failed
@@ -913,7 +916,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
             return 0
 
         # For regular tasks: require code changes
@@ -927,7 +930,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
             return 0
 
         # Squash any WIP commits before creating final commit
@@ -1125,7 +1128,9 @@ def _run_non_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            detected = extract_failure_reason(log_file)
+            failure_reason = detected if detected != "UNKNOWN" else "MAX_TURNS"
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:
             error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
@@ -1135,7 +1140,7 @@ def _run_non_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=extract_failure_reason(log_file))
             return 0
         elif exit_code != 0:
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
@@ -1145,7 +1150,7 @@ def _run_non_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=extract_failure_reason(log_file))
             return 0
 
         # Copy report file from worktree to main project directory

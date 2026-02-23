@@ -649,7 +649,11 @@ def cmd_history(args: argparse.Namespace) -> int:
         elif task.status == "completed":
             status_icon = f"[{c['success']}]✓[/{c['success']}]"
         else:
-            status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
+            # Show failure reason if it's not UNKNOWN or NULL
+            if task.failure_reason and task.failure_reason != "UNKNOWN":
+                status_icon = f"[{c['failure']}]✗ failed ({task.failure_reason})[/{c['failure']}]"
+            else:
+                status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
         date_str = f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if task.completed_at else ""
         type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
         merge_label = " \[merged]" if task.merge_status == "merged" else ""
@@ -762,6 +766,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
+        # Append failure reason if present and not UNKNOWN
+        if root_task.status == "failed" and root_task.failure_reason and root_task.failure_reason != "UNKNOWN":
+            suffix += f" [red]failed ({root_task.failure_reason})[/red]"
 
         # Add improve task references if any
         if improve_tasks:

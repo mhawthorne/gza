@@ -1,2 +1,6 @@
 
 When you are done, report what you accomplished.
+
+If you cannot complete the task, write a failure marker on its own line before your final message:
+  [GZA_FAILURE:REASON]
+where REASON is one of: MAX_TURNS, TEST_FAILURE
