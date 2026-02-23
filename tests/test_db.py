@@ -1078,7 +1078,7 @@ class TestMergeStatus:
         # Open with SqliteTaskStore to trigger migration
         store = SqliteTaskStore(db_path)
 
-        # Check schema version updated to 10
+        # Check schema version updated to 11
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]

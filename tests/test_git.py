@@ -935,6 +935,68 @@ class TestUtilityOperations:
             assert "file.py" in result
             assert "1 file changed" in result
 
+    def test_get_diff_stat_parsed_single_file(self, tmp_path: Path):
+        """Test parsing diff stat for a single file."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        diff_stat = " file.py | 10 +++++-----\n 1 file changed, 5 insertions(+), 5 deletions(-)"
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=diff_stat, stderr="")
+            files, insertions, deletions = git.get_diff_stat_parsed("main...feature")
+            assert files == 1
+            assert insertions == 5
+            assert deletions == 5
+
+    def test_get_diff_stat_parsed_multiple_files(self, tmp_path: Path):
+        """Test parsing diff stat for multiple files."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        diff_stat = (
+            " src/a.py | 20 ++++++++++++++------\n"
+            " src/b.py |  5 +++++\n"
+            " 2 files changed, 25 insertions(+), 6 deletions(-)"
+        )
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=diff_stat, stderr="")
+            files, insertions, deletions = git.get_diff_stat_parsed("main...feature")
+            assert files == 2
+            assert insertions == 25
+            assert deletions == 6
+
+    def test_get_diff_stat_parsed_insertions_only(self, tmp_path: Path):
+        """Test parsing diff stat with only insertions."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        diff_stat = " new.py | 10 ++++++++++\n 1 file changed, 10 insertions(+)"
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=diff_stat, stderr="")
+            files, insertions, deletions = git.get_diff_stat_parsed("main...feature")
+            assert files == 1
+            assert insertions == 10
+            assert deletions == 0
+
+    def test_get_diff_stat_parsed_empty(self, tmp_path: Path):
+        """Test parsing empty diff stat returns zeros."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            files, insertions, deletions = git.get_diff_stat_parsed("main...feature")
+            assert files == 0
+            assert insertions == 0
+            assert deletions == 0
+
     def test_get_diff(self, tmp_path: Path):
         """Test getting full diff."""
         repo_dir = tmp_path / "repo"

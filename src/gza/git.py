@@ -1,5 +1,6 @@
 """Git operations for Gza."""
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -287,6 +288,38 @@ class Git:
         """
         result = self._run("diff", "--stat", revision_range, check=False)
         return result.stdout.strip()
+
+    def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+        """Get parsed diff statistics for a revision range.
+
+        Args:
+            revision_range: The revision range (e.g., "main...feature")
+
+        Returns:
+            Tuple of (files_changed, insertions, deletions)
+        """
+        stat_output = self.get_diff_stat(revision_range)
+        if not stat_output:
+            return (0, 0, 0)
+
+        lines = stat_output.strip().split("\n")
+        summary = lines[-1].strip()
+
+        files = 0
+        insertions = 0
+        deletions = 0
+
+        m = re.search(r"(\d+) files? changed", summary)
+        if m:
+            files = int(m.group(1))
+        m = re.search(r"(\d+) insertions?\(\+\)", summary)
+        if m:
+            insertions = int(m.group(1))
+        m = re.search(r"(\d+) deletions?\(-\)", summary)
+        if m:
+            deletions = int(m.group(1))
+
+        return (files, insertions, deletions)
 
     def get_diff(self, revision_range: str) -> str:
         """Get full diff output for a revision range.

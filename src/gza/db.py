@@ -226,7 +226,6 @@ def extract_failure_reason(log_file_path: Path) -> str:
 
     return last_reason if last_reason is not None else "UNKNOWN"
 
-
 class SqliteTaskStore:
     """SQLite-based task storage."""
 

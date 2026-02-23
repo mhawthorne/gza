@@ -684,9 +684,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         console.print("[dim]Migrating merge status for existing tasks...[/dim]")
         migrate_merge_status(store, git)
 
-    # Query tasks with merge_status='unmerged' from the database
+    # Query tasks with merge_status='unmerged' from the database, completed only
     # --commits-only and --all flags are kept for backwards compatibility but are no-ops
-    unmerged = store.get_unmerged()
+    all_unmerged = store.get_unmerged()
+    unmerged = [t for t in all_unmerged if t.status == "completed"]
 
     if not unmerged:
         console.print("No unmerged tasks")
@@ -698,6 +699,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         "prompt": "#ff99cc",       # pink for prompt text
         "stats": "#6699ff",        # lighter blue for stats
         "branch": "#6699ff",       # lighter blue for branch name
+        "review_approved": "green",
+        "review_changes": "yellow",
+        "review_discussion": "blue",
+        "review_none": "dim yellow",
     }
 
     # Group tasks by branch
@@ -751,18 +756,13 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             verdict = get_review_verdict(config, latest_review)
             if verdict == "APPROVED":
                 review_status = "✓ approved"
-                review_status_color = "green"
+                review_status_color = UNMERGED_COLORS["review_approved"]
             elif verdict == "CHANGES_REQUESTED":
                 review_status = "⚠ changes requested"
-                review_status_color = "yellow"
+                review_status_color = UNMERGED_COLORS["review_changes"]
             elif verdict == "NEEDS_DISCUSSION":
                 review_status = "💬 needs discussion"
-                review_status_color = "blue"
-
-        # Build the display line with colorization
-        # Get first line of prompt, truncated to 50 chars
-        first_line = root_task.prompt.split('\n')[0]
-        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
+                review_status_color = UNMERGED_COLORS["review_discussion"]
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
@@ -770,23 +770,38 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if root_task.status == "failed" and root_task.failure_reason and root_task.failure_reason != "UNKNOWN":
             suffix += f" [red]failed ({root_task.failure_reason})[/red]"
 
-        # Add improve task references if any
+        # Header line: task ID, completion time, prompt
+        first_line = root_task.prompt.split('\n')[0]
+        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
+        date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
+
         if improve_tasks:
             improve_ids = ", ".join(f"[{c['task_id']}]#{t.id}[/{c['task_id']}]" for t in improve_tasks)
-            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] [{c['prompt']}]{prompt_display}[/{c['prompt']}] (improved by {improve_ids}){suffix}")
+            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}] (improved by {improve_ids})")
         else:
-            date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
-            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
+            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]")
 
-        # Show branch with commit count (branch may no longer exist if deleted)
+        # Show branch with commit count and diff stats (branch may no longer exist if deleted)
         if git.branch_exists(branch):
             commit_count = git.count_commits_ahead(branch, default_branch)
             commits_label = "commit" if commit_count == 1 else "commits"
-            console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}])")
+            revision_range = f"{default_branch}...{branch}"
+            files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
+            diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
+            branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
+            if diff_str:
+                branch_detail += f", [{c['task_id']}]{diff_str}[/{c['task_id']}]"
+            console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ({branch_detail})")
             if not git.can_merge(branch, default_branch):
                 console.print("[yellow]⚠️  has conflicts[/yellow]")
         else:
             console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]branch deleted[/{c['task_id']}])")
+
+        # Review status — shown prominently on its own line
+        if review_status:
+            console.print(f"review: [{review_status_color}]{review_status}[/{review_status_color}]")
+        else:
+            console.print(f"review: [{c['review_none']}]no review[/{c['review_none']}]")
 
         if root_task.report_file:
             console.print(f"report: [{c['task_id']}]{root_task.report_file}[/{c['task_id']}]")
