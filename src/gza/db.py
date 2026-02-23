@@ -839,6 +839,19 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_improve_tasks_for(self, impl_task_id: int, review_task_id: int) -> list[Task]:
+        """Get improve tasks that match the given implementation and review task IDs."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE task_type = 'improve' AND based_on = ? AND depends_on = ?
+                ORDER BY created_at DESC
+                """,
+                (impl_task_id, review_task_id),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_stats(self) -> dict:
         """Get aggregate statistics."""
         with self._connect() as conn:

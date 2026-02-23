@@ -3309,8 +3309,16 @@ def cmd_improve(args: argparse.Namespace) -> int:
     if review_task.status != "completed":
         print(f"Warning: Review #{review_task.id} is {review_task.status}. The improve task will be blocked until it completes.")
 
-    # Create improve task
+    # Check for duplicate improve task
     assert review_task.id is not None
+    existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
+    if existing:
+        existing_task = existing[0]
+        print(f"Error: An improve task already exists for implementation #{impl_task.id} and review #{review_task.id}")
+        print(f"  Existing task: #{existing_task.id} (status: {existing_task.status})")
+        return 1
+
+    # Create improve task
     prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
     improve_task = store.add(
         prompt=prompt,
