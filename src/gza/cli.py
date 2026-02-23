@@ -2623,6 +2623,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
+    skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -2681,6 +2682,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            skip_learnings=skip_learnings,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -2699,6 +2701,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            skip_learnings=skip_learnings,
         )
         if not new_task:
             return 1
@@ -2718,6 +2721,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            skip_learnings=skip_learnings,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -4146,6 +4150,12 @@ def main() -> int:
         metavar="PROVIDER",
         choices=["claude", "codex", "gemini"],
         help="Override provider for this task (claude, codex, or gemini)",
+    )
+    add_parser.add_argument(
+        "--no-learnings",
+        action="store_true",
+        dest="skip_learnings",
+        help="Skip injecting .gza/learnings.md context into this task's prompt",
     )
     add_common_args(add_parser)
 

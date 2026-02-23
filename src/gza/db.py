@@ -52,6 +52,7 @@ class Task:
     provider: str | None = None  # Per-task provider override
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     failure_reason: str | None = None
+    skip_learnings: bool = False
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -74,7 +75,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -124,7 +125,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Merge status tracking (v10)
     merge_status TEXT,
     -- Failure reason tracking (v11)
-    failure_reason TEXT
+    failure_reason TEXT,
+    -- Skip learnings injection (v12)
+    skip_learnings INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -195,6 +198,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
 MIGRATION_V10_TO_V11 = """
 ALTER TABLE tasks ADD COLUMN failure_reason TEXT;
 UPDATE tasks SET failure_reason = 'UNKNOWN' WHERE status = 'failed';
+"""
+
+# Migration from v11 to v12
+MIGRATION_V11_TO_V12 = """
+ALTER TABLE tasks ADD COLUMN skip_learnings INTEGER DEFAULT 0;
 """
 
 
@@ -378,6 +386,19 @@ class SqliteTaskStore:
                                 # Column might already exist
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (11,))
+                    current_version = 11
+
+                if current_version < 12:
+                    # Run migration v11 -> v12
+                    for stmt in MIGRATION_V11_TO_V12.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (12,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -423,6 +444,7 @@ class SqliteTaskStore:
             provider=row["provider"] if "provider" in row.keys() else None,
             merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
             failure_reason=row["failure_reason"] if "failure_reason" in row.keys() else None,
+            skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in row.keys() and row["skip_learnings"] is not None else False,
         )
 
     # === Task CRUD ===
@@ -440,16 +462,17 @@ class SqliteTaskStore:
         task_type_hint: str | None = None,
         model: str | None = None,
         provider: str | None = None,
+        skip_learnings: bool = False,
     ) -> Task:
         """Add a new task."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider),
+                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if skip_learnings else 0),
             )
             task_id = cur.lastrowid
             assert task_id is not None
@@ -505,7 +528,8 @@ class SqliteTaskStore:
                     model = ?,
                     provider = ?,
                     merge_status = ?,
-                    failure_reason = ?
+                    failure_reason = ?,
+                    skip_learnings = ?
                 WHERE id = ?
                 """,
                 (
@@ -538,6 +562,7 @@ class SqliteTaskStore:
                     task.provider,
                     task.merge_status,
                     task.failure_reason,
+                    1 if task.skip_learnings else 0,
                     task.id,
                 ),
             )
@@ -1085,6 +1110,7 @@ def add_task_interactive(
     task_type_hint: str | None = None,
     model: str | None = None,
     provider: str | None = None,
+    skip_learnings: bool = False,
 ) -> Task | None:
     """Interactively add a task using $EDITOR.
 
@@ -1123,6 +1149,7 @@ def add_task_interactive(
                 task_type_hint=task_type_hint,
                 model=model,
                 provider=provider,
+                skip_learnings=skip_learnings,
             )
 
         # Show errors and ask what to do

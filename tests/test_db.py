@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -625,7 +625,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -810,7 +810,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1078,12 +1078,12 @@ class TestMergeStatus:
         # Open with SqliteTaskStore to trigger migration
         store = SqliteTaskStore(db_path)
 
-        # Check schema version updated to 11
+        # Check schema version updated to 12
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1472,12 +1472,12 @@ class TestFailureReasonTracking:
         # Open with SqliteTaskStore to trigger migration
         store = SqliteTaskStore(db_path)
 
-        # Check schema version updated to 11
+        # Check schema version updated to 12
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)

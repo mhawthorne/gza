@@ -1900,6 +1900,44 @@ class TestAddCommandWithModelAndProvider:
         assert task.provider == "claude"
 
 
+class TestAddCommandWithNoLearnings:
+    """Tests for 'gza add' command with --no-learnings flag."""
+
+    def test_add_with_no_learnings_flag(self, tmp_path: Path):
+        """Add command with --no-learnings flag sets skip_learnings on task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza("add", "--no-learnings", "One-off experimental task", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify skip_learnings was set
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "One-off experimental task"), None)
+        assert task is not None
+        assert task.skip_learnings is True
+
+    def test_add_without_no_learnings_flag_defaults_false(self, tmp_path: Path):
+        """Add command without --no-learnings flag defaults skip_learnings to False."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza("add", "Normal task with learnings", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Normal task with learnings"), None)
+        assert task is not None
+        assert task.skip_learnings is False
+
+
 class TestEditCommandWithModelAndProvider:
     """Tests for 'gza edit' command with --model and --provider flags."""
 
