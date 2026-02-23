@@ -2583,6 +2583,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
+    skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -2641,6 +2642,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            skip_learnings=skip_learnings,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -2659,6 +2661,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            skip_learnings=skip_learnings,
         )
         if not new_task:
             return 1
@@ -2678,6 +2681,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            skip_learnings=skip_learnings,
         )
         print(f"✓ Added task #{task.id}")
         return 0
@@ -2741,6 +2745,13 @@ def cmd_edit(args: argparse.Namespace) -> int:
         task.provider = args.provider
         store.update(task)
         print(f"✓ Set provider override to '{args.provider}' for task #{task.id}")
+        return 0
+
+    # Handle --no-learnings flag
+    if hasattr(args, 'skip_learnings') and args.skip_learnings:
+        task.skip_learnings = True
+        store.update(task)
+        print(f"✓ Set skip_learnings for task #{task.id}")
         return 0
 
     if args.explore and args.task:
@@ -3409,6 +3420,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"Group: {task.group}")
     if task.spec:
         print(f"Spec: {task.spec}")
+    if task.skip_learnings:
+        print("Skip Learnings: yes")
     if task.branch:
         print(f"Branch: {task.branch}")
     if task.log_file:
@@ -3434,6 +3447,28 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"Stats: {stats_str}")
 
     return 0
+
+
+def cmd_learnings(args: argparse.Namespace) -> int:
+    """Handle learnings subcommands."""
+    config = Config.load(args.project_dir)
+    subcommand = args.learnings_command
+
+    if subcommand == "show":
+        learnings_path = config.project_dir / ".gza" / "learnings.md"
+        if not learnings_path.exists():
+            print("No learnings file found at .gza/learnings.md")
+            return 0
+        try:
+            content = learnings_path.read_text()
+        except OSError as e:
+            print(f"Error reading learnings file: {e}", file=sys.stderr)
+            return 1
+        print(content, end="")
+        return 0
+
+    print(f"Unknown learnings subcommand: {subcommand}", file=sys.stderr)
+    return 1
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -4107,6 +4142,12 @@ def main() -> int:
         choices=["claude", "codex", "gemini"],
         help="Override provider for this task (claude, codex, or gemini)",
     )
+    add_parser.add_argument(
+        "--no-learnings",
+        action="store_true",
+        dest="skip_learnings",
+        help="Skip injecting .gza/learnings.md context into this task's prompt",
+    )
     add_common_args(add_parser)
 
     # edit command
@@ -4165,7 +4206,26 @@ def main() -> int:
         choices=["claude", "codex", "gemini"],
         help="Set provider override for this task",
     )
+    edit_parser.add_argument(
+        "--no-learnings",
+        action="store_true",
+        dest="skip_learnings",
+        help="Skip injecting .gza/learnings.md context into this task's prompt",
+    )
     add_common_args(edit_parser)
+
+    # learnings command
+    learnings_parser = subparsers.add_parser("learnings", help="Manage project learnings")
+    learnings_subparsers = learnings_parser.add_subparsers(
+        dest="learnings_command",
+        metavar="SUBCOMMAND",
+    )
+    learnings_show_parser = learnings_subparsers.add_parser(
+        "show",
+        help="Display the current learnings file",
+    )
+    add_common_args(learnings_show_parser)
+    add_common_args(learnings_parser)
 
     # delete command
     delete_parser = subparsers.add_parser("delete", help="Delete a task")
@@ -4514,6 +4574,8 @@ def main() -> int:
             return cmd_force_complete(args)
         elif args.command == "mark-completed":
             return cmd_mark_completed(args)
+        elif args.command == "learnings":
+            return cmd_learnings(args)
         elif args.command == "claude-install-skills":
             return cmd_claude_install_skills(args)
     except ConfigError as e:

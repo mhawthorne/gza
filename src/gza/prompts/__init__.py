@@ -64,6 +64,16 @@ class PromptBuilder:
                     f"{spec_content}"
                 )
 
+        # Include learnings file if it exists and task doesn't opt out
+        if not task.skip_learnings:
+            learnings_path = config.project_dir / ".gza" / "learnings.md"
+            if learnings_path.exists():
+                try:
+                    learnings = learnings_path.read_text()
+                    base_prompt += f"\n\n## Accumulated Project Learnings\n\n{learnings}"
+                except OSError:
+                    pass
+
         # Add context from based_on chain (walk up the chain to find plan tasks)
         if task.based_on or task.task_type in ("implement", "review"):
             from gza.runner import _build_context_from_chain

@@ -1900,6 +1900,44 @@ class TestAddCommandWithModelAndProvider:
         assert task.provider == "claude"
 
 
+class TestAddCommandWithNoLearnings:
+    """Tests for 'gza add' command with --no-learnings flag."""
+
+    def test_add_with_no_learnings_flag(self, tmp_path: Path):
+        """Add command with --no-learnings flag sets skip_learnings on task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza("add", "--no-learnings", "One-off experimental task", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task" in result.stdout
+
+        # Verify skip_learnings was set
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "One-off experimental task"), None)
+        assert task is not None
+        assert task.skip_learnings is True
+
+    def test_add_without_no_learnings_flag_defaults_false(self, tmp_path: Path):
+        """Add command without --no-learnings flag defaults skip_learnings to False."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        result = run_gza("add", "Normal task with learnings", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Normal task with learnings"), None)
+        assert task is not None
+        assert task.skip_learnings is False
+
+
 class TestEditCommandWithModelAndProvider:
     """Tests for 'gza edit' command with --model and --provider flags."""
 
@@ -6475,3 +6513,85 @@ class TestMergeStatusTracking:
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Merge Status" not in result.stdout
+
+    def test_cmd_show_displays_skip_learnings(self, tmp_path: Path):
+        """gza show displays 'Skip Learnings: yes' when skip_learnings is True."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Test task with skip learnings", skip_learnings=True)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Skip Learnings: yes" in result.stdout
+
+    def test_cmd_show_no_skip_learnings_line_when_false(self, tmp_path: Path):
+        """gza show does not display Skip Learnings when skip_learnings is False."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Normal task")
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Skip Learnings" not in result.stdout
+
+
+class TestEditCommandWithNoLearnings:
+    """Tests for 'gza edit' command with --no-learnings flag."""
+
+    def test_edit_with_no_learnings_flag(self, tmp_path: Path):
+        """Edit command with --no-learnings sets skip_learnings on task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task without skip")
+        assert task.skip_learnings is False
+
+        result = run_gza("edit", str(task.id), "--no-learnings", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "skip_learnings" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.skip_learnings is True
+
+
+class TestLearningsCommand:
+    """Tests for 'gza learnings' command."""
+
+    def test_learnings_show_displays_content(self, tmp_path: Path):
+        """gza learnings show displays the learnings file content."""
+        setup_config(tmp_path)
+        gza_dir = tmp_path / ".gza"
+        gza_dir.mkdir(parents=True, exist_ok=True)
+        learnings_content = "# Project Learnings\n\n- Use pytest fixtures\n"
+        (gza_dir / "learnings.md").write_text(learnings_content)
+
+        result = run_gza("learnings", "show", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Project Learnings" in result.stdout
+        assert "Use pytest fixtures" in result.stdout
+
+    def test_learnings_show_no_file(self, tmp_path: Path):
+        """gza learnings show reports missing file gracefully."""
+        setup_config(tmp_path)
+
+        result = run_gza("learnings", "show", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No learnings file found" in result.stdout
