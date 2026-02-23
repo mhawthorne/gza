@@ -590,6 +590,7 @@ class TestResumeVerificationPrompt:
             mock_git._run.return_value = Mock(returncode=0)
             mock_git.branch_exists.return_value = True
             mock_git.worktree_add = Mock()
+            mock_git.worktree_list.return_value = []
 
             # Mock has_changes to return True
             mock_worktree_git = Mock()

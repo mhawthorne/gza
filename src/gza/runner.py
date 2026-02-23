@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import APP_NAME, Config
 from .console import console, task_header, stats_line, success_message, error_message, info_line, next_steps
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
-from .git import Git, GitError
+from .git import Git, GitError, cleanup_worktree_for_branch
 from .github import GitHub, GitHubError
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
@@ -772,7 +772,9 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
         # Check out existing branch in worktree
         try:
-            # Remove existing worktree if it exists
+            # Remove any existing worktree for this branch (may be at a different path
+            # from a previous task run), then also remove worktree at target path if present
+            cleanup_worktree_for_branch(git, branch_name, force=True)
             if worktree_path.exists():
                 git.worktree_remove(worktree_path, force=True)
 
