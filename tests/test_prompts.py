@@ -286,14 +286,19 @@ class TestPromptBuilderImproveTask:
 
     def test_improve_task_prompt_includes_review_id(self):
         """Test that improve task prompt references the review ID."""
-        result = PromptBuilder().improve_task_prompt(review_id=42)
+        result = PromptBuilder().improve_task_prompt(task_id=10, review_id=42)
         assert "42" in result
         assert "review" in result.lower()
 
+    def test_improve_task_prompt_includes_task_id(self):
+        """Test that improve task prompt references the task ID."""
+        result = PromptBuilder().improve_task_prompt(task_id=10, review_id=42)
+        assert "10" in result
+
     def test_improve_task_prompt_format(self):
         """Test the exact format of improve task prompt."""
-        result = PromptBuilder().improve_task_prompt(review_id=7)
-        assert result == "Improve implementation based on review #7"
+        result = PromptBuilder().improve_task_prompt(task_id=5, review_id=7)
+        assert result == "Improve implementation of task #5 based on review #7"
 
 
 class TestPromptBuilderReviewTask:
