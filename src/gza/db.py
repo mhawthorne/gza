@@ -1097,6 +1097,7 @@ def edit_prompt(
     initial_content: str = "",
     task_type: str = "task",
     based_on: int | None = None,
+    based_on_slug: str | None = None,
     spec: str | None = None,
     group: str | None = None,
     depends_on: int | None = None,
@@ -1135,7 +1136,10 @@ def edit_prompt(
     # Provide default prompt for implement tasks with based_on
     # This makes the slug unique by including the task ID
     if not initial_content and task_type == "implement" and based_on:
-        initial_content = f"Implement the plan from task #{based_on}"
+        if based_on_slug:
+            initial_content = f"Implement plan from task #{based_on}: {based_on_slug}"
+        else:
+            initial_content = f"Implement plan from task #{based_on}"
 
     content = template + "\n" + initial_content
 
@@ -1178,10 +1182,18 @@ def add_task_interactive(
 
     Returns the created task, or None if cancelled.
     """
+    # Look up slug from the based_on task's task_id (format: YYYYMMDD-slug)
+    based_on_slug = None
+    if based_on:
+        based_on_task = store.get(based_on)
+        if based_on_task and based_on_task.task_id:
+            based_on_slug = based_on_task.task_id[9:]  # Skip YYYYMMDD-
+
     while True:
         prompt = edit_prompt(
             task_type=task_type,
             based_on=based_on,
+            based_on_slug=based_on_slug,
             spec=spec,
             group=group,
             depends_on=depends_on,

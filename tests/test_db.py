@@ -1145,7 +1145,7 @@ class TestEditPromptDefaultContent:
                 content = f.read()
                 editor_content.append(content)
             # Verify the default prompt is present
-            assert "Implement the plan from task #42" in content
+            assert "Implement plan from task #42" in content
             # Return success without modifying the file
             class Result:
                 returncode = 0
@@ -1161,10 +1161,39 @@ class TestEditPromptDefaultContent:
 
         # Verify the default prompt was included in the editor
         assert len(editor_content) == 1
-        assert "Implement the plan from task #42" in editor_content[0]
+        assert "Implement plan from task #42" in editor_content[0]
 
         # Verify the result includes the default
-        assert result == "Implement the plan from task #42"
+        assert result == "Implement plan from task #42"
+
+    def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
+        """Test that edit_prompt includes the slug in the default prompt when provided."""
+        from gza.db import edit_prompt
+        import subprocess
+
+        editor_content = []
+
+        def mock_run_with_write(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                content = f.read()
+                editor_content.append(content)
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run_with_write)
+
+        result = edit_prompt(
+            initial_content="",
+            task_type="implement",
+            based_on=42,
+            based_on_slug="design-feature-x",
+        )
+
+        assert len(editor_content) == 1
+        assert "Implement plan from task #42: design-feature-x" in editor_content[0]
+        assert result == "Implement plan from task #42: design-feature-x"
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
@@ -1193,7 +1222,7 @@ class TestEditPromptDefaultContent:
 
         # Verify no default prompt was added for plan type
         assert len(editor_content) == 1
-        assert "Implement the plan from task #42" not in editor_content[0]
+        assert "Implement plan from task #42" not in editor_content[0]
 
         # Verify empty result since editor was "empty"
         assert result is None
@@ -1224,7 +1253,7 @@ class TestEditPromptDefaultContent:
 
         # Verify no default prompt was added
         assert len(editor_content) == 1
-        assert "Implement the plan from task #" not in editor_content[0]
+        assert "Implement plan from task #" not in editor_content[0]
         assert result is None
 
     def test_edit_prompt_preserves_custom_initial_content(self, tmp_path: Path, monkeypatch):
@@ -1258,6 +1287,38 @@ class TestEditPromptDefaultContent:
         # The default should NOT be added when initial_content is provided
         # (it's already in the content area, not overwritten)
         assert result == custom_content
+
+    def test_add_task_interactive_includes_slug_from_based_on(self, tmp_path: Path, monkeypatch):
+        """Test that add_task_interactive looks up the slug from the based_on task."""
+        from gza.db import add_task_interactive, SqliteTaskStore
+        import subprocess
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a plan task with a known task_id containing a slug
+        plan_task = store.add(prompt="Design feature X", task_type="plan")
+        plan_task.task_id = "20260223-design-feature-x"
+        store.update(plan_task)
+
+        editor_content = []
+
+        def mock_run(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, 'r') as f:
+                content = f.read()
+                editor_content.append(content)
+            class Result:
+                returncode = 0
+            return Result()
+
+        monkeypatch.setattr(subprocess, 'run', mock_run)
+
+        add_task_interactive(store, task_type="implement", based_on=plan_task.id)
+
+        assert len(editor_content) == 1
+        assert "Implement plan from task #" in editor_content[0]
+        assert "design-feature-x" in editor_content[0]
 
 
 class TestFailureReasonTracking:
