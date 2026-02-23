@@ -3799,6 +3799,247 @@ class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return format
 
 
+def _determine_advance_action(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    task: DbTask,
+    current_branch: str,
+) -> dict:
+    """Determine the next action needed to advance a task.
+
+    Returns a dict with:
+        type: action type ('merge', 'create_review', 'improve', 'needs_rebase',
+                           'wait_review', 'wait_improve', 'needs_discussion', 'skip')
+        description: human-readable description of the action
+        review_task: (optional) the review task involved
+    """
+    assert task.id is not None
+
+    # Check for merge conflicts first
+    if task.branch and not git.can_merge(task.branch, current_branch):
+        return {
+            'type': 'needs_rebase',
+            'description': 'SKIP: needs manual rebase (conflicts detected)',
+        }
+
+    # Check review state
+    reviews = store.get_reviews_for_task(task.id)
+
+    if reviews:
+        latest_review = reviews[0]
+
+        # Determine if the review has been cleared by a subsequent improve task
+        review_cleared = (
+            task.review_cleared_at is not None
+            and latest_review.completed_at is not None
+            and task.review_cleared_at >= latest_review.completed_at
+        )
+
+        if not review_cleared:
+            # Active (non-cleared) review exists
+            if latest_review.status in ('pending', 'in_progress'):
+                return {
+                    'type': 'wait_review',
+                    'description': f'SKIP: review #{latest_review.id} is {latest_review.status}',
+                    'review_task': latest_review,
+                }
+
+            verdict = get_review_verdict(config, latest_review)
+            if verdict == 'APPROVED':
+                return {
+                    'type': 'merge',
+                    'description': 'Merge (review APPROVED)',
+                    'review_task': latest_review,
+                }
+            elif verdict == 'CHANGES_REQUESTED':
+                # Check if an improve task is already pending/in_progress
+                assert latest_review.id is not None
+                existing_improve = store.get_improve_tasks_for(task.id, latest_review.id)
+                active_improve = [t for t in existing_improve if t.status in ('pending', 'in_progress')]
+                if active_improve:
+                    return {
+                        'type': 'wait_improve',
+                        'description': f'SKIP: improve task #{active_improve[0].id} already {active_improve[0].status}',
+                    }
+                return {
+                    'type': 'improve',
+                    'description': 'Create improve task (review CHANGES_REQUESTED)',
+                    'review_task': latest_review,
+                }
+            else:
+                return {
+                    'type': 'needs_discussion',
+                    'description': f'SKIP: review verdict is {verdict or "unknown"}, needs manual attention',
+                    'review_task': latest_review,
+                }
+
+    # No reviews, or review was cleared by improve — create a new review
+    return {
+        'type': 'create_review',
+        'description': 'Create review task' + (' (previous review addressed)' if reviews else ' (no review yet)'),
+    }
+
+
+def cmd_advance(args: argparse.Namespace) -> int:
+    """Intelligently progress unmerged tasks through their lifecycle."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    dry_run: bool = args.dry_run
+    max_tasks: int | None = getattr(args, 'max', None)
+    task_id: int | None = getattr(args, 'task_id', None)
+
+    # Determine which tasks to advance
+    if task_id is not None:
+        task = store.get(task_id)
+        if not task:
+            print(f"Error: Task #{task_id} not found")
+            return 1
+        if task.status != 'completed':
+            print(f"Error: Task #{task_id} is not completed (status: {task.status})")
+            return 1
+        if task.merge_status == 'merged':
+            print(f"Task #{task_id} is already merged")
+            return 0
+        tasks = [task]
+    else:
+        # Get all unmerged completed tasks
+        all_unmerged = store.get_unmerged()
+        tasks = [t for t in all_unmerged if t.status == 'completed']
+
+    if not tasks:
+        print("No eligible tasks to advance")
+        return 0
+
+    # Apply --max limit
+    if max_tasks is not None:
+        tasks = tasks[:max_tasks]
+
+    # Get current branch for merge operations
+    current_branch = git.current_branch()
+
+    # Analyze each task to determine the next action
+    plan: list[tuple[DbTask, dict]] = []
+    for task in tasks:
+        action = _determine_advance_action(config, store, git, task, current_branch)
+        plan.append((task, action))
+
+    if dry_run:
+        print(f"Would advance {len(plan)} task(s):\n")
+        for task, action in plan:
+            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+            print(f"  #{task.id} {prompt_display}")
+            print(f"      → {action['description']}")
+            print()
+        return 0
+
+    # Execute actions
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+
+    for task, action in plan:
+        assert task.id is not None
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        action_type = action['type']
+
+        if action_type in ('needs_rebase', 'wait_review', 'wait_improve', 'needs_discussion', 'skip'):
+            print(f"  #{task.id} {prompt_display}")
+            print(f"      {action['description']}")
+            skip_count += 1
+            continue
+
+        print(f"  #{task.id} {prompt_display}")
+        print(f"      → {action['description']}")
+
+        if action_type == 'merge':
+            # Build a minimal args namespace for _merge_single_task
+            merge_args = argparse.Namespace(
+                rebase=False,
+                squash=False,
+                delete=False,
+                mark_only=False,
+                remote=False,
+                resolve=False,
+            )
+            rc = _merge_single_task(task.id, config, store, git, merge_args, current_branch)
+            if rc == 0:
+                print(f"      ✓ Merged")
+                success_count += 1
+            else:
+                error_count += 1
+
+        elif action_type == 'create_review':
+            if task.task_type != 'implement':
+                print(f"      SKIP: cannot create review for task type '{task.task_type}'")
+                skip_count += 1
+                continue
+
+            # Check for an already-pending/in_progress review
+            existing_reviews = store.get_reviews_for_task(task.id)
+            active_reviews = [r for r in existing_reviews if r.status in ('pending', 'in_progress')]
+            if active_reviews:
+                print(f"      SKIP: review #{active_reviews[0].id} is already {active_reviews[0].status}")
+                skip_count += 1
+                continue
+
+            from .prompts import PromptBuilder
+            review_prompt = PromptBuilder().review_task_prompt(task.id, task.prompt)
+            review_task = store.add(
+                prompt=review_prompt,
+                task_type='review',
+                depends_on=task.id,
+                group=task.group,
+                based_on=task.based_on,
+            )
+            print(f"      ✓ Created review task #{review_task.id}")
+
+            # Spawn background worker to run the review
+            assert review_task.id is not None
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+                task_ids=[review_task.id],
+            )
+            _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            print(f"      ✓ Started review worker")
+            success_count += 1
+
+        elif action_type == 'improve':
+            review_task = action['review_task']
+            assert review_task.id is not None
+
+            from .prompts import PromptBuilder
+            improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task.id)
+            improve_task = store.add(
+                prompt=improve_prompt,
+                task_type='improve',
+                depends_on=review_task.id,
+                based_on=task.id,
+                same_branch=True,
+                group=task.group,
+            )
+            print(f"      ✓ Created improve task #{improve_task.id}")
+
+            # Spawn background worker to run the improve task
+            assert improve_task.id is not None
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+                task_ids=[improve_task.id],
+            )
+            _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            print(f"      ✓ Started improve worker")
+            success_count += 1
+
+        print()
+
+    print(f"Advanced: {success_count} task(s), skipped: {skip_count}, errors: {error_count}")
+    return 0 if error_count == 0 else 1
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add common arguments to a subparser."""
     parser.add_argument(
@@ -3908,6 +4149,43 @@ def main() -> int:
         "--all",
         action="store_true",
         help="Include failed tasks and check git directly for commits instead of trusting has_commits",
+    )
+
+    # advance command
+    advance_parser = subparsers.add_parser(
+        "advance",
+        help="Intelligently progress unmerged tasks through their lifecycle",
+    )
+    add_common_args(advance_parser)
+    advance_parser.add_argument(
+        "task_id",
+        type=int,
+        nargs="?",
+        metavar="task_id",
+        help="Specific task ID to advance (omit to advance all eligible tasks)",
+    )
+    advance_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Advance all eligible unmerged tasks (default behavior when no task_id given)",
+    )
+    advance_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Preview actions without executing them",
+    )
+    advance_parser.add_argument(
+        "--max",
+        type=int,
+        metavar="N",
+        dest="max",
+        help="Limit the number of tasks to advance",
+    )
+    advance_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run workers directly instead of in Docker",
     )
 
     # refresh command
@@ -4623,6 +4901,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
+        elif args.command == "advance":
+            return cmd_advance(args)
         elif args.command == "refresh":
             return cmd_refresh(args)
         elif args.command == "merge":

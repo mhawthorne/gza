@@ -7159,3 +7159,345 @@ class TestRefreshCommand:
 
         assert result.returncode == 0
         assert "Refreshed 2 task(s)" in result.stdout
+
+
+class TestAdvanceCommand:
+    """Tests for 'gza advance' command."""
+
+    def _setup_git_repo(self, tmp_path: Path):
+        """Initialize a git repo in tmp_path with an initial commit on main."""
+        from gza.git import Git
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+        return git
+
+    def _create_implement_task_with_branch(self, store, git, tmp_path, prompt="Implement feature"):
+        """Create a completed implement task with a real git branch."""
+        task = store.add(prompt, task_type="implement")
+        branch = f"feat/task-{task.id}"
+
+        # Create the branch with a commit
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Add feature for task {task.id}")
+        git._run("checkout", "main")
+
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        return task
+
+    def test_advance_no_eligible_tasks(self, tmp_path: Path):
+        """advance command reports no tasks when none are eligible."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        SqliteTaskStore(db_path)  # create empty db
+
+        self._setup_git_repo(tmp_path)
+
+        result = run_gza("advance", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "No eligible tasks" in result.stdout
+
+    def test_advance_dry_run_shows_actions(self, tmp_path: Path):
+        """advance --dry-run shows planned actions without executing."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Would advance" in result.stdout
+        assert str(task.id) in result.stdout
+
+    def test_advance_merges_approved_task(self, tmp_path: Path):
+        """advance merges a task whose review is APPROVED."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a completed review task with APPROVED verdict
+        review_prompt = f"Review implementation #{task.id}"
+        review_task = store.add(
+            review_prompt,
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: APPROVED**\n\nLooks good!"
+        store.update(review_task)
+
+        result = run_gza("advance", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Merged" in result.stdout or "merged" in result.stdout
+
+        # Verify merge status updated
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "merged"
+
+    def test_advance_skips_task_with_conflicts(self, tmp_path: Path):
+        """advance skips a task whose branch has merge conflicts."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a branch that conflicts with main
+        branch = "feat/conflicting"
+        git._run("checkout", "-b", branch)
+        (tmp_path / "README.md").write_text("feature version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Conflict commit")
+        git._run("checkout", "main")
+
+        # Modify same file on main to create a conflict
+        (tmp_path / "README.md").write_text("main version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Main change")
+
+        task = store.add("Conflicting feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        result = run_gza("advance", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "needs" in result.stdout.lower() and "rebase" in result.stdout.lower()
+
+        # Task should still be unmerged
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.merge_status == "unmerged"
+
+    def test_advance_creates_review_for_task_without_review(self, tmp_path: Path):
+        """advance creates a review task for a completed task with no review."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            max=None,
+            no_docker=True,
+        )
+
+        # Patch _spawn_background_worker to avoid actually spawning processes
+        with patch("gza.cli._spawn_background_worker", return_value=0):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+
+        # Verify review task was created
+        reviews = store.get_reviews_for_task(task.id)
+        assert len(reviews) == 1
+        assert reviews[0].task_type == "review"
+
+    def test_advance_creates_improve_for_changes_requested(self, tmp_path: Path):
+        """advance creates an improve task when review is CHANGES_REQUESTED."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a review with CHANGES_REQUESTED
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix the tests."
+        store.update(review_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            max=None,
+            no_docker=True,
+        )
+
+        # Patch _spawn_background_worker to avoid actually spawning processes
+        with patch("gza.cli._spawn_background_worker", return_value=0):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+
+        # Verify improve task was created
+        improve_tasks = store.get_improve_tasks_for(task.id, review_task.id)
+        assert len(improve_tasks) == 1
+        assert improve_tasks[0].task_type == "improve"
+
+    def test_advance_single_task_id(self, tmp_path: Path):
+        """advance with a specific task ID only advances that task."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task1 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature A")
+        task2 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature B")
+
+        # Give task1 an approved review so it can merge
+        review = store.add(f"Review #{task1.id}", task_type="review", depends_on=task1.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        # Advance only task1
+        result = run_gza("advance", str(task1.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        # task1 should be merged, task2 should still be unmerged
+        assert store.get(task1.id).merge_status == "merged"
+        assert store.get(task2.id).merge_status == "unmerged"
+
+    def test_advance_max_limits_batch(self, tmp_path: Path):
+        """advance --max N limits the number of tasks processed."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task1 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature A")
+        task2 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature B")
+        task3 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature C")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            max=2,
+            no_docker=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", return_value=0):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        # Only 2 review tasks should have been created (not 3)
+        all_reviews = (
+            store.get_reviews_for_task(task1.id)
+            + store.get_reviews_for_task(task2.id)
+            + store.get_reviews_for_task(task3.id)
+        )
+        assert len(all_reviews) == 2
+
+    def test_advance_skips_pending_review(self, tmp_path: Path):
+        """advance skips a task whose review is still pending."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a pending review
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        # review_task.status is 'pending' by default
+
+        result = run_gza("advance", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "SKIP" in result.stdout
+        assert "pending" in result.stdout
+
+    def test_advance_task_not_found(self, tmp_path: Path):
+        """advance with non-existent task ID returns error."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        SqliteTaskStore(db_path)  # create db
+        self._setup_git_repo(tmp_path)
+
+        result = run_gza("advance", "9999", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "not found" in result.stdout
+
+    def test_advance_dry_run_does_not_modify_state(self, tmp_path: Path):
+        """advance --dry-run does not modify task state or create tasks."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Add approved review so action would be merge
+        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Would advance" in result.stdout
+
+        # Task should still be unmerged
+        updated_task = store.get(task.id)
+        assert updated_task.merge_status == "unmerged"
