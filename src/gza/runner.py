@@ -979,6 +979,12 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             diff_lines_removed=diff_removed,
         )
 
+        # Clear review state on the based_on implementation task after improve completes.
+        # The improve task has addressed the review feedback, so the old review no longer
+        # reflects the current code state.
+        if task.task_type == "improve" and task.based_on:
+            store.clear_review_state(task.based_on)
+
         console.print("")
         success_message("Done")
         stats_line(stats, has_commits=True)

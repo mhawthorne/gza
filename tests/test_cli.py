@@ -5415,6 +5415,183 @@ This requires team discussion.
         assert "✓ approved" in result.stdout
         assert "⚠ changes requested" not in result.stdout
 
+    def test_unmerged_hides_review_status_after_improve_clears_it(self, tmp_path: Path):
+        """After improve task clears review state, review status is not shown."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        # Create initial commit
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create implementation task
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        # Create branch with commit
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create review task with changes requested
+        review = store.add("Review implementation", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.depends_on = task.id
+        review.task_id = "20260212-review-implementation"
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        # Before improve: should show changes requested
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" in result.stdout
+
+        # Simulate improve task completing (clear review state)
+        time.sleep(0.01)
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        # After improve: review status should be gone
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" not in result.stdout
+        assert "approved" not in result.stdout
+
+    def test_unmerged_shows_new_review_status_after_improve_and_re_review(self, tmp_path: Path):
+        """After improve clears review state, a newer review's verdict is shown."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create implementation task
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Create first review (changes requested)
+        review1 = store.add("Review", task_type="review")
+        review1.status = "completed"
+        review1.completed_at = datetime.now(timezone.utc)
+        review1.depends_on = task.id
+        review1.task_id = "20260212-review"
+        review1.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review1)
+
+        # Improve task runs, clearing the review state
+        time.sleep(0.01)
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        # A new review runs after the improve, resulting in approved
+        time.sleep(0.01)
+        review2 = store.add("Second review", task_type="review")
+        review2.status = "completed"
+        review2.completed_at = datetime.now(timezone.utc)
+        review2.depends_on = task.id
+        review2.task_id = "20260212-second-review"
+        review2.output_content = "**Verdict: APPROVED**"
+        store.update(review2)
+
+        # The new review's verdict should be shown (it's newer than review_cleared_at)
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "✓ approved" in result.stdout
+        assert "⚠ changes requested" not in result.stdout
+
+
+class TestClearReviewState:
+    """Tests for SqliteTaskStore.clear_review_state()."""
+
+    def test_clear_review_state_sets_review_cleared_at(self, tmp_path: Path):
+        """clear_review_state sets review_cleared_at on the task."""
+        from gza.db import SqliteTaskStore
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.review_cleared_at is None
+
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.review_cleared_at is not None
+
+    def test_clear_review_state_updates_timestamp_on_re_clear(self, tmp_path: Path):
+        """Calling clear_review_state twice updates the timestamp."""
+        from gza.db import SqliteTaskStore
+        import time
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+
+        store.clear_review_state(task.id)
+        first = store.get(task.id)
+        assert first is not None
+        first_cleared = first.review_cleared_at
+
+        time.sleep(0.01)
+        store.clear_review_state(task.id)
+        second = store.get(task.id)
+        assert second is not None
+
+        assert second.review_cleared_at is not None
+        assert first_cleared is not None
+        assert second.review_cleared_at > first_cleared
+
 
 class TestUnmergedAllFlag:
     """Tests for 'gza unmerged --all' flag."""

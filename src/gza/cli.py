@@ -713,16 +713,23 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if reviews:
             # Get the most recent review (first in the list, as they're ordered by created_at DESC)
             latest_review = reviews[0]
-            verdict = get_review_verdict(config, latest_review)
-            if verdict == "APPROVED":
-                review_status = "✓ approved"
-                review_status_color = UNMERGED_COLORS["review_approved"]
-            elif verdict == "CHANGES_REQUESTED":
-                review_status = "⚠ changes requested"
-                review_status_color = UNMERGED_COLORS["review_changes"]
-            elif verdict == "NEEDS_DISCUSSION":
-                review_status = "💬 needs discussion"
-                review_status_color = UNMERGED_COLORS["review_discussion"]
+            # If an improve task has run after this review, the review is stale — skip it.
+            review_cleared = (
+                root_task.review_cleared_at is not None
+                and latest_review.completed_at is not None
+                and root_task.review_cleared_at >= latest_review.completed_at
+            )
+            if not review_cleared:
+                verdict = get_review_verdict(config, latest_review)
+                if verdict == "APPROVED":
+                    review_status = "✓ approved"
+                    review_status_color = UNMERGED_COLORS["review_approved"]
+                elif verdict == "CHANGES_REQUESTED":
+                    review_status = "⚠ changes requested"
+                    review_status_color = UNMERGED_COLORS["review_changes"]
+                elif verdict == "NEEDS_DISCUSSION":
+                    review_status = "💬 needs discussion"
+                    review_status_color = UNMERGED_COLORS["review_discussion"]
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""

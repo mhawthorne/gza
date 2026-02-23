@@ -56,6 +56,7 @@ class Task:
     diff_files_changed: int | None = None  # Files changed vs. main (v13)
     diff_lines_added: int | None = None    # Lines added vs. main (v13)
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
+    review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -78,7 +79,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -134,7 +135,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Diff stats vs. main branch (v13)
     diff_files_changed INTEGER,
     diff_lines_added INTEGER,
-    diff_lines_removed INTEGER
+    diff_lines_removed INTEGER,
+    -- Review state cleared by improve task (v14)
+    review_cleared_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -217,6 +220,11 @@ MIGRATION_V12_TO_V13 = """
 ALTER TABLE tasks ADD COLUMN diff_files_changed INTEGER;
 ALTER TABLE tasks ADD COLUMN diff_lines_added INTEGER;
 ALTER TABLE tasks ADD COLUMN diff_lines_removed INTEGER;
+"""
+
+# Migration from v13 to v14
+MIGRATION_V13_TO_V14 = """
+ALTER TABLE tasks ADD COLUMN review_cleared_at TEXT;
 """
 
 
@@ -426,6 +434,19 @@ class SqliteTaskStore:
                                 # Column might already exist
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (13,))
+                    current_version = 13
+
+                if current_version < 14:
+                    # Run migration v13 -> v14
+                    for stmt in MIGRATION_V13_TO_V14.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (14,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -475,6 +496,7 @@ class SqliteTaskStore:
             diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
+            review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in row.keys() and row["review_cleared_at"] else None,
         )
 
     # === Task CRUD ===
@@ -562,7 +584,8 @@ class SqliteTaskStore:
                     skip_learnings = ?,
                     diff_files_changed = ?,
                     diff_lines_added = ?,
-                    diff_lines_removed = ?
+                    diff_lines_removed = ?,
+                    review_cleared_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -599,6 +622,7 @@ class SqliteTaskStore:
                     task.diff_files_changed,
                     task.diff_lines_added,
                     task.diff_lines_removed,
+                    task.review_cleared_at.isoformat() if task.review_cleared_at else None,
                     task.id,
                 ),
             )
@@ -771,6 +795,25 @@ class SqliteTaskStore:
                 (merge_status, task_id),
             )
 
+    def clear_review_state(self, task_id: int) -> None:
+        """Clear the review state on an implementation task.
+
+        Called when an improve task completes, to indicate that the previous
+        review's feedback has been addressed. Sets review_cleared_at to now.
+
+        Note: This is called whenever an improve task completes with commits.
+        It cannot verify whether the improve task actually addressed the review
+        feedback in a meaningful way — it only records that an improve task ran.
+
+        If task_id does not exist, this is a no-op (no error is raised).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET review_cleared_at = ? WHERE id = ?",
+                (now, task_id),
+            )
+
     def get_all(self) -> list[Task]:
         """Get all tasks."""
         with self._connect() as conn:
@@ -778,13 +821,19 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_reviews_for_task(self, task_id: int) -> list[Task]:
-        """Get all review tasks that depend on the given task, ordered by created_at DESC."""
+        """Get all review tasks that depend on the given task, ordered by completed_at DESC.
+
+        Reviews are ordered by completed_at so that the most recently completed
+        review is first (reviews[0]). Incomplete reviews (completed_at IS NULL) sort
+        last. This ensures the staleness check in cmd_unmerged compares against the
+        review that completed most recently, not merely the one created most recently.
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
                 WHERE task_type = 'review' AND depends_on = ?
-                ORDER BY created_at DESC
+                ORDER BY completed_at DESC NULLS LAST
                 """,
                 (task_id,),
             )
