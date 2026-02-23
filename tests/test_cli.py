@@ -1440,6 +1440,29 @@ class TestPrCommand:
         assert result.returncode == 1
         assert "no commits" in result.stdout
 
+    def test_pr_task_marked_merged_shows_distinct_error(self, tmp_path: Path):
+        """PR command shows a distinct error message for tasks marked merged via --mark-only."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Mark-only merged task")
+        task.status = "completed"
+        task.branch = "feature/mark-only-pr"
+        task.has_commits = True
+        task.merge_status = "merged"
+        store.update(task)
+
+        result = run_gza("pr", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "already marked as merged" in result.stdout
+        # Should NOT say "merged into" since the branch was not actually merged
+        assert "merged into" not in result.stdout
+
 
 class TestGroupsCommand:
     """Tests for 'gza groups' command."""

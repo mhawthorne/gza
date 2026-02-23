@@ -1492,6 +1492,11 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print(f"Error: Task #{task.id} has no commits")
         return 1
 
+    # Check merge_status before requiring gh (local DB check, no external dependencies)
+    if task.merge_status == "merged":
+        print(f"Error: Task #{task.id} is already marked as merged")
+        return 1
+
     # Check gh CLI is available (after task validation so tests can run without gh)
     if not gh.is_available():
         print("Error: GitHub CLI (gh) is not installed or not authenticated")
@@ -1501,8 +1506,8 @@ def cmd_pr(args: argparse.Namespace) -> int:
 
     default_branch = git.default_branch()
 
-    # Check branch is not already merged
-    if task.merge_status == "merged" or git.is_merged(task.branch, default_branch):
+    # Check branch is not actually merged into default branch
+    if git.is_merged(task.branch, default_branch):
         print(f"Error: Branch '{task.branch}' is already merged into {default_branch}")
         return 1
 
@@ -3935,7 +3940,7 @@ def main() -> int:
     merge_parser.add_argument(
         "--mark-only",
         action="store_true",
-        help="Mark the branch as merged without performing actual merge (deletes the branch)",
+        help="Mark the task as merged in the database without performing an actual git merge (branch is preserved)",
     )
     merge_parser.add_argument(
         "--resolve",
