@@ -638,20 +638,25 @@ class SqliteTaskStore:
     def get_next_pending(self) -> Task | None:
         """Get the next pending task (oldest first), skipping blocked tasks.
 
-        A task is blocked if it depends on another task that is not completed.
+        A task is unblocked when its dependency is completed OR when its
+        dependency is failed but a completed retry exists anywhere in the
+        based_on chain.
         """
         with self._connect() as conn:
             cur = conn.execute(
                 """
+                WITH RECURSIVE successful_ancestors(id) AS (
+                    SELECT id FROM tasks WHERE status = 'completed'
+                    UNION ALL
+                    SELECT t2.based_on FROM tasks t2
+                    JOIN successful_ancestors sa ON t2.id = sa.id
+                    WHERE t2.based_on IS NOT NULL
+                )
                 SELECT t.* FROM tasks t
                 WHERE t.status = 'pending'
                 AND (
                     t.depends_on IS NULL
-                    OR EXISTS (
-                        SELECT 1 FROM tasks dep
-                        WHERE dep.id = t.depends_on
-                        AND dep.status = 'completed'
-                    )
+                    OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
                 ORDER BY t.created_at ASC
                 LIMIT 1
@@ -676,15 +681,18 @@ class SqliteTaskStore:
                 # Find next pending task
                 cur = conn.execute(
                     """
+                    WITH RECURSIVE successful_ancestors(id) AS (
+                        SELECT id FROM tasks WHERE status = 'completed'
+                        UNION ALL
+                        SELECT t2.based_on FROM tasks t2
+                        JOIN successful_ancestors sa ON t2.id = sa.id
+                        WHERE t2.based_on IS NOT NULL
+                    )
                     SELECT t.* FROM tasks t
                     WHERE t.status = 'pending'
                     AND (
                         t.depends_on IS NULL
-                        OR EXISTS (
-                            SELECT 1 FROM tasks dep
-                            WHERE dep.id = t.depends_on
-                            AND dep.status = 'completed'
-                        )
+                        OR t.depends_on IN (SELECT id FROM successful_ancestors)
                     )
                     ORDER BY t.created_at ASC
                     LIMIT 1
@@ -933,8 +941,37 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def _find_successful_retry(self, task_id: int) -> bool:
+        """Check if any completed task exists in the retry chain rooted at task_id.
+
+        Follows based_on links forward (task_id → retries → retries of retries)
+        and returns True if any task in that tree has status='completed'.
+        No data is mutated; this is a read-only query-time check.
+        """
+        visited: set[int] = set()
+        queue = [task_id]
+        while queue:
+            current_id = queue.pop(0)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT id, status FROM tasks WHERE based_on = ?",
+                    (current_id,),
+                )
+                for row in cur.fetchall():
+                    if row["status"] == "completed":
+                        return True
+                    queue.append(row["id"])
+        return False
+
     def is_task_blocked(self, task: Task) -> tuple[bool, int | None, str | None]:
         """Check if a task is blocked by an incomplete dependency.
+
+        When the direct dependency has failed, follows the retry chain (via
+        based_on) to see if a subsequent retry succeeded.  If so, the task is
+        treated as unblocked.
 
         Returns:
             Tuple of (is_blocked, blocking_task_id, blocking_task_status)
@@ -949,21 +986,32 @@ class SqliteTaskStore:
         if dep.status == "completed":
             return (False, None, None)
 
+        if dep.status == "failed" and self._find_successful_retry(dep.id):
+            return (False, None, None)
+
         return (True, dep.id, dep.status)
 
     def count_blocked_tasks(self) -> int:
-        """Count pending tasks that are blocked by dependencies."""
+        """Count pending tasks that are blocked by dependencies.
+
+        A task is unblocked (and therefore not counted) if its dependency is
+        completed OR if the dependency is failed but a completed retry exists
+        anywhere in the based_on chain.
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """
+                WITH RECURSIVE successful_ancestors(id) AS (
+                    SELECT id FROM tasks WHERE status = 'completed'
+                    UNION ALL
+                    SELECT t2.based_on FROM tasks t2
+                    JOIN successful_ancestors sa ON t2.id = sa.id
+                    WHERE t2.based_on IS NOT NULL
+                )
                 SELECT COUNT(*) as count FROM tasks t
                 WHERE t.status = 'pending'
                 AND t.depends_on IS NOT NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM tasks dep
-                    WHERE dep.id = t.depends_on
-                    AND dep.status = 'completed'
-                )
+                AND t.depends_on NOT IN (SELECT id FROM successful_ancestors)
                 """
             )
             row = cur.fetchone()
