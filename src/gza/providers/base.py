@@ -37,6 +37,7 @@ RUN npm install -g {npm_package}
 
 RUN useradd -m -s /bin/bash gza
 USER gza
+ENV PATH="/usr/local/bin:/usr/bin:/bin:/home/gza/.local/bin"
 WORKDIR /home/gza
 
 CMD ["{cli_command}"]
