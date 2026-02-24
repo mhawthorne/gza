@@ -218,6 +218,70 @@ gza improve 2  # Runs immediately, commits include "Gza-Review: #3" trailer
 gza review 2  # New review auto-posts to PR
 ```
 
+## Building Skills
+
+Gza skills are Claude Code skills that agents can invoke during task execution. Here's how to author and ship them.
+
+### Where Skills Live
+
+Skills are authored as `SKILL.md` files in the package source:
+
+```
+src/gza/skills/<skill-name>/SKILL.md
+```
+
+For example: `src/gza/skills/gza-task-add/SKILL.md`
+
+When gza is installed, the `skills/` directory is included as package data. There is **no registry to update** — adding a new directory under `src/gza/skills/` with a `SKILL.md` file is sufficient for it to be discovered automatically.
+
+### Installing Skills into a Project
+
+Skills are installed to `.claude/skills/` in the target project via:
+
+```bash
+gza claude-install-skills
+```
+
+This copies skills from the installed gza package into the project's `.claude/skills/` directory, where Claude Code picks them up.
+
+### SKILL.md Frontmatter Fields
+
+Each `SKILL.md` begins with YAML frontmatter:
+
+```yaml
+---
+name: gza-task-add
+description: Create a well-formed gza task with appropriate type, group, and prompt
+allowed-tools: Read, Bash(uv run gza add:*), AskUserQuestion
+version: 1.0.0
+public: true
+---
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Skill identifier, must match the directory name |
+| `description` | Yes | Short description shown in skill listings |
+| `allowed-tools` | Yes | Comma-separated list of tools the skill may use |
+| `version` | Yes | Semantic version string |
+| `public` | No | Set to `true` to expose the skill via `claude-install-skills`. Defaults to `false` |
+
+### Public vs. Private Skills
+
+The `public` field controls which skills are exposed to end users:
+
+- **`public: true`** — Skill is included when running `gza claude-install-skills`
+- **`public: false` (or omitted)** — Skill is internal/developer-only and not installed by default
+
+The function `get_available_skills(public_only=True)` in `src/gza/skills_utils.py` is what `claude-install-skills` uses to determine which skills to expose.
+
+### Adding a New Skill
+
+1. Create a directory: `src/gza/skills/<your-skill-name>/`
+2. Create `SKILL.md` with required frontmatter and skill instructions
+3. Set `public: true` if the skill should be user-facing
+4. The skill is automatically discovered — no registry update needed
+
 ## Development
 
 After making changes, run the test suite to verify everything works:
