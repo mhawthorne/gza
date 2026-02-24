@@ -59,6 +59,10 @@ SUMMARY_DIR = f".{APP_NAME}/summaries"
 WIP_DIR = f".{APP_NAME}/wip"
 BACKUP_DIR = f".{APP_NAME}/backups"
 
+# Diff size thresholds for tiered diff strategy in review prompts
+DIFF_SMALL_THRESHOLD = 500   # lines: pass verbatim
+DIFF_MEDIUM_THRESHOLD = 2000  # lines: prepend --stat summary above full diff
+
 
 def backup_database(db_path: Path, project_dir: Path) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
@@ -268,14 +272,41 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
                         spec_content = spec_path.read_text()
                         context_parts.append(f"## Specification\n\nThe following specification file ({impl_task.spec}) provides context for this implementation:\n\n{spec_content}")
 
-                # Get diff if we have a branch
+                # Get diff if we have a branch (tiered strategy based on diff size)
                 if impl_task.branch and git:
                     try:
                         default_branch = git.default_branch()
-                        diff_content = git.get_diff(f"{default_branch}...{impl_task.branch}")
-                        if diff_content:
-                            context_parts.append(f"Implementation branch: {impl_task.branch}")
-                            context_parts.append(f"\nChanges:\n{diff_content}")
+                        revision_range = f"{default_branch}...{impl_task.branch}"
+                        numstat_output = git.get_diff_numstat(revision_range)
+                        _, lines_added, lines_removed = parse_diff_numstat(numstat_output)
+                        total_lines = lines_added + lines_removed
+
+                        context_parts.append(f"Implementation branch: {impl_task.branch}")
+
+                        if total_lines < DIFF_SMALL_THRESHOLD:
+                            # Small diff: pass verbatim
+                            diff_content = git.get_diff(revision_range)
+                            if diff_content:
+                                context_parts.append(f"\nChanges:\n{diff_content}")
+                        elif total_lines < DIFF_MEDIUM_THRESHOLD:
+                            # Medium diff: prepend --stat summary above full diff
+                            stat_summary = git.get_diff_stat(revision_range)
+                            diff_content = git.get_diff(revision_range)
+                            if diff_content:
+                                context_parts.append(f"\nDiff summary:\n{stat_summary}")
+                                context_parts.append(f"\nChanges:\n{diff_content}")
+                            elif stat_summary:
+                                context_parts.append(f"\nDiff summary:\n{stat_summary}")
+                        else:
+                            # Large diff: stat summary only, instruct model to use tools
+                            stat_summary = git.get_diff_stat(revision_range)
+                            if stat_summary:
+                                context_parts.append(f"\nDiff summary:\n{stat_summary}")
+                            context_parts.append(
+                                f"\nThe diff is too large to include inline ({total_lines} lines changed). "
+                                f"Use git and file reading tools to review the changes on the implementation "
+                                f"branch '{impl_task.branch}' directly."
+                            )
                     except GitError:
                         pass  # Ignore git errors
 

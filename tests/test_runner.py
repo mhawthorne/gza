@@ -513,6 +513,8 @@ class TestReviewNextSteps:
         mock_git = Mock()
         mock_git.default_branch.return_value = "main"
         mock_git._run.return_value = Mock(returncode=0)
+        mock_git.get_diff_numstat.return_value = ""
+        mock_git.get_diff.return_value = ""
 
         # Create worktree directory and report file
         worktree_path = config.worktree_path / f"{review_task.task_id}-review"
@@ -670,6 +672,8 @@ class TestRunNonCodeTaskPRPosting:
         mock_git = Mock()
         mock_git.default_branch.return_value = "main"
         mock_git._run.return_value = Mock(returncode=0)
+        mock_git.get_diff_numstat.return_value = ""
+        mock_git.get_diff.return_value = ""
 
         # Create worktree directory and report file (simulating provider writing it)
         worktree_path = config.worktree_path / f"{review_task.task_id}-review"
