@@ -1040,6 +1040,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     # Merge each task in sequence
     for task_id in task_ids:
+        if use_all:
+            print(f"Merging task #{task_id}...")
         result = _merge_single_task(task_id, config, store, git, args, current_branch)
 
         if result != 0:
@@ -1048,6 +1050,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
             break
 
         merged_tasks.append(task_id)
+        if use_all:
+            print()
 
     # Report results
     if merged_tasks:
