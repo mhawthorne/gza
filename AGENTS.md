@@ -128,14 +128,16 @@ uv run gza add --type implement --review "add dark mode toggle"
 # Task chaining - implementation based on a plan
 uv run gza add --type implement --based-on 5 "implement the approach from task #5"
 
-# Improve task to address review feedback
-uv run gza improve 29  # where 29 is the implementation task ID
+# Improve task to address review feedback (runs immediately by default)
+uv run gza improve 29  # where 29 is the implementation task ID (runs immediately)
 uv run gza improve 29 --review  # auto-create a review after improvements
+uv run gza improve 29 --queue  # add to queue without executing
 
-# Create and run a review task (with optional PR posting)
-uv run gza review 42 --run          # creates review, runs it, auto-posts to PR if exists
-uv run gza review 42 --run --no-pr  # creates review, runs it, skips PR posting
-uv run gza review 42 --run --pr     # creates review, runs it, errors if no PR found
+# Create and run a review task (runs immediately by default, with optional PR posting)
+uv run gza review 42            # creates review, runs it, auto-posts to PR if exists
+uv run gza review 42 --no-pr   # creates review, runs it, skips PR posting
+uv run gza review 42 --pr      # creates review, runs it, errors if no PR found
+uv run gza review 42 --queue   # creates review, adds to queue without executing
 
 # Create a pull request (caches PR number for future reviews)
 uv run gza pr 42                    # creates PR from implementation task #42
@@ -154,17 +156,20 @@ Gza supports automated code review and PR integration:
 
 ### Review Tasks
 
-Reviews automatically post to PRs when available:
+Reviews run immediately by default and automatically post to PRs when available:
 
 ```bash
 # Create and run review (auto-posts to PR if exists)
-gza review <task-id> --run
+gza review <task-id>
 
 # Skip PR posting
-gza review <task-id> --run --no-pr
+gza review <task-id> --no-pr
 
 # Require PR to exist
-gza review <task-id> --run --pr
+gza review <task-id> --pr
+
+# Add to queue without executing
+gza review <task-id> --queue
 ```
 
 ### How it Works
@@ -204,13 +209,12 @@ gza work    # Runs auto-created review
 gza pr 2
 
 # 3. Run review (auto-posts to PR)
-gza review 2 --run
+gza review 2
 
 # 4. If changes requested, iterate
-gza improve 2
-gza work    # Commits include "Gza-Review: #3" trailer
+gza improve 2  # Runs immediately, commits include "Gza-Review: #3" trailer
 
-gza review 2 --run  # New review auto-posts to PR
+gza review 2  # New review auto-posts to PR
 ```
 
 ## Development

@@ -3196,12 +3196,13 @@ def cmd_retry(args: argparse.Namespace) -> int:
         worker_args.task_ids = [new_task.id]
         return _spawn_background_worker(worker_args, config, task_id=new_task.id)
 
-    # Handle run mode - run the new task immediately
-    if hasattr(args, 'run') and args.run:
-        print(f"\nRunning task #{new_task.id}...")
-        return run(config, task_id=new_task.id)
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
 
-    return 0
+    # Default: run the new task immediately
+    print(f"\nRunning task #{new_task.id}...")
+    return run(config, task_id=new_task.id)
 
 
 def cmd_force_complete(args: argparse.Namespace) -> int:
@@ -3342,12 +3343,13 @@ def cmd_improve(args: argparse.Namespace) -> int:
         worker_args.task_ids = [improve_task.id]
         return _spawn_background_worker(worker_args, config, task_id=improve_task.id)
 
-    # Handle run mode - run the improve task immediately
-    if hasattr(args, 'run') and args.run:
-        print(f"\nRunning improve task #{improve_task.id}...")
-        return run(config, task_id=improve_task.id)
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
 
-    return 0
+    # Default: run the improve task immediately
+    print(f"\nRunning improve task #{improve_task.id}...")
+    return run(config, task_id=improve_task.id)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -3408,14 +3410,15 @@ def cmd_review(args: argparse.Namespace) -> int:
         worker_args.task_ids = [review_task.id]
         return _spawn_background_worker(worker_args, config, task_id=review_task.id)
 
-    # If --run flag is set, run the review task immediately
-    # Note: PR posting happens in _run_non_code_task, no need to do it here
-    if hasattr(args, 'run') and args.run:
-        print(f"\nRunning review task #{review_task.id}...")
-        open_after = hasattr(args, 'open') and args.open
-        return run(config, task_id=review_task.id, open_after=open_after)
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
 
-    return 0
+    # Default: run the review task immediately
+    # Note: PR posting happens in _run_non_code_task, no need to do it here
+    print(f"\nRunning review task #{review_task.id}...")
+    open_after = hasattr(args, 'open') and args.open
+    return run(config, task_id=review_task.id, open_after=open_after)
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -3473,7 +3476,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if args.background:
         return _spawn_background_resume_worker(args, config, new_task.id)
 
-    # Run the new resume task
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    # Default: run the new resume task immediately
     return run(config, task_id=new_task.id, resume=True)
 
 
@@ -4655,9 +4662,9 @@ def main() -> int:
         help="Run worker in background (detached mode)",
     )
     retry_parser.add_argument(
-        "--run",
+        "--queue", "-q",
         action="store_true",
-        help="Run the newly created task immediately after creation",
+        help="Add task to queue without executing immediately",
     )
     retry_parser.add_argument(
         "--max-turns",
@@ -4685,9 +4692,9 @@ def main() -> int:
         help="Run worker in background (detached mode)",
     )
     resume_parser.add_argument(
-        "--run",
+        "--queue", "-q",
         action="store_true",
-        help="Run the task immediately (resume runs by default, this flag is for consistency)",
+        help="Add task to queue without executing immediately",
     )
     resume_parser.add_argument(
         "--max-turns",
@@ -4710,9 +4717,9 @@ def main() -> int:
         help="Auto-create review task on completion",
     )
     improve_parser.add_argument(
-        "--run",
+        "--queue", "-q",
         action="store_true",
-        help="Run the improve task immediately after creating it",
+        help="Add task to queue without executing immediately",
     )
     improve_parser.add_argument(
         "--background", "-b",
@@ -4722,7 +4729,7 @@ def main() -> int:
     improve_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help="Run Claude directly instead of in Docker (only with --run or --background)",
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     improve_parser.add_argument(
         "--max-turns",
@@ -4740,9 +4747,9 @@ def main() -> int:
         help="Implementation task ID to review",
     )
     review_parser.add_argument(
-        "--run",
+        "--queue", "-q",
         action="store_true",
-        help="Run the review task immediately after creating it",
+        help="Add task to queue without executing immediately",
     )
     review_parser.add_argument(
         "--background", "-b",
@@ -4752,7 +4759,7 @@ def main() -> int:
     review_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help="Run Claude directly instead of in Docker (only used with --run or --background)",
+        help="Run Claude directly instead of in Docker (only used with --background or when running immediately)",
     )
     review_parser.add_argument(
         "--no-pr",
@@ -4767,7 +4774,7 @@ def main() -> int:
     review_parser.add_argument(
         "--open",
         action="store_true",
-        help="Open the review file in $EDITOR after the review task completes (only used with --run)",
+        help="Open the review file in $EDITOR after the review task completes",
     )
     add_common_args(review_parser)
 
