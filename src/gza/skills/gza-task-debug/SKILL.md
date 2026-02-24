@@ -1,7 +1,7 @@
 ---
 name: gza-task-debug
 description: Diagnose why a gza task failed — analyzes logs, detects loops, checks diffs, compares baselines, and suggests fixes
-allowed-tools: Read, Bash(sqlite3:*), Bash(git:*), Bash(wc:*), Bash(grep:*)
+allowed-tools: Read, Bash(uv run python -c:*), Bash(git:*), Bash(wc:*), Bash(grep:*)
 version: 1.0.0
 public: true
 ---
@@ -18,10 +18,10 @@ The user should provide a task ID (e.g., "18", "#42", or just "5"). Extract the 
 
 ### Step 2: Query task from database
 
-Run sqlite3 to get all task details:
+Run a Python one-liner to get all task details as JSON:
 
 ```bash
-sqlite3 .gza/gza.db "SELECT id, prompt, status, task_type, branch, log_file, report_file, has_commits, duration_seconds, num_turns, cost_usd, created_at, started_at, completed_at FROM tasks WHERE id = <ID>;"
+uv run python -c "from gza.db import get_task; import json; print(json.dumps(get_task(<ID>), indent=2, default=str))"
 ```
 
 Note the following fields for analysis:
@@ -38,7 +38,7 @@ Note the following fields for analysis:
 Compare the failed task's metrics against the last 20 completed tasks:
 
 ```bash
-sqlite3 .gza/gza.db "SELECT round(avg(num_turns),1) as avg_turns, round(avg(duration_seconds),1) as avg_duration, round(avg(cost_usd),4) as avg_cost FROM (SELECT * FROM tasks WHERE status='completed' ORDER BY completed_at DESC LIMIT 20);"
+uv run python -c "from gza.db import get_baseline_stats; import json; print(json.dumps(get_baseline_stats(20)))"
 ```
 
 Calculate how far the failed task deviates:
@@ -246,7 +246,7 @@ If the user says yes, use the `gza-task-add` skill to create each task.
 
 ## Important notes
 
-- **Database path**: Always use `.gza/gza.db` (relative to project root)
+- **Database path**: The Python API auto-discovers `.gza/gza.db` relative to cwd (project root)
 - **Log files**: May be absolute or relative paths — try both if the first fails
 - **Missing branch**: If `branch` is NULL, skip the git diff analysis
 - **No log file**: If `log_file` is NULL or empty, note this and rely on database fields only
