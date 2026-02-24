@@ -1346,6 +1346,130 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             return False
 
 
+# === Module-level convenience functions ===
+
+def _default_store() -> "SqliteTaskStore":
+    """Create a SqliteTaskStore using the default .gza/gza.db path relative to cwd."""
+    return SqliteTaskStore(Path(".gza/gza.db"))
+
+
+def _task_to_dict(task: "Task") -> dict:
+    """Convert a Task to a JSON-serializable dict."""
+    return {
+        "id": task.id,
+        "prompt": task.prompt,
+        "status": task.status,
+        "task_type": task.task_type,
+        "task_id": task.task_id,
+        "branch": task.branch,
+        "log_file": task.log_file,
+        "report_file": task.report_file,
+        "based_on": task.based_on,
+        "has_commits": task.has_commits,
+        "duration_seconds": task.duration_seconds,
+        "num_turns_reported": task.num_turns_reported,
+        "num_turns_computed": task.num_turns_computed,
+        "cost_usd": task.cost_usd,
+        "input_tokens": task.input_tokens,
+        "output_tokens": task.output_tokens,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "group": task.group,
+        "depends_on": task.depends_on,
+        "spec": task.spec,
+        "create_review": task.create_review,
+        "same_branch": task.same_branch,
+        "task_type_hint": task.task_type_hint,
+        "output_content": task.output_content,
+        "session_id": task.session_id,
+        "pr_number": task.pr_number,
+        "model": task.model,
+        "provider": task.provider,
+        "merge_status": task.merge_status,
+        "failure_reason": task.failure_reason,
+        "skip_learnings": task.skip_learnings,
+        "diff_files_changed": task.diff_files_changed,
+        "diff_lines_added": task.diff_lines_added,
+        "diff_lines_removed": task.diff_lines_removed,
+        "review_cleared_at": task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+    }
+
+
+def get_task(task_id: int) -> dict:
+    """Get a task by ID as a JSON-serializable dict.
+
+    Auto-discovers the DB at .gza/gza.db relative to cwd.
+
+    Raises:
+        ValueError: If task_id is not found.
+    """
+    store = _default_store()
+    task = store.get(task_id)
+    if task is None:
+        raise ValueError(f"Task {task_id} not found")
+    return _task_to_dict(task)
+
+
+def get_task_log_path(task_id: int) -> str | None:
+    """Get the log_file path for a task.
+
+    Auto-discovers the DB at .gza/gza.db relative to cwd.
+    Returns None if task not found or log_file is not set.
+    """
+    store = _default_store()
+    task = store.get(task_id)
+    if task is None:
+        return None
+    return task.log_file
+
+
+def get_task_report_path(task_id: int) -> str | None:
+    """Get the report_file path for a task.
+
+    Auto-discovers the DB at .gza/gza.db relative to cwd.
+    Returns None if task not found or report_file is not set.
+    """
+    store = _default_store()
+    task = store.get(task_id)
+    if task is None:
+        return None
+    return task.report_file
+
+
+def get_baseline_stats(limit: int = 20) -> dict:
+    """Get average stats from the last N completed tasks.
+
+    Auto-discovers the DB at .gza/gza.db relative to cwd.
+
+    Returns:
+        Dict with keys: avg_turns, avg_duration, avg_cost
+    """
+    store = _default_store()
+    with store._connect() as conn:
+        cur = conn.execute(
+            """
+            SELECT
+                round(avg(num_turns_reported), 1) as avg_turns,
+                round(avg(duration_seconds), 1) as avg_duration,
+                round(avg(cost_usd), 4) as avg_cost
+            FROM (
+                SELECT * FROM tasks
+                WHERE status = 'completed'
+                ORDER BY completed_at DESC
+                LIMIT ?
+            )
+            """,
+            (limit,),
+        )
+        row = cur.fetchone()
+        return {
+            "avg_turns": row["avg_turns"],
+            "avg_duration": row["avg_duration"],
+            "avg_cost": row["avg_cost"],
+        }
+
+
 def validate_prompt(prompt: str) -> list[str]:
     """Validate a task prompt.
 

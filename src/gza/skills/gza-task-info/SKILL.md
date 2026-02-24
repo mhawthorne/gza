@@ -1,7 +1,7 @@
 ---
 name: gza-task-info
 description: Gather comprehensive info about a specific gza task including status, branch, commits, and logs
-allowed-tools: Read, Bash(sqlite3:*), Bash(git:*)
+allowed-tools: Read, Bash(uv run python -c:*), Bash(git:*)
 version: 1.0.0
 public: true
 ---
@@ -18,10 +18,10 @@ The user should provide a task ID (e.g., "18", "#42", or just "5"). Extract the 
 
 ### Step 2: Query task from database
 
-Run sqlite3 query to get all task details:
+Run a Python one-liner to get all task details as JSON:
 
 ```bash
-sqlite3 .gza/gza.db "SELECT * FROM tasks WHERE id = <ID>;"
+uv run python -c "from gza.db import get_task; import json; print(json.dumps(get_task(<ID>), indent=2, default=str))"
 ```
 
 This will show:
@@ -142,7 +142,7 @@ Report: Found 3 authentication patterns in codebase (see below)
 
 ## Important notes
 
-- **Database path**: Always use `.gza/gza.db` (in project root)
+- **Database path**: The Python API auto-discovers `.gza/gza.db` relative to cwd (in project root)
 - **Handle missing fields**: Not all fields will be populated (e.g., branch might be NULL for failed/pending tasks)
 - **Format durations**: Show seconds and human-readable format (e.g., "245.3s (4:05)")
 - **Format costs**: Show USD with 2 decimal places (e.g., "$0.42")

@@ -1874,3 +1874,260 @@ class TestReviewClearedAt:
 
         # Should not raise any exception
         store.clear_review_state(99999)
+
+
+class TestConvenienceFunctions:
+    """Tests for module-level convenience functions get_task, get_task_log_path,
+    get_task_report_path, and get_baseline_stats."""
+
+    def test_get_task_returns_dict(self, tmp_path: Path, monkeypatch):
+        """get_task returns a dict with all task fields."""
+        from gza.db import get_task, TaskStats
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task for get_task", task_type="implement")
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task(task.id)
+
+        assert isinstance(result, dict)
+        assert result["id"] == task.id
+        assert result["prompt"] == "Test task for get_task"
+        assert result["status"] == "pending"
+        assert result["task_type"] == "implement"
+        # Datetime fields should be ISO strings or None
+        assert isinstance(result["created_at"], str)
+        assert result["started_at"] is None
+        assert result["completed_at"] is None
+
+    def test_get_task_all_fields_json_serializable(self, tmp_path: Path, monkeypatch):
+        """get_task result is fully JSON-serializable."""
+        import json
+        from gza.db import get_task, TaskStats
+        from datetime import datetime, timezone
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(
+            prompt="Full task",
+            task_type="implement",
+            group="test-group",
+            spec="specs/test.md",
+        )
+        store.mark_completed(
+            task,
+            has_commits=True,
+            branch="feature/test",
+            log_file=".gza/logs/test.log",
+            report_file=".gza/reports/test.md",
+            stats=TaskStats(
+                duration_seconds=42.0,
+                num_turns_reported=5,
+                num_turns_computed=4,
+                cost_usd=0.10,
+                input_tokens=1000,
+                output_tokens=500,
+            ),
+        )
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task(task.id)
+        # Should not raise
+        serialized = json.dumps(result)
+        assert serialized  # non-empty
+
+    def test_get_task_raises_for_missing_task(self, tmp_path: Path, monkeypatch):
+        """get_task raises ValueError when task does not exist."""
+        from gza.db import get_task
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        SqliteTaskStore(db_path)  # create empty DB
+
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(ValueError, match="Task 999 not found"):
+            get_task(999)
+
+    def test_get_task_log_path_returns_log_file(self, tmp_path: Path, monkeypatch):
+        """get_task_log_path returns the log_file field."""
+        from gza.db import get_task_log_path
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Task with log")
+        store.mark_failed(task, log_file=".gza/logs/task-1.log")
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task_log_path(task.id)
+        assert result == ".gza/logs/task-1.log"
+
+    def test_get_task_log_path_returns_none_when_not_set(self, tmp_path: Path, monkeypatch):
+        """get_task_log_path returns None when log_file is not set."""
+        from gza.db import get_task_log_path
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Task without log")
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task_log_path(task.id)
+        assert result is None
+
+    def test_get_task_log_path_returns_none_for_missing_task(self, tmp_path: Path, monkeypatch):
+        """get_task_log_path returns None when task does not exist."""
+        from gza.db import get_task_log_path
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        SqliteTaskStore(db_path)
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task_log_path(999)
+        assert result is None
+
+    def test_get_task_report_path_returns_report_file(self, tmp_path: Path, monkeypatch):
+        """get_task_report_path returns the report_file field."""
+        from gza.db import get_task_report_path
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Task with report")
+        store.mark_completed(task, report_file=".gza/reports/task-1.md", has_commits=False)
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task_report_path(task.id)
+        assert result == ".gza/reports/task-1.md"
+
+    def test_get_task_report_path_returns_none_when_not_set(self, tmp_path: Path, monkeypatch):
+        """get_task_report_path returns None when report_file is not set."""
+        from gza.db import get_task_report_path
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Task without report")
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task_report_path(task.id)
+        assert result is None
+
+    def test_get_task_report_path_returns_none_for_missing_task(self, tmp_path: Path, monkeypatch):
+        """get_task_report_path returns None when task does not exist."""
+        from gza.db import get_task_report_path
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        SqliteTaskStore(db_path)
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task_report_path(999)
+        assert result is None
+
+    def test_get_baseline_stats_returns_averages(self, tmp_path: Path, monkeypatch):
+        """get_baseline_stats returns avg_turns, avg_duration, avg_cost."""
+        from gza.db import get_baseline_stats, TaskStats
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add completed tasks with known stats
+        for i in range(3):
+            task = store.add(prompt=f"Task {i}")
+            store.mark_completed(
+                task,
+                has_commits=False,
+                stats=TaskStats(
+                    duration_seconds=float(10 * (i + 1)),  # 10, 20, 30
+                    num_turns_reported=i + 1,              # 1, 2, 3
+                    cost_usd=0.01 * (i + 1),               # 0.01, 0.02, 0.03
+                ),
+            )
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_baseline_stats()
+
+        assert isinstance(result, dict)
+        assert "avg_turns" in result
+        assert "avg_duration" in result
+        assert "avg_cost" in result
+        # avg_turns = (1+2+3)/3 = 2.0
+        assert result["avg_turns"] == 2.0
+        # avg_duration = (10+20+30)/3 = 20.0
+        assert result["avg_duration"] == 20.0
+        # avg_cost = (0.01+0.02+0.03)/3 = 0.02
+        assert result["avg_cost"] is not None
+
+    def test_get_baseline_stats_respects_limit(self, tmp_path: Path, monkeypatch):
+        """get_baseline_stats only includes the last N tasks."""
+        from gza.db import get_baseline_stats, TaskStats
+        from datetime import datetime, timezone, timedelta
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add 5 completed tasks with differing costs
+        for i in range(5):
+            task = store.add(prompt=f"Task {i}")
+            task.completed_at = datetime(2026, 1, i + 1, tzinfo=timezone.utc)
+            task.status = "completed"
+            task.cost_usd = float(i + 1)  # 1.0, 2.0, 3.0, 4.0, 5.0
+            task.num_turns_reported = i + 1
+            task.duration_seconds = float(i + 1)
+            store.update(task)
+
+        monkeypatch.chdir(tmp_path)
+
+        # limit=2 should only use the 2 most recent tasks (cost 4.0 and 5.0)
+        result = get_baseline_stats(limit=2)
+        assert result["avg_cost"] == round((4.0 + 5.0) / 2, 4)
+
+    def test_get_baseline_stats_returns_none_when_no_completed_tasks(self, tmp_path: Path, monkeypatch):
+        """get_baseline_stats returns None values when no completed tasks exist."""
+        from gza.db import get_baseline_stats
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        SqliteTaskStore(db_path)  # empty DB
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_baseline_stats()
+        assert result["avg_turns"] is None
+        assert result["avg_duration"] is None
+        assert result["avg_cost"] is None
+
+    def test_get_task_datetime_fields_serialized_as_iso_strings(self, tmp_path: Path, monkeypatch):
+        """get_task returns datetime fields as ISO-format strings, not datetime objects."""
+        from gza.db import get_task, TaskStats
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Task with dates")
+        store.mark_completed(task, has_commits=False, stats=TaskStats(duration_seconds=10.0))
+
+        monkeypatch.chdir(tmp_path)
+
+        result = get_task(task.id)
+        # Datetimes must be strings so JSON serialization works
+        assert isinstance(result["created_at"], str)
+        assert isinstance(result["completed_at"], str)
+        assert result["started_at"] is None  # never set started_at
