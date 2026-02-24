@@ -3971,12 +3971,12 @@ def _determine_advance_action(
                     'review_task': latest_review,
                 }
 
-    # No reviews, or review was cleared by improve — create a new review.
+    # No reviews, or review was cleared by improve — merge directly.
     # When reviews is non-empty here, the latest review was cleared (review_cleared=True),
     # meaning an improve task completed after the review.
     return {
-        'type': 'create_review',
-        'description': 'Create review task' + (' (previous review addressed)' if reviews else ' (no review yet)'),
+        'type': 'merge',
+        'description': 'Merge task' + (' (previous review addressed)' if reviews else ' (no review yet)'),
     }
 
 
