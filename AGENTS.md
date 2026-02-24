@@ -50,6 +50,7 @@ Available skills:
 - `gza-task-add`: Create well-formed gza tasks with appropriate types and groups
 - `gza-task-draft`: Guide through deliberate task creation with clarification, risk surfacing, and prompt refinement before running gza add
 - `gza-task-info`: Gather comprehensive info about specific gza tasks including status, branch, commits, and logs
+- `gza-task-debug`: Diagnose why a gza task failed — analyzes logs, detects loops, checks diffs, compares baselines, and suggests fixes
 - `gza-rebase`: Rebase current branch on main, with interactive conflict resolution
 
 The skills are installed to `.claude/skills/` in your project directory.
