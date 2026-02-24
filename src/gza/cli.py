@@ -616,7 +616,7 @@ def cmd_history(args: argparse.Namespace) -> int:
                 status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
         date_str = f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if task.completed_at else ""
         type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
-        merge_label = " \[merged]" if task.merge_status == "merged" else ""
+        merge_label = " \\[merged]" if task.merge_status == "merged" else ""
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         console.print(f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}")
         if task.branch:
