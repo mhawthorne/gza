@@ -7414,8 +7414,8 @@ class TestAdvanceCommand:
         assert updated_task is not None
         assert updated_task.merge_status == "unmerged"
 
-    def test_advance_creates_review_for_task_without_review(self, tmp_path: Path):
-        """advance creates a review task for a completed task with no review."""
+    def test_advance_merges_task_without_review(self, tmp_path: Path):
+        """advance merges a completed task with no review directly."""
         import argparse
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
@@ -7442,10 +7442,9 @@ class TestAdvanceCommand:
 
         assert rc == 0
 
-        # Verify review task was created
+        # Verify no review task was created — task is merged directly
         reviews = store.get_reviews_for_task(task.id)
-        assert len(reviews) == 1
-        assert reviews[0].task_type == "review"
+        assert len(reviews) == 0
 
     def test_advance_creates_improve_for_changes_requested(self, tmp_path: Path):
         """advance creates an improve task when review is CHANGES_REQUESTED."""
@@ -7546,13 +7545,13 @@ class TestAdvanceCommand:
             rc = cmd_advance(args)
 
         assert rc == 0
-        # Only 2 review tasks should have been created (not 3)
-        all_reviews = (
-            store.get_reviews_for_task(task1.id)
-            + store.get_reviews_for_task(task2.id)
-            + store.get_reviews_for_task(task3.id)
+        # Only 2 tasks should have been merged (not 3, due to --max 2)
+        merged_count = sum(
+            1
+            for t in [task1, task2, task3]
+            if store.get(t.id).merge_status == "merged"
         )
-        assert len(all_reviews) == 2
+        assert merged_count == 2
 
     def test_advance_skips_pending_review(self, tmp_path: Path):
         """advance skips a task whose review is still pending."""
@@ -7798,8 +7797,8 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         assert "already merged" in result.stdout
 
-    def test_advance_review_cleared_at_triggers_new_review(self, tmp_path: Path):
-        """advance creates a new review when review_cleared_at marks prior review as addressed."""
+    def test_advance_review_cleared_at_triggers_merge(self, tmp_path: Path):
+        """advance merges when review_cleared_at marks prior review as addressed (no new review)."""
         import argparse
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
@@ -7842,12 +7841,13 @@ class TestAdvanceCommand:
             rc = cmd_advance(args)
 
         assert rc == 0
-        # A new review should have been created (the old one was cleared)
+        # No new review should be created — task is merged directly after improve
         all_reviews = store.get_reviews_for_task(task.id)
-        assert len(all_reviews) == 2
+        assert len(all_reviews) == 1  # only the original review
+        assert store.get(task.id).merge_status == "merged"
 
     def test_advance_spawn_worker_failure_increments_error_count(self, tmp_path: Path):
-        """advance increments error_count and returns 1 when _spawn_background_worker fails."""
+        """advance returns 1 when _spawn_background_worker fails for an improve task."""
         import argparse
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
@@ -7859,6 +7859,17 @@ class TestAdvanceCommand:
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a CHANGES_REQUESTED review so advance will try to spawn an improve worker
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nFix things."
+        store.update(review_task)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
