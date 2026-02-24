@@ -82,7 +82,7 @@ Branch: feature/implement-the-jwt-authentication
 Create and run a review task:
 
 ```bash
-$ gza review 2 --run
+$ gza review 2
 ✓ Created review task #3
 === Task: Review implementation... ===
     ID: #3 20260108-review-implementation
@@ -117,21 +117,11 @@ Implementation follows the plan but needs improvements...
 
 ## Phase 4: Address review feedback
 
-If the review requests changes, create an improve task:
+If the review requests changes, create and run an improve task (runs immediately by default):
 
 ```bash
 $ gza improve 2
-
-Created task #4: 20260108-improve-implementation (improve)
-Based on: #2
-```
-
-> **Tip:** Add `--review` if you want automatic follow-up reviews after each improvement iteration.
-
-Run the improve task (continues on the same branch):
-
-```bash
-$ gza work 4
+✓ Created improve task #4
 === Task: Improve implementation based on review... ===
     ID: #4 20260108-improve-implementation
     Type: improve
@@ -140,10 +130,13 @@ $ gza work 4
 Stats: Runtime: 5m 22s | Turns: 14 | Cost: $0.45
 ```
 
+> **Tip:** Add `--review` if you want automatic follow-up reviews after each improvement iteration.
+> Use `--queue` to add to the queue without running immediately.
+
 Run a follow-up review to verify the changes:
 
 ```bash
-$ gza review 2 --run
+$ gza review 2
 ✓ Created review task #5
 === Task: Review implementation... ===
     ID: #5 20260108-review-implementation
@@ -205,6 +198,6 @@ The complete workflow:
 
 1. **Plan** - `gza add --type plan` → `gza work <id>` → review `.gza/plans/`
 2. **Implement** - `gza add --type implement --based-on <plan_id>` → `gza work <id>`
-3. **Review** - `gza review <impl_id> --run`
-4. **Improve** (if needed) - `gza improve <impl_id>` → `gza work <id>` → `gza review <impl_id> --run`
+3. **Review** - `gza review <impl_id>`
+4. **Improve** (if needed) - `gza improve <impl_id>` → `gza review <impl_id>`
 5. **Merge** - `gza pr <impl_id>` → `gza merge <impl_id> --squash`

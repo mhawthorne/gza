@@ -43,7 +43,7 @@ Practical examples showing common workflows with Gza.
 | Tail worker logs | `gza log -w <worker_id> -f` |
 | View task log | `gza log -t <task_id>` |
 | Stop a worker | `gza stop <worker_id>` |
-| Create review | `gza review <impl_id> --run` |
+| Create review | `gza review <impl_id>` |
 | Address feedback | `gza improve <impl_id>` |
 | Resume failed task | `gza resume <task_id>` |
 | Retry from scratch | `gza retry <task_id>` |

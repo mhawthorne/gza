@@ -43,10 +43,10 @@ You have two options for recovering:
 
 Resume continues the existing conversation. The AI picks up where it left off with full context of what it already did.
 
-By default, `gza resume` queues a new task. Use `--run` to run it immediately:
+`gza resume` runs the new task immediately by default. Use `--queue` to add to queue without executing:
 
 ```bash
-$ gza resume 5 --run
+$ gza resume 5
 === Resuming Task #5: 20260108-add-user-auth ===
 ...
 === Done ===
@@ -56,17 +56,23 @@ Stats: Runtime: 5m 23s | Turns: 15 | Cost: $0.34
 Increase the turn limit if the original was too low:
 
 ```bash
-$ gza resume 5 --run --max-turns 100
+$ gza resume 5 --max-turns 100
+```
+
+Add to queue without running immediately:
+
+```bash
+$ gza resume 5 --queue
 ```
 
 ## Retry a task
 
 Retry creates a fresh attempt. Use this when the AI went down a wrong path and you want it to start over.
 
-By default, `gza retry` creates a new queued task. Use `--run` to run it immediately:
+`gza retry` runs the new task immediately by default. Use `--queue` to add to queue without executing:
 
 ```bash
-$ gza retry 5 --run
+$ gza retry 5
 Created task #6 (retry of #5)
 === Task #6: 20260108-add-user-auth ===
 ...

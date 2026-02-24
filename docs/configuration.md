@@ -485,7 +485,7 @@ gza resume <task_id> [options]
 |--------|-------------|
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--background`, `-b` | Run worker in background |
-| `--run` | Run immediately (default behavior, for consistency) |
+| `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 
 ### retry
@@ -500,7 +500,7 @@ gza retry <task_id> [options]
 |--------|-------------|
 | `--no-docker` | Run Claude directly instead of in Docker (only with --background) |
 | `--background`, `-b` | Run worker in background |
-| `--run` | Run the task immediately after creation |
+| `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 
 ### merge
@@ -620,7 +620,7 @@ gza improve <impl_task_id> [options]
 |--------|-------------|
 | `impl_task_id` | Implementation task ID to improve |
 | `--review` | Auto-create review task on completion |
-| `--run` | Run the improve task immediately |
+| `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
@@ -629,7 +629,7 @@ The improve command finds the most recent review for the implementation task and
 
 ### review
 
-Create and optionally run a review task for an implementation.
+Create and run a review task for an implementation. Runs immediately by default.
 
 ```bash
 gza review <task_id> [options]
@@ -638,14 +638,14 @@ gza review <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Implementation task ID to review |
-| `--run` | Run the review task immediately after creating it |
+| `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--no-pr` | Do not post review to PR even if one exists |
 | `--pr` | Require PR to exist (error if not found) |
-| `--open` | Open the review file in $EDITOR after completion (with --run) |
+| `--open` | Open the review file in $EDITOR after completion |
 
-When `--run` is used and a PR exists for the implementation task, the review is automatically posted as a PR comment.
+When a PR exists for the implementation task, the review is automatically posted as a PR comment.
 
 ### next
 
