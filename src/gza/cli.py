@@ -265,6 +265,80 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         return 1
 
 
+def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) -> int:
+    """Spawn a background worker to perform a rebase.
+
+    Args:
+        args: Command-line arguments (task_id, onto, remote, force, resolve)
+        config: Configuration object
+
+    Returns:
+        0 on success, 1 on error
+    """
+    registry = WorkerRegistry(config.workers_path)
+
+    # Build command: gza rebase <task_id> [options] (without --background)
+    cmd = [
+        sys.executable, "-m", "gza",
+        "rebase",
+        str(args.task_id),
+    ]
+
+    if getattr(args, 'onto', None):
+        cmd.extend(["--onto", args.onto])
+
+    if getattr(args, 'remote', False):
+        cmd.append("--remote")
+
+    if getattr(args, 'force', False):
+        cmd.append("--force")
+
+    if getattr(args, 'resolve', False):
+        cmd.append("--resolve")
+
+    # Add project directory
+    cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    # Spawn detached process
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+
+        # Generate worker ID
+        worker_id = registry.generate_worker_id()
+
+        # Register worker
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=proc.pid,
+            task_id=args.task_id,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(worker)
+
+        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"  Rebasing task: #{args.task_id}")
+        print()
+        print(f"Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error spawning background worker: {e}")
+        return 1
+
+
 def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     """Spawn N background workers in parallel.
 
@@ -1095,6 +1169,11 @@ def invoke_claude_resolve(branch: str, target: str, config: Config) -> bool:
 def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
+
+    # Handle background mode - spawn worker to perform the rebase
+    if getattr(args, 'background', False):
+        return _spawn_background_rebase_worker(args, config)
+
     store = get_store(config)
     git = Git(config.project_dir)
 
@@ -4300,6 +4379,11 @@ def main() -> int:
         "--resolve",
         action="store_true",
         help="Auto-resolve conflicts using AI (non-interactive)",
+    )
+    rebase_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run rebase in background (detached mode)",
     )
     add_common_args(rebase_parser)
 
