@@ -2131,3 +2131,179 @@ class TestConvenienceFunctions:
         assert isinstance(result["created_at"], str)
         assert isinstance(result["completed_at"], str)
         assert result["started_at"] is None  # never set started_at
+
+
+class TestRetryChainDependencyResolution:
+    """Tests for auto-resolving blocked tasks when a retry of their dependency succeeds."""
+
+    def _make_store(self, tmp_path: Path) -> SqliteTaskStore:
+        return SqliteTaskStore(tmp_path / "test.db")
+
+    def _fail(self, store: SqliteTaskStore, task: Task) -> Task:
+        store.mark_failed(task, failure_reason="UNKNOWN")
+        result = store.get(task.id)
+        assert result is not None
+        return result
+
+    def _complete(self, store: SqliteTaskStore, task: Task) -> Task:
+        store.mark_completed(task, has_commits=False)
+        result = store.get(task.id)
+        assert result is not None
+        return result
+
+    # --- is_task_blocked ---
+
+    def test_no_dependency_not_blocked(self, tmp_path: Path):
+        """Regression: task with no dependency is never blocked."""
+        store = self._make_store(tmp_path)
+        task = store.add("Independent task")
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        assert is_blocked is False
+        assert blocking_id is None
+        assert blocking_status is None
+
+    def test_completed_dependency_not_blocked(self, tmp_path: Path):
+        """Regression: task with a completed dependency is not blocked."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        self._complete(store, dep)
+        downstream = store.add("Downstream", depends_on=dep.id)
+        is_blocked, _, _ = store.is_task_blocked(downstream)
+        assert is_blocked is False
+
+    def test_failed_dep_no_retry_still_blocked(self, tmp_path: Path):
+        """Task blocked by a failed dep with no retry stays blocked."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        self._fail(store, dep)
+        downstream = store.add("Downstream", depends_on=dep.id)
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
+        assert is_blocked is True
+        assert blocking_id == dep.id
+        assert blocking_status == "failed"
+
+    def test_failed_dep_with_successful_retry_unblocks(self, tmp_path: Path):
+        """Task blocked by failed dep is unblocked when a direct retry succeeds."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        self._fail(store, dep)
+        retry = store.add("Retry of dep", based_on=dep.id)
+        self._complete(store, retry)
+
+        downstream = store.add("Downstream", depends_on=dep.id)
+        is_blocked, _, _ = store.is_task_blocked(downstream)
+        assert is_blocked is False
+
+    def test_failed_dep_with_failed_retry_still_blocked(self, tmp_path: Path):
+        """Task stays blocked when the retry also failed."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        self._fail(store, dep)
+        retry = store.add("Retry of dep", based_on=dep.id)
+        self._fail(store, retry)
+
+        downstream = store.add("Downstream", depends_on=dep.id)
+        is_blocked, blocking_id, _ = store.is_task_blocked(downstream)
+        assert is_blocked is True
+        assert blocking_id == dep.id
+
+    def test_retry_chain_failed_failed_completed_unblocks(self, tmp_path: Path):
+        """dep(failed) → retry1(failed) → retry2(completed): downstream unblocked."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Original dep")
+        self._fail(store, dep)
+        retry1 = store.add("First retry", based_on=dep.id)
+        self._fail(store, retry1)
+        retry2 = store.add("Second retry", based_on=retry1.id)
+        self._complete(store, retry2)
+
+        downstream = store.add("Downstream", depends_on=dep.id)
+        is_blocked, _, _ = store.is_task_blocked(downstream)
+        assert is_blocked is False
+
+    # --- get_next_pending ---
+
+    def test_get_next_pending_skips_task_blocked_by_failed_dep(self, tmp_path: Path):
+        """get_next_pending does not return a task whose dep is failed with no retry."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        self._fail(store, dep)
+        _downstream = store.add("Downstream", depends_on=dep.id)
+
+        next_task = store.get_next_pending()
+        # dep is failed, downstream is blocked — nothing runnable
+        assert next_task is None
+
+    def test_get_next_pending_returns_task_unblocked_by_successful_retry(self, tmp_path: Path):
+        """get_next_pending returns downstream once its dep's retry succeeds."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        self._fail(store, dep)
+        retry = store.add("Retry", based_on=dep.id)
+        self._complete(store, retry)
+        downstream = store.add("Downstream", depends_on=dep.id)
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == downstream.id
+
+    def test_get_next_pending_handles_retry_chain(self, tmp_path: Path):
+        """get_next_pending unblocks downstream after multi-hop retry chain succeeds."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Original dep")
+        self._fail(store, dep)
+        retry1 = store.add("Retry 1", based_on=dep.id)
+        self._fail(store, retry1)
+        retry2 = store.add("Retry 2", based_on=retry1.id)
+        self._complete(store, retry2)
+        downstream = store.add("Downstream", depends_on=dep.id)
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == downstream.id
+
+    def test_get_next_pending_no_dep_always_runnable(self, tmp_path: Path):
+        """Regression: independent tasks are always returned by get_next_pending."""
+        store = self._make_store(tmp_path)
+        task = store.add("Independent task")
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == task.id
+
+    def test_get_next_pending_completed_dep_unblocks(self, tmp_path: Path):
+        """Regression: get_next_pending returns downstream when dep is completed."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep")
+        self._complete(store, dep)
+        downstream = store.add("Downstream", depends_on=dep.id)
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == downstream.id
+
+    # --- count_blocked_tasks ---
+
+    def test_count_blocked_excludes_unblocked_by_retry(self, tmp_path: Path):
+        """count_blocked_tasks does not count tasks unblocked by a successful retry."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep")
+        self._fail(store, dep)
+        retry = store.add("Retry", based_on=dep.id)
+        self._complete(store, retry)
+        _downstream = store.add("Downstream", depends_on=dep.id)
+
+        count = store.count_blocked_tasks()
+        assert count == 0
+
+    def test_count_blocked_includes_tasks_with_failed_retry(self, tmp_path: Path):
+        """count_blocked_tasks counts tasks whose dep's retry also failed."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep")
+        self._fail(store, dep)
+        retry = store.add("Retry", based_on=dep.id)
+        self._fail(store, retry)
+        _downstream = store.add("Downstream", depends_on=dep.id)
+
+        count = store.count_blocked_tasks()
+        assert count == 1
