@@ -873,7 +873,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         # Single task by ID
         task = store.get(args.task_id)
         if task is None:
-            console.print(f"[red]Error: Task #{args.task_id} not found[/red]", err=True)
+            console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
             return 1
         tasks_to_refresh = [task]
     else:
