@@ -986,7 +986,7 @@ class SqliteTaskStore:
         if dep.status == "completed":
             return (False, None, None)
 
-        if dep.status == "failed" and self._find_successful_retry(dep.id):
+        if dep.status == "failed" and dep.id is not None and self._find_successful_retry(dep.id):
             return (False, None, None)
 
         return (True, dep.id, dep.status)
