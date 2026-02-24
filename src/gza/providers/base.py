@@ -35,11 +35,15 @@ RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
 RUN npm install -g {npm_package}
 
+# Auto-install Python dependencies before CLI starts
+RUN printf '#!/bin/bash\\nset -e\\nif [ -f /workspace/pyproject.toml ]; then\\n    uv sync --project /workspace 2>/dev/null || true\\nfi\\nexec "$@"\\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
 RUN useradd -m -s /bin/bash gza
 USER gza
 ENV PATH="/usr/local/bin:/usr/bin:/bin:/home/gza/.local/bin"
 WORKDIR /home/gza
 
+ENTRYPOINT ["entrypoint.sh"]
 CMD ["{cli_command}"]
 """
 
