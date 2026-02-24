@@ -1,5 +1,5 @@
 ---
-name: docs-review
+name: gza-docs-review
 description: Review documentation for accuracy, completeness, and missing information that users may need
 allowed-tools: Read, Glob, Grep, Write, Bash(ls:*), Bash(uv run *--help*), Bash(date +%Y%m%d%H%M%S)
 ---
