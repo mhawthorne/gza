@@ -3804,7 +3804,7 @@ def _determine_advance_action(
     store: SqliteTaskStore,
     git: Git,
     task: DbTask,
-    current_branch: str,
+    default_branch: str,
 ) -> dict:
     """Determine the next action needed to advance a task.
 
@@ -3816,8 +3816,15 @@ def _determine_advance_action(
     """
     assert task.id is not None
 
-    # Check for merge conflicts first
-    if task.branch and not git.can_merge(task.branch, current_branch):
+    # Tasks with no branch (no commits) cannot be merged or reviewed
+    if not task.branch:
+        return {
+            'type': 'skip',
+            'description': 'SKIP: task has no branch (no commits)',
+        }
+
+    # Check for merge conflicts against the default branch (the merge target)
+    if not git.can_merge(task.branch, default_branch):
         return {
             'type': 'needs_rebase',
             'description': 'SKIP: needs manual rebase (conflicts detected)',
@@ -3874,7 +3881,9 @@ def _determine_advance_action(
                     'review_task': latest_review,
                 }
 
-    # No reviews, or review was cleared by improve — create a new review
+    # No reviews, or review was cleared by improve — create a new review.
+    # When reviews is non-empty here, the latest review was cleared (review_cleared=True),
+    # meaning an improve task completed after the review.
     return {
         'type': 'create_review',
         'description': 'Create review task' + (' (previous review addressed)' if reviews else ' (no review yet)'),
@@ -3917,13 +3926,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if max_tasks is not None:
         tasks = tasks[:max_tasks]
 
-    # Get current branch for merge operations
-    current_branch = git.current_branch()
+    # Use the default branch as the merge target for all operations.
+    # advance is a batch command and operators may not be on main, so we
+    # always merge into the canonical default branch (main/master).
+    default_branch = git.default_branch()
 
     # Analyze each task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
-        action = _determine_advance_action(config, store, git, task, current_branch)
+        action = _determine_advance_action(config, store, git, task, default_branch)
         plan.append((task, action))
 
     if dry_run:
@@ -3964,7 +3975,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 remote=False,
                 resolve=False,
             )
-            rc = _merge_single_task(task.id, config, store, git, merge_args, current_branch)
+            rc = _merge_single_task(task.id, config, store, git, merge_args, default_branch)
             if rc == 0:
                 print(f"      ✓ Merged")
                 success_count += 1
@@ -3977,7 +3988,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 skip_count += 1
                 continue
 
-            # Check for an already-pending/in_progress review
+            # Check for an already-pending/in_progress review (idempotency guard)
             existing_reviews = store.get_reviews_for_task(task.id)
             active_reviews = [r for r in existing_reviews if r.status in ('pending', 'in_progress')]
             if active_reviews:
@@ -4001,11 +4012,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
-                task_ids=[review_task.id],
             )
-            _spawn_background_worker(worker_args, config, task_id=review_task.id)
-            print(f"      ✓ Started review worker")
-            success_count += 1
+            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            if rc == 0:
+                print(f"      ✓ Started review worker")
+                success_count += 1
+            else:
+                print(f"      ✗ Failed to start review worker")
+                error_count += 1
 
         elif action_type == 'improve':
             review_task = action['review_task']
@@ -4028,11 +4042,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
-                task_ids=[improve_task.id],
             )
-            _spawn_background_worker(worker_args, config, task_id=improve_task.id)
-            print(f"      ✓ Started improve worker")
-            success_count += 1
+            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            if rc == 0:
+                print(f"      ✓ Started improve worker")
+                success_count += 1
+            else:
+                print(f"      ✗ Failed to start improve worker")
+                error_count += 1
 
         print()
 
@@ -4163,11 +4180,6 @@ def main() -> int:
         nargs="?",
         metavar="task_id",
         help="Specific task ID to advance (omit to advance all eligible tasks)",
-    )
-    advance_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Advance all eligible unmerged tasks (default behavior when no task_id given)",
     )
     advance_parser.add_argument(
         "--dry-run",
