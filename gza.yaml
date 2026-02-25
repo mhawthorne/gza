@@ -24,6 +24,9 @@ branch_strategy:
 # Custom Docker image name (defaults to <project_name>-gza)
 # docker_image: ""
 
+# Command to run inside Docker container before CLI starts (Python project setup)
+docker_setup_command: "uv sync --project /workspace"
+
 # Maximum time per task in minutes
 # timeout_minutes: 10
 

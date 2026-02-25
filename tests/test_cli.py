@@ -975,6 +975,55 @@ class TestConfigEnvVars:
             assert "~" not in volume.split(":")[0]
             assert str(PathLib.home()) in volume.split(":")[0]
 
+    def test_docker_setup_command_loaded_from_config(self, tmp_path: Path):
+        """docker_setup_command is loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "docker_setup_command: 'uv sync --project /workspace'\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.docker_setup_command == "uv sync --project /workspace"
+
+    def test_docker_setup_command_defaults_to_empty_string(self, tmp_path: Path):
+        """docker_setup_command defaults to empty string when not set."""
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: test\n")
+
+        config = Config.load(tmp_path)
+        assert config.docker_setup_command == ""
+
+
+class TestDockerSetupCommandValidation:
+    """Tests for docker_setup_command validation."""
+
+    def test_validate_docker_setup_command_must_be_string(self, tmp_path: Path):
+        """Validate rejects docker_setup_command that isn't a string."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: test\ndocker_setup_command: 123\n")
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "docker_setup_command" in result.stdout
+
+    def test_validate_docker_setup_command_valid(self, tmp_path: Path):
+        """Validate accepts a valid docker_setup_command string."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "docker_setup_command: 'uv sync --project /workspace'\n"
+        )
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
 
 class TestInitCommand:
     """Tests for 'gza init' command."""

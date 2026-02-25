@@ -104,6 +104,7 @@ class Config:
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
     branch_strategy: BranchStrategy | None = None  # Branch naming strategy
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
+    docker_setup_command: str = ""  # Command to run inside container before CLI starts
 
     def __post_init__(self):
         if not self.docker_image:
@@ -191,7 +192,7 @@ class Config:
         # Validate and warn about unknown keys
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns",
+            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
             "defaults", "task_types", "branch_strategy"
         }
@@ -360,6 +361,7 @@ class Config:
             use_docker=use_docker,
             docker_image=data.get("docker_image", ""),
             docker_volumes=docker_volumes,
+            docker_setup_command=data.get("docker_setup_command", ""),
             timeout_minutes=timeout_minutes,
             branch_mode=branch_mode,
             max_turns=max_turns,
@@ -413,7 +415,7 @@ class Config:
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns",
+            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
             "defaults", "task_types", "branch_strategy"
         }
@@ -439,6 +441,9 @@ class Config:
 
         if "docker_image" in data and not isinstance(data["docker_image"], str):
             errors.append("'docker_image' must be a string")
+
+        if "docker_setup_command" in data and not isinstance(data["docker_setup_command"], str):
+            errors.append("'docker_setup_command' must be a string")
 
         if "docker_volumes" in data:
             if not isinstance(data["docker_volumes"], list):

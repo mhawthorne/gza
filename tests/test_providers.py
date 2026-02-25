@@ -297,6 +297,71 @@ class TestBuildDockerCmd:
         v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
         assert len(v_indices) == 2
 
+    def test_passes_setup_command_as_env_var(self, tmp_path):
+        """Should pass GZA_DOCKER_SETUP_COMMAND when docker_setup_command is set."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_setup_command="uv sync --project /workspace",
+        )
+
+        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
+        env_values = [cmd[i + 1] for i in e_indices]
+        assert "GZA_DOCKER_SETUP_COMMAND=uv sync --project /workspace" in env_values
+
+    def test_no_setup_command_env_var_when_empty(self, tmp_path):
+        """Should not pass GZA_DOCKER_SETUP_COMMAND when docker_setup_command is empty."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_setup_command="",
+        )
+
+        assert "GZA_DOCKER_SETUP_COMMAND" not in " ".join(cmd)
+
+    def test_setup_command_placed_before_image_name(self, tmp_path):
+        """GZA_DOCKER_SETUP_COMMAND should be added before image name."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_setup_command="make setup",
+        )
+
+        image_idx = cmd.index("test-image")
+        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
+        setup_cmd_idx = next(
+            i for i in e_indices
+            if cmd[i + 1].startswith("GZA_DOCKER_SETUP_COMMAND=")
+        )
+        assert setup_cmd_idx < image_idx
+
 
 class TestDockerfileTemplate:
     """Tests for Dockerfile generation."""

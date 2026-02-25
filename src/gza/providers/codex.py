@@ -183,7 +183,7 @@ class CodexProvider(Provider):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
-        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes)
+        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
 
         if resume_session_id:
             cmd.extend(["codex", "exec", "resume", "--json", "--last"])
