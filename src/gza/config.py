@@ -201,10 +201,10 @@ class Config:
 
         Precedence:
         1. providers.<provider>.task_types.<task_type>.max_steps
-        2. task_types.<task_type>.max_steps
-        3. max_steps
-        4. providers.<provider>.task_types.<task_type>.max_turns (legacy)
-        5. task_types.<task_type>.max_turns (legacy)
+        2. providers.<provider>.task_types.<task_type>.max_turns (legacy)
+        3. task_types.<task_type>.max_steps
+        4. task_types.<task_type>.max_turns (legacy)
+        5. max_steps
         6. max_turns (legacy global)
         7. default (50)
         """

@@ -605,6 +605,25 @@ class TestNumTurnsFields:
         stats = store.get_stats()
         assert stats["total_steps"] == 17
 
+    def test_get_stats_aggregates_step_fallback_chain(self, tmp_path: Path):
+        """Test that get_stats uses steps -> computed steps -> legacy turns fallback."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        reported = store.add(prompt="Reported steps")
+        store.mark_completed(reported, has_commits=False, stats=TaskStats(num_steps_reported=8))
+
+        computed_only = store.add(prompt="Computed steps")
+        store.mark_completed(computed_only, has_commits=False, stats=TaskStats(num_steps_computed=5))
+
+        turns_only = store.add(prompt="Legacy turns")
+        store.mark_completed(turns_only, has_commits=False, stats=TaskStats(num_turns_reported=3))
+
+        stats = store.get_stats()
+        assert stats["total_steps"] == 16
+
     def test_migration_v7_to_v8_adds_columns(self, tmp_path: Path):
         """Test that migration from v7 to v8 adds num_turns_reported and num_turns_computed."""
         import sqlite3

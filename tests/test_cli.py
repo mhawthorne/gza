@@ -1,5 +1,6 @@
 """Tests for the CLI commands."""
 
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8060,3 +8061,29 @@ class TestAdvanceCommand:
             rc = cmd_advance(args)
 
         assert rc == 1
+
+
+class TestStatsCommand:
+    """Tests for 'gza stats' command."""
+
+    def test_stats_uses_computed_steps_when_reported_missing(self, tmp_path: Path):
+        """gza stats should display computed steps for computed-only providers."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Computed-only stats task", task_type="implement")
+        store.mark_completed(
+            task,
+            has_commits=False,
+            stats=TaskStats(num_steps_computed=5, cost_usd=0.12, duration_seconds=30.0),
+        )
+
+        result = run_gza("stats", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Total steps:  5" in result.stdout
+        assert re.search(r"✓\s+#1\s+implement\s+\$0\.1200\s+5\s", result.stdout)

@@ -612,13 +612,23 @@ def format_stats(task: DbTask) -> str:
             mins = int(task.duration_seconds // 60)
             secs = int(task.duration_seconds % 60)
             parts.append(f"{mins}m{secs}s")
-    if task.num_steps_reported is not None:
-        parts.append(f"{task.num_steps_reported} steps")
-    elif task.num_turns_reported is not None:
-        parts.append(f"{task.num_turns_reported} turns")
+    resolved_steps = get_task_step_count(task)
+    if resolved_steps is not None:
+        parts.append(f"{resolved_steps} steps")
     if task.cost_usd is not None:
         parts.append(f"${task.cost_usd:.4f}")
     return " | ".join(parts) if parts else ""
+
+
+def get_task_step_count(task: DbTask) -> int | None:
+    """Return a task's canonical step count using step-first fallback."""
+    if task.num_steps_reported is not None:
+        return task.num_steps_reported
+    if task.num_steps_computed is not None:
+        return task.num_steps_computed
+    if task.num_turns_reported is not None:
+        return task.num_turns_reported
+    return None
 
 
 def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
@@ -1736,12 +1746,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
         id_str = f"#{task.id}" if task.id is not None else "-"
         type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
-        if task.num_steps_reported is not None:
-            turns_str = str(task.num_steps_reported)
-        elif task.num_turns_reported is not None:
-            turns_str = str(task.num_turns_reported)
-        else:
-            turns_str = "-"
+        resolved_steps = get_task_step_count(task)
+        turns_str = str(resolved_steps) if resolved_steps is not None else "-"
         time_str = format_duration(task.duration_seconds, verbose=True) if task.duration_seconds else "-"
 
         # Calculate prompt length

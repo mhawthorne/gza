@@ -931,7 +931,7 @@ class SqliteTaskStore:
                     COUNT(*) FILTER (WHERE status = 'pending') as pending,
                     SUM(cost_usd) as total_cost,
                     SUM(duration_seconds) as total_duration,
-                    SUM(num_steps_reported) as total_steps,
+                    SUM(COALESCE(num_steps_reported, num_steps_computed, num_turns_reported)) as total_steps,
                     SUM(num_turns_reported) as total_turns,
                     SUM(input_tokens) as total_input_tokens,
                     SUM(output_tokens) as total_output_tokens
