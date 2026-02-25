@@ -1,7 +1,7 @@
 # Gza Configuration
 
 # Project name (required) - used for branch prefixes and Docker image naming
-project_name: gza
+project_name: my-project
 
 # Branch naming strategy (default: monorepo)
 # Options: monorepo, conventional, simple, or custom pattern dict

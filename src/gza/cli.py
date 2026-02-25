@@ -2099,18 +2099,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     """Generate a new gza.yaml configuration file with defaults."""
-    from .config import (
-        CONFIG_FILENAME,
-        DEFAULT_TASKS_FILE,
-        DEFAULT_LOG_DIR,
-        DEFAULT_TIMEOUT_MINUTES,
-        DEFAULT_USE_DOCKER,
-        DEFAULT_BRANCH_MODE,
-        DEFAULT_MAX_TURNS,
-        DEFAULT_CLAUDE_ARGS,
-        DEFAULT_WORKTREE_DIR,
-        DEFAULT_WORK_COUNT,
-    )
+    import importlib.resources
+
+    from .config import CONFIG_FILENAME
 
     # Derive project name from directory name
     default_project_name = args.project_dir.name
@@ -2121,6 +2112,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"Error: {CONFIG_FILENAME} already exists at {config_path}")
         print("Use --force to overwrite")
         return 1
+
+    # Read the example template from the package
+    template = importlib.resources.files("gza").joinpath("gza.yaml.example").read_text()
 
     # Check if running interactively (stdin is a TTY)
     is_interactive = sys.stdin.isatty()
@@ -2142,13 +2136,23 @@ def cmd_init(args: argparse.Namespace) -> int:
         # Non-interactive mode: use default (monorepo)
         choice = "1"
 
-    # Determine branch_strategy value
+    # Replace project name placeholder
+    config_content = template.replace("project_name: my-project", f"project_name: {default_project_name}")
+
+    # Apply branch strategy based on user's choice
+    default_branch_line = "# branch_strategy: monorepo  # Default: {project}/{task_id}"
     if choice == "1":
-        branch_strategy_line = "# branch_strategy: monorepo  # Default: {project}/{task_id}"
+        pass  # Keep commented-out default from template
     elif choice == "2":
-        branch_strategy_line = "branch_strategy: conventional  # {type}/{slug}"
+        config_content = config_content.replace(
+            default_branch_line,
+            "branch_strategy: conventional  # {type}/{slug}",
+        )
     elif choice == "3":
-        branch_strategy_line = "branch_strategy: simple  # {slug}"
+        config_content = config_content.replace(
+            default_branch_line,
+            "branch_strategy: simple  # {slug}",
+        )
     else:  # custom
         print("\nCustom pattern variables:")
         print("  {project}  - Project name")
@@ -2164,64 +2168,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             print("Pattern cannot be empty.")
 
         default_type = input("Default type [default=feature]: ").strip() or "feature"
-        branch_strategy_line = f"""branch_strategy:
-  pattern: "{pattern}"
-  default_type: {default_type}"""
-
-    # Generate config file with project_name required and other defaults commented out
-    config_content = f"""# Gza Configuration
-
-# Project name (required) - used for branch prefixes and Docker image naming
-project_name: {default_project_name}
-
-# Branch naming strategy (default: monorepo)
-# Options: monorepo, conventional, simple, or custom pattern dict
-{branch_strategy_line}
-
-# All settings below show default values and are commented out.
-# Uncomment and modify any setting you want to change.
-
-# Path to tasks file (relative to project directory) - deprecated, using SQLite now
-# tasks_file: {DEFAULT_TASKS_FILE}
-
-# Directory for log files (relative to project directory)
-# log_dir: {DEFAULT_LOG_DIR}
-
-# Whether to run Claude in Docker container
-# use_docker: {str(DEFAULT_USE_DOCKER).lower()}
-
-# Custom Docker image name (defaults to <project_name>-gza)
-# docker_image: ""
-
-# Maximum time per task in minutes
-# timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}
-
-# Branch mode: "single" (reuse one branch) or "multi" (create branch per task)
-# branch_mode: {DEFAULT_BRANCH_MODE}
-
-# Maximum conversation turns per task
-# max_turns: {DEFAULT_MAX_TURNS}
-
-# Directory for git worktrees (isolates task execution from main checkout)
-# worktree_dir: {DEFAULT_WORKTREE_DIR}
-
-# Number of tasks to run in a single work session (default: 1)
-# work_count: {DEFAULT_WORK_COUNT}
-
-# Claude-specific configuration
-# claude:
-#   # Fetch OAuth token from macOS Keychain for Docker (macOS only)
-#   fetch_auth_token_from_keychain: false
-#   # Arguments passed to Claude Code CLI
-#   args:
-#     - --allowedTools
-#     - Read
-#     - Write
-#     - Edit
-#     - Glob
-#     - Grep
-#     - Bash
-"""
+        custom_strategy = f'branch_strategy:\n  pattern: "{pattern}"\n  default_type: {default_type}'
+        config_content = config_content.replace(default_branch_line, custom_strategy)
 
     config_path.write_text(config_content)
     print(f"✓ Created {config_path}")
