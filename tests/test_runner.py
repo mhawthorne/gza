@@ -1315,3 +1315,159 @@ class TestBackupDatabase:
         backup_conn.close()
 
         assert rows == [(1, "hello")]
+
+
+class TestNoChangesWithExistingCommits:
+    """Tests for the fix that prevents false 'No changes made' failure on resume."""
+
+    def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        return config
+
+    def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path):
+        """When resuming, if there are no uncommitted changes but the branch already has
+        commits from a previous run, the task should succeed (not fail with 'No changes made')."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(
+            prompt="Implement feature X",
+            task_type="implement",
+        )
+        task.task_id = "20260212-implement-feature-x"
+        task.branch = "test/20260212-implement-feature-x"
+        task.session_id = "test-session-123"
+        store.mark_failed(task, log_file="logs/test.log", stats=None)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None):
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id="test-session-123",
+                error_type=None,
+            )
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = True
+            mock_git.count_commits_ahead.return_value = 0
+            mock_git.worktree_add = Mock()
+            mock_git.worktree_list.return_value = []
+
+            mock_worktree_git = Mock()
+            # No uncommitted changes (task already committed in previous run)
+            mock_worktree_git.has_changes.return_value = False
+            # Branch has 1 commit from the previous run
+            mock_worktree_git.count_commits_ahead.return_value = 1
+            mock_worktree_git.default_branch.return_value = "main"
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = ""
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / task.task_id
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=task.id, resume=True)
+
+        assert result == 0
+        refreshed = store.get(task.id)
+        assert refreshed.status == "completed", f"Expected 'completed', got '{refreshed.status}'"
+
+    def test_no_changes_and_no_prior_commits_still_fails(self, tmp_path: Path):
+        """When there are no uncommitted changes AND no commits on the branch,
+        the task should still fail with 'No changes made'."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(
+            prompt="Implement feature Y",
+            task_type="implement",
+        )
+        task.task_id = "20260212-implement-feature-y"
+        task.branch = "test/20260212-implement-feature-y"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None):
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id=None,
+                error_type=None,
+            )
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = False
+            mock_git.count_commits_ahead.return_value = 0
+            mock_git.worktree_add = Mock()
+            mock_git.worktree_list.return_value = []
+
+            mock_worktree_git = Mock()
+            # No uncommitted changes
+            mock_worktree_git.has_changes.return_value = False
+            # No prior commits on the branch either
+            mock_worktree_git.count_commits_ahead.return_value = 0
+            mock_worktree_git.default_branch.return_value = "main"
+            mock_log_result = Mock()
+            mock_log_result.stdout = ""
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / task.task_id
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=task.id, resume=False)
+
+        assert result == 0
+        refreshed = store.get(task.id)
+        assert refreshed.status == "failed", f"Expected 'failed', got '{refreshed.status}'"
