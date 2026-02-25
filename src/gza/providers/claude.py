@@ -13,8 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from rich.console import Console
-
 logger = logging.getLogger(__name__)
 
 from .base import (
@@ -25,6 +23,7 @@ from .base import (
     build_docker_cmd,
     verify_docker_credentials,
 )
+from .output_formatter import StreamOutputFormatter, truncate_text
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -44,16 +43,6 @@ def _format_tool_param(value: object) -> str:
     else:
         return str(value)
 
-
-# Output color scheme for conversation stream
-OUTPUT_COLORS = {
-    "turn_info": "blue",
-    "assistant_text": "green",
-    "tool_use": "magenta",
-    "todo_pending": "white",
-    "todo_in_progress": "yellow",
-    "todo_completed": "green",
-}
 
 # Claude pricing per million tokens (input, output)
 # https://www.anthropic.com/pricing
@@ -91,9 +80,6 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
         (output_tokens * output_price / 1_000_000)
     )
     return round(cost, 4)
-
-console = Console()
-
 
 def sync_keychain_credentials() -> bool:
     """Extract Claude OAuth credentials from macOS Keychain and write to ~/.claude/.credentials.json.
@@ -307,6 +293,7 @@ class ClaudeProvider(Provider):
         chat_text_display_length: int = 0,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
+        formatter = StreamOutputFormatter()
 
         def parse_claude_output(line: str, data: dict, log_handle=None) -> None:
             try:
@@ -337,19 +324,7 @@ class ClaudeProvider(Provider):
 
                         # Calculate runtime
                         elapsed_seconds = int(time.time() - data["start_time"])
-                        if elapsed_seconds >= 60:
-                            runtime_str = f"{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
-                        else:
-                            runtime_str = f"{elapsed_seconds}s"
-
-                        # Display live stats
                         total_tokens = data["total_input_tokens"] + data["total_output_tokens"]
-                        if total_tokens > 1_000_000:
-                            token_str = f"{total_tokens / 1_000_000:.1f}M tokens"
-                        elif total_tokens > 1000:
-                            token_str = f"{total_tokens // 1000}k tokens"
-                        else:
-                            token_str = f"{total_tokens} tokens"
 
                         # Calculate estimated cost
                         cost = calculate_cost(
@@ -357,7 +332,6 @@ class ClaudeProvider(Provider):
                             data["total_output_tokens"],
                             model,
                         )
-                        cost_str = f"${cost:.2f}"
 
                         # Log timestamp to log file at start of each turn
                         if log_handle:
@@ -366,11 +340,13 @@ class ClaudeProvider(Provider):
                             log_handle.flush()
 
                         # Add blank line before turn (except first turn)
-                        if turn_count > 1:
-                            console.print()
-
-                        # Print turn info with color
-                        console.print(f"| Turn {turn_count} | {token_str} | {cost_str} | {runtime_str} |", style=OUTPUT_COLORS["turn_info"])
+                        formatter.print_turn_header(
+                            turn_count,
+                            total_tokens,
+                            cost,
+                            elapsed_seconds,
+                            blank_line_before=turn_count > 1,
+                        )
 
                     for content in message.get("content", []):
                         if content.get("type") == "tool_use":
@@ -384,12 +360,11 @@ class ClaudeProvider(Provider):
                             if tool_name == "Bash":
                                 command = tool_input.get("command", "")
                                 # Truncate to 80 chars
-                                if len(command) > 80:
-                                    command = command[:77] + "..."
-                                console.print(f"→ {tool_name} {command}", style=OUTPUT_COLORS["tool_use"])
+                                command = truncate_text(command, 80)
+                                formatter.print_tool_event(tool_name, command)
                             elif tool_name == "Glob":
                                 pattern = tool_input.get("pattern", "")
-                                console.print(f"→ {tool_name} {pattern}", style=OUTPUT_COLORS["tool_use"])
+                                formatter.print_tool_event(tool_name, pattern)
                             elif tool_name == "TodoWrite":
                                 todos = tool_input.get("todos", [])
                                 todos_summary = f"{len(todos)} todos"
@@ -399,23 +374,12 @@ class ClaudeProvider(Provider):
                                     in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
                                     completed = sum(1 for t in todos if t.get("status") == "completed")
                                     todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
-                                console.print(f"→ {tool_name} {todos_summary}", style=OUTPUT_COLORS["tool_use"])
-                                # Print each todo with status icon and truncated content
-                                status_icons = {
-                                    "pending": "○",
-                                    "in_progress": "◐",
-                                    "completed": "●"
-                                }
+                                formatter.print_tool_event(tool_name, todos_summary)
+                                # Print each todo with status icon and truncated content.
                                 for todo in todos:
                                     status = todo.get("status", "pending")
-                                    icon = status_icons.get(status, "○")
                                     content = todo.get("content", "")
-                                    # Truncate to 60 chars
-                                    if len(content) > 60:
-                                        content = content[:57] + "..."
-                                    # Use status-based color for better visibility
-                                    color = OUTPUT_COLORS.get(f"todo_{status}", "white")
-                                    console.print(f"  {icon} {content}", style=color)
+                                    formatter.print_todo(status, truncate_text(content, 60))
                             elif tool_name == "Edit":
                                 # Enhanced logging for Edit tool
                                 parts = [tool_name]
@@ -447,41 +411,38 @@ class ClaudeProvider(Provider):
                                 if old_string:
                                     # Get first line of old_string, truncate if needed
                                     first_line = old_string.split("\n")[0]
-                                    if len(first_line) > 40:
-                                        preview = first_line[:37] + "..."
-                                    else:
-                                        preview = first_line
+                                    preview = truncate_text(first_line, 40)
                                     # Escape newlines and quotes for display
                                     preview = preview.replace("\r", "\\r").replace("\t", "\\t")
                                     parts.append(f'"{preview}"')
 
-                                console.print(f"→ {' '.join(parts)}", style=OUTPUT_COLORS["tool_use"])
+                                formatter.print_tool_event(" ".join(parts))
                             elif file_path:
-                                console.print(f"→ {tool_name} {file_path}", style=OUTPUT_COLORS["tool_use"])
+                                formatter.print_tool_event(tool_name, file_path)
                             else:
                                 parts = [tool_name]
                                 for k, v in tool_input.items():
                                     parts.append(f"{k}={_format_tool_param(v)}")
-                                console.print(f"→ {' '.join(parts)}", style=OUTPUT_COLORS["tool_use"])
+                                formatter.print_tool_event(" ".join(parts))
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:
                                 # Display text to console (configurable length, 0 = unlimited)
                                 if chat_text_display_length == 0:
                                     # Show full text
-                                    console.print(text, style=OUTPUT_COLORS["assistant_text"])
+                                    formatter.print_agent_message(text)
                                 else:
                                     # Truncate to first line and max length
                                     first_line = text.split("\n")[0]
-                                    if len(first_line) > chat_text_display_length:
-                                        first_line = first_line[:chat_text_display_length - 3] + "..."
-                                    console.print(first_line, style=OUTPUT_COLORS["assistant_text"])
+                                    formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
 
                 elif event_type == "result":
                     data["result"] = event
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
+                if line == data.get("_startup_line"):
+                    return
                 print(line)
 
         result = self.run_with_logging(
