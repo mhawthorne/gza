@@ -110,6 +110,12 @@ class PromptBuilder:
                 )
             else:
                 base_prompt += _load_template("task_without_summary.txt")
+
+            if config.verify_command:
+                base_prompt += (
+                    f"\n\nBefore finishing, run the following verification command"
+                    f" and fix any errors: `{config.verify_command}`"
+                )
         else:
             base_prompt += "\n\nWhen you are done, report what you accomplished."
 

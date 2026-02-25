@@ -47,6 +47,9 @@ task_types:
   review:
     model: claude-3-5-haiku-latest
 
+# Command to run before finishing any task/implement/improve task
+verify_command: 'uv run mypy src/ && uv run pytest tests/ -x -q'
+
 # Claude-specific configuration
 # claude:
 #   # Fetch OAuth token from macOS Keychain for Docker (macOS only)
