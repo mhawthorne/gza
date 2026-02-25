@@ -9,4 +9,4 @@ The summary should describe:
 
 If you cannot complete the task, write a failure marker on its own line before your final message:
   [GZA_FAILURE:REASON]
-where REASON is one of: MAX_TURNS, TEST_FAILURE
+where REASON is one of: MAX_STEPS, MAX_TURNS, TEST_FAILURE

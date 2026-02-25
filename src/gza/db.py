@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 # Known failure reason categories
-KNOWN_FAILURE_REASONS = {"MAX_TURNS", "TEST_FAILURE", "UNKNOWN"}
+KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "UNKNOWN"}
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
@@ -30,6 +30,8 @@ class Task:
     based_on: int | None = None  # Reference to parent task id
     has_commits: bool | None = None
     duration_seconds: float | None = None
+    num_steps_reported: int | None = None  # Step count reported by the provider
+    num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
@@ -71,6 +73,8 @@ class Task:
 class TaskStats:
     """Statistics from a task run."""
     duration_seconds: float | None = None
+    num_steps_reported: int | None = None  # Step count reported by the provider
+    num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
@@ -79,7 +83,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -98,6 +102,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     based_on INTEGER REFERENCES tasks(id),
     has_commits INTEGER,
     duration_seconds REAL,
+    num_steps_reported INTEGER,
+    num_steps_computed INTEGER,
     num_turns INTEGER,  -- kept for backward compat; use num_turns_reported instead
     num_turns_reported INTEGER,
     num_turns_computed INTEGER,
@@ -225,6 +231,18 @@ ALTER TABLE tasks ADD COLUMN diff_lines_removed INTEGER;
 # Migration from v13 to v14
 MIGRATION_V13_TO_V14 = """
 ALTER TABLE tasks ADD COLUMN review_cleared_at TEXT;
+"""
+
+# Migration from v14 to v15
+MIGRATION_V14_TO_V15 = """
+ALTER TABLE tasks ADD COLUMN num_steps_reported INTEGER;
+ALTER TABLE tasks ADD COLUMN num_steps_computed INTEGER;
+UPDATE tasks
+SET num_steps_reported = num_turns_reported
+WHERE num_steps_reported IS NULL AND num_turns_reported IS NOT NULL;
+UPDATE tasks
+SET num_steps_computed = num_turns_computed
+WHERE num_steps_computed IS NULL AND num_turns_computed IS NOT NULL;
 """
 
 
@@ -447,6 +465,19 @@ class SqliteTaskStore:
                                 # Column might already exist
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (14,))
+                    current_version = 14
+
+                if current_version < 15:
+                    # Run migration v14 -> v15
+                    for stmt in MIGRATION_V14_TO_V15.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (15,))
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -471,6 +502,8 @@ class SqliteTaskStore:
             based_on=row["based_on"],
             has_commits=bool(row["has_commits"]) if row["has_commits"] is not None else None,
             duration_seconds=row["duration_seconds"],
+            num_steps_reported=row["num_steps_reported"] if "num_steps_reported" in row.keys() else None,
+            num_steps_computed=row["num_steps_computed"] if "num_steps_computed" in row.keys() else None,
             num_turns_reported=row["num_turns_reported"] if "num_turns_reported" in row.keys() else None,
             num_turns_computed=row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
             cost_usd=row["cost_usd"],
@@ -562,6 +595,8 @@ class SqliteTaskStore:
                     based_on = ?,
                     has_commits = ?,
                     duration_seconds = ?,
+                    num_steps_reported = ?,
+                    num_steps_computed = ?,
                     num_turns_reported = ?,
                     num_turns_computed = ?,
                     cost_usd = ?,
@@ -599,6 +634,8 @@ class SqliteTaskStore:
                     task.based_on,
                     1 if task.has_commits else (0 if task.has_commits is False else None),
                     task.duration_seconds,
+                    task.num_steps_reported,
+                    task.num_steps_computed,
                     task.num_turns_reported,
                     task.num_turns_computed,
                     task.cost_usd,
@@ -894,6 +931,7 @@ class SqliteTaskStore:
                     COUNT(*) FILTER (WHERE status = 'pending') as pending,
                     SUM(cost_usd) as total_cost,
                     SUM(duration_seconds) as total_duration,
+                    SUM(num_steps_reported) as total_steps,
                     SUM(num_turns_reported) as total_turns,
                     SUM(input_tokens) as total_input_tokens,
                     SUM(output_tokens) as total_output_tokens
@@ -907,6 +945,7 @@ class SqliteTaskStore:
                 "pending": row["pending"] or 0,
                 "total_cost": row["total_cost"] or 0,
                 "total_duration": row["total_duration"] or 0,
+                "total_steps": row["total_steps"] or 0,
                 "total_turns": row["total_turns"] or 0,
                 "total_input_tokens": row["total_input_tokens"] or 0,
                 "total_output_tokens": row["total_output_tokens"] or 0,
@@ -1077,6 +1116,8 @@ class SqliteTaskStore:
             task.output_content = output_content
         if stats:
             task.duration_seconds = stats.duration_seconds
+            task.num_steps_reported = stats.num_steps_reported
+            task.num_steps_computed = stats.num_steps_computed
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
@@ -1126,6 +1167,8 @@ class SqliteTaskStore:
             task.branch = branch
         if stats:
             task.duration_seconds = stats.duration_seconds
+            task.num_steps_reported = stats.num_steps_reported
+            task.num_steps_computed = stats.num_steps_computed
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
@@ -1152,6 +1195,8 @@ class SqliteTaskStore:
             task.log_file = log_file
         if stats:
             task.duration_seconds = stats.duration_seconds
+            task.num_steps_reported = stats.num_steps_reported
+            task.num_steps_computed = stats.num_steps_computed
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
@@ -1438,6 +1483,8 @@ def _task_to_dict(task: "Task") -> dict:
         "based_on": task.based_on,
         "has_commits": task.has_commits,
         "duration_seconds": task.duration_seconds,
+        "num_steps_reported": task.num_steps_reported,
+        "num_steps_computed": task.num_steps_computed,
         "num_turns_reported": task.num_turns_reported,
         "num_turns_computed": task.num_turns_computed,
         "cost_usd": task.cost_usd,
@@ -1514,13 +1561,14 @@ def get_baseline_stats(limit: int = 20) -> dict:
     Auto-discovers the DB at .gza/gza.db relative to cwd.
 
     Returns:
-        Dict with keys: avg_turns, avg_duration, avg_cost
+        Dict with keys: avg_steps, avg_turns, avg_duration, avg_cost
     """
     store = _default_store()
     with store._connect() as conn:
         cur = conn.execute(
             """
             SELECT
+                round(avg(num_steps_reported), 1) as avg_steps,
                 round(avg(num_turns_reported), 1) as avg_turns,
                 round(avg(duration_seconds), 1) as avg_duration,
                 round(avg(cost_usd), 4) as avg_cost
@@ -1535,6 +1583,7 @@ def get_baseline_stats(limit: int = 20) -> dict:
         )
         row = cur.fetchone()
         return {
+            "avg_steps": row["avg_steps"],
             "avg_turns": row["avg_turns"],
             "avg_duration": row["avg_duration"],
             "avg_cost": row["avg_cost"],

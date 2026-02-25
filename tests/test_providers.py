@@ -786,7 +786,7 @@ class TestClaudeErrorTypeExtraction:
     """Tests for Claude provider extracting error_type from result."""
 
     def test_extracts_max_turns_error_from_result(self, tmp_path):
-        """Should set error_type='max_turns' when result has subtype error_max_turns."""
+        """Should set error_type='max_steps' when result has subtype error_max_turns."""
         import json
         from gza.providers.claude import ClaudeProvider
 
@@ -817,7 +817,7 @@ class TestClaudeErrorTypeExtraction:
                 timeout_minutes=30,
             )
 
-        assert result.error_type == "max_turns"
+        assert result.error_type == "max_steps"
         assert result.num_turns_reported == 60
         assert result.cost_usd == 1.35
         assert result.exit_code == 0  # Preserves actual exit code
@@ -2191,6 +2191,7 @@ class TestCodexOutputParsing:
 
         assert result.num_turns_reported == 1
         assert result.num_turns_computed == 2
+        assert result.num_steps_computed == 2
 
     def test_logs_item_prefix_with_turn_and_item_index(self, tmp_path, capsys):
         """Should include turn/item index prefix for item.completed output."""
@@ -2254,22 +2255,20 @@ class TestCodexOutputParsing:
         captured = capsys.readouterr()
         assert captured.out.count("Reading prompt from stdin...") == 1
 
-    def test_tracks_max_turns_exceeded(self, tmp_path):
-        """Should track when max_turns is exceeded."""
+    def test_tracks_max_steps_exceeded(self, tmp_path):
+        """Should track when max_steps is exceeded based on item.completed events."""
         import json
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
         log_file = tmp_path / "test.log"
 
-        # Simulate exceeding max_turns (set to 2)
+        # Simulate exceeding max_steps (set to 2)
         json_lines = [
             json.dumps({"type": "turn.started"}) + "\n",
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
-            json.dumps({"type": "turn.started"}) + "\n",
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
-            json.dumps({"type": "turn.started"}) + "\n",  # Third turn exceeds limit
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "echo 1"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "step 2"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "step 3"}}) + "\n",
         ]
 
         with patch("gza.providers.base.subprocess.Popen") as mock_popen:
@@ -2283,11 +2282,11 @@ class TestCodexOutputParsing:
                 cmd=["codex", "exec", "--json", "-"],
                 log_file=log_file,
                 timeout_minutes=30,
-                max_turns=2,  # Set max_turns to 2
+                max_steps=2,  # Set max_steps to 2
             )
 
-        assert result.num_turns_reported == 3
-        assert result.error_type == "max_turns"
+        assert result.num_steps_computed == 3
+        assert result.error_type == "max_steps"
 
     def test_uses_shared_formatter_for_turn_tool_message_and_error(self, tmp_path):
         """Codex parser should route key output lines through shared formatter."""
@@ -2555,6 +2554,7 @@ class TestProviderScopedConfig:
             "    task_types:\n"
             "      review:\n"
             "        model: claude-haiku-4-5\n"
+            "        max_steps: 25\n"
             "        max_turns: 20\n"
             "  codex:\n"
             "    model: o4-mini\n"
@@ -2563,6 +2563,7 @@ class TestProviderScopedConfig:
 
         assert config.providers["claude"].model == "claude-sonnet-4-5"
         assert config.providers["claude"].task_types["review"].model == "claude-haiku-4-5"
+        assert config.providers["claude"].task_types["review"].max_steps == 25
         assert config.providers["claude"].task_types["review"].max_turns == 20
         assert config.providers["codex"].model == "o4-mini"
 
@@ -2679,11 +2680,13 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "max_steps: 60\n"
             "max_turns: 50\n"
             "model: legacy-model\n"
             "task_types:\n"
             "  review:\n"
             "    model: legacy-review\n"
+            "    max_steps: 35\n"
             "    max_turns: 30\n"
             "providers:\n"
             "  claude:\n"
@@ -2691,12 +2694,44 @@ class TestProviderScopedConfig:
             "    task_types:\n"
             "      review:\n"
             "        model: scoped-review\n"
+            "        max_steps: 22\n"
             "        max_turns: 20\n"
         )
         config = Config.load(tmp_path)
         assert config.get_model_for_task("review", "claude") == "scoped-review"
         assert config.get_model_for_task("task", "claude") == "scoped-model"
         assert config.get_model_for_task("review", "codex") == "legacy-review"
-        assert config.get_max_turns_for_task("review", "claude") == 20
-        assert config.get_max_turns_for_task("review", "codex") == 30
-        assert config.get_max_turns_for_task("task", "codex") == 50
+        assert config.get_max_steps_for_task("review", "claude") == 22
+        assert config.get_max_steps_for_task("review", "codex") == 35
+        assert config.get_max_steps_for_task("task", "codex") == 60
+        assert config.get_max_turns_for_task("review", "claude") == 22
+        assert config.get_max_turns_for_task("review", "codex") == 35
+        assert config.get_max_turns_for_task("task", "codex") == 60
+
+    def test_max_steps_falls_back_to_max_turns_with_warning(self, tmp_path):
+        """Legacy max_turns should still resolve max steps and emit a deprecation warning."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "max_turns: 77\n"
+        )
+        with pytest.warns(DeprecationWarning, match="max_turns"):
+            config = Config.load(tmp_path)
+
+        assert config.max_steps == 77
+        assert config.get_max_steps_for_task("task", "claude") == 77
+
+    def test_max_steps_task_type_precedence_over_max_turns(self, tmp_path):
+        """task_types.<type>.max_steps should win over task_types.<type>.max_turns and global values."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "max_steps: 50\n"
+            "max_turns: 40\n"
+            "task_types:\n"
+            "  review:\n"
+            "    max_steps: 11\n"
+            "    max_turns: 9\n"
+        )
+        config = Config.load(tmp_path)
+        assert config.get_max_steps_for_task("review", "claude") == 11

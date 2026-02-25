@@ -5444,9 +5444,11 @@ class TestMaxTurnsFlag:
         # Apply override like cmd_run does
         args = argparse.Namespace(max_turns=100, project_dir=config.project_dir)
         if hasattr(args, 'max_turns') and args.max_turns is not None:
+            config.max_steps = args.max_turns
             config.max_turns = args.max_turns
 
         assert config.max_turns == 100
+        assert config.max_steps == 100
 
     def test_retry_command_accepts_max_turns_flag(self, tmp_path: Path):
         """Retry command accepts --max-turns flag without error."""
@@ -5464,9 +5466,11 @@ class TestMaxTurnsFlag:
         # Apply override like cmd_retry does
         args = argparse.Namespace(max_turns=150, project_dir=config.project_dir)
         if hasattr(args, 'max_turns') and args.max_turns is not None:
+            config.max_steps = args.max_turns
             config.max_turns = args.max_turns
 
         assert config.max_turns == 150
+        assert config.max_steps == 150
 
     def test_resume_command_accepts_max_turns_flag(self, tmp_path: Path):
         """Resume command accepts --max-turns flag without error."""
@@ -5484,9 +5488,11 @@ class TestMaxTurnsFlag:
         # Apply override like cmd_resume does
         args = argparse.Namespace(max_turns=200, project_dir=config.project_dir)
         if hasattr(args, 'max_turns') and args.max_turns is not None:
+            config.max_steps = args.max_turns
             config.max_turns = args.max_turns
 
         assert config.max_turns == 200
+        assert config.max_steps == 200
 
     def test_max_turns_override_takes_precedence_over_config(self, tmp_path: Path):
         """--max-turns flag overrides the value from gza.yaml."""
@@ -5505,6 +5511,7 @@ class TestMaxTurnsFlag:
         # Apply override
         args = argparse.Namespace(max_turns=999, project_dir=config.project_dir)
         if hasattr(args, 'max_turns') and args.max_turns is not None:
+            config.max_steps = args.max_turns
             config.max_turns = args.max_turns
 
         after = config.max_turns

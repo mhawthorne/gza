@@ -24,6 +24,7 @@ DEFAULT_WORKERS_DIR = f".{APP_NAME}/workers"
 DEFAULT_TIMEOUT_MINUTES = 10
 DEFAULT_USE_DOCKER = True
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
+DEFAULT_MAX_STEPS = 50
 DEFAULT_MAX_TURNS = 50
 DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
@@ -71,6 +72,7 @@ def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
 class TaskTypeConfig:
     """Configuration for a specific task type."""
     model: str | None = None
+    max_steps: int | None = None
     max_turns: int | None = None
 
 
@@ -134,6 +136,7 @@ class Config:
     docker_volumes: list[str] = field(default_factory=list)
     timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
     branch_mode: str = DEFAULT_BRANCH_MODE  # "single" or "multi"
+    max_steps: int = DEFAULT_MAX_STEPS
     max_turns: int = DEFAULT_MAX_TURNS
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     worktree_dir: str = DEFAULT_WORKTREE_DIR
@@ -193,27 +196,47 @@ class Config:
         """
         return self.get_model_for_task(task_type, self.provider)
 
-    def get_max_turns_for_task(self, task_type: str, provider: str) -> int | None:
-        """Get max_turns for task type within provider scope.
+    def get_max_steps_for_task(self, task_type: str, provider: str) -> int:
+        """Get max_steps for task type within provider scope.
 
         Precedence:
-        1. providers.<provider>.task_types.<task_type>.max_turns
-        2. task_types.<task_type>.max_turns (legacy)
-        3. max_turns (global default)
+        1. providers.<provider>.task_types.<task_type>.max_steps
+        2. task_types.<task_type>.max_steps
+        3. max_steps
+        4. providers.<provider>.task_types.<task_type>.max_turns (legacy)
+        5. task_types.<task_type>.max_turns (legacy)
+        6. max_turns (legacy global)
+        7. default (50)
         """
         provider_config = self.providers.get(provider)
         if provider_config:
             provider_task_type = provider_config.task_types.get(task_type)
+            if provider_task_type and provider_task_type.max_steps is not None:
+                return provider_task_type.max_steps
             if provider_task_type and provider_task_type.max_turns is not None:
                 return provider_task_type.max_turns
 
         legacy_task_type = self.task_types.get(task_type)
+        if legacy_task_type and legacy_task_type.max_steps is not None:
+            return legacy_task_type.max_steps
         if legacy_task_type and legacy_task_type.max_turns is not None:
             return legacy_task_type.max_turns
 
-        return self.max_turns
+        if self.max_steps is not None:
+            return self.max_steps
+        if self.max_turns is not None:
+            return self.max_turns
+        return DEFAULT_MAX_STEPS
 
-    def get_max_turns_for_task_type(self, task_type: str) -> int | None:
+    def get_max_turns_for_task(self, task_type: str, provider: str) -> int:
+        """Backward-compatible alias for step budget resolution."""
+        return self.get_max_steps_for_task(task_type, provider)
+
+    def get_max_steps_for_task_type(self, task_type: str) -> int:
+        """Get max_steps for a task type using the configured default provider."""
+        return self.get_max_steps_for_task(task_type, self.provider)
+
+    def get_max_turns_for_task_type(self, task_type: str) -> int:
         """Get the max_turns for a given task type, falling back to defaults.
 
         Args:
@@ -222,7 +245,7 @@ class Config:
         Returns:
             The max_turns to use for this task type
         """
-        return self.get_max_turns_for_task(task_type, self.provider)
+        return self.get_max_steps_for_task(task_type, self.provider)
 
     @property
     def worktree_path(self) -> Path:
@@ -269,7 +292,7 @@ class Config:
         # Validate and warn about unknown keys
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
+            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command"
         }
@@ -303,11 +326,37 @@ class Config:
         if os.getenv("GZA_BRANCH_MODE"):
             branch_mode = os.getenv("GZA_BRANCH_MODE")
 
-        # max_turns: check defaults section first, then top-level
-        max_turns = defaults.get("max_turns") or data.get("max_turns", DEFAULT_MAX_TURNS)
+        # max_steps (canonical): check defaults section first, then top-level
+        max_steps = defaults.get("max_steps")
+        if max_steps is None:
+            max_steps = data.get("max_steps")
+        env_max_steps = os.getenv("GZA_MAX_STEPS")
+        if env_max_steps:
+            max_steps = int(env_max_steps)
+
+        # max_turns (legacy fallback): check defaults section first, then top-level
+        max_turns = defaults.get("max_turns")
+        if max_turns is None:
+            max_turns = data.get("max_turns")
         env_max_turns = os.getenv("GZA_MAX_TURNS")
         if env_max_turns:
             max_turns = int(env_max_turns)
+
+        # Migration behavior: if max_steps isn't set, fall back to max_turns with warning.
+        if max_steps is None:
+            if max_turns is not None:
+                warnings.warn(
+                    "'max_turns' is deprecated; use 'max_steps'.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                max_steps = max_turns
+            else:
+                max_steps = DEFAULT_MAX_STEPS
+
+        # Keep max_turns populated for backward-compatible call sites.
+        if max_turns is None:
+            max_turns = max_steps
 
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
         if os.getenv("GZA_WORKTREE_DIR"):
@@ -359,6 +408,7 @@ class Config:
                 if isinstance(config_data, dict):
                     task_types[task_type] = TaskTypeConfig(
                         model=config_data.get("model"),
+                        max_steps=config_data.get("max_steps"),
                         max_turns=config_data.get("max_turns")
                     )
 
@@ -395,6 +445,16 @@ class Config:
                                 f"'providers.{provider_name}.task_types.{task_type}.model' must be a string"
                             )
                         provider_task_max_turns = task_type_config_data.get("max_turns")
+                        provider_task_max_steps = task_type_config_data.get("max_steps")
+                        if provider_task_max_steps is not None:
+                            if not isinstance(provider_task_max_steps, int):
+                                raise ConfigError(
+                                    f"'providers.{provider_name}.task_types.{task_type}.max_steps' must be an integer"
+                                )
+                            if provider_task_max_steps <= 0:
+                                raise ConfigError(
+                                    f"'providers.{provider_name}.task_types.{task_type}.max_steps' must be positive"
+                                )
                         if provider_task_max_turns is not None:
                             if not isinstance(provider_task_max_turns, int):
                                 raise ConfigError(
@@ -406,6 +466,7 @@ class Config:
                                 )
                         provider_task_types[task_type] = TaskTypeConfig(
                             model=provider_task_model,
+                            max_steps=provider_task_max_steps,
                             max_turns=provider_task_max_turns,
                         )
 
@@ -444,6 +505,43 @@ class Config:
                             f"Both provider-scoped and legacy max_turns are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.max_turns and task_types.{task_type}.max_turns). "
                             f"Using provider-scoped value for provider '{provider_name}'.",
+                            stacklevel=2,
+                        )
+                    if provider_task_type.max_steps is not None and "max_steps" in legacy_task_type:
+                        warnings.warn(
+                            f"Both provider-scoped and legacy max_steps are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.max_steps and task_types.{task_type}.max_steps). "
+                            f"Using provider-scoped value for provider '{provider_name}'.",
+                            stacklevel=2,
+                        )
+
+        # Deprecation warnings for legacy max_turns usage without max_steps.
+        if isinstance(defaults, dict) and "max_turns" in defaults and "max_steps" not in defaults:
+            warnings.warn("'defaults.max_turns' is deprecated; use 'defaults.max_steps'.", DeprecationWarning, stacklevel=2)
+        if "max_turns" in data and "max_steps" not in data:
+            warnings.warn("'max_turns' is deprecated; use 'max_steps'.", DeprecationWarning, stacklevel=2)
+        if isinstance(legacy_task_types_data, dict):
+            for task_type, legacy_task_type in legacy_task_types_data.items():
+                if isinstance(legacy_task_type, dict) and "max_turns" in legacy_task_type and "max_steps" not in legacy_task_type:
+                    warnings.warn(
+                        f"'task_types.{task_type}.max_turns' is deprecated; use 'task_types.{task_type}.max_steps'.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+        providers_data = data.get("providers")
+        if isinstance(providers_data, dict):
+            for provider_name, provider_data in providers_data.items():
+                if not isinstance(provider_data, dict):
+                    continue
+                provider_task_types_data = provider_data.get("task_types")
+                if not isinstance(provider_task_types_data, dict):
+                    continue
+                for task_type, task_type_data in provider_task_types_data.items():
+                    if isinstance(task_type_data, dict) and "max_turns" in task_type_data and "max_steps" not in task_type_data:
+                        warnings.warn(
+                            f"'providers.{provider_name}.task_types.{task_type}.max_turns' is deprecated; use "
+                            f"'providers.{provider_name}.task_types.{task_type}.max_steps'.",
+                            DeprecationWarning,
                             stacklevel=2,
                         )
 
@@ -556,6 +654,7 @@ class Config:
             docker_setup_command=data.get("docker_setup_command", ""),
             timeout_minutes=timeout_minutes,
             branch_mode=branch_mode,
+            max_steps=max_steps,
             max_turns=max_turns,
             claude=claude_config,
             worktree_dir=worktree_dir,
@@ -609,7 +708,7 @@ class Config:
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
+            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command"
         }
@@ -676,11 +775,21 @@ class Config:
             elif data["branch_mode"] not in ("single", "multi"):
                 errors.append("'branch_mode' must be either 'single' or 'multi'")
 
+        if "max_steps" in data:
+            if not isinstance(data["max_steps"], int):
+                errors.append("'max_steps' must be an integer")
+            elif data["max_steps"] <= 0:
+                errors.append("'max_steps' must be positive")
+
         if "max_turns" in data:
             if not isinstance(data["max_turns"], int):
                 errors.append("'max_turns' must be an integer")
             elif data["max_turns"] <= 0:
                 errors.append("'max_turns' must be positive")
+            if "max_steps" not in data and not (
+                isinstance(data.get("defaults"), dict) and "max_steps" in data["defaults"]
+            ):
+                warnings.append("'max_turns' is deprecated; use 'max_steps'.")
 
         if "claude_args" in data:
             warnings.append("'claude_args' is deprecated. Migrate to 'claude.args'.")
@@ -747,8 +856,13 @@ class Config:
                         errors.append("'defaults.max_turns' must be an integer")
                     elif defaults["max_turns"] <= 0:
                         errors.append("'defaults.max_turns' must be positive")
+                if "max_steps" in defaults:
+                    if not isinstance(defaults["max_steps"], int):
+                        errors.append("'defaults.max_steps' must be an integer")
+                    elif defaults["max_steps"] <= 0:
+                        errors.append("'defaults.max_steps' must be positive")
                 # Warn about unknown keys in defaults
-                valid_defaults_keys = {"model", "max_turns"}
+                valid_defaults_keys = {"model", "max_steps", "max_turns"}
                 for key in defaults.keys():
                     if key not in valid_defaults_keys:
                         warnings.append(f"Unknown field in 'defaults': '{key}'")
@@ -769,8 +883,13 @@ class Config:
                                 errors.append(f"'task_types.{task_type}.max_turns' must be an integer")
                             elif config["max_turns"] <= 0:
                                 errors.append(f"'task_types.{task_type}.max_turns' must be positive")
+                        if "max_steps" in config:
+                            if not isinstance(config["max_steps"], int):
+                                errors.append(f"'task_types.{task_type}.max_steps' must be an integer")
+                            elif config["max_steps"] <= 0:
+                                errors.append(f"'task_types.{task_type}.max_steps' must be positive")
                         # Warn about unknown keys
-                        valid_task_type_keys = {"model", "max_turns"}
+                        valid_task_type_keys = {"model", "max_steps", "max_turns"}
                         for key in config.keys():
                             if key not in valid_task_type_keys:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
@@ -876,7 +995,16 @@ class Config:
                                         errors.append(
                                             f"'providers.{provider_name}.task_types.{task_type}.max_turns' must be positive"
                                         )
-                                valid_provider_task_type_keys = {"model", "max_turns"}
+                                if "max_steps" in task_type_config:
+                                    if not isinstance(task_type_config["max_steps"], int):
+                                        errors.append(
+                                            f"'providers.{provider_name}.task_types.{task_type}.max_steps' must be an integer"
+                                        )
+                                    elif task_type_config["max_steps"] <= 0:
+                                        errors.append(
+                                            f"'providers.{provider_name}.task_types.{task_type}.max_steps' must be positive"
+                                        )
+                                valid_provider_task_type_keys = {"model", "max_steps", "max_turns"}
                                 for key in task_type_config.keys():
                                     if key not in valid_provider_task_type_keys:
                                         warnings.append(
@@ -921,6 +1049,12 @@ class Config:
                         warnings.append(
                             f"Both provider-scoped and legacy max_turns are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.max_turns and task_types.{task_type}.max_turns). "
+                            f"Provider-scoped value takes precedence."
+                        )
+                    if "max_steps" in provider_task_type and "max_steps" in legacy_task_type:
+                        warnings.append(
+                            f"Both provider-scoped and legacy max_steps are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.max_steps and task_types.{task_type}.max_steps). "
                             f"Provider-scoped value takes precedence."
                         )
 
