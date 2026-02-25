@@ -179,7 +179,7 @@ class GeminiProvider(Provider):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
-        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes)
+        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
         # Insert GEMINI_SHELL_ENABLED before the image name (last element from build_docker_cmd)
         cmd.insert(-1, "-e")
         cmd.insert(-1, "GEMINI_SHELL_ENABLED=true")

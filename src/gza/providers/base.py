@@ -35,8 +35,8 @@ RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
 RUN npm install -g {npm_package}
 
-# Auto-install Python dependencies before CLI starts
-RUN printf '#!/bin/bash\\nset -e\\nif [ -f /workspace/pyproject.toml ]; then\\n    uv sync --project /workspace 2>/dev/null || true\\nfi\\nexec "$@"\\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+# Run optional setup command from env var, then exec the CLI
+RUN printf '#!/bin/bash\\nset -e\\nif [ -n "$GZA_DOCKER_SETUP_COMMAND" ]; then\\n    eval "$GZA_DOCKER_SETUP_COMMAND"\\nfi\\nexec "$@"\\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 RUN useradd -m -s /bin/bash gza
 USER gza
@@ -138,6 +138,7 @@ def build_docker_cmd(
     work_dir: Path,
     timeout_minutes: int,
     docker_volumes: list[str] | None = None,
+    docker_setup_command: str = "",
 ) -> list[str]:
     """Build the base Docker run command.
 
@@ -146,6 +147,7 @@ def build_docker_cmd(
         work_dir: Working directory to mount
         timeout_minutes: Timeout in minutes
         docker_volumes: Optional list of custom volume mounts (e.g., ["/host:/container:ro"])
+        docker_setup_command: Optional setup command to run inside container before CLI starts
 
     Returns:
         List of command arguments (without the actual CLI command)
@@ -182,6 +184,10 @@ def build_docker_cmd(
     for env_var in docker_config.env_vars:
         if os.getenv(env_var):
             cmd.extend(["-e", env_var])
+
+    # Pass setup command if configured
+    if docker_setup_command:
+        cmd.extend(["-e", f"GZA_DOCKER_SETUP_COMMAND={docker_setup_command}"])
 
     cmd.append(docker_config.image_name)
     return cmd

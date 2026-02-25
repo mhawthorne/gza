@@ -14,8 +14,8 @@ RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
 RUN npm install -g @openai/codex
 
-# Auto-install Python dependencies before CLI starts
-RUN printf '#!/bin/bash\nset -e\nif [ -f /workspace/pyproject.toml ]; then\n    uv sync --project /workspace 2>/dev/null || true\nfi\nexec "$@"\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+# Run optional setup command from env var, then exec the CLI
+RUN printf '#!/bin/bash\nset -e\nif [ -n "$GZA_DOCKER_SETUP_COMMAND" ]; then\n    eval "$GZA_DOCKER_SETUP_COMMAND"\nfi\nexec "$@"\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 RUN useradd -m -s /bin/bash gza
 USER gza
