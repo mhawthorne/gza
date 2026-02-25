@@ -3724,8 +3724,37 @@ def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
     return 0
 
 
-def cmd_claude_install_skills(args: argparse.Namespace) -> int:
-    """Install Claude Code skills from gza package to project."""
+def _resolve_skill_install_targets(
+    project_dir: Path,
+    requested_targets: list[str] | None,
+    default_targets: list[str],
+) -> list[tuple[str, Path]]:
+    """Resolve skill install target names to destination directories."""
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    target_map = {
+        "claude": project_dir / ".claude" / "skills",
+        "codex": codex_home / "skills",
+    }
+
+    targets = requested_targets or default_targets
+    if "all" in targets:
+        normalized_targets = ["claude", "codex"]
+    else:
+        normalized_targets = []
+        for target in targets:
+            if target not in target_map:
+                continue
+            if target not in normalized_targets:
+                normalized_targets.append(target)
+
+    return [(target_name, target_map[target_name]) for target_name in normalized_targets]
+
+
+def cmd_skills_install(
+    args: argparse.Namespace,
+    default_targets: list[str],
+) -> int:
+    """Install gza skills from package to one or more target directories."""
     from .skills_utils import (
         get_available_skills,
         get_skill_description,
@@ -3769,41 +3798,55 @@ def cmd_claude_install_skills(args: argparse.Namespace) -> int:
         print("No skills to install")
         return 0
 
-    # Create target directory
-    target_dir = args.project_dir / '.claude' / 'skills'
-    target_dir.mkdir(parents=True, exist_ok=True)
+    requested_targets = getattr(args, "target", None)
+    install_targets = _resolve_skill_install_targets(
+        project_dir=args.project_dir,
+        requested_targets=requested_targets,
+        default_targets=default_targets,
+    )
 
-    # Install skills
-    print(f"Installing {len(skills_to_install)} skill(s) to {target_dir}...")
-
-    installed = 0
-    skipped = 0
-    failed = 0
-
-    for skill in skills_to_install:
-        success, message = copy_skill(skill, target_dir, args.force)
-
-        if success:
-            print(f"  ✓ {skill}")
-            installed += 1
-        elif "already exists" in message:
-            print(f"  ⊘ {skill} ({message})")
-            skipped += 1
-        else:
-            print(f"  ✗ {skill} ({message})")
-            failed += 1
-
-    # Print summary
-    print()
-    if failed > 0:
-        print(f"Installed {installed} skill(s), {skipped} skipped, {failed} failed")
+    if not install_targets:
+        print("Error: No install targets selected")
         return 1
-    elif skipped > 0:
-        print(f"Installed {installed} skill(s) ({skipped} skipped)")
-    else:
-        print(f"Installed {installed} skill(s)")
 
-    return 0
+    any_failed = False
+
+    for target_name, target_dir in install_targets:
+        # Create target directory
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Install skills
+        print(f"Installing {len(skills_to_install)} skill(s) to {target_dir} [{target_name}]...")
+
+        installed = 0
+        skipped = 0
+        failed = 0
+
+        for skill in skills_to_install:
+            success, message = copy_skill(skill, target_dir, args.force)
+
+            if success:
+                print(f"  ✓ {skill}")
+                installed += 1
+            elif "already exists" in message:
+                print(f"  ⊘ {skill} ({message})")
+                skipped += 1
+            else:
+                print(f"  ✗ {skill} ({message})")
+                failed += 1
+
+        # Print summary
+        print()
+        if failed > 0:
+            print(f"Installed {installed} skill(s), {skipped} skipped, {failed} failed [{target_name}]")
+            any_failed = True
+        elif skipped > 0:
+            print(f"Installed {installed} skill(s) ({skipped} skipped) [{target_name}]")
+        else:
+            print(f"Installed {installed} skill(s) [{target_name}]")
+        print()
+
+    return 1 if any_failed else 0
 
 
 class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -3842,6 +3885,33 @@ class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
             else:
                 return (result, ) * tuple_size
         return format
+
+
+def _add_skills_install_args(
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Add common arguments for skills install commands."""
+    parser.add_argument(
+        "skills",
+        nargs="*",
+        help="Specific skills to install (installs all public skills if not specified)",
+    )
+    parser.add_argument(
+        "--target",
+        choices=["claude", "codex", "all"],
+        action="append",
+        help="Install target(s): claude, codex, or all (default depends on command)",
+    )
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing skills",
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List available skills without installing",
+    )
 
 
 def _determine_advance_action(
@@ -4923,27 +4993,13 @@ def main() -> int:
     )
     add_common_args(mark_completed_parser)
 
-    # claude-install-skills command
-    claude_install_parser = subparsers.add_parser(
-        "claude-install-skills",
-        help="Install gza Claude Code skills to project",
+    # skills-install command
+    skills_install_parser = subparsers.add_parser(
+        "skills-install",
+        help="Install gza skills for supported agent runtimes",
     )
-    claude_install_parser.add_argument(
-        "skills",
-        nargs="*",
-        help="Specific skills to install (installs all if not specified)",
-    )
-    claude_install_parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Overwrite existing skills",
-    )
-    claude_install_parser.add_argument(
-        "--list", "-l",
-        action="store_true",
-        help="List available skills without installing",
-    )
-    add_common_args(claude_install_parser)
+    _add_skills_install_args(skills_install_parser)
+    add_common_args(skills_install_parser)
 
     args = parser.parse_args()
 
@@ -5021,8 +5077,8 @@ def main() -> int:
             return cmd_mark_completed(args)
         elif args.command == "learnings":
             return cmd_learnings(args)
-        elif args.command == "claude-install-skills":
-            return cmd_claude_install_skills(args)
+        elif args.command == "skills-install":
+            return cmd_skills_install(args, default_targets=["all"])
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

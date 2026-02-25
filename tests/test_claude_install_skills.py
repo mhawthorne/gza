@@ -1,5 +1,6 @@
-"""Tests for the claude-install-skills command."""
+"""Tests for the skills-install command."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -7,13 +8,21 @@ import pytest
 import yaml
 
 
-def run_gza(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run_gza(
+    *args: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """Run gza command and return result."""
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
     return subprocess.run(
         ["uv", "run", "gza", *args],
         capture_output=True,
         text=True,
         cwd=cwd,
+        env=run_env,
     )
 
 
@@ -23,13 +32,13 @@ def setup_config(tmp_path: Path) -> None:
     config_path.write_text("project_name: test-project\n")
 
 
-class TestClaudeInstallSkillsCommand:
-    """Tests for 'gza claude-install-skills' command."""
+class TestSkillsInstallClaudeTarget:
+    """Tests for `gza skills-install --target claude` behavior."""
 
     def test_list_available_skills(self, tmp_path: Path):
         """List command shows all available skills."""
         setup_config(tmp_path)
-        result = run_gza("claude-install-skills", "--list", "--project", str(tmp_path))
+        result = run_gza("skills-install", "--target", "claude", "--list", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Available skills:" in result.stdout
@@ -39,7 +48,7 @@ class TestClaudeInstallSkillsCommand:
     def test_install_all_skills(self, tmp_path: Path):
         """Install all skills to a project."""
         setup_config(tmp_path)
-        result = run_gza("claude-install-skills", "--project", str(tmp_path))
+        result = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Installing" in result.stdout
@@ -54,7 +63,7 @@ class TestClaudeInstallSkillsCommand:
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
         setup_config(tmp_path)
-        result = run_gza("claude-install-skills", "gza-task-add", "--project", str(tmp_path))
+        result = run_gza("skills-install", "--target", "claude", "gza-task-add", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Installing 1 skill(s)" in result.stdout
@@ -70,11 +79,11 @@ class TestClaudeInstallSkillsCommand:
         setup_config(tmp_path)
 
         # Install skills first time
-        result1 = run_gza("claude-install-skills", "--project", str(tmp_path))
+        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         # Try to install again without --force
-        result2 = run_gza("claude-install-skills", "--project", str(tmp_path))
+        result2 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "skipped" in result2.stdout
         assert "already exists" in result2.stdout
@@ -84,7 +93,7 @@ class TestClaudeInstallSkillsCommand:
         setup_config(tmp_path)
 
         # Install skills first time
-        result1 = run_gza("claude-install-skills", "--project", str(tmp_path))
+        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         # Modify one of the skills
@@ -93,7 +102,7 @@ class TestClaudeInstallSkillsCommand:
         skill_file.write_text("Modified content")
 
         # Install again with --force
-        result2 = run_gza("claude-install-skills", "--force", "--project", str(tmp_path))
+        result2 = run_gza("skills-install", "--target", "claude", "--force", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "skipped" not in result2.stdout
 
@@ -103,7 +112,9 @@ class TestClaudeInstallSkillsCommand:
     def test_install_nonexistent_skill(self, tmp_path: Path):
         """Error when requesting a skill that doesn't exist."""
         setup_config(tmp_path)
-        result = run_gza("claude-install-skills", "nonexistent-skill", "--project", str(tmp_path))
+        result = run_gza(
+            "skills-install", "--target", "claude", "nonexistent-skill", "--project", str(tmp_path)
+        )
 
         assert result.returncode == 1
         assert "Error: Skill 'nonexistent-skill' not found" in result.stdout
@@ -117,7 +128,7 @@ class TestClaudeInstallSkillsCommand:
         skills_dir = tmp_path / ".claude" / "skills"
         assert not skills_dir.exists()
 
-        result = run_gza("claude-install-skills", "--project", str(tmp_path))
+        result = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result.returncode == 0
         assert skills_dir.exists()
 
@@ -128,13 +139,63 @@ class TestClaudeInstallSkillsCommand:
         setup_config(project_dir)
 
         # Run from tmp_path but target project_dir
-        result = run_gza("claude-install-skills", "--project", str(project_dir), cwd=tmp_path)
+        result = run_gza("skills-install", "--target", "claude", "--project", str(project_dir), cwd=tmp_path)
         assert result.returncode == 0
 
         # Verify skills were created in project_dir
         skills_dir = project_dir / ".claude" / "skills"
         assert skills_dir.exists()
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
+
+
+class TestSkillsInstallCommand:
+    """Tests for 'gza skills-install' command."""
+
+    def test_list_available_skills(self, tmp_path: Path):
+        """List command works via flat skills-install command."""
+        setup_config(tmp_path)
+        result = run_gza("skills-install", "--list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Available skills:" in result.stdout
+        assert "gza-task-add" in result.stdout
+
+    def test_install_all_targets_by_default(self, tmp_path: Path):
+        """skills-install defaults to both claude and codex targets."""
+        setup_config(tmp_path)
+        codex_home = tmp_path / "codex-home"
+        result = run_gza("skills-install", "--project", str(tmp_path), env={"CODEX_HOME": str(codex_home)})
+
+        assert result.returncode == 0
+        assert "[claude]" in result.stdout
+        assert "[codex]" in result.stdout
+
+        claude_skills_dir = tmp_path / ".claude" / "skills"
+        codex_skills_dir = codex_home / "skills"
+        assert claude_skills_dir.exists()
+        assert codex_skills_dir.exists()
+        assert (claude_skills_dir / "gza-task-add" / "SKILL.md").exists()
+        assert (codex_skills_dir / "gza-task-add" / "SKILL.md").exists()
+
+    def test_install_only_codex_target(self, tmp_path: Path):
+        """Target filter installs only to the requested runtime directory."""
+        setup_config(tmp_path)
+        codex_home = tmp_path / "codex-home"
+        result = run_gza(
+            "skills-install",
+            "--target",
+            "codex",
+            "--project",
+            str(tmp_path),
+            env={"CODEX_HOME": str(codex_home)},
+        )
+
+        assert result.returncode == 0
+        assert "[codex]" in result.stdout
+        assert "[claude]" not in result.stdout
+
+        assert (codex_home / "skills" / "gza-task-add" / "SKILL.md").exists()
+        assert not (tmp_path / ".claude" / "skills").exists()
 
 
 class TestSkillContentValidation:
