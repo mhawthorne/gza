@@ -847,6 +847,29 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_unlinked_reviews_for_slug(self, slug: str) -> list[Task]:
+        """Get completed review tasks not linked via depends_on, matched by slug.
+
+        This is a fallback for review tasks created manually (e.g., prompt starts
+        with "review <slug>") without an explicit depends_on relationship.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE task_type = 'review'
+                  AND status = 'completed'
+                  AND depends_on IS NULL
+                  AND (
+                    task_id LIKE ?
+                    OR prompt LIKE ?
+                  )
+                ORDER BY completed_at DESC NULLS LAST
+                """,
+                (f"%review-{slug}%", f"review {slug}%"),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_improve_tasks_for(self, impl_task_id: int, review_task_id: int) -> list[Task]:
         """Get improve tasks that match the given implementation and review task IDs."""
         with self._connect() as conn:

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -649,6 +650,28 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
     return None
 
 
+def _get_task_slug(task: DbTask) -> str | None:
+    """Extract slug part from task_id (YYYYMMDD-slug -> slug)."""
+    if not task.task_id:
+        return None
+    match = re.match(r"^\d{8}-(.+)$", task.task_id)
+    return match.group(1) if match else task.task_id
+
+
+def _get_reviews_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
+    """Get reviews for a root task, with fallback for unlinked manual reviews."""
+    if root_task.id is None:
+        return []
+    reviews = store.get_reviews_for_task(root_task.id)
+    if reviews:
+        return reviews
+
+    slug = _get_task_slug(root_task)
+    if not slug:
+        return []
+    return store.get_unlinked_reviews_for_slug(slug)
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
     config = Config.load(args.project_dir)
@@ -783,7 +806,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # Check for review status
         review_status = None
         review_status_color = None
-        reviews = store.get_reviews_for_task(root_task.id)
+        reviews = _get_reviews_for_root_task(store, root_task)
         if reviews:
             # Get the most recent review (first in the list, as they're ordered by created_at DESC)
             latest_review = reviews[0]
@@ -3219,9 +3242,13 @@ def cmd_retry(args: argparse.Namespace) -> int:
         task_type=task.task_type,
         group=task.group,
         spec=task.spec,
+        depends_on=task.depends_on,
         create_review=task.create_review,
+        same_branch=task.same_branch,
         task_type_hint=task.task_type_hint,
         based_on=args.task_id,  # Track retry lineage
+        model=task.model,
+        provider=task.provider,
     )
 
     print(f"✓ Created task #{new_task.id} (retry of #{args.task_id})")
@@ -3946,7 +3973,7 @@ def _determine_advance_action(
         }
 
     # Check review state
-    reviews = store.get_reviews_for_task(task.id)
+    reviews = _get_reviews_for_root_task(store, task)
 
     if reviews:
         latest_review = reviews[0]

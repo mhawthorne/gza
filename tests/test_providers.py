@@ -2,12 +2,13 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from gza.config import Config, ClaudeConfig
+from gza.config import Config, ClaudeConfig, ConfigError
 from gza.providers import (
     get_provider,
     ClaudeProvider,
@@ -22,6 +23,8 @@ from gza.providers.base import (
     verify_docker_credentials,
     ensure_docker_image,
     _get_image_created_time,
+    _format_command_for_log,
+    _extract_startup_log_line,
 )
 from gza.providers.gemini import calculate_cost, GEMINI_PRICING
 
@@ -101,6 +104,82 @@ class TestDockerConfig:
         assert "GEMINI_API_KEY" in config.env_vars
         assert "GOOGLE_API_KEY" in config.env_vars
         assert "GOOGLE_APPLICATION_CREDENTIALS" in config.env_vars
+
+
+class TestProviderCommandLogging:
+    """Tests for provider command logging output."""
+
+    def test_format_command_redacts_sensitive_values(self):
+        """Should hide secret values in command log output."""
+        cmd = [
+            "docker", "run", "-e", "OPENAI_API_KEY=abc123", "-e",
+            "GZA_DOCKER_SETUP_COMMAND=export TOKEN=foo", "gza-gza", "codex", "exec",
+        ]
+
+        rendered = _format_command_for_log(cmd)
+
+        assert "OPENAI_API_KEY=***" in rendered
+        assert "GZA_DOCKER_SETUP_COMMAND=***" in rendered
+        assert "abc123" not in rendered
+        assert "TOKEN=foo" not in rendered
+
+    def test_format_command_keeps_non_sensitive_values(self):
+        """Should preserve normal command arguments."""
+        cmd = ["timeout", "10m", "docker", "run", "-e", "PATH=/usr/bin", "image", "claude", "-p"]
+
+        rendered = _format_command_for_log(cmd)
+
+        assert "PATH=/usr/bin" in rendered
+        assert "docker run" in rendered
+
+    def test_extract_startup_line_skips_json(self):
+        """Should suppress JSON event lines from startup echo."""
+        assert _extract_startup_log_line('{"type":"event","message":"hello"}') is None
+
+    def test_extract_startup_line_truncates_long_text(self):
+        """Should truncate very long startup output lines."""
+        line = "x" * 220
+        extracted = _extract_startup_log_line(line)
+        assert extracted is not None
+        assert extracted.endswith("...")
+        assert len(extracted) == 180
+
+    def test_run_with_logging_uses_devnull_when_no_stdin(self, tmp_path):
+        """Should not inherit terminal stdin when no stdin_input is provided."""
+        from gza.providers.base import Provider, RunResult
+
+        class DummyProvider(Provider):
+            @property
+            def name(self) -> str:
+                return "dummy"
+
+            def check_credentials(self) -> bool:
+                return True
+
+            def verify_credentials(self, config: Config) -> bool:
+                return True
+
+            def run(self, config: Config, prompt: str, log_file: Path, work_dir: Path, resume_session_id: str | None = None) -> RunResult:
+                return RunResult(exit_code=0)
+
+        provider = DummyProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter([])
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider.run_with_logging(
+                cmd=["echo", "hello"],
+                log_file=log_file,
+                timeout_minutes=1,
+                stdin_input=None,
+            )
+
+        assert mock_popen.call_args.kwargs["stdin"] == subprocess.DEVNULL
 
 
 class TestBuildDockerCmd:
@@ -1631,12 +1710,47 @@ class TestEnsureDockerImage:
         image_time = dockerfile_mtime + 100  # Image created after Dockerfile
 
         with patch("gza.providers.base._get_image_created_time", return_value=image_time):
-            with patch("gza.providers.base.subprocess.run") as mock_run:
-                result = ensure_docker_image(docker_config, tmp_path)
+            with patch("gza.providers.base._get_image_label", return_value="testcli"):
+                with patch("gza.providers.base.subprocess.run") as mock_run:
+                    result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is True
         # subprocess.run should NOT be called (no build needed)
         mock_run.assert_not_called()
+
+    def test_rebuilds_when_image_label_mismatch(self, tmp_path):
+        """Should rebuild image when existing tag was built for another CLI."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@openai/codex",
+            cli_command="codex",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        # Create Dockerfile
+        etc_dir = tmp_path / "etc"
+        etc_dir.mkdir()
+        dockerfile = etc_dir / "Dockerfile.codex"
+        dockerfile.write_text("FROM node:20-slim")
+
+        # Image exists and is newer, but label mismatch should still rebuild
+        dockerfile_mtime = dockerfile.stat().st_mtime
+        image_time = dockerfile_mtime + 100
+
+        with patch("gza.providers.base._get_image_created_time", return_value=image_time):
+            with patch("gza.providers.base._get_image_label", return_value="claude"):
+                with patch("gza.providers.base.subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0)
+                    result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is True
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert call_args[:3] == ["docker", "build", "-t"]
+        assert "--label" in call_args
+        assert "gza.cli_command=codex" in call_args
+        assert "gza.npm_package=@openai/codex" in call_args
 
     def test_rebuilds_when_dockerfile_newer(self, tmp_path):
         """Should rebuild image when Dockerfile is newer than image."""
@@ -1659,9 +1773,10 @@ class TestEnsureDockerImage:
         image_time = dockerfile_mtime - 100  # Image created before Dockerfile
 
         with patch("gza.providers.base._get_image_created_time", return_value=image_time):
-            with patch("gza.providers.base.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=0)
-                result = ensure_docker_image(docker_config, tmp_path)
+            with patch("gza.providers.base._get_image_label", return_value="testcli"):
+                with patch("gza.providers.base.subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0)
+                    result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is True
         # Verify docker build was called
@@ -1987,6 +2102,108 @@ class TestCodexOutputParsing:
         captured = capsys.readouterr()
         assert "I will help you with that task." in captured.out
 
+    def test_tracks_computed_turns_from_agent_messages(self, tmp_path):
+        """Should track computed turn count based on agent_message items."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "step one"},
+            }) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "step two"},
+            }) + "\n",
+            json.dumps({
+                "type": "turn.completed",
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.num_turns_reported == 1
+        assert result.num_turns_computed == 2
+
+    def test_logs_item_prefix_with_turn_and_item_index(self, tmp_path, capsys):
+        """Should include turn/item index prefix for item.completed output."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "command_execution", "command": "ls -la"},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "[T1.1]" in captured.out
+        assert "→ Bash ls -la" in captured.out
+
+    def test_does_not_print_startup_non_json_line_twice(self, tmp_path, capsys):
+        """Startup line should be shown once, not duplicated by parser fallback."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        lines = [
+            "Reading prompt from stdin...\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "resume", "--json", "--last"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert captured.out.count("Reading prompt from stdin...") == 1
+
     def test_tracks_max_turns_exceeded(self, tmp_path):
         """Should track when max_turns is exceeded."""
         import json
@@ -2196,3 +2413,43 @@ class TestClaudeConfigIntegration:
         is_valid, errors, warns = Config.validate(tmp_path)
         assert is_valid
         assert any("deprecated" in w.lower() for w in warns)
+
+    def test_validate_rejects_model_incompatible_with_provider(self, tmp_path):
+        """Validate should reject obvious cross-provider model mismatches."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "model: claude-3-5-haiku-latest\n"
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("'model' model 'claude-3-5-haiku-latest' appears incompatible with provider 'codex'" in e for e in errors)
+
+    def test_validate_rejects_task_type_model_incompatible_with_provider(self, tmp_path):
+        """Validate should reject incompatible task_types.<type>.model overrides."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "task_types:\n"
+            "  review:\n"
+            "    model: claude-3-5-haiku-latest\n"
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("task_types.review.model" in e and "incompatible with provider 'codex'" in e for e in errors)
+
+    def test_load_rejects_incompatible_task_type_model(self, tmp_path):
+        """Load should fail fast on incompatible provider/task-type model config."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "task_types:\n"
+            "  review:\n"
+            "    model: claude-3-5-haiku-latest\n"
+        )
+
+        with pytest.raises(ConfigError, match="Invalid provider/model configuration"):
+            Config.load(tmp_path)

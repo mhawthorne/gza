@@ -474,7 +474,7 @@ class TestRetryCommand:
         assert "not found" in result.stdout
 
     def test_retry_preserves_task_fields(self, tmp_path: Path):
-        """Retry command preserves task_type, group, spec, and other fields."""
+        """Retry command preserves task metadata and linkage fields."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -487,8 +487,12 @@ class TestRetryCommand:
             task_type="explore",
             group="test-group",
             spec="spec.md",
+            depends_on=42,
             create_review=True,
+            same_branch=True,
             task_type_hint="feature",
+            model="gpt-5.3-codex",
+            provider="codex",
         )
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
@@ -506,8 +510,12 @@ class TestRetryCommand:
         assert new_task.task_type == "explore"
         assert new_task.group == "test-group"
         assert new_task.spec == "spec.md"
+        assert new_task.depends_on == 42
         assert new_task.create_review is True
+        assert new_task.same_branch is True
         assert new_task.task_type_hint == "feature"
+        assert new_task.model == "gpt-5.3-codex"
+        assert new_task.provider == "codex"
         assert new_task.based_on == 1
         assert new_task.status == "pending"
 
@@ -5715,7 +5723,51 @@ This requires team discussion.
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
-        assert "⚠ changes requested" not in result.stdout
+
+    def test_unmerged_falls_back_to_unlinked_review_slug_match(self, tmp_path: Path):
+        """Unmerged should infer review status from unlinked 'review <slug>' tasks."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Simplify mixer", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260225-simplify-mixer-by-removing-the-people-strategy"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        # Simulate a retry-created review that lost depends_on but kept review slug.
+        review = store.add("review simplify-mixer-by-removing-the-people-strategy", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.task_id = "20260225-review-simplify-mixer-by-removing-the-people-strategy-2"
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" in result.stdout
 
     def test_unmerged_hides_review_status_after_improve_clears_it(self, tmp_path: Path):
         """After improve task clears review state, review status is not shown."""

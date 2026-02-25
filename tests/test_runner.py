@@ -544,6 +544,72 @@ class TestReviewNextSteps:
             assert f"gza improve {impl_task.id}" in all_output
             assert f"gza improve {impl_task.id} --run" in all_output
 
+    def test_review_completion_prints_verdict(self, tmp_path: Path):
+        """Completed review output should print parsed review verdict."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Add user authentication", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.branch = "gza/20260211-add-user-authentication"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review the implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.task_id = "20260212-review-the-implementation"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=10.0,
+            num_turns_reported=5,
+            cost_usd=0.05,
+            session_id="test-session",
+            error_type=None,
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.get_diff_numstat.return_value = ""
+        mock_git.get_diff.return_value = ""
+
+        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_review_dir = worktree_path / ".gza" / "reviews"
+        worktree_review_dir.mkdir(parents=True, exist_ok=True)
+        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+        report_file.write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+
+        printed_lines: list[str] = []
+
+        def capture_print(*args, **kwargs):
+            printed_lines.append(str(args[0]) if args else "")
+
+        with patch('gza.runner.console') as mock_console, \
+             patch('gza.runner.post_review_to_pr'):
+            mock_console.print.side_effect = capture_print
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        assert "Verdict: " in "\n".join(printed_lines)
+        assert "CHANGES_REQUESTED" in "\n".join(printed_lines)
+
     def test_non_review_task_does_not_suggest_improve(self, tmp_path: Path):
         """Test that explore/plan task completion does NOT suggest gza improve."""
         db_path = tmp_path / "test.db"

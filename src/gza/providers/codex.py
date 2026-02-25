@@ -261,7 +261,11 @@ class CodexProvider(Provider):
                     if "turn_count" not in data:
                         data["turn_count"] = 0
                         data["start_time"] = time.time()
+                        data["item_count"] = 0
+                        data["item_count_in_turn"] = 0
+                        data["computed_turn_count"] = 0
                     data["turn_count"] += 1
+                    data["item_count_in_turn"] = 0
 
                     # Check if we've exceeded max_turns
                     if data["turn_count"] > max_turns:
@@ -303,22 +307,28 @@ class CodexProvider(Provider):
                 elif event_type == "item.completed":
                     item = event.get("item", {})
                     item_type = item.get("type")
+                    data["item_count"] = data.get("item_count", 0) + 1
+                    data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
+                    turn_count = data.get("turn_count", 0)
+                    item_idx = data.get("item_count_in_turn", 0)
+                    item_prefix = f"[T{turn_count}.{item_idx}] " if turn_count > 0 else ""
 
                     if item_type == "command_execution":
                         command = item.get("command", "")
                         # Truncate to 80 chars
                         if len(command) > 80:
                             command = command[:77] + "..."
-                        print(f"  → Bash {command}")
+                        print(f"  {item_prefix}→ Bash {command}")
 
                     elif item_type == "agent_message":
+                        data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
                         text = item.get("text", "").strip()
                         if text:
                             # Truncate to first line and 80 chars
                             first_line = text.split("\n")[0]
                             if len(first_line) > 80:
                                 first_line = first_line[:77] + "..."
-                            print(f"  {first_line}")
+                            print(f"  {item_prefix}{first_line}")
 
                     elif item_type == "reasoning":
                         # Optional: show reasoning (currently skipped)
@@ -336,6 +346,8 @@ class CodexProvider(Provider):
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
+                if line == data.get("_startup_line"):
+                    return
                 print(line)
 
         result = self.run_with_logging(
@@ -349,6 +361,8 @@ class CodexProvider(Provider):
             # Set num_turns_reported from turn_count
             if "turn_count" in accumulated:
                 result.num_turns_reported = accumulated["turn_count"]
+            if "computed_turn_count" in accumulated:
+                result.num_turns_computed = accumulated["computed_turn_count"]
 
             # Set token counts
             if "input_tokens" in accumulated:

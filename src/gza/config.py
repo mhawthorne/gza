@@ -35,6 +35,37 @@ DEFAULT_CLAUDE_ARGS = [
 ]
 
 
+def _detect_model_provider_family(model: str) -> str | None:
+    """Detect provider family implied by a model name."""
+    model_norm = model.strip().lower()
+    if not model_norm:
+        return None
+    if model_norm.startswith("claude"):
+        return "claude"
+    if model_norm.startswith("gemini"):
+        return "gemini"
+    if "codex" in model_norm or model_norm.startswith(("gpt-", "o1", "o3", "o4")):
+        return "codex"
+    return None
+
+
+def _is_model_compatible_with_provider(provider: str, model: str | None) -> bool:
+    """Return True if model appears compatible with provider."""
+    if not model or not isinstance(model, str):
+        return True
+    family = _detect_model_provider_family(model)
+    if family is None:
+        return True
+    return family == provider
+
+
+def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
+    return (
+        f"'{path}' model '{model}' appears incompatible with provider '{provider}'. "
+        f"Use a model for '{provider}' or change provider."
+    )
+
+
 @dataclass
 class TaskTypeConfig:
     """Configuration for a specific task type."""
@@ -285,6 +316,18 @@ class Config:
                         model=config_data.get("model"),
                         max_turns=config_data.get("max_turns")
                     )
+
+        # Validate provider/model compatibility with effective loaded settings.
+        model_compat_errors: list[str] = []
+        if not _is_model_compatible_with_provider(provider, model):
+            model_compat_errors.append(_provider_model_mismatch_error("model", provider, model))
+        for task_type, task_cfg in task_types.items():
+            if task_cfg.model and not _is_model_compatible_with_provider(provider, task_cfg.model):
+                model_compat_errors.append(
+                    _provider_model_mismatch_error(f"task_types.{task_type}.model", provider, task_cfg.model)
+                )
+        if model_compat_errors:
+            raise ConfigError("Invalid provider/model configuration:\n- " + "\n- ".join(model_compat_errors))
 
         # Parse branch_strategy configuration
         branch_strategy = None
@@ -581,6 +624,41 @@ class Config:
                         for key in config.keys():
                             if key not in valid_task_type_keys:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
+
+        # Validate provider/model compatibility to fail early on mixed-provider configs.
+        provider_for_models = data.get("provider", DEFAULT_PROVIDER)
+        if isinstance(provider_for_models, str) and provider_for_models in ("claude", "codex", "gemini"):
+            top_model = data.get("model")
+            if isinstance(top_model, str) and top_model and not _is_model_compatible_with_provider(provider_for_models, top_model):
+                errors.append(_provider_model_mismatch_error("model", provider_for_models, top_model))
+
+            defaults_cfg = data.get("defaults")
+            if isinstance(defaults_cfg, dict):
+                defaults_model = defaults_cfg.get("model")
+                if (
+                    isinstance(defaults_model, str)
+                    and defaults_model
+                    and not _is_model_compatible_with_provider(provider_for_models, defaults_model)
+                ):
+                    errors.append(_provider_model_mismatch_error("defaults.model", provider_for_models, defaults_model))
+
+            task_types_cfg = data.get("task_types")
+            if isinstance(task_types_cfg, dict):
+                for task_type, task_cfg in task_types_cfg.items():
+                    if isinstance(task_cfg, dict):
+                        task_model = task_cfg.get("model")
+                        if (
+                            isinstance(task_model, str)
+                            and task_model
+                            and not _is_model_compatible_with_provider(provider_for_models, task_model)
+                        ):
+                            errors.append(
+                                _provider_model_mismatch_error(
+                                    f"task_types.{task_type}.model",
+                                    provider_for_models,
+                                    task_model,
+                                )
+                            )
 
         # Validate branch_strategy section
         if "branch_strategy" in data:

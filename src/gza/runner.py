@@ -64,6 +64,20 @@ DIFF_SMALL_THRESHOLD = 500   # lines: pass verbatim
 DIFF_MEDIUM_THRESHOLD = 2000  # lines: prepend --stat summary above full diff
 
 
+def _extract_review_verdict(content: str | None) -> str | None:
+    """Extract review verdict from markdown content."""
+    if not content:
+        return None
+    match = re.search(
+        r"\*{0,2}Verdict:\s*(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
+        content,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
 def backup_database(db_path: Path, project_dir: Path) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
 
@@ -1246,6 +1260,15 @@ def _run_non_code_task(
         stats_line(stats, has_commits=False)
         console.print(f"Task ID: {task.id}")
         console.print(f"Report: {report_file_relative}")
+        if task.task_type == "review":
+            verdict = _extract_review_verdict(output_content)
+            if verdict:
+                verdict_color = {
+                    "APPROVED": "green",
+                    "CHANGES_REQUESTED": "yellow",
+                    "NEEDS_DISCUSSION": "blue",
+                }.get(verdict, "white")
+                console.print(f"Verdict: [{verdict_color}]{verdict}[/{verdict_color}]")
         console.print("")
 
         if task.task_type == "explore":

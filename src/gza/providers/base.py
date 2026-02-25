@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -90,6 +91,32 @@ def _get_image_created_time(image_name: str) -> float | None:
         return None
 
 
+def _get_image_label(image_name: str, label_key: str) -> str | None:
+    """Get a specific label value from a Docker image.
+
+    Returns:
+        Label value, or None if image/label does not exist.
+    """
+    result = subprocess.run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            image_name,
+            "--format",
+            f'{{{{index .Config.Labels "{label_key}"}}}}',
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    if not value or value == "<no value>":
+        return None
+    return value
+
+
 def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     """Ensure Docker image exists, building if needed.
 
@@ -105,17 +132,37 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     dockerfile_path = etc_dir / f"Dockerfile.{docker_config.cli_command}"
 
     # Check if image exists and is up-to-date
+    rebuild_reason: str | None = None
     image_time = _get_image_created_time(docker_config.image_name)
     if image_time is not None:
-        # Image exists - check if Dockerfile is newer
-        if dockerfile_path.exists():
-            dockerfile_time = dockerfile_path.stat().st_mtime
-            if dockerfile_time > image_time:
-                print(f"Dockerfile changed, rebuilding {docker_config.image_name}...")
-            else:
-                return True  # Image is up-to-date
+        # Rebuild when an existing shared tag was built for a different CLI.
+        # This handles provider switches (e.g., claude -> codex) safely.
+        image_cli = _get_image_label(docker_config.image_name, "gza.cli_command")
+        if image_cli != docker_config.cli_command:
+            rebuild_reason = (
+                f"provider mismatch (image cli: {image_cli or 'unknown'}, "
+                f"requested cli: {docker_config.cli_command})"
+            )
         else:
-            return True  # No Dockerfile to compare, image exists
+            # Image exists - check if Dockerfile is newer
+            if dockerfile_path.exists():
+                dockerfile_time = dockerfile_path.stat().st_mtime
+                if dockerfile_time > image_time:
+                    rebuild_reason = f"{dockerfile_path.name} is newer than image"
+                else:
+                    print(
+                        f"Using Docker image {docker_config.image_name} "
+                        f"(up-to-date for {docker_config.cli_command})"
+                    )
+                    return True  # Image is up-to-date
+            else:
+                print(
+                    f"Using Docker image {docker_config.image_name} "
+                    f"(up-to-date for {docker_config.cli_command}; no {dockerfile_path.name} timestamp to compare)"
+                )
+                return True  # No Dockerfile to compare, image exists
+    else:
+        rebuild_reason = "image not found"
 
     # Generate Dockerfile if it doesn't exist (preserve custom Dockerfiles)
     if not dockerfile_path.exists():
@@ -125,10 +172,21 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
         )
         dockerfile_path.write_text(dockerfile_content)
 
-    print(f"Building Docker image {docker_config.image_name}...")
+    print(f"Rebuilding Docker image {docker_config.image_name}: {rebuild_reason}")
     result = subprocess.run(
-        ["docker", "build", "-t", docker_config.image_name,
-         "-f", str(dockerfile_path), str(etc_dir)],
+        [
+            "docker",
+            "build",
+            "-t",
+            docker_config.image_name,
+            "--label",
+            f"gza.cli_command={docker_config.cli_command}",
+            "--label",
+            f"gza.npm_package={docker_config.npm_package}",
+            "-f",
+            str(dockerfile_path),
+            str(etc_dir),
+        ],
     )
     return result.returncode == 0
 
@@ -392,25 +450,28 @@ class Provider(ABC):
             RunResult with exit code and duration. Stats should be filled
             in by parse_output callback or by caller.
         """
+        print(f"Running command: {_format_command_for_log(cmd)}")
         print(f"Logging to: {log_file}")
         print(f"Timeout: {timeout_minutes} minutes")
         print("")
 
         start_time = time.time()
         accumulated_data: dict = {}
+        startup_logged = False
 
         with open(log_file, "w") as log:
+            stdin_target = subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE if stdin_input else None,
+                stdin=stdin_target,
                 text=True,
                 cwd=cwd,
             )
 
             # Write stdin if provided
-            if stdin_input and process.stdin:
+            if stdin_input is not None and process.stdin:
                 process.stdin.write(stdin_input)
                 process.stdin.close()
 
@@ -420,6 +481,13 @@ class Provider(ABC):
                     line = line.strip()
                     if not line:
                         continue
+
+                    if not startup_logged:
+                        startup_line = _extract_startup_log_line(line)
+                        if startup_line:
+                            print(f"Startup: {startup_line}")
+                            accumulated_data["_startup_line"] = line
+                            startup_logged = True
 
                     if parse_output:
                         parse_output(line, accumulated_data, log)
@@ -436,6 +504,33 @@ class Provider(ABC):
         # Let caller extract stats from accumulated_data
         result._accumulated_data = accumulated_data
         return result
+
+
+def _format_command_for_log(cmd: list[str]) -> str:
+    """Format command for display while redacting sensitive values."""
+
+    def redact(arg: str) -> str:
+        if "=" not in arg:
+            return arg
+        key, value = arg.split("=", 1)
+        key_upper = key.upper()
+        if key_upper == "GZA_DOCKER_SETUP_COMMAND":
+            return f"{key}=***"
+        sensitive_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+        if any(marker in key_upper for marker in sensitive_markers):
+            return f"{key}=***"
+        return f"{key}={value}"
+
+    return shlex.join([redact(arg) for arg in cmd])
+
+
+def _extract_startup_log_line(line: str, max_len: int = 180) -> str | None:
+    """Return a concise startup line, skipping structured JSON output."""
+    if line.startswith("{") and line.endswith("}"):
+        return None
+    if len(line) > max_len:
+        return f"{line[: max_len - 3]}..."
+    return line
 
 
 def get_provider(config: Config) -> Provider:
