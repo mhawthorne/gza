@@ -2,6 +2,7 @@
 
 import os
 import sys
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +40,13 @@ class TaskTypeConfig:
     """Configuration for a specific task type."""
     model: str | None = None
     max_turns: int | None = None
+
+
+@dataclass
+class ClaudeConfig:
+    """Claude-specific configuration."""
+    fetch_auth_token_from_keychain: bool = False
+    args: list[str] = field(default_factory=lambda: list(DEFAULT_CLAUDE_ARGS))
 
 
 @dataclass
@@ -88,7 +96,7 @@ class Config:
     timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
     branch_mode: str = DEFAULT_BRANCH_MODE  # "single" or "multi"
     max_turns: int = DEFAULT_MAX_TURNS
-    claude_args: list[str] = field(default_factory=lambda: list(DEFAULT_CLAUDE_ARGS))
+    claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     worktree_dir: str = DEFAULT_WORKTREE_DIR
     work_count: int = DEFAULT_WORK_COUNT
     provider: str = DEFAULT_PROVIDER  # "claude" or "gemini"
@@ -184,7 +192,7 @@ class Config:
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns",
-            "claude_args", "worktree_dir", "work_count", "provider", "model",
+            "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
             "defaults", "task_types", "branch_strategy"
         }
         for key in data.keys():
@@ -317,6 +325,33 @@ class Config:
                     default_type=bs_data.get("default_type", "feature")
                 )
 
+        # Parse claude configuration section
+        claude_config = ClaudeConfig()
+        claude_data = data.get("claude")
+        if isinstance(claude_data, dict):
+            if "fetch_auth_token_from_keychain" in claude_data:
+                claude_config.fetch_auth_token_from_keychain = bool(claude_data["fetch_auth_token_from_keychain"])
+            if "args" in claude_data:
+                claude_config.args = claude_data["args"]
+
+        # Backward compat: top-level claude_args still works but is deprecated
+        if "claude_args" in data:
+            if isinstance(claude_data, dict) and "args" in claude_data:
+                # claude.args takes precedence; warn about both being set
+                warnings.warn(
+                    "Both 'claude_args' and 'claude.args' are set in gza.yaml. "
+                    "Using 'claude.args'. Please remove deprecated 'claude_args'.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            else:
+                warnings.warn(
+                    "'claude_args' is deprecated. Migrate to 'claude.args' in gza.yaml.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                claude_config.args = data["claude_args"]
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -328,7 +363,7 @@ class Config:
             timeout_minutes=timeout_minutes,
             branch_mode=branch_mode,
             max_turns=max_turns,
-            claude_args=data.get("claude_args", list(DEFAULT_CLAUDE_ARGS)),
+            claude=claude_config,
             worktree_dir=worktree_dir,
             work_count=work_count,
             provider=provider,
@@ -378,9 +413,9 @@ class Config:
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
-            "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns", "claude_args",
-            "worktree_dir", "work_count", "provider", "model", "defaults", "task_types",
-            "branch_strategy"
+            "docker_image", "docker_volumes", "timeout_minutes", "branch_mode", "max_turns",
+            "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
+            "defaults", "task_types", "branch_strategy"
         }
 
         for key in data.keys():
@@ -449,12 +484,34 @@ class Config:
                 errors.append("'max_turns' must be positive")
 
         if "claude_args" in data:
+            warnings.append("'claude_args' is deprecated. Migrate to 'claude.args'.")
             if not isinstance(data["claude_args"], list):
                 errors.append("'claude_args' must be a list")
             else:
                 for i, arg in enumerate(data["claude_args"]):
                     if not isinstance(arg, str):
                         errors.append(f"'claude_args[{i}]' must be a string")
+
+        if "claude" in data:
+            if not isinstance(data["claude"], dict):
+                errors.append("'claude' must be a dictionary")
+            else:
+                claude_data = data["claude"]
+                if "fetch_auth_token_from_keychain" in claude_data:
+                    if not isinstance(claude_data["fetch_auth_token_from_keychain"], bool):
+                        errors.append("'claude.fetch_auth_token_from_keychain' must be a boolean")
+                if "args" in claude_data:
+                    if not isinstance(claude_data["args"], list):
+                        errors.append("'claude.args' must be a list")
+                    else:
+                        for i, arg in enumerate(claude_data["args"]):
+                            if not isinstance(arg, str):
+                                errors.append(f"'claude.args[{i}]' must be a string")
+                # Warn about unknown keys
+                valid_claude_keys = {"fetch_auth_token_from_keychain", "args"}
+                for key in claude_data.keys():
+                    if key not in valid_claude_keys:
+                        warnings.append(f"Unknown field in 'claude': '{key}'")
 
         if "worktree_dir" in data and not isinstance(data["worktree_dir"], str):
             errors.append("'worktree_dir' must be a string")

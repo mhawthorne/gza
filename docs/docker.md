@@ -172,10 +172,20 @@ On macOS, Docker needs access to the directories gza uses. The default `/tmp/gza
 
 ## Claude Authentication
 
-Claude Code supports two authentication methods in Docker:
+Claude Code supports three authentication methods in Docker:
 
 1. **OAuth** (preferred for subscriptions): Run `claude login` on host. Credentials in `~/.claude/` are mounted into the container. Uses your Claude Max subscription.
 2. **API Key** (fallback): Set `ANTHROPIC_API_KEY` in `~/.gza/.env`. Uses pay-per-token API pricing.
+3. **Keychain Token Fetch** (macOS Docker): Extracts OAuth credentials from the macOS Keychain and writes them to `~/.claude/.credentials.json` before each Docker run. Useful when Docker containers can't access the Keychain directly.
+
+To enable keychain token fetching, add to your `gza.yaml`:
+
+```yaml
+claude:
+  fetch_auth_token_from_keychain: true
+```
+
+This requires that you've previously logged in with `claude login` on macOS, which stores tokens in the Keychain under "Claude Code-credentials".
 
 **Important:** `ANTHROPIC_API_KEY` takes precedence over OAuth. If both are configured and you want to use your subscription, comment out or remove `ANTHROPIC_API_KEY` from your `.env` files.
 

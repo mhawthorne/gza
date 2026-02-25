@@ -44,12 +44,16 @@ task_types:
   review:
     model: claude-3-5-haiku-latest
 
-# Arguments passed to Claude Code
-# claude_args:
-#   - --allowedTools
-#   - Read
-#   - Write
-#   - Edit
-#   - Glob
-#   - Grep
-#   - Bash
+# Claude-specific configuration
+# claude:
+#   # Fetch OAuth token from macOS Keychain for Docker (macOS only)
+#   fetch_auth_token_from_keychain: false
+#   # Arguments passed to Claude Code CLI
+#   args:
+#     - --allowedTools
+#     - Read
+#     - Write
+#     - Edit
+#     - Glob
+#     - Grep
+#     - Bash

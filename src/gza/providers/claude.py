@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+
+logger = logging.getLogger(__name__)
 
 from .base import (
     Provider,
@@ -90,6 +95,59 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
 console = Console()
 
 
+def sync_keychain_credentials() -> bool:
+    """Extract Claude OAuth credentials from macOS Keychain and write to ~/.claude/.credentials.json.
+
+    Returns True if credentials were written, False otherwise.
+    """
+    if sys.platform != "darwin":
+        logger.warning("sync_keychain_credentials: not on macOS, skipping")
+        return False
+
+    if not shutil.which("security"):
+        logger.warning("sync_keychain_credentials: 'security' command not found, skipping")
+        return False
+
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-l", "Claude Code-credentials", "-w"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        logger.warning("sync_keychain_credentials: failed to run security command")
+        return False
+
+    if result.returncode != 0:
+        logger.warning("sync_keychain_credentials: no keychain entry found for 'Claude Code-credentials'")
+        return False
+
+    raw = result.stdout.strip()
+    if not raw:
+        logger.warning("sync_keychain_credentials: keychain entry is empty")
+        return False
+
+    try:
+        creds = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("sync_keychain_credentials: keychain entry is not valid JSON")
+        return False
+
+    if "claudeAiOauth" not in creds:
+        logger.warning("sync_keychain_credentials: keychain entry missing 'claudeAiOauth' key")
+        return False
+
+    claude_dir = Path.home() / ".claude"
+    claude_dir.mkdir(exist_ok=True)
+    creds_path = claude_dir / ".credentials.json"
+    creds_path.write_text(json.dumps(creds, indent=2) + "\n")
+    creds_path.chmod(0o600)
+
+    logger.info("sync_keychain_credentials: wrote credentials to %s", creds_path)
+    return True
+
+
 def _get_docker_config(image_name: str) -> DockerConfig:
     """Get Docker configuration for Claude."""
     return DockerConfig(
@@ -129,6 +187,8 @@ class ClaudeProvider(Provider):
 
     def _verify_docker(self, config: Config) -> bool:
         """Verify credentials work in Docker."""
+        if config.claude.fetch_auth_token_from_keychain:
+            sync_keychain_credentials()
         docker_config = _get_docker_config(config.docker_image)
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
@@ -188,6 +248,8 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
+        if config.claude.fetch_auth_token_from_keychain:
+            sync_keychain_credentials()
         docker_config = _get_docker_config(config.docker_image)
 
         if not ensure_docker_image(docker_config, config.project_dir):
@@ -200,7 +262,7 @@ class ClaudeProvider(Provider):
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
 
-        cmd.extend(config.claude_args)
+        cmd.extend(config.claude.args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
         return self._run_with_output_parsing(
@@ -226,7 +288,7 @@ class ClaudeProvider(Provider):
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
 
-        cmd.extend(config.claude_args)
+        cmd.extend(config.claude.args)
         cmd.extend(["--max-turns", str(config.max_turns)])
 
         return self._run_with_output_parsing(

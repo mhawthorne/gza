@@ -2208,13 +2208,20 @@ project_name: {default_project_name}
 # Number of tasks to run in a single work session (default: 1)
 # work_count: {DEFAULT_WORK_COUNT}
 
-# Arguments passed to Claude Code
-# claude_args:
+# Claude-specific configuration
+# claude:
+#   # Fetch OAuth token from macOS Keychain for Docker (macOS only)
+#   fetch_auth_token_from_keychain: false
+#   # Arguments passed to Claude Code CLI
+#   args:
+#     - --allowedTools
+#     - Read
+#     - Write
+#     - Edit
+#     - Glob
+#     - Grep
+#     - Bash
 """
-
-    # Add commented claude_args list
-    for arg in DEFAULT_CLAUDE_ARGS:
-        config_content += f"#   - {arg}\n"
 
     config_path.write_text(config_content)
     print(f"✓ Created {config_path}")

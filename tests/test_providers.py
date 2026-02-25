@@ -1,12 +1,13 @@
 """Tests for AI code generation providers."""
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from gza.config import Config
+from gza.config import Config, ClaudeConfig
 from gza.providers import (
     get_provider,
     ClaudeProvider,
@@ -1955,3 +1956,178 @@ class TestCodexOutputParsing:
 
         assert result.num_turns_reported == 3
         assert result.error_type == "max_turns"
+
+
+class TestSyncKeychainCredentials:
+    """Tests for sync_keychain_credentials function."""
+
+    def test_skips_on_non_darwin(self):
+        """Should return False on non-macOS platforms."""
+        from gza.providers.claude import sync_keychain_credentials
+        with patch("gza.providers.claude.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            assert sync_keychain_credentials() is False
+
+    def test_skips_when_security_not_found(self):
+        """Should return False when security command is not available."""
+        from gza.providers.claude import sync_keychain_credentials
+        with patch("gza.providers.claude.sys") as mock_sys, \
+             patch("gza.providers.claude.shutil.which", return_value=None):
+            mock_sys.platform = "darwin"
+            assert sync_keychain_credentials() is False
+
+    def test_skips_on_security_failure(self):
+        """Should return False when security command fails."""
+        from gza.providers.claude import sync_keychain_credentials
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        with patch("gza.providers.claude.sys") as mock_sys, \
+             patch("gza.providers.claude.shutil.which", return_value="/usr/bin/security"), \
+             patch("gza.providers.claude.subprocess.run", return_value=mock_result):
+            mock_sys.platform = "darwin"
+            assert sync_keychain_credentials() is False
+
+    def test_skips_on_invalid_json(self):
+        """Should return False when keychain entry is not valid JSON."""
+        from gza.providers.claude import sync_keychain_credentials
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "not-json"
+        with patch("gza.providers.claude.sys") as mock_sys, \
+             patch("gza.providers.claude.shutil.which", return_value="/usr/bin/security"), \
+             patch("gza.providers.claude.subprocess.run", return_value=mock_result):
+            mock_sys.platform = "darwin"
+            assert sync_keychain_credentials() is False
+
+    def test_skips_when_missing_oauth_key(self):
+        """Should return False when JSON doesn't contain claudeAiOauth."""
+        from gza.providers.claude import sync_keychain_credentials
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({"someOtherKey": "value"})
+        with patch("gza.providers.claude.sys") as mock_sys, \
+             patch("gza.providers.claude.shutil.which", return_value="/usr/bin/security"), \
+             patch("gza.providers.claude.subprocess.run", return_value=mock_result):
+            mock_sys.platform = "darwin"
+            assert sync_keychain_credentials() is False
+
+    def test_writes_credentials_file(self, tmp_path):
+        """Should write credentials to ~/.claude/.credentials.json."""
+        from gza.providers.claude import sync_keychain_credentials
+        creds = {"claudeAiOauth": {"accessToken": "test-token", "refreshToken": "test-refresh"}}
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps(creds)
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+
+        with patch("gza.providers.claude.sys") as mock_sys, \
+             patch("gza.providers.claude.shutil.which", return_value="/usr/bin/security"), \
+             patch("gza.providers.claude.subprocess.run", return_value=mock_result), \
+             patch("gza.providers.claude.Path.home", return_value=fake_home):
+            mock_sys.platform = "darwin"
+            assert sync_keychain_credentials() is True
+
+        creds_path = fake_home / ".claude" / ".credentials.json"
+        assert creds_path.exists()
+        written = json.loads(creds_path.read_text())
+        assert written["claudeAiOauth"]["accessToken"] == "test-token"
+        # Check file permissions (owner read/write only)
+        assert oct(creds_path.stat().st_mode & 0o777) == "0o600"
+
+
+class TestClaudeConfigIntegration:
+    """Tests for ClaudeConfig in Config loading."""
+
+    def test_default_claude_config(self, tmp_path):
+        """Config should have default ClaudeConfig."""
+        config = Config(project_dir=tmp_path, project_name="test")
+        assert isinstance(config.claude, ClaudeConfig)
+        assert config.claude.fetch_auth_token_from_keychain is False
+        assert "--allowedTools" in config.claude.args
+
+    def test_load_claude_section(self, tmp_path):
+        """Config.load should parse claude section."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "claude:\n"
+            "  fetch_auth_token_from_keychain: true\n"
+            "  args:\n"
+            "    - --verbose\n"
+        )
+        config = Config.load(tmp_path)
+        assert config.claude.fetch_auth_token_from_keychain is True
+        assert config.claude.args == ["--verbose"]
+
+    def test_backward_compat_claude_args(self, tmp_path):
+        """Top-level claude_args should still work with deprecation warning."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "claude_args:\n"
+            "  - --verbose\n"
+        )
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = Config.load(tmp_path)
+        assert config.claude.args == ["--verbose"]
+        assert any("deprecated" in str(warning.message).lower() for warning in w)
+
+    def test_claude_args_section_takes_precedence(self, tmp_path):
+        """claude.args should take precedence over top-level claude_args."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "claude_args:\n"
+            "  - --old\n"
+            "claude:\n"
+            "  args:\n"
+            "    - --new\n"
+        )
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = Config.load(tmp_path)
+        assert config.claude.args == ["--new"]
+        assert any("deprecated" in str(warning.message).lower() for warning in w)
+
+    def test_validate_claude_section(self, tmp_path):
+        """Validate should accept valid claude section."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "claude:\n"
+            "  fetch_auth_token_from_keychain: true\n"
+            "  args:\n"
+            "    - --verbose\n"
+        )
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert is_valid
+        assert not errors
+
+    def test_validate_claude_section_bad_type(self, tmp_path):
+        """Validate should reject non-dict claude section."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "claude: not-a-dict\n"
+        )
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("'claude' must be a dictionary" in e for e in errors)
+
+    def test_validate_claude_args_deprecation_warning(self, tmp_path):
+        """Validate should warn about deprecated claude_args."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "claude_args:\n"
+            "  - --verbose\n"
+        )
+        is_valid, errors, warns = Config.validate(tmp_path)
+        assert is_valid
+        assert any("deprecated" in w.lower() for w in warns)

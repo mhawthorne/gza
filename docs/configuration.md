@@ -28,7 +28,10 @@ The main configuration file is `gza.yaml` in your project root directory.
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
 | `provider` | String | `claude` | AI provider: `claude` or `gemini` |
 | `model` | String | *(empty)* | Provider-specific model name override |
-| `claude_args` | List | `["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]` | Arguments passed to Claude Code CLI |
+| `claude` | Dict | *(see below)* | Claude-specific configuration section |
+| `claude.fetch_auth_token_from_keychain` | Boolean | `false` | Fetch OAuth token from macOS Keychain for Docker (macOS only) |
+| `claude.args` | List | `["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]` | Arguments passed to Claude Code CLI |
+| `claude_args` | List | *(deprecated)* | Use `claude.args` instead |
 
 ### Branch Naming Strategy
 
