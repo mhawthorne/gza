@@ -542,7 +542,7 @@ class TestReviewNextSteps:
             # Verify improve suggestions appear in output
             all_output = "\n".join(printed_lines)
             assert f"gza improve {impl_task.id}" in all_output
-            assert f"gza improve {impl_task.id} --run" in all_output
+            assert f"gza improve {impl_task.id} --run" not in all_output
 
     def test_review_completion_prints_verdict(self, tmp_path: Path):
         """Completed review output should print parsed review verdict."""

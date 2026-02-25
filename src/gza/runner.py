@@ -1280,7 +1280,6 @@ def _run_non_code_task(
         elif task.task_type == "review" and task.depends_on:
             console.print("To address review feedback, run:")
             console.print(f"  [cyan]gza improve {task.depends_on}[/cyan]")
-            console.print(f"  [cyan]gza improve {task.depends_on} --run[/cyan]  [dim]# create and run immediately[/dim]")
 
         next_steps([
             (f"gza retry {task.id}", "retry from scratch"),
