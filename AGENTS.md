@@ -59,6 +59,38 @@ The skills are installed to `.claude/skills/` in your project directory.
 
 Tasks are stored in a SQLite database (`.gza/gza.db`), not in YAML files. The database handles task state, history, and coordination.
 
+## Configuration
+
+Gza is configured via `gza.yaml` in the project root. Key fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `project_name` | string | (required) | Project name, used for branch prefixes and Docker image naming |
+| `verify_command` | string | `""` | Shell command run before finishing any `task`/`implement`/`improve` task. Agents are instructed to run this and fix any errors. Example: `uv run mypy src/ && uv run pytest tests/ -x -q` |
+| `max_turns` | int | 50 | Maximum conversation turns per task |
+| `timeout_minutes` | int | 10 | Maximum time per task in minutes |
+| `use_docker` | bool | true | Whether to run Claude in a Docker container |
+| `branch_mode` | string | `"multi"` | `"single"` (reuse one branch) or `"multi"` (new branch per task) |
+| `provider` | string | `"claude"` | AI provider: `"claude"`, `"gemini"`, or `"codex"` |
+| `model` | string | `""` | Provider-specific model name (optional) |
+| `task_types` | dict | `{}` | Per-task-type overrides for `model` and `max_turns` |
+| `branch_strategy` | string or dict | `"monorepo"` | Branch naming strategy (presets: `monorepo`, `conventional`, `simple`, `date_slug`) |
+| `work_count` | int | 1 | Number of tasks to run in a single work session |
+
+### verify_command
+
+The `verify_command` field ensures agents always run project-specific verification before finishing. When set, gza injects the following instruction into `task`, `implement`, and `improve` prompts:
+
+> Before finishing, run the following verification command and fix any errors: `<verify_command>`
+
+This is NOT added to `explore`, `plan`, or `review` tasks since those don't produce code changes.
+
+Example `gza.yaml`:
+```yaml
+project_name: myproject
+verify_command: 'uv run mypy src/ && uv run pytest tests/ -x -q'
+```
+
 ## Project Structure
 
 Key modules:

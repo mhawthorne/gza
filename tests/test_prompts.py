@@ -341,3 +341,180 @@ class TestPromptBuilderReviewTask:
         assert "Read" in result
         assert "Glob" in result
         assert "Grep" in result
+
+
+class TestVerifyCommandConfig:
+    """Tests for verify_command field in Config."""
+
+    def test_verify_command_loaded_from_yaml(self, tmp_path: Path):
+        """Test that verify_command is loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "verify_command: 'uv run pytest tests/'\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.verify_command == "uv run pytest tests/"
+
+    def test_verify_command_defaults_to_empty(self, tmp_path: Path):
+        """Test that verify_command defaults to empty string when not set."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("project_name: testproject\n")
+
+        config = Config.load(tmp_path)
+        assert config.verify_command == ""
+
+    def test_verify_command_validation_rejects_non_string(self, tmp_path: Path):
+        """Test that verify_command validation fails for non-string values."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "verify_command: 42\n"
+        )
+
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("verify_command" in e for e in errors)
+
+    def test_verify_command_not_unknown_field(self, tmp_path: Path):
+        """Test that verify_command is not treated as an unknown field."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "verify_command: 'uv run mypy src/'\n"
+        )
+
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert is_valid
+        assert not any("verify_command" in w for w in warnings)
+
+
+class TestVerifyCommandInjection:
+    """Tests for verify_command injection into prompts."""
+
+    def test_verify_command_injected_for_task_type(self, tmp_path: Path):
+        """Test that verify_command is appended for task type."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Do something", task_type="task")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run mypy src/ && uv run pytest tests/ -x -q"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Before finishing, run the following verification command" in result
+        assert "uv run mypy src/ && uv run pytest tests/ -x -q" in result
+
+    def test_verify_command_injected_for_implement_type(self, tmp_path: Path):
+        """Test that verify_command is appended for implement type."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run pytest tests/ -x -q"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Before finishing, run the following verification command" in result
+        assert "uv run pytest tests/ -x -q" in result
+
+    def test_verify_command_injected_for_improve_type(self, tmp_path: Path):
+        """Test that verify_command is appended for improve type."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Improve the code", task_type="improve")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run pytest tests/"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Before finishing, run the following verification command" in result
+        assert "uv run pytest tests/" in result
+
+    def test_verify_command_not_injected_when_empty(self, tmp_path: Path):
+        """Test that no verification instruction is added when verify_command is empty."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Do something", task_type="task")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = ""
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Before finishing, run the following verification command" not in result
+
+    def test_verify_command_not_injected_for_explore_type(self, tmp_path: Path):
+        """Test that verify_command is NOT injected for explore tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Explore codebase", task_type="explore")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run pytest tests/"
+
+        report_path = tmp_path / "report.md"
+        result = PromptBuilder().build(task, config, store, report_path=report_path)
+
+        assert "Before finishing, run the following verification command" not in result
+
+    def test_verify_command_not_injected_for_plan_type(self, tmp_path: Path):
+        """Test that verify_command is NOT injected for plan tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Design feature", task_type="plan")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run pytest tests/"
+
+        report_path = tmp_path / "report.md"
+        result = PromptBuilder().build(task, config, store, report_path=report_path)
+
+        assert "Before finishing, run the following verification command" not in result
+
+    def test_verify_command_not_injected_for_review_type(self, tmp_path: Path):
+        """Test that verify_command is NOT injected for review tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Review the code", task_type="review")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run pytest tests/"
+
+        report_path = tmp_path / "report.md"
+        result = PromptBuilder().build(task, config, store, report_path=report_path)
+
+        assert "Before finishing, run the following verification command" not in result
+
+    def test_verify_command_appears_in_backticks(self, tmp_path: Path):
+        """Test that the verify_command is wrapped in backticks in the prompt."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "make test"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "`make test`" in result

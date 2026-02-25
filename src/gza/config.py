@@ -105,6 +105,7 @@ class Config:
     branch_strategy: BranchStrategy | None = None  # Branch naming strategy
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
     docker_setup_command: str = ""  # Command to run inside container before CLI starts
+    verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
 
     def __post_init__(self):
         if not self.docker_image:
@@ -194,7 +195,7 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
-            "defaults", "task_types", "branch_strategy"
+            "defaults", "task_types", "branch_strategy", "verify_command"
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -373,6 +374,7 @@ class Config:
             task_types=task_types,
             branch_strategy=branch_strategy,
             chat_text_display_length=chat_text_display_length,
+            verify_command=data.get("verify_command", ""),
         )
 
     @classmethod
@@ -417,7 +419,7 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
-            "defaults", "task_types", "branch_strategy"
+            "defaults", "task_types", "branch_strategy", "verify_command"
         }
 
         for key in data.keys():
@@ -535,6 +537,9 @@ class Config:
 
         if "model" in data and not isinstance(data["model"], str):
             errors.append("'model' must be a string")
+
+        if "verify_command" in data and not isinstance(data["verify_command"], str):
+            errors.append("'verify_command' must be a string")
 
         # Validate defaults section
         if "defaults" in data:
