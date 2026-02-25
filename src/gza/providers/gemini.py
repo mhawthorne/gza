@@ -16,6 +16,7 @@ from .base import (
     build_docker_cmd,
     verify_docker_credentials,
 )
+from .output_formatter import StreamOutputFormatter, truncate_text
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -230,6 +231,7 @@ class GeminiProvider(Provider):
         chat_text_display_length: int = 0,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
+        formatter = StreamOutputFormatter()
 
         def parse_gemini_output(line: str, data: dict, log_handle=None) -> None:
             try:
@@ -249,13 +251,13 @@ class GeminiProvider(Provider):
                             # Display text to console (configurable length, 0 = unlimited)
                             if chat_text_display_length == 0:
                                 # Show full text
-                                print(f"  {content}")
+                                formatter.print_agent_message(content, prefix="  ")
                             else:
                                 # Truncate to first line and max length
                                 first_line = content.split("\n")[0]
-                                if len(first_line) > chat_text_display_length:
-                                    first_line = first_line[:chat_text_display_length - 3] + "..."
-                                print(f"  {first_line}")
+                                formatter.print_agent_message(
+                                    truncate_text(first_line, chat_text_display_length), prefix="  "
+                                )
 
                 elif event_type == "tool_use":
                     tool_name = event.get("tool_name", "unknown")
@@ -263,16 +265,16 @@ class GeminiProvider(Provider):
                     # Extract file path for file-related tools
                     file_path = tool_input.get("file_path") or tool_input.get("path")
                     if file_path:
-                        print(f"  → {tool_name} {file_path}")
+                        formatter.print_tool_event(tool_name, file_path, prefix="  ")
                     else:
-                        print(f"  → {tool_name}")
+                        formatter.print_tool_event(tool_name, prefix="  ")
 
                 elif event_type == "result":
                     data["result"] = event
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
-                print(line)
+                formatter.print_error(line)
 
         result = self.run_with_logging(
             cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_gemini_output

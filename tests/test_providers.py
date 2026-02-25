@@ -1,12 +1,15 @@
 """Tests for AI code generation providers."""
 
+import io
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+from rich.console import Console
 
 from gza.config import Config, ClaudeConfig, ConfigError
 from gza.providers import (
@@ -25,6 +28,12 @@ from gza.providers.base import (
     _get_image_created_time,
     _format_command_for_log,
     _extract_startup_log_line,
+)
+from gza.providers.output_formatter import (
+    StreamOutputFormatter,
+    format_runtime,
+    format_token_count,
+    truncate_text,
 )
 from gza.providers.gemini import calculate_cost, GEMINI_PRICING
 
@@ -180,6 +189,47 @@ class TestProviderCommandLogging:
             )
 
         assert mock_popen.call_args.kwargs["stdin"] == subprocess.DEVNULL
+
+
+class TestSharedStreamOutputFormatter:
+    """Tests for shared provider output formatting utilities."""
+
+    def test_runtime_and_token_format_helpers(self):
+        """Should format runtime and token counts consistently."""
+        assert format_runtime(9) == "9s"
+        assert format_runtime(65) == "1m 5s"
+        assert format_token_count(500) == "500 tokens"
+        assert format_token_count(12_000) == "12k tokens"
+        assert truncate_text("abcdefghijklmnopqrstuvwxyz", 8) == "abcde..."
+
+    def test_turn_header_is_colorized(self):
+        """Turn headers should include ANSI color sequences."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=True, color_system="truecolor")
+        formatter = StreamOutputFormatter(console=console)
+
+        formatter.print_turn_header(2, 1500, 0.1234, 65)
+
+        rendered = output.getvalue()
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        assert "| Turn 2 | 1k tokens | $0.12 | 1m 5s |" in plain
+        assert "\x1b[" in rendered
+
+    def test_key_event_lines_are_colorized(self):
+        """Tool, assistant, and error lines should all be colorized."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=True, color_system="truecolor")
+        formatter = StreamOutputFormatter(console=console)
+
+        formatter.print_tool_event("Bash", "ls -la")
+        formatter.print_agent_message("Working on it")
+        formatter.print_error("Error: failed")
+
+        rendered = output.getvalue()
+        assert "→ Bash ls -la" in rendered
+        assert "Working on it" in rendered
+        assert "Error: failed" in rendered
+        assert "\x1b[" in rendered
 
 
 class TestBuildDockerCmd:
@@ -2238,6 +2288,41 @@ class TestCodexOutputParsing:
 
         assert result.num_turns_reported == 3
         assert result.error_type == "max_turns"
+
+    def test_uses_shared_formatter_for_turn_tool_message_and_error(self, tmp_path):
+        """Codex parser should route key output lines through shared formatter."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        mock_formatter = MagicMock()
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "echo hi"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
+            json.dumps({"type": "turn.error", "message": "bad turn"}) + "\n",
+        ]
+
+        with patch("gza.providers.codex.StreamOutputFormatter", return_value=mock_formatter):
+            with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+                mock_process = MagicMock()
+                mock_process.stdout = iter(json_lines)
+                mock_process.wait.return_value = None
+                mock_process.returncode = 0
+                mock_popen.return_value = mock_process
+
+                provider._run_with_output_parsing(
+                    cmd=["codex", "exec", "--json", "-"],
+                    log_file=log_file,
+                    timeout_minutes=30,
+                )
+
+        mock_formatter.print_turn_header.assert_called_once()
+        mock_formatter.print_tool_event.assert_called()
+        mock_formatter.print_agent_message.assert_called()
+        mock_formatter.print_error.assert_called()
 
 
 class TestSyncKeychainCredentials:

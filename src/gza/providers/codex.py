@@ -17,6 +17,7 @@ from .base import (
     build_docker_cmd,
     verify_docker_credentials,
 )
+from .output_formatter import StreamOutputFormatter, truncate_text
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -248,6 +249,7 @@ class CodexProvider(Provider):
         max_turns: int = 50,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
+        formatter = StreamOutputFormatter()
 
         def parse_codex_output(line: str, data: dict, log_handle=None) -> None:
             try:
@@ -275,19 +277,7 @@ class CodexProvider(Provider):
 
                     # Calculate runtime
                     elapsed_seconds = int(time.time() - data["start_time"])
-                    if elapsed_seconds >= 60:
-                        runtime_str = f"{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
-                    else:
-                        runtime_str = f"{elapsed_seconds}s"
-
-                    # Display turn info
                     total_tokens = data.get("input_tokens", 0) + data.get("output_tokens", 0)
-                    if total_tokens > 1_000_000:
-                        token_str = f"{total_tokens / 1_000_000:.1f}M tokens"
-                    elif total_tokens > 1000:
-                        token_str = f"{total_tokens // 1000}k tokens"
-                    else:
-                        token_str = f"{total_tokens} tokens"
 
                     # Calculate estimated cost
                     cost = calculate_cost(
@@ -295,14 +285,13 @@ class CodexProvider(Provider):
                         data.get("output_tokens", 0),
                         model,
                     )
-                    cost_str = f"${cost:.2f}"
-
-                    # Add blank line before turn (except first turn)
-                    if data["turn_count"] > 1:
-                        print()
-
-                    # Print turn info
-                    print(f"| Turn {data['turn_count']} | {token_str} | {cost_str} | {runtime_str} |")
+                    formatter.print_turn_header(
+                        data["turn_count"],
+                        total_tokens,
+                        cost,
+                        elapsed_seconds,
+                        blank_line_before=data["turn_count"] > 1,
+                    )
 
                 elif event_type == "item.completed":
                     item = event.get("item", {})
@@ -316,9 +305,8 @@ class CodexProvider(Provider):
                     if item_type == "command_execution":
                         command = item.get("command", "")
                         # Truncate to 80 chars
-                        if len(command) > 80:
-                            command = command[:77] + "..."
-                        print(f"  {item_prefix}→ Bash {command}")
+                        command = truncate_text(command, 80)
+                        formatter.print_tool_event("Bash", command, prefix=f"  {item_prefix}")
 
                     elif item_type == "agent_message":
                         data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
@@ -326,9 +314,9 @@ class CodexProvider(Provider):
                         if text:
                             # Truncate to first line and 80 chars
                             first_line = text.split("\n")[0]
-                            if len(first_line) > 80:
-                                first_line = first_line[:77] + "..."
-                            print(f"  {item_prefix}{first_line}")
+                            formatter.print_agent_message(
+                                truncate_text(first_line, 80), prefix=f"  {item_prefix}"
+                            )
 
                     elif item_type == "reasoning":
                         # Optional: show reasoning (currently skipped)
@@ -344,11 +332,15 @@ class CodexProvider(Provider):
                     data["output_tokens"] += usage.get("output_tokens", 0)
                     data["cached_tokens"] += usage.get("cached_input_tokens", 0)
 
+                elif isinstance(event_type, str) and "error" in event_type:
+                    message = event.get("message") or event.get("error") or json.dumps(event)
+                    formatter.print_error(f"Error: {message}")
+
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
                 if line == data.get("_startup_line"):
                     return
-                print(line)
+                formatter.print_error(line)
 
         result = self.run_with_logging(
             cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_codex_output, stdin_input=stdin_input
