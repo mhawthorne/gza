@@ -59,13 +59,24 @@ project_name: gza
 provider: codex
 model: gpt-5.3-codex
 
-# Provider-specific model name (optional)
+# Legacy global model fallback (optional)
 # model: ""
 
 # Maximum characters of chat text to display (0 = unlimited)
 # chat_text_display_length: 0
 
-# --- Per-task-type overrides ---
+# --- Provider-scoped model/task-type config (preferred) ---
+# providers:
+#   claude:
+#     model: claude-sonnet-4-20250514
+#     task_types:
+#       review:
+#         model: claude-haiku-4-20250514
+#         max_turns: 20
+#   codex:
+#     model: o4-mini
+#
+# --- Legacy per-task-type overrides (fallback-compatible) ---
 # task_types:
 #   plan:
 #     model: claude-sonnet-4-20250514

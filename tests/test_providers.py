@@ -2453,3 +2453,165 @@ class TestClaudeConfigIntegration:
 
         with pytest.raises(ConfigError, match="Invalid provider/model configuration"):
             Config.load(tmp_path)
+
+
+class TestProviderScopedConfig:
+    """Tests for provider-scoped model/task-type configuration."""
+
+    def test_load_parses_provider_scoped_config(self, tmp_path):
+        """Config.load should parse providers section into provider-scoped config."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: claude\n"
+            "providers:\n"
+            "  claude:\n"
+            "    model: claude-sonnet-4-5\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-haiku-4-5\n"
+            "        max_turns: 20\n"
+            "  codex:\n"
+            "    model: o4-mini\n"
+        )
+        config = Config.load(tmp_path)
+
+        assert config.providers["claude"].model == "claude-sonnet-4-5"
+        assert config.providers["claude"].task_types["review"].model == "claude-haiku-4-5"
+        assert config.providers["claude"].task_types["review"].max_turns == 20
+        assert config.providers["codex"].model == "o4-mini"
+
+    def test_validate_accepts_valid_providers_schema(self, tmp_path):
+        """Validate should accept well-formed providers schema."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    model: o4-mini\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        max_turns: 10\n"
+            "  claude:\n"
+            "    model: claude-sonnet-4-5\n"
+        )
+        is_valid, errors, warns = Config.validate(tmp_path)
+        assert is_valid
+        assert not errors
+        assert not [w for w in warns if "invalid" in w.lower()]
+
+    def test_validate_rejects_invalid_provider_shapes(self, tmp_path):
+        """Validate should reject unknown providers and invalid providers schema types."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "providers:\n"
+            "  unknown:\n"
+            "    model: x\n"
+            "  claude: nope\n"
+        )
+        is_valid, errors, warns = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("providers.unknown" in e for e in errors)
+        assert any("'providers.claude' must be a dictionary" in e for e in errors)
+
+    def test_validate_rejects_invalid_provider_task_type_values(self, tmp_path):
+        """Validate should reject non-string model and non-positive max_turns in providers.task_types."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: 123\n"
+            "        max_turns: 0\n"
+        )
+        is_valid, errors, warns = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("providers.claude.task_types.review.model" in e for e in errors)
+        assert any("providers.claude.task_types.review.max_turns" in e for e in errors)
+
+    def test_validate_rejects_incompatible_provider_scoped_model(self, tmp_path):
+        """Validate should reject providers.<provider>.model mismatched with provider family."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    model: claude-3-5-haiku-latest\n"
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+
+        assert not is_valid
+        assert any("providers.codex.model" in e and "incompatible with provider 'codex'" in e for e in errors)
+
+    def test_load_rejects_incompatible_provider_scoped_task_type_model(self, tmp_path):
+        """Load should reject providers.<provider>.task_types.<type>.model mismatches."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-3-5-haiku-latest\n"
+        )
+
+        with pytest.raises(ConfigError, match="Invalid provider/model configuration"):
+            Config.load(tmp_path)
+
+    def test_validate_warns_for_mixed_legacy_and_scoped_config(self, tmp_path):
+        """Validate should warn when scoped and legacy fields overlap on the same semantic target."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "model: legacy-model\n"
+            "task_types:\n"
+            "  review:\n"
+            "    model: legacy-review\n"
+            "    max_turns: 30\n"
+            "providers:\n"
+            "  claude:\n"
+            "    model: scoped-model\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: scoped-review\n"
+            "        max_turns: 20\n"
+        )
+        is_valid, errors, warns = Config.validate(tmp_path)
+        assert is_valid
+        assert not errors
+        assert any("provider-scoped model" in w for w in warns)
+        assert any("provider-scoped and legacy model are set for task type 'review'" in w for w in warns)
+        assert any("provider-scoped and legacy max_turns are set for task type 'review'" in w for w in warns)
+
+    def test_getters_apply_provider_scoped_precedence(self, tmp_path):
+        """Provider-scoped getters should prefer scoped values then legacy fallbacks."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "max_turns: 50\n"
+            "model: legacy-model\n"
+            "task_types:\n"
+            "  review:\n"
+            "    model: legacy-review\n"
+            "    max_turns: 30\n"
+            "providers:\n"
+            "  claude:\n"
+            "    model: scoped-model\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: scoped-review\n"
+            "        max_turns: 20\n"
+        )
+        config = Config.load(tmp_path)
+        assert config.get_model_for_task("review", "claude") == "scoped-review"
+        assert config.get_model_for_task("task", "claude") == "scoped-model"
+        assert config.get_model_for_task("review", "codex") == "legacy-review"
+        assert config.get_max_turns_for_task("review", "claude") == 20
+        assert config.get_max_turns_for_task("review", "codex") == 30
+        assert config.get_max_turns_for_task("task", "codex") == 50
