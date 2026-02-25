@@ -2131,36 +2131,48 @@ class TestEditCommandWithModelAndProvider:
 class TestGetEffectiveConfigForTask:
     """Tests for get_effective_config_for_task helper function."""
 
-    def test_task_model_overrides_config(self, tmp_path: Path):
-        """Task-specific model takes priority over config model."""
-        from gza.config import Config
+    def test_task_model_override_beats_provider_scoped_config(self, tmp_path: Path):
+        """Task-specific model takes priority over provider-scoped model config."""
+        from gza.config import Config, ProviderConfig, TaskTypeConfig
         from gza.db import Task
         from gza.runner import get_effective_config_for_task
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
-        config.model = "claude-3-5-sonnet-latest"
+        config.provider = "claude"
+        config.providers = {
+            "claude": ProviderConfig(
+                model="claude-default",
+                task_types={"review": TaskTypeConfig(model="claude-review")},
+            )
+        }
 
         task = Task(
             id=1,
             prompt="Test task",
-            model="claude-3-5-haiku-latest",
+            task_type="review",
+            model="task-model-override",
         )
 
-        model, provider = get_effective_config_for_task(task, config)
-        assert model == "claude-3-5-haiku-latest"
+        model, provider, max_turns = get_effective_config_for_task(task, config)
+        assert model == "task-model-override"
+        assert provider == "claude"
+        assert max_turns == config.max_turns
 
-    def test_task_type_model_overrides_default(self, tmp_path: Path):
-        """Task-type model takes priority over default config model."""
-        from gza.config import Config, TaskTypeConfig
+    def test_provider_scoped_task_type_model_selected(self, tmp_path: Path):
+        """Provider-scoped task type model takes priority over provider default."""
+        from gza.config import Config, ProviderConfig, TaskTypeConfig
         from gza.db import Task
         from gza.runner import get_effective_config_for_task
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
-        config.model = "claude-3-5-sonnet-latest"
-        config.task_types = {
-            "review": TaskTypeConfig(model="claude-3-5-haiku-latest")
+        config.provider = "claude"
+        config.providers = {
+            "claude": ProviderConfig(
+                model="claude-default",
+                task_types={"review": TaskTypeConfig(model="claude-review")},
+            )
         }
 
         task = Task(
@@ -2169,45 +2181,101 @@ class TestGetEffectiveConfigForTask:
             task_type="review",
         )
 
-        model, provider = get_effective_config_for_task(task, config)
-        assert model == "claude-3-5-haiku-latest"
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert model == "claude-review"
+        assert provider == "claude"
 
-    def test_default_config_model_used(self, tmp_path: Path):
-        """Default config model is used when no overrides."""
-        from gza.config import Config
-        from gza.db import Task
-        from gza.runner import get_effective_config_for_task
-
-        setup_config(tmp_path)
-        config = Config.load(tmp_path)
-        config.model = "claude-3-5-sonnet-latest"
-
-        task = Task(
-            id=1,
-            prompt="Test task",
-        )
-
-        model, provider = get_effective_config_for_task(task, config)
-        assert model == "claude-3-5-sonnet-latest"
-
-    def test_task_provider_overrides_config(self, tmp_path: Path):
-        """Task-specific provider takes priority over config provider."""
-        from gza.config import Config
+    def test_provider_scoped_default_model_selected(self, tmp_path: Path):
+        """Provider-scoped default model is used when task type override is absent."""
+        from gza.config import Config, ProviderConfig
         from gza.db import Task
         from gza.runner import get_effective_config_for_task
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         config.provider = "claude"
+        config.providers = {"claude": ProviderConfig(model="claude-default")}
 
         task = Task(
             id=1,
             prompt="Test task",
-            provider="gemini",
         )
 
-        model, provider = get_effective_config_for_task(task, config)
-        assert provider == "gemini"
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert model == "claude-default"
+        assert provider == "claude"
+
+    def test_provider_override_switches_provider_scope(self, tmp_path: Path):
+        """Task provider override switches model selection to that provider scope."""
+        from gza.config import Config, ProviderConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.provider = "claude"
+        config.providers = {
+            "claude": ProviderConfig(model="claude-default"),
+            "codex": ProviderConfig(model="o4-mini"),
+        }
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+            provider="codex",
+        )
+
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert provider == "codex"
+        assert model == "o4-mini"
+
+    def test_falls_back_to_legacy_when_provider_scope_missing(self, tmp_path: Path):
+        """Legacy top-level task_types/model remain as fallback if scope is missing."""
+        from gza.config import Config, TaskTypeConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.provider = "claude"
+        config.model = "legacy-default"
+        config.task_types = {"review": TaskTypeConfig(model="legacy-review")}
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+            task_type="review",
+        )
+
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert provider == "claude"
+        assert model == "legacy-review"
+
+    def test_provider_scoped_max_turns_selected(self, tmp_path: Path):
+        """Provider-scoped task type max_turns takes priority."""
+        from gza.config import Config, ProviderConfig, TaskTypeConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.max_turns = 50
+        config.provider = "claude"
+        config.task_types = {"review": TaskTypeConfig(max_turns=30)}
+        config.providers = {
+            "claude": ProviderConfig(
+                task_types={"review": TaskTypeConfig(max_turns=20)}
+            )
+        }
+
+        task = Task(
+            id=1,
+            prompt="Test task",
+            task_type="review",
+        )
+
+        _, _, max_turns = get_effective_config_for_task(task, config)
+        assert max_turns == 20
 
 
 class TestBuildPromptWithSpec:

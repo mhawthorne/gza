@@ -27,7 +27,8 @@ DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
 DEFAULT_MAX_TURNS = 50
 DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
-DEFAULT_PROVIDER = "claude"  # "claude" or "gemini"
+DEFAULT_PROVIDER = "claude"  # "claude", "codex", or "gemini"
+KNOWN_PROVIDERS = ("claude", "codex", "gemini")
 DEFAULT_CHAT_TEXT_DISPLAY_LENGTH = 0  # 0 means unlimited (show all)
 DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
 DEFAULT_CLAUDE_ARGS = [
@@ -71,6 +72,13 @@ class TaskTypeConfig:
     """Configuration for a specific task type."""
     model: str | None = None
     max_turns: int | None = None
+
+
+@dataclass
+class ProviderConfig:
+    """Configuration scoped to a specific provider."""
+    model: str | None = None
+    task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,9 +138,10 @@ class Config:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     worktree_dir: str = DEFAULT_WORKTREE_DIR
     work_count: int = DEFAULT_WORK_COUNT
-    provider: str = DEFAULT_PROVIDER  # "claude" or "gemini"
+    provider: str = DEFAULT_PROVIDER  # "claude", "codex", or "gemini"
     model: str = ""  # Provider-specific model name (optional)
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
+    providers: dict[str, ProviderConfig] = field(default_factory=dict)  # Provider-scoped config
     branch_strategy: BranchStrategy | None = None  # Branch naming strategy
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
     docker_setup_command: str = ""  # Command to run inside container before CLI starts
@@ -149,6 +158,30 @@ class Config:
                 default_type="feature"
             )
 
+    def get_model_for_task(self, task_type: str, provider: str) -> str | None:
+        """Get model for task type within provider scope.
+
+        Precedence:
+        1. providers.<provider>.task_types.<task_type>.model
+        2. providers.<provider>.model
+        3. task_types.<task_type>.model (legacy)
+        4. model (legacy)
+        5. None (provider runtime default)
+        """
+        provider_config = self.providers.get(provider)
+        if provider_config:
+            provider_task_type = provider_config.task_types.get(task_type)
+            if provider_task_type and provider_task_type.model:
+                return provider_task_type.model
+            if provider_config.model:
+                return provider_config.model
+
+        legacy_task_type = self.task_types.get(task_type)
+        if legacy_task_type and legacy_task_type.model:
+            return legacy_task_type.model
+
+        return self.model or None
+
     def get_model_for_task_type(self, task_type: str) -> str | None:
         """Get the model for a given task type, falling back to defaults.
 
@@ -158,11 +191,27 @@ class Config:
         Returns:
             The model name to use for this task type
         """
-        # Check task_types config first
-        if task_type in self.task_types and self.task_types[task_type].model:
-            return self.task_types[task_type].model
-        # Fall back to default model
-        return self.model
+        return self.get_model_for_task(task_type, self.provider)
+
+    def get_max_turns_for_task(self, task_type: str, provider: str) -> int | None:
+        """Get max_turns for task type within provider scope.
+
+        Precedence:
+        1. providers.<provider>.task_types.<task_type>.max_turns
+        2. task_types.<task_type>.max_turns (legacy)
+        3. max_turns (global default)
+        """
+        provider_config = self.providers.get(provider)
+        if provider_config:
+            provider_task_type = provider_config.task_types.get(task_type)
+            if provider_task_type and provider_task_type.max_turns is not None:
+                return provider_task_type.max_turns
+
+        legacy_task_type = self.task_types.get(task_type)
+        if legacy_task_type and legacy_task_type.max_turns is not None:
+            return legacy_task_type.max_turns
+
+        return self.max_turns
 
     def get_max_turns_for_task_type(self, task_type: str) -> int | None:
         """Get the max_turns for a given task type, falling back to defaults.
@@ -173,11 +222,7 @@ class Config:
         Returns:
             The max_turns to use for this task type
         """
-        # Check task_types config first
-        if task_type in self.task_types and self.task_types[task_type].max_turns is not None:
-            return self.task_types[task_type].max_turns
-        # Fall back to default max_turns
-        return self.max_turns
+        return self.get_max_turns_for_task(task_type, self.provider)
 
     @property
     def worktree_path(self) -> Path:
@@ -226,7 +271,7 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
-            "defaults", "task_types", "branch_strategy", "verify_command"
+            "defaults", "task_types", "providers", "branch_strategy", "verify_command"
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -316,6 +361,91 @@ class Config:
                         model=config_data.get("model"),
                         max_turns=config_data.get("max_turns")
                     )
+
+        # Parse provider-scoped configuration
+        providers: dict[str, ProviderConfig] = {}
+        if "providers" in data:
+            providers_data = data["providers"]
+            if not isinstance(providers_data, dict):
+                raise ConfigError("'providers' must be a dictionary")
+            for provider_name, provider_config_data in providers_data.items():
+                if provider_name not in KNOWN_PROVIDERS:
+                    raise ConfigError(
+                        f"'providers.{provider_name}' is invalid. "
+                        f"Known providers: {', '.join(KNOWN_PROVIDERS)}"
+                    )
+                if not isinstance(provider_config_data, dict):
+                    raise ConfigError(f"'providers.{provider_name}' must be a dictionary")
+
+                provider_model = provider_config_data.get("model")
+                if provider_model is not None and not isinstance(provider_model, str):
+                    raise ConfigError(f"'providers.{provider_name}.model' must be a string")
+
+                provider_task_types: dict[str, TaskTypeConfig] = {}
+                provider_task_types_data = provider_config_data.get("task_types")
+                if provider_task_types_data is not None:
+                    if not isinstance(provider_task_types_data, dict):
+                        raise ConfigError(f"'providers.{provider_name}.task_types' must be a dictionary")
+                    for task_type, task_type_config_data in provider_task_types_data.items():
+                        if not isinstance(task_type_config_data, dict):
+                            raise ConfigError(f"'providers.{provider_name}.task_types.{task_type}' must be a dictionary")
+                        provider_task_model = task_type_config_data.get("model")
+                        if provider_task_model is not None and not isinstance(provider_task_model, str):
+                            raise ConfigError(
+                                f"'providers.{provider_name}.task_types.{task_type}.model' must be a string"
+                            )
+                        provider_task_max_turns = task_type_config_data.get("max_turns")
+                        if provider_task_max_turns is not None:
+                            if not isinstance(provider_task_max_turns, int):
+                                raise ConfigError(
+                                    f"'providers.{provider_name}.task_types.{task_type}.max_turns' must be an integer"
+                                )
+                            if provider_task_max_turns <= 0:
+                                raise ConfigError(
+                                    f"'providers.{provider_name}.task_types.{task_type}.max_turns' must be positive"
+                                )
+                        provider_task_types[task_type] = TaskTypeConfig(
+                            model=provider_task_model,
+                            max_turns=provider_task_max_turns,
+                        )
+
+                providers[provider_name] = ProviderConfig(
+                    model=provider_model,
+                    task_types=provider_task_types,
+                )
+
+        # Warn when provider-scoped and legacy fields are both set for same semantic target
+        legacy_model_set = "model" in data or ("defaults" in data and isinstance(defaults, dict) and "model" in defaults)
+        if legacy_model_set:
+            for provider_name, provider_config in providers.items():
+                if provider_config.model:
+                    warnings.warn(
+                        f"Both provider-scoped model ('providers.{provider_name}.model') and legacy global model "
+                        f"('model'/'defaults.model') are set. Using provider-scoped value for provider '{provider_name}'.",
+                        stacklevel=2,
+                    )
+
+        legacy_task_types_data = data.get("task_types")
+        if isinstance(legacy_task_types_data, dict):
+            for provider_name, provider_config in providers.items():
+                for task_type, provider_task_type in provider_config.task_types.items():
+                    legacy_task_type = legacy_task_types_data.get(task_type)
+                    if not isinstance(legacy_task_type, dict):
+                        continue
+                    if provider_task_type.model is not None and "model" in legacy_task_type:
+                        warnings.warn(
+                            f"Both provider-scoped and legacy model are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.model and task_types.{task_type}.model). "
+                            f"Using provider-scoped value for provider '{provider_name}'.",
+                            stacklevel=2,
+                        )
+                    if provider_task_type.max_turns is not None and "max_turns" in legacy_task_type:
+                        warnings.warn(
+                            f"Both provider-scoped and legacy max_turns are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.max_turns and task_types.{task_type}.max_turns). "
+                            f"Using provider-scoped value for provider '{provider_name}'.",
+                            stacklevel=2,
+                        )
 
         # Validate provider/model compatibility with effective loaded settings.
         model_compat_errors: list[str] = []
@@ -415,6 +545,7 @@ class Config:
             provider=provider,
             model=model,
             task_types=task_types,
+            providers=providers,
             branch_strategy=branch_strategy,
             chat_text_display_length=chat_text_display_length,
             verify_command=data.get("verify_command", ""),
@@ -462,7 +593,7 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
-            "defaults", "task_types", "branch_strategy", "verify_command"
+            "defaults", "task_types", "providers", "branch_strategy", "verify_command"
         }
 
         for key in data.keys():
@@ -575,8 +706,9 @@ class Config:
         if "provider" in data:
             if not isinstance(data["provider"], str):
                 errors.append("'provider' must be a string")
-            elif data["provider"] not in ("claude", "codex", "gemini"):
-                errors.append("'provider' must be one of: 'claude', 'codex', 'gemini'")
+            elif data["provider"] not in KNOWN_PROVIDERS:
+                provider_list = ", ".join("'" + p + "'" for p in KNOWN_PROVIDERS)
+                errors.append(f"'provider' must be one of: {provider_list}")
 
         if "model" in data and not isinstance(data["model"], str):
             errors.append("'model' must be a string")
@@ -659,6 +791,96 @@ class Config:
                                     task_model,
                                 )
                             )
+
+        # Validate provider-scoped configuration
+        if "providers" in data:
+            if not isinstance(data["providers"], dict):
+                errors.append("'providers' must be a dictionary")
+            else:
+                for provider_name, provider_data in data["providers"].items():
+                    if provider_name not in KNOWN_PROVIDERS:
+                        errors.append(
+                            f"'providers.{provider_name}' is invalid. "
+                            f"Known providers: {', '.join(KNOWN_PROVIDERS)}"
+                        )
+                        continue
+                    if not isinstance(provider_data, dict):
+                        errors.append(f"'providers.{provider_name}' must be a dictionary")
+                        continue
+
+                    if "model" in provider_data and not isinstance(provider_data["model"], str):
+                        errors.append(f"'providers.{provider_name}.model' must be a string")
+
+                    if "task_types" in provider_data:
+                        if not isinstance(provider_data["task_types"], dict):
+                            errors.append(f"'providers.{provider_name}.task_types' must be a dictionary")
+                        else:
+                            for task_type, task_type_config in provider_data["task_types"].items():
+                                if not isinstance(task_type_config, dict):
+                                    errors.append(
+                                        f"'providers.{provider_name}.task_types.{task_type}' must be a dictionary"
+                                    )
+                                    continue
+                                if "model" in task_type_config and not isinstance(task_type_config["model"], str):
+                                    errors.append(
+                                        f"'providers.{provider_name}.task_types.{task_type}.model' must be a string"
+                                    )
+                                if "max_turns" in task_type_config:
+                                    if not isinstance(task_type_config["max_turns"], int):
+                                        errors.append(
+                                            f"'providers.{provider_name}.task_types.{task_type}.max_turns' must be an integer"
+                                        )
+                                    elif task_type_config["max_turns"] <= 0:
+                                        errors.append(
+                                            f"'providers.{provider_name}.task_types.{task_type}.max_turns' must be positive"
+                                        )
+                                valid_provider_task_type_keys = {"model", "max_turns"}
+                                for key in task_type_config.keys():
+                                    if key not in valid_provider_task_type_keys:
+                                        warnings.append(
+                                            f"Unknown field in 'providers.{provider_name}.task_types.{task_type}': '{key}'"
+                                        )
+
+                    valid_provider_keys = {"model", "task_types"}
+                    for key in provider_data.keys():
+                        if key not in valid_provider_keys:
+                            warnings.append(f"Unknown field in 'providers.{provider_name}': '{key}'")
+
+        # Warn when provider-scoped and legacy fields are both set for same semantic target
+        legacy_model_set = "model" in data or (
+            "defaults" in data and isinstance(data.get("defaults"), dict) and "model" in data["defaults"]
+        )
+        if legacy_model_set and isinstance(data.get("providers"), dict):
+            for provider_name, provider_data in data["providers"].items():
+                if isinstance(provider_data, dict) and provider_data.get("model") is not None:
+                    warnings.append(
+                        f"Both provider-scoped model ('providers.{provider_name}.model') and legacy global model "
+                        f"('model'/'defaults.model') are set. Provider-scoped value takes precedence."
+                    )
+
+        if isinstance(data.get("task_types"), dict) and isinstance(data.get("providers"), dict):
+            for provider_name, provider_data in data["providers"].items():
+                if not isinstance(provider_data, dict):
+                    continue
+                provider_task_types = provider_data.get("task_types")
+                if not isinstance(provider_task_types, dict):
+                    continue
+                for task_type, provider_task_type in provider_task_types.items():
+                    legacy_task_type = data["task_types"].get(task_type)
+                    if not isinstance(provider_task_type, dict) or not isinstance(legacy_task_type, dict):
+                        continue
+                    if "model" in provider_task_type and "model" in legacy_task_type:
+                        warnings.append(
+                            f"Both provider-scoped and legacy model are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.model and task_types.{task_type}.model). "
+                            f"Provider-scoped value takes precedence."
+                        )
+                    if "max_turns" in provider_task_type and "max_turns" in legacy_task_type:
+                        warnings.append(
+                            f"Both provider-scoped and legacy max_turns are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.max_turns and task_types.{task_type}.max_turns). "
+                            f"Provider-scoped value takes precedence."
+                        )
 
         # Validate branch_strategy section
         if "branch_strategy" in data:

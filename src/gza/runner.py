@@ -15,41 +15,31 @@ from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 
 
-def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str]:
-    """Get the effective model and provider for a task based on priority order.
-
-    Priority order for model selection:
-    1. Task-specific model (task.model)
-    2. Task-type config (task_types.<type>.model)
-    3. Default config (config.model)
-    4. Environment variable (GZA_MODEL)
+def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str, int | None]:
+    """Get the effective model, provider, and max_turns for a task.
 
     Priority order for provider selection:
     1. Task-specific provider (task.provider)
-    2. Default config (config.provider)
-    3. Environment variable (GZA_PROVIDER)
+    2. Config default (config.provider, already env-merged in Config.load)
+
+    Priority order for model selection:
+    1. Task-specific model (task.model)
+    2. Provider-aware config resolution (Config.get_model_for_task)
+
+    Priority order for max_turns selection:
+    1. Provider-aware config resolution (Config.get_max_turns_for_task)
 
     Args:
         task: The task to get config for
         config: The base configuration
 
     Returns:
-        Tuple of (model, provider) where model can be None
+        Tuple of (model, provider, max_turns) where model can be None
     """
-    # Get effective model
-    model = None
-    if task.model:
-        # Task-specific model (highest priority)
-        model = task.model
-    else:
-        # Fall back to task-type or default model
-        model = config.get_model_for_task_type(task.task_type)
-        # Environment variable override is already applied in config
-
-    # Get effective provider
     provider = task.provider if task.provider else config.provider
-
-    return model, provider
+    model = task.model if task.model else config.get_model_for_task(task.task_type, provider)
+    max_turns = config.get_max_turns_for_task(task.task_type, provider)
+    return model, provider, max_turns
 
 
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
@@ -703,13 +693,15 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         return 0
 
     # Get effective model and provider for this task
-    effective_model, effective_provider = get_effective_config_for_task(task, config)
+    effective_model, effective_provider, effective_max_turns = get_effective_config_for_task(task, config)
 
     # Create a modified config with task-specific settings
     from copy import copy
     task_config = copy(config)
     task_config.model = effective_model or ""
     task_config.provider = effective_provider
+    if effective_max_turns is not None:
+        task_config.max_turns = effective_max_turns
 
     # Get the provider for this task
     provider = get_provider(task_config)

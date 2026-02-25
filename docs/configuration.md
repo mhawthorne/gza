@@ -26,8 +26,10 @@ The main configuration file is `gza.yaml` in your project root directory.
 | `max_turns` | Integer | `50` | Maximum conversation turns per task |
 | `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
-| `provider` | String | `claude` | AI provider: `claude` or `gemini` |
-| `model` | String | *(empty)* | Provider-specific model name override |
+| `provider` | String | `claude` | AI provider: `claude`, `codex`, or `gemini` |
+| `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
+| `model` | String | *(empty)* | Legacy global model fallback (compatible) |
+| `task_types` | Dict | `{}` | Legacy global per-task fallback (compatible) |
 | `claude` | Dict | *(see below)* | Claude-specific configuration section |
 | `claude.fetch_auth_token_from_keychain` | Boolean | `false` | Fetch OAuth token from macOS Keychain for Docker (macOS only) |
 | `claude.args` | List | `["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]` | Arguments passed to Claude Code CLI |
@@ -118,7 +120,24 @@ gza work
 - The workspace is always mounted at `/workspace` automatically
 - Config validation warns about common syntax errors but doesn't block invalid formats
 
-### Task Types Configuration
+### Provider-Scoped Configuration
+
+Preferred approach for multi-provider setups:
+
+```yaml
+provider: claude
+providers:
+  claude:
+    model: claude-sonnet-4-5
+    task_types:
+      review:
+        model: claude-haiku-4-5
+        max_turns: 20
+  codex:
+    model: o4-mini
+```
+
+### Task Types Configuration (Legacy-Compatible)
 
 Override settings per task type:
 
@@ -136,6 +155,27 @@ task_types:
 
 Valid task types: `task`, `explore`, `plan`, `implement`, `review`, `improve`
 
+Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
+
+### Resolution Precedence
+
+Provider selection:
+1. `task.provider`
+2. `provider` (already merged with `GZA_PROVIDER`)
+
+Model selection:
+1. `task.model`
+2. `providers.<effective_provider>.task_types.<task_type>.model`
+3. `providers.<effective_provider>.model`
+4. `task_types.<task_type>.model` (legacy fallback)
+5. `model` / `defaults.model` / `GZA_MODEL` (legacy fallback)
+6. Provider runtime default (if no model resolved)
+
+Max turns selection:
+1. `providers.<effective_provider>.task_types.<task_type>.max_turns`
+2. `task_types.<task_type>.max_turns` (legacy fallback)
+3. `max_turns` / `defaults.max_turns` / `GZA_MAX_TURNS`
+
 ---
 
 ## Environment Variables
@@ -151,7 +191,7 @@ All `gza.yaml` options can be overridden via environment variables:
 | `GZA_WORKTREE_DIR` | `worktree_dir` | Override worktree directory |
 | `GZA_WORK_COUNT` | `work_count` | Override tasks per session |
 | `GZA_PROVIDER` | `provider` | Override AI provider |
-| `GZA_MODEL` | `model` | Override model name |
+| `GZA_MODEL` | `model` | Override global legacy model fallback |
 
 ### Providers and Models
 
@@ -176,6 +216,8 @@ Or via environment variable:
 export GZA_PROVIDER=claude
 export GZA_MODEL=claude-sonnet-4-5
 ```
+
+`GZA_MODEL` is provider-agnostic and applies as a global legacy fallback, so it can override to a model that doesn't match the selected provider if set manually.
 
 ### Provider Credentials
 
