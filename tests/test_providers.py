@@ -2533,6 +2533,37 @@ class TestProviderScopedConfig:
         assert any("providers.claude.task_types.review.model" in e for e in errors)
         assert any("providers.claude.task_types.review.max_turns" in e for e in errors)
 
+    def test_validate_rejects_incompatible_provider_scoped_model(self, tmp_path):
+        """Validate should reject providers.<provider>.model mismatched with provider family."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    model: claude-3-5-haiku-latest\n"
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+
+        assert not is_valid
+        assert any("providers.codex.model" in e and "incompatible with provider 'codex'" in e for e in errors)
+
+    def test_load_rejects_incompatible_provider_scoped_task_type_model(self, tmp_path):
+        """Load should reject providers.<provider>.task_types.<type>.model mismatches."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-3-5-haiku-latest\n"
+        )
+
+        with pytest.raises(ConfigError, match="Invalid provider/model configuration"):
+            Config.load(tmp_path)
+
     def test_validate_warns_for_mixed_legacy_and_scoped_config(self, tmp_path):
         """Validate should warn when scoped and legacy fields overlap on the same semantic target."""
         config_path = tmp_path / "gza.yaml"

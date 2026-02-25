@@ -456,6 +456,24 @@ class Config:
                 model_compat_errors.append(
                     _provider_model_mismatch_error(f"task_types.{task_type}.model", provider, task_cfg.model)
                 )
+        for provider_name, provider_cfg in providers.items():
+            if provider_cfg.model and not _is_model_compatible_with_provider(provider_name, provider_cfg.model):
+                model_compat_errors.append(
+                    _provider_model_mismatch_error(
+                        f"providers.{provider_name}.model",
+                        provider_name,
+                        provider_cfg.model,
+                    )
+                )
+            for task_type, task_cfg in provider_cfg.task_types.items():
+                if task_cfg.model and not _is_model_compatible_with_provider(provider_name, task_cfg.model):
+                    model_compat_errors.append(
+                        _provider_model_mismatch_error(
+                            f"providers.{provider_name}.task_types.{task_type}.model",
+                            provider_name,
+                            task_cfg.model,
+                        )
+                    )
         if model_compat_errors:
             raise ConfigError("Invalid provider/model configuration:\n- " + "\n- ".join(model_compat_errors))
 
@@ -810,6 +828,18 @@ class Config:
 
                     if "model" in provider_data and not isinstance(provider_data["model"], str):
                         errors.append(f"'providers.{provider_name}.model' must be a string")
+                    elif (
+                        isinstance(provider_data.get("model"), str)
+                        and provider_data["model"]
+                        and not _is_model_compatible_with_provider(provider_name, provider_data["model"])
+                    ):
+                        errors.append(
+                            _provider_model_mismatch_error(
+                                f"providers.{provider_name}.model",
+                                provider_name,
+                                provider_data["model"],
+                            )
+                        )
 
                     if "task_types" in provider_data:
                         if not isinstance(provider_data["task_types"], dict):
@@ -824,6 +854,18 @@ class Config:
                                 if "model" in task_type_config and not isinstance(task_type_config["model"], str):
                                     errors.append(
                                         f"'providers.{provider_name}.task_types.{task_type}.model' must be a string"
+                                    )
+                                elif (
+                                    isinstance(task_type_config.get("model"), str)
+                                    and task_type_config["model"]
+                                    and not _is_model_compatible_with_provider(provider_name, task_type_config["model"])
+                                ):
+                                    errors.append(
+                                        _provider_model_mismatch_error(
+                                            f"providers.{provider_name}.task_types.{task_type}.model",
+                                            provider_name,
+                                            task_type_config["model"],
+                                        )
                                     )
                                 if "max_turns" in task_type_config:
                                     if not isinstance(task_type_config["max_turns"], int):
