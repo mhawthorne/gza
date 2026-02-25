@@ -953,35 +953,42 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             return 0
 
         # For regular tasks: require code changes
-        if not worktree_git.has_changes("."):
-            # Check exit code - if Claude succeeded but made no changes, that's a failure
-            # Note: No need to save WIP here since there are no changes
-            error_message("No changes made")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
-            return 0
+        has_uncommitted = worktree_git.has_changes(".")
+        if not has_uncommitted:
+            # Check if branch already has commits from a previous run
+            default_branch = worktree_git.default_branch()
+            commits_ahead = worktree_git.count_commits_ahead(branch_name, default_branch)
+            if commits_ahead == 0:
+                # No uncommitted changes and no commits on branch - real failure
+                # Note: No need to save WIP here since there are no changes
+                error_message("No changes made")
+                stats_line(stats, has_commits=False)
+                console.print(f"Task ID: {task.id}")
+                next_steps([
+                    (f"gza retry {task.id}", "retry from scratch"),
+                    (f"gza resume {task.id}", "resume from where it left off"),
+                ])
+                store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
+                return 0
+            # else: branch has commits from a previous run - treat as success without committing
 
-        # Squash any WIP commits before creating final commit
-        _squash_wip_commits(worktree_git, task)
+        if has_uncommitted:
+            # Squash any WIP commits before creating final commit
+            _squash_wip_commits(worktree_git, task)
 
-        # Commit changes in worktree
-        worktree_git.add(".")
+            # Commit changes in worktree
+            worktree_git.add(".")
 
-        # Build commit message with trailer for improve tasks
-        commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
+            # Build commit message with trailer for improve tasks
+            commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
 
-        # Add review trailer for improve tasks
-        if task.task_type == "improve" and task.depends_on:
-            review_task = store.get(task.depends_on)
-            if review_task and review_task.task_type == "review":
-                commit_message += f"\nGza-Review: #{review_task.id}"
+            # Add review trailer for improve tasks
+            if task.task_type == "improve" and task.depends_on:
+                review_task = store.get(task.depends_on)
+                if review_task and review_task.task_type == "review":
+                    commit_message += f"\nGza-Review: #{review_task.id}"
 
-        worktree_git.commit(commit_message)
+            worktree_git.commit(commit_message)
 
         # Copy summary file from worktree to main project directory
         output_content = None
