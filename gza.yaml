@@ -1,99 +1,18 @@
 # Gza Configuration
 
-# Project name (required) - used for branch prefixes and Docker image naming
 project_name: gza
 
-# Branch naming strategy (default: monorepo)
-# Options: monorepo, conventional, simple, or custom pattern dict
-# branch_strategy: monorepo  # Default: {project}/{task_id}
+branch_strategy: date_slug
 
-# All settings below show default values and are commented out.
-# Uncomment and modify any setting you want to change.
+max_steps: 60
 
-# --- Execution ---
-
-# Whether to run Claude in Docker container
-# use_docker: true
-
-# Custom Docker image name (defaults to <project_name>-gza)
-# docker_image: ""
-
-# Additional Docker volume mounts
-# docker_volumes: []
-
-# Command to run inside container before CLI starts (e.g., dependency install)
-# docker_setup_command: ""
-
-# Maximum time per task in minutes
-# timeout_minutes: 10
-
-# Maximum conversation turns per task
-# max_turns: 50
-
-# Number of tasks to run in a single work session (default: 1)
-# work_count: 1
-
-# Shell command run before finishing any task/implement/improve task.
-# Agents are instructed to run this and fix any errors.
-# Example: 'uv run mypy src/ && uv run pytest tests/ -x -q'
-# verify_command: ""
-
-# --- Branching ---
-
-# Branch mode: "single" (reuse one branch) or "multi" (create branch per task)
-# branch_mode: multi
-
-# Directory for git worktrees (isolates task execution from main checkout)
-# worktree_dir: /tmp/gza-worktrees
-
-# --- Storage ---
-
-# Directory for log files (relative to project directory)
-# log_dir: .gza/logs
-
-# --- Provider ---
-
-# AI provider: "claude", "gemini", or "codex"
-# provider: claude
-
+#provider: claude
+#model: claude-sonnet-4-6
 provider: codex
 model: gpt-5.3-codex
 
-# Legacy global model fallback (optional)
-# model: ""
-
-# Maximum characters of chat text to display (0 = unlimited)
-# chat_text_display_length: 0
-
-# --- Provider-scoped model/task-type config (preferred) ---
-# providers:
-#   claude:
-#     model: claude-sonnet-4-20250514
-#     task_types:
-#       review:
-#         model: claude-haiku-4-20250514
-#         max_turns: 20
-#   codex:
-#     model: o4-mini
-#
-# --- Legacy per-task-type overrides (fallback-compatible) ---
-# task_types:
-#   plan:
-#     model: claude-sonnet-4-20250514
-#     max_turns: 30
-#   review:
-#     model: claude-sonnet-4-20250514
-
-# --- Claude-specific configuration ---
-# claude:
-#   # Fetch OAuth token from macOS Keychain for Docker (macOS only)
-#   fetch_auth_token_from_keychain: false
-#   # Arguments passed to Claude Code CLI
-#   args:
-#     - --allowedTools
-#     - Read
-#     - Write
-#     - Edit
-#     - Glob
-#     - Grep
-#     - Bash
+#task_types:
+#  plan:
+#    model: claude-opus-4-6
+#  review:
+#    model: claude-haiku-4-5-20251001
