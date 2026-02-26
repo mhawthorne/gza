@@ -633,6 +633,14 @@ List tasks with branches that haven't been merged to main.
 gza unmerged
 ```
 
+For each unmerged implementation, output includes:
+- Branch diff/commit summary.
+- A `lineage:` chain showing related task IDs and types (implementation, review, improve).
+- A `review:` freshness classification:
+  - `no review` when no completed review exists.
+  - `reviewed` when the latest completed review still reflects current code.
+  - `review stale` when code-changing work (for example an improve task) happened after the latest review.
+
 ### groups
 
 List all task groups with their task counts.

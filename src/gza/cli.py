@@ -686,6 +686,21 @@ def _get_reviews_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> lis
     return store.get_unlinked_reviews_for_slug(slug)
 
 
+def _task_time_for_lineage(task: DbTask) -> datetime:
+    """Return best-effort timestamp for lineage ordering."""
+    return task.completed_at or task.created_at or datetime.min
+
+
+def _get_improves_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
+    """Get improve tasks related to the root implementation task."""
+    if root_task.id is None:
+        return []
+    return [
+        task for task in store.get_all()
+        if task.task_type == "improve" and task.based_on == root_task.id
+    ]
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
     config = Config.load(args.project_dir)
@@ -800,7 +815,6 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         # Find the root implementation task and any improve tasks that reference it
         root_task = None
-        improve_tasks = []
 
         # First pass: identify the root implementation task
         for task in tasks_sorted:
@@ -812,42 +826,91 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if not root_task:
             root_task = tasks_sorted[0]
 
-        # Second pass: find improve tasks that are based on the root task
-        for task in tasks_sorted:
-            if task.task_type == "improve" and task.based_on == root_task.id:
-                improve_tasks.append(task)
-
-        # Check for review status
-        review_status = None
-        review_status_color = None
         reviews = _get_reviews_for_root_task(store, root_task)
-        if reviews:
-            # Reviews are ordered newest-to-oldest. Select the first non-stale parseable verdict.
-            for review in reviews:
-                review_cleared = (
-                    root_task.review_cleared_at is not None
-                    and review.completed_at is not None
-                    and root_task.review_cleared_at >= review.completed_at
-                )
-                if review_cleared:
-                    continue
+        improve_tasks = _get_improves_for_root_task(store, root_task)
 
-                verdict = get_review_verdict(config, review)
-                if verdict == "APPROVED":
-                    review_status = "✓ approved"
-                    review_status_color = UNMERGED_COLORS["review_approved"]
-                    break
-                if verdict == "CHANGES_REQUESTED":
-                    review_status = "⚠ changes requested"
-                    review_status_color = UNMERGED_COLORS["review_changes"]
-                    break
-                if verdict == "NEEDS_DISCUSSION":
-                    review_status = "💬 needs discussion"
-                    review_status_color = UNMERGED_COLORS["review_discussion"]
-                    break
+        # Build relationship lineage for this implementation chain.
+        lineage_tasks: list[DbTask] = [root_task]
+        lineage_tasks.extend(reviews)
+        lineage_tasks.extend(improve_tasks)
+        lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
 
+        seen_ids: set[int] = set()
+        lineage_parts: list[str] = []
         c = UNMERGED_COLORS  # shorthand
-        suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
+        for lineage_task in lineage_tasks:
+            if lineage_task.id is None or lineage_task.id in seen_ids:
+                continue
+            seen_ids.add(lineage_task.id)
+            lineage_parts.append(
+                f"[{c['task_id']}]#{lineage_task.id}[/{c['task_id']}]"
+                f"[dim]\\[{lineage_task.task_type}][/dim]"
+            )
+        lineage_str = " -> ".join(lineage_parts)
+
+        # Classify review freshness/status for this implementation.
+        latest_review = next((r for r in reviews if r.completed_at is not None), None)
+        latest_improve = max(
+            (imp for imp in improve_tasks if imp.completed_at is not None),
+            key=lambda imp: imp.completed_at or datetime.min,
+            default=None,
+        )
+
+        review_classification = "no review"
+        review_status_color = UNMERGED_COLORS["review_none"]
+        review_detail = None
+        review_verdict = None
+
+        if latest_review:
+            latest_review_completed = latest_review.completed_at
+            assert latest_review_completed is not None
+
+            review_is_stale = False
+            if root_task.review_cleared_at and root_task.review_cleared_at >= latest_review_completed:
+                review_is_stale = True
+            if latest_improve and latest_improve.completed_at and latest_improve.completed_at > latest_review_completed:
+                review_is_stale = True
+
+            if review_is_stale:
+                review_classification = "review stale"
+                review_status_color = UNMERGED_COLORS["review_changes"]
+                latest_review_id = latest_review.id if latest_review.id is not None else "?"
+                if latest_improve and latest_improve.id is not None:
+                    review_detail = f"last review #{latest_review_id} before latest improve #{latest_improve.id}"
+                else:
+                    review_detail = f"last review #{latest_review_id} before latest improve"
+            else:
+                review_classification = "reviewed"
+                review_status_color = UNMERGED_COLORS["review_approved"]
+
+            # Preserve verdict extraction behavior by scanning newest-to-oldest
+            # and taking the first parseable verdict after stale filtering.
+            if review_classification != "review stale":
+                for review in reviews:
+                    if review.completed_at is None:
+                        continue
+                    if root_task.review_cleared_at and root_task.review_cleared_at >= review.completed_at:
+                        continue
+                    verdict = get_review_verdict(config, review)
+                    if verdict:
+                        review_verdict = verdict
+                        break
+
+        verdict_label = None
+        if review_verdict == "APPROVED":
+            verdict_label = "✓ approved"
+        elif review_verdict == "CHANGES_REQUESTED":
+            verdict_label = "⚠ changes requested"
+        elif review_verdict == "NEEDS_DISCUSSION":
+            verdict_label = "💬 needs discussion"
+
+        review_line = review_classification
+        if review_detail:
+            review_line = f"{review_line} ({review_detail})"
+        if verdict_label:
+            review_line = f"{review_line} [{verdict_label}]"
+
+        suffix = ""
         # Append failure reason if present and not UNKNOWN
         if root_task.status == "failed" and root_task.failure_reason and root_task.failure_reason != "UNKNOWN":
             suffix += f" [red]failed ({root_task.failure_reason})[/red]"
@@ -857,11 +920,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
         date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
 
-        if improve_tasks:
-            improve_ids = ", ".join(f"[{c['task_id']}]#{t.id}[/{c['task_id']}]" for t in improve_tasks)
-            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}] (improved by {improve_ids})")
-        else:
-            console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]")
+        console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
+
+        if lineage_str:
+            console.print(f"lineage: {lineage_str}")
 
         # Show branch with diff stats (branch may no longer exist if deleted)
         if git.branch_exists(branch):
@@ -887,11 +949,8 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         else:
             console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]branch deleted[/{c['task_id']}])")
 
-        # Review status — shown prominently on its own line
-        if review_status:
-            console.print(f"review: [{review_status_color}]{review_status}[/{review_status_color}]")
-        else:
-            console.print(f"review: [{c['review_none']}]no review[/{c['review_none']}]")
+        # Review freshness status for this implementation.
+        console.print(f"review: [{review_status_color}]{review_line}[/{review_status_color}]")
 
         if root_task.report_file:
             console.print(f"report: [{c['task_id']}]{root_task.report_file}[/{c['task_id']}]")

@@ -6017,6 +6017,7 @@ This requires team discussion.
         # Run unmerged command (no review)
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
+        assert "review: no review" in result.stdout
         assert "approved" not in result.stdout
         assert "changes requested" not in result.stdout
         assert "needs discussion" not in result.stdout
@@ -6202,6 +6203,7 @@ This requires team discussion.
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" not in result.stdout
+        assert "review: reviewed" in result.stdout
 
     def test_unmerged_falls_back_to_unlinked_review_slug_match(self, tmp_path: Path):
         """Unmerged should infer review status from unlinked 'review <slug>' tasks."""
@@ -6248,8 +6250,8 @@ This requires team discussion.
         assert result.returncode == 0
         assert "⚠ changes requested" in result.stdout
 
-    def test_unmerged_hides_review_status_after_improve_clears_it(self, tmp_path: Path):
-        """After improve task clears review state, review status is not shown."""
+    def test_unmerged_marks_review_stale_after_improve_clears_it(self, tmp_path: Path):
+        """After improve clears review state, unmerged marks review as stale."""
         from gza.db import SqliteTaskStore
         from gza.git import Git
         import time
@@ -6306,11 +6308,11 @@ This requires team discussion.
         assert task.id is not None
         store.clear_review_state(task.id)
 
-        # After improve: review status should be gone
+        # After improve: status should explicitly show stale review
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "⚠ changes requested" not in result.stdout
-        assert "approved" not in result.stdout
+        assert "review stale" in result.stdout
+        assert "last review" in result.stdout
 
     def test_unmerged_shows_new_review_status_after_improve_and_re_review(self, tmp_path: Path):
         """After improve clears review state, a newer review's verdict is shown."""
@@ -6376,8 +6378,76 @@ This requires team discussion.
         # The new review's verdict should be shown (it's newer than review_cleared_at)
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
+        assert "reviewed" in result.stdout
         assert "✓ approved" in result.stdout
         assert "⚠ changes requested" not in result.stdout
+
+    def test_unmerged_shows_lineage_for_review_improve_chain(self, tmp_path: Path):
+        """Unmerged output includes related review/improve lineage for implementation."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        impl = store.add("Add feature", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(timezone.utc)
+        impl.branch = "feature/test"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.task_id = "20260212-add-feature"
+        store.update(impl)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        review = store.add("Review", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.depends_on = impl.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        time.sleep(0.01)
+        improve = store.add("Address review feedback", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime.now(timezone.utc)
+        improve.based_on = impl.id
+        improve.depends_on = review.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        # Simulate improve completion clearing the review state.
+        assert impl.id is not None
+        store.clear_review_state(impl.id)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "lineage:" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+        assert f"#{review.id}" in result.stdout
+        assert f"#{improve.id}" in result.stdout
+        assert "[implement]" in result.stdout
+        assert "[review]" in result.stdout
+        assert "[improve]" in result.stdout
+        assert "review stale" in result.stdout
 
 
 class TestClearReviewState:
