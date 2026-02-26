@@ -1035,6 +1035,141 @@ class TestDockerSetupCommandValidation:
         assert result.returncode == 0
 
 
+class TestLocalConfigOverrides:
+    """Tests for gza.local.yaml local override behavior."""
+
+    def test_local_overrides_deep_merge_nested_config(self, tmp_path: Path):
+        """Local overrides should deep-merge dictionaries over gza.yaml."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-base\n"
+            "        max_steps: 20\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-local\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        review_cfg = config.providers["claude"].task_types["review"]
+        assert review_cfg.model == "claude-local"
+        assert review_cfg.max_steps == 20
+        assert config.local_overrides_active is True
+        assert config.source_map["providers.claude.task_types.review.model"] == "local"
+        assert config.source_map["providers.claude.task_types.review.max_steps"] == "base"
+
+    def test_env_vars_take_precedence_over_local_overrides(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Environment variables should override local and base config values."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "use_docker: true\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "use_docker: false\n"
+        )
+        monkeypatch.setenv("GZA_USE_DOCKER", "true")
+
+        config = Config.load(tmp_path)
+
+        assert config.use_docker is True
+        assert config.source_map["use_docker"] == "env"
+
+    def test_local_override_guardrails_reject_disallowed_keys(self, tmp_path: Path):
+        """Local overrides should reject disallowed keys like project_name."""
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
+
+        with pytest.raises(ConfigError, match="Invalid local override key 'project_name'"):
+            Config.load(tmp_path)
+
+    def test_validate_fails_for_invalid_local_override_key(self, tmp_path: Path):
+        """gza validate should fail when local override contains disallowed keys."""
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Invalid local override key 'project_name'" in result.stdout
+
+    def test_notice_printed_when_local_overrides_active(self, tmp_path: Path):
+        """Commands should print a startup notice when local overrides are active."""
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("use_docker: false\n")
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Notice: local config overrides active from gza.local.yaml" in result.stderr
+
+    def test_config_command_shows_effective_values_with_sources(self, tmp_path: Path):
+        """gza config --json should include effective values and source attribution."""
+        import json
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "timeout_minutes: 10\n"
+            "use_docker: true\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "use_docker: false\n"
+        )
+
+        env = os.environ.copy()
+        env["GZA_TIMEOUT_MINUTES"] = "99"
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["timeout_minutes"] == 99
+        assert payload["effective"]["use_docker"] is False
+        assert payload["sources"]["timeout_minutes"] == "env"
+        assert payload["sources"]["use_docker"] == "local"
+        assert payload["local_overrides_active"] is True
+        assert payload["local_override_file"] == "gza.local.yaml"
+
+    def test_config_command_projects_source_for_branch_strategy_preset(self, tmp_path: Path):
+        """gza config should attribute normalized branch_strategy fields to configured source."""
+        import json
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "branch_strategy: conventional\n"
+        )
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["branch_strategy"]["pattern"] == "{type}/{slug}"
+        assert payload["effective"]["branch_strategy"]["default_type"] == "feature"
+        assert payload["sources"]["branch_strategy.pattern"] == "base"
+        assert payload["sources"]["branch_strategy.default_type"] == "base"
+
+
 class TestInitCommand:
     """Tests for 'gza init' command."""
 
@@ -1044,7 +1179,9 @@ class TestInitCommand:
 
         assert result.returncode == 0
         config_path = tmp_path / "gza.yaml"
+        local_example_path = tmp_path / "gza.local.yaml.example"
         assert config_path.exists()
+        assert local_example_path.exists()
 
         # Verify project_name is set (derived from directory name)
         content = config_path.read_text()
@@ -1067,6 +1204,8 @@ class TestInitCommand:
     def test_init_force_overwrites(self, tmp_path: Path):
         """Init command overwrites existing config with --force."""
         setup_config(tmp_path, project_name="original")
+        local_example_path = tmp_path / "gza.local.yaml.example"
+        local_example_path.write_text("# stale local example\n")
 
         result = run_gza("init", "--force", "--project", str(tmp_path))
 
@@ -1076,6 +1215,8 @@ class TestInitCommand:
         config_path = tmp_path / "gza.yaml"
         content = config_path.read_text()
         assert tmp_path.name in content
+        assert local_example_path.exists()
+        assert "# stale local example" not in local_example_path.read_text()
 
 
 class TestImportCommand:

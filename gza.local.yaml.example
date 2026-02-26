@@ -1,0 +1,11 @@
+# Local machine-only overrides for gza.yaml.
+# Copy to gza.local.yaml and customize for your environment.
+# Keep gza.local.yaml gitignored.
+
+# use_docker: false
+# timeout_minutes: 30
+# worktree_dir: /tmp/gza-worktrees
+# provider: codex
+# model: o4-mini
+# docker_volumes:
+#   - ~/datasets:/datasets:ro

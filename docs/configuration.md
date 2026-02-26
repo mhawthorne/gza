@@ -5,6 +5,7 @@ This document provides a comprehensive reference for all configuration options a
 ## Configuration File (gza.yaml)
 
 The main configuration file is `gza.yaml` in your project root directory.
+You can optionally add `gza.local.yaml` for machine-local overrides.
 
 ### Required Configuration
 
@@ -34,6 +35,36 @@ The main configuration file is `gza.yaml` in your project root directory.
 | `claude.fetch_auth_token_from_keychain` | Boolean | `false` | Fetch OAuth token from macOS Keychain for Docker (macOS only) |
 | `claude.args` | List | `["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]` | Arguments passed to Claude Code CLI |
 | `claude_args` | List | *(deprecated)* | Use `claude.args` instead |
+
+### Local Overrides (gza.local.yaml)
+
+Use `gza.local.yaml` for machine-specific settings that should not be committed.
+
+- Merge behavior: deep merge for dictionaries, replace for scalars/lists
+- Precedence: `gza.yaml` < `gza.local.yaml` < env vars
+- Guardrails: only approved keys can be overridden in `gza.local.yaml`
+
+Example:
+
+```yaml
+# gza.local.yaml
+use_docker: false
+timeout_minutes: 30
+docker_volumes:
+  - ~/datasets:/datasets:ro
+providers:
+  claude:
+    task_types:
+      review:
+        model: claude-haiku-4-5
+```
+
+Inspect effective values and source attribution:
+
+```bash
+gza config
+gza config --json
+```
 
 ### Branch Naming Strategy
 
@@ -269,6 +300,8 @@ Environment variables can be set in `.env` files:
 1. **Project `.env`** - Overrides all other sources
 2. **Shell environment** - Variables exported in your shell
 3. **`~/.gza/.env`** - Only sets values not already defined
+4. **`gza.local.yaml`** - Local machine overrides
+5. **`gza.yaml`** - Base shared config
 
 This means if you have `ANTHROPIC_API_KEY` set in your shell, you don't need `~/.gza/.env` at all. The home `.env` file uses `setdefault` behavior, so it won't override existing environment variables.
 
@@ -508,6 +541,15 @@ Validate configuration.
 
 ```bash
 gza validate
+```
+
+### config
+
+Show effective configuration and source attribution (`base`, `local`, `env`, `default`).
+
+```bash
+gza config
+gza config --json
 ```
 
 ### show
@@ -795,8 +837,9 @@ Configuration is resolved in the following order (highest to lowest priority):
 2. **Environment variables** (`GZA_*`)
 3. **Project `.env` file**
 4. **Home `.env` file** (`~/.gza/.env`)
-5. **`gza.yaml` file**
-6. **Hardcoded defaults**
+5. **`gza.local.yaml` file** (if present)
+6. **`gza.yaml` file**
+7. **Hardcoded defaults**
 
 ---
 
@@ -807,6 +850,7 @@ Configuration is resolved in the following order (highest to lowest priority):
 | Path | Purpose |
 |------|---------|
 | `gza.yaml` | Main configuration file |
+| `gza.local.yaml` | Local machine overrides (gitignored) |
 | `.env` | Project-specific environment variables |
 | `.gza/` | Local state directory (add to `.gitignore`) |
 | `.gza/gza.db` | SQLite task database |
@@ -816,7 +860,7 @@ Configuration is resolved in the following order (highest to lowest priority):
 | `etc/Dockerfile.codex` | Generated Docker image for Codex |
 | `etc/Dockerfile.gemini` | Generated Docker image for Gemini |
 
-> **Note:** The `.gza/` directory contains machine-specific state and should be added to `.gitignore`. Run `echo ".gza/" >> .gitignore` after initializing your project.
+> **Note:** `.gza/` and `gza.local.yaml` are machine-specific and should be gitignored.
 
 ### Home Directory
 

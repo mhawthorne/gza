@@ -6,6 +6,7 @@ src/gza/_version.py
 .docker-build-marker
 .pytest_cache/
 tmp/
+gza.local.yaml
 
 # Gza runtime data
 .gza/
