@@ -75,4 +75,6 @@ files = ["src/gza"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "mypy>=1.0",
+    "types-PyYAML>=6.0",
 ]

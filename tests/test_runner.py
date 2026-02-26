@@ -206,8 +206,6 @@ class TestBuildPrompt:
 
     def test_build_prompt_learnings_unreadable_file_does_not_crash(self, tmp_path: Path):
         """Test that an unreadable learnings.md doesn't crash prompt building."""
-        import os
-
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -220,16 +218,19 @@ class TestBuildPrompt:
         gza_dir.mkdir(parents=True, exist_ok=True)
         learnings_path = gza_dir / "learnings.md"
         learnings_path.write_text("- Some learning\n")
-        # Make file unreadable
-        os.chmod(learnings_path, 0o000)
 
-        try:
+        # Mock read_text to raise PermissionError (chmod 0o000 doesn't work as root)
+        original_read_text = Path.read_text
+        def mock_read_text(self, *args, **kwargs):
+            if self == learnings_path:
+                raise PermissionError("Permission denied")
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", mock_read_text):
             prompt = build_prompt(task, config, store)
             # Should not crash; learnings simply omitted
             assert "Some learning" not in prompt
             assert "Complete this task: Implement feature Z" in prompt
-        finally:
-            os.chmod(learnings_path, 0o644)
 
 
 class TestReviewContextFromChain:
