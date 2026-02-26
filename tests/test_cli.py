@@ -2640,6 +2640,7 @@ class TestPsCommand:
         # Verify task ID is in output
         assert result.returncode == 0
         assert "TASK ID" in result.stdout, "Header should contain 'TASK ID' column"
+        assert "STARTED" in result.stdout, "Header should contain 'STARTED' column"
         assert f"#{task.id}" in result.stdout, f"Output should contain task ID #{task.id}"
 
         # Cleanup
@@ -2683,6 +2684,7 @@ class TestPsCommand:
         assert rows[0]["task_id"] == task.id
         assert rows[0]["source"] == "both"
         assert rows[0]["is_orphaned"] is False
+        assert rows[0]["started_at"] is not None
 
         registry.remove("w-test-both")
 
@@ -2708,6 +2710,43 @@ class TestPsCommand:
         assert rows[0]["status"] == "in_progress"
         assert rows[0]["is_orphaned"] is True
         assert "orphaned" in rows[0]["flags"]
+        assert rows[0]["started_at"] is not None
+
+    def test_ps_formats_started_timestamp_in_table_output(self, tmp_path: Path):
+        """PS table output renders start timestamps in UTC with clear formatting."""
+        import os
+
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Formatted start time")
+        store.mark_in_progress(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-start-format",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at="2026-01-08T00:00:00+00:00",
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--all", cwd=tmp_path)
+        assert result.returncode == 0
+        assert "2026-01-08 00:00:00 UTC" in result.stdout
+
+        registry.remove("w-test-start-format")
 
     def test_ps_quiet_shows_only_worker_ids(self, tmp_path: Path):
         """PS quiet output should only include real worker IDs."""
@@ -2788,6 +2827,79 @@ class TestPsCommand:
         assert "orphaned" in rows[0]["flags"]
 
         registry.remove("w-test-stale-ps")
+
+    def test_ps_handles_missing_started_timestamp(self, tmp_path: Path):
+        """PS should gracefully handle invalid/missing start timestamps."""
+        import json
+
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-start",
+                pid=99999,
+                task_id=None,
+                task_slug="standalone-worker",
+                started_at="not-a-timestamp",
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        table_result = run_gza("ps", "--all", cwd=tmp_path)
+        assert table_result.returncode == 0
+        assert "w-test-no-start" in table_result.stdout
+        assert "standalone-worker" in table_result.stdout
+        assert " - " in table_result.stdout
+
+        json_result = run_gza("ps", "--all", "--json", cwd=tmp_path)
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["worker_id"] == "w-test-no-start"
+        assert rows[0]["started"] == "-"
+        assert rows[0]["started_at"] is None
+
+        registry.remove("w-test-no-start")
+
+    def test_ps_json_order_stable_when_started_timestamps_missing(self, tmp_path: Path):
+        """PS JSON ordering is deterministic when start times are unavailable."""
+        import json
+
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        # Register in reverse lexical order to assert sort stability by worker_id.
+        for worker_id in ["w-test-order-b", "w-test-order-a"]:
+            registry.register(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    pid=99999,
+                    task_id=None,
+                    task_slug=None,
+                    started_at="invalid",
+                    status="running",
+                    log_file=None,
+                    worktree=None,
+                )
+            )
+
+        result = run_gza("ps", "--all", "--json", cwd=tmp_path)
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert [row["worker_id"] for row in rows] == ["w-test-order-a", "w-test-order-b"]
+
+        registry.remove("w-test-order-a")
+        registry.remove("w-test-order-b")
 
 
 class TestHelpOutput:

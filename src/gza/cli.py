@@ -3325,16 +3325,16 @@ def cmd_ps(args: argparse.Namespace) -> int:
 
     print(
         f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'SOURCE':<7} {'TASK ID':<10} "
-        f"{'STATUS':<12} {'FLAGS':<12} {'TASK':<30} {'DURATION':<10}"
+        f"{'STATUS':<12} {'FLAGS':<12} {'TASK':<30} {'STARTED':<20} {'DURATION':<10}"
     )
-    print("-" * 133)
+    print("-" * 154)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
         print(
             f"{row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} {row['source']:<7} "
             f"{task_id_display:<10} {row['status']:<12} {row['flags']:<12} "
-            f"{row['task']:<30} {row['duration']:<10}"
+            f"{row['task']:<30} {row['started']:<20} {row['duration']:<10}"
         )
 
     return 0
@@ -3373,8 +3373,19 @@ def _build_ps_rows(
             merged[key] = {"worker": None, "task": task}
 
     rows = [_to_ps_row(item["worker"], item["task"]) for item in merged.values()]
-    rows.sort(key=lambda row: row["sort_timestamp"] or "")
+    rows.sort(key=_ps_sort_key)
     return rows
+
+
+def _ps_sort_key(row: dict) -> tuple[bool, str, int, str]:
+    """Sort ps rows by start time, then stable identifiers."""
+    sort_timestamp = row["sort_timestamp"] or ""
+    has_no_timestamp = sort_timestamp == ""
+
+    raw_task_id = row.get("task_id")
+    task_id_sort = raw_task_id if isinstance(raw_task_id, int) else sys.maxsize
+    worker_id = row.get("worker_id", "")
+    return (has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
 
 
 def _prefer_worker(existing: WorkerMetadata, candidate: WorkerMetadata) -> bool:
@@ -3450,6 +3461,8 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
         "status": status,
         "flags": ",".join(flags),
         "task": task_display,
+        "started": _format_started(started),
+        "started_at": started.isoformat() if started else None,
         "duration": duration,
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,
@@ -3496,6 +3509,16 @@ def _format_duration(started: datetime | None, ended: datetime | None = None) ->
     minutes = int(duration_sec // 60)
     seconds = int(duration_sec % 60)
     return f"{minutes}m {seconds}s"
+
+
+def _format_started(started: datetime | None) -> str:
+    """Format start timestamp for ps output."""
+    if not started:
+        return "-"
+    if started.tzinfo is None:
+        return started.strftime("%Y-%m-%d %H:%M:%S")
+    started_utc = started.astimezone(timezone.utc)
+    return started_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
