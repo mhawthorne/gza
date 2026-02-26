@@ -28,6 +28,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
 | `provider` | String | `claude` | AI provider: `claude`, `codex`, or `gemini` |
+| `task_providers` | Dict | `{}` | Route task types to providers (e.g., `review: claude`) |
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
 | `model` | String | *(empty)* | Legacy global model fallback (compatible) |
 | `task_types` | Dict | `{}` | Legacy global per-task fallback (compatible) |
@@ -157,6 +158,9 @@ Preferred approach for multi-provider setups:
 
 ```yaml
 provider: claude
+task_providers:
+  review: claude
+  implement: codex
 providers:
   claude:
     model: claude-sonnet-4-5
@@ -192,7 +196,8 @@ Top-level `task_types` and `model` are still supported for backward compatibilit
 
 Provider selection:
 1. `task.provider`
-2. `provider` (already merged with `GZA_PROVIDER`)
+2. `task_providers.<task_type>`
+3. `provider` (already merged with `GZA_PROVIDER`)
 
 Model selection:
 1. `task.model`
@@ -202,10 +207,13 @@ Model selection:
 5. `model` / `defaults.model` / `GZA_MODEL` (legacy fallback)
 6. Provider runtime default (if no model resolved)
 
-Max turns selection:
-1. `providers.<effective_provider>.task_types.<task_type>.max_turns`
-2. `task_types.<task_type>.max_turns` (legacy fallback)
-3. `max_turns` / `defaults.max_turns` / `GZA_MAX_TURNS`
+Max steps selection:
+1. `providers.<effective_provider>.task_types.<task_type>.max_steps`
+2. `providers.<effective_provider>.task_types.<task_type>.max_turns` (legacy)
+3. `task_types.<task_type>.max_steps` (legacy fallback)
+4. `task_types.<task_type>.max_turns` (legacy fallback)
+5. `max_steps` / `defaults.max_steps` / `GZA_MAX_STEPS`
+6. `max_turns` / `defaults.max_turns` / `GZA_MAX_TURNS` (legacy fallback)
 
 ---
 

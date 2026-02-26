@@ -48,6 +48,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "worktree_dir": None,
     "work_count": None,
     "provider": None,
+    "task_providers": {
+        "*": None,
+    },
     "model": None,
     "defaults": {
         "model": None,
@@ -252,6 +255,7 @@ class Config:
     worktree_dir: str = DEFAULT_WORKTREE_DIR
     work_count: int = DEFAULT_WORK_COUNT
     provider: str = DEFAULT_PROVIDER  # "claude", "codex", or "gemini"
+    task_providers: dict[str, str] = field(default_factory=dict)  # Per-task-type provider routing
     model: str = ""  # Provider-specific model name (optional)
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
     providers: dict[str, ProviderConfig] = field(default_factory=dict)  # Provider-scoped config
@@ -297,6 +301,15 @@ class Config:
             return legacy_task_type.model
 
         return self.model or None
+
+    def get_provider_for_task(self, task_type: str) -> str:
+        """Get effective provider for a task type.
+
+        Precedence:
+        1. task_providers.<task_type>
+        2. provider
+        """
+        return self.task_providers.get(task_type, self.provider)
 
     def get_model_for_task_type(self, task_type: str) -> str | None:
         """Get the model for a given task type, falling back to defaults.
@@ -439,7 +452,7 @@ class Config:
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
-            "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
+            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command"
         }
         for key in data.keys():
@@ -530,6 +543,21 @@ class Config:
         if os.getenv("GZA_PROVIDER"):
             provider = os.getenv("GZA_PROVIDER")
             source_map["provider"] = "env"
+
+        # task_providers routing
+        task_providers: dict[str, str] = {}
+        task_providers_data = data.get("task_providers")
+        if task_providers_data is not None:
+            if not isinstance(task_providers_data, dict):
+                raise ConfigError("'task_providers' must be a dictionary")
+            for task_type, provider_name in task_providers_data.items():
+                if not isinstance(provider_name, str):
+                    raise ConfigError(f"'task_providers.{task_type}' must be a string")
+                if provider_name not in KNOWN_PROVIDERS:
+                    raise ConfigError(
+                        f"'task_providers.{task_type}' must be one of: {', '.join(KNOWN_PROVIDERS)}"
+                    )
+                task_providers[task_type] = provider_name
 
         # model: check defaults section first, then top-level
         model = defaults.get("model") or data.get("model", "")
@@ -707,9 +735,10 @@ class Config:
         if not _is_model_compatible_with_provider(provider, model):
             model_compat_errors.append(_provider_model_mismatch_error("model", provider, model))
         for task_type, task_cfg in task_types.items():
-            if task_cfg.model and not _is_model_compatible_with_provider(provider, task_cfg.model):
+            task_provider = task_providers.get(task_type, provider)
+            if task_cfg.model and not _is_model_compatible_with_provider(task_provider, task_cfg.model):
                 model_compat_errors.append(
-                    _provider_model_mismatch_error(f"task_types.{task_type}.model", provider, task_cfg.model)
+                    _provider_model_mismatch_error(f"task_types.{task_type}.model", task_provider, task_cfg.model)
                 )
         for provider_name, provider_cfg in providers.items():
             if provider_cfg.model and not _is_model_compatible_with_provider(provider_name, provider_cfg.model):
@@ -846,6 +875,7 @@ class Config:
             worktree_dir=worktree_dir,
             work_count=work_count,
             provider=provider,
+            task_providers=task_providers,
             model=model,
             task_types=task_types,
             providers=providers,
@@ -893,7 +923,7 @@ class Config:
         valid_fields = {
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
-            "claude_args", "claude", "worktree_dir", "work_count", "provider", "model",
+            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command"
         }
 
@@ -1021,6 +1051,19 @@ class Config:
                 provider_list = ", ".join("'" + p + "'" for p in KNOWN_PROVIDERS)
                 errors.append(f"'provider' must be one of: {provider_list}")
 
+        if "task_providers" in data:
+            if not isinstance(data["task_providers"], dict):
+                errors.append("'task_providers' must be a dictionary")
+            else:
+                for task_type, provider_name in data["task_providers"].items():
+                    if not isinstance(provider_name, str):
+                        errors.append(f"'task_providers.{task_type}' must be a string")
+                    elif provider_name not in KNOWN_PROVIDERS:
+                        provider_list = ", ".join("'" + p + "'" for p in KNOWN_PROVIDERS)
+                        errors.append(
+                            f"'task_providers.{task_type}' must be one of: {provider_list}"
+                        )
+
         if "model" in data and not isinstance(data["model"], str):
             errors.append("'model' must be a string")
 
@@ -1080,6 +1123,9 @@ class Config:
 
         # Validate provider/model compatibility to fail early on mixed-provider configs.
         provider_for_models = data.get("provider", DEFAULT_PROVIDER)
+        task_providers_for_models = data.get("task_providers", {})
+        if not isinstance(task_providers_for_models, dict):
+            task_providers_for_models = {}
         if isinstance(provider_for_models, str) and provider_for_models in ("claude", "codex", "gemini"):
             top_model = data.get("model")
             if isinstance(top_model, str) and top_model and not _is_model_compatible_with_provider(provider_for_models, top_model):
@@ -1099,16 +1145,19 @@ class Config:
             if isinstance(task_types_cfg, dict):
                 for task_type, task_cfg in task_types_cfg.items():
                     if isinstance(task_cfg, dict):
+                        task_provider = task_providers_for_models.get(task_type, provider_for_models)
+                        if not isinstance(task_provider, str) or task_provider not in KNOWN_PROVIDERS:
+                            task_provider = provider_for_models
                         task_model = task_cfg.get("model")
                         if (
                             isinstance(task_model, str)
                             and task_model
-                            and not _is_model_compatible_with_provider(provider_for_models, task_model)
+                            and not _is_model_compatible_with_provider(task_provider, task_model)
                         ):
                             errors.append(
                                 _provider_model_mismatch_error(
                                     f"task_types.{task_type}.model",
-                                    provider_for_models,
+                                    task_provider,
                                     task_model,
                                 )
                             )

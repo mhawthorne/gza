@@ -59,6 +59,11 @@ project_name: my-project
 # AI provider: "claude", "gemini", or "codex"
 # provider: claude
 
+# Route specific task types to a provider
+# task_providers:
+#   review: claude
+#   implement: codex
+
 # Provider-specific model name (optional)
 # model: ""
 
