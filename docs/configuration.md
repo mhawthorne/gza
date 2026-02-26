@@ -548,6 +548,24 @@ gza retry <task_id> [options]
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 
+### mark-completed
+
+Manually complete a task when automation failed. Defaults are task-type aware:
+- `task`, `implement`, `improve` default to git-verified completion
+- `explore`, `plan`, `review` default to status-only completion
+
+```bash
+gza mark-completed <task_id> [--verify-git | --force]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Task ID to mark as completed |
+| `--verify-git` | Validate branch and commits before completion |
+| `--force` | Status-only completion (for non-code tasks or stale in_progress recovery) |
+
+`force-complete` is deprecated. Use `mark-completed <task_id> --force`.
+
 ### merge
 
 Merge a completed task's branch into the current branch.

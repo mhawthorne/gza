@@ -822,25 +822,29 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         review_status_color = None
         reviews = _get_reviews_for_root_task(store, root_task)
         if reviews:
-            # Get the most recent review (first in the list, as they're ordered by created_at DESC)
-            latest_review = reviews[0]
-            # If an improve task has run after this review, the review is stale — skip it.
-            review_cleared = (
-                root_task.review_cleared_at is not None
-                and latest_review.completed_at is not None
-                and root_task.review_cleared_at >= latest_review.completed_at
-            )
-            if not review_cleared:
-                verdict = get_review_verdict(config, latest_review)
+            # Reviews are ordered newest-to-oldest. Select the first non-stale parseable verdict.
+            for review in reviews:
+                review_cleared = (
+                    root_task.review_cleared_at is not None
+                    and review.completed_at is not None
+                    and root_task.review_cleared_at >= review.completed_at
+                )
+                if review_cleared:
+                    continue
+
+                verdict = get_review_verdict(config, review)
                 if verdict == "APPROVED":
                     review_status = "✓ approved"
                     review_status_color = UNMERGED_COLORS["review_approved"]
-                elif verdict == "CHANGES_REQUESTED":
+                    break
+                if verdict == "CHANGES_REQUESTED":
                     review_status = "⚠ changes requested"
                     review_status_color = UNMERGED_COLORS["review_changes"]
-                elif verdict == "NEEDS_DISCUSSION":
+                    break
+                if verdict == "NEEDS_DISCUSSION":
                     review_status = "💬 needs discussion"
                     review_status_color = UNMERGED_COLORS["review_discussion"]
+                    break
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
@@ -3082,8 +3086,6 @@ def cmd_ps(args: argparse.Namespace) -> int:
         for row in rows:
             if row["worker_id"] != "-":
                 print(row["worker_id"])
-            elif row["task_id"] is not None:
-                print(f"db:{row['task_id']}")
         return 0
 
     if hasattr(args, "json") and args.json:
@@ -3169,7 +3171,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
     status = "unknown"
     if source == "db":
         status = "in_progress"
-    elif source == "worker":
+    elif source == "worker" and worker is not None:
         status = worker.status
     elif worker is not None:
         if worker.status in ("completed", "failed", "stale"):
@@ -3418,8 +3420,15 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return run(config, task_id=new_task.id)
 
 
-def cmd_force_complete(args: argparse.Namespace) -> int:
-    """Manually mark a task as completed (for infrastructure failures)."""
+def _default_mark_completed_mode(task_type: str) -> str:
+    """Choose default completion mode based on task type."""
+    if task_type in {"task", "implement", "improve"}:
+        return "verify-git"
+    return "force"
+
+
+def cmd_mark_completed(args: argparse.Namespace) -> int:
+    """Mark a task as completed with either git verification or status-only mode."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -3432,50 +3441,42 @@ def cmd_force_complete(args: argparse.Namespace) -> int:
         print(f"Error: Task #{args.task_id} is already completed")
         return 1
 
-    old_status = task.status
-    store.mark_completed(task, branch=task.branch if task.branch else None)
-    print(f"✓ Task #{args.task_id} status changed: {old_status} → completed")
-    return 0
-
-
-def cmd_mark_completed(args: argparse.Namespace) -> int:
-    """Mark a failed task as completed, checking git for actual commits."""
-    config = Config.load(args.project_dir)
-    store = get_store(config)
-
-    task = store.get(args.task_id)
-    if not task:
-        print(f"Error: Task #{args.task_id} not found")
+    if args.verify_git and args.force:
+        print("Error: Cannot use --verify-git and --force together")
         return 1
+
+    mode = "verify-git" if args.verify_git else ("force" if args.force else _default_mark_completed_mode(task.task_type))
 
     # Warn if task wasn't failed (but still proceed)
     if task.status != "failed":
         print(f"Warning: Task #{args.task_id} is not in failed status (current status: {task.status}), proceeding anyway")
 
-    # Check that task has a branch
+    if mode == "force":
+        old_status = task.status
+        store.mark_completed(task, branch=task.branch if task.branch else None)
+        print(f"✓ Task #{args.task_id} status changed: {old_status} → completed (status-only)")
+        return 0
+
+    # verify-git mode: validate branch and commit state
     if not task.branch:
-        print(f"Error: Task #{args.task_id} has no branch set")
+        print(f"Error: Task #{args.task_id} has no branch set. Use --force for status-only completion.")
         return 1
 
-    # Check git for branch existence
     git = Git(config.project_dir)
     if not git.branch_exists(task.branch):
-        print(f"Error: Branch '{task.branch}' does not exist")
+        print(f"Error: Branch '{task.branch}' does not exist. Use --force for status-only completion.")
         return 1
 
-    # Set has_commits based on actual commits on branch
     default_branch = git.default_branch()
     commit_count = git.count_commits_ahead(task.branch, default_branch)
-    has_commits = commit_count > 0
-
-    if not has_commits:
-        # Log if no commits found, but still mark completed
+    if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
         store.mark_completed(task, branch=task.branch, has_commits=False)
         print(f"✓ Task #{args.task_id} marked as completed")
-    else:
-        store.mark_completed(task, branch=task.branch, has_commits=True)
-        print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
+        return 0
+
+    store.mark_completed(task, branch=task.branch, has_commits=True)
+    print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
 
@@ -5174,27 +5175,26 @@ def main() -> int:
     )
     add_common_args(stop_parser)
 
-    # force-complete command
-    force_complete_parser = subparsers.add_parser(
-        "force-complete",
-        help="Manually mark a task as completed (for infrastructure failures)",
-    )
-    force_complete_parser.add_argument(
-        "task_id",
-        type=int,
-        help="Task ID to force-complete",
-    )
-    add_common_args(force_complete_parser)
-
     # mark-completed command
     mark_completed_parser = subparsers.add_parser(
         "mark-completed",
-        help="Mark a failed task as completed, checking git for actual commits on the branch",
+        help="Mark a task as completed (defaults by task type; supports --verify-git or --force)",
     )
     mark_completed_parser.add_argument(
         "task_id",
         type=int,
         help="Task ID to mark as completed",
+    )
+    mark_completed_mode_group = mark_completed_parser.add_mutually_exclusive_group()
+    mark_completed_mode_group.add_argument(
+        "--verify-git",
+        action="store_true",
+        help="Validate branch/commits against git before completion",
+    )
+    mark_completed_mode_group.add_argument(
+        "--force",
+        action="store_true",
+        help="Status-only completion (for non-code tasks or infrastructure recovery)",
     )
     add_common_args(mark_completed_parser)
 
@@ -5276,8 +5276,6 @@ def main() -> int:
             return cmd_ps(args)
         elif args.command == "stop":
             return cmd_stop(args)
-        elif args.command == "force-complete":
-            return cmd_force_complete(args)
         elif args.command == "mark-completed":
             return cmd_mark_completed(args)
         elif args.command == "learnings":

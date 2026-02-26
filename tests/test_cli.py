@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2519,6 +2520,44 @@ class TestPsCommand:
         assert rows[0]["status"] == "in_progress"
         assert rows[0]["is_orphaned"] is True
         assert "orphaned" in rows[0]["flags"]
+
+    def test_ps_quiet_shows_only_worker_ids(self, tmp_path: Path):
+        """PS quiet output should only include real worker IDs."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # DB-only in-progress task must not appear in quiet mode.
+        db_only_task = store.add("DB-only in-progress task")
+        store.mark_in_progress(db_only_task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-quiet",
+                pid=os.getpid(),
+                task_id=None,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--quiet", cwd=tmp_path)
+        assert result.returncode == 0
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert lines == ["w-test-quiet"]
+        assert all(not line.startswith("db:") for line in lines)
+
+        registry.remove("w-test-quiet")
 
     def test_ps_flags_stale_and_orphaned_for_stale_worker_in_progress_task(self, tmp_path: Path):
         """PS flags stale worker + orphaned in-progress task in reconciled row."""
@@ -5906,6 +5945,123 @@ This requires team discussion.
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
 
+    def test_unmerged_uses_older_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+        """Unmerged scans newest-to-oldest and uses first parseable review verdict."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.depends_on = task.id
+        older_review.task_id = "20260212-older-review"
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        time.sleep(0.01)
+
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.depends_on = task.id
+        latest_review.task_id = "20260212-latest-review"
+        latest_review.output_content = None
+        latest_review.report_file = None
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" in result.stdout
+
+    def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+        """Staleness via review_cleared_at still suppresses older verdicts."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.depends_on = task.id
+        older_review.task_id = "20260212-older-review"
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        time.sleep(0.01)
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        time.sleep(0.01)
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.depends_on = task.id
+        latest_review.task_id = "20260212-latest-review"
+        latest_review.output_content = None
+        latest_review.report_file = None
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" not in result.stdout
+
     def test_unmerged_falls_back_to_unlinked_review_slug_match(self, tmp_path: Path):
         """Unmerged should infer review status from unlinked 'review <slug>' tasks."""
         from gza.db import SqliteTaskStore
@@ -6775,108 +6931,6 @@ class TestRebaseHelpers:
             assert result is False
 
 
-class TestForceCompleteCommand:
-    """Tests for 'gza force-complete' command."""
-
-    def test_force_complete_failed_task(self, tmp_path: Path):
-        """Force-complete marks a failed task as completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Failed task", "status": "failed"},
-        ])
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "failed → completed" in result.stdout
-
-    def test_force_complete_pending_task(self, tmp_path: Path):
-        """Force-complete marks a pending task as completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Pending task", "status": "pending"},
-        ])
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "pending → completed" in result.stdout
-
-    def test_force_complete_in_progress_task(self, tmp_path: Path):
-        """Force-complete marks an in_progress task as completed."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("In-progress task")
-        task.status = "in_progress"
-        store.update(task)
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "in_progress → completed" in result.stdout
-
-    def test_force_complete_already_completed_fails(self, tmp_path: Path):
-        """Force-complete fails if task is already completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Completed task", "status": "completed"},
-        ])
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "already completed" in result.stdout
-
-    def test_force_complete_nonexistent_task(self, tmp_path: Path):
-        """Force-complete fails for a nonexistent task."""
-        setup_db_with_tasks(tmp_path, [])
-
-        result = run_gza("force-complete", "999", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "not found" in result.stdout
-
-    def test_force_complete_persists_status(self, tmp_path: Path):
-        """Force-complete actually updates the task status in the store."""
-        from gza.db import SqliteTaskStore
-
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Failed task", "status": "failed"},
-        ])
-
-        run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "completed"
-
-    def test_force_complete_preserves_branch(self, tmp_path: Path):
-        """Force-complete preserves an existing branch on the task."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("Task with branch")
-        task.status = "failed"
-        task.branch = "gza/1-task-with-branch"
-        store.update(task)
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        updated_task = store.get(1)
-        assert updated_task is not None
-        assert updated_task.branch == "gza/1-task-with-branch"
-        assert updated_task.status == "completed"
-
-
 class TestMarkCompletedCommand:
     """Tests for 'gza mark-completed' command."""
 
@@ -6901,10 +6955,61 @@ class TestMarkCompletedCommand:
         assert result.returncode == 1
         assert "not found" in result.stdout
 
+    def test_mark_completed_default_verify_git_for_code_tasks(self, tmp_path: Path):
+        """Code task types default to git verification mode."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        self._setup_git_repo(tmp_path)
+
+        task = store.add("Code task with no branch", task_type="task")
+        task.status = "failed"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no branch" in result.stdout
+
+    def test_mark_completed_default_force_for_non_code_tasks(self, tmp_path: Path):
+        """Non-code task types default to status-only completion."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Review task", "status": "failed", "task_type": "review"},
+        ])
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "status-only" in result.stdout
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "completed"
+        assert updated.has_commits is False
+
+    def test_mark_completed_verify_git_requires_branch(self, tmp_path: Path):
+        """--verify-git errors when no branch is set."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task without branch", "status": "failed", "task_type": "review"},
+        ])
+
+        result = run_gza("mark-completed", "1", "--verify-git", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no branch" in result.stdout
+        assert "Use --force" in result.stdout
+
     def test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
         """mark-completed warns when task status is not failed."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -6928,17 +7033,6 @@ class TestMarkCompletedCommand:
         assert "Warning" in result.stdout
         assert "not in failed status" in result.stdout
 
-    def test_mark_completed_errors_if_no_branch_on_task(self, tmp_path: Path):
-        """mark-completed errors when task has no branch set."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Task without branch", "status": "failed"},
-        ])
-
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "no branch" in result.stdout
-
     def test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
         """mark-completed errors when git branch does not exist."""
         from gza.db import SqliteTaskStore
@@ -6959,11 +7053,11 @@ class TestMarkCompletedCommand:
 
         assert result.returncode == 1
         assert "does not exist" in result.stdout
+        assert "Use --force" in result.stdout
 
     def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
         """mark-completed sets status='unmerged' when branch has commits."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -6998,7 +7092,6 @@ class TestMarkCompletedCommand:
     def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
         """mark-completed sets status='completed' when branch has no commits."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -7027,10 +7120,31 @@ class TestMarkCompletedCommand:
         assert updated.status == "completed"
         assert updated.has_commits is False
 
+    def test_mark_completed_force_stale_in_progress_recovery(self, tmp_path: Path):
+        """--force supports stale in_progress recovery without git validation."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Stale worker task", task_type="implement")
+        task.status = "in_progress"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--force", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "in_progress → completed" in result.stdout
+
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "completed"
+
     def test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
         """mark-completed does not warn when task is in failed status."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -7050,6 +7164,22 @@ class TestMarkCompletedCommand:
 
         assert result.returncode == 0
         assert "Warning" not in result.stdout
+
+
+class TestForceCompleteRemoval:
+    """Tests for removed force-complete command."""
+
+    def test_force_complete_is_not_a_valid_command(self, tmp_path: Path):
+        """force-complete command is removed and rejected by CLI parsing."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Failed task", "status": "failed", "task_type": "implement"},
+        ])
+
+        result = run_gza("force-complete", "1", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "invalid choice" in result.stderr
+        assert "force-complete" in result.stderr
 
 
 class TestMergeStatusTracking:
