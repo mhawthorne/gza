@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2519,6 +2520,44 @@ class TestPsCommand:
         assert rows[0]["status"] == "in_progress"
         assert rows[0]["is_orphaned"] is True
         assert "orphaned" in rows[0]["flags"]
+
+    def test_ps_quiet_shows_only_worker_ids(self, tmp_path: Path):
+        """PS quiet output should only include real worker IDs."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # DB-only in-progress task must not appear in quiet mode.
+        db_only_task = store.add("DB-only in-progress task")
+        store.mark_in_progress(db_only_task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-quiet",
+                pid=os.getpid(),
+                task_id=None,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--quiet", cwd=tmp_path)
+        assert result.returncode == 0
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert lines == ["w-test-quiet"]
+        assert all(not line.startswith("db:") for line in lines)
+
+        registry.remove("w-test-quiet")
 
     def test_ps_flags_stale_and_orphaned_for_stale_worker_in_progress_task(self, tmp_path: Path):
         """PS flags stale worker + orphaned in-progress task in reconciled row."""
@@ -7010,29 +7049,20 @@ class TestMarkCompletedCommand:
         assert "Warning" not in result.stdout
 
 
-class TestForceCompleteCompatibility:
-    """Backward compatibility tests for deprecated force-complete command."""
+class TestForceCompleteRemoval:
+    """Tests for removed force-complete command."""
 
-    def test_force_complete_shows_deprecation_and_uses_force_mode(self, tmp_path: Path):
-        """force-complete remains supported with deprecation messaging."""
-        from gza.db import SqliteTaskStore
-
+    def test_force_complete_is_not_a_valid_command(self, tmp_path: Path):
+        """force-complete command is removed and rejected by CLI parsing."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "Failed task", "status": "failed", "task_type": "implement"},
         ])
 
         result = run_gza("force-complete", "1", "--project", str(tmp_path))
 
-        assert result.returncode == 0
-        assert "deprecated" in result.stdout
-        assert "mark-completed <task_id> --force" in result.stdout
-        assert "status-only" in result.stdout
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-        updated = store.get(1)
-        assert updated is not None
-        assert updated.status == "completed"
+        assert result.returncode != 0
+        assert "invalid choice" in result.stderr
+        assert "force-complete" in result.stderr
 
 
 class TestMergeStatusTracking:

@@ -3082,8 +3082,6 @@ def cmd_ps(args: argparse.Namespace) -> int:
         for row in rows:
             if row["worker_id"] != "-":
                 print(row["worker_id"])
-            elif row["task_id"] is not None:
-                print(f"db:{row['task_id']}")
         return 0
 
     if hasattr(args, "json") and args.json:
@@ -3416,14 +3414,6 @@ def cmd_retry(args: argparse.Namespace) -> int:
     # Default: run the new task immediately
     print(f"\nRunning task #{new_task.id}...")
     return run(config, task_id=new_task.id)
-
-
-def cmd_force_complete(args: argparse.Namespace) -> int:
-    """Deprecated alias for mark-completed --force."""
-    print("Warning: 'force-complete' is deprecated. Use 'mark-completed <task_id> --force' instead.")
-    args.force = True
-    args.verify_git = False
-    return cmd_mark_completed(args)
 
 
 def _default_mark_completed_mode(task_type: str) -> str:
@@ -5181,18 +5171,6 @@ def main() -> int:
     )
     add_common_args(stop_parser)
 
-    # force-complete command (deprecated alias)
-    force_complete_parser = subparsers.add_parser(
-        "force-complete",
-        help=argparse.SUPPRESS,
-    )
-    force_complete_parser.add_argument(
-        "task_id",
-        type=int,
-        help=argparse.SUPPRESS,
-    )
-    add_common_args(force_complete_parser)
-
     # mark-completed command
     mark_completed_parser = subparsers.add_parser(
         "mark-completed",
@@ -5294,8 +5272,6 @@ def main() -> int:
             return cmd_ps(args)
         elif args.command == "stop":
             return cmd_stop(args)
-        elif args.command == "force-complete":
-            return cmd_force_complete(args)
         elif args.command == "mark-completed":
             return cmd_mark_completed(args)
         elif args.command == "learnings":
