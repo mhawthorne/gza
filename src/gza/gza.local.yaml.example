@@ -1,0 +1,17 @@
+# Local machine-only overrides for gza.yaml.
+# This file should stay uncommitted (add gza.local.yaml to .gitignore).
+
+# Examples:
+# use_docker: false
+# timeout_minutes: 30
+# provider: codex
+# model: o4-mini
+# docker_volumes:
+#   - ~/datasets:/datasets:ro
+
+# Nested sections are deep-merged over gza.yaml:
+# providers:
+#   claude:
+#     task_types:
+#       review:
+#         model: claude-haiku-4-5

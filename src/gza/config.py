@@ -1,5 +1,6 @@
 """Configuration for Gza."""
 
+import copy
 import os
 import sys
 import warnings
@@ -10,6 +11,7 @@ import yaml
 
 APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
+LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
 
 
 class ConfigError(Exception):
@@ -35,6 +37,51 @@ DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
 DEFAULT_CLAUDE_ARGS = [
     "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash",
 ]
+LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
+    "use_docker": None,
+    "docker_image": None,
+    "docker_volumes": None,
+    "docker_setup_command": None,
+    "timeout_minutes": None,
+    "max_steps": None,
+    "max_turns": None,
+    "worktree_dir": None,
+    "work_count": None,
+    "provider": None,
+    "model": None,
+    "defaults": {
+        "model": None,
+        "max_steps": None,
+        "max_turns": None,
+    },
+    "task_types": {
+        "*": {
+            "model": None,
+            "max_steps": None,
+            "max_turns": None,
+        },
+    },
+    "providers": {
+        "*": {
+            "model": None,
+            "task_types": {
+                "*": {
+                    "model": None,
+                    "max_steps": None,
+                    "max_turns": None,
+                },
+            },
+        },
+    },
+    "claude": {
+        "fetch_auth_token_from_keychain": None,
+        "args": None,
+    },
+    "chat_text_display_length": None,
+    "verify_command": None,
+}
+
+_LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
 
 
 def _detect_model_provider_family(model: str) -> str | None:
@@ -66,6 +113,69 @@ def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
         f"'{path}' model '{model}' appears incompatible with provider '{provider}'. "
         f"Use a model for '{provider}' or change provider."
     )
+
+
+def _read_yaml_dict(path: Path) -> dict:
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"Configuration in {path} must be a YAML dictionary/object")
+    return data
+
+
+def _remove_source_subtree(source_map: dict[str, str], prefix: str) -> None:
+    keys_to_delete = [key for key in source_map if key == prefix or key.startswith(f"{prefix}.")]
+    for key in keys_to_delete:
+        del source_map[key]
+
+
+def _record_leaf_sources(data: dict, source: str, source_map: dict[str, str], path_prefix: str = "") -> None:
+    for key, value in data.items():
+        path = f"{path_prefix}.{key}" if path_prefix else key
+        if isinstance(value, dict):
+            _record_leaf_sources(value, source, source_map, path)
+        else:
+            source_map[path] = source
+
+
+def _deep_merge_dicts(base: dict, override: dict, source_map: dict[str, str], path_prefix: str = "") -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        path = f"{path_prefix}.{key}" if path_prefix else key
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value, source_map, path)
+            continue
+
+        merged[key] = copy.deepcopy(value)
+        _remove_source_subtree(source_map, path)
+        if isinstance(value, dict):
+            _record_leaf_sources(value, "local", source_map, path)
+        else:
+            source_map[path] = "local"
+    return merged
+
+
+def _validate_local_override_data(data: dict, schema: dict[str, object], path_prefix: str = "") -> None:
+    for key, value in data.items():
+        path = f"{path_prefix}.{key}" if path_prefix else key
+        allowed = schema.get(key, schema.get("*"))
+        if allowed is None and key not in schema and "*" not in schema:
+            raise ConfigError(
+                f"Invalid local override key '{path}' in {LOCAL_CONFIG_FILENAME}. "
+                "Only approved machine-local settings may be overridden."
+            )
+        if isinstance(allowed, dict):
+            if not isinstance(value, dict):
+                raise ConfigError(
+                    f"Invalid local override value for '{path}' in {LOCAL_CONFIG_FILENAME}: "
+                    "expected a dictionary."
+                )
+            _validate_local_override_data(value, allowed, path)
+        elif isinstance(value, dict):
+            raise ConfigError(
+                f"Invalid local override value for '{path}' in {LOCAL_CONFIG_FILENAME}: "
+                "nested object is not allowed here."
+            )
 
 
 @dataclass
@@ -149,6 +259,9 @@ class Config:
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
     docker_setup_command: str = ""  # Command to run inside container before CLI starts
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
+    source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
+    local_override_path: Path | None = None
+    local_overrides_active: bool = False
 
     def __post_init__(self):
         if not self.docker_image:
@@ -273,11 +386,13 @@ class Config:
         return project_dir / CONFIG_FILENAME
 
     @classmethod
-    def load(cls, project_dir: Path) -> "Config":
-        """Load config from gza.yaml in project root.
+    def local_config_path(cls, project_dir: Path) -> Path:
+        """Get the path to the local override config file."""
+        return project_dir / LOCAL_CONFIG_FILENAME
 
-        Raises ConfigError if config file is missing or project_name is not set.
-        """
+    @classmethod
+    def _load_merged_config_data(cls, project_dir: Path) -> tuple[dict, dict[str, str], Path | None, bool]:
+        """Load base/local config layers with deep-merge and source attribution."""
         config_path = cls.config_path(project_dir)
 
         if not config_path.exists():
@@ -286,8 +401,39 @@ class Config:
                 f"Run 'gza init' to create one."
             )
 
-        with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
+        base_data = _read_yaml_dict(config_path)
+        source_map: dict[str, str] = {}
+        _record_leaf_sources(base_data, "base", source_map)
+
+        local_path = cls.local_config_path(project_dir)
+        local_active = False
+        merged_data = copy.deepcopy(base_data)
+        if local_path.exists():
+            local_data = _read_yaml_dict(local_path)
+            if local_data:
+                _validate_local_override_data(local_data, LOCAL_OVERRIDE_ALLOWED_SCHEMA)
+                merged_data = _deep_merge_dicts(merged_data, local_data, source_map)
+                local_active = True
+
+        return merged_data, source_map, (local_path if local_path.exists() else None), local_active
+
+    @classmethod
+    def load(cls, project_dir: Path) -> "Config":
+        """Load config from gza.yaml in project root.
+
+        Raises ConfigError if config file is missing or project_name is not set.
+        """
+        config_path = cls.config_path(project_dir)
+        data, source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
+
+        if local_overrides_active and local_override_path:
+            project_key = str(project_dir.resolve())
+            if project_key not in _LOCAL_OVERRIDE_NOTICE_SHOWN:
+                print(
+                    f"Notice: local config overrides active from {local_override_path.name}",
+                    file=sys.stderr,
+                )
+                _LOCAL_OVERRIDE_NOTICE_SHOWN.add(project_key)
 
         # Validate and warn about unknown keys
         valid_fields = {
@@ -316,15 +462,18 @@ class Config:
         env_use_docker = os.getenv("GZA_USE_DOCKER")
         if env_use_docker:
             use_docker = env_use_docker.lower() != "false"
+            source_map["use_docker"] = "env"
 
         timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
         env_timeout = os.getenv("GZA_TIMEOUT_MINUTES")
         if env_timeout:
             timeout_minutes = int(env_timeout)
+            source_map["timeout_minutes"] = "env"
 
         branch_mode = data.get("branch_mode", DEFAULT_BRANCH_MODE)
         if os.getenv("GZA_BRANCH_MODE"):
             branch_mode = os.getenv("GZA_BRANCH_MODE")
+            source_map["branch_mode"] = "env"
 
         # max_steps (canonical): check defaults section first, then top-level
         max_steps = defaults.get("max_steps")
@@ -333,6 +482,7 @@ class Config:
         env_max_steps = os.getenv("GZA_MAX_STEPS")
         if env_max_steps:
             max_steps = int(env_max_steps)
+            source_map["max_steps"] = "env"
 
         # max_turns (legacy fallback): check defaults section first, then top-level
         max_turns = defaults.get("max_turns")
@@ -341,6 +491,7 @@ class Config:
         env_max_turns = os.getenv("GZA_MAX_TURNS")
         if env_max_turns:
             max_turns = int(env_max_turns)
+            source_map["max_turns"] = "env"
 
         # Migration behavior: if max_steps isn't set, fall back to max_turns with warning.
         if max_steps is None:
@@ -361,25 +512,30 @@ class Config:
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
         if os.getenv("GZA_WORKTREE_DIR"):
             worktree_dir = os.getenv("GZA_WORKTREE_DIR")
+            source_map["worktree_dir"] = "env"
 
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
         env_work_count = os.getenv("GZA_WORK_COUNT")
         if env_work_count:
             work_count = int(env_work_count)
+            source_map["work_count"] = "env"
 
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
         env_chat_text_display_length = os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH")
         if env_chat_text_display_length:
             chat_text_display_length = int(env_chat_text_display_length)
+            source_map["chat_text_display_length"] = "env"
 
         provider = data.get("provider", DEFAULT_PROVIDER)
         if os.getenv("GZA_PROVIDER"):
             provider = os.getenv("GZA_PROVIDER")
+            source_map["provider"] = "env"
 
         # model: check defaults section first, then top-level
         model = defaults.get("model") or data.get("model", "")
         if os.getenv("GZA_MODEL"):
             model = os.getenv("GZA_MODEL")
+            source_map["model"] = "env"
 
         # docker_volumes: can be overridden by environment variable
         docker_volumes = data.get("docker_volumes", [])
@@ -387,6 +543,7 @@ class Config:
         if env_docker_volumes:
             # Parse comma-separated volumes
             docker_volumes = [v.strip() for v in env_docker_volumes.split(",") if v.strip()]
+            source_map["docker_volumes"] = "env"
 
         # Expand tilde in volume paths
         expanded_volumes = []
@@ -642,6 +799,35 @@ class Config:
                     stacklevel=2,
                 )
                 claude_config.args = data["claude_args"]
+                source_map["claude.args"] = source_map.get("claude_args", "base")
+
+        # Resolve source for fields that may come from defaults.* fallback.
+        if "max_steps" not in source_map:
+            if defaults.get("max_steps") is not None:
+                source_map["max_steps"] = source_map.get("defaults.max_steps", "base")
+            elif data.get("max_steps") is not None:
+                source_map["max_steps"] = source_map.get("max_steps", "base")
+            elif max_turns is not None:
+                if env_max_turns:
+                    source_map["max_steps"] = "env"
+                elif defaults.get("max_turns") is not None:
+                    source_map["max_steps"] = source_map.get("defaults.max_turns", "base")
+                elif data.get("max_turns") is not None:
+                    source_map["max_steps"] = source_map.get("max_turns", "base")
+
+        if "max_turns" not in source_map:
+            if env_max_turns:
+                source_map["max_turns"] = "env"
+            elif defaults.get("max_turns") is not None:
+                source_map["max_turns"] = source_map.get("defaults.max_turns", "base")
+            elif data.get("max_turns") is not None:
+                source_map["max_turns"] = source_map.get("max_turns", "base")
+
+        if "model" not in source_map and model:
+            if defaults.get("model"):
+                source_map["model"] = source_map.get("defaults.model", "base")
+            elif data.get("model"):
+                source_map["model"] = source_map.get("model", "base")
 
         return cls(
             project_dir=project_dir,
@@ -666,6 +852,9 @@ class Config:
             branch_strategy=branch_strategy,
             chat_text_display_length=chat_text_display_length,
             verify_command=data.get("verify_command", ""),
+            source_map=source_map,
+            local_override_path=local_override_path,
+            local_overrides_active=local_overrides_active,
         )
 
     @classmethod
@@ -684,26 +873,21 @@ class Config:
             errors.append(f"Configuration file not found: {config_path}")
             return False, errors, warnings
 
-        # Try to parse YAML
+        # Try to parse and merge YAML config layers
         try:
-            with open(config_path) as f:
-                data = yaml.safe_load(f)
+            data, _source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
         except yaml.YAMLError as e:
             errors.append(f"Invalid YAML syntax: {e}")
+            return False, errors, warnings
+        except ConfigError as e:
+            errors.append(str(e))
             return False, errors, warnings
         except Exception as e:
             errors.append(f"Error reading file: {e}")
             return False, errors, warnings
 
-        # If empty file, project_name is required
-        if data is None:
-            errors.append("'project_name' is required")
-            return False, errors, warnings
-
-        # Check if it's a dict
-        if not isinstance(data, dict):
-            errors.append("Configuration must be a YAML dictionary/object")
-            return False, errors, warnings
+        if local_overrides_active and local_override_path:
+            warnings.append(f"Local overrides active: {local_override_path.name}")
 
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {

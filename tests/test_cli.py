@@ -1035,6 +1035,141 @@ class TestDockerSetupCommandValidation:
         assert result.returncode == 0
 
 
+class TestLocalConfigOverrides:
+    """Tests for gza.local.yaml local override behavior."""
+
+    def test_local_overrides_deep_merge_nested_config(self, tmp_path: Path):
+        """Local overrides should deep-merge dictionaries over gza.yaml."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-base\n"
+            "        max_steps: 20\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: claude-local\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        review_cfg = config.providers["claude"].task_types["review"]
+        assert review_cfg.model == "claude-local"
+        assert review_cfg.max_steps == 20
+        assert config.local_overrides_active is True
+        assert config.source_map["providers.claude.task_types.review.model"] == "local"
+        assert config.source_map["providers.claude.task_types.review.max_steps"] == "base"
+
+    def test_env_vars_take_precedence_over_local_overrides(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Environment variables should override local and base config values."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "use_docker: true\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "use_docker: false\n"
+        )
+        monkeypatch.setenv("GZA_USE_DOCKER", "true")
+
+        config = Config.load(tmp_path)
+
+        assert config.use_docker is True
+        assert config.source_map["use_docker"] == "env"
+
+    def test_local_override_guardrails_reject_disallowed_keys(self, tmp_path: Path):
+        """Local overrides should reject disallowed keys like project_name."""
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
+
+        with pytest.raises(ConfigError, match="Invalid local override key 'project_name'"):
+            Config.load(tmp_path)
+
+    def test_validate_fails_for_invalid_local_override_key(self, tmp_path: Path):
+        """gza validate should fail when local override contains disallowed keys."""
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Invalid local override key 'project_name'" in result.stdout
+
+    def test_notice_printed_when_local_overrides_active(self, tmp_path: Path):
+        """Commands should print a startup notice when local overrides are active."""
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("use_docker: false\n")
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Notice: local config overrides active from gza.local.yaml" in result.stderr
+
+    def test_config_command_shows_effective_values_with_sources(self, tmp_path: Path):
+        """gza config --json should include effective values and source attribution."""
+        import json
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "timeout_minutes: 10\n"
+            "use_docker: true\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "use_docker: false\n"
+        )
+
+        env = os.environ.copy()
+        env["GZA_TIMEOUT_MINUTES"] = "99"
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["timeout_minutes"] == 99
+        assert payload["effective"]["use_docker"] is False
+        assert payload["sources"]["timeout_minutes"] == "env"
+        assert payload["sources"]["use_docker"] == "local"
+        assert payload["local_overrides_active"] is True
+        assert payload["local_override_file"] == "gza.local.yaml"
+
+    def test_config_command_projects_source_for_branch_strategy_preset(self, tmp_path: Path):
+        """gza config should attribute normalized branch_strategy fields to configured source."""
+        import json
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "branch_strategy: conventional\n"
+        )
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["branch_strategy"]["pattern"] == "{type}/{slug}"
+        assert payload["effective"]["branch_strategy"]["default_type"] == "feature"
+        assert payload["sources"]["branch_strategy.pattern"] == "base"
+        assert payload["sources"]["branch_strategy.default_type"] == "base"
+
+
 class TestInitCommand:
     """Tests for 'gza init' command."""
 
@@ -1044,7 +1179,9 @@ class TestInitCommand:
 
         assert result.returncode == 0
         config_path = tmp_path / "gza.yaml"
+        local_example_path = tmp_path / "gza.local.yaml.example"
         assert config_path.exists()
+        assert local_example_path.exists()
 
         # Verify project_name is set (derived from directory name)
         content = config_path.read_text()
@@ -1067,6 +1204,8 @@ class TestInitCommand:
     def test_init_force_overwrites(self, tmp_path: Path):
         """Init command overwrites existing config with --force."""
         setup_config(tmp_path, project_name="original")
+        local_example_path = tmp_path / "gza.local.yaml.example"
+        local_example_path.write_text("# stale local example\n")
 
         result = run_gza("init", "--force", "--project", str(tmp_path))
 
@@ -1076,6 +1215,8 @@ class TestInitCommand:
         config_path = tmp_path / "gza.yaml"
         content = config_path.read_text()
         assert tmp_path.name in content
+        assert local_example_path.exists()
+        assert "# stale local example" not in local_example_path.read_text()
 
 
 class TestImportCommand:
@@ -5944,6 +6085,123 @@ This requires team discussion.
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
+
+    def test_unmerged_uses_older_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+        """Unmerged scans newest-to-oldest and uses first parseable review verdict."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.depends_on = task.id
+        older_review.task_id = "20260212-older-review"
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        time.sleep(0.01)
+
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.depends_on = task.id
+        latest_review.task_id = "20260212-latest-review"
+        latest_review.output_content = None
+        latest_review.report_file = None
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" in result.stdout
+
+    def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+        """Staleness via review_cleared_at still suppresses older verdicts."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.depends_on = task.id
+        older_review.task_id = "20260212-older-review"
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        time.sleep(0.01)
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        time.sleep(0.01)
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.depends_on = task.id
+        latest_review.task_id = "20260212-latest-review"
+        latest_review.output_content = None
+        latest_review.report_file = None
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" not in result.stdout
 
     def test_unmerged_falls_back_to_unlinked_review_slug_match(self, tmp_path: Path):
         """Unmerged should infer review status from unlinked 'review <slug>' tasks."""

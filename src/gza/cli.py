@@ -822,25 +822,29 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         review_status_color = None
         reviews = _get_reviews_for_root_task(store, root_task)
         if reviews:
-            # Get the most recent review (first in the list, as they're ordered by created_at DESC)
-            latest_review = reviews[0]
-            # If an improve task has run after this review, the review is stale — skip it.
-            review_cleared = (
-                root_task.review_cleared_at is not None
-                and latest_review.completed_at is not None
-                and root_task.review_cleared_at >= latest_review.completed_at
-            )
-            if not review_cleared:
-                verdict = get_review_verdict(config, latest_review)
+            # Reviews are ordered newest-to-oldest. Select the first non-stale parseable verdict.
+            for review in reviews:
+                review_cleared = (
+                    root_task.review_cleared_at is not None
+                    and review.completed_at is not None
+                    and root_task.review_cleared_at >= review.completed_at
+                )
+                if review_cleared:
+                    continue
+
+                verdict = get_review_verdict(config, review)
                 if verdict == "APPROVED":
                     review_status = "✓ approved"
                     review_status_color = UNMERGED_COLORS["review_approved"]
-                elif verdict == "CHANGES_REQUESTED":
+                    break
+                if verdict == "CHANGES_REQUESTED":
                     review_status = "⚠ changes requested"
                     review_status_color = UNMERGED_COLORS["review_changes"]
-                elif verdict == "NEEDS_DISCUSSION":
+                    break
+                if verdict == "NEEDS_DISCUSSION":
                     review_status = "💬 needs discussion"
                     review_status_color = UNMERGED_COLORS["review_discussion"]
+                    break
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
@@ -1786,6 +1790,129 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
 
+def _config_to_effective_dict(config: Config) -> dict:
+    """Build an effective configuration dict from a loaded Config object."""
+    return {
+        "project_name": config.project_name,
+        "tasks_file": config.tasks_file,
+        "log_dir": config.log_dir,
+        "use_docker": config.use_docker,
+        "docker_image": config.docker_image,
+        "docker_volumes": config.docker_volumes,
+        "docker_setup_command": config.docker_setup_command,
+        "timeout_minutes": config.timeout_minutes,
+        "branch_mode": config.branch_mode,
+        "max_steps": config.max_steps,
+        "max_turns": config.max_turns,
+        "worktree_dir": config.worktree_dir,
+        "work_count": config.work_count,
+        "provider": config.provider,
+        "model": config.model,
+        "chat_text_display_length": config.chat_text_display_length,
+        "verify_command": config.verify_command,
+        "claude": {
+            "fetch_auth_token_from_keychain": config.claude.fetch_auth_token_from_keychain,
+            "args": config.claude.args,
+        },
+        "task_types": {
+            task_type: {
+                "model": task_cfg.model,
+                "max_steps": task_cfg.max_steps,
+                "max_turns": task_cfg.max_turns,
+            }
+            for task_type, task_cfg in config.task_types.items()
+        },
+        "providers": {
+            provider_name: {
+                "model": provider_cfg.model,
+                "task_types": {
+                    task_type: {
+                        "model": task_cfg.model,
+                        "max_steps": task_cfg.max_steps,
+                        "max_turns": task_cfg.max_turns,
+                    }
+                    for task_type, task_cfg in provider_cfg.task_types.items()
+                },
+            }
+            for provider_name, provider_cfg in config.providers.items()
+        },
+        "branch_strategy": {
+            "pattern": config.branch_strategy.pattern if config.branch_strategy else None,
+            "default_type": config.branch_strategy.default_type if config.branch_strategy else None,
+        },
+    }
+
+
+def _flatten_dict(data: dict, prefix: str = "") -> list[tuple[str, object]]:
+    """Flatten nested dictionaries into dotted key paths."""
+    flattened: list[tuple[str, object]] = []
+    for key, value in data.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            flattened.extend(_flatten_dict(value, path))
+        else:
+            flattened.append((path, value))
+    return flattened
+
+
+def _resolve_source_for_effective_path(path: str, source_map: dict[str, str]) -> str:
+    """Resolve source attribution for an effective config path.
+
+    Effective output can contain normalized/derived leaf keys (for example
+    ``branch_strategy.pattern``), while ``source_map`` may only track the
+    originating parent key (for example ``branch_strategy``).
+    """
+    if path in source_map:
+        return source_map[path]
+
+    parent = path
+    while "." in parent:
+        parent = parent.rsplit(".", 1)[0]
+        if parent in source_map:
+            return source_map[parent]
+
+    return "default"
+
+
+def _project_effective_source_map(effective: dict, source_map: dict[str, str]) -> dict[str, str]:
+    """Project raw source_map keys onto effective config paths."""
+    projected: dict[str, str] = {}
+    for path, _value in _flatten_dict(effective):
+        projected[path] = _resolve_source_for_effective_path(path, source_map)
+    return projected
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show effective config with source attribution."""
+    config = Config.load(args.project_dir)
+    effective = _config_to_effective_dict(config)
+    effective_sources = _project_effective_source_map(effective, config.source_map)
+
+    if args.json:
+        payload = {
+            "effective": effective,
+            "sources": effective_sources,
+            "local_overrides_active": config.local_overrides_active,
+            "local_override_file": (
+                config.local_override_path.name if config.local_override_path else None
+            ),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    print("Effective Configuration")
+    print("=" * 50)
+    if config.local_overrides_active and config.local_override_path:
+        print(f"Local overrides: active ({config.local_override_path.name})")
+    else:
+        print("Local overrides: inactive")
+    print()
+    for path, value in sorted(_flatten_dict(effective), key=lambda item: item[0]):
+        source = effective_sources.get(path, "default")
+        print(f"{path} = {json.dumps(value)} [{source}]")
+    return 0
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     """Clean up stale worktrees, old logs, and stale worker metadata."""
     from datetime import timedelta
@@ -2139,7 +2266,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     """Generate a new gza.yaml configuration file with defaults."""
     import importlib.resources
 
-    from .config import CONFIG_FILENAME
+    from .config import CONFIG_FILENAME, LOCAL_CONFIG_FILENAME
 
     # Derive project name from directory name
     default_project_name = args.project_dir.name
@@ -2211,6 +2338,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     config_path.write_text(config_content)
     print(f"✓ Created {config_path}")
+
+    local_example_path = args.project_dir / f"{LOCAL_CONFIG_FILENAME}.example"
+    if not local_example_path.exists() or args.force:
+        local_template = importlib.resources.files("gza").joinpath("gza.local.yaml.example").read_text()
+        local_example_path.write_text(local_template)
+        print(f"✓ Created {local_example_path}")
 
     # Initialize the database (Config.load will now work since we have project_name)
     config = Config.load(args.project_dir)
@@ -3167,7 +3300,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
     status = "unknown"
     if source == "db":
         status = "in_progress"
-    elif source == "worker":
+    elif source == "worker" and worker is not None:
         status = worker.status
     elif worker is not None:
         if worker.status in ("completed", "failed", "stale"):
@@ -4658,6 +4791,15 @@ def main() -> int:
     validate_parser = subparsers.add_parser("validate", help="Validate gza.yaml configuration")
     add_common_args(validate_parser)
 
+    # config command
+    config_parser = subparsers.add_parser("config", help="Show effective config with source attribution")
+    config_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output effective config and source attribution as JSON",
+    )
+    add_common_args(config_parser)
+
     # cleanup command
     cleanup_parser = subparsers.add_parser("cleanup", help="Clean up stale worktrees, old logs, and worker metadata")
     cleanup_parser.add_argument(
@@ -5238,6 +5380,8 @@ def main() -> int:
             return cmd_stats(args)
         elif args.command == "validate":
             return cmd_validate(args)
+        elif args.command == "config":
+            return cmd_config(args)
         elif args.command == "cleanup":
             return cmd_cleanup(args)
         elif args.command == "clean":
