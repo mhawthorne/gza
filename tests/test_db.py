@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from gza.db import SqliteTaskStore, Task
+from gza.db import SqliteTaskStore, StepRef, Task
 
 
 class TestTaskChaining:
@@ -407,7 +407,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -517,7 +517,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -702,7 +702,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -887,7 +887,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1222,7 +1222,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1687,7 +1687,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1858,7 +1858,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1938,7 +1938,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2467,9 +2467,209 @@ class TestStepColumnsMigration:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 15
+        assert version == 16
 
         migrated = store.get(1)
         assert migrated is not None
         assert migrated.num_steps_reported == 4
         assert migrated.num_steps_computed == 3
+
+
+class TestRunStepPersistence:
+    """Tests for run_steps/run_substeps schema and writer APIs."""
+
+    def test_migration_v15_to_v16_adds_run_step_tables(self, tmp_path: Path):
+        """v15 databases should be migrated to include run_steps/run_substeps tables."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        del store
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE run_substeps")
+        conn.execute("DROP TABLE run_steps")
+        conn.execute("UPDATE schema_version SET version = 15")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path)
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        assert version == 16
+
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('run_steps', 'run_substeps')"
+        )
+        tables = {row[0] for row in cur.fetchall()}
+        conn.close()
+        assert tables == {"run_steps", "run_substeps"}
+
+    def test_emit_step_emit_substep_finalize_step_persists_records(self, tmp_path: Path):
+        """Writer APIs should persist ordered step/substep data with compatibility metadata."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task for step persistence")
+        assert task.id is not None
+
+        step_ref = store.emit_step(
+            task.id,
+            "I am running tests",
+            provider="codex",
+            legacy_turn_id="T1",
+            legacy_event_id="T1.1",
+        )
+        first = store.emit_substep(
+            step_ref,
+            "tool_call",
+            {"tool": "Bash", "command": "rg -n test"},
+            source="provider",
+            call_id="call-1",
+            legacy_turn_id="T1",
+            legacy_event_id="T1.2",
+        )
+        second = store.emit_substep(
+            step_ref,
+            "tool_output",
+            {"exit_code": 0, "stdout": "ok"},
+            source="tool",
+            call_id="call-1",
+            legacy_turn_id="T1",
+            legacy_event_id="T1.3",
+        )
+        store.finalize_step(step_ref, "completed", "Tests finished")
+
+        steps = store.get_run_steps(task.id)
+        assert len(steps) == 1
+        step = steps[0]
+        assert step.step_index == 1
+        assert step.step_id == "S1"
+        assert step.provider == "codex"
+        assert step.message_text == "I am running tests"
+        assert step.outcome == "completed"
+        assert step.summary == "Tests finished"
+        assert step.completed_at is not None
+        assert step.legacy_turn_id == "T1"
+        assert step.legacy_event_id == "T1.1"
+
+        substeps = store.get_run_substeps(step_ref)
+        assert len(substeps) == 2
+        assert first.substep_id == "S1.1"
+        assert second.substep_id == "S1.2"
+        assert substeps[0].substep_index == 1
+        assert substeps[0].type == "tool_call"
+        assert substeps[0].payload == {"tool": "Bash", "command": "rg -n test"}
+        assert substeps[0].legacy_turn_id == "T1"
+        assert substeps[0].legacy_event_id == "T1.2"
+        assert substeps[1].substep_index == 2
+        assert substeps[1].type == "tool_output"
+        assert substeps[1].payload == {"exit_code": 0, "stdout": "ok"}
+        assert substeps[1].legacy_turn_id == "T1"
+        assert substeps[1].legacy_event_id == "T1.3"
+
+    def test_step_and_substep_indices_are_scoped(self, tmp_path: Path):
+        """Step indices should increment per run and substeps should increment per parent step."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        run_a = store.add("Run A")
+        run_b = store.add("Run B")
+        assert run_a.id is not None
+        assert run_b.id is not None
+
+        step_a1 = store.emit_step(run_a.id, "A1", provider="claude")
+        step_a2 = store.emit_step(run_a.id, "A2", provider="claude")
+        step_b1 = store.emit_step(run_b.id, "B1", provider="claude")
+
+        sub_a1 = store.emit_substep(step_a1, "status_update", {"msg": "one"}, source="runner")
+        sub_a2 = store.emit_substep(step_a1, "status_update", {"msg": "two"}, source="runner")
+        sub_b1 = store.emit_substep(step_a2, "status_update", {"msg": "three"}, source="runner")
+
+        assert step_a1.step_id == "S1"
+        assert step_a2.step_id == "S2"
+        assert step_b1.step_id == "S1"
+        assert sub_a1.substep_id == "S1.1"
+        assert sub_a2.substep_id == "S1.2"
+        assert sub_b1.substep_id == "S2.1"
+
+    def test_emit_substep_rejects_invalid_step_ref(self, tmp_path: Path):
+        """emit_substep should fail for unknown step references."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.id is not None
+
+        invalid = StepRef(id=999, run_id=task.id, step_index=1, step_id="S1")
+        with pytest.raises(ValueError, match="Unknown step reference"):
+            store.emit_substep(invalid, "tool_call", {"tool": "Bash"}, source="provider")
+
+    def test_finalize_step_rejects_tampered_step_ref(self, tmp_path: Path):
+        """finalize_step should reject mismatched StepRef metadata."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.id is not None
+        step_ref = store.emit_step(task.id, "hello", provider="claude")
+
+        tampered = StepRef(
+            id=step_ref.id,
+            run_id=step_ref.run_id,
+            step_index=step_ref.step_index,
+            step_id="S999",
+        )
+        with pytest.raises(ValueError, match="Step reference label mismatch"):
+            store.finalize_step(tampered, "completed")
+
+    def test_get_run_substeps_rejects_tampered_step_ref(self, tmp_path: Path):
+        """get_run_substeps should reject mismatched StepRef metadata."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.id is not None
+        step_ref = store.emit_step(task.id, "hello", provider="claude")
+        store.emit_substep(step_ref, "tool_call", {"tool": "Bash"}, source="provider")
+
+        tampered = StepRef(
+            id=step_ref.id,
+            run_id=step_ref.run_id,
+            step_index=999,
+            step_id=step_ref.step_id,
+        )
+        with pytest.raises(ValueError, match="Step reference index mismatch"):
+            store.get_run_substeps(tampered)
+
+    def test_migration_v15_to_v16_is_idempotent(self, tmp_path: Path):
+        """Running v15->v16 migration twice should not duplicate indexes/tables."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        del store
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE run_substeps")
+        conn.execute("DROP TABLE run_steps")
+        conn.execute("UPDATE schema_version SET version = 15")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path)
+        SqliteTaskStore(db_path)
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='index'
+              AND name IN (
+                'idx_run_steps_run_id',
+                'idx_run_steps_step_index',
+                'idx_run_substeps_run_id',
+                'idx_run_substeps_step_id'
+              )
+            """
+        )
+        indexes = sorted(row[0] for row in cur.fetchall())
+        conn.close()
+        assert indexes == [
+            "idx_run_steps_run_id",
+            "idx_run_steps_step_index",
+            "idx_run_substeps_run_id",
+            "idx_run_substeps_step_id",
+        ]

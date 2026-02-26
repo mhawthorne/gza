@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .base import (
     Provider,
@@ -285,14 +285,47 @@ class CodexProvider(Provider):
         """Run command and parse Codex's JSON output."""
         formatter = StreamOutputFormatter()
 
+        def _ensure_step_store(data: dict) -> None:
+            if "run_step_events" not in data:
+                data["run_step_events"] = []
+                data["_current_step_event"] = None
+
+        def _step_count(data: dict) -> int:
+            return len(data.get("run_step_events", []))
+
+        def _current_turn_id(data: dict) -> str | None:
+            turn_count = int(data.get("turn_count", 0))
+            return f"T{turn_count}" if turn_count > 0 else None
+
+        def _maybe_mark_max_steps_exceeded(data: dict) -> None:
+            if _step_count(data) > max_steps:
+                data["exceeded_max_steps"] = True
+                data["__terminate_process__"] = True
+
+        def _start_step(data: dict, message_text: str | None, legacy_turn_id: str | None) -> dict:
+            _ensure_step_store(data)
+            event: dict[str, Any] = {
+                "message_role": "assistant",
+                "message_text": message_text,
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": None,
+                "substeps": [],
+                "outcome": "completed",
+                "summary": None,
+            }
+            data["run_step_events"].append(event)
+            data["_current_step_event"] = event
+            return event
+
         def parse_codex_output(line: str, data: dict, log_handle=None) -> None:
             try:
                 if "approx_input_chars" not in data:
                     data["approx_input_chars"] = len(stdin_input or "")
                     data["approx_output_chars"] = 0
                     data["usage_events_seen"] = set()
+                _ensure_step_store(data)
 
-                event = json.loads(line)
+                event: dict[str, Any] = json.loads(line)
                 event_type = event.get("type")
 
                 if event_type == "thread.started":
@@ -308,6 +341,7 @@ class CodexProvider(Provider):
                         data["computed_step_count"] = 0
                     data["turn_count"] += 1
                     data["item_count_in_turn"] = 0
+                    data["_current_step_event"] = None
 
                     # Calculate runtime
                     elapsed_seconds = int(time.time() - data["start_time"])
@@ -331,11 +365,7 @@ class CodexProvider(Provider):
                     item = event.get("item", {})
                     item_type = item.get("type")
                     data["item_count"] = data.get("item_count", 0) + 1
-                    data["computed_step_count"] = data.get("computed_step_count", 0) + 1
                     data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
-                    if data["computed_step_count"] > max_steps:
-                        data["exceeded_max_steps"] = True
-                        data["__terminate_process__"] = True
                     turn_count = data.get("turn_count", 0)
                     item_idx = data.get("item_count_in_turn", 0)
                     item_prefix = f"[T{turn_count}.{item_idx}] " if turn_count > 0 else ""
@@ -344,6 +374,23 @@ class CodexProvider(Provider):
                         command = item.get("command", "")
                         aggregated_output = item.get("aggregated_output", "")
                         data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(command) + len(aggregated_output)
+                        current_step = data.get("_current_step_event")
+                        legacy_turn_id = _current_turn_id(data)
+                        if current_step is None:
+                            current_step = _start_step(data, None, legacy_turn_id)
+                            _maybe_mark_max_steps_exceeded(data)
+                        current_step["substeps"].append(
+                            {
+                                "type": "command_execution",
+                                "source": "provider",
+                                "call_id": item.get("id"),
+                                "payload": {
+                                    "command": command,
+                                    "aggregated_output": aggregated_output,
+                                },
+                                "legacy_turn_id": legacy_turn_id,
+                            }
+                        )
                         # Truncate to 80 chars
                         command = truncate_text(command, 80)
                         formatter.print_tool_event("Bash", command, prefix=f"  {item_prefix}")
@@ -352,6 +399,17 @@ class CodexProvider(Provider):
                         data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
                         raw_text = item.get("text", "")
                         data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(raw_text)
+                        legacy_turn_id = _current_turn_id(data)
+                        current_step = data.get("_current_step_event")
+                        if (
+                            current_step is not None
+                            and current_step.get("legacy_turn_id") == legacy_turn_id
+                            and not current_step.get("message_text")
+                        ):
+                            current_step["message_text"] = raw_text.strip() or None
+                        else:
+                            _start_step(data, raw_text.strip() or None, legacy_turn_id)
+                            _maybe_mark_max_steps_exceeded(data)
                         text = item.get("text", "").strip()
                         if text:
                             # Truncate to first line and 80 chars
@@ -410,8 +468,7 @@ class CodexProvider(Provider):
                 result.num_turns_reported = accumulated["turn_count"]
             if "computed_turn_count" in accumulated:
                 result.num_turns_computed = accumulated["computed_turn_count"]
-            if "computed_step_count" in accumulated:
-                result.num_steps_computed = accumulated["computed_step_count"]
+            result.num_steps_computed = _step_count(accumulated)
 
             # Set token counts
             if "input_tokens" in accumulated:

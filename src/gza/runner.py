@@ -17,6 +17,50 @@ from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 
 
+def _persist_run_steps_from_result(
+    store: SqliteTaskStore,
+    run_id: int,
+    provider_name: str,
+    result: RunResult,
+) -> None:
+    """Persist provider-emitted step/substep events into run_steps tables."""
+    accumulated = getattr(result, "_accumulated_data", None)
+    if not isinstance(accumulated, dict):
+        return
+    events = accumulated.get("run_step_events")
+    if not isinstance(events, list):
+        return
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        step_ref = store.emit_step(
+            run_id,
+            event.get("message_text"),
+            provider=provider_name,
+            message_role=str(event.get("message_role") or "assistant"),
+            legacy_turn_id=event.get("legacy_turn_id"),
+            legacy_event_id=event.get("legacy_event_id"),
+        )
+        for substep in event.get("substeps", []):
+            if not isinstance(substep, dict):
+                continue
+            store.emit_substep(
+                step_ref,
+                str(substep.get("type") or "event"),
+                substep.get("payload"),
+                source=str(substep.get("source") or "provider"),
+                call_id=substep.get("call_id"),
+                legacy_turn_id=substep.get("legacy_turn_id"),
+                legacy_event_id=substep.get("legacy_event_id"),
+            )
+        store.finalize_step(
+            step_ref,
+            str(event.get("outcome") or "completed"),
+            event.get("summary"),
+        )
+
+
 def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str, int]:
     """Get the effective model, provider, and max_steps for a task.
 
@@ -1037,6 +1081,8 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
+        assert task.id is not None
+        _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
 
         # Store session_id if available
         if result.session_id:
@@ -1309,6 +1355,8 @@ def _run_non_code_task(
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
+        assert task.id is not None
+        _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
 
         # Store session_id if available
         if result.session_id:

@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger(__name__)
 
@@ -295,22 +295,48 @@ class ClaudeProvider(Provider):
         """Run command and parse Claude's stream-json output."""
         formatter = StreamOutputFormatter()
 
+        def _ensure_step_store(data: dict) -> None:
+            if "run_step_events" not in data:
+                data["run_step_events"] = []
+                data["_step_by_msg_id"] = {}
+                data["_current_step_event"] = None
+
+        def _start_step(data: dict, msg_id: str | None, legacy_turn_id: str | None) -> dict:
+            _ensure_step_store(data)
+            event: dict[str, Any] = {
+                "message_role": "assistant",
+                "message_text": None,
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": None,
+                "substeps": [],
+                "outcome": "completed",
+                "summary": None,
+            }
+            data["run_step_events"].append(event)
+            data["_current_step_event"] = event
+            if msg_id:
+                data["_step_by_msg_id"][msg_id] = event
+            return event
+
         def parse_claude_output(line: str, data: dict, log_handle=None) -> None:
             try:
-                event = json.loads(line)
+                event: dict[str, Any] = json.loads(line)
                 event_type = event.get("type")
 
                 if event_type == "assistant":
                     message = event.get("message", {})
                     msg_id = message.get("id")
+                    _ensure_step_store(data)
 
                     # Track unique message IDs as turn proxy
                     if "seen_msg_ids" not in data:
                         data["seen_msg_ids"] = set()
                         data["start_time"] = time.time()
+                    turn_count = len(data["seen_msg_ids"])
                     if msg_id and msg_id not in data["seen_msg_ids"]:
                         data["seen_msg_ids"].add(msg_id)
                         turn_count = len(data["seen_msg_ids"])
+                        _start_step(data, msg_id, f"T{turn_count}")
 
                         # Accumulate token usage for cost estimation
                         usage = message.get("usage", {})
@@ -347,11 +373,27 @@ class ClaudeProvider(Provider):
                             elapsed_seconds,
                             blank_line_before=turn_count > 1,
                         )
+                    current_step = data["_step_by_msg_id"].get(msg_id) if msg_id else data.get("_current_step_event")
+                    if current_step is None:
+                        legacy_turn_id = f"T{turn_count}" if turn_count > 0 else None
+                        current_step = _start_step(data, msg_id, legacy_turn_id)
 
                     for content in message.get("content", []):
                         if content.get("type") == "tool_use":
                             tool_name = content.get("name", "unknown")
                             tool_input = content.get("input", {})
+                            current_step["substeps"].append(
+                                {
+                                    "type": "tool_use",
+                                    "source": "provider",
+                                    "call_id": content.get("id"),
+                                    "payload": {
+                                        "tool_name": tool_name,
+                                        "tool_input": tool_input,
+                                    },
+                                    "legacy_turn_id": current_step.get("legacy_turn_id"),
+                                }
+                            )
 
                             # Extract file path for file-related tools
                             file_path = tool_input.get("file_path") or tool_input.get("path")
@@ -427,6 +469,10 @@ class ClaudeProvider(Provider):
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:
+                                previous = current_step.get("message_text")
+                                current_step["message_text"] = (
+                                    text if not previous else f"{previous}\n{text}"
+                                )
                                 # Display text to console (configurable length, 0 = unlimited)
                                 if chat_text_display_length == 0:
                                     # Show full text

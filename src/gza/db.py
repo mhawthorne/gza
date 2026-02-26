@@ -1,5 +1,6 @@
 """SQLite-based task storage."""
 
+import json
 import os
 import re
 import sqlite3
@@ -8,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 # Known failure reason categories
@@ -85,7 +87,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -154,6 +156,46 @@ CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
 CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
 CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
+
+CREATE TABLE IF NOT EXISTS run_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES tasks(id),
+    step_index INTEGER NOT NULL,
+    step_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    message_role TEXT NOT NULL,
+    message_text TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    outcome TEXT,
+    summary TEXT,
+    legacy_turn_id TEXT,
+    legacy_event_id TEXT,
+    UNIQUE(run_id, step_index),
+    UNIQUE(run_id, step_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_substeps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES tasks(id),
+    step_id INTEGER NOT NULL REFERENCES run_steps(id),
+    substep_index INTEGER NOT NULL,
+    substep_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    call_id TEXT,
+    payload_json TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    legacy_turn_id TEXT,
+    legacy_event_id TEXT,
+    UNIQUE(step_id, substep_index),
+    UNIQUE(step_id, substep_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_steps_step_index ON run_steps(run_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
 """
 
 # Migration from v1 to v2
@@ -246,6 +288,94 @@ UPDATE tasks
 SET num_steps_computed = num_turns_computed
 WHERE num_steps_computed IS NULL AND num_turns_computed IS NOT NULL;
 """
+
+# Migration from v15 to v16
+MIGRATION_V15_TO_V16 = """
+CREATE TABLE IF NOT EXISTS run_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES tasks(id),
+    step_index INTEGER NOT NULL,
+    step_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    message_role TEXT NOT NULL,
+    message_text TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    outcome TEXT,
+    summary TEXT,
+    legacy_turn_id TEXT,
+    legacy_event_id TEXT,
+    UNIQUE(run_id, step_index),
+    UNIQUE(run_id, step_id)
+);
+CREATE TABLE IF NOT EXISTS run_substeps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES tasks(id),
+    step_id INTEGER NOT NULL REFERENCES run_steps(id),
+    substep_index INTEGER NOT NULL,
+    substep_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    call_id TEXT,
+    payload_json TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    legacy_turn_id TEXT,
+    legacy_event_id TEXT,
+    UNIQUE(step_id, substep_index),
+    UNIQUE(step_id, substep_id)
+);
+CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_steps_step_index ON run_steps(run_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
+"""
+
+
+@dataclass(frozen=True)
+class StepRef:
+    """Opaque step reference used when writing substeps/finalization."""
+
+    id: int
+    run_id: int
+    step_index: int
+    step_id: str
+
+
+@dataclass(frozen=True)
+class RunStep:
+    """Persisted top-level message step for a run."""
+
+    id: int
+    run_id: int
+    step_index: int
+    step_id: str
+    provider: str
+    message_role: str
+    message_text: str | None
+    started_at: datetime
+    completed_at: datetime | None
+    outcome: str | None
+    summary: str | None
+    legacy_turn_id: str | None
+    legacy_event_id: str | None
+
+
+@dataclass(frozen=True)
+class RunSubstep:
+    """Persisted substep/tool event under a top-level message step."""
+
+    id: int
+    run_id: int
+    step_id: int
+    substep_index: int
+    substep_id: str
+    type: str
+    source: str
+    call_id: str | None
+    payload: Any
+    timestamp: datetime
+    legacy_turn_id: str | None
+    legacy_event_id: str | None
 
 
 def extract_failure_reason(log_file_path: Path) -> str:
@@ -480,6 +610,20 @@ class SqliteTaskStore:
                                 # Column might already exist
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (15,))
+                    current_version = 15
+
+                if current_version < 16:
+                    # Run migration v15 -> v16
+                    for stmt in MIGRATION_V15_TO_V16.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Table/index might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (16,))
+                    current_version = 16
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -532,6 +676,47 @@ class SqliteTaskStore:
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
             review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in row.keys() and row["review_cleared_at"] else None,
+        )
+
+    def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
+        """Convert a database row to a RunStep."""
+        return RunStep(
+            id=row["id"],
+            run_id=row["run_id"],
+            step_index=row["step_index"],
+            step_id=row["step_id"],
+            provider=row["provider"],
+            message_role=row["message_role"],
+            message_text=row["message_text"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            outcome=row["outcome"],
+            summary=row["summary"],
+            legacy_turn_id=row["legacy_turn_id"],
+            legacy_event_id=row["legacy_event_id"],
+        )
+
+    def _row_to_run_substep(self, row: sqlite3.Row) -> RunSubstep:
+        """Convert a database row to a RunSubstep."""
+        payload: Any
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = row["payload_json"]
+
+        return RunSubstep(
+            id=row["id"],
+            run_id=row["run_id"],
+            step_id=row["step_id"],
+            substep_index=row["substep_index"],
+            substep_id=row["substep_id"],
+            type=row["type"],
+            source=row["source"],
+            call_id=row["call_id"],
+            payload=payload,
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            legacy_turn_id=row["legacy_turn_id"],
+            legacy_event_id=row["legacy_event_id"],
         )
 
     # === Task CRUD ===
@@ -882,6 +1067,202 @@ class SqliteTaskStore:
                 "UPDATE tasks SET review_cleared_at = ? WHERE id = ?",
                 (now, task_id),
             )
+
+    # === Run step/substep persistence ===
+
+    def emit_step(
+        self,
+        run_id: int,
+        message: str | None,
+        *,
+        provider: str,
+        message_role: str = "assistant",
+        started_at: datetime | None = None,
+        legacy_turn_id: str | None = None,
+        legacy_event_id: str | None = None,
+    ) -> StepRef:
+        """Create and persist a top-level message step for a run."""
+        timestamp = (started_at or datetime.now(timezone.utc)).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(MAX(step_index), 0) + 1 AS next_step FROM run_steps WHERE run_id = ?",
+                (run_id,),
+            )
+            next_step = int(cur.fetchone()["next_step"])
+            step_label = f"S{next_step}"
+            cur = conn.execute(
+                """
+                INSERT INTO run_steps (
+                    run_id, step_index, step_id, provider, message_role,
+                    message_text, started_at, legacy_turn_id, legacy_event_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    next_step,
+                    step_label,
+                    provider,
+                    message_role,
+                    message,
+                    timestamp,
+                    legacy_turn_id,
+                    legacy_event_id,
+                ),
+            )
+            step_row_id = cur.lastrowid
+            assert step_row_id is not None
+            return StepRef(id=step_row_id, run_id=run_id, step_index=next_step, step_id=step_label)
+
+    def emit_substep(
+        self,
+        step_ref: StepRef,
+        substep_type: str,
+        payload: Any,
+        *,
+        source: str,
+        call_id: str | None = None,
+        timestamp: datetime | None = None,
+        legacy_turn_id: str | None = None,
+        legacy_event_id: str | None = None,
+    ) -> RunSubstep:
+        """Append a substep/tool event under an existing step."""
+        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        payload_json = json.dumps(payload)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT run_id, step_id FROM run_steps WHERE id = ?",
+                (step_ref.id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(f"Unknown step reference: {step_ref.id}")
+            if row["run_id"] != step_ref.run_id:
+                raise ValueError(
+                    f"Step reference run mismatch: step run_id={row['run_id']}, ref run_id={step_ref.run_id}"
+                )
+            if row["step_id"] != step_ref.step_id:
+                raise ValueError(
+                    f"Step reference label mismatch: step step_id={row['step_id']}, ref step_id={step_ref.step_id}"
+                )
+
+            cur = conn.execute(
+                "SELECT COALESCE(MAX(substep_index), 0) + 1 AS next_substep FROM run_substeps WHERE step_id = ?",
+                (step_ref.id,),
+            )
+            next_substep = int(cur.fetchone()["next_substep"])
+            substep_label = f"{step_ref.step_id}.{next_substep}"
+            cur = conn.execute(
+                """
+                INSERT INTO run_substeps (
+                    run_id, step_id, substep_index, substep_id, type, source, call_id,
+                    payload_json, timestamp, legacy_turn_id, legacy_event_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step_ref.run_id,
+                    step_ref.id,
+                    next_substep,
+                    substep_label,
+                    substep_type,
+                    source,
+                    call_id,
+                    payload_json,
+                    ts,
+                    legacy_turn_id,
+                    legacy_event_id,
+                ),
+            )
+            substep_row_id = cur.lastrowid
+            assert substep_row_id is not None
+            row = conn.execute("SELECT * FROM run_substeps WHERE id = ?", (substep_row_id,)).fetchone()
+            assert row is not None
+            return self._row_to_run_substep(row)
+
+    def finalize_step(
+        self,
+        step_ref: StepRef,
+        outcome: str,
+        summary: str | None = None,
+        *,
+        completed_at: datetime | None = None,
+    ) -> None:
+        """Mark a step complete and persist final outcome metadata."""
+        ts = (completed_at or datetime.now(timezone.utc)).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
+                (step_ref.id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(f"Unknown step reference: {step_ref.id}")
+            if row["run_id"] != step_ref.run_id:
+                raise ValueError(
+                    f"Step reference run mismatch: step run_id={row['run_id']}, ref run_id={step_ref.run_id}"
+                )
+            if row["step_index"] != step_ref.step_index:
+                raise ValueError(
+                    f"Step reference index mismatch: step step_index={row['step_index']}, ref step_index={step_ref.step_index}"
+                )
+            if row["step_id"] != step_ref.step_id:
+                raise ValueError(
+                    f"Step reference label mismatch: step step_id={row['step_id']}, ref step_id={step_ref.step_id}"
+                )
+
+            cur = conn.execute(
+                """
+                UPDATE run_steps
+                SET completed_at = ?, outcome = ?, summary = ?
+                WHERE id = ?
+                """,
+                (ts, outcome, summary, step_ref.id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"Unknown step reference: {step_ref.id}")
+
+    def get_run_steps(self, run_id: int) -> list[RunStep]:
+        """Get all stored run steps for a run, ordered by step index."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index ASC",
+                (run_id,),
+            )
+            return [self._row_to_run_step(row) for row in cur.fetchall()]
+
+    def get_run_substeps(self, step_ref: StepRef) -> list[RunSubstep]:
+        """Get all stored substeps for a step, ordered by substep index."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
+                (step_ref.id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(f"Unknown step reference: {step_ref.id}")
+            if row["run_id"] != step_ref.run_id:
+                raise ValueError(
+                    f"Step reference run mismatch: step run_id={row['run_id']}, ref run_id={step_ref.run_id}"
+                )
+            if row["step_index"] != step_ref.step_index:
+                raise ValueError(
+                    f"Step reference index mismatch: step step_index={row['step_index']}, ref step_index={step_ref.step_index}"
+                )
+            if row["step_id"] != step_ref.step_id:
+                raise ValueError(
+                    f"Step reference label mismatch: step step_id={row['step_id']}, ref step_id={step_ref.step_id}"
+                )
+
+            cur = conn.execute(
+                """
+                SELECT * FROM run_substeps
+                WHERE run_id = ? AND step_id = ?
+                ORDER BY substep_index ASC
+                """,
+                (step_ref.run_id, step_ref.id),
+            )
+            return [self._row_to_run_substep(row) for row in cur.fetchall()]
 
     def get_all(self) -> list[Task]:
         """Get all tasks."""
