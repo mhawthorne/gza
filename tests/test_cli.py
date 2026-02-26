@@ -7037,39 +7037,79 @@ class TestCleanupCommand:
 class TestRebaseHelpers:
     """Tests for rebase helper functions."""
 
-    def test_invoke_claude_resolve_returns_true_when_resolved(self, tmp_path):
-        """Test invoke_claude_resolve returns True when conflicts are resolved."""
+    def test_invoke_claude_resolve_uses_effective_codex_provider(self, tmp_path):
+        """Auto-resolve uses effective provider selection (codex override)."""
         from gza.cli import invoke_claude_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from unittest.mock import patch
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
 
-        config = Config(project_dir=tmp_path, project_name="test")
+        config = Config(project_dir=tmp_path, project_name="test", provider="claude")
+        task = SimpleNamespace(task_type="implement", provider="codex", model=None)
 
-        with patch('gza.providers.claude.ClaudeProvider.run', return_value=RunResult(exit_code=0)) as mock_run, \
-             patch('pathlib.Path.exists', return_value=False):
-            result = invoke_claude_resolve("feature", "main", config)
+        with patch("gza.cli._has_runtime_rebase_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
 
+            result = invoke_claude_resolve(task, "feature", "main", config)
             assert result is True
-            # Verify ClaudeProvider.run was called with the skill prompt
-            mock_run.assert_called_once()
-            call_args = mock_run.call_args
-            assert "/gza-rebase --auto" in call_args.args or "/gza-rebase --auto" in call_args.kwargs.values()
+            assert mock_get_provider.call_count == 1
+            resolve_config = mock_get_provider.call_args.args[0]
+            assert resolve_config.provider == "codex"
+            assert resolve_config.use_docker is False
+            mock_provider.run.assert_called_once()
+            assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
 
-    def test_invoke_claude_resolve_returns_false_when_unresolved(self, tmp_path):
-        """Test invoke_claude_resolve returns False when conflicts remain."""
+    def test_invoke_claude_resolve_uses_effective_gemini_provider(self, tmp_path):
+        """Auto-resolve supports gemini provider selection from effective config."""
         from gza.cli import invoke_claude_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="gemini")
+        task = SimpleNamespace(task_type="implement", provider=None, model=None)
+
+        with patch("gza.cli._has_runtime_rebase_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_claude_resolve(task, "feature", "main", config)
+            assert result is True
+            assert mock_get_provider.call_count == 1
+            resolve_config = mock_get_provider.call_args.args[0]
+            assert resolve_config.provider == "gemini"
+            mock_provider.run.assert_called_once()
+            assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
+
+    def test_invoke_claude_resolve_fails_fast_when_skill_missing(self, tmp_path, capsys, monkeypatch):
+        """Auto-resolve fails before provider run when runtime skill is missing."""
+        from gza.cli import invoke_claude_resolve
+        from gza.config import Config
+        from types import SimpleNamespace
         from unittest.mock import patch
 
-        config = Config(project_dir=tmp_path, project_name="test")
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        config = Config(project_dir=tmp_path, project_name="test", provider="codex")
+        task = SimpleNamespace(task_type="implement", provider=None, model=None)
 
-        with patch('gza.providers.claude.ClaudeProvider.run', return_value=RunResult(exit_code=0)), \
-             patch('pathlib.Path.exists', return_value=True):
-            result = invoke_claude_resolve("feature", "main", config)
-
+        with patch("gza.providers.get_provider") as mock_get_provider:
+            result = invoke_claude_resolve(task, "feature", "main", config)
             assert result is False
+            assert mock_get_provider.call_count == 0
+
+        out = capsys.readouterr().out
+        assert "Missing required 'gza-rebase' skill for provider 'codex'" in out
+        assert "uv run gza skills-install --target codex gza-rebase --project" in out
 
 
 class TestMarkCompletedCommand:

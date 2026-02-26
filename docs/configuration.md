@@ -694,7 +694,14 @@ gza rebase <task_id> [options]
 |--------|-------------|
 | `--onto BRANCH` | Branch to rebase onto (defaults to current branch) |
 | `--remote` | Fetch from origin and rebase against remote target branch |
+| `--resolve` | Auto-resolve rebase conflicts using `/gza-rebase` in the active provider runtime |
 | `--force`, `-f` | Force remove worktree even if it has uncommitted changes |
+
+When `--resolve` is used, gza runs the active task provider (`claude`, `codex`, or `gemini`) and sends the `/gza-rebase --auto` prompt. If the `gza-rebase` skill is missing for that runtime, gza fails fast with an install command such as:
+
+```bash
+uv run gza skills-install --target codex gza-rebase --project /path/to/project
+```
 
 ### cleanup
 

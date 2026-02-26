@@ -27,7 +27,7 @@ from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
 from .learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from .prompts import PromptBuilder
-from .runner import run, post_review_to_pr
+from .runner import run, post_review_to_pr, get_effective_config_for_task
 from .tasks import YamlTaskStore, Task as YamlTask
 from .workers import WorkerMetadata, WorkerRegistry
 
@@ -1068,7 +1068,7 @@ def _merge_single_task(
         if args.rebase and getattr(args, 'resolve', False):
             # --resolve: invoke Claude to fix conflicts
             print("Conflicts detected. Invoking Claude to resolve...")
-            resolved = invoke_claude_resolve(task.branch, rebase_target, config)
+            resolved = invoke_claude_resolve(task, task.branch, rebase_target, config)
 
             if not resolved:
                 print("Could not resolve conflicts automatically.")
@@ -1181,24 +1181,65 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
-def invoke_claude_resolve(branch: str, target: str, config: Config) -> bool:
-    """Invoke Claude to resolve rebase conflicts using ClaudeProvider.
+def _resolve_runtime_skill_dir(project_dir: Path, provider: str) -> tuple[str, Path] | None:
+    """Resolve runtime skill directory for a provider."""
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    gemini_home = Path(os.environ.get("GEMINI_HOME", str(Path.home() / ".gemini"))).expanduser()
+    target_map = {
+        "claude": ("claude", project_dir / ".claude" / "skills"),
+        "codex": ("codex", codex_home / "skills"),
+        "gemini": ("gemini", gemini_home / "skills"),
+    }
+    return target_map.get(provider)
 
-    Returns True if conflicts were resolved, False if Claude aborted.
-    """
+
+def _has_runtime_rebase_skill(project_dir: Path, provider: str) -> bool:
+    """Return True when gza-rebase skill is available for the provider runtime."""
+    runtime = _resolve_runtime_skill_dir(project_dir, provider)
+    if not runtime:
+        return False
+    _, runtime_dir = runtime
+    return (runtime_dir / "gza-rebase" / "SKILL.md").exists()
+
+
+def invoke_claude_resolve(task: DbTask, branch: str, target: str, config: Config) -> bool:
+    """Invoke active provider runtime to resolve rebase conflicts via /gza-rebase."""
     from dataclasses import replace
-    from .providers.claude import ClaudeProvider
+    from .providers import get_provider
 
     # Always run directly (not in Docker) since we need access to the
     # host's git rebase state on the local filesystem
-    resolve_config = replace(config, use_docker=False)
+    effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
+
+    runtime = _resolve_runtime_skill_dir(config.project_dir, effective_provider)
+    if not runtime:
+        print(f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve.")
+        return False
+
+    target_name, _ = runtime
+    if not _has_runtime_rebase_skill(config.project_dir, effective_provider):
+        print(f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'.")
+        print(
+            "Install it with: "
+            f"uv run gza skills-install --target {target_name} gza-rebase --project {config.project_dir}"
+        )
+        return False
+
+    resolve_config = replace(
+        config,
+        use_docker=False,
+        provider=effective_provider,
+        model=effective_model or "",
+        max_steps=effective_max_steps,
+        max_turns=effective_max_steps,
+    )
 
     log_dir = config.project_dir / config.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_file = log_dir / f"resolve-{timestamp}.log"
 
-    provider = ClaudeProvider()
+    provider = get_provider(resolve_config)
     provider.run(resolve_config, "/gza-rebase --auto", log_file, config.project_dir)
 
     # Check if rebase completed (no longer in rebase state)
@@ -1303,7 +1344,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
 
         # --resolve: invoke Claude to fix conflicts
         print("Conflicts detected. Invoking Claude to resolve...")
-        resolved = invoke_claude_resolve(task.branch, rebase_target, config)
+        resolved = invoke_claude_resolve(task, task.branch, rebase_target, config)
 
         if not resolved:
             print("Could not resolve conflicts automatically.")
@@ -4055,9 +4096,11 @@ def _resolve_skill_install_targets(
 ) -> list[tuple[str, Path]]:
     """Resolve skill install target names to destination directories."""
     codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    gemini_home = Path(os.environ.get("GEMINI_HOME", str(Path.home() / ".gemini"))).expanduser()
     target_map = {
         "claude": project_dir / ".claude" / "skills",
         "codex": codex_home / "skills",
+        "gemini": gemini_home / "skills",
     }
 
     targets = requested_targets or default_targets
@@ -4222,9 +4265,9 @@ def _add_skills_install_args(
     )
     parser.add_argument(
         "--target",
-        choices=["claude", "codex", "all"],
+        choices=["claude", "codex", "gemini", "all"],
         action="append",
-        help="Install target(s): claude, codex, or all (default depends on command)",
+        help="Install target(s): claude, codex, gemini, or all (default depends on command)",
     )
     parser.add_argument(
         "--force", "-f",
