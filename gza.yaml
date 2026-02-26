@@ -4,7 +4,7 @@ project_name: gza
 
 branch_strategy: date_slug
 
-max_steps: 80
+max_steps: 100
 
 #provider: claude
 #model: claude-sonnet-4-6
