@@ -51,7 +51,12 @@ Or abort with:
   gza rebase 3 --abort
 ```
 
-You can also use the `/gza-rebase` skill in Claude Code for interactive conflict resolution.
+You can also use the `/gza-rebase` skill in your active runtime (Claude, Codex, or Gemini) for interactive conflict resolution.
+If `gza rebase --resolve` reports the skill is missing, install it for the active runtime first, for example:
+
+```bash
+uv run gza skills-install --target codex gza-rebase --project .
+```
 
 ## Rebase against remote
 

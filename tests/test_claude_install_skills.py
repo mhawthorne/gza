@@ -197,6 +197,25 @@ class TestSkillsInstallCommand:
         assert (codex_home / "skills" / "gza-task-add" / "SKILL.md").exists()
         assert not (tmp_path / ".claude" / "skills").exists()
 
+    def test_install_only_gemini_target(self, tmp_path: Path):
+        """Gemini target installs skills into GEMINI_HOME runtime directory."""
+        setup_config(tmp_path)
+        gemini_home = tmp_path / "gemini-home"
+        result = run_gza(
+            "skills-install",
+            "--target",
+            "gemini",
+            "--project",
+            str(tmp_path),
+            env={"GEMINI_HOME": str(gemini_home)},
+        )
+
+        assert result.returncode == 0
+        assert "[gemini]" in result.stdout
+        assert "[claude]" not in result.stdout
+        assert "[codex]" not in result.stdout
+        assert (gemini_home / "skills" / "gza-task-add" / "SKILL.md").exists()
+
 
 class TestSkillContentValidation:
     """Tests to validate skill content format and structure."""
