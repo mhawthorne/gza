@@ -3068,70 +3068,202 @@ def cmd_ps(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
+    show_all = args.all if hasattr(args, "all") else False
+    rows = _build_ps_rows(registry, store, include_completed=show_all)
 
-    workers = registry.list_all(include_completed=args.all if hasattr(args, 'all') else False)
-
-    if not workers:
-        if hasattr(args, 'all') and args.all:
-            print("No workers found")
+    if not rows:
+        if show_all:
+            print("No workers or in-progress tasks found")
         else:
-            print("No running workers (use --all to see completed)")
+            print("No running workers or in-progress tasks (use --all to see completed)")
         return 0
 
-    if hasattr(args, 'quiet') and args.quiet:
-        # Just print worker IDs
-        for worker in workers:
-            print(worker.worker_id)
+    if hasattr(args, "quiet") and args.quiet:
+        for row in rows:
+            if row["worker_id"] != "-":
+                print(row["worker_id"])
+            elif row["task_id"] is not None:
+                print(f"db:{row['task_id']}")
         return 0
 
-    if hasattr(args, 'json') and args.json:
-        # JSON output
+    if hasattr(args, "json") and args.json:
         import json as json_lib
-        print(json_lib.dumps([w.to_dict() for w in workers], indent=2))
+        print(json_lib.dumps(rows, indent=2))
         return 0
 
-    # Table output
-    print(f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'TASK ID':<10} {'STATUS':<12} {'TASK':<30} {'DURATION':<10}")
-    print("-" * 106)
+    print(
+        f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'SOURCE':<7} {'TASK ID':<10} "
+        f"{'STATUS':<12} {'FLAGS':<12} {'TASK':<30} {'DURATION':<10}"
+    )
+    print("-" * 133)
+
+    for row in rows:
+        task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
+        print(
+            f"{row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} {row['source']:<7} "
+            f"{task_id_display:<10} {row['status']:<12} {row['flags']:<12} "
+            f"{row['task']:<30} {row['duration']:<10}"
+        )
+
+    return 0
+
+
+def _build_ps_rows(
+    registry: WorkerRegistry,
+    store: SqliteTaskStore,
+    include_completed: bool,
+) -> list[dict]:
+    """Build reconciled ps rows from worker registry and DB in-progress tasks."""
+    workers = registry.list_all(include_completed=include_completed)
+    in_progress_tasks = store.get_in_progress()
+    merged: dict[tuple[str, str], dict] = {}
 
     for worker in workers:
-        # Check if still running
         if worker.status == "running" and not registry.is_running(worker.worker_id):
             worker.status = "stale"
 
-        # Get task info
-        task_display = ""
-        task_id_display = ""
-        if worker.task_id:
-            task_id_display = f"#{worker.task_id}"
-            task = store.get(worker.task_id)
-            if task:
-                if task.task_id:
-                    task_display = task.task_id
-                else:
-                    task_display = truncate(task.prompt, 25)
+        key = ("task", str(worker.task_id)) if worker.task_id is not None else ("worker", worker.worker_id)
+        existing = merged.get(key)
+        if existing and existing["worker"] is not None:
+            if _prefer_worker(existing["worker"], worker):
+                existing["worker"] = worker
+            continue
 
-        # Calculate duration
-        started = datetime.fromisoformat(worker.started_at)
-        if worker.completed_at:
-            ended = datetime.fromisoformat(worker.completed_at)
-            duration_sec = (ended - started).total_seconds()
+        task = store.get(worker.task_id) if worker.task_id is not None else None
+        merged[key] = {"worker": worker, "task": task}
+
+    for task in in_progress_tasks:
+        assert task.id is not None
+        key = ("task", str(task.id))
+        if key in merged:
+            merged[key]["task"] = task
         else:
-            duration_sec = (datetime.now(timezone.utc) - started).total_seconds()
+            merged[key] = {"worker": None, "task": task}
 
-        if duration_sec < 60:
-            duration = f"{duration_sec:.0f}s"
+    rows = [_to_ps_row(item["worker"], item["task"]) for item in merged.values()]
+    rows.sort(key=lambda row: row["sort_timestamp"] or "")
+    return rows
+
+
+def _prefer_worker(existing: WorkerMetadata, candidate: WorkerMetadata) -> bool:
+    """Return True when candidate worker should replace existing worker."""
+    priority = {"running": 3, "stale": 2, "failed": 1, "completed": 0}
+    existing_rank = priority.get(existing.status, -1)
+    candidate_rank = priority.get(candidate.status, -1)
+    if candidate_rank != existing_rank:
+        return candidate_rank > existing_rank
+
+    existing_started = _parse_iso(existing.started_at)
+    candidate_started = _parse_iso(candidate.started_at)
+    if existing_started and candidate_started:
+        return candidate_started > existing_started
+    if candidate_started:
+        return True
+    return False
+
+
+def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
+    """Convert a reconciled worker/task pair into display data."""
+    source = "both" if worker and task else "worker" if worker else "db"
+
+    status = "unknown"
+    if source == "db":
+        status = "in_progress"
+    elif source == "worker":
+        status = worker.status
+    elif worker is not None:
+        if worker.status in ("completed", "failed", "stale"):
+            status = worker.status
         else:
-            minutes = int(duration_sec // 60)
-            seconds = int(duration_sec % 60)
-            duration = f"{minutes}m {seconds}s"
+            status = "running"
 
-        # Determine worker type (default to background for old workers without is_background field)
-        worker_type = "fg" if hasattr(worker, 'is_background') and not worker.is_background else "bg"
+    is_stale = worker is not None and worker.status == "stale"
+    is_orphaned = (
+        task is not None
+        and task.status == "in_progress"
+        and (worker is None or worker.status != "running")
+    )
 
-        print(f"{worker.worker_id:<20} {worker.pid:<8} {worker_type:<6} {task_id_display:<10} {worker.status:<12} {task_display:<30} {duration:<10}")
+    started = _started_at(worker, task)
+    ended = _ended_at(worker)
+    duration = _format_duration(started, ended)
 
-    return 0
+    worker_id = worker.worker_id if worker else "-"
+    pid = str(worker.pid) if worker else "-"
+    worker_type = (
+        "fg" if worker and hasattr(worker, "is_background") and not worker.is_background else "bg"
+    ) if worker else "-"
+
+    task_id = task.id if task and task.id is not None else worker.task_id if worker else None
+    task_display = ""
+    if task and task.task_id:
+        task_display = task.task_id
+    elif task:
+        task_display = truncate(task.prompt, 25)
+    elif worker and worker.task_slug:
+        task_display = worker.task_slug
+
+    flags = []
+    if is_stale:
+        flags.append("stale")
+    if is_orphaned:
+        flags.append("orphaned")
+
+    return {
+        "worker_id": worker_id,
+        "pid": pid,
+        "type": worker_type,
+        "source": source,
+        "task_id": task_id,
+        "status": status,
+        "flags": ",".join(flags),
+        "task": task_display,
+        "duration": duration,
+        "is_stale": is_stale,
+        "is_orphaned": is_orphaned,
+        "sort_timestamp": started.isoformat() if started else "",
+    }
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp safely."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _started_at(worker: WorkerMetadata | None, task: DbTask | None) -> datetime | None:
+    """Get the best available started timestamp."""
+    if worker:
+        started = _parse_iso(worker.started_at)
+        if started:
+            return started
+    if task:
+        return task.started_at or task.created_at
+    return None
+
+
+def _ended_at(worker: WorkerMetadata | None) -> datetime | None:
+    """Get completed timestamp when available."""
+    if not worker:
+        return None
+    return _parse_iso(worker.completed_at)
+
+
+def _format_duration(started: datetime | None, ended: datetime | None = None) -> str:
+    """Format duration from timestamps."""
+    if not started:
+        return "-"
+    end_time = ended or datetime.now(timezone.utc)
+    duration_sec = max(0.0, (end_time - started).total_seconds())
+    if duration_sec < 60:
+        return f"{duration_sec:.0f}s"
+    minutes = int(duration_sec // 60)
+    seconds = int(duration_sec % 60)
+    return f"{minutes}m {seconds}s"
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
