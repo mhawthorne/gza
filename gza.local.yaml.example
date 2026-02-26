@@ -6,6 +6,8 @@
 # timeout_minutes: 30
 # worktree_dir: /tmp/gza-worktrees
 # provider: codex
+# task_providers:
+#   review: claude
 # model: o4-mini
 # docker_volumes:
 #   - ~/datasets:/datasets:ro

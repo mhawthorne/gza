@@ -1907,6 +1907,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "worktree_dir": config.worktree_dir,
         "work_count": config.work_count,
         "provider": config.provider,
+        "task_providers": config.task_providers,
         "model": config.model,
         "chat_text_display_length": config.chat_text_display_length,
         "verify_command": config.verify_command,
