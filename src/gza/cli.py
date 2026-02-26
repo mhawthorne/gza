@@ -741,7 +741,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             else:
                 status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
         date_str = f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if task.completed_at else ""
-        type_label = f" [{task.task_type}]" if task.task_type != "task" else ""
+        type_label = f" \\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         console.print(f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}")
@@ -3821,22 +3821,38 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    """Create a review task for an implementation task and optionally run it."""
+    """Create a review task for an implementation/improve task and optionally run it."""
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
 
     store = get_store(config)
 
-    # Get the implementation task
-    impl_task = store.get(args.task_id)
-    if not impl_task:
+    # Resolve target implementation from provided task
+    source_task = store.get(args.task_id)
+    if not source_task:
         print(f"Error: Task #{args.task_id} not found")
         return 1
 
-    # Validate that it's an implementation task
+    impl_task = source_task
+    if source_task.task_type == "improve":
+        if source_task.based_on:
+            candidate = store.get(source_task.based_on)
+            if candidate and candidate.task_type == "implement":
+                impl_task = candidate
+            else:
+                print(
+                    f"Error: Improve task #{source_task.id} points to task #{source_task.based_on}, "
+                    "which is not an implementation task"
+                )
+                return 1
+        else:
+            print(f"Error: Improve task #{source_task.id} has no based_on implementation task")
+            return 1
+
+    # Validate that the effective target is an implementation task
     if impl_task.task_type != "implement":
-        print(f"Error: Task #{args.task_id} is a {impl_task.task_type} task, not an implementation task")
+        print(f"Error: Task #{args.task_id} is a {source_task.task_type} task, not an implementation/improve task")
         return 1
 
     # Check if task is completed
@@ -5323,11 +5339,14 @@ def main() -> int:
     add_common_args(improve_parser)
 
     # review command
-    review_parser = subparsers.add_parser("review", help="Create and optionally run a review task for an implementation")
+    review_parser = subparsers.add_parser(
+        "review",
+        help="Create and optionally run a review task for an implementation or improve task",
+    )
     review_parser.add_argument(
         "task_id",
         type=int,
-        help="Implementation task ID to review",
+        help="Implementation or improve task ID to review",
     )
     review_parser.add_argument(
         "--queue", "-q",
