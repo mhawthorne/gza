@@ -822,25 +822,29 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         review_status_color = None
         reviews = _get_reviews_for_root_task(store, root_task)
         if reviews:
-            # Get the most recent review (first in the list, as they're ordered by created_at DESC)
-            latest_review = reviews[0]
-            # If an improve task has run after this review, the review is stale — skip it.
-            review_cleared = (
-                root_task.review_cleared_at is not None
-                and latest_review.completed_at is not None
-                and root_task.review_cleared_at >= latest_review.completed_at
-            )
-            if not review_cleared:
-                verdict = get_review_verdict(config, latest_review)
+            # Reviews are ordered newest-to-oldest. Select the first non-stale parseable verdict.
+            for review in reviews:
+                review_cleared = (
+                    root_task.review_cleared_at is not None
+                    and review.completed_at is not None
+                    and root_task.review_cleared_at >= review.completed_at
+                )
+                if review_cleared:
+                    continue
+
+                verdict = get_review_verdict(config, review)
                 if verdict == "APPROVED":
                     review_status = "✓ approved"
                     review_status_color = UNMERGED_COLORS["review_approved"]
-                elif verdict == "CHANGES_REQUESTED":
+                    break
+                if verdict == "CHANGES_REQUESTED":
                     review_status = "⚠ changes requested"
                     review_status_color = UNMERGED_COLORS["review_changes"]
-                elif verdict == "NEEDS_DISCUSSION":
+                    break
+                if verdict == "NEEDS_DISCUSSION":
                     review_status = "💬 needs discussion"
                     review_status_color = UNMERGED_COLORS["review_discussion"]
+                    break
 
         c = UNMERGED_COLORS  # shorthand
         suffix = f" [[{review_status_color}]{review_status}[/{review_status_color}]]" if review_status else ""
@@ -3167,7 +3171,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
     status = "unknown"
     if source == "db":
         status = "in_progress"
-    elif source == "worker":
+    elif source == "worker" and worker is not None:
         status = worker.status
     elif worker is not None:
         if worker.status in ("completed", "failed", "stale"):

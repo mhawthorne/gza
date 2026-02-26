@@ -5945,6 +5945,123 @@ This requires team discussion.
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
 
+    def test_unmerged_uses_older_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+        """Unmerged scans newest-to-oldest and uses first parseable review verdict."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.depends_on = task.id
+        older_review.task_id = "20260212-older-review"
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        time.sleep(0.01)
+
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.depends_on = task.id
+        latest_review.task_id = "20260212-latest-review"
+        latest_review.output_content = None
+        latest_review.report_file = None
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" in result.stdout
+
+    def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+        """Staleness via review_cleared_at still suppresses older verdicts."""
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add("Add feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feature/test"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.task_id = "20260212-add-feature"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/test")
+        (tmp_path / "feature.txt").write_text("feature")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.depends_on = task.id
+        older_review.task_id = "20260212-older-review"
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        time.sleep(0.01)
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        time.sleep(0.01)
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.depends_on = task.id
+        latest_review.task_id = "20260212-latest-review"
+        latest_review.output_content = None
+        latest_review.report_file = None
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested" not in result.stdout
+
     def test_unmerged_falls_back_to_unlinked_review_slug_match(self, tmp_path: Path):
         """Unmerged should infer review status from unlinked 'review <slug>' tasks."""
         from gza.db import SqliteTaskStore
