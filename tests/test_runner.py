@@ -14,6 +14,7 @@ from gza.runner import (
     SUMMARY_DIR,
     WIP_DIR,
     BACKUP_DIR,
+    _build_context_from_chain,
     backup_database,
     _create_and_run_review_task,
     _run_non_code_task,
@@ -229,6 +230,73 @@ class TestBuildPrompt:
             assert "Complete this task: Implement feature Z" in prompt
         finally:
             os.chmod(learnings_path, 0o644)
+
+
+class TestReviewContextFromChain:
+    """Tests for self-contained review context generation."""
+
+    def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
+        """Review context should include changed files, diffstat, and inline diff."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test/feature-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        mock_git = Mock(spec=Git)
+        mock_git.default_branch.return_value = "main"
+        mock_git.get_diff_numstat.return_value = "10\t2\tsrc/a.py\n3\t1\tsrc/b.py\n"
+        mock_git.get_diff_stat.return_value = (
+            " src/a.py | 12 ++++++++++\n src/b.py | 4 +++-\n 2 files changed, 13 insertions(+), 3 deletions(-)"
+        )
+        mock_git.get_diff.return_value = "diff --git a/src/a.py b/src/a.py\n@@ -1 +1 @@\n-old\n+new\n"
+
+        context = _build_context_from_chain(review_task, store, tmp_path, mock_git)
+
+        assert "## Implementation Diff Context" in context
+        assert "Changed files:" in context
+        assert "- src/a.py" in context
+        assert "- src/b.py" in context
+        assert "Diff summary:" in context
+        assert "Full diff:" in context
+        assert "Use git and file reading tools" not in context
+
+    def test_review_context_large_diff_adds_targeted_excerpts(self, tmp_path: Path):
+        """Large review diffs should include targeted diff excerpts."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement large feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test/large-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review large implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        mock_git = Mock(spec=Git)
+        mock_git.default_branch.return_value = "main"
+        mock_git.get_diff_numstat.return_value = (
+            "1500\t400\tsrc/large_a.py\n800\t200\tsrc/large_b.py\n"
+        )
+        mock_git.get_diff_stat.return_value = " 2 files changed, 2300 insertions(+), 600 deletions(-)"
+        mock_git._run.return_value = Mock(stdout="diff --git a/src/large_a.py b/src/large_a.py\n@@ ...", returncode=0)
+
+        context = _build_context_from_chain(review_task, store, tmp_path, mock_git)
+
+        assert "Targeted diff excerpts" in context
+        assert "Additional changed files not expanded inline" not in context
 
 
 class TestSummaryDirectory:
@@ -669,6 +737,86 @@ class TestReviewNextSteps:
 
             all_output = "\n".join(printed_lines)
             assert "gza improve" not in all_output
+
+
+class TestRunNonCodeTaskDockerGitMetadata:
+    """Tests for Docker review execution when worktree git metadata is invalid."""
+
+    def test_docker_review_hides_and_restores_invalid_worktree_git_file(self, tmp_path: Path):
+        """Invalid host gitdir metadata should be hidden during provider run and restored after."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.task_id = "20260225-implement-feature"
+        impl_task.branch = "test/feature-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.task_id = "20260225-review-feature"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = True
+
+        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        original_git_file = worktree_path / ".git"
+        original_git_content = "gitdir: /nonexistent/host/path/.git/worktrees/review\n"
+        original_git_file.write_text(original_git_content)
+
+        worktree_review_dir = worktree_path / ".gza" / "reviews"
+        worktree_review_dir.mkdir(parents=True, exist_ok=True)
+        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None):
+            assert not (worktree_path / ".git").exists()
+            assert (worktree_path / ".git.gza-host-worktree").exists()
+            report_file.write_text("# Review\n\nVerdict: APPROVED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id="session-1",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.get_diff_numstat.return_value = "1\t1\tsrc/app.py\n"
+        mock_git.get_diff_stat.return_value = " 1 file changed, 1 insertion(+), 1 deletion(-)"
+        mock_git.get_diff.return_value = "diff --git a/src/app.py b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+
+        with patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(
+                review_task,
+                config,
+                store,
+                mock_provider,
+                mock_git,
+                resume=False,
+            )
+
+        assert exit_code == 0
+        assert original_git_file.exists()
+        assert original_git_file.read_text() == original_git_content
+        assert not (worktree_path / ".git.gza-host-worktree").exists()
 
 
 class TestRunNonCodeTaskPRPosting:

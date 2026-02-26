@@ -521,6 +521,22 @@ class TestDockerfileTemplate:
         assert "gza" in content
         assert "USER gza" in content
 
+    def test_template_includes_ripgrep(self):
+        """Template should include ripgrep for agent search tooling."""
+        content = DOCKERFILE_TEMPLATE.format(
+            npm_package="@test/cli",
+            cli_command="test",
+        )
+        assert "ripgrep" in content
+
+    def test_checked_in_provider_dockerfiles_include_ripgrep(self):
+        """Checked-in Claude/Codex Dockerfiles should include ripgrep."""
+        repo_root = Path(__file__).resolve().parents[1]
+        for relpath in ("etc/Dockerfile.claude", "etc/Dockerfile.codex"):
+            dockerfile = repo_root / relpath
+            assert dockerfile.exists()
+            assert "ripgrep" in dockerfile.read_text()
+
 
 class TestGeminiCostCalculation:
     """Tests for Gemini cost calculation."""
@@ -694,6 +710,49 @@ class TestProviderRunMethods:
 
                 mock_direct.assert_called_once()
                 mock_docker.assert_not_called()
+
+
+class TestCodexGitRepoCheckBypass:
+    """Tests that Codex execution bypasses git repo checks."""
+
+    def test_codex_docker_includes_skip_git_repo_check(self, tmp_path):
+        """Docker codex exec command should include --skip-git-repo-check."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=True,
+            timeout_minutes=5,
+        )
+        config.docker_image = "test-codex-image"
+        config.docker_volumes = []
+        config.docker_setup_command = ""
+
+        with patch("gza.providers.codex.ensure_docker_image", return_value=True), \
+             patch("gza.providers.codex.build_docker_cmd", return_value=["timeout", "5m", "docker", "run", "--rm", "test-codex-image"]), \
+             patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)) as mock_run_parse:
+            provider._run_docker(config, "test prompt", tmp_path / "log.txt", tmp_path)
+
+        cmd = mock_run_parse.call_args[0][0]
+        assert "--skip-git-repo-check" in cmd
+
+    def test_codex_direct_includes_skip_git_repo_check(self, tmp_path):
+        """Direct codex exec command should include --skip-git-repo-check."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=False,
+            timeout_minutes=5,
+        )
+
+        with patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)) as mock_run_parse:
+            provider._run_direct(config, "test prompt", tmp_path / "log.txt", tmp_path)
+
+        cmd = mock_run_parse.call_args[0][0]
+        assert "--skip-git-repo-check" in cmd
 
 
 class TestDockerDaemonCheck:
