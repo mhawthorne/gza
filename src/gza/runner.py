@@ -1166,7 +1166,8 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         ])
         if auto_learnings:
             info_line(
-                f"Updated learnings from {auto_learnings.tasks_used} tasks "
+                "Learnings",
+                f"updated from {auto_learnings.tasks_used} tasks "
                 f"({auto_learnings.path.relative_to(config.project_dir)}) "
                 f"+{auto_learnings.added_count}/-{auto_learnings.removed_count}/={auto_learnings.retained_count} "
                 f"churn {auto_learnings.churn_percent:.1f}%"
@@ -1414,7 +1415,8 @@ def _run_non_code_task(
         ])
         if auto_learnings:
             info_line(
-                f"Updated learnings from {auto_learnings.tasks_used} tasks "
+                "Learnings",
+                f"updated from {auto_learnings.tasks_used} tasks "
                 f"({auto_learnings.path.relative_to(config.project_dir)}) "
                 f"+{auto_learnings.added_count}/-{auto_learnings.removed_count}/={auto_learnings.retained_count} "
                 f"churn {auto_learnings.churn_percent:.1f}%"
