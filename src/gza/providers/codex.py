@@ -201,6 +201,7 @@ class CodexProvider(Provider):
             cmd.extend([
                 "codex", "exec", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
+                "--skip-git-repo-check",  # Worktree metadata may be unavailable inside containers
                 "-C", "/workspace",  # Set working directory explicitly
                 "-",  # Read prompt from stdin
             ])
@@ -242,6 +243,7 @@ class CodexProvider(Provider):
             cmd.extend([
                 "codex", "exec", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
+                "--skip-git-repo-check",  # Worktree metadata may be unavailable in detached review contexts
                 "-C", str(work_dir),
                 "-",  # Read prompt from stdin
             ])

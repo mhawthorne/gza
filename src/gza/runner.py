@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,7 @@ BACKUP_DIR = f".{APP_NAME}/backups"
 # Diff size thresholds for tiered diff strategy in review prompts
 DIFF_SMALL_THRESHOLD = 500   # lines: pass verbatim
 DIFF_MEDIUM_THRESHOLD = 2000  # lines: prepend --stat summary above full diff
+REVIEW_CONTEXT_FILE_LIMIT = 12
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
@@ -228,6 +230,96 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
     return None
 
 
+def _parse_changed_files_from_numstat(numstat_output: str) -> list[str]:
+    """Extract changed file paths from git diff --numstat output."""
+    changed_files: list[str] = []
+    for line in numstat_output.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        changed_files.append(parts[2].strip())
+    return changed_files
+
+
+def _build_review_diff_context(git: Git, revision_range: str, branch_name: str) -> str:
+    """Build self-contained review diff context for prompts."""
+    numstat_output = git.get_diff_numstat(revision_range)
+    if not isinstance(numstat_output, str):
+        numstat_output = ""
+    files_changed, lines_added, lines_removed = parse_diff_numstat(numstat_output)
+    total_lines = lines_added + lines_removed
+    changed_files = _parse_changed_files_from_numstat(numstat_output)
+
+    parts = [
+        "## Implementation Diff Context",
+        "",
+        f"Implementation branch: {branch_name}",
+        f"Revision range: {revision_range}",
+        f"Files changed: {files_changed}, lines added: {lines_added}, lines removed: {lines_removed}",
+    ]
+
+    if changed_files:
+        parts.append("")
+        parts.append("Changed files:")
+        for file_path in changed_files:
+            parts.append(f"- {file_path}")
+
+    stat_summary = git.get_diff_stat(revision_range)
+    if not isinstance(stat_summary, str):
+        stat_summary = ""
+    if stat_summary:
+        parts.append("")
+        parts.append("Diff summary:")
+        parts.append(stat_summary)
+
+    if total_lines < DIFF_SMALL_THRESHOLD:
+        diff_content = git.get_diff(revision_range)
+        if not isinstance(diff_content, str):
+            diff_content = ""
+        if diff_content:
+            parts.append("")
+            parts.append("Full diff:")
+            parts.append(diff_content)
+        return "\n".join(parts)
+
+    if total_lines < DIFF_MEDIUM_THRESHOLD:
+        diff_content = git.get_diff(revision_range)
+        if not isinstance(diff_content, str):
+            diff_content = ""
+        if diff_content:
+            parts.append("")
+            parts.append("Full diff:")
+            parts.append(diff_content)
+        return "\n".join(parts)
+
+    # Large diff: include targeted per-file diff excerpts for the most relevant files.
+    selected_files = changed_files[:REVIEW_CONTEXT_FILE_LIMIT]
+    if selected_files:
+        excerpt_result = git._run(
+            "diff",
+            "--unified=8",
+            revision_range,
+            "--",
+            *selected_files,
+            check=False,
+        )
+        excerpt_stdout = excerpt_result.stdout if isinstance(excerpt_result.stdout, str) else ""
+        excerpt_content = excerpt_stdout.strip()
+        if excerpt_content:
+            parts.append("")
+            parts.append(
+                f"Targeted diff excerpts (first {len(selected_files)} changed files; total changed lines: {total_lines}):"
+            )
+            parts.append(excerpt_content)
+        if len(changed_files) > len(selected_files):
+            parts.append("")
+            parts.append(
+                f"Additional changed files not expanded inline: {len(changed_files) - len(selected_files)}"
+            )
+
+    return "\n".join(parts)
+
+
 def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: Path, git: Git | None) -> str:
     """Build context by walking the depends_on and based_on chain."""
     context_parts = []
@@ -281,36 +373,9 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
                     try:
                         default_branch = git.default_branch()
                         revision_range = f"{default_branch}...{impl_task.branch}"
-                        numstat_output = git.get_diff_numstat(revision_range)
-                        _, lines_added, lines_removed = parse_diff_numstat(numstat_output)
-                        total_lines = lines_added + lines_removed
-
-                        context_parts.append(f"Implementation branch: {impl_task.branch}")
-
-                        if total_lines < DIFF_SMALL_THRESHOLD:
-                            # Small diff: pass verbatim
-                            diff_content = git.get_diff(revision_range)
-                            if diff_content:
-                                context_parts.append(f"\nChanges:\n{diff_content}")
-                        elif total_lines < DIFF_MEDIUM_THRESHOLD:
-                            # Medium diff: prepend --stat summary above full diff
-                            stat_summary = git.get_diff_stat(revision_range)
-                            diff_content = git.get_diff(revision_range)
-                            if diff_content:
-                                context_parts.append(f"\nDiff summary:\n{stat_summary}")
-                                context_parts.append(f"\nChanges:\n{diff_content}")
-                            elif stat_summary:
-                                context_parts.append(f"\nDiff summary:\n{stat_summary}")
-                        else:
-                            # Large diff: stat summary only, instruct model to use tools
-                            stat_summary = git.get_diff_stat(revision_range)
-                            if stat_summary:
-                                context_parts.append(f"\nDiff summary:\n{stat_summary}")
-                            context_parts.append(
-                                f"\nThe diff is too large to include inline ({total_lines} lines changed). "
-                                f"Use git and file reading tools to review the changes on the implementation "
-                                f"branch '{impl_task.branch}' directly."
-                            )
+                        context_parts.append(
+                            _build_review_diff_context(git, revision_range, impl_task.branch)
+                        )
                     except GitError:
                         pass  # Ignore git errors
 
@@ -639,6 +704,61 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     # Run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     return run(config, task_id=review_task.id)
+
+
+def _hide_invalid_worktree_git_metadata_for_docker(task: Task, config: Config, worktree_path: Path) -> Path | None:
+    """Temporarily hide invalid worktree .git metadata for Docker review runs.
+
+    Worktree .git files can reference host-only absolute gitdir paths that do not
+    exist inside the container. Hiding the file prevents provider-side git probes
+    from failing with path-mismatch errors.
+
+    Returns:
+        Backup path of the hidden .git file if one was moved, otherwise None.
+    """
+    if not config.use_docker or task.task_type != "review":
+        return None
+
+    git_file = worktree_path / ".git"
+    if not git_file.is_file():
+        return None
+
+    try:
+        first_line = git_file.read_text().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+
+    if not first_line.startswith("gitdir:"):
+        return None
+
+    gitdir_path = Path(first_line.split(":", 1)[1].strip())
+    if gitdir_path.exists():
+        return None
+
+    backup_path = worktree_path / ".git.gza-host-worktree"
+    if backup_path.exists():
+        if backup_path.is_dir():
+            shutil.rmtree(backup_path)
+        else:
+            backup_path.unlink()
+
+    git_file.rename(backup_path)
+    return backup_path
+
+
+def _restore_worktree_git_metadata(worktree_path: Path, backup_path: Path | None) -> None:
+    """Restore original worktree .git metadata after provider execution."""
+    if not backup_path or not backup_path.exists():
+        return
+
+    git_path = worktree_path / ".git"
+    if git_path.exists():
+        if git_path.is_dir():
+            shutil.rmtree(git_path)
+        else:
+            git_path.unlink()
+
+    backup_path.rename(git_path)
 
 
 def run(config: Config, task_id: int | None = None, resume: bool = False, open_after: bool = False) -> int:
@@ -1167,11 +1287,14 @@ def _run_non_code_task(
             prompt = PromptBuilder().resume_prompt()
         else:
             prompt = build_prompt(task, config, store, report_path=prompt_report_path, git=git)
+        hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
         except KeyboardInterrupt:
             console.print("\nInterrupted")
             return 130
+        finally:
+            _restore_worktree_git_metadata(worktree_path, hidden_git_backup)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)

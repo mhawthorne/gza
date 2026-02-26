@@ -176,9 +176,7 @@ class PromptBuilder:
         if impl_prompt:
             prompt += f": {impl_prompt[:100]}"
         prompt += (
-            ". The diff shows what changed, but you should use Read/Glob/Grep tools"
-            " to understand the surrounding context of each changed file."
-            " Read the full content of modified files to understand how changes fit"
-            " into the broader codebase."
+            ". Review the provided changed-files list, diffstat, and inline diff/context"
+            " in the prompt. Do not rely on git discovery commands to reconstruct the diff."
         )
         return prompt
