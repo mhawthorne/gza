@@ -6775,108 +6775,6 @@ class TestRebaseHelpers:
             assert result is False
 
 
-class TestForceCompleteCommand:
-    """Tests for 'gza force-complete' command."""
-
-    def test_force_complete_failed_task(self, tmp_path: Path):
-        """Force-complete marks a failed task as completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Failed task", "status": "failed"},
-        ])
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "failed → completed" in result.stdout
-
-    def test_force_complete_pending_task(self, tmp_path: Path):
-        """Force-complete marks a pending task as completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Pending task", "status": "pending"},
-        ])
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "pending → completed" in result.stdout
-
-    def test_force_complete_in_progress_task(self, tmp_path: Path):
-        """Force-complete marks an in_progress task as completed."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("In-progress task")
-        task.status = "in_progress"
-        store.update(task)
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "in_progress → completed" in result.stdout
-
-    def test_force_complete_already_completed_fails(self, tmp_path: Path):
-        """Force-complete fails if task is already completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Completed task", "status": "completed"},
-        ])
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "already completed" in result.stdout
-
-    def test_force_complete_nonexistent_task(self, tmp_path: Path):
-        """Force-complete fails for a nonexistent task."""
-        setup_db_with_tasks(tmp_path, [])
-
-        result = run_gza("force-complete", "999", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "not found" in result.stdout
-
-    def test_force_complete_persists_status(self, tmp_path: Path):
-        """Force-complete actually updates the task status in the store."""
-        from gza.db import SqliteTaskStore
-
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Failed task", "status": "failed"},
-        ])
-
-        run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "completed"
-
-    def test_force_complete_preserves_branch(self, tmp_path: Path):
-        """Force-complete preserves an existing branch on the task."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("Task with branch")
-        task.status = "failed"
-        task.branch = "gza/1-task-with-branch"
-        store.update(task)
-
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        updated_task = store.get(1)
-        assert updated_task is not None
-        assert updated_task.branch == "gza/1-task-with-branch"
-        assert updated_task.status == "completed"
-
-
 class TestMarkCompletedCommand:
     """Tests for 'gza mark-completed' command."""
 
@@ -6901,10 +6799,61 @@ class TestMarkCompletedCommand:
         assert result.returncode == 1
         assert "not found" in result.stdout
 
+    def test_mark_completed_default_verify_git_for_code_tasks(self, tmp_path: Path):
+        """Code task types default to git verification mode."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        self._setup_git_repo(tmp_path)
+
+        task = store.add("Code task with no branch", task_type="task")
+        task.status = "failed"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no branch" in result.stdout
+
+    def test_mark_completed_default_force_for_non_code_tasks(self, tmp_path: Path):
+        """Non-code task types default to status-only completion."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Review task", "status": "failed", "task_type": "review"},
+        ])
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "status-only" in result.stdout
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "completed"
+        assert updated.has_commits is False
+
+    def test_mark_completed_verify_git_requires_branch(self, tmp_path: Path):
+        """--verify-git errors when no branch is set."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task without branch", "status": "failed", "task_type": "review"},
+        ])
+
+        result = run_gza("mark-completed", "1", "--verify-git", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no branch" in result.stdout
+        assert "Use --force" in result.stdout
+
     def test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
         """mark-completed warns when task status is not failed."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -6928,17 +6877,6 @@ class TestMarkCompletedCommand:
         assert "Warning" in result.stdout
         assert "not in failed status" in result.stdout
 
-    def test_mark_completed_errors_if_no_branch_on_task(self, tmp_path: Path):
-        """mark-completed errors when task has no branch set."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Task without branch", "status": "failed"},
-        ])
-
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "no branch" in result.stdout
-
     def test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
         """mark-completed errors when git branch does not exist."""
         from gza.db import SqliteTaskStore
@@ -6959,11 +6897,11 @@ class TestMarkCompletedCommand:
 
         assert result.returncode == 1
         assert "does not exist" in result.stdout
+        assert "Use --force" in result.stdout
 
     def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
         """mark-completed sets status='unmerged' when branch has commits."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -6998,7 +6936,6 @@ class TestMarkCompletedCommand:
     def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
         """mark-completed sets status='completed' when branch has no commits."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -7027,10 +6964,31 @@ class TestMarkCompletedCommand:
         assert updated.status == "completed"
         assert updated.has_commits is False
 
+    def test_mark_completed_force_stale_in_progress_recovery(self, tmp_path: Path):
+        """--force supports stale in_progress recovery without git validation."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Stale worker task", task_type="implement")
+        task.status = "in_progress"
+        store.update(task)
+
+        result = run_gza("mark-completed", "1", "--force", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "in_progress → completed" in result.stdout
+
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "completed"
+
     def test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
         """mark-completed does not warn when task is in failed status."""
         from gza.db import SqliteTaskStore
-        from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -7050,6 +7008,31 @@ class TestMarkCompletedCommand:
 
         assert result.returncode == 0
         assert "Warning" not in result.stdout
+
+
+class TestForceCompleteCompatibility:
+    """Backward compatibility tests for deprecated force-complete command."""
+
+    def test_force_complete_shows_deprecation_and_uses_force_mode(self, tmp_path: Path):
+        """force-complete remains supported with deprecation messaging."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Failed task", "status": "failed", "task_type": "implement"},
+        ])
+
+        result = run_gza("force-complete", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "deprecated" in result.stdout
+        assert "mark-completed <task_id> --force" in result.stdout
+        assert "status-only" in result.stdout
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        updated = store.get(1)
+        assert updated is not None
+        assert updated.status == "completed"
 
 
 class TestMergeStatusTracking:

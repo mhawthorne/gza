@@ -3419,7 +3419,22 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
 
 def cmd_force_complete(args: argparse.Namespace) -> int:
-    """Manually mark a task as completed (for infrastructure failures)."""
+    """Deprecated alias for mark-completed --force."""
+    print("Warning: 'force-complete' is deprecated. Use 'mark-completed <task_id> --force' instead.")
+    args.force = True
+    args.verify_git = False
+    return cmd_mark_completed(args)
+
+
+def _default_mark_completed_mode(task_type: str) -> str:
+    """Choose default completion mode based on task type."""
+    if task_type in {"task", "implement", "improve"}:
+        return "verify-git"
+    return "force"
+
+
+def cmd_mark_completed(args: argparse.Namespace) -> int:
+    """Mark a task as completed with either git verification or status-only mode."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -3432,50 +3447,42 @@ def cmd_force_complete(args: argparse.Namespace) -> int:
         print(f"Error: Task #{args.task_id} is already completed")
         return 1
 
-    old_status = task.status
-    store.mark_completed(task, branch=task.branch if task.branch else None)
-    print(f"✓ Task #{args.task_id} status changed: {old_status} → completed")
-    return 0
-
-
-def cmd_mark_completed(args: argparse.Namespace) -> int:
-    """Mark a failed task as completed, checking git for actual commits."""
-    config = Config.load(args.project_dir)
-    store = get_store(config)
-
-    task = store.get(args.task_id)
-    if not task:
-        print(f"Error: Task #{args.task_id} not found")
+    if args.verify_git and args.force:
+        print("Error: Cannot use --verify-git and --force together")
         return 1
+
+    mode = "verify-git" if args.verify_git else ("force" if args.force else _default_mark_completed_mode(task.task_type))
 
     # Warn if task wasn't failed (but still proceed)
     if task.status != "failed":
         print(f"Warning: Task #{args.task_id} is not in failed status (current status: {task.status}), proceeding anyway")
 
-    # Check that task has a branch
+    if mode == "force":
+        old_status = task.status
+        store.mark_completed(task, branch=task.branch if task.branch else None)
+        print(f"✓ Task #{args.task_id} status changed: {old_status} → completed (status-only)")
+        return 0
+
+    # verify-git mode: validate branch and commit state
     if not task.branch:
-        print(f"Error: Task #{args.task_id} has no branch set")
+        print(f"Error: Task #{args.task_id} has no branch set. Use --force for status-only completion.")
         return 1
 
-    # Check git for branch existence
     git = Git(config.project_dir)
     if not git.branch_exists(task.branch):
-        print(f"Error: Branch '{task.branch}' does not exist")
+        print(f"Error: Branch '{task.branch}' does not exist. Use --force for status-only completion.")
         return 1
 
-    # Set has_commits based on actual commits on branch
     default_branch = git.default_branch()
     commit_count = git.count_commits_ahead(task.branch, default_branch)
-    has_commits = commit_count > 0
-
-    if not has_commits:
-        # Log if no commits found, but still mark completed
+    if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
         store.mark_completed(task, branch=task.branch, has_commits=False)
         print(f"✓ Task #{args.task_id} marked as completed")
-    else:
-        store.mark_completed(task, branch=task.branch, has_commits=True)
-        print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
+        return 0
+
+    store.mark_completed(task, branch=task.branch, has_commits=True)
+    print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
 
@@ -5174,27 +5181,38 @@ def main() -> int:
     )
     add_common_args(stop_parser)
 
-    # force-complete command
+    # force-complete command (deprecated alias)
     force_complete_parser = subparsers.add_parser(
         "force-complete",
-        help="Manually mark a task as completed (for infrastructure failures)",
+        help=argparse.SUPPRESS,
     )
     force_complete_parser.add_argument(
         "task_id",
         type=int,
-        help="Task ID to force-complete",
+        help=argparse.SUPPRESS,
     )
     add_common_args(force_complete_parser)
 
     # mark-completed command
     mark_completed_parser = subparsers.add_parser(
         "mark-completed",
-        help="Mark a failed task as completed, checking git for actual commits on the branch",
+        help="Mark a task as completed (defaults by task type; supports --verify-git or --force)",
     )
     mark_completed_parser.add_argument(
         "task_id",
         type=int,
         help="Task ID to mark as completed",
+    )
+    mark_completed_mode_group = mark_completed_parser.add_mutually_exclusive_group()
+    mark_completed_mode_group.add_argument(
+        "--verify-git",
+        action="store_true",
+        help="Validate branch/commits against git before completion",
+    )
+    mark_completed_mode_group.add_argument(
+        "--force",
+        action="store_true",
+        help="Status-only completion (for non-code tasks or infrastructure recovery)",
     )
     add_common_args(mark_completed_parser)
 
