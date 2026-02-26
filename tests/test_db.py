@@ -388,7 +388,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -498,7 +498,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -516,6 +516,29 @@ class TestTaskResume:
 
 class TestNumTurnsFields:
     """Tests for num_turns_reported and num_turns_computed fields."""
+
+    def test_num_steps_reported_stored_and_retrieved(self, tmp_path: Path):
+        """Step metrics should be stored and retrieved correctly."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        stats = TaskStats(
+            num_steps_reported=12,
+            num_steps_computed=10,
+            num_turns_reported=6,
+            num_turns_computed=5,
+        )
+        store.mark_completed(task, has_commits=False, stats=stats)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.num_steps_reported == 12
+        assert retrieved.num_steps_computed == 10
+        assert retrieved.num_turns_reported == 6
+        assert retrieved.num_turns_computed == 5
 
     def test_num_turns_reported_stored_and_retrieved(self, tmp_path: Path):
         """Test that num_turns_reported is stored and retrieved correctly."""
@@ -565,6 +588,41 @@ class TestNumTurnsFields:
 
         stats = store.get_stats()
         assert stats["total_turns"] == 12
+
+    def test_get_stats_aggregates_num_steps_reported(self, tmp_path: Path):
+        """Test that get_stats sums num_steps_reported correctly."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task1 = store.add(prompt="Task 1")
+        store.mark_completed(task1, has_commits=False, stats=TaskStats(num_steps_reported=8))
+
+        task2 = store.add(prompt="Task 2")
+        store.mark_completed(task2, has_commits=False, stats=TaskStats(num_steps_reported=9))
+
+        stats = store.get_stats()
+        assert stats["total_steps"] == 17
+
+    def test_get_stats_aggregates_step_fallback_chain(self, tmp_path: Path):
+        """Test that get_stats uses steps -> computed steps -> legacy turns fallback."""
+        from gza.db import TaskStats
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        reported = store.add(prompt="Reported steps")
+        store.mark_completed(reported, has_commits=False, stats=TaskStats(num_steps_reported=8))
+
+        computed_only = store.add(prompt="Computed steps")
+        store.mark_completed(computed_only, has_commits=False, stats=TaskStats(num_steps_computed=5))
+
+        turns_only = store.add(prompt="Legacy turns")
+        store.mark_completed(turns_only, has_commits=False, stats=TaskStats(num_turns_reported=3))
+
+        stats = store.get_stats()
+        assert stats["total_steps"] == 16
 
     def test_migration_v7_to_v8_adds_columns(self, tmp_path: Path):
         """Test that migration from v7 to v8 adds num_turns_reported and num_turns_computed."""
@@ -625,7 +683,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -810,7 +868,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1145,7 +1203,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1472,6 +1530,16 @@ class TestFailureReasonTracking:
         result = extract_failure_reason(log_file)
         assert result == "TEST_FAILURE"
 
+    def test_extract_failure_reason_detects_max_steps(self, tmp_path: Path):
+        """extract_failure_reason detects MAX_STEPS marker."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Some output\n[GZA_FAILURE:MAX_STEPS]\nEnd of output")
+
+        result = extract_failure_reason(log_file)
+        assert result == "MAX_STEPS"
+
     def test_extract_failure_reason_returns_last_match(self, tmp_path: Path):
         """extract_failure_reason returns the last matching marker."""
         from gza.db import extract_failure_reason
@@ -1600,7 +1668,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1618,6 +1686,7 @@ class TestFailureReasonTracking:
         """KNOWN_FAILURE_REASONS contains expected values."""
         from gza.db import KNOWN_FAILURE_REASONS
 
+        assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
         assert "TEST_FAILURE" in KNOWN_FAILURE_REASONS
         assert "UNKNOWN" in KNOWN_FAILURE_REASONS
@@ -1770,7 +1839,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1850,7 +1919,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2307,3 +2376,81 @@ class TestRetryChainDependencyResolution:
 
         count = store.count_blocked_tasks()
         assert count == 1
+
+
+class TestStepColumnsMigration:
+    """Tests for step-metric columns migration (v14 -> v15)."""
+
+    def test_migration_v14_to_v15_adds_step_columns_and_backfills(self, tmp_path: Path):
+        """v14 databases should gain step columns and copy turn values into them."""
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (14)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT
+            )
+            """
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO tasks (prompt, status, created_at, num_turns_reported, num_turns_computed) VALUES (?, ?, ?, ?, ?)",
+            ("Legacy task", "completed", now, 4, 3),
+        )
+        conn.commit()
+        conn.close()
+
+        store = SqliteTaskStore(db_path)
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT version FROM schema_version")
+        version = cur.fetchone()[0]
+        conn.close()
+        assert version == 15
+
+        migrated = store.get(1)
+        assert migrated is not None
+        assert migrated.num_steps_reported == 4
+        assert migrated.num_steps_computed == 3

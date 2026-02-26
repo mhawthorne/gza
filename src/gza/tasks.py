@@ -47,6 +47,8 @@ class Task:
     based_on: int | None = None  # Reference to parent task id
     has_commits: bool | None = None
     duration_seconds: float | None = None
+    num_steps_reported: int | None = None  # Step count reported by the provider
+    num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
@@ -93,6 +95,8 @@ class Task:
             based_on=data.get("based_on"),
             has_commits=data.get("has_commits"),
             duration_seconds=data.get("duration_seconds"),
+            num_steps_reported=data.get("num_steps_reported"),
+            num_steps_computed=data.get("num_steps_computed"),
             num_turns_reported=data.get("num_turns_reported", data.get("num_turns")),
             num_turns_computed=data.get("num_turns_computed"),
             cost_usd=data.get("cost_usd"),
@@ -133,6 +137,10 @@ class Task:
             result["has_commits"] = self.has_commits
         if self.duration_seconds:
             result["duration_seconds"] = self.duration_seconds
+        if self.num_steps_reported:
+            result["num_steps_reported"] = self.num_steps_reported
+        if self.num_steps_computed:
+            result["num_steps_computed"] = self.num_steps_computed
         if self.num_turns_reported:
             result["num_turns_reported"] = self.num_turns_reported
         if self.num_turns_computed:
@@ -148,6 +156,8 @@ class Task:
 class TaskStats:
     """Statistics from a task run."""
     duration_seconds: float | None = None
+    num_steps_reported: int | None = None  # Step count reported by the provider
+    num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
@@ -267,6 +277,8 @@ class YamlTaskStore:
             task.report_file = report_file
         if stats:
             task.duration_seconds = stats.duration_seconds
+            task.num_steps_reported = stats.num_steps_reported
+            task.num_steps_computed = stats.num_steps_computed
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
@@ -289,6 +301,8 @@ class YamlTaskStore:
             task.branch = branch
         if stats:
             task.duration_seconds = stats.duration_seconds
+            task.num_steps_reported = stats.num_steps_reported
+            task.num_steps_computed = stats.num_steps_computed
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd
@@ -312,6 +326,8 @@ class YamlTaskStore:
             task.log_file = log_file
         if stats:
             task.duration_seconds = stats.duration_seconds
+            task.num_steps_reported = stats.num_steps_reported
+            task.num_steps_computed = stats.num_steps_computed
             task.num_turns_reported = stats.num_turns_reported
             task.num_turns_computed = stats.num_turns_computed
             task.cost_usd = stats.cost_usd

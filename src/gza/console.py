@@ -84,7 +84,16 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
         duration_str = format_duration(stats.duration_seconds)
         parts.append(f"[dim]Runtime:[/dim] [bold]{duration_str}[/bold]")
 
-    if stats.num_turns_reported is not None:
+    if stats.num_steps_reported is not None:
+        steps_display = str(stats.num_steps_reported)
+        if stats.num_steps_computed is not None and stats.num_steps_computed != stats.num_steps_reported:
+            steps_display += f" (computed: {stats.num_steps_computed})"
+        if stats.num_turns_reported is not None and stats.num_turns_reported != stats.num_steps_reported:
+            steps_display += f" (legacy turns: {stats.num_turns_reported})"
+        parts.append(f"[dim]Steps:[/dim] [bold]{steps_display}[/bold]")
+    elif stats.num_steps_computed is not None:
+        parts.append(f"[dim]Steps:[/dim] [bold]{stats.num_steps_computed}[/bold]")
+    elif stats.num_turns_reported is not None:
         turns_display = str(stats.num_turns_reported)
         if stats.num_turns_computed is not None and stats.num_turns_computed != stats.num_turns_reported:
             turns_display += f" (computed: {stats.num_turns_computed})"

@@ -194,7 +194,13 @@ class GeminiProvider(Provider):
         if config.model:
             cmd.extend(["-m", config.model])
 
-        return self._run_with_output_parsing(cmd, log_file, config.timeout_minutes, config.model)
+        return self._run_with_output_parsing(
+            cmd,
+            log_file,
+            config.timeout_minutes,
+            config.model,
+            max_steps=config.max_steps,
+        )
 
     def _run_direct(
         self,
@@ -219,6 +225,7 @@ class GeminiProvider(Provider):
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, config.model, cwd=work_dir,
             chat_text_display_length=config.chat_text_display_length,
+            max_steps=config.max_steps,
         )
 
     def _run_with_output_parsing(
@@ -229,6 +236,7 @@ class GeminiProvider(Provider):
         model: str,
         cwd: Path | None = None,
         chat_text_display_length: int = 0,
+        max_steps: int = 50,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
         formatter = StreamOutputFormatter()
@@ -300,10 +308,15 @@ class GeminiProvider(Provider):
             tool_calls = stats.get("tool_calls")
             if tool_calls is not None:
                 result.num_turns_reported = tool_calls
+                result.num_steps_reported = tool_calls
+                result.num_steps_computed = tool_calls
 
             # Calculate cost from tokens
             if input_tokens is not None and output_tokens is not None:
                 used_model = model or accumulated.get("model", "default")
                 result.cost_usd = calculate_cost(used_model, input_tokens, output_tokens)
+
+            if result.num_steps_computed is not None and result.num_steps_computed > max_steps:
+                result.error_type = "max_steps"
 
         return result

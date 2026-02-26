@@ -20,6 +20,7 @@ from gza.runner import (
     _save_wip_changes,
     _restore_wip_changes,
     _squash_wip_commits,
+    _run_result_to_stats,
     post_review_to_pr,
     run,
 )
@@ -768,6 +769,69 @@ class TestRunNonCodeTaskPRPosting:
             assert pr_post_called[0]['required'] is False
         finally:
             gza.runner.post_review_to_pr = original_post_review
+
+
+class TestMaxStepsHandling:
+    """Tests for max-steps behavior in runner integration."""
+
+    def test_run_result_to_stats_includes_step_fields(self):
+        """Step metrics should be transferred from RunResult to TaskStats."""
+        result = RunResult(
+            exit_code=0,
+            duration_seconds=12.3,
+            num_steps_reported=7,
+            num_steps_computed=8,
+            num_turns_reported=5,
+            num_turns_computed=5,
+            cost_usd=0.12,
+            input_tokens=100,
+            output_tokens=200,
+        )
+        stats = _run_result_to_stats(result)
+        assert stats.num_steps_reported == 7
+        assert stats.num_steps_computed == 8
+        assert stats.num_turns_reported == 5
+
+    def test_non_code_task_marks_max_steps_failure_reason(self, tmp_path: Path):
+        """Provider max_steps errors should be stored as MAX_STEPS."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.task_id = "20260225-plan-task"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 2
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=4.2,
+            num_steps_computed=3,
+            error_type="max_steps",
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "MAX_STEPS"
 
     def test_run_non_code_task_skips_pr_posting_for_explore(self, tmp_path: Path):
         """Test that _run_non_code_task does NOT call post_review_to_pr for explore tasks."""

@@ -15,8 +15,8 @@ from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 
 
-def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str, int | None]:
-    """Get the effective model, provider, and max_turns for a task.
+def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str, int]:
+    """Get the effective model, provider, and max_steps for a task.
 
     Priority order for provider selection:
     1. Task-specific provider (task.provider)
@@ -26,20 +26,20 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     1. Task-specific model (task.model)
     2. Provider-aware config resolution (Config.get_model_for_task)
 
-    Priority order for max_turns selection:
-    1. Provider-aware config resolution (Config.get_max_turns_for_task)
+    Priority order for max_steps selection:
+    1. Provider-aware config resolution (Config.get_max_steps_for_task)
 
     Args:
         task: The task to get config for
         config: The base configuration
 
     Returns:
-        Tuple of (model, provider, max_turns) where model can be None
+        Tuple of (model, provider, max_steps) where model can be None
     """
     provider = task.provider if task.provider else config.provider
     model = task.model if task.model else config.get_model_for_task(task.task_type, provider)
-    max_turns = config.get_max_turns_for_task(task.task_type, provider)
-    return model, provider, max_turns
+    max_steps = config.get_max_steps_for_task(task.task_type, provider)
+    return model, provider, max_steps
 
 
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
@@ -361,6 +361,8 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
     """Convert a provider RunResult to TaskStats for storage."""
     return TaskStats(
         duration_seconds=result.duration_seconds,
+        num_steps_reported=result.num_steps_reported,
+        num_steps_computed=result.num_steps_computed,
         num_turns_reported=result.num_turns_reported,
         num_turns_computed=result.num_turns_computed,
         cost_usd=result.cost_usd,
@@ -693,15 +695,15 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         return 0
 
     # Get effective model and provider for this task
-    effective_model, effective_provider, effective_max_turns = get_effective_config_for_task(task, config)
+    effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
     # Create a modified config with task-specific settings
     from copy import copy
     task_config = copy(config)
     task_config.model = effective_model or ""
     task_config.provider = effective_provider
-    if effective_max_turns is not None:
-        task_config.max_turns = effective_max_turns
+    task_config.max_steps = effective_max_steps
+    task_config.max_turns = effective_max_steps
 
     # Get the provider for this task
     provider = get_provider(task_config)
@@ -918,19 +920,19 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             store.update(task)
 
         # Handle failures - check error_type first, then exit codes
-        if result.error_type == "max_turns":
+        if result.error_type in ("max_turns", "max_steps"):
             # Save WIP changes before marking failed
             _save_wip_changes(task, worktree_git, config, branch_name)
-            error_message(f"Task failed: max turns of {config.max_turns} exceeded")
+            error_message(f"Task failed: max steps of {task_config.max_steps} exceeded")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            # Check log for agent-written marker; fall back to MAX_TURNS (provider-detected)
+            # Check log for agent-written marker; prefer MAX_STEPS for provider-detected over-budget failures.
             detected = extract_failure_reason(log_file)
-            failure_reason = detected if detected != "UNKNOWN" else "MAX_TURNS"
+            failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:
@@ -1180,8 +1182,8 @@ def _run_non_code_task(
             store.update(task)
 
         # Handle failures - check error_type first, then exit codes
-        if result.error_type == "max_turns":
-            error_message(f"Task failed: max turns of {config.max_turns} exceeded")
+        if result.error_type in ("max_turns", "max_steps"):
+            error_message(f"Task failed: max steps of {config.max_steps} exceeded")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
             next_steps([
@@ -1189,7 +1191,7 @@ def _run_non_code_task(
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
             detected = extract_failure_reason(log_file)
-            failure_reason = detected if detected != "UNKNOWN" else "MAX_TURNS"
+            failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:

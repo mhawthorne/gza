@@ -249,7 +249,7 @@ class ClaudeProvider(Provider):
             cmd.extend(["--resume", resume_session_id])
 
         cmd.extend(config.claude.args)
-        cmd.extend(["--max-turns", str(config.max_turns)])
+        cmd.extend(["--max-turns", str(config.max_steps)])
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
@@ -275,7 +275,7 @@ class ClaudeProvider(Provider):
             cmd.extend(["--resume", resume_session_id])
 
         cmd.extend(config.claude.args)
-        cmd.extend(["--max-turns", str(config.max_turns)])
+        cmd.extend(["--max-turns", str(config.max_steps)])
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
@@ -455,6 +455,7 @@ class ClaudeProvider(Provider):
         if result_data:
             if "num_turns" in result_data:
                 result.num_turns_reported = result_data["num_turns"]
+                result.num_steps_reported = result_data["num_turns"]
             if "total_cost_usd" in result_data:
                 result.cost_usd = result_data["total_cost_usd"]
             if "session_id" in result_data:
@@ -462,12 +463,13 @@ class ClaudeProvider(Provider):
             # Check for error subtypes (e.g., error_max_turns)
             subtype = result_data.get("subtype", "")
             if subtype == "error_max_turns":
-                result.error_type = "max_turns"
+                result.error_type = "max_steps"
 
         # Store our internally computed turn count (unique assistant message IDs)
         seen_msg_ids = accumulated_data.get("seen_msg_ids", set())
         if seen_msg_ids:
             result.num_turns_computed = len(seen_msg_ids)
+            result.num_steps_computed = len(seen_msg_ids)
 
         # Store accumulated token counts
         if "total_input_tokens" in accumulated_data:

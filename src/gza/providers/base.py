@@ -362,12 +362,14 @@ class RunResult:
     """Result from running a code generation provider."""
     exit_code: int
     duration_seconds: float = 0.0
+    num_steps_reported: int | None = None  # Step count reported by the provider
+    num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider (e.g., Claude's result event)
     num_turns_computed: int | None = None  # Turn count computed internally (e.g., by counting unique message IDs)
     cost_usd: float | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
-    error_type: str | None = None  # e.g., "max_turns" when turn limit exceeded
+    error_type: str | None = None  # e.g., "max_steps" when step limit exceeded
     session_id: str | None = None  # Claude session ID for resume capability
     _accumulated_data: dict[str, Any] | None = None  # Internal data for parsing
 
@@ -491,6 +493,10 @@ class Provider(ABC):
 
                     if parse_output:
                         parse_output(line, accumulated_data, log)
+                    if accumulated_data.get("__terminate_process__"):
+                        process.terminate()
+                        accumulated_data["__terminated_by_parser__"] = True
+                        break
 
             process.wait()
 
@@ -500,6 +506,9 @@ class Provider(ABC):
             exit_code=process.returncode,
             duration_seconds=round(duration_seconds, 1),
         )
+        if accumulated_data.get("__terminated_by_parser__"):
+            # Keep successful parser-directed termination as non-shell-failure.
+            result.exit_code = 0
 
         # Let caller extract stats from accumulated_data
         result._accumulated_data = accumulated_data

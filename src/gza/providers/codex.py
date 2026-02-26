@@ -202,7 +202,7 @@ class CodexProvider(Provider):
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt if not resume_session_id else None,
-            model=config.model, max_turns=config.max_turns,
+            model=config.model, max_steps=config.max_steps,
         )
 
     def _run_direct(
@@ -235,7 +235,7 @@ class CodexProvider(Provider):
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir if not resume_session_id else None,
             stdin_input=prompt if not resume_session_id else None, model=config.model,
-            max_turns=config.max_turns,
+            max_steps=config.max_steps,
         )
 
     def _run_with_output_parsing(
@@ -246,7 +246,7 @@ class CodexProvider(Provider):
         cwd: Path | None = None,
         stdin_input: str | None = None,
         model: str = "",
-        max_turns: int = 50,
+        max_steps: int = 50,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
         formatter = StreamOutputFormatter()
@@ -266,14 +266,9 @@ class CodexProvider(Provider):
                         data["item_count"] = 0
                         data["item_count_in_turn"] = 0
                         data["computed_turn_count"] = 0
+                        data["computed_step_count"] = 0
                     data["turn_count"] += 1
                     data["item_count_in_turn"] = 0
-
-                    # Check if we've exceeded max_turns
-                    if data["turn_count"] > max_turns:
-                        data["exceeded_max_turns"] = True
-                        # Note: We can't kill the process from here, so we just mark it
-                        # The actual process will be killed by the timeout mechanism
 
                     # Calculate runtime
                     elapsed_seconds = int(time.time() - data["start_time"])
@@ -297,7 +292,11 @@ class CodexProvider(Provider):
                     item = event.get("item", {})
                     item_type = item.get("type")
                     data["item_count"] = data.get("item_count", 0) + 1
+                    data["computed_step_count"] = data.get("computed_step_count", 0) + 1
                     data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
+                    if data["computed_step_count"] > max_steps:
+                        data["exceeded_max_steps"] = True
+                        data["__terminate_process__"] = True
                     turn_count = data.get("turn_count", 0)
                     item_idx = data.get("item_count_in_turn", 0)
                     item_prefix = f"[T{turn_count}.{item_idx}] " if turn_count > 0 else ""
@@ -355,6 +354,8 @@ class CodexProvider(Provider):
                 result.num_turns_reported = accumulated["turn_count"]
             if "computed_turn_count" in accumulated:
                 result.num_turns_computed = accumulated["computed_turn_count"]
+            if "computed_step_count" in accumulated:
+                result.num_steps_computed = accumulated["computed_step_count"]
 
             # Set token counts
             if "input_tokens" in accumulated:
@@ -370,9 +371,9 @@ class CodexProvider(Provider):
                     model,
                 )
 
-            # Check if we exceeded max turns
-            if accumulated.get("exceeded_max_turns"):
-                result.error_type = "max_turns"
+            # Check if we exceeded max steps
+            if accumulated.get("exceeded_max_steps"):
+                result.error_type = "max_steps"
 
             # Store session ID for resume capability
             if "thread_id" in accumulated:

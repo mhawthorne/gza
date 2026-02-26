@@ -399,6 +399,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Override max_turns if specified
     if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
         config.max_turns = args.max_turns
 
     # Handle background mode
@@ -611,11 +612,23 @@ def format_stats(task: DbTask) -> str:
             mins = int(task.duration_seconds // 60)
             secs = int(task.duration_seconds % 60)
             parts.append(f"{mins}m{secs}s")
-    if task.num_turns_reported is not None:
-        parts.append(f"{task.num_turns_reported} turns")
+    resolved_steps = get_task_step_count(task)
+    if resolved_steps is not None:
+        parts.append(f"{resolved_steps} steps")
     if task.cost_usd is not None:
         parts.append(f"${task.cost_usd:.4f}")
     return " | ".join(parts) if parts else ""
+
+
+def get_task_step_count(task: DbTask) -> int | None:
+    """Return a task's canonical step count using step-first fallback."""
+    if task.num_steps_reported is not None:
+        return task.num_steps_reported
+    if task.num_steps_computed is not None:
+        return task.num_steps_computed
+    if task.num_turns_reported is not None:
+        return task.num_turns_reported
+    return None
 
 
 def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
@@ -1692,7 +1705,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"  Tasks:        {stats['completed']} completed, {stats['failed']} failed")
     print(f"  Total cost:   ${stats['total_cost']:.2f}")
     print(f"  Total time:   {format_duration(stats['total_duration'], verbose=True)}")
-    print(f"  Total turns:  {stats['total_turns']}")
+    print(f"  Total steps:  {stats['total_steps']}")
     if tasks_with_cost:
         print(f"  Avg cost:     ${avg_cost:.2f}/task")
     print()
@@ -1725,7 +1738,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     prompt_width = max(20, table_width - fixed_width)  # At least 20 chars for prompt
 
     # Table header
-    print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Turns':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
+    print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Steps':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
     print("-" * table_width)
 
     for task in recent:
@@ -1733,7 +1746,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
         id_str = f"#{task.id}" if task.id is not None else "-"
         type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
-        turns_str = str(task.num_turns_reported) if task.num_turns_reported is not None else "-"
+        resolved_steps = get_task_step_count(task)
+        turns_str = str(resolved_steps) if resolved_steps is not None else "-"
         time_str = format_duration(task.duration_seconds, verbose=True) if task.duration_seconds else "-"
 
         # Calculate prompt length
@@ -3221,6 +3235,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     # Override max_turns if specified
     if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
         config.max_turns = args.max_turns
 
     store = get_store(config)
@@ -3340,6 +3355,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     # Override max_turns if specified
     if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
         config.max_turns = args.max_turns
 
     store = get_store(config)
@@ -3494,6 +3510,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     # Override max_turns if specified
     if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
         config.max_turns = args.max_turns
 
     store = get_store(config)
