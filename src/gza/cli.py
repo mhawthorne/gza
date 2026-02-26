@@ -3643,10 +3643,18 @@ def cmd_learnings(args: argparse.Namespace) -> int:
     if subcommand == "update":
         store = get_store(config)
         window = args.window if hasattr(args, "window") and args.window is not None else DEFAULT_LEARNINGS_WINDOW
+        if window <= 0:
+            print("Error: --window must be a positive integer", file=sys.stderr)
+            return 1
         result = regenerate_learnings(store, config, window=window)
         print(f"Updated learnings: {result.path.relative_to(config.project_dir)}")
         print(f"  Tasks used: {result.tasks_used}")
         print(f"  Learnings: {result.learnings_count}")
+        print(
+            "  Delta: "
+            f"+{result.added_count} / -{result.removed_count} / ={result.retained_count} "
+            f"(churn {result.churn_percent:.1f}%)"
+        )
         return 0
 
     print(f"Unknown learnings subcommand: {subcommand}", file=sys.stderr)

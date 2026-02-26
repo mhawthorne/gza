@@ -7319,6 +7319,7 @@ class TestLearningsCommand:
 
         assert result.returncode == 0
         assert "Updated learnings" in result.stdout
+        assert "Delta:" in result.stdout
         learnings_path = tmp_path / ".gza" / "learnings.md"
         assert learnings_path.exists()
         assert "Use dedicated fixtures for tests" in learnings_path.read_text()

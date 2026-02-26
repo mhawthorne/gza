@@ -1,5 +1,6 @@
 """Tests for learnings generation."""
 
+import json
 from pathlib import Path
 
 from gza.config import Config
@@ -31,6 +32,9 @@ def test_regenerate_learnings_writes_file_from_completed_tasks(tmp_path: Path):
     result = regenerate_learnings(store, config, window=10)
 
     assert result.tasks_used == 1
+    assert result.added_count >= 1
+    assert result.removed_count == 0
+    assert result.retained_count == 0
     assert result.path.exists()
     content = result.path.read_text()
     assert "# Project Learnings" in content
@@ -70,3 +74,53 @@ def test_auto_regenerate_only_on_interval(tmp_path: Path):
     result = maybe_auto_regenerate_learnings(store, config, interval=5, window=10)
     assert result is not None
     assert (tmp_path / ".gza" / "learnings.md").exists()
+
+
+def test_regenerate_learnings_reports_delta_counts(tmp_path: Path):
+    """Delta metrics should reflect previous vs regenerated learnings."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    learnings_path = tmp_path / ".gza" / "learnings.md"
+    learnings_path.parent.mkdir(parents=True, exist_ok=True)
+    learnings_path.write_text(
+        "# Project Learnings\n\n## Recent Patterns\n- Keep old pattern\n- Remove this\n"
+    )
+
+    task = store.add("Task", task_type="implement")
+    store.mark_completed(
+        task,
+        output_content="- Keep old pattern\n- Add new pattern\n",
+        has_commits=False,
+    )
+
+    result = regenerate_learnings(store, config, window=10)
+    assert result.retained_count == 1
+    assert result.added_count == 1
+    assert result.removed_count == 1
+    assert result.churn_percent == 100.0
+
+
+def test_regenerate_learnings_writes_history_log(tmp_path: Path):
+    """Regeneration should append metrics to .gza/learnings_history.jsonl."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task", task_type="implement")
+    store.mark_completed(task, output_content="- Keep pattern\n", has_commits=False)
+
+    regenerate_learnings(store, config, window=10)
+
+    history_path = tmp_path / ".gza" / "learnings_history.jsonl"
+    assert history_path.exists()
+    lines = history_path.read_text().strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["window"] == 10
+    assert record["tasks_used"] == 1
+    assert record["learnings_count"] >= 1
+    assert "added_count" in record
+    assert "removed_count" in record
+    assert "retained_count" in record
+    assert "churn_percent" in record
+    assert record["learnings_file"] == ".gza/learnings.md"
