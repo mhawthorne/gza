@@ -82,6 +82,25 @@ class TestTaskChaining:
         # Could be task2 or task3 depending on order
         assert next_task.id in (task2.id, task3.id)
 
+    def test_get_in_progress_returns_only_in_progress_tasks(self, tmp_path: Path):
+        """Test get_in_progress returns only in-progress tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        pending = store.add("Pending task")
+        in_progress = store.add("In-progress task")
+        completed = store.add("Completed task")
+
+        store.mark_in_progress(in_progress)
+        completed.status = "completed"
+        completed.completed_at = datetime.now(timezone.utc)
+        store.update(completed)
+        store.update(pending)
+
+        rows = store.get_in_progress()
+        assert len(rows) == 1
+        assert rows[0].id == in_progress.id
+
     def test_is_task_blocked(self, tmp_path: Path):
         """Test is_task_blocked correctly identifies blocked tasks."""
         db_path = tmp_path / "test.db"

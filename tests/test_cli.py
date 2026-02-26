@@ -2456,6 +2456,112 @@ class TestPsCommand:
         # Cleanup
         registry.remove("w-test-ps")
 
+    def test_ps_reconciles_db_and_worker_with_source_both(self, tmp_path: Path):
+        """PS dedupes by task_id and marks row source as both."""
+        import json
+        import os
+
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Reconciled task")
+        store.mark_in_progress(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-both",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--json", cwd=tmp_path)
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["source"] == "both"
+        assert rows[0]["is_orphaned"] is False
+
+        registry.remove("w-test-both")
+
+    def test_ps_includes_db_only_in_progress_and_flags_orphaned(self, tmp_path: Path):
+        """PS includes in-progress DB rows even when no worker exists."""
+        import json
+
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("DB-only in-progress task")
+        store.mark_in_progress(task)
+
+        result = run_gza("ps", "--json", cwd=tmp_path)
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["source"] == "db"
+        assert rows[0]["status"] == "in_progress"
+        assert rows[0]["is_orphaned"] is True
+        assert "orphaned" in rows[0]["flags"]
+
+    def test_ps_flags_stale_and_orphaned_for_stale_worker_in_progress_task(self, tmp_path: Path):
+        """PS flags stale worker + orphaned in-progress task in reconciled row."""
+        import json
+
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Stale worker task")
+        store.mark_in_progress(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-stale-ps",
+                pid=999999,
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--json", cwd=tmp_path)
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["source"] == "both"
+        assert rows[0]["is_stale"] is True
+        assert rows[0]["is_orphaned"] is True
+        assert "stale" in rows[0]["flags"]
+        assert "orphaned" in rows[0]["flags"]
+
+        registry.remove("w-test-stale-ps")
+
 
 class TestHelpOutput:
     """Tests for CLI help output."""

@@ -767,6 +767,14 @@ class SqliteTaskStore:
             cur = conn.execute(query)
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_in_progress(self) -> list[Task]:
+        """Get all in-progress tasks, oldest first."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM tasks WHERE status = 'in_progress' ORDER BY started_at ASC, created_at ASC"
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_history(self, limit: int | None = 10, status: str | None = None, task_type: str | None = None) -> list[Task]:
         """Get completed/failed tasks, most recent first.
 
