@@ -99,8 +99,17 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
             turns_display += f" (computed: {stats.num_turns_computed})"
         parts.append(f"[dim]Turns:[/dim] [bold]{turns_display}[/bold]")
 
+    if stats.input_tokens is not None or stats.output_tokens is not None:
+        input_tokens = stats.input_tokens if stats.input_tokens is not None else 0
+        output_tokens = stats.output_tokens if stats.output_tokens is not None else 0
+        estimated_suffix = " [yellow](estimated)[/yellow]" if stats.tokens_estimated else ""
+        parts.append(
+            f"[dim]Tokens:[/dim] [bold]in {input_tokens:,} / out {output_tokens:,}[/bold]{estimated_suffix}"
+        )
+
     if stats.cost_usd is not None:
-        parts.append(f"[dim]Cost:[/dim] [bold]${stats.cost_usd:.4f}[/bold]")
+        estimated_suffix = " [yellow](estimated)[/yellow]" if stats.cost_estimated else ""
+        parts.append(f"[dim]Cost:[/dim] [bold]${stats.cost_usd:.4f}[/bold]{estimated_suffix}")
 
     if has_commits is not None:
         commit_value = "[green]yes[/green]" if has_commits else "no"

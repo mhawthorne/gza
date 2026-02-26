@@ -434,6 +434,8 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
         cost_usd=result.cost_usd,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
+        tokens_estimated=result.tokens_estimated,
+        cost_estimated=result.cost_estimated,
     )
 
 

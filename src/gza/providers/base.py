@@ -370,6 +370,8 @@ class RunResult:
     cost_usd: float | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    tokens_estimated: bool = False
+    cost_estimated: bool = False
     error_type: str | None = None  # e.g., "max_steps" when step limit exceeded
     session_id: str | None = None  # Claude session ID for resume capability
     _accumulated_data: dict[str, Any] | None = None  # Internal data for parsing

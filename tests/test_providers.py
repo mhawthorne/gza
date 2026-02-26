@@ -2465,6 +2465,81 @@ class TestCodexOutputParsing:
         mock_formatter.print_agent_message.assert_called()
         mock_formatter.print_error.assert_called()
 
+    def test_parses_usage_from_non_turn_completed_event(self, tmp_path):
+        """Should capture usage from completion events beyond turn.completed."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "response.completed",
+                "usage": {"input_tokens": 321, "output_tokens": 123, "cached_input_tokens": 7},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.input_tokens == 321
+        assert result.output_tokens == 123
+        assert result.cost_usd is not None
+
+    def test_estimates_tokens_when_usage_missing(self, tmp_path):
+        """Should estimate tokens/cost when no usage event is emitted."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "command_execution", "command": "echo hi", "aggregated_output": "hello world"},
+            }) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "working on it"},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+                stdin_input="run tests and summarize results",
+            )
+
+        assert result.input_tokens is not None
+        assert result.input_tokens > 0
+        assert result.output_tokens is not None
+        assert result.output_tokens > 0
+        assert result.cost_usd is not None
+        assert result.tokens_estimated is True
+        assert result.cost_estimated is True
+
 
 class TestSyncKeychainCredentials:
     """Tests for sync_keychain_credentials function."""

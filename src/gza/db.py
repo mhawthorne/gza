@@ -80,6 +80,8 @@ class TaskStats:
     cost_usd: float | None = None
     input_tokens: int | None = None   # Total input tokens (including cache tokens)
     output_tokens: int | None = None  # Total output tokens
+    tokens_estimated: bool = False
+    cost_estimated: bool = False
 
 
 # Schema version for migrations

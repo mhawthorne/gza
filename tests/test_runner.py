@@ -940,6 +940,22 @@ class TestMaxStepsHandling:
         assert stats.num_steps_reported == 7
         assert stats.num_steps_computed == 8
         assert stats.num_turns_reported == 5
+        assert stats.tokens_estimated is False
+        assert stats.cost_estimated is False
+
+    def test_run_result_to_stats_includes_estimation_flags(self):
+        """Estimation flags should be transferred from RunResult to TaskStats."""
+        result = RunResult(
+            exit_code=0,
+            input_tokens=123,
+            output_tokens=45,
+            cost_usd=0.01,
+            tokens_estimated=True,
+            cost_estimated=True,
+        )
+        stats = _run_result_to_stats(result)
+        assert stats.tokens_estimated is True
+        assert stats.cost_estimated is True
 
     def test_non_code_task_marks_max_steps_failure_reason(self, tmp_path: Path):
         """Provider max_steps errors should be stored as MAX_STEPS."""

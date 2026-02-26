@@ -33,6 +33,20 @@ CODEX_PRICING = {
 }
 
 
+def _estimate_tokens_from_chars(char_count: int) -> int:
+    """Estimate token count from character count using a simple 4-char heuristic."""
+    if char_count <= 0:
+        return 0
+    return (char_count + 3) // 4
+
+
+def _as_nonnegative_int(value: object) -> int:
+    """Convert value to non-negative int with safe fallback."""
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return 0
+
+
 def get_pricing_for_model(model: str) -> tuple[float, float]:
     """Get (input, output) pricing per million tokens for a model."""
     if not model:
@@ -273,6 +287,11 @@ class CodexProvider(Provider):
 
         def parse_codex_output(line: str, data: dict, log_handle=None) -> None:
             try:
+                if "approx_input_chars" not in data:
+                    data["approx_input_chars"] = len(stdin_input or "")
+                    data["approx_output_chars"] = 0
+                    data["usage_events_seen"] = set()
+
                 event = json.loads(line)
                 event_type = event.get("type")
 
@@ -323,12 +342,16 @@ class CodexProvider(Provider):
 
                     if item_type == "command_execution":
                         command = item.get("command", "")
+                        aggregated_output = item.get("aggregated_output", "")
+                        data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(command) + len(aggregated_output)
                         # Truncate to 80 chars
                         command = truncate_text(command, 80)
                         formatter.print_tool_event("Bash", command, prefix=f"  {item_prefix}")
 
                     elif item_type == "agent_message":
                         data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
+                        raw_text = item.get("text", "")
+                        data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(raw_text)
                         text = item.get("text", "").strip()
                         if text:
                             # Truncate to first line and 80 chars
@@ -341,15 +364,28 @@ class CodexProvider(Provider):
                         # Optional: show reasoning (currently skipped)
                         pass
 
-                elif event_type == "turn.completed":
-                    usage = event.get("usage", {})
-                    if "input_tokens" not in data:
-                        data["input_tokens"] = 0
-                        data["output_tokens"] = 0
-                        data["cached_tokens"] = 0
-                    data["input_tokens"] += usage.get("input_tokens", 0)
-                    data["output_tokens"] += usage.get("output_tokens", 0)
-                    data["cached_tokens"] += usage.get("cached_input_tokens", 0)
+                # Codex usage may appear in different completion/error events depending on
+                # execution mode. Capture usage from all completion/error events.
+                if (
+                    isinstance(event_type, str)
+                    and (event_type.endswith(".completed") or event_type.endswith(".error"))
+                    and isinstance(event.get("usage"), dict)
+                ):
+                    usage = event["usage"]
+                    input_tokens = _as_nonnegative_int(usage.get("input_tokens"))
+                    output_tokens = _as_nonnegative_int(usage.get("output_tokens"))
+                    cached_tokens = _as_nonnegative_int(usage.get("cached_input_tokens"))
+                    usage_key = (data.get("turn_count"), input_tokens, output_tokens, cached_tokens)
+                    usage_events_seen = data.get("usage_events_seen")
+                    if isinstance(usage_events_seen, set) and usage_key not in usage_events_seen:
+                        usage_events_seen.add(usage_key)
+                        if "input_tokens" not in data:
+                            data["input_tokens"] = 0
+                            data["output_tokens"] = 0
+                            data["cached_tokens"] = 0
+                        data["input_tokens"] += input_tokens
+                        data["output_tokens"] += output_tokens
+                        data["cached_tokens"] += cached_tokens
 
                 elif isinstance(event_type, str) and "error" in event_type:
                     message = event.get("message") or event.get("error") or json.dumps(event)
@@ -383,6 +419,15 @@ class CodexProvider(Provider):
             if "output_tokens" in accumulated:
                 result.output_tokens = accumulated["output_tokens"]
 
+            # Fallback estimate for interrupted one-turn runs with no usage events.
+            if result.input_tokens is None and result.output_tokens is None:
+                input_chars = _as_nonnegative_int(accumulated.get("approx_input_chars"))
+                output_chars = _as_nonnegative_int(accumulated.get("approx_output_chars"))
+                if input_chars > 0 or output_chars > 0:
+                    result.input_tokens = _estimate_tokens_from_chars(input_chars)
+                    result.output_tokens = _estimate_tokens_from_chars(output_chars)
+                    result.tokens_estimated = True
+
             # Calculate cost
             if result.input_tokens is not None and result.output_tokens is not None:
                 result.cost_usd = calculate_cost(
@@ -390,6 +435,8 @@ class CodexProvider(Provider):
                     result.output_tokens,
                     model,
                 )
+                if result.tokens_estimated:
+                    result.cost_estimated = True
 
             # Check if we exceeded max steps
             if accumulated.get("exceeded_max_steps"):
