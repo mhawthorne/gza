@@ -187,7 +187,16 @@ class CodexProvider(Provider):
         cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
 
         if resume_session_id:
-            cmd.extend(["codex", "exec", "resume", "--json", "--last"])
+            cmd.extend([
+                "codex", "exec", "resume", "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                resume_session_id,
+                "-",  # Read resume prompt from stdin
+            ])
+
+            # Add model if specified
+            if config.model:
+                cmd.extend(["-m", config.model])
         else:
             cmd.extend([
                 "codex", "exec", "--json",
@@ -201,7 +210,7 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, stdin_input=prompt if not resume_session_id else None,
+            cmd, log_file, config.timeout_minutes, stdin_input=prompt,
             model=config.model, max_steps=config.max_steps,
         )
 
@@ -219,7 +228,16 @@ class CodexProvider(Provider):
         ]
 
         if resume_session_id:
-            cmd.extend(["codex", "exec", "resume", "--json", "--last"])
+            cmd.extend([
+                "codex", "exec", "resume", "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                resume_session_id,
+                "-",  # Read resume prompt from stdin
+            ])
+
+            # Add model if specified
+            if config.model:
+                cmd.extend(["-m", config.model])
         else:
             cmd.extend([
                 "codex", "exec", "--json",
@@ -233,8 +251,8 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, cwd=work_dir if not resume_session_id else None,
-            stdin_input=prompt if not resume_session_id else None, model=config.model,
+            cmd, log_file, config.timeout_minutes, cwd=work_dir,
+            stdin_input=prompt, model=config.model,
             max_steps=config.max_steps,
         )
 

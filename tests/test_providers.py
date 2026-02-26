@@ -2004,6 +2004,89 @@ class TestCodexProvider:
                 mock_direct.assert_called_once()
                 mock_docker.assert_not_called()
 
+    def test_resume_direct_uses_session_id_and_stdin_prompt(self, tmp_path):
+        """Resume should target the stored session id and pass prompt via stdin."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=False,
+            timeout_minutes=10,
+            model="gpt-5.3-codex",
+        )
+        log_file = tmp_path / "log.txt"
+
+        with patch.object(provider, "_run_with_output_parsing") as mock_run:
+            mock_run.return_value = MagicMock(exit_code=0)
+            provider._run_direct(
+                config=config,
+                prompt="resume prompt",
+                log_file=log_file,
+                work_dir=tmp_path,
+                resume_session_id="thread_123",
+            )
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd == [
+            "timeout",
+            "10m",
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "thread_123",
+            "-",
+            "-m",
+            "gpt-5.3-codex",
+        ]
+        assert mock_run.call_args.kwargs["cwd"] == tmp_path
+        assert mock_run.call_args.kwargs["stdin_input"] == "resume prompt"
+
+    def test_resume_docker_uses_session_id_and_stdin_prompt(self, tmp_path):
+        """Docker resume should target the stored session id and pass prompt via stdin."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=True,
+            timeout_minutes=10,
+            model="gpt-5.3-codex",
+        )
+        log_file = tmp_path / "log.txt"
+        docker_base_cmd = ["timeout", "10m", "docker", "run", "--rm", "image"]
+
+        with patch("gza.providers.codex._get_docker_config") as mock_get_docker_config, \
+             patch("gza.providers.codex.ensure_docker_image", return_value=True), \
+             patch("gza.providers.codex.build_docker_cmd", return_value=docker_base_cmd.copy()), \
+             patch.object(provider, "_run_with_output_parsing") as mock_run:
+            mock_get_docker_config.return_value = MagicMock()
+            mock_run.return_value = MagicMock(exit_code=0)
+
+            provider._run_docker(
+                config=config,
+                prompt="resume prompt",
+                log_file=log_file,
+                work_dir=tmp_path,
+                resume_session_id="thread_456",
+            )
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd == docker_base_cmd + [
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "thread_456",
+            "-",
+            "-m",
+            "gpt-5.3-codex",
+        ]
+        assert mock_run.call_args.kwargs["stdin_input"] == "resume prompt"
+
 
 class TestCodexCostCalculation:
     """Tests for Codex cost calculation."""
