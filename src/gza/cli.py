@@ -25,6 +25,7 @@ from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, va
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
+from .learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from .prompts import PromptBuilder
 from .runner import run, post_review_to_pr
 from .tasks import YamlTaskStore, Task as YamlTask
@@ -3639,6 +3640,15 @@ def cmd_learnings(args: argparse.Namespace) -> int:
         print(content, end="")
         return 0
 
+    if subcommand == "update":
+        store = get_store(config)
+        window = args.window if hasattr(args, "window") and args.window is not None else DEFAULT_LEARNINGS_WINDOW
+        result = regenerate_learnings(store, config, window=window)
+        print(f"Updated learnings: {result.path.relative_to(config.project_dir)}")
+        print(f"  Tasks used: {result.tasks_used}")
+        print(f"  Learnings: {result.learnings_count}")
+        return 0
+
     print(f"Unknown learnings subcommand: {subcommand}", file=sys.stderr)
     return 1
 
@@ -4780,6 +4790,17 @@ def main() -> int:
         help="Display the current learnings file",
     )
     add_common_args(learnings_show_parser)
+    learnings_update_parser = learnings_subparsers.add_parser(
+        "update",
+        help="Regenerate learnings from recent completed tasks",
+    )
+    learnings_update_parser.add_argument(
+        "--window",
+        type=int,
+        default=DEFAULT_LEARNINGS_WINDOW,
+        help=f"Number of recent completed tasks to process (default: {DEFAULT_LEARNINGS_WINDOW})",
+    )
+    add_common_args(learnings_update_parser)
     add_common_args(learnings_parser)
 
     # delete command

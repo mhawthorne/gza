@@ -814,6 +814,20 @@ class SqliteTaskStore:
 
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_recent_completed(self, limit: int = 15) -> list[Task]:
+        """Get recent completed tasks, most recent first."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'completed'
+                ORDER BY completed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_unmerged(self) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
 

@@ -12,6 +12,7 @@ from .console import console, task_header, stats_line, success_message, error_me
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
+from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 
@@ -1144,6 +1145,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             diff_lines_added=diff_added,
             diff_lines_removed=diff_removed,
         )
+        auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
         # Clear review state on the based_on implementation task after improve completes.
         # The improve task has addressed the review feedback, so the old review no longer
@@ -1162,6 +1164,11 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
             (f"gza retry {task.id}", "retry from scratch"),
             (f"gza resume {task.id}", "resume from where it left off"),
         ])
+        if auto_learnings:
+            info_line(
+                f"Updated learnings from {auto_learnings.tasks_used} tasks "
+                f"({auto_learnings.path.relative_to(config.project_dir)})"
+            )
         console.print("")
         console.print("To review changes:")
         console.print(f"  [cyan]git diff {default_branch}...{branch_name} --[/cyan]")
@@ -1365,6 +1372,7 @@ def _run_non_code_task(
             has_commits=False,
             stats=stats,
         )
+        auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
         # For review tasks, post to PR if applicable
         if task.task_type == "review" and task.depends_on:
@@ -1402,6 +1410,11 @@ def _run_non_code_task(
             (f"gza retry {task.id}", "retry from scratch"),
             (f"gza resume {task.id}", "resume from where it left off"),
         ])
+        if auto_learnings:
+            info_line(
+                f"Updated learnings from {auto_learnings.tasks_used} tasks "
+                f"({auto_learnings.path.relative_to(config.project_dir)})"
+            )
 
         # Open review file in $EDITOR if requested
         if open_after and task.task_type == "review" and report_path.exists():

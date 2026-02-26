@@ -7303,6 +7303,26 @@ class TestLearningsCommand:
         assert result.returncode == 0
         assert "No learnings file found" in result.stdout
 
+    def test_learnings_update_generates_file(self, tmp_path: Path):
+        """gza learnings update writes .gza/learnings.md from completed tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Implement testing flow", task_type="implement")
+        store.mark_completed(task, output_content="- Use dedicated fixtures for tests\n", has_commits=False)
+
+        result = run_gza("learnings", "update", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Updated learnings" in result.stdout
+        learnings_path = tmp_path / ".gza" / "learnings.md"
+        assert learnings_path.exists()
+        assert "Use dedicated fixtures for tests" in learnings_path.read_text()
+
 
 class TestRefreshCommand:
     """Tests for 'gza refresh' command."""
