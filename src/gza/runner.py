@@ -1164,8 +1164,6 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         next_steps([
             (f"gza merge {task.id}", "merge branch for task"),
             (f"gza pr {task.id}", "create a PR"),
-            (f"gza retry {task.id}", "retry from scratch"),
-            (f"gza resume {task.id}", "resume from where it left off"),
         ])
         if auto_learnings:
             info_line(
@@ -1412,10 +1410,6 @@ def _run_non_code_task(
             console.print("To address review feedback, run:")
             console.print(f"  [cyan]gza improve {task.depends_on}[/cyan]")
 
-        next_steps([
-            (f"gza retry {task.id}", "retry from scratch"),
-            (f"gza resume {task.id}", "resume from where it left off"),
-        ])
         if auto_learnings:
             info_line(
                 "Learnings",

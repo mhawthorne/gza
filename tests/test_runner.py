@@ -738,6 +738,8 @@ class TestReviewNextSteps:
 
             all_output = "\n".join(printed_lines)
             assert "gza improve" not in all_output
+            assert "gza retry" not in all_output
+            assert "gza resume" not in all_output
 
 
 class TestRunNonCodeTaskDockerGitMetadata:
@@ -1633,7 +1635,7 @@ class TestNoChangesWithExistingCommits:
         config.branch_strategy.default_type = "feature"
         return config
 
-    def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path):
+    def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """When resuming, if there are no uncommitted changes but the branch already has
         commits from a previous run, the task should succeed (not fail with 'No changes made')."""
         db_path = tmp_path / "test.db"
@@ -1700,6 +1702,11 @@ class TestNoChangesWithExistingCommits:
         assert result == 0
         refreshed = store.get(task.id)
         assert refreshed.status == "completed", f"Expected 'completed', got '{refreshed.status}'"
+        output = capsys.readouterr().out
+        assert "gza merge" in output
+        assert "gza pr" in output
+        assert "gza retry" not in output
+        assert "gza resume" not in output
 
     def test_no_changes_and_no_prior_commits_still_fails(self, tmp_path: Path):
         """When there are no uncommitted changes AND no commits on the branch,

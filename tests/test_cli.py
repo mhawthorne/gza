@@ -5879,9 +5879,9 @@ class TestMaxTurnsFlag:
         from gza.config import Config
         import argparse
 
-        # Create a config with a default max_turns
+        # Create a config with a default max_steps
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_turns: 50\n")
+        config_path.write_text("project_name: test\nmax_steps: 50\n")
 
         # Load config
         config = Config.load(tmp_path)
@@ -5901,9 +5901,9 @@ class TestMaxTurnsFlag:
         from gza.config import Config
         import argparse
 
-        # Create a config with a default max_turns
+        # Create a config with a default max_steps
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_turns: 50\n")
+        config_path.write_text("project_name: test\nmax_steps: 50\n")
 
         # Load config
         config = Config.load(tmp_path)
@@ -5923,9 +5923,9 @@ class TestMaxTurnsFlag:
         from gza.config import Config
         import argparse
 
-        # Create a config with a default max_turns
+        # Create a config with a default max_steps
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_turns: 50\n")
+        config_path.write_text("project_name: test\nmax_steps: 50\n")
 
         # Load config
         config = Config.load(tmp_path)
@@ -5945,9 +5945,9 @@ class TestMaxTurnsFlag:
         from gza.config import Config
         import argparse
 
-        # Create a config with a default max_turns of 50
+        # Create a config with a default max_steps of 50
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_turns: 50\n")
+        config_path.write_text("project_name: test\nmax_steps: 50\n")
 
         # Load config
         config = Config.load(tmp_path)

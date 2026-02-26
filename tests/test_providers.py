@@ -2960,7 +2960,8 @@ class TestProviderScopedConfig:
             "        max_steps: 22\n"
             "        max_turns: 20\n"
         )
-        config = Config.load(tmp_path)
+        with pytest.warns(UserWarning):
+            config = Config.load(tmp_path)
         assert config.get_model_for_task("review", "claude") == "scoped-review"
         assert config.get_model_for_task("task", "claude") == "scoped-model"
         assert config.get_model_for_task("review", "codex") == "legacy-review"
