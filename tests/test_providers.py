@@ -2784,6 +2784,52 @@ class TestProviderScopedConfig:
         assert config.providers["claude"].task_types["review"].max_turns == 20
         assert config.providers["codex"].model == "o4-mini"
 
+    def test_load_parses_task_provider_routing(self, tmp_path):
+        """Config.load should parse task_providers routing map."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "task_providers:\n"
+            "  review: claude\n"
+            "  plan: gemini\n"
+        )
+        config = Config.load(tmp_path)
+
+        assert config.task_providers == {"review": "claude", "plan": "gemini"}
+        assert config.get_provider_for_task("review") == "claude"
+        assert config.get_provider_for_task("implement") == "codex"
+
+    def test_validate_rejects_invalid_task_providers_shape(self, tmp_path):
+        """Validate should reject non-dict and unknown provider names in task_providers."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "task_providers:\n"
+            "  review: unknown\n"
+        )
+        is_valid, errors, _warns = Config.validate(tmp_path)
+
+        assert not is_valid
+        assert any("task_providers.review" in e and "must be one of" in e for e in errors)
+
+    def test_validate_uses_task_provider_route_for_legacy_task_type_model(self, tmp_path):
+        """task_types.<type>.model compatibility should validate against routed provider."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "task_providers:\n"
+            "  review: claude\n"
+            "task_types:\n"
+            "  review:\n"
+            "    model: claude-3-5-haiku-latest\n"
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+
+        assert is_valid
+        assert not errors
+
     def test_validate_accepts_valid_providers_schema(self, tmp_path):
         """Validate should accept well-formed providers schema."""
         config_path = tmp_path / "gza.yaml"

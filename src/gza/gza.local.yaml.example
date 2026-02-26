@@ -5,6 +5,8 @@
 # use_docker: false
 # timeout_minutes: 30
 # provider: codex
+# task_providers:
+#   review: claude
 # model: o4-mini
 # docker_volumes:
 #   - ~/datasets:/datasets:ro

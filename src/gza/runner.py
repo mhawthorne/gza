@@ -22,7 +22,8 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
 
     Priority order for provider selection:
     1. Task-specific provider (task.provider)
-    2. Config default (config.provider, already env-merged in Config.load)
+    2. Task-type route (config.task_providers.<task_type>)
+    3. Config default (config.provider, already env-merged in Config.load)
 
     Priority order for model selection:
     1. Task-specific model (task.model)
@@ -38,7 +39,7 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     Returns:
         Tuple of (model, provider, max_steps) where model can be None
     """
-    provider = task.provider if task.provider else config.provider
+    provider = task.provider if task.provider else config.get_provider_for_task(task.task_type)
     model = task.model if task.model else config.get_model_for_task(task.task_type, provider)
     max_steps = config.get_max_steps_for_task(task.task_type, provider)
     return model, provider, max_steps

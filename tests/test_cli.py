@@ -1169,6 +1169,28 @@ class TestLocalConfigOverrides:
         assert payload["sources"]["branch_strategy.pattern"] == "base"
         assert payload["sources"]["branch_strategy.default_type"] == "base"
 
+    def test_config_command_includes_task_providers_with_sources(self, tmp_path: Path):
+        """gza config --json should project task_providers values and source attribution."""
+        import json
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "task_providers:\n"
+            "  review: claude\n"
+        )
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["task_providers"]["review"] == "claude"
+        assert payload["sources"]["task_providers.review"] == "base"
+
 
 class TestInitCommand:
     """Tests for 'gza init' command."""
@@ -2371,6 +2393,31 @@ class TestGetEffectiveConfigForTask:
         model, provider, _ = get_effective_config_for_task(task, config)
         assert provider == "codex"
         assert model == "o4-mini"
+
+    def test_task_provider_route_applies_without_task_override(self, tmp_path: Path):
+        """task_providers should route by task type before falling back to default provider."""
+        from gza.config import Config, ProviderConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.provider = "codex"
+        config.task_providers = {"review": "claude"}
+        config.providers = {
+            "claude": ProviderConfig(model="claude-review-model"),
+            "codex": ProviderConfig(model="o4-mini"),
+        }
+
+        task = Task(
+            id=1,
+            prompt="Review task",
+            task_type="review",
+        )
+
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert provider == "claude"
+        assert model == "claude-review-model"
 
     def test_falls_back_to_legacy_when_provider_scope_missing(self, tmp_path: Path):
         """Legacy top-level task_types/model remain as fallback if scope is missing."""
