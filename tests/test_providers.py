@@ -616,6 +616,86 @@ class TestGeminiOutputParsing:
         assert result.num_steps_reported == 2
         assert result.num_turns_reported == 1
 
+    def test_maps_tool_lifecycle_events_to_substeps(self, tmp_path):
+        """Gemini tool lifecycle events should map to tool_* substeps on current step."""
+        import json
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "gemini.log"
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": "working"}) + "\n",
+            json.dumps({"type": "tool_use", "id": "call_1", "tool_name": "Bash", "tool_input": {"command": "ls"}}) + "\n",
+            json.dumps({"type": "tool_output", "call_id": "call_1", "output": "ok"}) + "\n",
+            json.dumps({"type": "tool_retry", "call_id": "call_2", "retry_of_call_id": "call_1"}) + "\n",
+            json.dumps({"type": "tool_error", "call_id": "call_2", "error": "failed"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 10, "output_tokens": 5, "tool_calls": 2}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="",
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 1
+        assert run_steps[0]["message_text"] == "working"
+        assert [s["type"] for s in run_steps[0]["substeps"]] == [
+            "tool_call",
+            "tool_output",
+            "tool_retry",
+            "tool_error",
+        ]
+        assert [s["legacy_event_id"] for s in run_steps[0]["substeps"]] == [
+            "T1.2",
+            "T1.3",
+            "T1.4",
+            "T1.5",
+        ]
+
+    def test_pre_message_tool_creates_synthetic_step_with_summary(self, tmp_path):
+        """First tool event should create synthetic step until assistant text arrives."""
+        import json
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "gemini.log"
+
+        json_lines = [
+            json.dumps({"type": "tool_use", "id": "call_1", "tool_name": "Bash", "tool_input": {"command": "echo hi"}}) + "\n",
+            json.dumps({"type": "message", "role": "assistant", "content": "done"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 10, "output_tokens": 5, "tool_calls": 1}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="",
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 1
+        assert run_steps[0]["message_text"] == "done"
+        assert run_steps[0]["legacy_event_id"] == "T1.1"
+        assert run_steps[0]["summary"] is None
+        assert run_steps[0]["substeps"][0]["legacy_event_id"] == "T1.2"
+
 
 class TestCredentialChecks:
     """Tests for credential checking logic."""
@@ -1106,6 +1186,104 @@ class TestClaudeErrorTypeExtraction:
         assert result.input_tokens == 380
         # output_tokens = 75 + 100 = 175
         assert result.output_tokens == 175
+
+
+class TestClaudeStepMapping:
+    """Tests for Claude message-step/substep mapping."""
+
+    def test_maps_tool_use_and_tool_result_to_lifecycle_substeps(self, tmp_path):
+        """Claude content items should map to tool_call/tool_output/tool_error types."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_1",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "Bash",
+                            "input": {"command": "ls"},
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "content": "ok",
+                            "is_error": False,
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "content": "failed",
+                            "is_error": True,
+                        },
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+            }) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 7, "total_cost_usd": 0.1}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 1
+        assert run_steps[0]["legacy_event_id"] == "T1.1"
+        assert [s["type"] for s in run_steps[0]["substeps"]] == [
+            "tool_call",
+            "tool_output",
+            "tool_error",
+        ]
+        assert [s["legacy_event_id"] for s in run_steps[0]["substeps"]] == ["T1.2", "T1.3", "T1.4"]
+        assert result.num_turns_reported == 7
+        assert result.num_steps_computed == 1
+        assert result.num_steps_reported == 1
+
+    def test_sets_zero_step_metrics_when_no_assistant_message(self, tmp_path):
+        """Claude should persist explicit zero step metrics for runs with no step events."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "result", "subtype": "error_max_turns", "num_turns": 0, "total_cost_usd": 0.0}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.num_steps_computed == 0
+        assert result.num_steps_reported == 0
 
 
 class TestClaudeToolLogging:
@@ -2511,6 +2689,51 @@ class TestCodexOutputParsing:
         assert run_steps[1]["legacy_turn_id"] == "T2"
         assert len(run_steps[1]["substeps"]) == 1
         assert run_steps[1]["substeps"][0]["payload"]["command"] == "echo before"
+
+    def test_maps_command_execution_to_tool_call_and_output(self, tmp_path):
+        """Codex command_execution should emit lifecycle substeps and deterministic legacy IDs."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "cmd_1",
+                        "type": "command_execution",
+                        "command": "ls -la",
+                        "aggregated_output": "file.txt",
+                        "exit_code": 0,
+                    },
+                }
+            ) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 1
+        assert run_steps[0]["message_text"] == "done"
+        assert run_steps[0]["legacy_event_id"] == "T1.1"
+        assert [s["type"] for s in run_steps[0]["substeps"]] == ["tool_call", "tool_output"]
+        assert [s["legacy_event_id"] for s in run_steps[0]["substeps"]] == ["T1.2", "T1.3"]
 
     def test_uses_shared_formatter_for_turn_tool_message_and_error(self, tmp_path):
         """Codex parser should route key output lines through shared formatter."""

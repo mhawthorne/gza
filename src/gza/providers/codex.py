@@ -289,6 +289,7 @@ class CodexProvider(Provider):
             if "run_step_events" not in data:
                 data["run_step_events"] = []
                 data["_current_step_event"] = None
+                data["_legacy_event_count_by_turn"] = {}
 
         def _step_count(data: dict) -> int:
             return len(data.get("run_step_events", []))
@@ -297,21 +298,38 @@ class CodexProvider(Provider):
             turn_count = int(data.get("turn_count", 0))
             return f"T{turn_count}" if turn_count > 0 else None
 
+        def _allocate_legacy_event_id(data: dict, legacy_turn_id: str | None) -> str | None:
+            if not legacy_turn_id:
+                return None
+            counters = data.get("_legacy_event_count_by_turn")
+            if not isinstance(counters, dict):
+                counters = {}
+                data["_legacy_event_count_by_turn"] = counters
+            current = int(counters.get(legacy_turn_id, 0)) + 1
+            counters[legacy_turn_id] = current
+            return f"{legacy_turn_id}.{current}"
+
         def _maybe_mark_max_steps_exceeded(data: dict) -> None:
             if _step_count(data) > max_steps:
                 data["exceeded_max_steps"] = True
                 data["__terminate_process__"] = True
 
-        def _start_step(data: dict, message_text: str | None, legacy_turn_id: str | None) -> dict:
+        def _start_step(
+            data: dict,
+            message_text: str | None,
+            legacy_turn_id: str | None,
+            legacy_event_id: str | None = None,
+            summary: str | None = None,
+        ) -> dict:
             _ensure_step_store(data)
             event: dict[str, Any] = {
                 "message_role": "assistant",
                 "message_text": message_text,
                 "legacy_turn_id": legacy_turn_id,
-                "legacy_event_id": None,
+                "legacy_event_id": legacy_event_id,
                 "substeps": [],
                 "outcome": "completed",
-                "summary": None,
+                "summary": summary,
             }
             data["run_step_events"].append(event)
             data["_current_step_event"] = event
@@ -342,6 +360,12 @@ class CodexProvider(Provider):
                     data["turn_count"] += 1
                     data["item_count_in_turn"] = 0
                     data["_current_step_event"] = None
+                    _ensure_step_store(data)
+                    legacy_turn_id = _current_turn_id(data)
+                    if legacy_turn_id:
+                        counters = data.get("_legacy_event_count_by_turn")
+                        if isinstance(counters, dict):
+                            counters.setdefault(legacy_turn_id, 0)
 
                     # Calculate runtime
                     elapsed_seconds = int(time.time() - data["start_time"])
@@ -377,20 +401,74 @@ class CodexProvider(Provider):
                         current_step = data.get("_current_step_event")
                         legacy_turn_id = _current_turn_id(data)
                         if current_step is None:
-                            current_step = _start_step(data, None, legacy_turn_id)
+                            current_step = _start_step(
+                                data,
+                                None,
+                                legacy_turn_id,
+                                legacy_event_id=_allocate_legacy_event_id(data, legacy_turn_id),
+                                summary="Pre-message tool activity",
+                            )
                             _maybe_mark_max_steps_exceeded(data)
+                        call_id = item.get("id")
+                        retry_of_call_id = item.get("retry_of_call_id") or item.get("retry_of")
+
+                        if retry_of_call_id:
+                            current_step["substeps"].append(
+                                {
+                                    "type": "tool_retry",
+                                    "source": "provider",
+                                    "call_id": call_id,
+                                    "payload": {"retry_of_call_id": retry_of_call_id},
+                                    "legacy_turn_id": legacy_turn_id,
+                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
+                                }
+                            )
+
                         current_step["substeps"].append(
                             {
-                                "type": "command_execution",
+                                "type": "tool_call",
                                 "source": "provider",
-                                "call_id": item.get("id"),
+                                "call_id": call_id,
                                 "payload": {
+                                    "tool_name": "Bash",
                                     "command": command,
-                                    "aggregated_output": aggregated_output,
+                                    "tool_input": {"command": command},
+                                    "retry_of_call_id": retry_of_call_id,
                                 },
                                 "legacy_turn_id": legacy_turn_id,
+                                "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
                             }
                         )
+                        exit_code = item.get("exit_code")
+                        if not isinstance(exit_code, int):
+                            maybe_exit = item.get("status_code")
+                            exit_code = maybe_exit if isinstance(maybe_exit, int) else None
+                        if isinstance(exit_code, int):
+                            substep_type = "tool_output" if exit_code == 0 else "tool_error"
+                            current_step["substeps"].append(
+                                {
+                                    "type": substep_type,
+                                    "source": "provider",
+                                    "call_id": call_id,
+                                    "payload": {
+                                        "exit_code": exit_code,
+                                        "output": aggregated_output,
+                                    },
+                                    "legacy_turn_id": legacy_turn_id,
+                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
+                                }
+                            )
+                        elif aggregated_output:
+                            current_step["substeps"].append(
+                                {
+                                    "type": "tool_output",
+                                    "source": "provider",
+                                    "call_id": call_id,
+                                    "payload": {"output": aggregated_output},
+                                    "legacy_turn_id": legacy_turn_id,
+                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
+                                }
+                            )
                         # Truncate to 80 chars
                         command = truncate_text(command, 80)
                         formatter.print_tool_event("Bash", command, prefix=f"  {item_prefix}")
@@ -407,8 +485,16 @@ class CodexProvider(Provider):
                             and not current_step.get("message_text")
                         ):
                             current_step["message_text"] = raw_text.strip() or None
+                            current_step["summary"] = None
+                            if current_step.get("legacy_event_id") is None:
+                                current_step["legacy_event_id"] = _allocate_legacy_event_id(data, legacy_turn_id)
                         else:
-                            _start_step(data, raw_text.strip() or None, legacy_turn_id)
+                            _start_step(
+                                data,
+                                raw_text.strip() or None,
+                                legacy_turn_id,
+                                legacy_event_id=_allocate_legacy_event_id(data, legacy_turn_id),
+                            )
                             _maybe_mark_max_steps_exceeded(data)
                         text = item.get("text", "").strip()
                         if text:
@@ -469,6 +555,7 @@ class CodexProvider(Provider):
             if "computed_turn_count" in accumulated:
                 result.num_turns_computed = accumulated["computed_turn_count"]
             result.num_steps_computed = _step_count(accumulated)
+            result.num_steps_reported = result.num_steps_computed
 
             # Set token counts
             if "input_tokens" in accumulated:

@@ -1269,7 +1269,7 @@ class TestRunStepPersistenceIntegration:
         substeps = store.get_run_substeps(step_ref)
         assert len(substeps) == 1
         assert substeps[0].substep_id == "S1.1"
-        assert substeps[0].type == "tool_use"
+        assert substeps[0].type == "tool_call"
         assert substeps[0].payload == {
             "tool_name": "Bash",
             "tool_input": {"command": "ls -la"},
