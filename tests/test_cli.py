@@ -378,6 +378,27 @@ class TestShowCommand:
         assert result.returncode == 1
         assert "not found" in result.stdout
 
+    def test_show_displays_lineage_for_review_task(self, tmp_path: Path):
+        """Show command displays lineage using implementation/review chain."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+
+        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+        assert f"#{review.id}" in result.stdout
+
 
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""
