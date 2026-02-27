@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
@@ -12,9 +13,11 @@ from gza.providers import RunResult, ClaudeProvider
 from gza.runner import (
     build_prompt,
     SUMMARY_DIR,
+    REVIEW_IMPROVE_LINEAGE_LIMIT,
     WIP_DIR,
     BACKUP_DIR,
     _build_context_from_chain,
+    _build_review_improve_lineage_context,
     backup_database,
     _create_and_run_review_task,
     _run_non_code_task,
@@ -298,6 +301,232 @@ class TestReviewContextFromChain:
 
         assert "Targeted diff excerpts" in context
         assert "Additional changed files not expanded inline" not in context
+
+    def test_review_context_includes_compact_improve_lineage(self, tmp_path: Path):
+        """Review context includes compact summaries for prior improve runs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        store.update(review1)
+
+        improve1 = store.add(
+            prompt="Improve 1",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review1.id,
+        )
+        improve1.status = "completed"
+        improve1.output_content = (
+            "# Summary\n"
+            "- Fix flaky tests\n"
+            "- Tighten input validation\n"
+            "- Keep this concise\n"
+        )
+        store.update(improve1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        store.update(review2)
+
+        improve2 = store.add(
+            prompt="Improve 2",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+        )
+        improve2.status = "completed"
+        improve2.task_id = "20260227-improve-2"
+        store.update(improve2)
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        (summary_dir / f"{improve2.task_id}.md").write_text(
+            "# What was accomplished\n- Reduced retry loops\n- Added guardrails\n"
+        )
+
+        review3 = store.add(prompt="Review latest", task_type="review", depends_on=impl_task.id)
+
+        context = _build_context_from_chain(review3, store, tmp_path, git=None)
+
+        assert "## Improve Lineage Context" in context
+        assert f"Improve #{improve1.id} (review #{review1.id})" in context
+        assert f"Improve #{improve2.id} (review #{review2.id})" in context
+        assert "Fix flaky tests Tighten input validation Keep this concise" in context
+        assert "What was accomplished Reduced retry loops Added guardrails" in context
+
+    def test_review_context_bounds_improve_lineage_and_reports_omitted(self, tmp_path: Path):
+        """Review context includes only recent improves and reports omitted count."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement bounded lineage", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        improve_ids = []
+        for idx in range(REVIEW_IMPROVE_LINEAGE_LIMIT + 2):
+            review = store.add(prompt=f"Review {idx}", task_type="review", depends_on=impl_task.id)
+            review.status = "completed"
+            store.update(review)
+            improve = store.add(
+                prompt=f"Improve {idx}",
+                task_type="improve",
+                based_on=impl_task.id,
+                depends_on=review.id,
+            )
+            improve.status = "completed"
+            improve.output_content = f"- Improve summary {idx}\n"
+            store.update(improve)
+            improve_ids.append(improve.id)
+
+        current_review = store.add(prompt="Review now", task_type="review", depends_on=impl_task.id)
+        context = _build_context_from_chain(current_review, store, tmp_path, git=None)
+
+        assert "## Improve Lineage Context" in context
+        assert f"showing {REVIEW_IMPROVE_LINEAGE_LIMIT} most recent" in context
+        assert "2 older omitted" in context
+
+        # Most recent improves are included.
+        for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
+            assert f"Improve #{improve_id}" in context
+
+        # Older improves are not included.
+        for improve_id in improve_ids[:-REVIEW_IMPROVE_LINEAGE_LIMIT]:
+            assert f"Improve #{improve_id}" not in context
+
+    def test_review_context_includes_retry_improves_in_same_chain(self, tmp_path: Path):
+        """Review context includes retry/resume improve attempts chained from prior improves."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement retry-aware lineage", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        store.update(review1)
+        improve_a = store.add(
+            prompt="Improve A",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review1.id,
+        )
+        improve_a.status = "completed"
+        improve_a.output_content = "- Direct improve"
+        store.update(improve_a)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        store.update(review2)
+        improve_b = store.add(
+            prompt="Improve B",
+            task_type="improve",
+            based_on=improve_a.id,
+            depends_on=review2.id,
+        )
+        improve_b.status = "completed"
+        improve_b.output_content = "- Retry improve"
+        store.update(improve_b)
+
+        current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
+        context = _build_context_from_chain(current_review, store, tmp_path, git=None)
+
+        assert "## Improve Lineage Context" in context
+        assert f"Improve #{improve_a.id} (review #{review1.id})" in context
+        assert f"Improve #{improve_b.id} (review #{review2.id})" in context
+        assert "Direct improve" in context
+        assert "Retry improve" in context
+
+    def test_review_context_bounds_mixed_direct_and_retry_improves(self, tmp_path: Path):
+        """Bounded lineage remains correct with mixed direct and retry/resume improve attempts."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement mixed lineage", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        improve_ids: list[int] = []
+        parent_improve_id: int | None = None
+        for idx in range(REVIEW_IMPROVE_LINEAGE_LIMIT + 2):
+            review = store.add(prompt=f"Review {idx}", task_type="review", depends_on=impl_task.id)
+            review.status = "completed"
+            store.update(review)
+            based_on = impl_task.id if idx % 2 == 0 else parent_improve_id
+            improve = store.add(
+                prompt=f"Improve {idx}",
+                task_type="improve",
+                based_on=based_on,
+                depends_on=review.id,
+            )
+            improve.status = "completed"
+            improve.output_content = f"- Mixed improve summary {idx}\n"
+            store.update(improve)
+            assert improve.id is not None
+            improve_ids.append(improve.id)
+            parent_improve_id = improve.id
+
+        current_review = store.add(prompt="Review now", task_type="review", depends_on=impl_task.id)
+        context = _build_context_from_chain(current_review, store, tmp_path, git=None)
+
+        assert "## Improve Lineage Context" in context
+        assert f"showing {REVIEW_IMPROVE_LINEAGE_LIMIT} most recent" in context
+        assert "2 older omitted" in context
+
+        for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
+            assert f"Improve #{improve_id}" in context
+        for improve_id in improve_ids[:-REVIEW_IMPROVE_LINEAGE_LIMIT]:
+            assert f"Improve #{improve_id}" not in context
+
+    def test_review_context_excludes_equal_timestamp_later_improve(self, tmp_path: Path):
+        """Equal-timestamp improves created after the review are excluded."""
+        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=timezone.utc)
+        impl_task = Task(id=100, prompt="Implement", task_type="implement", status="completed")
+        review_task = Task(
+            id=50,
+            prompt="Review current",
+            task_type="review",
+            depends_on=impl_task.id,
+            created_at=created_at,
+        )
+
+        older_improve = Task(
+            id=40,
+            prompt="Improve older",
+            task_type="improve",
+            status="completed",
+            based_on=impl_task.id,
+            depends_on=10,
+            created_at=created_at,
+            output_content="- older improve",
+        )
+        later_improve = Task(
+            id=60,
+            prompt="Improve later",
+            task_type="improve",
+            status="completed",
+            based_on=impl_task.id,
+            depends_on=11,
+            created_at=created_at,
+            output_content="- later improve",
+        )
+
+        store = Mock(spec=SqliteTaskStore)
+        store.get_all.return_value = [older_improve, later_improve]
+
+        context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
+
+        assert f"Improve #{older_improve.id}" in context
+        assert "older improve" in context
+        assert f"Improve #{later_improve.id}" not in context
+        assert "later improve" not in context
 
 
 class TestSummaryDirectory:

@@ -118,6 +118,8 @@ BACKUP_DIR = f".{APP_NAME}/backups"
 DIFF_SMALL_THRESHOLD = 500   # lines: pass verbatim
 DIFF_MEDIUM_THRESHOLD = 2000  # lines: prepend --stat summary above full diff
 REVIEW_CONTEXT_FILE_LIMIT = 12
+REVIEW_IMPROVE_LINEAGE_LIMIT = 4
+REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
@@ -291,7 +293,128 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
         if path.exists():
             return path.read_text()
 
+    # Final fallback for code-task summaries when report_file/output_content are absent.
+    # This supports older tasks where summary content exists only on disk.
+    if task.task_id and task.task_type in {"task", "implement", "improve"}:
+        summary_path = project_dir / SUMMARY_DIR / f"{task.task_id}.md"
+        if summary_path.exists():
+            return summary_path.read_text()
+
     return None
+
+
+def _compact_output_summary(content: str, max_chars: int = REVIEW_IMPROVE_SUMMARY_MAX_CHARS) -> str:
+    """Reduce markdown output content to a compact, single-line summary."""
+    lines = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line == "```" or line.startswith("```"):
+            continue
+        if line.startswith("#"):
+            line = line.lstrip("#").strip()
+            if not line:
+                continue
+        if line.startswith("- "):
+            line = line[2:].strip()
+        lines.append(line)
+        if len(lines) >= 4:
+            break
+
+    compact = " ".join(lines).strip()
+    compact = re.sub(r"\s+", " ", compact)
+    if len(compact) > max_chars:
+        return compact[: max_chars - 3].rstrip() + "..."
+    return compact
+
+
+def _is_improve_in_impl_chain(improve_task: Task, impl_task: Task, tasks_by_id: dict[int, Task]) -> bool:
+    """Return True when an improve task belongs to an implementation's improve chain."""
+    if impl_task.id is None or improve_task.based_on is None:
+        return False
+    current_based_on = improve_task.based_on
+    seen: set[int] = set()
+    while True:
+        if current_based_on == impl_task.id:
+            return True
+        if current_based_on in seen:
+            return False
+        seen.add(current_based_on)
+        parent = tasks_by_id.get(current_based_on)
+        if parent is None or parent.task_type != "improve" or parent.based_on is None:
+            return False
+        current_based_on = parent.based_on
+
+
+def _get_completed_improves_for_implementation_chain(store: SqliteTaskStore, impl_task: Task) -> list[Task]:
+    """Collect completed improve tasks tied to an implementation, including retry/resume descendants."""
+    all_tasks = store.get_all()
+    tasks_by_id = {task.id: task for task in all_tasks if task.id is not None}
+    return [
+        task for task in all_tasks
+        if task.task_type == "improve"
+        and task.id is not None
+        and task.status == "completed"
+        and _is_improve_in_impl_chain(task, impl_task, tasks_by_id)
+    ]
+
+
+def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, store: SqliteTaskStore, project_dir: Path) -> str:
+    """Build compact improve lineage context for review prompts."""
+    improves = _get_completed_improves_for_implementation_chain(store, impl_task)
+    if not improves:
+        return ""
+
+    review_created_at = review_task.created_at
+    prior_improves = []
+    for improve in improves:
+        if review_created_at is None:
+            prior_improves.append(improve)
+            continue
+        if improve.created_at is None:
+            if review_task.id is not None and improve.id is not None and improve.id < review_task.id:
+                prior_improves.append(improve)
+            continue
+
+        review_id = review_task.id if review_task.id is not None else 0
+        if (improve.created_at, improve.id) < (review_created_at, review_id):
+            prior_improves.append(improve)
+
+    if not prior_improves:
+        return ""
+
+    # Most recent first by completion/creation, then id.
+    prior_improves.sort(
+        key=lambda t: (
+            t.completed_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            t.id or 0,
+        ),
+        reverse=True,
+    )
+
+    included = prior_improves[:REVIEW_IMPROVE_LINEAGE_LIMIT]
+    omitted_count = max(0, len(prior_improves) - len(included))
+
+    lines = [
+        "## Improve Lineage Context",
+        "",
+        (
+            f"Prior improve runs for implementation #{impl_task.id}: {len(prior_improves)} total "
+            f"(showing {len(included)} most recent"
+            + (f", {omitted_count} older omitted" if omitted_count else "")
+            + ")."
+        ),
+        "",
+    ]
+
+    for improve in included:
+        review_ref = f"review #{improve.depends_on}" if improve.depends_on else "review #?"
+        content = _get_task_output(improve, project_dir)
+        summary = _compact_output_summary(content) if content else ""
+        if not summary:
+            summary = "No summary content available."
+        lines.append(f"- Improve #{improve.id} ({review_ref}): {summary}")
+
+    return "\n".join(lines)
 
 
 def _parse_changed_files_from_numstat(numstat_output: str) -> list[str]:
@@ -451,6 +574,10 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
                         if plan_content:
                             context_parts.append("\n## Original plan:\n")
                             context_parts.append(plan_content)
+
+                improve_lineage_context = _build_review_improve_lineage_context(task, impl_task, store, project_dir)
+                if improve_lineage_context:
+                    context_parts.append(improve_lineage_context)
 
     # Fallback for generic based_on references
     if task.based_on and not context_parts:
