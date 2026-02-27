@@ -223,6 +223,26 @@ class TestSkillsInstallCommand:
 class TestSkillContentValidation:
     """Tests to validate skill content format and structure."""
 
+    def test_gza_plan_review_uses_supported_history_flag(self):
+        """gza-plan-review should use supported gza history flags in command examples."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-plan-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza history --type plan --limit 10" in content
+        assert "--last 10" not in content
+
+    def test_gza_plan_review_documents_hash_id_normalization(self):
+        """gza-plan-review should explicitly normalize #<id> input before command execution."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-plan-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "supports `42` or `#42`" in content
+        assert "strip the leading `#`" in content
+
     def test_all_skills_use_uppercase_skill_md(self):
         """All skills must use SKILL.md (uppercase) naming convention."""
         from gza.skills_utils import get_skills_source_path
