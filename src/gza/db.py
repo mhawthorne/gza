@@ -1131,7 +1131,7 @@ class SqliteTaskStore:
         payload_json = json.dumps(payload)
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT run_id, step_id FROM run_steps WHERE id = ?",
+                "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
                 (step_ref.id,),
             )
             row = cur.fetchone()
@@ -1140,6 +1140,10 @@ class SqliteTaskStore:
             if row["run_id"] != step_ref.run_id:
                 raise ValueError(
                     f"Step reference run mismatch: step run_id={row['run_id']}, ref run_id={step_ref.run_id}"
+                )
+            if row["step_index"] != step_ref.step_index:
+                raise ValueError(
+                    f"Step reference index mismatch: step step_index={row['step_index']}, ref step_index={step_ref.step_index}"
                 )
             if row["step_id"] != step_ref.step_id:
                 raise ValueError(

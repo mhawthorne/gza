@@ -1000,6 +1000,123 @@ class TestMaxStepsHandling:
         assert failed.status == "failed"
         assert failed.failure_reason == "MAX_STEPS"
 
+    def test_non_code_task_marks_terminal_step_interrupted_on_max_steps(self, tmp_path: Path):
+        """Persisted run steps should reflect interruption on max-steps failures."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.task_id = "20260225-plan-task"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 2
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=4.2,
+            num_steps_computed=3,
+            error_type="max_steps",
+            _accumulated_data={
+                "run_step_events": [
+                    {
+                        "message_role": "assistant",
+                        "message_text": "First",
+                        "legacy_turn_id": "T1",
+                        "legacy_event_id": None,
+                        "substeps": [],
+                        "outcome": "completed",
+                        "summary": None,
+                    },
+                    {
+                        "message_role": "assistant",
+                        "message_text": "Second",
+                        "legacy_turn_id": "T2",
+                        "legacy_event_id": None,
+                        "substeps": [],
+                        "outcome": "completed",
+                        "summary": None,
+                    },
+                ]
+            },
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        steps = store.get_run_steps(task.id)
+        assert len(steps) == 2
+        assert steps[0].outcome == "completed"
+        assert steps[1].outcome == "interrupted"
+
+    def test_non_code_task_marks_terminal_step_failed_on_nonzero_exit(self, tmp_path: Path):
+        """Persisted run steps should reflect terminal failure when provider exits non-zero."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.task_id = "20260225-plan-task"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=1,
+            duration_seconds=4.2,
+            _accumulated_data={
+                "run_step_events": [
+                    {
+                        "message_role": "assistant",
+                        "message_text": "Only step",
+                        "legacy_turn_id": "T1",
+                        "legacy_event_id": None,
+                        "substeps": [],
+                        "outcome": "completed",
+                        "summary": None,
+                    }
+                ]
+            },
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        steps = store.get_run_steps(task.id)
+        assert len(steps) == 1
+        assert steps[0].outcome == "failed"
+
     def test_run_non_code_task_skips_pr_posting_for_explore(self, tmp_path: Path):
         """Test that _run_non_code_task does NOT call post_review_to_pr for explore tasks."""
         db_path = tmp_path / "test.db"

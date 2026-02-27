@@ -1045,6 +1045,87 @@ class TestClaudeErrorTypeExtraction:
         assert result.num_turns_reported == 1
         assert result.num_turns_computed == 1  # Deduplicated
 
+    def test_tool_use_before_next_message_boundary_dedupes_repeated_message_id(self, tmp_path):
+        """Tool substeps should stay on the current step and dedupe repeated chunks by call id."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_001",
+                    "content": [{"type": "text", "text": "first"}],
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                },
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_002",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "Bash",
+                            "input": {"command": "echo hi"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 200, "output_tokens": 80},
+                },
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_002",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "Bash",
+                            "input": {"command": "echo hi"},
+                        },
+                        {"type": "text", "text": "second"},
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            }) + "\n",
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "num_turns": 2,
+                    "total_cost_usd": 0.10,
+                }
+            ) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 2
+        assert run_steps[0]["message_text"] == "first"
+        assert run_steps[0]["substeps"] == []
+        assert run_steps[1]["message_text"] == "second"
+        assert run_steps[1]["legacy_turn_id"] == "T2"
+        assert len(run_steps[1]["substeps"]) == 1
+        assert run_steps[1]["substeps"][0]["call_id"] == "tool_1"
+        assert run_steps[1]["substeps"][0]["payload"]["tool_name"] == "Bash"
+
     def test_stores_token_counts_from_usage(self, tmp_path):
         """Should accumulate input and output token counts from assistant messages."""
         import json

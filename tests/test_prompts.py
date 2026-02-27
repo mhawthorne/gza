@@ -146,6 +146,7 @@ class TestPromptBuilderBuild:
 
         assert "review task" in result.lower()
         assert str(report_path) in result
+        assert "AGENTS.md" in result
         assert "APPROVED" in result
         assert "CHANGES_REQUESTED" in result
         assert "Verdict:" in result
