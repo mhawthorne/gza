@@ -3106,6 +3106,49 @@ def _display_conversation_turns(entries: list[dict]) -> None:
     _display_step_timeline(entries, verbose=True)
 
 
+def _extract_task_slug(task: DbTask) -> str | None:
+    """Extract slug from task_id (YYYYMMDD-slug or YYYYMMDD-slug-N)."""
+    if not task.task_id:
+        return None
+    parts = task.task_id.split("-", 1)
+    if len(parts) != 2:
+        return None
+    return re.sub(r"-\d+$", "", parts[1])
+
+
+def cmd_implement(args: argparse.Namespace) -> int:
+    """Create an implementation task from a completed plan task."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    plan_task = store.get(args.plan_task_id)
+    if not plan_task:
+        print(f"Error: Task #{args.plan_task_id} not found")
+        return 1
+    if plan_task.task_type != "plan":
+        print(f"Error: Task #{plan_task.id} is a {plan_task.task_type} task. Expected a completed plan task.")
+        return 1
+    if plan_task.status != "completed":
+        print(f"Error: Task #{plan_task.id} is {plan_task.status}. Plan task must be completed.")
+        return 1
+
+    prompt = args.prompt
+    if not prompt:
+        slug = _extract_task_slug(plan_task)
+        if slug:
+            prompt = f"Implement plan from task #{plan_task.id}: {slug}"
+        else:
+            prompt = f"Implement plan from task #{plan_task.id}"
+
+    add_args = argparse.Namespace(**vars(args))
+    add_args.prompt = prompt
+    add_args.type = "implement"
+    add_args.based_on = plan_task.id
+    add_args.explore = False
+    add_args.edit = False
+    return cmd_add(add_args)
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     """Add a new task."""
     config = Config.load(args.project_dir)
@@ -5568,6 +5611,66 @@ def main() -> int:
     )
     add_common_args(improve_parser)
 
+    # implement command
+    implement_parser = subparsers.add_parser(
+        "implement",
+        help="Create an implementation task from a completed plan task",
+    )
+    implement_parser.add_argument(
+        "plan_task_id",
+        type=int,
+        help="Completed plan task ID to implement",
+    )
+    implement_parser.add_argument(
+        "prompt",
+        nargs="?",
+        help="Implementation prompt (defaults to plan-derived prompt)",
+    )
+    implement_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Auto-create review task on completion",
+    )
+    implement_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Set task group",
+    )
+    implement_parser.add_argument(
+        "--depends-on",
+        type=int,
+        metavar="ID",
+        help="Set dependency on another task",
+    )
+    implement_parser.add_argument(
+        "--same-branch",
+        action="store_true",
+        help="Continue on depends_on task's branch instead of creating new",
+    )
+    implement_parser.add_argument(
+        "--branch-type",
+        metavar="TYPE",
+        help="Set branch type hint for branch naming (e.g., fix, feature, chore)",
+    )
+    implement_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override model for this task (e.g., claude-3-5-haiku-latest)",
+    )
+    implement_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        choices=["claude", "codex", "gemini"],
+        help="Override provider for this task (claude, codex, or gemini)",
+    )
+    implement_parser.add_argument(
+        "--no-learnings",
+        action="store_true",
+        dest="skip_learnings",
+        help="Skip injecting .gza/learnings.md context into this task's prompt",
+    )
+    add_common_args(implement_parser)
+
     # review command
     review_parser = subparsers.add_parser(
         "review",
@@ -5775,6 +5878,8 @@ def main() -> int:
             return cmd_retry(args)
         elif args.command == "improve":
             return cmd_improve(args)
+        elif args.command == "implement":
+            return cmd_implement(args)
         elif args.command == "review":
             return cmd_review(args)
         elif args.command == "resume":
