@@ -9625,8 +9625,8 @@ class TestCycleCommand:
         assert result.returncode != 0
         assert "active cycle" in result.stdout.lower() or "already has an active cycle" in result.stdout.lower()
 
-    def test_cycle_continue_resumes_existing_active_cycle(self, tmp_path: Path):
-        """gza cycle --continue --dry-run finds the existing active cycle."""
+    def test_cycle_continue_dry_run_shows_resume_message(self, tmp_path: Path):
+        """gza cycle --continue --dry-run shows 'resume' message, not 'start' message."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -9639,12 +9639,53 @@ class TestCycleCommand:
 
         result = run_gza("cycle", str(impl.id), "--continue", "--dry-run", "--project", str(tmp_path))
 
-        # Dry run exits 0 before actually resuming so we just check it doesn't error on "no active cycle"
+        assert result.returncode == 0
+        # Must say "resume", not "start", when --continue is given
+        assert "resume" in result.stdout.lower()
         assert "No active cycle" not in result.stdout
-        # The active cycle should still be there
+        # The active cycle should still be there (dry-run doesn't mutate state)
         active = store.get_active_cycle_for_impl(impl.id)
         assert active is not None
         assert active.id == cycle.id
+
+    def test_cycle_continue_resumes_existing_active_cycle(self, tmp_path: Path):
+        """gza cycle --continue finds existing active cycle and enters the resume path."""
+        from gza.db import SqliteTaskStore
+        from unittest.mock import patch
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        cycle = store.start_cycle(impl.id, max_iterations=3)
+        # Simulate one completed iteration already recorded so resume starts at index 1
+        it = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
+
+        # Mock run() so the loop actually executes: return 0 for review (verdict APPROVED) to stop cleanly
+        with patch("gza.cli.run", return_value=0), \
+             patch("gza.cli._create_review_task") as mock_review, \
+             patch("gza.cli.get_review_verdict", return_value="APPROVED"):
+            from gza.db import Task as DbTask
+            from datetime import datetime, timezone
+            fake_review = store.add("review", task_type="review")
+            fake_review.status = "completed"
+            fake_review.completed_at = datetime.now(timezone.utc)
+            store.update(fake_review)
+            mock_review.return_value = fake_review
+
+            result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+
+        # Should complete without error
+        assert "No active cycle" not in result.stdout
+        # Verify iteration records: the new iteration record should have iteration_index=1, not 0
+        iterations = store.get_cycle_iterations(cycle.id)
+        # We seeded iteration_index=0; the resumed run should have added iteration_index=1
+        assert len(iterations) == 2
+        assert iterations[0].iteration_index == 0
+        assert iterations[1].iteration_index == 1
 
 
 class TestStatsCyclesCommand:

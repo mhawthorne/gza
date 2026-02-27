@@ -4573,6 +4573,8 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     Loops: create+run review -> parse verdict -> if CHANGES_REQUESTED create+run improve -> repeat.
     Stops on APPROVED, max iterations reached, NEEDS_DISCUSSION, or failure.
     """
+    from datetime import datetime, timezone
+
     config = Config.load(args.project_dir)
     if hasattr(args, 'no_docker') and args.no_docker:
         config.use_docker = False
@@ -4595,10 +4597,6 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
     assert impl_task.id is not None
 
-    if dry_run:
-        print(f"[dry-run] Would start cycle for implementation #{impl_task.id} (max {max_iterations} iterations)")
-        return 0
-
     # Handle --continue: resume an existing active cycle
     cycle: TaskCycle
     if continue_existing:
@@ -4607,8 +4605,25 @@ def cmd_cycle(args: argparse.Namespace) -> int:
             print(f"Error: No active cycle found for implementation #{impl_task.id}")
             return 1
         cycle = existing
-        print(f"Resuming cycle #{cycle.id} for implementation #{impl_task.id}...")
+
+        if dry_run:
+            print(f"[dry-run] Would resume cycle #{cycle.id} for implementation #{impl_task.id}")
+            return 0
+
+        # Determine next iteration index by inspecting existing iteration records
+        existing_iterations = store.get_cycle_iterations(cycle.id)
+        if existing_iterations:
+            max_index = max(it.iteration_index for it in existing_iterations)
+            iteration = max_index + 1
+        else:
+            iteration = 0
+
+        print(f"Resuming cycle #{cycle.id} for implementation #{impl_task.id} from iteration {iteration + 1}...")
     else:
+        if dry_run:
+            print(f"[dry-run] Would start cycle for implementation #{impl_task.id} (max {max_iterations} iterations)")
+            return 0
+
         # Start a new cycle (raises ValueError if one already exists)
         try:
             cycle = store.start_cycle(impl_task.id, max_iterations=max_iterations)
@@ -4616,11 +4631,11 @@ def cmd_cycle(args: argparse.Namespace) -> int:
             print(f"Error: {e}")
             return 1
         print(f"Starting cycle #{cycle.id} for implementation #{impl_task.id} (max {max_iterations} iterations)...")
+        iteration = 0
 
     # Summary rows collected as we run: (iteration, review_id, verdict, improve_id)
     summary_rows: list[tuple[int, int | None, str | None, int | None]] = []
 
-    iteration = 0
     final_status = "blocked"
     final_stop_reason = "unknown"
 
@@ -4635,7 +4650,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
             review_task = _create_review_task(store, impl_task)
         except ValueError as e:
             print(f"  Error creating review: {e}")
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "blocked"
             final_stop_reason = "review_failed"
             summary_rows.append((iteration, None, None, None))
@@ -4654,7 +4669,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         rc = run(config, task_id=review_task.id)
         if rc != 0:
             print(f"  Review #{review_task.id} failed (exit code {rc})")
-            store.update_cycle_iteration(iter_record.id, state="terminal")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "blocked"
             final_stop_reason = "review_failed"
             summary_rows.append((iteration, review_task.id, None, None))
@@ -4672,7 +4687,6 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         print(f"  Review #{review_task.id}: verdict={verdict or '(none)'}")
 
         if verdict == "APPROVED":
-            from datetime import datetime, timezone
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "approved"
             final_stop_reason = "approved"
@@ -4680,7 +4694,6 @@ def cmd_cycle(args: argparse.Namespace) -> int:
             break
 
         if verdict == "NEEDS_DISCUSSION" or verdict is None:
-            from datetime import datetime, timezone
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "blocked"
             final_stop_reason = "needs_discussion" if verdict == "NEEDS_DISCUSSION" else "no_verdict"
@@ -4690,7 +4703,6 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         # verdict == "CHANGES_REQUESTED"
         if iteration >= max_iterations - 1:
             # This was the last iteration
-            from datetime import datetime, timezone
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "maxed_out"
             final_stop_reason = "max_iterations"
@@ -4702,7 +4714,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
             improve_task = _create_improve_task(store, impl_task, review_task)
         except ValueError as e:
             print(f"  Error creating improve: {e}")
-            store.update_cycle_iteration(iter_record.id, state="terminal")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "blocked"
             final_stop_reason = "improve_failed"
             summary_rows.append((iteration, review_task.id, verdict, None))
@@ -4721,18 +4733,17 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         rc = run(config, task_id=improve_task.id)
         if rc != 0:
             print(f"  Improve #{improve_task.id} failed (exit code {rc})")
-            store.update_cycle_iteration(iter_record.id, state="terminal")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
             final_status = "blocked"
             final_stop_reason = "improve_failed"
             summary_rows.append((iteration, review_task.id, verdict, improve_task.id))
             break
 
-        from datetime import datetime, timezone
         store.update_cycle_iteration(iter_record.id, state="improve_completed", ended_at=datetime.now(timezone.utc))
         summary_rows.append((iteration, review_task.id, verdict, improve_task.id))
 
-        # Update impl_task to the improve task for next iteration's review
-        # (reviews use the latest code, which is on the same branch after improve completes)
+        # Reviews in subsequent iterations still target the original impl_task because
+        # improve runs on same_branch=True, so the branch already has the latest code.
         iteration += 1
 
     store.close_cycle(cycle.id, status=final_status, stop_reason=final_stop_reason)
