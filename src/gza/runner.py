@@ -31,6 +31,22 @@ def _persist_run_steps_from_result(
     if not isinstance(events, list):
         return
 
+    has_non_completed = any(
+        isinstance(event, dict) and str(event.get("outcome") or "completed") != "completed"
+        for event in events
+    )
+    fallback_outcome: str | None = None
+    if not has_non_completed:
+        if result.error_type in ("max_steps", "max_turns"):
+            fallback_outcome = "interrupted"
+        elif result.error_type is not None or result.exit_code != 0:
+            fallback_outcome = "failed"
+        if fallback_outcome is not None:
+            for event in reversed(events):
+                if isinstance(event, dict):
+                    event["outcome"] = fallback_outcome
+                    break
+
     for event in events:
         if not isinstance(event, dict):
             continue

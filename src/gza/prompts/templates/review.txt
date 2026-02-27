@@ -3,11 +3,24 @@ This is a review task. Write your review to:
 
 Your prompt already includes changed files, diffstat, and relevant diff/context excerpts. Base your review on that provided context and avoid using git discovery commands.
 
+Project-specific guidance:
+- Follow repository instructions (for example AGENTS.md, REVIEW.md, project docs, and configured verification commands when available).
+- Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
+
 Your review should include:
-- Assessment of whether the implementation matches the plan
-- Code quality observations
-- Potential issues or improvements
+- Summary (3-5 bullets)
+- Must-fix issues (ordered by severity), each with:
+  - Evidence (file/line references)
+  - Impact
+  - Required fix direction
+  - Required test coverage
+- Suggestions (non-blocking improvements)
+- Questions/assumptions
 - Final verdict: APPROVED, CHANGES_REQUESTED, or NEEDS_DISCUSSION
+
+Blocking discipline:
+- Request changes only for concrete, actionable blockers.
+- For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.
 
 End your review with a clear verdict line like:
 Verdict: APPROVED

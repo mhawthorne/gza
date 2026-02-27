@@ -2601,6 +2601,22 @@ class TestRunStepPersistence:
         with pytest.raises(ValueError, match="Unknown step reference"):
             store.emit_substep(invalid, "tool_call", {"tool": "Bash"}, source="provider")
 
+    def test_emit_substep_rejects_tampered_step_ref(self, tmp_path: Path):
+        """emit_substep should reject mismatched StepRef metadata."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.id is not None
+        step_ref = store.emit_step(task.id, "hello", provider="claude")
+
+        tampered = StepRef(
+            id=step_ref.id,
+            run_id=step_ref.run_id,
+            step_index=999,
+            step_id=step_ref.step_id,
+        )
+        with pytest.raises(ValueError, match="Step reference index mismatch"):
+            store.emit_substep(tampered, "tool_call", {"tool": "Bash"}, source="provider")
+
     def test_finalize_step_rejects_tampered_step_ref(self, tmp_path: Path):
         """finalize_step should reject mismatched StepRef metadata."""
         store = SqliteTaskStore(tmp_path / "test.db")
