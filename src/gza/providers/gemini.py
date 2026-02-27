@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .base import (
     Provider,
@@ -241,10 +241,36 @@ class GeminiProvider(Provider):
         """Run command and parse Gemini's stream-json output."""
         formatter = StreamOutputFormatter()
 
+        def _ensure_step_store(data: dict) -> None:
+            if "run_step_events" not in data:
+                data["run_step_events"] = []
+                data["_current_step_event"] = None
+                data["_turn_count"] = 0
+
+        def _step_count(data: dict) -> int:
+            return len(data.get("run_step_events", []))
+
+        def _start_step(data: dict, message_text: str | None) -> dict:
+            _ensure_step_store(data)
+            data["_turn_count"] = int(data.get("_turn_count", 0)) + 1
+            event: dict[str, Any] = {
+                "message_role": "assistant",
+                "message_text": message_text,
+                "legacy_turn_id": f"T{data['_turn_count']}",
+                "legacy_event_id": None,
+                "substeps": [],
+                "outcome": "completed",
+                "summary": None,
+            }
+            data["run_step_events"].append(event)
+            data["_current_step_event"] = event
+            return event
+
         def parse_gemini_output(line: str, data: dict, log_handle=None) -> None:
             try:
-                event = json.loads(line)
+                event: dict[str, Any] = json.loads(line)
                 event_type = event.get("type")
+                _ensure_step_store(data)
 
                 if event_type == "init":
                     # Store model from init event if not specified
@@ -252,10 +278,18 @@ class GeminiProvider(Provider):
                         data["model"] = event["model"]
 
                 elif event_type == "message":
+                    role = event.get("role")
+                    if role == "user":
+                        data["_current_step_event"] = None
                     # Show assistant messages
-                    if event.get("role") == "assistant":
+                    if role == "assistant":
                         content = event.get("content", "")
                         if content and not event.get("delta"):
+                            current_step = data.get("_current_step_event")
+                            if current_step is not None and not current_step.get("message_text"):
+                                current_step["message_text"] = content
+                            else:
+                                _start_step(data, content)
                             # Display text to console (configurable length, 0 = unlimited)
                             if chat_text_display_length == 0:
                                 # Show full text
@@ -270,6 +304,18 @@ class GeminiProvider(Provider):
                 elif event_type == "tool_use":
                     tool_name = event.get("tool_name", "unknown")
                     tool_input = event.get("tool_input", {})
+                    current_step = data.get("_current_step_event")
+                    if current_step is None:
+                        current_step = _start_step(data, None)
+                    current_step["substeps"].append(
+                        {
+                            "type": "tool_use",
+                            "source": "provider",
+                            "call_id": event.get("id"),
+                            "payload": {"tool_name": tool_name, "tool_input": tool_input},
+                            "legacy_turn_id": current_step.get("legacy_turn_id"),
+                        }
+                    )
                     # Extract file path for file-related tools
                     file_path = tool_input.get("file_path") or tool_input.get("path")
                     if file_path:
@@ -304,19 +350,20 @@ class GeminiProvider(Provider):
             if output_tokens is not None:
                 result.output_tokens = output_tokens
 
-            # Get tool calls as proxy for turns
+            # Legacy provider metric (tool calls) retained only for num_turns_reported.
             tool_calls = stats.get("tool_calls")
             if tool_calls is not None:
                 result.num_turns_reported = tool_calls
-                result.num_steps_reported = tool_calls
-                result.num_steps_computed = tool_calls
 
             # Calculate cost from tokens
             if input_tokens is not None and output_tokens is not None:
                 used_model = model or accumulated.get("model", "default")
                 result.cost_usd = calculate_cost(used_model, input_tokens, output_tokens)
 
-            if result.num_steps_computed is not None and result.num_steps_computed > max_steps:
-                result.error_type = "max_steps"
+        step_count = _step_count(accumulated)
+        result.num_steps_computed = step_count
+        result.num_steps_reported = step_count
+        if step_count > max_steps:
+            result.error_type = "max_steps"
 
         return result

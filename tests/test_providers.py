@@ -573,6 +573,50 @@ class TestGeminiCostCalculation:
         assert cost == 0.0
 
 
+class TestGeminiOutputParsing:
+    """Tests for Gemini stream-json parsing."""
+
+    def test_tool_use_before_new_assistant_message_creates_new_step(self, tmp_path):
+        """Tool events after a new user message should not attach to prior assistant step."""
+        import json
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "gemini.log"
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": "first"}) + "\n",
+            json.dumps({"type": "message", "role": "user", "content": "next"}) + "\n",
+            json.dumps({"type": "tool_use", "id": "tool_1", "tool_name": "Bash", "tool_input": {"command": "echo hi"}}) + "\n",
+            json.dumps({"type": "message", "role": "assistant", "content": "second"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 10, "output_tokens": 5, "tool_calls": 1}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="",
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 2
+        assert run_steps[0]["message_text"] == "first"
+        assert run_steps[0]["substeps"] == []
+        assert run_steps[1]["message_text"] == "second"
+        assert len(run_steps[1]["substeps"]) == 1
+        assert run_steps[1]["substeps"][0]["payload"]["tool_name"] == "Bash"
+        assert result.num_steps_computed == 2
+        assert result.num_steps_reported == 2
+        assert result.num_turns_reported == 1
+
+
 class TestCredentialChecks:
     """Tests for credential checking logic."""
 
@@ -2398,7 +2442,7 @@ class TestCodexOutputParsing:
         assert captured.out.count("Reading prompt from stdin...") == 1
 
     def test_tracks_max_steps_exceeded(self, tmp_path):
-        """Should track when max_steps is exceeded based on item.completed events."""
+        """Should track when max_steps is exceeded based on message-step count."""
         import json
         from gza.providers.codex import CodexProvider
 
@@ -2408,9 +2452,9 @@ class TestCodexOutputParsing:
         # Simulate exceeding max_steps (set to 2)
         json_lines = [
             json.dumps({"type": "turn.started"}) + "\n",
-            json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "echo 1"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "step 1"}}) + "\n",
             json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "step 2"}}) + "\n",
-            json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "step 3"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "step 3"}}) + "\n",
         ]
 
         with patch("gza.providers.base.subprocess.Popen") as mock_popen:
@@ -2429,6 +2473,44 @@ class TestCodexOutputParsing:
 
         assert result.num_steps_computed == 3
         assert result.error_type == "max_steps"
+
+    def test_new_turn_tool_substep_does_not_attach_to_previous_step(self, tmp_path):
+        """Tool items before the next message should attach to the new turn's step."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "first"}}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "echo before"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "second"}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        run_steps = result._accumulated_data["run_step_events"]
+        assert len(run_steps) == 2
+        assert run_steps[0]["message_text"] == "first"
+        assert run_steps[0]["substeps"] == []
+        assert run_steps[1]["message_text"] == "second"
+        assert run_steps[1]["legacy_turn_id"] == "T2"
+        assert len(run_steps[1]["substeps"]) == 1
+        assert run_steps[1]["substeps"][0]["payload"]["command"] == "echo before"
 
     def test_uses_shared_formatter_for_turn_tool_message_and_error(self, tmp_path):
         """Codex parser should route key output lines through shared formatter."""
