@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","model":"test-model"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Inspecting repository"},{"type":"tool_use","id":"tool_1","name":"Bash","input":{"command":"rg -n \"foo\" src"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","is_error":false,"content":"src/app.py:10: foo"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Updated tests."}]}}
+{"type":"result","subtype":"success","result":"## Done\n\nFinished.","duration_ms":45000,"num_steps":2,"num_turns":2,"total_cost_usd":0.1234}
