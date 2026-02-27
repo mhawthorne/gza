@@ -484,6 +484,49 @@ class TestShowCommand:
         assert "gza retry 1" in result.stdout
         assert "Run Context: background (w-20260227-000001)" in result.stdout
 
+    def test_show_failed_task_extracts_verify_failure_from_tool_error_entries(self, tmp_path: Path):
+        """Failed-task diagnostics should detect verify failures in non-Claude tool_* entry shapes."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Failed task with non-Claude logs")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "TEST_FAILURE"
+        task.log_file = ".gza/logs/non-claude.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "uv run pytest tests/ -q"},
+            },
+            {
+                "type": "tool_error",
+                "tool_use_id": "call_1",
+                "content": "FAILED tests/test_cli.py::test_case - AssertionError",
+            },
+            {"type": "result", "subtype": "error_test_failure", "result": "verification failed"},
+        ]
+        (log_dir / "non-claude.log").write_text("\n".join(json.dumps(line) for line in lines))
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Last Verify Failure:" in result.stdout
+        assert "uv run pytest tests/ -q" in result.stdout
+        assert "AssertionError" in result.stdout
+
     def test_show_completed_task_omits_failure_diagnostics(self, tmp_path: Path):
         """Completed task output should not include failed-task diagnostics block."""
         from gza.db import SqliteTaskStore
@@ -1640,6 +1683,53 @@ class TestLogCommand:
         assert result.returncode == 0
         assert "Resolved to latest run attempt" in result.stdout
         assert "Latest attempt output" in result.stdout
+
+    def test_log_by_task_id_resolves_to_latest_sibling_attempt_from_non_root_query(self, tmp_path: Path):
+        """Querying an older retry resolves to the newest same-type sibling in lineage."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        root = store.add("Original failed task")
+        assert root.id is not None
+        root.status = "failed"
+        root.log_file = ".gza/logs/root.log"
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        store.update(root)
+
+        retry_a = store.add("Retry A", based_on=root.id, task_type=root.task_type)
+        assert retry_a.id is not None
+        retry_a.status = "failed"
+        retry_a.log_file = ".gza/logs/retry_a.log"
+        retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        store.update(retry_a)
+
+        retry_b = store.add("Retry B", based_on=root.id, task_type=root.task_type)
+        assert retry_b.id is not None
+        retry_b.status = "completed"
+        retry_b.log_file = ".gza/logs/retry_b.log"
+        retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        store.update(retry_b)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "root.log").write_text(json.dumps({"type": "result", "result": "root run"}))
+        (log_dir / "retry_a.log").write_text(json.dumps({"type": "result", "result": "retry A run"}))
+        (log_dir / "retry_b.log").write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Newest sibling output"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
+        ]))
+
+        result = run_gza("log", "--task", str(retry_a.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"task #{retry_b.id}" in result.stdout
+        assert "Resolved to latest run attempt" in result.stdout
+        assert "Newest sibling output" in result.stdout
 
     def test_log_default_mode_renders_entries_when_result_exists(self, tmp_path: Path):
         """Default formatted output should include entry rendering, not metadata-only output."""

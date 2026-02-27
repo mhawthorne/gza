@@ -10,6 +10,7 @@ import sys
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .config import Config, ConfigError
 from .console import (
@@ -2847,6 +2848,7 @@ def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tu
     """
     if task.id is None:
         return task, [task]
+    assert task.id is not None
 
     all_tasks = store.get_all()
     by_parent: dict[int, list[DbTask]] = {}
@@ -2855,18 +2857,45 @@ def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tu
             continue
         by_parent.setdefault(candidate.based_on, []).append(candidate)
 
-    related: list[DbTask] = [task]
-    queue = [task.id]
-    seen: set[int] = {task.id}
+    by_id: dict[int, DbTask] = {t.id: t for t in all_tasks if t.id is not None}
+
+    # Walk to lineage root first so sibling retry/resume attempts are considered.
+    root_id: int = task.id
+    root_seen: set[int] = set()
+    current = task
+    while current.id is not None and current.id not in root_seen:
+        root_seen.add(current.id)
+        if current.based_on is None:
+            root_id = current.id
+            break
+        parent = by_id.get(current.based_on)
+        if not parent:
+            # Broken/missing parent: stop at the latest known node.
+            root_id = current.id
+            break
+        current = parent
+        assert current.id is not None
+        root_id = current.id
+
+    related: list[DbTask] = []
+    queue = [root_id]
+    seen: set[int] = set()
     while queue:
         parent_id = queue.pop(0)
+        if parent_id in seen:
+            continue
+        seen.add(parent_id)
+        parent_task = by_id.get(parent_id)
+        if parent_task and parent_task.task_type == task.task_type:
+            related.append(parent_task)
         for child in by_parent.get(parent_id, []):
-            if child.id is None or child.id in seen:
+            if child.id is None:
                 continue
-            seen.add(child.id)
-            if child.task_type == task.task_type:
-                related.append(child)
-                queue.append(child.id)
+            queue.append(child.id)
+
+    # Preserve queried task in candidate set for edge-cases (e.g. broken lineage graph).
+    if not any(candidate.id == task.id for candidate in related):
+        related.append(task)
 
     related_sorted = sorted(related, key=_task_run_sort_key, reverse=True)
     for candidate in related_sorted:
@@ -4467,6 +4496,37 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
     last_verify_failure: str | None = None
     last_result_context: str | None = None
 
+    def _result_snippet(value: Any, limit: int = 160) -> str:
+        if isinstance(value, str):
+            return truncate(value.replace("\\n", "\n"), limit)
+        return truncate(json.dumps(value, ensure_ascii=True), limit)
+
+    def _record_verify_failure(command: str, output: Any, *, is_error: bool) -> None:
+        nonlocal last_verify_failure
+        snippet = _result_snippet(output)
+        if _looks_like_verify_command(command, verify_command) and (is_error or _looks_like_failure_output(snippet)):
+            last_verify_failure = f"{truncate(command, 120)} => {snippet}"
+
+    def _store_tool_command(tool_id: str, command: str) -> None:
+        if tool_id and command:
+            tool_calls[tool_id] = command
+
+    def _extract_command(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                return command.strip()
+        return ""
+
+    def _resolve_tool_command(entry: dict) -> str:
+        tool_id = str(entry.get("id") or entry.get("call_id") or entry.get("tool_use_id") or "")
+        command = tool_calls.get(tool_id, "")
+        if command:
+            return command
+        return _extract_command(entry.get("tool_input"))
+
     for entry in entries:
         entry_type = entry.get("type")
         if entry_type == "assistant":
@@ -4480,8 +4540,7 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
                 if not isinstance(tool_input, dict):
                     continue
                 command = str(tool_input.get("command") or "").strip()
-                if tool_id and command:
-                    tool_calls[tool_id] = command
+                _store_tool_command(tool_id, command)
         elif entry_type == "user":
             for item in _message_content_items(entry):
                 if item.get("type") != "tool_result":
@@ -4490,14 +4549,47 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
                 command = tool_calls.get(tool_id, "")
                 if not command:
                     continue
-                result_text = item.get("content", "")
-                if isinstance(result_text, str):
-                    snippet = truncate(result_text.replace("\\n", "\n"), 160)
-                else:
-                    snippet = truncate(json.dumps(result_text, ensure_ascii=True), 160)
                 is_error = bool(item.get("is_error", False))
-                if _looks_like_verify_command(command, verify_command) and (is_error or _looks_like_failure_output(snippet)):
-                    last_verify_failure = f"{truncate(command, 120)} => {snippet}"
+                _record_verify_failure(command, item.get("content", ""), is_error=is_error)
+        elif entry_type == "tool_use":
+            tool_name = str(entry.get("tool_name") or "")
+            if tool_name != "Bash":
+                continue
+            command = _resolve_tool_command(entry)
+            tool_id = str(entry.get("id") or entry.get("call_id") or "")
+            _store_tool_command(tool_id, command)
+        elif entry_type in {"tool_output", "tool_error"}:
+            command = _resolve_tool_command(entry)
+            if not command:
+                continue
+            is_error = entry_type == "tool_error"
+            if not is_error:
+                is_error = bool(entry.get("is_error"))
+            if not is_error:
+                exit_code = entry.get("exit_code")
+                is_error = isinstance(exit_code, int) and exit_code != 0
+            output = entry.get("content")
+            if output is None:
+                output = entry.get("output")
+            if output is None:
+                payload = {k: v for k, v in entry.items() if k not in {"type", "id", "call_id", "tool_use_id"}}
+                output = payload
+            _record_verify_failure(command, output, is_error=is_error)
+        elif entry_type == "item.completed":
+            item = entry.get("item", {})
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "command_execution":
+                continue
+            command = str(item.get("command") or "").strip()
+            if not command:
+                continue
+            exit_code = item.get("exit_code")
+            is_error = isinstance(exit_code, int) and exit_code != 0
+            output = item.get("aggregated_output")
+            if output is None:
+                output = item.get("output")
+            _record_verify_failure(command, output or "", is_error=is_error)
         elif entry_type == "result":
             subtype = str(entry.get("subtype") or "unknown")
             if subtype == "success":
