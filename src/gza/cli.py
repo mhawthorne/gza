@@ -2728,8 +2728,7 @@ def _format_log_entry(entry: dict) -> str | None:
 
     elif entry_type == "user":
         # User messages contain tool results
-        message = entry.get("message", {})
-        content = message.get("content", [])
+        content = _message_content_items(entry)
         parts = []
         for item in content:
             if item.get("type") == "tool_result":
@@ -2746,8 +2745,7 @@ def _format_log_entry(entry: dict) -> str | None:
         return None
 
     elif entry_type == "assistant":
-        message = entry.get("message", {})
-        content = message.get("content", [])
+        content = _message_content_items(entry)
         parts = []
         for item in content:
             if item.get("type") == "text":
@@ -2805,15 +2803,158 @@ def _format_log_entry(entry: dict) -> str | None:
     elif entry_type == "result":
         result = entry.get("result", "")
         is_error = entry.get("is_error", False)
+        subtype = str(entry.get("subtype") or "")
         if is_error:
             return f"[result] ERROR: {result}"
+        if subtype and subtype != "success":
+            if isinstance(result, str) and result.strip():
+                return f"[result] {subtype}: {result.strip()}"
+            return f"[result] {subtype}"
         # For success, show summary if available
         duration = entry.get("duration_ms", 0)
         num_steps = _result_step_count(entry) or 0
         cost = entry.get("total_cost_usd", 0)
-        return f"[result] Completed in {num_steps} steps, {duration/1000:.1f}s, ${cost:.4f}"
+        summary = f"[result] Completed in {num_steps} steps, {duration/1000:.1f}s, ${cost:.4f}"
+        if isinstance(result, str) and result.strip():
+            return f"{summary}\n{result.strip()}"
+        return summary
 
     return None
+
+
+def _task_run_sort_key(task: DbTask) -> tuple[datetime, int]:
+    """Sort key for selecting latest task run attempt deterministically."""
+    timestamp = task.started_at or task.completed_at or task.created_at or datetime.min.replace(tzinfo=timezone.utc)
+    return (timestamp, task.id or -1)
+
+
+def _task_has_run_artifacts(task: DbTask) -> bool:
+    """Return True if task appears to have executed at least once."""
+    return (
+        task.status in {"in_progress", "completed", "failed", "unmerged"}
+        or task.log_file is not None
+        or task.started_at is not None
+        or task.completed_at is not None
+    )
+
+
+def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tuple[DbTask, list[DbTask]]:
+    """Resolve latest same-type retry/resume attempt for a task.
+
+    Rule: include task itself plus same-type descendants in the based_on chain,
+    then choose the newest task with run artifacts. If none have artifacts,
+    choose newest task by timestamp/id.
+    """
+    if task.id is None:
+        return task, [task]
+
+    all_tasks = store.get_all()
+    by_parent: dict[int, list[DbTask]] = {}
+    for candidate in all_tasks:
+        if candidate.based_on is None:
+            continue
+        by_parent.setdefault(candidate.based_on, []).append(candidate)
+
+    related: list[DbTask] = [task]
+    queue = [task.id]
+    seen: set[int] = {task.id}
+    while queue:
+        parent_id = queue.pop(0)
+        for child in by_parent.get(parent_id, []):
+            if child.id is None or child.id in seen:
+                continue
+            seen.add(child.id)
+            if child.task_type == task.task_type:
+                related.append(child)
+                queue.append(child.id)
+
+    related_sorted = sorted(related, key=_task_run_sort_key, reverse=True)
+    for candidate in related_sorted:
+        if _task_has_run_artifacts(candidate):
+            return candidate, related_sorted
+    return related_sorted[0], related_sorted
+
+
+def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
+    """Build ordered candidate log paths for a task."""
+    candidates: list[Path] = []
+
+    if task.log_file:
+        path = Path(task.log_file)
+        if not path.is_absolute():
+            path = config.project_dir / path
+        candidates.append(path)
+
+    if task.task_id:
+        inferred = config.log_path / f"{task.task_id}.log"
+        candidates.append(inferred)
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMetadata | None:
+    """Return most recent worker metadata for a task."""
+    workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
+    if not workers:
+        return None
+    workers.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
+    return workers[-1]
+
+
+def _running_worker_id_for_task(registry: WorkerRegistry, task_id: int) -> str | None:
+    """Return a running worker ID for a task when available."""
+    workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
+    running = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
+    if not running:
+        return None
+    running.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
+    return running[-1].worker_id
+
+
+def _load_log_file_entries(log_path: Path) -> tuple[dict | None, list[dict], str]:
+    """Load log file as old JSON object or JSONL entries."""
+    with open(log_path) as f:
+        content = f.read().strip()
+
+    log_data = None
+    entries: list[dict] = []
+
+    if not content:
+        return None, [], content
+
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            log_data = parsed
+            if parsed.get("type"):
+                entries.append(parsed)
+            return log_data, entries, content
+    except json.JSONDecodeError:
+        pass
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            if not isinstance(entry, dict):
+                continue
+            entries.append(entry)
+            if entry.get("type") == "result":
+                log_data = entry
+        except json.JSONDecodeError:
+            continue
+
+    return log_data, entries, content
 
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -2824,9 +2965,12 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     query = args.identifier
     task = None
+    requested_task = None
+    resolution_note = None
     worker = None
     log_path = None
     is_running = False
+    worker_id_for_follow: str | None = None
 
     if args.worker:
         # Look up by worker ID
@@ -2841,36 +2985,83 @@ def cmd_log(args: argparse.Namespace) -> int:
             log_path = config.project_dir / task.log_file
         elif task and task.task_id:
             log_path = config.log_path / f"{task.task_id}.log"
+        worker_id_for_follow = worker.worker_id
 
     elif args.task:
         # Look up by numeric task ID
         try:
             task_id = int(query)
-            task = store.get(task_id)
+            requested_task = store.get(task_id)
         except ValueError:
             print(f"Error: '{query}' is not a valid task ID (must be numeric)")
             return 1
-        if not task:
+        if not requested_task:
             print(f"Error: Task {query} not found")
             return 1
-        if task.log_file:
-            log_path = config.project_dir / task.log_file
+
+        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
+        if requested_task.id != task.id and task.id is not None:
+            resolution_note = (
+                f"Resolved to latest run attempt: task #{task.id} "
+                "(latest same-type retry/resume in based_on chain)"
+            )
+
+        slug_candidate_paths: list[Path] = []
+        slug_candidate_paths.extend(_task_log_candidates(config, task))
+        for attempt in attempts:
+            if attempt.id == task.id:
+                continue
+            slug_candidate_paths.extend(_task_log_candidates(config, attempt))
+
+        for candidate in slug_candidate_paths:
+            if candidate.exists():
+                log_path = candidate
+                break
+        if log_path is None and slug_candidate_paths:
+            log_path = slug_candidate_paths[0]
+
+        if task.id is not None:
+            worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
+            is_running = worker_id_for_follow is not None
 
     elif args.slug:
         # Look up by slug (exact or partial match)
-        task = store.get_by_task_id(query)
-        if not task:
+        requested_task = store.get_by_task_id(query)
+        if not requested_task:
             # Try partial match
             all_tasks = store.get_all()
             for t in all_tasks:
                 if t.task_id and query in t.task_id:
-                    task = t
+                    requested_task = t
                     break
-        if not task:
+        if not requested_task:
             print(f"Error: No task found matching slug '{query}'")
             return 1
-        if task.log_file:
-            log_path = config.project_dir / task.log_file
+
+        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
+        if requested_task.id != task.id and task.id is not None:
+            resolution_note = (
+                f"Resolved to latest run attempt: task #{task.id} "
+                "(latest same-type retry/resume in based_on chain)"
+            )
+
+        candidate_paths: list[Path] = []
+        candidate_paths.extend(_task_log_candidates(config, task))
+        for attempt in attempts:
+            if attempt.id == task.id:
+                continue
+            candidate_paths.extend(_task_log_candidates(config, attempt))
+
+        for candidate in candidate_paths:
+            if candidate.exists():
+                log_path = candidate
+                break
+        if log_path is None and candidate_paths:
+            log_path = candidate_paths[0]
+
+        if task.id is not None:
+            worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
+            is_running = worker_id_for_follow is not None
 
     if not log_path:
         print(f"Error: No log file found")
@@ -2894,31 +3085,18 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     if follow or raw_mode:
         # Live streaming mode - use the formatted streaming output
-        return _tail_log_file(log_path, args, registry, query if worker else None)
+        return _tail_log_file(
+            log_path,
+            args,
+            registry,
+            worker_id_for_follow if is_running else None,
+            task.id if task else None,
+            store if task else None,
+        )
 
     # Static display mode - show summary or full turns
-    log_data = None
-    entries = []
     try:
-        with open(log_path) as f:
-            content = f.read().strip()
-
-        # Try parsing as single JSON first (old format)
-        try:
-            log_data = json.loads(content)
-        except json.JSONDecodeError:
-            # Try parsing as JSONL (new format)
-            for line in content.split('\n'):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    entries.append(entry)
-                    if entry.get("type") == "result":
-                        log_data = entry
-                except json.JSONDecodeError:
-                    continue
+        log_data, entries, content = _load_log_file_entries(log_path)
 
         if log_data is None and not entries:
             # If we have content but couldn't parse any JSON, it's likely a startup error
@@ -2942,6 +3120,8 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"Task: {prompt_display}")
         print(f"ID: {task.id} | Slug: {task.task_id}")
         print(f"Status: {task.status}")
+        if resolution_note:
+            print(f"Run selection: {resolution_note}")
         print(f"Log: {log_path}")
         if task.branch:
             print(f"Branch: {task.branch}")
@@ -2955,6 +3135,22 @@ def cmd_log(args: argparse.Namespace) -> int:
     timeline_mode = getattr(args, "timeline_mode", None)
     if timeline_mode and entries:
         _display_step_timeline(entries, verbose=timeline_mode == "verbose")
+    elif entries:
+        formatted_entries = [_format_log_entry(entry) for entry in entries]
+        rendered = [line for line in formatted_entries if line]
+        if rendered:
+            for line in rendered:
+                print(line)
+        elif log_data:
+            if "result" in log_data:
+                print(log_data["result"])
+            else:
+                subtype = log_data.get("subtype", "unknown")
+                print(f"Run ended with: {subtype}")
+                if log_data.get("errors"):
+                    print(f"Errors: {log_data['errors']}")
+        else:
+            print("No displayable log entries found.")
     elif log_data:
         # Extract and display the result field (which contains markdown)
         if "result" in log_data:
@@ -2988,7 +3184,14 @@ def cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
-def _tail_log_file(log_path: Path, args: argparse.Namespace, registry: WorkerRegistry, worker_id: str | None) -> int:
+def _tail_log_file(
+    log_path: Path,
+    args: argparse.Namespace,
+    registry: WorkerRegistry,
+    worker_id: str | None,
+    task_id: int | None = None,
+    store: SqliteTaskStore | None = None,
+) -> int:
     """Tail a log file with optional follow mode."""
     raw_mode = hasattr(args, 'raw') and args.raw
     follow = hasattr(args, 'follow') and args.follow
@@ -3091,6 +3294,27 @@ def _tail_log_file(log_path: Path, args: argparse.Namespace, registry: WorkerReg
                     except json.JSONDecodeError:
                         print(line)
                 break
+
+            # Fallback for task-based follow without a running worker ID.
+            if task_id is not None and store is not None and worker_id is None:
+                latest_task = store.get(task_id)
+                if latest_task is None or latest_task.status != "in_progress":
+                    time.sleep(0.5)
+                    with open(log_path, 'r') as f:
+                        lines = f.readlines()
+                    new_lines = lines[last_line_count:]
+                    for line in new_lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            output = _format_log_entry(entry)
+                            if output:
+                                print(output)
+                        except json.JSONDecodeError:
+                            print(line)
+                    break
 
         return 0
 
@@ -4189,6 +4413,150 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return run(config, task_id=new_task.id, resume=True)
 
 
+def _resolve_task_log_path(config: Config, task: DbTask) -> Path | None:
+    """Resolve best log path for a task from explicit and inferred candidates."""
+    candidates = _task_log_candidates(config, task)
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _looks_like_verify_command(command: str, verify_command: str | None) -> bool:
+    """Heuristic match for verification-related command invocations."""
+    normalized = command.lower()
+    if verify_command and verify_command.strip() and verify_command.strip().lower() in normalized:
+        return True
+
+    verify_tokens = [
+        "pytest",
+        "mypy",
+        "ruff",
+        "uv run pytest",
+        "uv run mypy",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "cargo test",
+    ]
+    return any(token in normalized for token in verify_tokens)
+
+
+def _looks_like_failure_output(text: str) -> bool:
+    """Heuristic match for command output that indicates failure."""
+    lowered = text.lower()
+    markers = ["failed", "error", "traceback", "assertionerror", "exit code", "exception"]
+    return any(marker in lowered for marker in markers)
+
+
+def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> tuple[str | None, str | None]:
+    """Extract last failing verify snippet and last result context from log."""
+    try:
+        log_data, entries, content = _load_log_file_entries(log_path)
+    except OSError:
+        return None, None
+
+    if not entries and content:
+        last_line = content.splitlines()[-1].strip()
+        return None, truncate(last_line, 180) if last_line else None
+
+    tool_calls: dict[str, str] = {}
+    last_verify_failure: str | None = None
+    last_result_context: str | None = None
+
+    for entry in entries:
+        entry_type = entry.get("type")
+        if entry_type == "assistant":
+            for item in _message_content_items(entry):
+                if item.get("type") != "tool_use":
+                    continue
+                if str(item.get("name")) != "Bash":
+                    continue
+                tool_id = str(item.get("id") or "")
+                tool_input = item.get("input", {})
+                if not isinstance(tool_input, dict):
+                    continue
+                command = str(tool_input.get("command") or "").strip()
+                if tool_id and command:
+                    tool_calls[tool_id] = command
+        elif entry_type == "user":
+            for item in _message_content_items(entry):
+                if item.get("type") != "tool_result":
+                    continue
+                tool_id = str(item.get("tool_use_id") or "")
+                command = tool_calls.get(tool_id, "")
+                if not command:
+                    continue
+                result_text = item.get("content", "")
+                if isinstance(result_text, str):
+                    snippet = truncate(result_text.replace("\\n", "\n"), 160)
+                else:
+                    snippet = truncate(json.dumps(result_text, ensure_ascii=True), 160)
+                is_error = bool(item.get("is_error", False))
+                if _looks_like_verify_command(command, verify_command) and (is_error or _looks_like_failure_output(snippet)):
+                    last_verify_failure = f"{truncate(command, 120)} => {snippet}"
+        elif entry_type == "result":
+            subtype = str(entry.get("subtype") or "unknown")
+            if subtype == "success":
+                continue
+            result_text = entry.get("result", "")
+            if isinstance(result_text, str) and result_text.strip():
+                detail = truncate(result_text.replace("\\n", "\n"), 180)
+            elif entry.get("errors"):
+                detail = truncate(json.dumps(entry.get("errors"), ensure_ascii=True), 180)
+            else:
+                detail = ""
+            if detail:
+                last_result_context = f"{subtype}: {detail}"
+            else:
+                last_result_context = subtype
+
+    if last_result_context is None and log_data:
+        subtype = str(log_data.get("subtype") or "")
+        if subtype and subtype != "success":
+            last_result_context = subtype
+
+    return last_verify_failure, last_result_context
+
+
+def _failure_summary(reason: str) -> str:
+    """Build short human-readable failure summary."""
+    summaries = {
+        "MAX_STEPS": "Stopped due to max steps limit.",
+        "MAX_TURNS": "Stopped due to max steps limit.",
+        "TEST_FAILURE": "Stopped due to verification/test failure.",
+        "UNKNOWN": "Task failed; inspect log output for details.",
+    }
+    return summaries.get(reason, f"Task failed: {reason}")
+
+
+def _failure_next_steps(task: DbTask, reason: str) -> list[str]:
+    """Return concrete next-step commands for a failed task."""
+    if task.id is None:
+        return []
+
+    steps = [f"gza log -t {task.id} --steps-verbose"]
+    if reason in {"MAX_STEPS", "MAX_TURNS"}:
+        if task.session_id:
+            steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if reason == "TEST_FAILURE":
+        if task.session_id:
+            steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if task.session_id:
+        steps.append(f"gza resume {task.id}")
+    steps.append(f"gza retry {task.id}")
+    return steps
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
     config = Config.load(args.project_dir)
@@ -4276,6 +4644,53 @@ def cmd_show(args: argparse.Namespace) -> int:
     stats_str = format_stats(task)
     if stats_str:
         console.print(f"[{c['label']}]Stats:[/{c['label']}] [{c['stats']}]{stats_str}[/{c['stats']}]")
+
+    if task.id is not None:
+        latest_worker = _latest_worker_for_task(WorkerRegistry(config.workers_path), task.id)
+        if latest_worker:
+            run_mode = "background" if latest_worker.is_background else "foreground"
+            worker_label = f"{run_mode} ({latest_worker.worker_id})"
+            console.print(f"[{c['label']}]Run Context:[/{c['label']}] [{c['value']}]{worker_label}[/{c['value']}]")
+
+    if task.status == "failed":
+        reason = task.failure_reason or "UNKNOWN"
+        console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['status_failed']}]{reason}[/{c['status_failed']}]")
+        console.print(f"[{c['label']}]Failure Summary:[/{c['label']}] [{c['value']}]{_failure_summary(reason)}[/{c['value']}]")
+
+        if reason in {"MAX_STEPS", "MAX_TURNS"}:
+            _, _, effective_max_steps = get_effective_config_for_task(task, config)
+            steps_used = task.num_steps_reported if task.num_steps_reported is not None else task.num_steps_computed
+            if steps_used is not None:
+                console.print(
+                    f"[{c['label']}]Step Limit:[/{c['label']}] "
+                    f"[{c['value']}]{steps_used} / {effective_max_steps}[/{c['value']}]"
+                )
+            turns_used = task.num_turns_reported if task.num_turns_reported is not None else task.num_turns_computed
+            if turns_used is not None:
+                console.print(
+                    f"[{c['label']}]Legacy Turns:[/{c['label']}] "
+                    f"[{c['value']}]{turns_used}[/{c['value']}]"
+                )
+
+        log_path = _resolve_task_log_path(config, task)
+        if log_path and log_path.exists():
+            verify_context, result_context = _extract_failure_log_context(log_path, config.verify_command)
+            if verify_context:
+                console.print(
+                    f"[{c['label']}]Last Verify Failure:[/{c['label']}] "
+                    f"[{c['value']}]{verify_context}[/{c['value']}]"
+                )
+            if result_context:
+                console.print(
+                    f"[{c['label']}]Last Result Context:[/{c['label']}] "
+                    f"[{c['value']}]{result_context}[/{c['value']}]"
+                )
+
+        next_step_commands = _failure_next_steps(task, reason)
+        if next_step_commands:
+            console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
+            for command in next_step_commands:
+                console.print(f"[{c['value']}]  - {command}[/{c['value']}]")
 
     return 0
 
@@ -5274,7 +5689,7 @@ def main() -> int:
     log_type_group.add_argument(
         "--task", "-t",
         action="store_true",
-        help="Look up by task ID (numeric)",
+        help="Look up by task ID (numeric). Resolves to latest same-type retry/resume run in based_on chain",
     )
     log_type_group.add_argument(
         "--slug", "-s",
@@ -5311,7 +5726,7 @@ def main() -> int:
     log_parser.add_argument(
         "--follow", "-f",
         action="store_true",
-        help="Follow the log in real-time (for running workers)",
+        help="Follow log in real-time when the resolved task run is actively running",
     )
     log_parser.add_argument(
         "--tail",

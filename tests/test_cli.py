@@ -401,6 +401,107 @@ class TestShowCommand:
         assert f"#{impl.id}" in result.stdout
         assert f"#{review.id}" in result.stdout
 
+    def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
+        """Failed task output includes reason, limits, context, and next-step commands."""
+        import json
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_steps: 50\nverify_command: uv run pytest tests/ -q\n")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Failed task for show diagnostics")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "MAX_STEPS"
+        task.log_file = ".gza/logs/fail.log"
+        task.session_id = "session-123"
+        task.num_steps_reported = 55
+        task.num_turns_reported = 55
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-20260227-000001",
+                pid=12345,
+                task_id=task.id,
+                task_slug=task.task_id,
+                started_at="2026-02-27T00:00:00+00:00",
+                status="failed",
+                log_file=task.log_file,
+                worktree=None,
+                is_background=True,
+            )
+        )
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "uv run pytest tests/ -q"}},
+                        {"type": "text", "text": "Running verification"},
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "is_error": True,
+                            "content": "FAILED tests/test_cli.py::test_case - AssertionError",
+                        }
+                    ],
+                },
+            },
+            {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit", "num_steps": 55},
+        ]
+        (log_dir / "fail.log").write_text("\n".join(json.dumps(line) for line in lines))
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: MAX_STEPS" in result.stdout
+        assert "Failure Summary: Stopped due to max steps limit." in result.stdout
+        assert "Step Limit: 55 / 50" in result.stdout
+        assert "Last Verify Failure:" in result.stdout
+        assert "uv run pytest tests/ -q" in result.stdout
+        assert "Last Result Context: error_max_turns" in result.stdout
+        assert "gza resume 1" in result.stdout
+        assert "gza retry 1" in result.stdout
+        assert "Run Context: background (w-20260227-000001)" in result.stdout
+
+    def test_show_completed_task_omits_failure_diagnostics(self, tmp_path: Path):
+        """Completed task output should not include failed-task diagnostics block."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Completed task")
+        task.status = "completed"
+        store.update(task)
+
+        result = run_gza("show", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason:" not in result.stdout
+        assert "Failure Summary:" not in result.stdout
+
 
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""
@@ -1472,8 +1573,197 @@ class TestLogCommand:
 
         # Should show formatted entries instead of failing
         assert result.returncode == 0
-        assert "[Step S1]" in result.stdout
         assert "Working..." in result.stdout
+
+    def test_log_by_task_id_falls_back_to_inferred_log_path(self, tmp_path: Path):
+        """Task lookup should render entries from inferred slug log when task.log_file is stale."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Fallback log path task")
+        task.status = "completed"
+        task.task_id = "20260227-fallback-log"
+        task.log_file = ".gza/logs/missing.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        inferred_log = log_dir / "20260227-fallback-log.log"
+        lines = [
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Recovered via inferred path"}]}},
+            {"type": "result", "subtype": "success", "result": "ok", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01},
+        ]
+        inferred_log.write_text("\n".join(json.dumps(line) for line in lines))
+
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Recovered via inferred path" in result.stdout
+
+    def test_log_by_task_id_resolves_to_latest_retry_resume_attempt(self, tmp_path: Path):
+        """Task lookup resolves deterministically to latest same-type based_on attempt."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        original = store.add("Original failed task")
+        assert original.id is not None
+        original.status = "failed"
+        original.log_file = ".gza/logs/original.log"
+        store.update(original)
+
+        retry = store.add("Retry task", based_on=original.id, task_type=original.task_type)
+        assert retry.id is not None
+        retry.status = "completed"
+        retry.log_file = ".gza/logs/retry.log"
+        retry.started_at = datetime.now(timezone.utc)
+        store.update(retry)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "original.log").write_text(json.dumps({"type": "result", "result": "old run"}))
+        (log_dir / "retry.log").write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Latest attempt output"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
+        ]))
+
+        result = run_gza("log", "--task", str(original.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resolved to latest run attempt" in result.stdout
+        assert "Latest attempt output" in result.stdout
+
+    def test_log_default_mode_renders_entries_when_result_exists(self, tmp_path: Path):
+        """Default formatted output should include entry rendering, not metadata-only output."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Default render parity task")
+        task.status = "completed"
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Entry text should render"}]}},
+            {"type": "result", "subtype": "success", "result": "summary", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01},
+        ]
+        (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
+
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Entry text should render" in result.stdout
+
+    def test_log_follow_by_task_uses_running_worker_when_available(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """-t -f should follow via live worker when a task is actively running."""
+        import argparse
+        import json
+        from gza.cli import cmd_log
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Running task for follow")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.log_file = ".gza/logs/follow.log"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-20260227-010101",
+            pid=os.getpid(),
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-02-27T01:01:01+00:00",
+            status="running",
+            log_file=task.log_file,
+            worktree=None,
+            is_background=False,
+        )
+        registry.register(worker)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "follow.log").write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "live"}]}})
+        ]))
+
+        captured: dict[str, str | None] = {}
+
+        def fake_tail(log_path, args, reg, worker_id, task_id, store_obj):
+            captured["worker_id"] = worker_id
+            captured["task_id"] = str(task_id) if task_id is not None else None
+            return 0
+
+        monkeypatch.setattr("gza.cli._tail_log_file", fake_tail)
+
+        args = argparse.Namespace(
+            identifier=str(task.id),
+            task=True,
+            slug=False,
+            worker=False,
+            follow=True,
+            raw=False,
+            timeline_mode=None,
+            tail=None,
+            project_dir=tmp_path,
+        )
+
+        rc = cmd_log(args)
+        assert rc == 0
+        assert captured["worker_id"] == "w-20260227-010101"
+        assert captured["task_id"] == str(task.id)
+
+    def test_log_follow_by_task_not_running_falls_back_to_static_output(self, tmp_path: Path):
+        """-t -f should print persisted logs and exit when task is not actively running."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Completed task with persisted log")
+        task.status = "completed"
+        task.log_file = ".gza/logs/static.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "static.log").write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "persisted output"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
+        ]))
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "log", "--task", "1", "--follow", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert result.returncode == 0
+        assert "persisted output" in result.stdout
 
     def test_log_steps_compact_renders_step_labels(self, tmp_path: Path):
         """--steps renders compact step-first timeline anchors."""
