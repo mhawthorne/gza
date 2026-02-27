@@ -22,14 +22,15 @@ def _persist_run_steps_from_result(
     run_id: int,
     provider_name: str,
     result: RunResult,
-) -> None:
+) -> bool:
     """Persist provider-emitted step/substep events into run_steps tables."""
     accumulated = getattr(result, "_accumulated_data", None)
     if not isinstance(accumulated, dict):
-        return
+        return False
     events = accumulated.get("run_step_events")
     if not isinstance(events, list):
-        return
+        return False
+    store.set_log_schema_version(run_id, 2)
 
     has_non_completed = any(
         isinstance(event, dict) and str(event.get("outcome") or "completed") != "completed"
@@ -75,6 +76,7 @@ def _persist_run_steps_from_result(
             str(event.get("outcome") or "completed"),
             event.get("summary"),
         )
+    return True
 
 
 def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | None, str, int]:
@@ -1098,7 +1100,9 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None
-        _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
+        has_step_events = _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
+        if has_step_events:
+            task.log_schema_version = 2
 
         # Store session_id if available
         if result.session_id:
@@ -1372,7 +1376,9 @@ def _run_non_code_task(
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None
-        _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
+        has_step_events = _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
+        if has_step_events:
+            task.log_schema_version = 2
 
         # Store session_id if available
         if result.session_id:
