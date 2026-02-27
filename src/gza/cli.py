@@ -2842,9 +2842,13 @@ def _task_has_run_artifacts(task: DbTask) -> bool:
 def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tuple[DbTask, list[DbTask]]:
     """Resolve latest same-type retry/resume attempt for a task.
 
-    Rule: include task itself plus same-type descendants in the based_on chain,
-    then choose the newest task with run artifacts. If none have artifacts,
-    choose newest task by timestamp/id.
+    Rule: stay within the queried task's same-type retry/resume lineage.
+    Include same-type ancestors of the queried task, plus same-type descendants
+    branching from the queried task itself. Exclude sibling/parallel branches
+    that only share an older ancestor with the queried task.
+
+    Choose the newest task with run artifacts. If none have artifacts, choose
+    newest task by timestamp/id.
     """
     if task.id is None:
         return task, [task]
@@ -2859,45 +2863,51 @@ def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tu
 
     by_id: dict[int, DbTask] = {t.id: t for t in all_tasks if t.id is not None}
 
-    # Walk to lineage root first so sibling retry/resume attempts are considered.
-    root_id: int = task.id
-    root_seen: set[int] = set()
+    # Collect same-type ancestors up from queried task (retry/resume chain backtracking).
+    related: list[DbTask] = []
+    ancestor_seen: set[int] = set()
     current = task
-    while current.id is not None and current.id not in root_seen:
-        root_seen.add(current.id)
+    while current.id is not None and current.id not in ancestor_seen:
+        ancestor_seen.add(current.id)
+        if current.task_type == task.task_type:
+            related.append(current)
         if current.based_on is None:
-            root_id = current.id
             break
         parent = by_id.get(current.based_on)
-        if not parent:
-            # Broken/missing parent: stop at the latest known node.
-            root_id = current.id
+        if parent is None or parent.task_type != task.task_type:
             break
         current = parent
-        assert current.id is not None
-        root_id = current.id
 
-    related: list[DbTask] = []
-    queue = [root_id]
+    # Collect same-type descendants only from the queried task forward.
+    queue = [task.id]
     seen: set[int] = set()
     while queue:
         parent_id = queue.pop(0)
         if parent_id in seen:
             continue
         seen.add(parent_id)
-        parent_task = by_id.get(parent_id)
-        if parent_task and parent_task.task_type == task.task_type:
-            related.append(parent_task)
         for child in by_parent.get(parent_id, []):
-            if child.id is None:
+            if child.id is None or child.task_type != task.task_type:
                 continue
+            related.append(child)
             queue.append(child.id)
 
-    # Preserve queried task in candidate set for edge-cases (e.g. broken lineage graph).
-    if not any(candidate.id == task.id for candidate in related):
-        related.append(task)
+    # Deduplicate while preserving traversal order.
+    deduped_related: list[DbTask] = []
+    related_seen: set[int] = set()
+    for candidate in related:
+        if candidate.id is None:
+            continue
+        if candidate.id in related_seen:
+            continue
+        related_seen.add(candidate.id)
+        deduped_related.append(candidate)
 
-    related_sorted = sorted(related, key=_task_run_sort_key, reverse=True)
+    # Preserve queried task in candidate set for edge-cases.
+    if task.id not in related_seen:
+        deduped_related.append(task)
+
+    related_sorted = sorted(deduped_related, key=_task_run_sort_key, reverse=True)
     for candidate in related_sorted:
         if _task_has_run_artifacts(candidate):
             return candidate, related_sorted
@@ -5781,7 +5791,7 @@ def main() -> int:
     log_type_group.add_argument(
         "--task", "-t",
         action="store_true",
-        help="Look up by task ID (numeric). Resolves to latest same-type retry/resume run in based_on chain",
+        help="Look up by task ID (numeric). Resolves to latest same-type retry/resume run in queried lineage",
     )
     log_type_group.add_argument(
         "--slug", "-s",

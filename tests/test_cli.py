@@ -1684,8 +1684,8 @@ class TestLogCommand:
         assert "Resolved to latest run attempt" in result.stdout
         assert "Latest attempt output" in result.stdout
 
-    def test_log_by_task_id_resolves_to_latest_sibling_attempt_from_non_root_query(self, tmp_path: Path):
-        """Querying an older retry resolves to the newest same-type sibling in lineage."""
+    def test_log_by_task_id_non_root_query_stays_within_its_retry_chain(self, tmp_path: Path):
+        """Querying a retry should not jump to a newer same-type sibling chain."""
         import json
         from gza.db import SqliteTaskStore
 
@@ -1727,9 +1727,153 @@ class TestLogCommand:
         result = run_gza("log", "--task", str(retry_a.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"task #{retry_b.id}" in result.stdout
+        assert "Resolved to latest run attempt" not in result.stdout
+        assert "retry A run" in result.stdout
+        assert "Newest sibling output" not in result.stdout
+
+    def test_log_by_slug_non_root_query_stays_within_its_retry_chain(self, tmp_path: Path):
+        """Slug lookup should not jump to a newer same-type sibling chain."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        root = store.add("Original failed task")
+        assert root.id is not None
+        root.task_id = "20260227-chain-root"
+        root.status = "failed"
+        root.log_file = ".gza/logs/root.log"
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        store.update(root)
+
+        retry_a = store.add("Retry A", based_on=root.id, task_type=root.task_type)
+        assert retry_a.id is not None
+        retry_a.task_id = "20260227-chain-a"
+        retry_a.status = "failed"
+        retry_a.log_file = ".gza/logs/retry_a.log"
+        retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        store.update(retry_a)
+
+        retry_b = store.add("Retry B", based_on=root.id, task_type=root.task_type)
+        assert retry_b.id is not None
+        retry_b.task_id = "20260227-chain-b"
+        retry_b.status = "completed"
+        retry_b.log_file = ".gza/logs/retry_b.log"
+        retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        store.update(retry_b)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "root.log").write_text(json.dumps({"type": "result", "result": "root run"}))
+        (log_dir / "retry_a.log").write_text(json.dumps({"type": "result", "result": "retry A run"}))
+        (log_dir / "retry_b.log").write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Newest sibling output"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
+        ]))
+
+        result = run_gza("log", "--slug", "20260227-chain-a", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resolved to latest run attempt" not in result.stdout
+        assert "retry A run" in result.stdout
+        assert "Newest sibling output" not in result.stdout
+
+    def test_log_by_task_id_latest_attempt_ignores_mixed_type_lineage_nodes(self, tmp_path: Path):
+        """Latest-attempt resolution should only consider same-type retry/resume attempts."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        root = store.add("Original task", task_type="task")
+        assert root.id is not None
+        root.status = "failed"
+        root.log_file = ".gza/logs/root.log"
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        store.update(root)
+
+        retry = store.add("Retry task", based_on=root.id, task_type="task")
+        assert retry.id is not None
+        retry.status = "completed"
+        retry.log_file = ".gza/logs/retry.log"
+        retry.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        store.update(retry)
+
+        review = store.add("Review task", based_on=root.id, task_type="review")
+        assert review.id is not None
+        review.status = "completed"
+        review.log_file = ".gza/logs/review.log"
+        review.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        store.update(review)
+
+        improve = store.add("Improve task", based_on=review.id, task_type="improve")
+        assert improve.id is not None
+        improve.status = "completed"
+        improve.log_file = ".gza/logs/improve.log"
+        improve.started_at = datetime(2026, 2, 26, 13, 0, tzinfo=timezone.utc)
+        store.update(improve)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "root.log").write_text(json.dumps({"type": "result", "result": "root run"}))
+        (log_dir / "retry.log").write_text(json.dumps({"type": "result", "result": "retry chain output"}))
+        (log_dir / "review.log").write_text(json.dumps({"type": "result", "result": "review output"}))
+        (log_dir / "improve.log").write_text(json.dumps({"type": "result", "result": "improve output"}))
+
+        result = run_gza("log", "--task", str(root.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
         assert "Resolved to latest run attempt" in result.stdout
-        assert "Newest sibling output" in result.stdout
+        assert f"task #{retry.id}" in result.stdout
+        assert "retry chain output" in result.stdout
+        assert "review output" not in result.stdout
+        assert "improve output" not in result.stdout
+
+    def test_resolve_latest_attempt_for_task_excludes_parallel_same_type_sibling_chains(self, tmp_path: Path):
+        """Resolver should stay within the queried task's direct same-type chain."""
+        from gza.cli import _resolve_latest_attempt_for_task
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        root = store.add("Root task", task_type="task")
+        assert root.id is not None
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        root.status = "failed"
+        store.update(root)
+
+        chain_a = store.add("Chain A", based_on=root.id, task_type="task")
+        assert chain_a.id is not None
+        chain_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        chain_a.status = "failed"
+        store.update(chain_a)
+
+        chain_a_resume = store.add("Chain A Resume", based_on=chain_a.id, task_type="task")
+        assert chain_a_resume.id is not None
+        chain_a_resume.started_at = datetime(2026, 2, 26, 12, 10, tzinfo=timezone.utc)
+        chain_a_resume.status = "completed"
+        store.update(chain_a_resume)
+
+        sibling_chain = store.add("Sibling Chain", based_on=root.id, task_type="task")
+        assert sibling_chain.id is not None
+        sibling_chain.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        sibling_chain.status = "completed"
+        store.update(sibling_chain)
+
+        selected, attempts = _resolve_latest_attempt_for_task(store, chain_a)
+
+        attempt_ids = [attempt.id for attempt in attempts]
+        assert selected.id == chain_a_resume.id
+        assert sibling_chain.id not in attempt_ids
 
     def test_log_default_mode_renders_entries_when_result_exists(self, tmp_path: Path):
         """Default formatted output should include entry rendering, not metadata-only output."""
