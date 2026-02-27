@@ -1257,6 +1257,34 @@ class TestClaudeStepMapping:
         assert result.num_steps_computed == 1
         assert result.num_steps_reported == 1
 
+    def test_sets_zero_step_metrics_when_no_assistant_message(self, tmp_path):
+        """Claude should persist explicit zero step metrics for runs with no step events."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "result", "subtype": "error_max_turns", "num_turns": 0, "total_cost_usd": 0.0}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.num_steps_computed == 0
+        assert result.num_steps_reported == 0
+
 
 class TestClaudeToolLogging:
     """Tests for enhanced Claude provider tool logging."""

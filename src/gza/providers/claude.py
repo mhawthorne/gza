@@ -559,9 +559,8 @@ class ClaudeProvider(Provider):
             result.num_turns_computed = len(seen_msg_ids)
 
         step_count = len(accumulated_data.get("run_step_events", []))
-        if step_count > 0:
-            result.num_steps_computed = step_count
-            result.num_steps_reported = step_count
+        result.num_steps_computed = step_count
+        result.num_steps_reported = step_count
 
         # Store accumulated token counts
         if "total_input_tokens" in accumulated_data:
