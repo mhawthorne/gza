@@ -18,6 +18,39 @@ KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "UNKNOWN"}
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
 
+def _compute_percentiles(values: list[float]) -> dict | None:
+    """Compute min/max/avg/median/p90 for a list of numeric values.
+
+    Returns None if the list is empty.
+    """
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    total = sum(sorted_vals)
+    avg = total / n
+
+    # Median: average of two middle elements for even n
+    mid = n // 2
+    if n % 2 == 1:
+        median = sorted_vals[mid]
+    else:
+        median = (sorted_vals[mid - 1] + sorted_vals[mid]) / 2
+
+    # p90: 90th percentile via nearest-rank method
+    p90_idx = max(0, int(0.9 * n) - 1)
+    p90 = sorted_vals[p90_idx] if n >= 10 else sorted_vals[-1]
+
+    return {
+        "min": sorted_vals[0],
+        "max": sorted_vals[-1],
+        "avg": round(avg, 2),
+        "median": median,
+        "p90": p90,
+        "count": n,
+    }
+
+
 @dataclass
 class Task:
     """A task in the database."""
@@ -62,6 +95,9 @@ class Task:
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
+    cycle_id: int | None = None  # Cycle this task belongs to (v18)
+    cycle_iteration_index: int | None = None  # Iteration index within cycle (v18)
+    cycle_role: str | None = None  # 'review' or 'improve' within a cycle (v18)
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -87,8 +123,34 @@ class TaskStats:
     cost_estimated: bool = False
 
 
+@dataclass
+class TaskCycle:
+    """A cycle of review/improve iterations for an implementation task."""
+    id: int
+    implementation_task_id: int
+    status: str  # active | approved | maxed_out | blocked
+    max_iterations: int
+    started_at: datetime
+    ended_at: datetime | None
+    stop_reason: str | None  # approved | max_iterations | needs_discussion | review_failed | improve_failed
+
+
+@dataclass
+class TaskCycleIteration:
+    """A single iteration within a cycle (one review + optional improve)."""
+    id: int
+    cycle_id: int
+    iteration_index: int
+    review_task_id: int | None
+    review_verdict: str | None
+    improve_task_id: int | None
+    state: str  # review_created | review_completed | improve_created | improve_completed | terminal
+    started_at: datetime
+    ended_at: datetime | None
+
+
 # Schema version for migrations
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -150,7 +212,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Review state cleared by improve task (v14)
     review_cleared_at TEXT,
     -- Log entry schema marker (v17): 1=legacy turn/event logs, 2=message-step logs
-    log_schema_version INTEGER DEFAULT 1
+    log_schema_version INTEGER DEFAULT 1,
+    -- Cycle tracking (v18): nullable FK and metadata for cycle orchestration
+    cycle_id INTEGER,
+    cycle_iteration_index INTEGER,
+    cycle_role TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -199,6 +265,33 @@ CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_steps_step_index ON run_steps(run_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
+
+CREATE TABLE IF NOT EXISTS task_cycles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    implementation_task_id INTEGER NOT NULL REFERENCES tasks(id),
+    status TEXT NOT NULL DEFAULT 'active',
+    max_iterations INTEGER NOT NULL DEFAULT 3,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    stop_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_cycle_iterations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id INTEGER NOT NULL REFERENCES task_cycles(id),
+    iteration_index INTEGER NOT NULL,
+    review_task_id INTEGER REFERENCES tasks(id),
+    review_verdict TEXT,
+    improve_task_id INTEGER REFERENCES tasks(id),
+    state TEXT NOT NULL DEFAULT 'review_created',
+    started_at TEXT NOT NULL,
+    ended_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_cycles_impl_id ON task_cycles(implementation_task_id);
+CREATE INDEX IF NOT EXISTS idx_task_cycles_status ON task_cycles(status);
+CREATE INDEX IF NOT EXISTS idx_task_cycle_iterations_cycle_idx ON task_cycle_iterations(cycle_id, iteration_index);
+CREATE INDEX IF NOT EXISTS idx_tasks_cycle_id ON tasks(cycle_id);
 """
 
 # Migration from v1 to v2
@@ -337,6 +430,37 @@ CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
 MIGRATION_V16_TO_V17 = """
 ALTER TABLE tasks ADD COLUMN log_schema_version INTEGER DEFAULT 1;
 UPDATE tasks SET log_schema_version = 1 WHERE log_schema_version IS NULL;
+"""
+
+# Migration from v17 to v18
+MIGRATION_V17_TO_V18 = """
+ALTER TABLE tasks ADD COLUMN cycle_id INTEGER;
+ALTER TABLE tasks ADD COLUMN cycle_iteration_index INTEGER;
+ALTER TABLE tasks ADD COLUMN cycle_role TEXT;
+CREATE TABLE IF NOT EXISTS task_cycles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    implementation_task_id INTEGER NOT NULL REFERENCES tasks(id),
+    status TEXT NOT NULL DEFAULT 'active',
+    max_iterations INTEGER NOT NULL DEFAULT 3,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    stop_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS task_cycle_iterations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id INTEGER NOT NULL REFERENCES task_cycles(id),
+    iteration_index INTEGER NOT NULL,
+    review_task_id INTEGER REFERENCES tasks(id),
+    review_verdict TEXT,
+    improve_task_id INTEGER REFERENCES tasks(id),
+    state TEXT NOT NULL DEFAULT 'review_created',
+    started_at TEXT NOT NULL,
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_cycles_impl_id ON task_cycles(implementation_task_id);
+CREATE INDEX IF NOT EXISTS idx_task_cycles_status ON task_cycles(status);
+CREATE INDEX IF NOT EXISTS idx_task_cycle_iterations_cycle_idx ON task_cycle_iterations(cycle_id, iteration_index);
+CREATE INDEX IF NOT EXISTS idx_tasks_cycle_id ON tasks(cycle_id);
 """
 
 
@@ -647,6 +771,19 @@ class SqliteTaskStore:
                     conn.execute("UPDATE schema_version SET version = ?", (17,))
                     current_version = 17
 
+                if current_version < 18:
+                    # Run migration v17 -> v18
+                    for stmt in MIGRATION_V17_TO_V18.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column/table/index might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (18,))
+                    current_version = 18
+
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
@@ -703,6 +840,9 @@ class SqliteTaskStore:
                 if "log_schema_version" in row.keys() and row["log_schema_version"] is not None
                 else 1
             ),
+            cycle_id=row["cycle_id"] if "cycle_id" in row.keys() else None,
+            cycle_iteration_index=row["cycle_iteration_index"] if "cycle_iteration_index" in row.keys() else None,
+            cycle_role=row["cycle_role"] if "cycle_role" in row.keys() else None,
         )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
@@ -835,7 +975,10 @@ class SqliteTaskStore:
                     diff_lines_added = ?,
                     diff_lines_removed = ?,
                     review_cleared_at = ?,
-                    log_schema_version = ?
+                    log_schema_version = ?,
+                    cycle_id = ?,
+                    cycle_iteration_index = ?,
+                    cycle_role = ?
                 WHERE id = ?
                 """,
                 (
@@ -876,6 +1019,9 @@ class SqliteTaskStore:
                     task.diff_lines_removed,
                     task.review_cleared_at.isoformat() if task.review_cleared_at else None,
                     task.log_schema_version,
+                    task.cycle_id,
+                    task.cycle_iteration_index,
+                    task.cycle_role,
                     task.id,
                 ),
             )
@@ -1104,6 +1250,212 @@ class SqliteTaskStore:
                 "UPDATE tasks SET log_schema_version = ? WHERE id = ?",
                 (version, task_id),
             )
+
+    # === Cycle orchestration APIs (v18) ===
+
+    def _row_to_task_cycle(self, row: sqlite3.Row) -> "TaskCycle":
+        """Convert a database row to a TaskCycle."""
+        return TaskCycle(
+            id=row["id"],
+            implementation_task_id=row["implementation_task_id"],
+            status=row["status"],
+            max_iterations=row["max_iterations"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
+            stop_reason=row["stop_reason"],
+        )
+
+    def _row_to_task_cycle_iteration(self, row: sqlite3.Row) -> "TaskCycleIteration":
+        """Convert a database row to a TaskCycleIteration."""
+        return TaskCycleIteration(
+            id=row["id"],
+            cycle_id=row["cycle_id"],
+            iteration_index=row["iteration_index"],
+            review_task_id=row["review_task_id"],
+            review_verdict=row["review_verdict"],
+            improve_task_id=row["improve_task_id"],
+            state=row["state"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
+        )
+
+    def start_cycle(self, impl_task_id: int, max_iterations: int = 3) -> "TaskCycle":
+        """Start a new cycle for an implementation task.
+
+        Raises ValueError if there is already an active cycle for this task.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            # Enforce uniqueness: only one active cycle per implementation
+            cur = conn.execute(
+                "SELECT id FROM task_cycles WHERE implementation_task_id = ? AND status = 'active'",
+                (impl_task_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                raise ValueError(
+                    f"Task #{impl_task_id} already has an active cycle (#{existing['id']}). "
+                    "Use --continue to resume it."
+                )
+            cur = conn.execute(
+                """
+                INSERT INTO task_cycles (implementation_task_id, status, max_iterations, started_at)
+                VALUES (?, 'active', ?, ?)
+                """,
+                (impl_task_id, max_iterations, now),
+            )
+            cycle_id = cur.lastrowid
+            assert cycle_id is not None
+            cur = conn.execute("SELECT * FROM task_cycles WHERE id = ?", (cycle_id,))
+            row = cur.fetchone()
+            assert row is not None
+            return self._row_to_task_cycle(row)
+
+    def get_active_cycle_for_impl(self, impl_task_id: int) -> "TaskCycle | None":
+        """Get the active cycle for an implementation task, if any."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM task_cycles WHERE implementation_task_id = ? AND status = 'active'",
+                (impl_task_id,),
+            )
+            row = cur.fetchone()
+            return self._row_to_task_cycle(row) if row else None
+
+    def get_cycles_for_impl(self, impl_task_id: int) -> "list[TaskCycle]":
+        """Get all cycles for an implementation task, newest first."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM task_cycles WHERE implementation_task_id = ? ORDER BY id DESC",
+                (impl_task_id,),
+            )
+            return [self._row_to_task_cycle(row) for row in cur.fetchall()]
+
+    def get_all_closed_cycles(self) -> "list[TaskCycle]":
+        """Get all closed (non-active) cycles, newest first."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM task_cycles WHERE status != 'active' ORDER BY id DESC",
+            )
+            return [self._row_to_task_cycle(row) for row in cur.fetchall()]
+
+    def append_cycle_iteration(self, cycle_id: int, iteration_index: int) -> "TaskCycleIteration":
+        """Create a new iteration record for a cycle."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO task_cycle_iterations (cycle_id, iteration_index, state, started_at)
+                VALUES (?, ?, 'review_created', ?)
+                """,
+                (cycle_id, iteration_index, now),
+            )
+            iter_id = cur.lastrowid
+            assert iter_id is not None
+            cur = conn.execute("SELECT * FROM task_cycle_iterations WHERE id = ?", (iter_id,))
+            row = cur.fetchone()
+            assert row is not None
+            return self._row_to_task_cycle_iteration(row)
+
+    def update_cycle_iteration(
+        self,
+        iteration_id: int,
+        *,
+        review_task_id: int | None = None,
+        review_verdict: str | None = None,
+        improve_task_id: int | None = None,
+        state: str | None = None,
+        ended_at: datetime | None = None,
+    ) -> None:
+        """Update fields on a cycle iteration row."""
+        with self._connect() as conn:
+            updates = []
+            params: list[Any] = []
+            if review_task_id is not None:
+                updates.append("review_task_id = ?")
+                params.append(review_task_id)
+            if review_verdict is not None:
+                updates.append("review_verdict = ?")
+                params.append(review_verdict)
+            if improve_task_id is not None:
+                updates.append("improve_task_id = ?")
+                params.append(improve_task_id)
+            if state is not None:
+                updates.append("state = ?")
+                params.append(state)
+            if ended_at is not None:
+                updates.append("ended_at = ?")
+                params.append(ended_at.isoformat())
+            if not updates:
+                return
+            params.append(iteration_id)
+            conn.execute(
+                f"UPDATE task_cycle_iterations SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+
+    def get_cycle_iterations(self, cycle_id: int) -> "list[TaskCycleIteration]":
+        """Get all iterations for a cycle, ordered by iteration_index."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM task_cycle_iterations WHERE cycle_id = ? ORDER BY iteration_index ASC",
+                (cycle_id,),
+            )
+            return [self._row_to_task_cycle_iteration(row) for row in cur.fetchall()]
+
+    def close_cycle(self, cycle_id: int, status: str, stop_reason: str) -> None:
+        """Close a cycle with the given status and stop reason."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE task_cycles SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
+                (status, stop_reason, now, cycle_id),
+            )
+
+    def get_cycle_aggregate_stats(self) -> dict:
+        """Get aggregate cycle stats across all closed approved cycles.
+
+        Returns a dict with percentile distributions for:
+        - iterations_to_approval (improve count before first approval)
+        - reviews_per_cycle
+        - improves_per_cycle
+        - cycle_duration_seconds
+        """
+        cycles = self.get_all_closed_cycles()
+        if not cycles:
+            return {
+                "total_cycles": 0,
+                "approved_cycles": 0,
+                "iterations_to_approval": None,
+                "reviews_per_cycle": None,
+                "improves_per_cycle": None,
+                "cycle_duration_seconds": None,
+            }
+
+        approved = [c for c in cycles if c.status == "approved"]
+        iterations_vals: list[float] = []
+        reviews_vals: list[float] = []
+        improves_vals: list[float] = []
+        duration_vals: list[float] = []
+
+        for cycle in cycles:
+            iters = self.get_cycle_iterations(cycle.id)
+            reviews_vals.append(sum(1 for it in iters if it.review_task_id is not None))
+            improves_vals.append(sum(1 for it in iters if it.improve_task_id is not None))
+            if cycle.ended_at and cycle.started_at:
+                duration_vals.append((cycle.ended_at - cycle.started_at).total_seconds())
+
+        for cycle in approved:
+            iters = self.get_cycle_iterations(cycle.id)
+            iterations_vals.append(sum(1 for it in iters if it.improve_task_id is not None))
+
+        return {
+            "total_cycles": len(cycles),
+            "approved_cycles": len(approved),
+            "iterations_to_approval": _compute_percentiles(iterations_vals) if iterations_vals else None,
+            "reviews_per_cycle": _compute_percentiles(reviews_vals) if reviews_vals else None,
+            "improves_per_cycle": _compute_percentiles(improves_vals) if improves_vals else None,
+            "cycle_duration_seconds": _compute_percentiles(duration_vals) if duration_vals else None,
+        }
 
     # === Run step/substep persistence ===
 
