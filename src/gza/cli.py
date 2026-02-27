@@ -2496,6 +2496,222 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _result_step_count(result_entry: dict) -> int | None:
+    """Resolve a result entry's step count using step-first fallback."""
+    num_steps = result_entry.get("num_steps")
+    if isinstance(num_steps, int):
+        return num_steps
+    num_steps_reported = result_entry.get("num_steps_reported")
+    if isinstance(num_steps_reported, int):
+        return num_steps_reported
+    num_turns = result_entry.get("num_turns")
+    if isinstance(num_turns, int):
+        return num_turns
+    return None
+
+
+def _summarize_tool_detail(tool_name: str, tool_input: dict) -> str:
+    """Build a compact one-line tool summary for timeline rendering."""
+    if tool_name == "Bash":
+        cmd = str(tool_input.get("command", ""))
+        return truncate(cmd, 100) if cmd else "Bash"
+    if tool_name in {"Read", "Edit", "Write"}:
+        path = str(tool_input.get("file_path", ""))
+        return f"{tool_name} {path}".strip()
+    if tool_name == "Grep":
+        pattern = str(tool_input.get("pattern", ""))
+        path = str(tool_input.get("path", ""))
+        detail = f"{pattern} [{path}]".strip()
+        return f"Grep {detail}".strip()
+    if tool_name == "Glob":
+        pattern = str(tool_input.get("pattern", ""))
+        return f"Glob {pattern}".strip()
+    if tool_name == "TodoWrite":
+        todos = tool_input.get("todos", [])
+        if isinstance(todos, list):
+            return f"TodoWrite {len(todos)} todos"
+        return "TodoWrite"
+    return tool_name
+
+
+def _append_timeline_step(steps: list[dict], message_text: str | None, summary: str | None = None) -> dict:
+    """Append a timeline step and return it."""
+    step_index = len(steps) + 1
+    step: dict = {
+        "step_id": f"S{step_index}",
+        "message_text": (message_text or "").strip() or None,
+        "summary": summary,
+        "substeps": [],
+    }
+    steps.append(step)
+    return step
+
+
+def _append_substep(step: dict, detail: str) -> None:
+    """Append a substep line to a timeline step."""
+    detail = detail.strip()
+    if not detail:
+        return
+    substeps = step["substeps"]
+    substeps.append(
+        {
+            "substep_id": f"{step['step_id']}.{len(substeps) + 1}",
+            "detail": detail,
+        }
+    )
+
+
+def _ensure_current_step(steps: list[dict], current_step: dict | None) -> dict:
+    """Ensure a current step exists for pre-message tool activity."""
+    if current_step is not None:
+        return current_step
+    return _append_timeline_step(steps, None, summary="Pre-message tool activity")
+
+
+def _message_content_items(entry: dict) -> list[dict]:
+    """Normalize assistant/user message content into a list of content items."""
+    message = entry.get("message", {})
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content", [])
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, dict):
+        return [content]
+    if isinstance(content, list):
+        return [item for item in content if isinstance(item, dict)]
+    return []
+
+
+def _build_step_timeline(entries: list[dict]) -> list[dict]:
+    """Build step-first timeline model from mixed historical log entry shapes."""
+    steps: list[dict] = []
+    current_step: dict | None = None
+
+    for entry in entries:
+        entry_type = entry.get("type")
+
+        if entry_type == "assistant":
+            content_items = _message_content_items(entry)
+            text_chunks: list[str] = []
+            tool_items: list[dict] = []
+            for item in content_items:
+                item_type = item.get("type")
+                if item_type == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        text_chunks.append(text.strip())
+                elif item_type == "tool_use":
+                    tool_items.append(item)
+
+            if text_chunks:
+                current_step = _append_timeline_step(steps, "\n".join(text_chunks))
+            elif tool_items:
+                current_step = _ensure_current_step(steps, current_step)
+
+            for item in tool_items:
+                if current_step is None:
+                    current_step = _ensure_current_step(steps, current_step)
+                tool_name = str(item.get("name", "unknown"))
+                tool_input = item.get("input", {})
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                _append_substep(current_step, f"tool_call {_summarize_tool_detail(tool_name, tool_input)}")
+
+        elif entry_type == "user":
+            content_items = _message_content_items(entry)
+            for item in content_items:
+                if item.get("type") != "tool_result":
+                    continue
+                current_step = _ensure_current_step(steps, current_step)
+                is_error = bool(item.get("is_error", False))
+                result_type = "tool_error" if is_error else "tool_output"
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    detail = truncate(content.replace("\\n", "\n"), 120)
+                else:
+                    detail = truncate(json.dumps(content, ensure_ascii=True), 120)
+                _append_substep(current_step, f"{result_type} {detail}".strip())
+
+        elif entry_type == "message":
+            role = entry.get("role")
+            if role == "user":
+                current_step = None
+                continue
+            if role == "assistant":
+                content = entry.get("content", "")
+                if isinstance(content, str) and content.strip() and not entry.get("delta"):
+                    current_step = _append_timeline_step(steps, content.strip())
+
+        elif entry_type == "tool_use":
+            current_step = _ensure_current_step(steps, current_step)
+            tool_name = str(entry.get("tool_name", "unknown"))
+            tool_input = entry.get("tool_input", {})
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            _append_substep(current_step, f"tool_call {_summarize_tool_detail(tool_name, tool_input)}")
+
+        elif entry_type in {"tool_output", "tool_error", "tool_retry"}:
+            current_step = _ensure_current_step(steps, current_step)
+            payload = {
+                key: value
+                for key, value in entry.items()
+                if key not in {"type", "id", "call_id"}
+            }
+            detail = truncate(json.dumps(payload, ensure_ascii=True), 120)
+            _append_substep(current_step, f"{entry_type} {detail}".strip())
+
+        elif entry_type == "turn.started":
+            current_step = None
+
+        elif entry_type == "item.completed":
+            item = entry.get("item", {})
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    current_step = _append_timeline_step(steps, text.strip())
+            elif item_type == "command_execution":
+                current_step = _ensure_current_step(steps, current_step)
+                command = truncate(str(item.get("command", "")), 100)
+                _append_substep(current_step, f"tool_call Bash {command}".strip())
+                if "aggregated_output" in item or "exit_code" in item:
+                    exit_code = item.get("exit_code")
+                    is_error = isinstance(exit_code, int) and exit_code != 0
+                    substep_type = "tool_error" if is_error else "tool_output"
+                    output = str(item.get("aggregated_output", ""))
+                    _append_substep(
+                        current_step,
+                        f"{substep_type} {truncate(output, 120)}".strip(),
+                    )
+
+    return steps
+
+
+def _display_step_timeline(entries: list[dict], *, verbose: bool) -> None:
+    """Render a step-first timeline in compact or verbose mode."""
+    steps = _build_step_timeline(entries)
+    if not steps:
+        print("No step entries found.")
+        return
+
+    for step in steps:
+        title = f"[Step {step['step_id']}]"
+        message_text = step.get("message_text")
+        summary = step.get("summary")
+        if message_text:
+            print(f"{title} {message_text}")
+        elif summary:
+            print(f"{title} {summary}")
+        else:
+            print(title)
+        if verbose:
+            for substep in step["substeps"]:
+                print(f"  [{substep['substep_id']}] {substep['detail']}")
+
+
 def _format_log_entry(entry: dict) -> str | None:
     """Format a single JSON log entry for display.
 
@@ -2593,9 +2809,9 @@ def _format_log_entry(entry: dict) -> str | None:
             return f"[result] ERROR: {result}"
         # For success, show summary if available
         duration = entry.get("duration_ms", 0)
-        num_turns = entry.get("num_turns", 0)
+        num_steps = _result_step_count(entry) or 0
         cost = entry.get("total_cost_usd", 0)
-        return f"[result] Completed in {num_turns} turns, {duration/1000:.1f}s, ${cost:.4f}"
+        return f"[result] Completed in {num_steps} steps, {duration/1000:.1f}s, ${cost:.4f}"
 
     return None
 
@@ -2736,9 +2952,9 @@ def cmd_log(args: argparse.Namespace) -> int:
     print("=" * 70)
     print()
 
-    if args.turns and entries:
-        # Show the full conversation turns
-        _display_conversation_turns(entries)
+    timeline_mode = getattr(args, "timeline_mode", None)
+    if timeline_mode and entries:
+        _display_step_timeline(entries, verbose=timeline_mode == "verbose")
     elif log_data:
         # Extract and display the result field (which contains markdown)
         if "result" in log_data:
@@ -2750,11 +2966,8 @@ def cmd_log(args: argparse.Namespace) -> int:
             if log_data.get("errors"):
                 print(f"Errors: {log_data['errors']}")
     else:
-        # No result entry yet - show formatted entries
-        for entry in entries:
-            output = _format_log_entry(entry)
-            if output:
-                print(output)
+        # No result entry yet - show compact step timeline
+        _display_step_timeline(entries, verbose=False)
 
     print()
     print("=" * 70)
@@ -2764,8 +2977,11 @@ def cmd_log(args: argparse.Namespace) -> int:
         if "duration_ms" in log_data:
             duration_sec = log_data["duration_ms"] / 1000
             print(f"Duration: {format_duration(duration_sec, verbose=True)}")
-        if "num_turns" in log_data:
-            print(f"Turns: {log_data['num_turns']}")
+        step_count = _result_step_count(log_data)
+        if step_count is not None:
+            print(f"Steps: {step_count}")
+            if "num_steps" not in log_data and "num_steps_reported" not in log_data and "num_turns" in log_data:
+                print(f"Legacy turns: {log_data['num_turns']}")
         if "total_cost_usd" in log_data:
             print(f"Cost: ${log_data['total_cost_usd']:.4f}")
 
@@ -2886,89 +3102,8 @@ def _tail_log_file(log_path: Path, args: argparse.Namespace, registry: WorkerReg
 
 
 def _display_conversation_turns(entries: list[dict]) -> None:
-    """Display the conversation turns from JSONL log entries."""
-    turn_num = 0
-    for entry in entries:
-        entry_type = entry.get("type")
-
-        if entry_type == "system":
-            # Show init info briefly
-            model = entry.get("model", "unknown")
-            print(f"[System] Model: {model}")
-            print("-" * 40)
-            continue
-
-        if entry_type == "assistant":
-            message = entry.get("message", {})
-            content = message.get("content", [])
-
-            for item in content:
-                if item.get("type") == "text":
-                    text = item.get("text", "")
-                    if text:
-                        turn_num += 1
-                        print(f"\n[Assistant - Turn {turn_num}]")
-                        print(text)
-                        print()
-                elif item.get("type") == "tool_use":
-                    tool_name = item.get("name", "unknown")
-                    tool_input = item.get("input", {})
-                    print(f"  -> Tool: {tool_name}")
-                    # Show brief summary of tool input
-                    if tool_name == "Read":
-                        print(f"     File: {tool_input.get('file_path', 'unknown')}")
-                    elif tool_name == "Edit":
-                        print(f"     File: {tool_input.get('file_path', 'unknown')}")
-                    elif tool_name == "Bash":
-                        cmd = tool_input.get('command', '')
-                        if len(cmd) > 80:
-                            cmd = cmd[:77] + "..."
-                        print(f"     Command: {cmd}")
-                    elif tool_name == "Grep":
-                        pattern = tool_input.get('pattern', 'unknown')
-                        path = tool_input.get('path', '')
-                        glob = tool_input.get('glob', '')
-                        type_filter = tool_input.get('type', '')
-
-                        # Format: pattern [path] (filter)
-                        output = f"     Pattern: {pattern}"
-                        if path:
-                            output += f" [{path}]"
-                        if glob:
-                            output += f" (glob: {glob})"
-                        elif type_filter:
-                            output += f" (type: {type_filter})"
-                        print(output)
-                    elif tool_name == "Glob":
-                        print(f"     Pattern: {tool_input.get('pattern', 'unknown')}")
-                    elif tool_name == "Write":
-                        print(f"     File: {tool_input.get('file_path', 'unknown')}")
-                    elif tool_name == "TodoWrite":
-                        todos = tool_input.get('todos', [])
-                        print(f"     Todos: {len(todos)} items")
-                    else:
-                        # Show first key-value for unknown tools
-                        for k, v in list(tool_input.items())[:1]:
-                            v_str = str(v)
-                            if len(v_str) > 60:
-                                v_str = v_str[:57] + "..."
-                            print(f"     {k}: {v_str}")
-
-        elif entry_type == "user":
-            # User entries are tool results - show brief summary
-            message = entry.get("message", {})
-            content = message.get("content", [])
-            for item in content:
-                if item.get("type") == "tool_result":
-                    is_error = item.get("is_error", False)
-                    result_content = item.get("content", "")
-                    if is_error:
-                        print(f"  <- Error: {result_content[:100]}")
-                    # Don't print successful tool results - too verbose
-
-        elif entry_type == "result":
-            # Final result - already shown in summary
-            pass
+    """Deprecated compatibility wrapper for legacy call sites."""
+    _display_step_timeline(entries, verbose=True)
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -5108,10 +5243,27 @@ def main() -> int:
         action="store_true",
         help="Look up by worker ID",
     )
-    log_parser.add_argument(
+    timeline_group = log_parser.add_mutually_exclusive_group()
+    timeline_group.add_argument(
+        "--steps",
+        dest="timeline_mode",
+        action="store_const",
+        const="compact",
+        help="Show compact step timeline (S<n>)",
+    )
+    timeline_group.add_argument(
+        "--steps-verbose",
+        dest="timeline_mode",
+        action="store_const",
+        const="verbose",
+        help="Show verbose step timeline with substeps (S<n>.<m>)",
+    )
+    timeline_group.add_argument(
         "--turns",
-        action="store_true",
-        help="Show the full conversation turns instead of just the summary",
+        dest="timeline_mode",
+        action="store_const",
+        const="verbose",
+        help="Deprecated alias for --steps-verbose",
     )
     log_parser.add_argument(
         "--follow", "-f",

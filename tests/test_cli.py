@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+LOG_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "logs"
+
 
 def run_gza(*args: str, cwd: Path | None = None, stdin_input: str | None = None) -> subprocess.CompletedProcess:
     """Run gza command and return result."""
@@ -1345,12 +1347,12 @@ class TestLogCommand:
         assert result.returncode == 0
         assert "Task completed successfully!" in result.stdout
         assert "Duration:" in result.stdout
-        assert "Turns: 10" in result.stdout
+        assert "Steps: 10" in result.stdout
+        assert "Legacy turns: 10" in result.stdout
         assert "Cost: $0.5000" in result.stdout
 
     def test_log_by_task_id_jsonl_format(self, tmp_path: Path):
-        """Log command with --task parses JSONL format with successful result."""
-        import json
+        """Log command with --task parses step-first JSONL format with successful result."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -1364,32 +1366,19 @@ class TestLogCommand:
         task.log_file = ".gza/logs/test.log"
         store.update(task)
 
-        # Create a JSONL log file (new format)
+        # Create a JSONL log file (step-first format fixture)
         log_dir = tmp_path / ".gza" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "test.log"
-        lines = [
-            {"type": "system", "subtype": "init", "session_id": "abc123"},
-            {"type": "assistant", "message": {"role": "assistant", "content": "Hello"}},
-            {"type": "user", "message": {"role": "user", "content": "Hi"}},
-            {
-                "type": "result",
-                "subtype": "success",
-                "result": "## JSONL Summary\n\nThis was parsed from JSONL!",
-                "duration_ms": 120000,
-                "num_turns": 5,
-                "total_cost_usd": 0.25,
-            },
-        ]
-        log_file.write_text("\n".join(json.dumps(line) for line in lines))
+        log_file.write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
         result = run_gza("log", "--task", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "This was parsed from JSONL!" in result.stdout
+        assert "Finished." in result.stdout
         assert "Duration:" in result.stdout
-        assert "Turns: 5" in result.stdout
-        assert "Cost: $0.2500" in result.stdout
+        assert "Steps: 2" in result.stdout
+        assert "Cost: $0.1234" in result.stdout
 
     def test_log_by_task_id_error_max_turns(self, tmp_path: Path):
         """Log command with --task handles JSONL format with error_max_turns result."""
@@ -1429,7 +1418,8 @@ class TestLogCommand:
 
         assert result.returncode == 0
         assert "error_max_turns" in result.stdout
-        assert "Turns: 60" in result.stdout
+        assert "Steps: 60" in result.stdout
+        assert "Legacy turns: 60" in result.stdout
         assert "Cost: $1.5000" in result.stdout
 
     def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
@@ -1453,7 +1443,7 @@ class TestLogCommand:
         assert "Log file not found" in result.stdout
 
     def test_log_by_task_id_no_result_entry(self, tmp_path: Path):
-        """Log command with --task shows formatted entries when no result entry exists."""
+        """Log command with --task shows compact step timeline when no result entry exists."""
         import json
         from gza.db import SqliteTaskStore
 
@@ -1482,7 +1472,80 @@ class TestLogCommand:
 
         # Should show formatted entries instead of failing
         assert result.returncode == 0
+        assert "[Step S1]" in result.stdout
         assert "Working..." in result.stdout
+
+    def test_log_steps_compact_renders_step_labels(self, tmp_path: Path):
+        """--steps renders compact step-first timeline anchors."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Step timeline task")
+        task.status = "completed"
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
+
+        result = run_gza("log", "--task", "1", "--steps", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1]" in result.stdout
+        assert "[Step S2]" in result.stdout
+        assert "[S1.1]" not in result.stdout
+
+    def test_log_steps_verbose_renders_substep_labels(self, tmp_path: Path):
+        """--steps-verbose renders S<n>.<m> substep labels."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Verbose step timeline task")
+        task.status = "completed"
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
+
+        result = run_gza("log", "--task", "1", "--steps-verbose", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1]" in result.stdout
+        assert "[S1.1]" in result.stdout
+        assert "tool_call rg -n" in result.stdout
+
+    def test_log_turns_alias_reads_legacy_turn_only_logs(self, tmp_path: Path):
+        """Deprecated --turns alias still renders verbose step timeline for turn-only logs."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Legacy log task")
+        task.status = "completed"
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "legacy_turn_only_codex.jsonl").read_text())
+
+        result = run_gza("log", "--task", "1", "--turns", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1] Pre-message tool activity" in result.stdout
+        assert "[S1.1] tool_call Bash ls -la" in result.stdout
+        assert "[Step S2] Listed files." in result.stdout
 
     def test_log_by_task_id_not_found(self, tmp_path: Path):
         """Log command with --task handles nonexistent task."""

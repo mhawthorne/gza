@@ -1,0 +1,4 @@
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"command_execution","id":"cmd_1","command":"ls -la","aggregated_output":"file.txt","exit_code":0}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Listed files."}}
+{"type":"result","subtype":"success","result":"## Legacy\n\nDone.","duration_ms":12000,"num_turns":1,"total_cost_usd":0.01}
