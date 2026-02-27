@@ -701,6 +701,64 @@ def _get_improves_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> li
     ]
 
 
+def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
+    """Build deduplicated lineage tasks for a root implementation chain."""
+    reviews = _get_reviews_for_root_task(store, root_task)
+    improve_tasks = _get_improves_for_root_task(store, root_task)
+    lineage_tasks: list[DbTask] = [root_task]
+    lineage_tasks.extend(reviews)
+    lineage_tasks.extend(improve_tasks)
+    lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
+
+    seen_ids: set[int] = set()
+    deduped: list[DbTask] = []
+    for lineage_task in lineage_tasks:
+        if lineage_task.id is None or lineage_task.id in seen_ids:
+            continue
+        seen_ids.add(lineage_task.id)
+        deduped.append(lineage_task)
+    return deduped
+
+
+def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc") -> str:
+    """Format lineage tasks as a linear #id[type] chain."""
+    lineage_parts: list[str] = []
+    for lineage_task in lineage_tasks:
+        if lineage_task.id is None:
+            continue
+        lineage_parts.append(
+            f"[{task_id_color}]#{lineage_task.id}[/{task_id_color}]"
+            f"[dim]\\[{lineage_task.task_type}][/dim]"
+        )
+    return " -> ".join(lineage_parts)
+
+
+def _resolve_lineage_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Resolve the root implementation task for lineage display."""
+    if task.task_type == "review" and task.depends_on:
+        depends = store.get(task.depends_on)
+        if depends is not None:
+            return depends
+
+    if task.task_type == "improve" and task.based_on:
+        based = store.get(task.based_on)
+        if based is not None:
+            return based
+
+    current = task
+    seen: set[int] = set()
+    while current.based_on:
+        next_task = store.get(current.based_on)
+        if next_task is None or next_task.id is None or next_task.id in seen:
+            break
+        seen.add(next_task.id)
+        if next_task.task_type == "implement":
+            return next_task
+        current = next_task
+
+    return task
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
     config = Config.load(args.project_dir)
@@ -828,25 +886,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         reviews = _get_reviews_for_root_task(store, root_task)
         improve_tasks = _get_improves_for_root_task(store, root_task)
-
-        # Build relationship lineage for this implementation chain.
-        lineage_tasks: list[DbTask] = [root_task]
-        lineage_tasks.extend(reviews)
-        lineage_tasks.extend(improve_tasks)
-        lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
-
-        seen_ids: set[int] = set()
-        lineage_parts: list[str] = []
+        lineage_tasks = _build_lineage_tasks_for_root(store, root_task)
         c = UNMERGED_COLORS  # shorthand
-        for lineage_task in lineage_tasks:
-            if lineage_task.id is None or lineage_task.id in seen_ids:
-                continue
-            seen_ids.add(lineage_task.id)
-            lineage_parts.append(
-                f"[{c['task_id']}]#{lineage_task.id}[/{c['task_id']}]"
-                f"[dim]\\[{lineage_task.task_type}][/dim]"
-            )
-        lineage_str = " -> ".join(lineage_parts)
+        lineage_str = _format_lineage(lineage_tasks, c["task_id"])
 
         # Classify review freshness/status for this implementation.
         latest_review = next((r for r in reviews if r.completed_at is not None), None)
@@ -3976,50 +4018,86 @@ def cmd_show(args: argparse.Namespace) -> int:
 
     task = store.get(args.task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
         return 1
 
-    print(f"Task #{task.id}")
-    print("=" * 50)
-    print(f"Status: {task.status}")
+    SHOW_COLORS = {
+        "heading": "bold cyan",
+        "section": "dim",
+        "label": "dim",
+        "value": "white",
+        "task_id": "#cccccc",
+        "prompt": "#ff99cc",
+        "branch": "#6699ff",
+        "stats": "#6699ff",
+        "status_pending": "yellow",
+        "status_running": "cyan",
+        "status_completed": "green",
+        "status_failed": "red",
+        "status_default": "white",
+    }
+    c = SHOW_COLORS
+
+    status_color_map = {
+        "pending": c["status_pending"],
+        "in_progress": c["status_running"],
+        "completed": c["status_completed"],
+        "failed": c["status_failed"],
+        "unmerged": c["status_pending"],
+    }
+    status_color = status_color_map.get(task.status, c["status_default"])
+
+    console.print(f"[{c['heading']}]Task #{task.id}[/{c['heading']}]")
+    console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
+    console.print(f"[{c['label']}]Status:[/{c['label']}] [{status_color}]{task.status}[/{status_color}]")
     if task.merge_status:
-        print(f"Merge Status: {task.merge_status}")
-    print(f"Type: {task.task_type}")
+        console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
+    console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
     if task.task_id:
-        print(f"Slug: {task.task_id}")
+        console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{task.task_id}[/{c['value']}]")
     if task.based_on:
-        print(f"Based on: task #{task.based_on}")
+        console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task #{task.based_on}[/{c['value']}]")
     if task.depends_on:
-        print(f"Depends on: task #{task.depends_on}")
+        console.print(f"[{c['label']}]Depends on:[/{c['label']}] [{c['value']}]task #{task.depends_on}[/{c['value']}]")
     if task.group:
-        print(f"Group: {task.group}")
+        console.print(f"[{c['label']}]Group:[/{c['label']}] [{c['value']}]{task.group}[/{c['value']}]")
     if task.spec:
-        print(f"Spec: {task.spec}")
+        console.print(f"[{c['label']}]Spec:[/{c['label']}] [{c['value']}]{task.spec}[/{c['value']}]")
     if task.skip_learnings:
-        print("Skip Learnings: yes")
+        console.print(f"[{c['label']}]Skip Learnings:[/{c['label']}] [green]yes[/green]")
     if task.branch:
-        print(f"Branch: {task.branch}")
+        console.print(f"[{c['label']}]Branch:[/{c['label']}] [{c['branch']}]{task.branch}[/{c['branch']}]")
     if task.log_file:
-        print(f"Log: {task.log_file}")
+        console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{task.log_file}[/{c['value']}]")
     if task.report_file:
-        print(f"Report: {task.report_file}")
+        console.print(f"[{c['label']}]Report:[/{c['label']}] [{c['value']}]{task.report_file}[/{c['value']}]")
     if task.session_id:
-        print(f"Session ID: {task.session_id}")
-    print()
-    print("Prompt:")
-    print("-" * 50)
-    print(task.prompt)
-    print("-" * 50)
-    print()
+        console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
+
+    root_task = _resolve_lineage_root_task(store, task)
+    lineage_tasks = _build_lineage_tasks_for_root(store, root_task)
+    if not any(t.id == task.id for t in lineage_tasks if t.id is not None):
+        lineage_tasks.append(task)
+        lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
+    lineage_str = _format_lineage(lineage_tasks, c["task_id"])
+    if lineage_str:
+        console.print(f"[{c['label']}]Lineage:[/{c['label']}] {lineage_str}")
+
+    console.print()
+    console.print(f"[{c['label']}]Prompt:[/{c['label']}]")
+    console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+    console.print(f"[{c['prompt']}]{task.prompt}[/{c['prompt']}]")
+    console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+    console.print()
     if task.created_at:
-        print(f"Created: {task.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        console.print(f"[{c['label']}]Created:[/{c['label']}] [{c['value']}]{task.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC[/{c['value']}]")
     if task.started_at:
-        print(f"Started: {task.started_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        console.print(f"[{c['label']}]Started:[/{c['label']}] [{c['value']}]{task.started_at.strftime('%Y-%m-%d %H:%M:%S')} UTC[/{c['value']}]")
     if task.completed_at:
-        print(f"Completed: {task.completed_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        console.print(f"[{c['label']}]Completed:[/{c['label']}] [{c['value']}]{task.completed_at.strftime('%Y-%m-%d %H:%M:%S')} UTC[/{c['value']}]")
     stats_str = format_stats(task)
     if stats_str:
-        print(f"Stats: {stats_str}")
+        console.print(f"[{c['label']}]Stats:[/{c['label']}] [{c['stats']}]{stats_str}[/{c['stats']}]")
 
     return 0
 
