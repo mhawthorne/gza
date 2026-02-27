@@ -44,6 +44,7 @@ class TestSkillsInstallClaudeTarget:
         assert "Available skills:" in result.stdout
         assert "gza-task-add" in result.stdout
         assert "gza-task-info" in result.stdout
+        assert "gza-plan-review" in result.stdout
 
     def test_install_all_skills(self, tmp_path: Path):
         """Install all skills to a project."""
@@ -59,6 +60,7 @@ class TestSkillsInstallClaudeTarget:
         assert skills_dir.exists()
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
         assert (skills_dir / "gza-task-info" / "SKILL.md").exists()
+        assert (skills_dir / "gza-plan-review" / "SKILL.md").exists()
 
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
@@ -159,6 +161,7 @@ class TestSkillsInstallCommand:
         assert result.returncode == 0
         assert "Available skills:" in result.stdout
         assert "gza-task-add" in result.stdout
+        assert "gza-plan-review" in result.stdout
 
     def test_install_all_targets_by_default(self, tmp_path: Path):
         """skills-install defaults to both claude and codex targets."""
