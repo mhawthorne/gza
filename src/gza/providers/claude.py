@@ -300,6 +300,18 @@ class ClaudeProvider(Provider):
                 data["run_step_events"] = []
                 data["_step_by_msg_id"] = {}
                 data["_current_step_event"] = None
+                data["_legacy_event_count_by_turn"] = {}
+
+        def _allocate_legacy_event_id(data: dict, legacy_turn_id: str | None) -> str | None:
+            if not legacy_turn_id:
+                return None
+            counters = data.get("_legacy_event_count_by_turn")
+            if not isinstance(counters, dict):
+                counters = {}
+                data["_legacy_event_count_by_turn"] = counters
+            next_idx = int(counters.get(legacy_turn_id, 0)) + 1
+            counters[legacy_turn_id] = next_idx
+            return f"{legacy_turn_id}.{next_idx}"
 
         def _start_step(data: dict, msg_id: str | None, legacy_turn_id: str | None) -> dict:
             _ensure_step_store(data)
@@ -307,7 +319,7 @@ class ClaudeProvider(Provider):
                 "message_role": "assistant",
                 "message_text": None,
                 "legacy_turn_id": legacy_turn_id,
-                "legacy_event_id": None,
+                "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
                 "substeps": [],
                 "outcome": "completed",
                 "summary": None,
@@ -384,7 +396,7 @@ class ClaudeProvider(Provider):
                             tool_input = content.get("input", {})
                             current_step["substeps"].append(
                                 {
-                                    "type": "tool_use",
+                                    "type": "tool_call",
                                     "source": "provider",
                                     "call_id": content.get("id"),
                                     "payload": {
@@ -392,6 +404,7 @@ class ClaudeProvider(Provider):
                                         "tool_input": tool_input,
                                     },
                                     "legacy_turn_id": current_step.get("legacy_turn_id"),
+                                    "legacy_event_id": _allocate_legacy_event_id(data, current_step.get("legacy_turn_id")),
                                 }
                             )
 
@@ -466,6 +479,36 @@ class ClaudeProvider(Provider):
                                 for k, v in tool_input.items():
                                     parts.append(f"{k}={_format_tool_param(v)}")
                                 formatter.print_tool_event(" ".join(parts))
+                        elif content.get("type") == "tool_result":
+                            legacy_turn_id = current_step.get("legacy_turn_id")
+                            is_error = bool(content.get("is_error"))
+                            current_step["substeps"].append(
+                                {
+                                    "type": "tool_error" if is_error else "tool_output",
+                                    "source": "provider",
+                                    "call_id": content.get("tool_use_id") or content.get("id"),
+                                    "payload": {
+                                        "content": content.get("content"),
+                                        "is_error": is_error,
+                                    },
+                                    "legacy_turn_id": legacy_turn_id,
+                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
+                                }
+                            )
+                        elif content.get("type") == "tool_retry":
+                            legacy_turn_id = current_step.get("legacy_turn_id")
+                            current_step["substeps"].append(
+                                {
+                                    "type": "tool_retry",
+                                    "source": "provider",
+                                    "call_id": content.get("id"),
+                                    "payload": {
+                                        "retry_of_call_id": content.get("retry_of_call_id"),
+                                    },
+                                    "legacy_turn_id": legacy_turn_id,
+                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
+                                }
+                            )
                         elif content.get("type") == "text":
                             text = content.get("text", "").strip()
                             if text:
@@ -501,7 +544,6 @@ class ClaudeProvider(Provider):
         if result_data:
             if "num_turns" in result_data:
                 result.num_turns_reported = result_data["num_turns"]
-                result.num_steps_reported = result_data["num_turns"]
             if "total_cost_usd" in result_data:
                 result.cost_usd = result_data["total_cost_usd"]
             if "session_id" in result_data:
@@ -515,7 +557,11 @@ class ClaudeProvider(Provider):
         seen_msg_ids = accumulated_data.get("seen_msg_ids", set())
         if seen_msg_ids:
             result.num_turns_computed = len(seen_msg_ids)
-            result.num_steps_computed = len(seen_msg_ids)
+
+        step_count = len(accumulated_data.get("run_step_events", []))
+        if step_count > 0:
+            result.num_steps_computed = step_count
+            result.num_steps_reported = step_count
 
         # Store accumulated token counts
         if "total_input_tokens" in accumulated_data:
