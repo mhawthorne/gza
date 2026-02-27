@@ -61,6 +61,7 @@ class Task:
     diff_lines_added: int | None = None    # Lines added vs. main (v13)
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
+    log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -87,7 +88,7 @@ class TaskStats:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -147,7 +148,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_lines_added INTEGER,
     diff_lines_removed INTEGER,
     -- Review state cleared by improve task (v14)
-    review_cleared_at TEXT
+    review_cleared_at TEXT,
+    -- Log entry schema marker (v17): 1=legacy turn/event logs, 2=message-step logs
+    log_schema_version INTEGER DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -328,6 +331,12 @@ CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_steps_step_index ON run_steps(run_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
+"""
+
+# Migration from v16 to v17
+MIGRATION_V16_TO_V17 = """
+ALTER TABLE tasks ADD COLUMN log_schema_version INTEGER DEFAULT 1;
+UPDATE tasks SET log_schema_version = 1 WHERE log_schema_version IS NULL;
 """
 
 
@@ -625,6 +634,19 @@ class SqliteTaskStore:
                     conn.execute("UPDATE schema_version SET version = ?", (16,))
                     current_version = 16
 
+                if current_version < 17:
+                    # Run migration v16 -> v17
+                    for stmt in MIGRATION_V16_TO_V17.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Column might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (17,))
+                    current_version = 17
+
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
@@ -676,6 +698,11 @@ class SqliteTaskStore:
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
             review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in row.keys() and row["review_cleared_at"] else None,
+            log_schema_version=(
+                row["log_schema_version"]
+                if "log_schema_version" in row.keys() and row["log_schema_version"] is not None
+                else 1
+            ),
         )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
@@ -807,7 +834,8 @@ class SqliteTaskStore:
                     diff_files_changed = ?,
                     diff_lines_added = ?,
                     diff_lines_removed = ?,
-                    review_cleared_at = ?
+                    review_cleared_at = ?,
+                    log_schema_version = ?
                 WHERE id = ?
                 """,
                 (
@@ -847,6 +875,7 @@ class SqliteTaskStore:
                     task.diff_lines_added,
                     task.diff_lines_removed,
                     task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+                    task.log_schema_version,
                     task.id,
                 ),
             )
@@ -1066,6 +1095,14 @@ class SqliteTaskStore:
             conn.execute(
                 "UPDATE tasks SET review_cleared_at = ? WHERE id = ?",
                 (now, task_id),
+            )
+
+    def set_log_schema_version(self, task_id: int, version: int) -> None:
+        """Set the persisted log schema marker for a task/run."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET log_schema_version = ? WHERE id = ?",
+                (version, task_id),
             )
 
     # === Run step/substep persistence ===
@@ -1920,6 +1957,7 @@ def _task_to_dict(task: "Task") -> dict:
         "diff_lines_added": task.diff_lines_added,
         "diff_lines_removed": task.diff_lines_removed,
         "review_cleared_at": task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+        "log_schema_version": task.log_schema_version,
     }
 
 

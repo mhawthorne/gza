@@ -1259,6 +1259,9 @@ class TestRunStepPersistenceIntegration:
         assert steps[0].provider == "claude"
         assert steps[0].message_text == "I will inspect the code."
         assert steps[0].outcome == "completed"
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.log_schema_version == 2
 
         step_ref = StepRef(
             id=steps[0].id,

@@ -407,7 +407,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -517,7 +517,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -702,7 +702,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -887,7 +887,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1222,7 +1222,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1687,7 +1687,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1858,7 +1858,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1938,7 +1938,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2467,7 +2467,7 @@ class TestStepColumnsMigration:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 16
+        assert version == 17
 
         migrated = store.get(1)
         assert migrated is not None
@@ -2498,7 +2498,7 @@ class TestRunStepPersistence:
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
-        assert version == 16
+        assert version == 17
 
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('run_steps', 'run_substeps')"
@@ -2689,3 +2689,93 @@ class TestRunStepPersistence:
             "idx_run_substeps_run_id",
             "idx_run_substeps_step_id",
         ]
+
+    def test_new_tasks_default_log_schema_version_1(self, tmp_path: Path):
+        """New tasks should default to legacy log schema marker until step logs are persisted."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.log_schema_version == 1
+
+        reloaded = store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.log_schema_version == 1
+
+    def test_migration_v16_to_v17_adds_log_schema_version(self, tmp_path: Path):
+        """v16 databases should gain log_schema_version with default value 1."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (16)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER REFERENCES tasks(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER REFERENCES tasks(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT
+            )
+            """
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)", ("legacy", "pending", now))
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path)
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        assert version == 17
+        assert value == 1
+
+    def test_set_log_schema_version_updates_task(self, tmp_path: Path):
+        """set_log_schema_version should persist explicit schema marker values."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.id is not None
+
+        store.set_log_schema_version(task.id, 2)
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.log_schema_version == 2
