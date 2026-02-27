@@ -327,15 +327,40 @@ def _compact_output_summary(content: str, max_chars: int = REVIEW_IMPROVE_SUMMAR
     return compact
 
 
+def _is_improve_in_impl_chain(improve_task: Task, impl_task: Task, tasks_by_id: dict[int, Task]) -> bool:
+    """Return True when an improve task belongs to an implementation's improve chain."""
+    if impl_task.id is None or improve_task.based_on is None:
+        return False
+    current_based_on = improve_task.based_on
+    seen: set[int] = set()
+    while True:
+        if current_based_on == impl_task.id:
+            return True
+        if current_based_on in seen:
+            return False
+        seen.add(current_based_on)
+        parent = tasks_by_id.get(current_based_on)
+        if parent is None or parent.task_type != "improve" or parent.based_on is None:
+            return False
+        current_based_on = parent.based_on
+
+
+def _get_completed_improves_for_implementation_chain(store: SqliteTaskStore, impl_task: Task) -> list[Task]:
+    """Collect completed improve tasks tied to an implementation, including retry/resume descendants."""
+    all_tasks = store.get_all()
+    tasks_by_id = {task.id: task for task in all_tasks if task.id is not None}
+    return [
+        task for task in all_tasks
+        if task.task_type == "improve"
+        and task.id is not None
+        and task.status == "completed"
+        and _is_improve_in_impl_chain(task, impl_task, tasks_by_id)
+    ]
+
+
 def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, store: SqliteTaskStore, project_dir: Path) -> str:
     """Build compact improve lineage context for review prompts."""
-    improves = [
-        t for t in store.get_all()
-        if t.task_type == "improve"
-        and t.based_on == impl_task.id
-        and t.id is not None
-        and t.status == "completed"
-    ]
+    improves = _get_completed_improves_for_implementation_chain(store, impl_task)
     if not improves:
         return ""
 
