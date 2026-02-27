@@ -4754,6 +4754,112 @@ class TestRebaseCommand:
             assert "Successfully rebased" in result.stdout
 
 
+class TestImplementCommand:
+    """Tests for 'gza implement' command."""
+
+    def test_implement_creates_task_from_completed_plan(self, tmp_path: Path):
+        """Implement command creates an implementation task using add workflow."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add("Plan authentication rollout", task_type="plan")
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(timezone.utc)
+        store.update(plan_task)
+
+        result = run_gza(
+            "implement",
+            str(plan_task.id),
+            "Implement auth rollout",
+            "--review",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "Added task #2" in result.stdout
+
+        impl_task = store.get(2)
+        assert impl_task is not None
+        assert impl_task.task_type == "implement"
+        assert impl_task.based_on == plan_task.id
+        assert impl_task.prompt == "Implement auth rollout"
+        assert impl_task.create_review is True
+
+    def test_implement_fails_for_missing_plan_task(self, tmp_path: Path):
+        """Implement command validates referenced plan task exists."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("implement", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: Task #999 not found" in result.stdout
+
+    def test_implement_fails_for_non_plan_task(self, tmp_path: Path):
+        """Implement command requires a plan task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Not a plan", task_type="task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("implement", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert f"Error: Task #{task.id} is a task task" in result.stdout
+
+    def test_implement_fails_for_incomplete_plan_task(self, tmp_path: Path):
+        """Implement command requires the plan task to be completed."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add("Plan feature", task_type="plan")
+
+        result = run_gza("implement", str(plan_task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert f"Error: Task #{plan_task.id} is pending. Plan task must be completed." in result.stdout
+
+    def test_implement_derives_prompt_from_plan_slug_when_omitted(self, tmp_path: Path):
+        """Implement command derives prompt from the plan task slug when prompt omitted."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        plan_task.task_id = "20260226-plan-auth-migration"
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(timezone.utc)
+        store.update(plan_task)
+
+        result = run_gza("implement", str(plan_task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added task #2" in result.stdout
+
+        impl_task = store.get(2)
+        assert impl_task is not None
+        assert impl_task.prompt == "Implement plan from task #1: plan-auth-migration"
+        assert impl_task.based_on == plan_task.id
+
+
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
 
