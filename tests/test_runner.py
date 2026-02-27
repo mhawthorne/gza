@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
@@ -16,6 +17,7 @@ from gza.runner import (
     WIP_DIR,
     BACKUP_DIR,
     _build_context_from_chain,
+    _build_review_improve_lineage_context,
     backup_database,
     _create_and_run_review_task,
     _run_non_code_task,
@@ -397,6 +399,49 @@ class TestReviewContextFromChain:
         # Older improves are not included.
         for improve_id in improve_ids[:-REVIEW_IMPROVE_LINEAGE_LIMIT]:
             assert f"Improve #{improve_id}" not in context
+
+    def test_review_context_excludes_equal_timestamp_later_improve(self, tmp_path: Path):
+        """Equal-timestamp improves created after the review are excluded."""
+        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=timezone.utc)
+        impl_task = Task(id=100, prompt="Implement", task_type="implement", status="completed")
+        review_task = Task(
+            id=50,
+            prompt="Review current",
+            task_type="review",
+            depends_on=impl_task.id,
+            created_at=created_at,
+        )
+
+        older_improve = Task(
+            id=40,
+            prompt="Improve older",
+            task_type="improve",
+            status="completed",
+            based_on=impl_task.id,
+            depends_on=10,
+            created_at=created_at,
+            output_content="- older improve",
+        )
+        later_improve = Task(
+            id=60,
+            prompt="Improve later",
+            task_type="improve",
+            status="completed",
+            based_on=impl_task.id,
+            depends_on=11,
+            created_at=created_at,
+            output_content="- later improve",
+        )
+
+        store = Mock(spec=SqliteTaskStore)
+        store.get_all.return_value = [older_improve, later_improve]
+
+        context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
+
+        assert f"Improve #{older_improve.id}" in context
+        assert "older improve" in context
+        assert f"Improve #{later_improve.id}" not in context
+        assert "later improve" not in context
 
 
 class TestSummaryDirectory:

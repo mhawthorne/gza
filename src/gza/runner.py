@@ -345,10 +345,13 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
         if review_created_at is None:
             prior_improves.append(improve)
             continue
-        if improve.created_at and improve.created_at <= review_created_at:
-            prior_improves.append(improve)
+        if improve.created_at is None:
+            if review_task.id is not None and improve.id is not None and improve.id < review_task.id:
+                prior_improves.append(improve)
             continue
-        if review_task.id is not None and improve.id is not None and improve.id < review_task.id:
+
+        review_id = review_task.id if review_task.id is not None else 0
+        if (improve.created_at, improve.id) < (review_created_at, review_id):
             prior_improves.append(improve)
 
     if not prior_improves:
