@@ -6,10 +6,8 @@ branch_strategy: date_slug
 
 max_steps: 100
 
-#provider: claude
-#model: claude-sonnet-4-6
-provider: codex
-model: gpt-5.3-codex
+provider: claude
+model: claude-sonnet-4-6
 
 #task_types:
 #  plan:
