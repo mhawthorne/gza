@@ -4605,6 +4605,8 @@ def cmd_cycle(args: argparse.Namespace) -> int:
             print(f"Error: No active cycle found for implementation #{impl_task.id}")
             return 1
         cycle = existing
+        # Honor the original cycle's max_iterations, not the CLI arg
+        max_iterations = cycle.max_iterations
 
         if dry_run:
             print(f"[dry-run] Would resume cycle #{cycle.id} for implementation #{impl_task.id}")

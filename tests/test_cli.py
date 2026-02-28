@@ -9687,6 +9687,61 @@ class TestCycleCommand:
         assert iterations[0].iteration_index == 0
         assert iterations[1].iteration_index == 1
 
+    def test_cycle_continue_no_active_cycle_returns_error(self, tmp_path: Path):
+        """gza cycle --continue with no active cycle returns non-zero exit code and error message."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        # No active cycle exists for this implementation
+
+        result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "No active cycle" in result.stdout or "No active cycle" in result.stderr
+
+    def test_cycle_continue_respects_original_max_iterations(self, tmp_path: Path):
+        """gza cycle --continue uses cycle.max_iterations, not the CLI default of 3.
+
+        With max_iterations=5 and 3 iterations already completed, resuming without
+        --max-iterations must enter the loop (iteration=3 < 5) rather than exiting
+        immediately (iteration=3 < 3 is False under the buggy CLI-default behaviour).
+        """
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        # Start cycle with max_iterations=5 (higher than the CLI default of 3)
+        cycle = store.start_cycle(impl.id, max_iterations=5)
+        # Simulate 3 completed iterations (at CLI default, resuming would skip the loop entirely)
+        for i in range(3):
+            it = store.append_cycle_iteration(cycle.id, i)
+            store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
+
+        # Resume without --max-iterations; the subprocess honours cycle.max_iterations=5
+        result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+
+        # With the bug (CLI default max_iterations=3), iteration starts at 3 and
+        # `while 3 < 3` is immediately False — no new iteration record is created.
+        # With the fix (cycle.max_iterations=5), the loop body executes at least once,
+        # appending iteration_index=3 before any runner/verdict logic is attempted.
+        all_iterations = store.get_cycle_iterations(cycle.id)
+        # With the bug: `while 3 < 3` is immediately False → loop body never runs → still 3 records.
+        # With the fix: `while 3 < 5` → loop body executes at least once →
+        # append_cycle_iteration(cycle.id, 3) is called before any runner/verdict logic.
+        assert len(all_iterations) >= 4, (
+            f"Expected >=4 iteration records (3 seeded + >=1 from resume), got {len(all_iterations)}. "
+            f"stdout: {result.stdout!r}"
+        )
+
 
 class TestStatsCyclesCommand:
     """Tests for 'gza stats --cycles' command."""
