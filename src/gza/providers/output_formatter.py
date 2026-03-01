@@ -11,7 +11,6 @@ from rich.console import Console
 class OutputStyles:
     """Color and style definitions for provider stream output."""
 
-    turn_header: str = "blue"
     step_header: str = "blue"
     assistant_text: str = "green"
     tool_use: str = "magenta"
