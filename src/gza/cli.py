@@ -4854,7 +4854,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    """Resume a failed task from where it left off."""
+    """Resume a failed or orphaned task from where it left off."""
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
@@ -4871,9 +4871,20 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print(f"Error: Task #{args.task_id} not found")
         return 1
 
-    if task.status != "failed":
-        print(f"Error: Can only resume failed tasks (task is {task.status})")
+    if task.status not in ("failed", "in_progress"):
+        print(f"Error: Can only resume failed or orphaned tasks (task is {task.status})")
         return 1
+
+    if task.status == "in_progress":
+        # Allow resume only if the task is orphaned (no live worker)
+        assert task.id is not None
+        registry = WorkerRegistry(config.workers_path)
+        running_worker = _running_worker_id_for_task(registry, task.id)
+        if running_worker is not None:
+            print(f"Error: Task #{args.task_id} is still running (worker {running_worker})")
+            print("Use 'gza cancel' to stop it first, or wait for it to finish")
+            return 1
+        print(f"Note: Task #{args.task_id} appears orphaned (in_progress but no live worker), resuming...")
 
     if not task.session_id:
         print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")
