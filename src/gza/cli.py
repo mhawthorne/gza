@@ -740,7 +740,15 @@ def _create_improve_task(
 
 
 def _get_task_slug(task: DbTask) -> str | None:
-    """Extract slug part from task_id (YYYYMMDD-slug -> slug)."""
+    """Return the full slug including any trailing revision suffix (e.g. 'my-feature-2').
+
+    Strips only the leading date prefix (YYYYMMDD-). Revision suffixes such as
+    '-2', '-3' are preserved so callers that need an exact match against the
+    original task_id slug string get the right value.
+
+    Use ``_extract_task_slug`` instead when you want the *base* slug with the
+    revision suffix removed (e.g. for display or for matching across revisions).
+    """
     if not task.task_id:
         return None
     match = re.match(r"^\d{8}-(.+)$", task.task_id)
@@ -3565,13 +3573,20 @@ def _display_conversation_turns(entries: list[dict]) -> None:
 
 
 def _extract_task_slug(task: DbTask) -> str | None:
-    """Extract slug from task_id (YYYYMMDD-slug or YYYYMMDD-slug-N)."""
-    if not task.task_id:
+    """Return the *base* slug with any trailing revision suffix stripped.
+
+    Calls ``_get_task_slug`` to strip the leading date prefix, then removes a
+    trailing numeric revision suffix (e.g. 'my-feature-2' -> 'my-feature').
+    Use this when you want a canonical slug that matches across revisions of the
+    same task.
+
+    Use ``_get_task_slug`` instead when the exact, revision-preserving slug is
+    required (e.g. when matching against the literal task_id string).
+    """
+    full_slug = _get_task_slug(task)
+    if full_slug is None:
         return None
-    parts = task.task_id.split("-", 1)
-    if len(parts) != 2:
-        return None
-    return re.sub(r"-\d+$", "", parts[1])
+    return re.sub(r"-\d+$", "", full_slug)
 
 
 def cmd_implement(args: argparse.Namespace) -> int:
@@ -6671,6 +6686,8 @@ def main() -> int:
         action="store_true",
         help="Run Claude directly instead of in Docker",
     )
+    # TODO: Phase 1 deferred — add --queue (create chain without running immediately)
+    # and --background flags as specified in the design plan.
     add_common_args(cycle_parser)
 
     # implement command

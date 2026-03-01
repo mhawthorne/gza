@@ -9649,9 +9649,15 @@ class TestCycleCommand:
         assert active.id == cycle.id
 
     def test_cycle_continue_resumes_existing_active_cycle(self, tmp_path: Path):
-        """gza cycle --continue finds existing active cycle and enters the resume path."""
+        """--continue resumes at next iteration and APPROVED verdict closes cycle correctly.
+
+        This is a unit test that calls cmd_cycle() directly so that unittest.mock.patch
+        is effective. (run_gza spawns a subprocess where in-process patches have no effect.)
+        """
+        import argparse
         from gza.db import SqliteTaskStore
-        from unittest.mock import patch
+        from gza.cli import cmd_cycle
+        from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -9664,28 +9670,46 @@ class TestCycleCommand:
         it = store.append_cycle_iteration(cycle.id, 0)
         store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
 
-        # Mock run() so the loop actually executes: return 0 for review (verdict APPROVED) to stop cleanly
-        with patch("gza.cli.run", return_value=0), \
-             patch("gza.cli._create_review_task") as mock_review, \
-             patch("gza.cli.get_review_verdict", return_value="APPROVED"):
-            from gza.db import Task as DbTask
-            from datetime import datetime, timezone
-            fake_review = store.add("review", task_type="review")
-            fake_review.status = "completed"
-            fake_review.completed_at = datetime.now(timezone.utc)
-            store.update(fake_review)
-            mock_review.return_value = fake_review
+        # Create a completed review task in the store with an APPROVED verdict in output_content.
+        # _create_review_task will be patched to return this pre-seeded task, and run() will
+        # return 0 (success), so get_review_verdict will read output_content and return APPROVED.
+        fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
+        fake_review.status = "completed"
+        fake_review.completed_at = datetime.now(timezone.utc)
+        fake_review.output_content = "**Verdict: APPROVED**"
+        store.update(fake_review)
 
-            result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=3,
+            dry_run=False,
+            continue_cycle=True,
+            project_dir=tmp_path,
+            no_docker=True,
+        )
 
-        # Should complete without error
-        assert "No active cycle" not in result.stdout
-        # Verify iteration records: the new iteration record should have iteration_index=1, not 0
+        mock_config = MagicMock()
+        mock_config.project_dir = tmp_path
+        mock_config.use_docker = False
+
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._create_review_task", return_value=fake_review), \
+             patch("gza.cli.run", return_value=0):
+            result = cmd_cycle(args)
+
+        # The cycle should complete as approved
+        assert result == 0
+        # Verify iteration records: seeded index=0 plus new index=1 from the resumed run
         iterations = store.get_cycle_iterations(cycle.id)
-        # We seeded iteration_index=0; the resumed run should have added iteration_index=1
         assert len(iterations) == 2
         assert iterations[0].iteration_index == 0
         assert iterations[1].iteration_index == 1
+        # Verify the cycle was closed with approved status
+        cycles = store.get_cycles_for_impl(impl.id)
+        assert len(cycles) == 1
+        assert cycles[0].status == "approved"
+        assert cycles[0].stop_reason == "approved"
 
     def test_cycle_continue_no_active_cycle_returns_error(self, tmp_path: Path):
         """gza cycle --continue with no active cycle returns non-zero exit code and error message."""
