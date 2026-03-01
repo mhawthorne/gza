@@ -2201,53 +2201,132 @@ class TestEnsureDockerImage:
 class TestCodexProvider:
     """Tests for Codex provider."""
 
-    def test_codex_docker_config_with_oauth(self, tmp_path):
-        """Codex should prefer OAuth when ~/.codex/auth.json exists."""
-        from gza.providers.codex import _get_docker_config, _has_codex_oauth
-
-        # When OAuth exists, mount .codex and don't pass API key
-        with patch("gza.providers.codex._has_codex_oauth", return_value=True):
-            config = _get_docker_config("my-project-gza")
-            assert config.image_name == "my-project-gza"
-            assert config.npm_package == "@openai/codex"
-            assert config.cli_command == "codex"
-            assert config.config_dir == ".codex"
-            assert config.env_vars == []
-
-    def test_codex_docker_config_with_api_key(self):
-        """Codex should use CODEX_API_KEY when no OAuth credentials exist."""
+    def test_codex_docker_config_api_key_takes_precedence_over_oauth(self):
+        """API key should take precedence over OAuth when both are present."""
         from gza.providers.codex import _get_docker_config
 
-        # When no OAuth, use API key
-        with patch("gza.providers.codex._has_codex_oauth", return_value=False):
-            config = _get_docker_config("my-project-gza")
-            assert config.image_name == "my-project-gza"
-            assert config.npm_package == "@openai/codex"
-            assert config.cli_command == "codex"
-            assert config.config_dir is None
-            assert "CODEX_API_KEY" in config.env_vars
+        with patch("gza.providers.codex._has_codex_oauth", return_value=True):
+            with patch.dict(os.environ, {"CODEX_API_KEY": "sk-test"}, clear=False):
+                config = _get_docker_config("my-project-gza")
+                assert config.image_name == "my-project-gza"
+                assert config.npm_package == "@openai/codex"
+                assert config.cli_command == "codex"
+                # API key wins: no .codex mount, env var passed instead
+                assert config.config_dir is None
+                assert "CODEX_API_KEY" in config.env_vars
 
-    def test_check_credentials_with_api_key(self):
-        """Codex should check for CODEX_API_KEY."""
+    def test_codex_docker_config_with_oauth_fallback(self):
+        """OAuth should be used when no API key is configured."""
+        from gza.providers.codex import _get_docker_config
+
+        with patch("gza.providers.codex._has_codex_oauth", return_value=True):
+            with patch.dict(os.environ, {}, clear=True):
+                config = _get_docker_config("my-project-gza")
+                assert config.image_name == "my-project-gza"
+                assert config.npm_package == "@openai/codex"
+                assert config.cli_command == "codex"
+                assert config.config_dir == ".codex"
+                assert config.env_vars == []
+
+    def test_codex_docker_config_with_codex_api_key(self):
+        """Codex should use CODEX_API_KEY (canonical) when no OAuth credentials exist."""
+        from gza.providers.codex import _get_docker_config
+
+        with patch("gza.providers.codex._has_codex_oauth", return_value=False):
+            with patch.dict(os.environ, {"CODEX_API_KEY": "sk-test"}, clear=True):
+                config = _get_docker_config("my-project-gza")
+                assert config.image_name == "my-project-gza"
+                assert config.npm_package == "@openai/codex"
+                assert config.cli_command == "codex"
+                assert config.config_dir is None
+                assert "CODEX_API_KEY" in config.env_vars
+                assert "OPENAI_API_KEY" not in config.env_vars
+
+    def test_codex_docker_config_with_openai_api_key_alias(self):
+        """Codex should accept OPENAI_API_KEY as a backward-compatible alias."""
+        from gza.providers.codex import _get_docker_config
+
+        with patch("gza.providers.codex._has_codex_oauth", return_value=False):
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-openai-test"}, clear=True):
+                config = _get_docker_config("my-project-gza")
+                assert config.config_dir is None
+                assert "OPENAI_API_KEY" in config.env_vars
+                assert "CODEX_API_KEY" not in config.env_vars
+
+    def test_codex_docker_config_both_api_keys_set(self):
+        """When both CODEX_API_KEY and OPENAI_API_KEY are set, both are passed through."""
+        from gza.providers.codex import _get_docker_config
+
+        with patch("gza.providers.codex._has_codex_oauth", return_value=False):
+            with patch.dict(
+                os.environ,
+                {"CODEX_API_KEY": "sk-codex", "OPENAI_API_KEY": "sk-openai"},
+                clear=True,
+            ):
+                config = _get_docker_config("my-project-gza")
+                assert config.config_dir is None
+                assert "CODEX_API_KEY" in config.env_vars
+                assert "OPENAI_API_KEY" in config.env_vars
+
+    def test_codex_docker_config_no_credentials(self):
+        """When no credentials exist, default to API key mode with CODEX_API_KEY hint."""
+        from gza.providers.codex import _get_docker_config
+
+        with patch("gza.providers.codex._has_codex_oauth", return_value=False):
+            with patch.dict(os.environ, {}, clear=True):
+                config = _get_docker_config("my-project-gza")
+                assert config.config_dir is None
+                assert "CODEX_API_KEY" in config.env_vars
+
+    def test_check_credentials_with_codex_api_key(self):
+        """Codex should check for CODEX_API_KEY (canonical)."""
         provider = CodexProvider()
 
         with patch.object(Path, "home", return_value=Path("/nonexistent")):
             with patch.dict(os.environ, {}, clear=True):
                 assert provider.check_credentials() is False
 
-            with patch.dict(os.environ, {"CODEX_API_KEY": "sk-test"}):
+            with patch.dict(os.environ, {"CODEX_API_KEY": "sk-test"}, clear=True):
+                assert provider.check_credentials() is True
+
+    def test_check_credentials_with_openai_api_key_alias(self):
+        """Codex should accept OPENAI_API_KEY as a backward-compatible alias."""
+        provider = CodexProvider()
+
+        with patch.object(Path, "home", return_value=Path("/nonexistent")):
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-openai"}, clear=True):
                 assert provider.check_credentials() is True
 
     def test_check_credentials_with_config_dir(self, tmp_path):
-        """Codex should check for ~/.codex directory."""
+        """Codex should accept OAuth (~/.codex directory) as a fallback credential."""
         provider = CodexProvider()
 
-        with patch.object(Path, "home", return_value=tmp_path):
-            with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(Path, "home", return_value=tmp_path):
                 assert provider.check_credentials() is False
 
-            (tmp_path / ".codex").mkdir()
-            assert provider.check_credentials() is True
+                (tmp_path / ".codex").mkdir()
+                assert provider.check_credentials() is True
+
+    def test_check_credentials_api_key_takes_precedence_over_oauth(self, tmp_path):
+        """API key check succeeds even when OAuth is present (API key takes precedence)."""
+        provider = CodexProvider()
+
+        (tmp_path / ".codex").mkdir()
+        with patch.object(Path, "home", return_value=tmp_path):
+            # With API key set, returns True via the API key path
+            with patch.dict(os.environ, {"CODEX_API_KEY": "sk-test"}, clear=True):
+                assert provider.check_credentials() is True
+            # OAuth alone also returns True (as a valid fallback)
+            with patch.dict(os.environ, {}, clear=True):
+                assert provider.check_credentials() is True
+
+    def test_credential_setup_hint_mentions_canonical_and_alias(self):
+        """credential_setup_hint should mention CODEX_API_KEY as canonical and OPENAI_API_KEY as alias."""
+        provider = CodexProvider()
+        hint = provider.credential_setup_hint
+        assert "CODEX_API_KEY" in hint
+        assert "OPENAI_API_KEY" in hint
 
     def test_routes_to_docker_when_enabled(self, tmp_path):
         """Codex should route to Docker when use_docker is True."""
