@@ -678,7 +678,12 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
     return None
 
 
-def _create_review_task(store: SqliteTaskStore, impl_task: DbTask) -> DbTask:
+def _create_review_task(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    model: str | None = None,
+    provider: str | None = None,
+) -> DbTask:
     """Create a review task for an implementation task.
 
     Validates that:
@@ -711,6 +716,8 @@ def _create_review_task(store: SqliteTaskStore, impl_task: DbTask) -> DbTask:
         depends_on=impl_task.id,
         group=impl_task.group,
         based_on=impl_task.based_on,
+        model=model,
+        provider=provider,
     )
 
 
@@ -719,6 +726,8 @@ def _create_improve_task(
     impl_task: DbTask,
     review_task: DbTask,
     create_review: bool = False,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> DbTask:
     """Create an improve task for an implementation task based on a review.
 
@@ -745,6 +754,8 @@ def _create_improve_task(
         same_branch=True,
         group=impl_task.group,
         create_review=create_review,
+        model=model,
+        provider=provider,
     )
 
 
@@ -4532,6 +4543,8 @@ def cmd_improve(args: argparse.Namespace) -> int:
             impl_task,
             review_task,
             create_review=args.review if hasattr(args, 'review') and args.review else False,
+            model=args.model if hasattr(args, 'model') and args.model else None,
+            provider=args.provider if hasattr(args, 'provider') and args.provider else None,
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -4599,8 +4612,10 @@ def cmd_review(args: argparse.Namespace) -> int:
         return 1
 
     # Create review task (using shared helper)
+    model = args.model if hasattr(args, 'model') and args.model else None
+    provider = args.provider if hasattr(args, 'provider') and args.provider else None
     try:
-        review_task = _create_review_task(store, impl_task)
+        review_task = _create_review_task(store, impl_task, model=model, provider=provider)
     except DuplicateReviewError as e:
         review = e.active_review
         print(f"Warning: A review task already exists for implementation #{impl_task.id}")
@@ -6729,6 +6744,16 @@ def main() -> int:
         metavar="N",
         help="Override max_turns setting from gza.yaml for this run",
     )
+    improve_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override the model for this task (e.g. 'claude-opus-4-5')",
+    )
+    improve_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        help="Override the provider for this task (e.g. 'claude', 'gemini', 'codex')",
+    )
     add_common_args(improve_parser)
 
     # cycle command
@@ -6869,6 +6894,16 @@ def main() -> int:
         "--open",
         action="store_true",
         help="Open the review file in $EDITOR after the review task completes",
+    )
+    review_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override the model for this task (e.g. 'claude-opus-4-5')",
+    )
+    review_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        help="Override the provider for this task (e.g. 'claude', 'gemini', 'codex')",
     )
     add_common_args(review_parser)
 
