@@ -1997,14 +1997,14 @@ def _cmd_stats_cycles(config: Config, store: "SqliteTaskStore", as_json: bool) -
         return 0
 
     print("  Improves before approval (approved cycles only):")
-    print(_format_percentile_row("  improves_before_approval", agg["improves_before_approval"]))
+    print(_format_percentile_row("improves_before_approval", agg["improves_before_approval"]))
     print()
     print("  Per-cycle review/improve counts (all closed cycles):")
-    print(_format_percentile_row("  reviews_per_cycle", agg["reviews_per_cycle"]))
-    print(_format_percentile_row("  improves_per_cycle", agg["improves_per_cycle"]))
+    print(_format_percentile_row("reviews_per_cycle", agg["reviews_per_cycle"]))
+    print(_format_percentile_row("improves_per_cycle", agg["improves_per_cycle"]))
     print()
     print("  Cycle duration (seconds, all closed cycles):")
-    print(_format_percentile_row("  cycle_duration_seconds", agg["cycle_duration_seconds"]))
+    print(_format_percentile_row("cycle_duration_seconds", agg["cycle_duration_seconds"]))
     return 0
 
 

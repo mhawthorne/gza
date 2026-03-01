@@ -11,7 +11,7 @@ from rich.console import Console
 class OutputStyles:
     """Color and style definitions for provider stream output."""
 
-    turn_header: str = "blue"
+    step_header: str = "blue"
     assistant_text: str = "green"
     tool_use: str = "magenta"
     error: str = "bold red"
@@ -46,11 +46,30 @@ def truncate_text(text: str, max_length: int) -> str:
 
 
 class StreamOutputFormatter:
-    """Shared formatter for provider event lines and turn headers."""
+    """Shared formatter for provider event lines and step headers."""
 
     def __init__(self, console: Console | None = None, styles: OutputStyles | None = None):
         self.console = console or Console()
         self.styles = styles or OutputStyles()
+
+    def print_step_header(
+        self,
+        step_num: int,
+        total_tokens: int,
+        cost_usd: float,
+        runtime_seconds: int,
+        *,
+        blank_line_before: bool = False,
+    ) -> None:
+        """Print a standardized, colorized step header line."""
+        if blank_line_before:
+            self.console.print()
+        token_str = format_token_count(total_tokens)
+        runtime_str = format_runtime(runtime_seconds)
+        self.console.print(
+            f"| Step {step_num} | {token_str} | ${cost_usd:.2f} | {runtime_str} |",
+            style=self.styles.step_header,
+        )
 
     def print_turn_header(
         self,
@@ -61,14 +80,13 @@ class StreamOutputFormatter:
         *,
         blank_line_before: bool = False,
     ) -> None:
-        """Print a standardized, colorized turn header line."""
-        if blank_line_before:
-            self.console.print()
-        token_str = format_token_count(total_tokens)
-        runtime_str = format_runtime(runtime_seconds)
-        self.console.print(
-            f"| Turn {turn_count} | {token_str} | ${cost_usd:.2f} | {runtime_str} |",
-            style=self.styles.turn_header,
+        """Backward-compatible alias for print_step_header."""
+        self.print_step_header(
+            turn_count,
+            total_tokens,
+            cost_usd,
+            runtime_seconds,
+            blank_line_before=blank_line_before,
         )
 
     def print_tool_event(self, label: str, detail: str = "", *, prefix: str = "") -> None:

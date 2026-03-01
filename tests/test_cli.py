@@ -10184,13 +10184,20 @@ class TestCycleCommand:
         assert "No active cycle" in result.stdout or "No active cycle" in result.stderr
 
     def test_cycle_continue_respects_original_max_iterations(self, tmp_path: Path):
-        """gza cycle --continue uses cycle.max_iterations, not the CLI default of 3.
+        """gza cycle --continue uses cycle.max_iterations, not the CLI --max-iterations default.
 
-        With max_iterations=5 and 3 iterations already completed, resuming without
-        --max-iterations must enter the loop (iteration=3 < 5) rather than exiting
-        immediately (iteration=3 < 3 is False under the buggy CLI-default behaviour).
+        Seeded state: max_iterations=5, 3 completed iterations (indices 0, 1, 2).
+        CLI args: max_iterations=3 (should be IGNORED when --continue is given).
+
+        With the bug (CLI default max_iterations=3): iteration starts at 3,
+        `while 3 < 3` is immediately False → loop body never runs → still 3 records.
+        With the fix (cycle.max_iterations=5): loop runs iterations 3 and 4,
+        exhausts max_iterations, and returns exit code 2 (maxed_out).
         """
+        import argparse
         from gza.db import SqliteTaskStore
+        from gza.cli import cmd_cycle
+        from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -10200,26 +10207,61 @@ class TestCycleCommand:
         impl = self._make_completed_impl(store)
         # Start cycle with max_iterations=5 (higher than the CLI default of 3)
         cycle = store.start_cycle(impl.id, max_iterations=5)
-        # Simulate 3 completed iterations (at CLI default, resuming would skip the loop entirely)
+        # Simulate 3 completed iterations (indices 0, 1, 2)
         for i in range(3):
             it = store.append_cycle_iteration(cycle.id, i)
             store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
 
-        # Resume without --max-iterations; the subprocess honours cycle.max_iterations=5
-        result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+        # Fake review task: always returns CHANGES_REQUESTED verdict so the loop runs to completion
+        fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
+        fake_review.status = "completed"
+        fake_review.completed_at = datetime.now(timezone.utc)
+        fake_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        store.update(fake_review)
 
-        # With the bug (CLI default max_iterations=3), iteration starts at 3 and
-        # `while 3 < 3` is immediately False — no new iteration record is created.
-        # With the fix (cycle.max_iterations=5), the loop body executes at least once,
-        # appending iteration_index=3 before any runner/verdict logic is attempted.
-        all_iterations = store.get_cycle_iterations(cycle.id)
-        # With the bug: `while 3 < 3` is immediately False → loop body never runs → still 3 records.
-        # With the fix: `while 3 < 5` → loop body executes at least once →
-        # append_cycle_iteration(cycle.id, 3) is called before any runner/verdict logic.
-        assert len(all_iterations) >= 4, (
-            f"Expected >=4 iteration records (3 seeded + >=1 from resume), got {len(all_iterations)}. "
-            f"stdout: {result.stdout!r}"
+        # Fake improve task for the improve phase
+        fake_improve = store.add("Improve impl", task_type="improve", depends_on=impl.id)
+        store.update(fake_improve)
+
+        # CLI args: max_iterations=3 (should be IGNORED in favour of cycle.max_iterations=5)
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=3,
+            dry_run=False,
+            continue_cycle=True,
+            project_dir=tmp_path,
+            no_docker=True,
         )
+
+        mock_config = MagicMock()
+        mock_config.project_dir = tmp_path
+        mock_config.use_docker = False
+
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._create_review_task", return_value=fake_review), \
+             patch("gza.cli._create_improve_task", return_value=fake_improve), \
+             patch("gza.cli.run", return_value=0):
+            result = cmd_cycle(args)
+
+        # With the fix, the loop runs iterations 3 and 4, exhausts max_iterations=5,
+        # and exits with code 2 (maxed_out). With the CLI-default bug it would never
+        # enter the loop and would return 3 (blocked/unknown stop reason).
+        assert result == 2, f"Expected exit code 2 (maxed_out), got {result}"
+
+        # Verify exactly 2 new iterations were appended (indices 3 and 4)
+        all_iterations = store.get_cycle_iterations(cycle.id)
+        assert len(all_iterations) == 5, (
+            f"Expected 5 iteration records (3 seeded + 2 new), got {len(all_iterations)}"
+        )
+        new_indices = sorted(it.iteration_index for it in all_iterations if it.iteration_index >= 3)
+        assert new_indices == [3, 4], f"Expected new iteration indices [3, 4], got {new_indices}"
+
+        # Verify the cycle was closed with maxed_out status
+        cycles = store.get_cycles_for_impl(impl.id)
+        assert len(cycles) == 1
+        assert cycles[0].status == "maxed_out"
+        assert cycles[0].stop_reason == "max_iterations"
 
 
 class TestStatsCyclesCommand:
@@ -10372,6 +10414,58 @@ class TestStatsCyclesCommand:
         assert "improves_before_approval" in data
         assert "iterations_to_approval" not in data
         assert data["improves_before_approval"]["min"] == 1.0
+
+    def test_stats_cycles_human_readable_indentation(self, tmp_path: Path):
+        """Human-readable stats rows have exactly 2 leading spaces, not 4.
+
+        Regression test for the double-indentation bug where call sites passed
+        labels with '  ' prefix while _format_percentile_row already adds '  '.
+        """
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+
+        # One iteration with improve (CHANGES_REQUESTED) followed by APPROVED
+        review0 = store.add("Review 0", task_type="review")
+        improve0 = store.add("Improve 0", task_type="improve")
+        assert review0.id is not None and improve0.id is not None
+        it0 = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(
+            it0.id,
+            review_task_id=review0.id,
+            improve_task_id=improve0.id,
+            state="improve_completed",
+            review_verdict="CHANGES_REQUESTED",
+        )
+        review1 = store.add("Review 1", task_type="review")
+        assert review1.id is not None
+        it1 = store.append_cycle_iteration(cycle.id, 1)
+        store.update_cycle_iteration(
+            it1.id,
+            review_task_id=review1.id,
+            state="terminal",
+            review_verdict="APPROVED",
+        )
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        result = run_gza("stats", "--cycles", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Find the improves_before_approval row in the output
+        lines = result.stdout.splitlines()
+        matching = [ln for ln in lines if "improves_before_approval" in ln]
+        assert matching, "Expected an 'improves_before_approval' row in output"
+        row = matching[0]
+        # Must start with exactly 2 leading spaces (not 4)
+        assert row.startswith("  "), f"Row should start with 2 spaces: {row!r}"
+        assert not row.startswith("    "), f"Row must not have 4 leading spaces (double-indent bug): {row!r}"
 
 
 class TestAdvancePlansCommand:
