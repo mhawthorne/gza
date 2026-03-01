@@ -2,7 +2,7 @@
 """Analyze review/improve cycle counts per implementation task.
 
 Shows median, p90, and max cycle counts grouped by week.
-Chains of implement tasks (via based_on) are treated as one logical implementation.
+Chains of implement tasks (via based_on/depends_on) are treated as one logical implementation.
 Percentile stats only include tasks that had at least one review.
 """
 
@@ -64,12 +64,12 @@ def main() -> int:
 
     # Load all tasks for chain resolution
     rows = conn.execute(
-        "SELECT id, task_type, based_on, created_at FROM tasks"
+        "SELECT id, task_type, based_on, depends_on, created_at, model FROM tasks"
     ).fetchall()
     tasks = {r["id"]: dict(r) for r in rows}
 
     def find_root_impl(task_id: int, visited: set | None = None) -> int | None:
-        """Walk up based_on chain to find the root implement task."""
+        """Walk up based_on/depends_on chains to find the root implement task."""
         if visited is None:
             visited = set()
         if task_id in visited:
@@ -80,11 +80,13 @@ def main() -> int:
         if task is None:
             return None
 
-        if task["based_on"]:
-            parent = tasks.get(task["based_on"])
-            if parent and parent["task_type"] == "implement":
-                root = find_root_impl(parent["id"], visited)
-                return root if root is not None else parent["id"]
+        # Walk up via based_on (lineage chain) or depends_on (dependency link)
+        for parent_id in (task["based_on"], task["depends_on"]):
+            if parent_id:
+                parent = tasks.get(parent_id)
+                if parent and parent["task_type"] == "implement":
+                    root = find_root_impl(parent["id"], visited)
+                    return root if root is not None else parent["id"]
 
         if task["task_type"] == "implement":
             return task_id
@@ -93,11 +95,11 @@ def main() -> int:
     # Find all review/improve tasks in the date range
     ri_tasks = conn.execute(
         """
-        SELECT id, task_type, based_on, created_at
+        SELECT id, task_type, based_on, depends_on, created_at, model
         FROM tasks
         WHERE task_type IN ('review', 'improve')
           AND created_at >= ? AND created_at < ?
-          AND based_on IS NOT NULL
+          AND (based_on IS NOT NULL OR depends_on IS NOT NULL)
         ORDER BY id
         """,
         (start_iso, end_iso),
@@ -105,15 +107,17 @@ def main() -> int:
 
     conn.close()
 
-    # Count reviews per root impl
+    # Count reviews per root impl, tracking models
     root_reviews: dict[int, list[str]] = defaultdict(list)
+    root_review_models: dict[int, list[str | None]] = defaultdict(list)
 
     for ri in ri_tasks:
-        root = find_root_impl(ri["based_on"])
+        root = find_root_impl(ri["depends_on"] or ri["based_on"])
         if root is None:
             continue
         if ri["task_type"] == "review":
             root_reviews[root].append(ri["created_at"])
+            root_review_models[root].append(ri["model"])
 
     # Find all root implement tasks in range (including those continued by improve chains)
     root_impls_in_range: list[dict] = []
@@ -209,6 +213,30 @@ def main() -> int:
         for count in sorted(dist.keys()):
             bar = "#" * dist[count]
             print(f"  {count} cycles: {dist[count]:>3} impls  {bar}")
+
+    # Per-model review cycle stats
+    # For each root impl, determine the predominant review model
+    model_cycles: dict[str, list[int]] = defaultdict(list)
+    for root_id in reviewed_impls:
+        models = root_review_models.get(root_id, [])
+        cycle_count = len(root_reviews[root_id])
+        # Use the most common review model for this impl
+        model_counts = Counter(m for m in models if m)
+        if model_counts:
+            model = model_counts.most_common(1)[0][0]
+        else:
+            model = "unknown"
+        model_cycles[model].append(cycle_count)
+
+    if model_cycles:
+        print(f"\n{'Review model':<35} {'Impls':>5} {'Med':>5} {'P90':>5} {'Max':>5}")
+        print("-" * 58)
+        for model in sorted(model_cycles):
+            cycles = sorted(model_cycles[model])
+            med = int(median(cycles))
+            p90 = percentile(cycles, 90)
+            mx = max(cycles)
+            print(f"{model:<35} {len(cycles):>5} {med:>5} {p90:>5} {mx:>5}")
 
     return 0
 
