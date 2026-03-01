@@ -8647,7 +8647,7 @@ class TestRebaseHelpers:
         config = Config(project_dir=tmp_path, project_name="test", provider="claude")
         task = SimpleNamespace(task_type="implement", provider="codex", model=None)
 
-        with patch("gza.cli._has_runtime_rebase_skill", return_value=True), \
+        with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
              patch("pathlib.Path.exists", return_value=False):
             mock_provider = Mock()
@@ -8674,7 +8674,7 @@ class TestRebaseHelpers:
         config = Config(project_dir=tmp_path, project_name="test", provider="gemini")
         task = SimpleNamespace(task_type="implement", provider=None, model=None)
 
-        with patch("gza.cli._has_runtime_rebase_skill", return_value=True), \
+        with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
              patch("pathlib.Path.exists", return_value=False):
             mock_provider = Mock()
@@ -8690,7 +8690,7 @@ class TestRebaseHelpers:
             assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
 
     def test_invoke_claude_resolve_fails_fast_when_skill_missing(self, tmp_path, capsys, monkeypatch):
-        """Auto-resolve fails before provider run when runtime skill is missing."""
+        """Auto-resolve fails before provider run when runtime skill is missing and auto-install fails."""
         from gza.cli import invoke_claude_resolve
         from gza.config import Config
         from types import SimpleNamespace
@@ -8701,7 +8701,8 @@ class TestRebaseHelpers:
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
         task = SimpleNamespace(task_type="implement", provider=None, model=None)
 
-        with patch("gza.providers.get_provider") as mock_get_provider:
+        with patch("gza.cli.ensure_skill", return_value=False), \
+             patch("gza.providers.get_provider") as mock_get_provider:
             result = invoke_claude_resolve(task, "feature", "main", config)
             assert result is False
             assert mock_get_provider.call_count == 0
@@ -8709,6 +8710,59 @@ class TestRebaseHelpers:
         out = capsys.readouterr().out
         assert "Missing required 'gza-rebase' skill for provider 'codex'" in out
         assert "uv run gza skills-install --target codex gza-rebase --project" in out
+
+    def test_ensure_skill_returns_true_when_skill_already_present(self, tmp_path):
+        """ensure_skill returns True immediately when the skill file already exists."""
+        from gza.cli import ensure_skill
+
+        skills_dir = tmp_path / ".claude" / "skills"
+        skill_dir = skills_dir / "gza-rebase"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: gza-rebase\n---\n")
+
+        result = ensure_skill("gza-rebase", "claude", tmp_path)
+        assert result is True
+
+    def test_ensure_skill_installs_when_missing(self, tmp_path):
+        """ensure_skill auto-installs from bundled package when skill is absent."""
+        from gza.cli import ensure_skill
+        from unittest.mock import patch
+
+        with patch("gza.cli._resolve_runtime_skill_dir") as mock_resolve, \
+             patch("gza.skills_utils.copy_skill") as mock_copy:
+            runtime_dir = tmp_path / ".claude" / "skills"
+            mock_resolve.return_value = ("claude", runtime_dir)
+            # Simulate successful install: copy_skill writes the file
+            def fake_copy(name, target, force=False):
+                skill_path = target / name / "SKILL.md"
+                skill_path.parent.mkdir(parents=True, exist_ok=True)
+                skill_path.write_text("---\nname: gza-rebase\n---\n")
+                return True, "installed"
+            mock_copy.side_effect = fake_copy
+
+            result = ensure_skill("gza-rebase", "claude", tmp_path)
+            assert result is True
+            mock_copy.assert_called_once_with("gza-rebase", runtime_dir)
+
+    def test_ensure_skill_returns_false_when_install_fails(self, tmp_path):
+        """ensure_skill returns False when copy_skill fails."""
+        from gza.cli import ensure_skill
+        from unittest.mock import patch
+
+        with patch("gza.cli._resolve_runtime_skill_dir") as mock_resolve, \
+             patch("gza.skills_utils.copy_skill", return_value=(False, "copy failed: error")):
+            runtime_dir = tmp_path / ".claude" / "skills"
+            mock_resolve.return_value = ("claude", runtime_dir)
+
+            result = ensure_skill("gza-rebase", "claude", tmp_path)
+            assert result is False
+
+    def test_ensure_skill_returns_false_for_unknown_provider(self, tmp_path):
+        """ensure_skill returns False when the provider has no known skill dir."""
+        from gza.cli import ensure_skill
+
+        result = ensure_skill("gza-rebase", "unknown-provider", tmp_path)
+        assert result is False
 
 
 class TestMarkCompletedCommand:

@@ -1468,6 +1468,36 @@ def _has_runtime_rebase_skill(project_dir: Path, provider: str) -> bool:
     return (runtime_dir / "gza-rebase" / "SKILL.md").exists()
 
 
+def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
+    """Ensure a skill is available for the provider runtime, installing if missing.
+
+    Resolves the runtime skill directory for the provider, checks whether the
+    skill file exists, and if not attempts to auto-install it from the bundled
+    package via skills_utils.copy_skill.
+
+    Args:
+        skill_name: Name of the skill to ensure (e.g. 'gza-rebase').
+        provider: Provider name ('claude', 'codex', or 'gemini').
+        project_dir: Project directory used to resolve the runtime skill path.
+
+    Returns:
+        True if the skill is available after the check/install, False otherwise.
+    """
+    from .skills_utils import copy_skill
+
+    runtime = _resolve_runtime_skill_dir(project_dir, provider)
+    if not runtime:
+        return False
+    _, runtime_dir = runtime
+    skill_path = runtime_dir / skill_name / "SKILL.md"
+    if skill_path.exists():
+        return True
+    # Skill missing — attempt auto-install from bundled package.
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    ok, _ = copy_skill(skill_name, runtime_dir)
+    return ok and skill_path.exists()
+
+
 def invoke_claude_resolve(task: DbTask, branch: str, target: str, config: Config) -> bool:
     """Invoke active provider runtime to resolve rebase conflicts via /gza-rebase."""
     from dataclasses import replace
@@ -1483,18 +1513,13 @@ def invoke_claude_resolve(task: DbTask, branch: str, target: str, config: Config
         return False
 
     target_name, runtime_dir = runtime
-    if not _has_runtime_rebase_skill(config.project_dir, effective_provider):
-        # Skill may be missing because a rebase wiped the working tree copy.
-        # Auto-install from the bundled package before giving up.
-        from .skills_utils import copy_skill
-        ok, msg = copy_skill("gza-rebase", runtime_dir)
-        if not ok or not _has_runtime_rebase_skill(config.project_dir, effective_provider):
-            print(f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'.")
-            print(
-                "Install it with: "
-                f"uv run gza skills-install --target {target_name} gza-rebase --project {config.project_dir}"
-            )
-            return False
+    if not ensure_skill("gza-rebase", effective_provider, config.project_dir):
+        print(f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'.")
+        print(
+            "Install it with: "
+            f"uv run gza skills-install --target {target_name} gza-rebase --project {config.project_dir}"
+        )
+        return False
 
     resolve_config = replace(
         config,
