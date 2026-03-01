@@ -5677,6 +5677,60 @@ class TestImproveCommand:
         assert "Created improve task #3" in result.stdout
         assert "Running improve task #3" in result.stdout
 
+    def test_improve_with_model_flag(self, tmp_path: Path):
+        """Improve command with --model sets the model on the created task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        store.update(review_task)
+
+        result = run_gza("improve", "1", "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        improve_task = store.get(3)
+        assert improve_task is not None
+        assert improve_task.model == "claude-opus-4-5"
+
+    def test_improve_with_provider_flag(self, tmp_path: Path):
+        """Improve command with --provider sets the provider on the created task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        store.update(review_task)
+
+        result = run_gza("improve", "1", "--provider", "gemini", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        improve_task = store.get(3)
+        assert improve_task is not None
+        assert improve_task.provider == "gemini"
+
 
 class TestReviewCommand:
     """Tests for the 'gza review' command."""
@@ -6125,6 +6179,50 @@ class TestReviewCommand:
         assert len(call_count) == 1, (
             f"get_reviews_for_task was called {len(call_count)} times; expected exactly 1"
         )
+
+    def test_review_with_model_flag(self, tmp_path: Path):
+        """Review command with --model sets the model on the created review task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add user authentication", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-user-authentication"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        result = run_gza("review", "1", "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        review_task = store.get(2)
+        assert review_task is not None
+        assert review_task.model == "claude-opus-4-5"
+
+    def test_review_with_provider_flag(self, tmp_path: Path):
+        """Review command with --provider sets the provider on the created review task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add user authentication", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-user-authentication"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        result = run_gza("review", "1", "--provider", "gemini", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        review_task = store.get(2)
+        assert review_task is not None
+        assert review_task.provider == "gemini"
 
 
 class TestDiffCommand:
