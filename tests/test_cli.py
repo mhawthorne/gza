@@ -222,6 +222,79 @@ class TestHistoryCommand:
         assert "Regular task [task]" in result.stdout
         assert "Implement task [implement]" in result.stdout
 
+    def test_history_shows_orphaned_tasks_at_top(self, tmp_path: Path):
+        """History command includes orphaned in-progress tasks at the top."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create an orphaned (in-progress, no worker) task
+        orphaned_task = store.add("Orphaned task needing attention")
+        store.mark_in_progress(orphaned_task)
+
+        # Create a completed task
+        completed_task = store.add("Completed task")
+        completed_task.status = "completed"
+        completed_task.completed_at = datetime.now(timezone.utc)
+        store.update(completed_task)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "orphaned" in result.stdout
+        assert "Orphaned task needing attention" in result.stdout
+        assert "Completed task" in result.stdout
+        # Orphaned should appear before completed in output
+        orphaned_pos = result.stdout.find("Orphaned task needing attention")
+        completed_pos = result.stdout.find("Completed task")
+        assert orphaned_pos < completed_pos, "Orphaned task should appear before completed task"
+
+    def test_history_orphaned_shows_resume_suggestion(self, tmp_path: Path):
+        """History command shows resume suggestion for orphaned tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        orphaned_task = store.add("Orphaned task")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"gza work {orphaned_task.id}" in result.stdout
+
+    def test_history_no_orphaned_when_status_filter_set(self, tmp_path: Path):
+        """History command does not show orphaned tasks when --status filter is active."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create an orphaned task
+        orphaned_task = store.add("Orphaned task")
+        store.mark_in_progress(orphaned_task)
+
+        # Create a completed task
+        completed_task = store.add("Completed task")
+        completed_task.status = "completed"
+        completed_task.completed_at = datetime.now(timezone.utc)
+        store.update(completed_task)
+
+        result = run_gza("history", "--status", "completed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Orphaned should NOT appear when a status filter is specified
+        assert "orphaned" not in result.stdout
+        assert "Completed task" in result.stdout
+
 
 class TestNextCommand:
     """Tests for 'gza next' command."""
@@ -251,6 +324,50 @@ class TestNextCommand:
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
+
+    def test_next_warns_about_orphaned_tasks(self, tmp_path: Path):
+        """Next command warns about orphaned in-progress tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a pending task
+        store.add("Pending task")
+
+        # Create an orphaned (in-progress, no active worker) task
+        orphaned_task = store.add("Orphaned task that needs attention")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending task" in result.stdout
+        assert "orphaned" in result.stdout
+        assert "Orphaned task that needs attention" in result.stdout
+        assert "gza work" in result.stdout
+
+    def test_next_warns_orphaned_when_no_pending(self, tmp_path: Path):
+        """Next command shows orphaned warning even when there are no pending tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Only an orphaned task, no pending tasks
+        orphaned_task = store.add("Stuck orphaned task")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No pending tasks" in result.stdout
+        assert "orphaned" in result.stdout
+        assert "Stuck orphaned task" in result.stdout
 
 
 class TestAddCommand:
@@ -2679,6 +2796,53 @@ class TestStatusCommand:
         assert "First task" in result.stdout
         assert "Second task" in result.stdout
 
+    def test_status_warns_about_orphaned_tasks_in_group(self, tmp_path: Path):
+        """Status command warns about orphaned tasks belonging to the viewed group."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed task and an orphaned in-progress task in the same group
+        task1 = store.add("Completed task", group="my-group")
+        task1.status = "completed"
+        task1.completed_at = datetime.now(timezone.utc)
+        store.update(task1)
+
+        orphaned_task = store.add("Orphaned in-progress task", group="my-group")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("status", "my-group", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "orphaned" in result.stdout
+        assert "Orphaned in-progress task" in result.stdout
+        assert "gza work" in result.stdout
+
+    def test_status_no_orphaned_warning_for_other_groups(self, tmp_path: Path):
+        """Status command does not show orphaned warning for tasks in other groups."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create tasks in different groups
+        task1 = store.add("Task in group A", group="group-a")
+        store.mark_in_progress(task1)  # orphaned in group-a
+
+        store.add("Task in group B", group="group-b")  # pending in group-b
+
+        # View group-b - should NOT show orphaned warning for group-a task
+        result = run_gza("status", "group-b", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "orphaned" not in result.stdout
+        assert "Task in group B" in result.stdout
+
 
 class TestEditCommand:
     """Tests for 'gza edit' command."""
@@ -3987,6 +4151,30 @@ class TestWorkCommandMultiTask:
         # Should error about task status
         assert result.returncode != 0
         assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
+
+    def test_work_warns_about_orphaned_tasks_before_starting(self, tmp_path: Path):
+        """Work command warns about orphaned in-progress tasks before starting new work."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create an orphaned task (in-progress, no active worker) and no pending tasks.
+        # With no pending tasks, run() will return 0 immediately after printing
+        # "No pending tasks found", so we can observe the orphaned warning without
+        # needing to actually execute a task.
+        orphaned_task = store.add("Stuck task from yesterday")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("work", "--no-docker", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Warning about orphaned task should appear before the "No pending tasks" message
+        assert "orphaned" in result.stdout
+        assert "Stuck task from yesterday" in result.stdout
+        assert "gza work" in result.stdout
 
 
 class TestBackgroundWorkerCommand:
