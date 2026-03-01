@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..config import APP_NAME
 
@@ -412,6 +412,7 @@ class Provider(ABC):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run the provider to execute a task.
 
@@ -421,6 +422,10 @@ class Provider(ABC):
             log_file: Path to write logs
             work_dir: Working directory for execution
             resume_session_id: Optional session ID to resume from
+            on_session_id: Optional callback invoked with the session_id as soon
+                as it is first observed in the streaming output.  Use this to
+                persist the session_id before the run completes so that
+                interrupted tasks can still be resumed.
 
         Returns:
             RunResult with exit code and statistics

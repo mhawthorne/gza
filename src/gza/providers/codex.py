@@ -6,8 +6,9 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from .base import (
     Provider,
@@ -207,11 +208,12 @@ class CodexProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Codex to execute a task."""
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id)
-        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id)
+            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
+        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
 
     def _run_docker(
         self,
@@ -220,6 +222,7 @@ class CodexProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Codex in Docker container."""
         docker_config = _get_docker_config(config.docker_image)
@@ -257,6 +260,7 @@ class CodexProvider(Provider):
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt,
             model=config.model, max_steps=config.max_steps,
+            on_session_id=on_session_id,
         )
 
     def _run_direct(
@@ -266,6 +270,7 @@ class CodexProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Codex directly (no Docker)."""
         cmd = [
@@ -300,6 +305,7 @@ class CodexProvider(Provider):
             cmd, log_file, config.timeout_minutes, cwd=work_dir,
             stdin_input=prompt, model=config.model,
             max_steps=config.max_steps,
+            on_session_id=on_session_id,
         )
 
     def _run_with_output_parsing(
@@ -311,6 +317,7 @@ class CodexProvider(Provider):
         stdin_input: str | None = None,
         model: str = "",
         max_steps: int = 50,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
         formatter = StreamOutputFormatter()
@@ -377,7 +384,13 @@ class CodexProvider(Provider):
                 event_type = event.get("type")
 
                 if event_type == "thread.started":
-                    data["thread_id"] = event.get("thread_id")
+                    thread_id = event.get("thread_id")
+                    if thread_id and "thread_id" not in data:
+                        data["thread_id"] = thread_id
+                        if on_session_id:
+                            on_session_id(thread_id)
+                    elif thread_id:
+                        data["thread_id"] = thread_id
 
                 elif event_type == "turn.started":
                     if "turn_count" not in data:

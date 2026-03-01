@@ -1109,7 +1109,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
         report_file = worktree_review_dir / f"{review_task.task_id}.md"
 
-        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None):
+        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None):
             assert not (worktree_path / ".git").exists()
             assert (worktree_path / ".git.gza-host-worktree").exists()
             report_file.write_text("# Review\n\nVerdict: APPROVED")
@@ -1647,7 +1647,7 @@ class TestResumeVerificationPrompt:
         # Mock provider to capture the prompt
         captured_prompts = []
 
-        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None):
+        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
             captured_prompts.append({
                 'prompt': prompt,
                 'resume_session_id': resume_session_id
@@ -1761,7 +1761,7 @@ class TestResumeVerificationPrompt:
         # Mock provider to capture the prompt
         captured_prompts = []
 
-        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None):
+        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
             captured_prompts.append({
                 'prompt': prompt,
                 'resume_session_id': resume_session_id
@@ -2294,7 +2294,7 @@ class TestNoChangesWithExistingCommits:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -2366,7 +2366,7 @@ class TestNoChangesWithExistingCommits:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,

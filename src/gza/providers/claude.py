@@ -11,7 +11,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -219,11 +220,12 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Claude to execute a task."""
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id)
-        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id)
+            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
+        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
 
     def _run_docker(
         self,
@@ -232,6 +234,7 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
         if config.claude.fetch_auth_token_from_keychain:
@@ -254,6 +257,7 @@ class ClaudeProvider(Provider):
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
             chat_text_display_length=config.chat_text_display_length,
+            on_session_id=on_session_id,
         )
 
     def _run_direct(
@@ -263,6 +267,7 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
         cmd = [
@@ -280,6 +285,7 @@ class ClaudeProvider(Provider):
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
             chat_text_display_length=config.chat_text_display_length,
+            on_session_id=on_session_id,
         )
 
     def _run_with_output_parsing(
@@ -291,6 +297,7 @@ class ClaudeProvider(Provider):
         stdin_input: str | None = None,
         model: str = "",
         chat_text_display_length: int = 0,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
         formatter = StreamOutputFormatter()
@@ -525,8 +532,23 @@ class ClaudeProvider(Provider):
                                     first_line = text.split("\n")[0]
                                     formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
 
+                elif event_type == "system":
+                    subtype = event.get("subtype")
+                    if subtype == "init":
+                        session_id = event.get("session_id")
+                        if session_id and "session_id" not in data:
+                            data["session_id"] = session_id
+                            if on_session_id:
+                                on_session_id(session_id)
+
                 elif event_type == "result":
                     data["result"] = event
+                    # Also capture session_id from result event if not already seen
+                    session_id = event.get("session_id")
+                    if session_id and "session_id" not in data:
+                        data["session_id"] = session_id
+                        if on_session_id:
+                            on_session_id(session_id)
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
@@ -546,12 +568,14 @@ class ClaudeProvider(Provider):
                 result.num_turns_reported = result_data["num_turns"]
             if "total_cost_usd" in result_data:
                 result.cost_usd = result_data["total_cost_usd"]
-            if "session_id" in result_data:
-                result.session_id = result_data["session_id"]
             # Check for error subtypes (e.g., error_max_turns)
             subtype = result_data.get("subtype", "")
             if subtype == "error_max_turns":
                 result.error_type = "max_steps"
+
+        # Expose accumulated session_id (captured from system/init or result event)
+        if "session_id" in accumulated_data:
+            result.session_id = accumulated_data["session_id"]
 
         # Store our internally computed turn count (unique assistant message IDs)
         seen_msg_ids = accumulated_data.get("seen_msg_ids", set())
