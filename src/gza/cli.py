@@ -28,7 +28,7 @@ from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
 from .learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from .prompts import PromptBuilder
-from .runner import run, post_review_to_pr, get_effective_config_for_task
+from .runner import run, post_review_to_pr, get_effective_config_for_task, _get_task_output
 from .tasks import YamlTaskStore, Task as YamlTask
 from .workers import WorkerMetadata, WorkerRegistry
 
@@ -5218,6 +5218,13 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{task.log_file}[/{c['value']}]")
     if task.report_file:
         console.print(f"[{c['label']}]Report:[/{c['label']}] [{c['value']}]{task.report_file}[/{c['value']}]")
+        # Detect if disk file is newer than task completion (drift warning)
+        if task.completed_at and task.output_content:
+            report_path = config.project_dir / task.report_file
+            if report_path.exists():
+                file_mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=timezone.utc)
+                if file_mtime > task.completed_at:
+                    console.print(f"[yellow]Warning: Report on disk has been modified since task completion[/yellow]")
     if task.session_id:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 
@@ -5320,6 +5327,54 @@ def cmd_show(args: argparse.Namespace) -> int:
                         f"review #{it.review_task_id} [{verdict_str}]{imp_str}[/{c['value']}]"
                     )
 
+    # Display output content using precedence logic (disk version when newer)
+    output = _get_task_output(task, config.project_dir)
+    if output:
+        console.print()
+        console.print(f"[{c['label']}]Output:[/{c['label']}]")
+        console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+        full_mode = getattr(args, "full", False)
+        lines = output.splitlines()
+        if not full_mode and len(lines) > 30:
+            truncated = "\n".join(lines[:20])
+            remainder = len(lines) - 20
+            console.print(truncated)
+            console.print(f"[{c['section']}](... truncated, {remainder} more lines — use `gza show {task.id} --full` to see all)[/{c['section']}]")
+        else:
+            console.print(output)
+        console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+
+    return 0
+
+
+def cmd_sync_report(args: argparse.Namespace) -> int:
+    """Sync report file content from disk into DB output_content."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task = store.get(args.task_id)
+    if not task:
+        console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
+        return 1
+
+    if not task.report_file:
+        console.print(f"[red]Error: Task #{args.task_id} has no report file[/red]")
+        return 1
+
+    report_path = config.project_dir / task.report_file
+    if not report_path.exists():
+        console.print(f"[red]Error: Report file not found: {task.report_file}[/red]")
+        return 1
+
+    disk_content = report_path.read_text()
+
+    if task.output_content == disk_content:
+        console.print(f"[dim]Task #{args.task_id} already in sync — no changes needed.[/dim]")
+        return 0
+
+    task.output_content = disk_content
+    store.update(task)
+    console.print(f"[green]Synced report for task #{args.task_id} from disk to DB.[/green]")
     return 0
 
 
@@ -6914,7 +6969,24 @@ def main() -> int:
         type=int,
         help="Task ID to show",
     )
+    show_parser.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        help="Show full output without truncation",
+    )
     add_common_args(show_parser)
+
+    # sync-report command
+    sync_report_parser = subparsers.add_parser(
+        "sync-report", help="Sync report file content from disk into DB output_content"
+    )
+    sync_report_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to sync",
+    )
+    add_common_args(sync_report_parser)
 
     # import command
     import_parser = subparsers.add_parser("import", help="Import tasks from a YAML file")
@@ -7082,6 +7154,8 @@ def main() -> int:
             return cmd_resume(args)
         elif args.command == "show":
             return cmd_show(args)
+        elif args.command == "sync-report":
+            return cmd_sync_report(args)
         elif args.command == "import":
             return cmd_import(args)
         elif args.command == "groups":
