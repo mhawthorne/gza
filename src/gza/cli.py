@@ -914,10 +914,10 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     # Configurable colors for history output
     HISTORY_COLORS = {
-        "task_id": "#cccccc",      # light gray for task ID and date
-        "prompt": "#ff99cc",       # pink for prompt text
-        "branch": "#6699ff",       # lighter blue for branch name
-        "stats": "#6699ff",        # lighter blue for stats
+        "task_id": "dim",          # dim for task ID and date (adapts to terminal background)
+        "prompt": "#ff99cc",       # pink for prompt text (works on dark and light)
+        "branch": "cyan",          # cyan for branch name (visible on dark and light)
+        "stats": "cyan",           # cyan for stats (visible on dark and light)
         "success": "green",        # green for completed (✓)
         "failure": "red",          # red for failed (✗)
         "unmerged": "yellow",      # yellow for unmerged (⚡)
@@ -1004,13 +1004,13 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
     # Configurable colors for unmerged output
     UNMERGED_COLORS = {
-        "task_id": "#cccccc",      # light gray for task ID and date
-        "prompt": "#ff99cc",       # pink for prompt text
-        "stats": "#6699ff",        # lighter blue for stats
-        "branch": "#6699ff",       # lighter blue for branch name
+        "task_id": "dim",          # dim for task ID and date (adapts to terminal background)
+        "prompt": "#ff99cc",       # pink for prompt text (works on dark and light)
+        "stats": "cyan",           # cyan for stats (visible on dark and light)
+        "branch": "cyan",          # cyan for branch name (visible on dark and light)
         "review_approved": "green",
         "review_changes": "yellow",
-        "review_discussion": "blue",
+        "review_discussion": "cyan",
         "review_none": "dim yellow",
     }
 
@@ -5241,16 +5241,16 @@ def cmd_show(args: argparse.Namespace) -> int:
         "heading": "bold cyan",
         "section": "dim",
         "label": "dim",
-        "value": "white",
-        "task_id": "#cccccc",
-        "prompt": "#ff99cc",
-        "branch": "#6699ff",
-        "stats": "#6699ff",
+        "value": "bold",           # bold adapts to terminal background (was "white")
+        "task_id": "dim",          # dim adapts to terminal background (was "#cccccc")
+        "prompt": "#ff99cc",       # pink works on dark and light backgrounds
+        "branch": "cyan",          # cyan visible on dark and light (was "#6699ff")
+        "stats": "cyan",           # cyan visible on dark and light (was "#6699ff")
         "status_pending": "yellow",
         "status_running": "cyan",
         "status_completed": "green",
         "status_failed": "red",
-        "status_default": "white",
+        "status_default": "bold",  # bold adapts to terminal background (was "white")
     }
     c = SHOW_COLORS
 
