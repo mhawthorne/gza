@@ -168,6 +168,8 @@ def _validate_local_override_data(data: dict, schema: dict[str, object], path_pr
                 "Only approved machine-local settings may be overridden."
             )
         if isinstance(allowed, dict):
+            if value is None:
+                continue  # Empty block (e.g. commented-out contents), skip
             if not isinstance(value, dict):
                 raise ConfigError(
                     f"Invalid local override value for '{path}' in {LOCAL_CONFIG_FILENAME}: "
@@ -609,6 +611,8 @@ class Config:
                         f"'providers.{provider_name}' is invalid. "
                         f"Known providers: {', '.join(KNOWN_PROVIDERS)}"
                     )
+                if provider_config_data is None:
+                    continue  # Empty block, skip
                 if not isinstance(provider_config_data, dict):
                     raise ConfigError(f"'providers.{provider_name}' must be a dictionary")
 
@@ -622,6 +626,8 @@ class Config:
                     if not isinstance(provider_task_types_data, dict):
                         raise ConfigError(f"'providers.{provider_name}.task_types' must be a dictionary")
                     for task_type, task_type_config_data in provider_task_types_data.items():
+                        if task_type_config_data is None:
+                            continue  # Empty block, skip
                         if not isinstance(task_type_config_data, dict):
                             raise ConfigError(f"'providers.{provider_name}.task_types.{task_type}' must be a dictionary")
                         provider_task_model = task_type_config_data.get("model")
@@ -1174,6 +1180,8 @@ class Config:
                             f"Known providers: {', '.join(KNOWN_PROVIDERS)}"
                         )
                         continue
+                    if provider_data is None:
+                        continue  # Empty block, skip
                     if not isinstance(provider_data, dict):
                         errors.append(f"'providers.{provider_name}' must be a dictionary")
                         continue
@@ -1193,11 +1201,13 @@ class Config:
                             )
                         )
 
-                    if "task_types" in provider_data:
+                    if "task_types" in provider_data and provider_data["task_types"] is not None:
                         if not isinstance(provider_data["task_types"], dict):
                             errors.append(f"'providers.{provider_name}.task_types' must be a dictionary")
                         else:
                             for task_type, task_type_config in provider_data["task_types"].items():
+                                if task_type_config is None:
+                                    continue  # Empty block, skip
                                 if not isinstance(task_type_config, dict):
                                     errors.append(
                                         f"'providers.{provider_name}.task_types.{task_type}' must be a dictionary"
