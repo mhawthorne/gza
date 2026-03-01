@@ -3,7 +3,7 @@
 import re
 import subprocess
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -294,6 +294,127 @@ class TestHistoryCommand:
         # Orphaned should NOT appear when a status filter is specified
         assert "orphaned" not in result.stdout
         assert "Completed task" in result.stdout
+
+    def test_history_incomplete_flag(self, tmp_path: Path):
+        """--incomplete shows failed/unmerged tasks but not completed+merged ones."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Failed task (should appear)
+        failed = store.add("Failed task")
+        failed.status = "failed"
+        failed.completed_at = datetime.now(timezone.utc)
+        store.update(failed)
+
+        # Completed + merged (should NOT appear)
+        merged = store.add("Merged task")
+        merged.status = "completed"
+        merged.merge_status = "merged"
+        merged.completed_at = datetime.now(timezone.utc)
+        store.update(merged)
+
+        result = run_gza("history", "--incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failed task" in result.stdout
+        assert "Merged task" not in result.stdout
+
+    def test_history_lookback_days(self, tmp_path: Path):
+        """--lookback-days excludes old tasks and includes recent ones."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        old = store.add("Old task")
+        old.status = "completed"
+        old.completed_at = now - timedelta(days=30)
+        store.update(old)
+
+        recent = store.add("Recent task")
+        recent.status = "completed"
+        recent.completed_at = now - timedelta(days=1)
+        store.update(recent)
+
+        result = run_gza("history", "--lookback-days", "7", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Recent task" in result.stdout
+        assert "Old task" not in result.stdout
+
+    def test_history_lineage_depth(self, tmp_path: Path):
+        """--lineage-depth shows ancestor/descendant relationship lines."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add("Parent task")
+        parent.status = "completed"
+        parent.completed_at = datetime.now(timezone.utc)
+        store.update(parent)
+
+        child = store.add("Child task", based_on=parent.id)
+        child.status = "completed"
+        child.completed_at = datetime.now(timezone.utc)
+        store.update(child)
+
+        result = run_gza("history", "--lineage-depth", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Child should appear with ancestor relationship label
+        assert "Child task" in result.stdout
+        assert "ancestor" in result.stdout
+
+    def test_history_incomplete_with_lookback(self, tmp_path: Path):
+        """--incomplete combined with --lookback-days applies both filters."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        # Recent + incomplete (should appear)
+        recent_failed = store.add("Recent failed")
+        recent_failed.status = "failed"
+        recent_failed.completed_at = now - timedelta(days=1)
+        store.update(recent_failed)
+
+        # Old + incomplete (excluded by lookback)
+        old_failed = store.add("Old failed")
+        old_failed.status = "failed"
+        old_failed.completed_at = now - timedelta(days=30)
+        store.update(old_failed)
+
+        # Recent + complete (excluded by incomplete filter)
+        recent_merged = store.add("Recent merged")
+        recent_merged.status = "completed"
+        recent_merged.merge_status = "merged"
+        recent_merged.completed_at = now - timedelta(days=1)
+        store.update(recent_merged)
+
+        result = run_gza(
+            "history", "--incomplete", "--lookback-days", "7",
+            "--project", str(tmp_path)
+        )
+
+        assert result.returncode == 0
+        assert "Recent failed" in result.stdout
+        assert "Old failed" not in result.stdout
+        assert "Recent merged" not in result.stdout
 
 
 class TestNextCommand:

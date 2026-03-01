@@ -903,14 +903,25 @@ def _resolve_lineage_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
 
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
+    from gza.query import HistoryFilter, query_history, query_history_with_lineage, TaskLineageNode
+
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    # Determine the limit: None for --all, otherwise use --limit/-n value
-    limit = None if args.all else args.limit
     status = getattr(args, 'status', None)
     task_type = getattr(args, 'type', None)
-    recent = store.get_history(limit=limit, status=status, task_type=task_type)
+    incomplete = getattr(args, 'incomplete', False)
+    lookback_days = getattr(args, 'lookback_days', None)
+    lineage_depth = getattr(args, 'lineage_depth', 0)
+
+    f = HistoryFilter(
+        limit=None if args.all else args.limit,
+        status=status,
+        task_type=task_type,
+        incomplete=incomplete,
+        lookback_days=lookback_days,
+        lineage_depth=lineage_depth,
+    )
 
     # Configurable colors for history output
     HISTORY_COLORS = {
@@ -922,7 +933,65 @@ def cmd_history(args: argparse.Namespace) -> int:
         "failure": "red",          # red for failed (✗)
         "unmerged": "yellow",      # yellow for unmerged (⚡)
         "orphaned": "yellow",      # yellow for orphaned (⚠)
+        "lineage": "dim",          # dim for lineage relationship labels
     }
+    c = HISTORY_COLORS
+
+    def _render_task_line(task: DbTask, indent: str = "") -> None:
+        """Render a single task entry."""
+        if task.merge_status == "unmerged":
+            status_icon = f"[{c['unmerged']}]⚡[/{c['unmerged']}]"
+        elif task.status == "completed":
+            status_icon = f"[{c['success']}]✓[/{c['success']}]"
+        else:
+            if task.failure_reason and task.failure_reason != "UNKNOWN":
+                status_icon = f"[{c['failure']}]✗ failed ({task.failure_reason})[/{c['failure']}]"
+            else:
+                status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
+        date_str = (
+            f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]"
+            if task.completed_at
+            else ""
+        )
+        type_label = f" \\[{task.task_type}]"
+        merge_label = " \\[merged]" if task.merge_status == "merged" else ""
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        console.print(
+            f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
+            f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}"
+        )
+        if task.branch:
+            console.print(f"{indent}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
+        if task.report_file:
+            console.print(f"{indent}    report: [{c['task_id']}]{task.report_file}[/{c['task_id']}]")
+        stats_str = format_stats(task)
+        if stats_str:
+            console.print(f"{indent}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
+
+    def _render_lineage_node(node: TaskLineageNode, is_root: bool = False) -> None:
+        """Render a TaskLineageNode with ancestors above and descendants below."""
+        indent_unit = "  "
+
+        # Render ancestors (oldest first so root is closest to the task)
+        for ancestor_node in reversed(node.ancestors):
+            depth_indent = indent_unit * ancestor_node.depth
+            console.print(
+                f"{depth_indent}[{c['lineage']}]↑ ancestor[/{c['lineage']}]"
+            )
+            _render_task_line(ancestor_node.task, indent=depth_indent)
+
+        # Render the root task itself
+        _render_task_line(node.task)
+
+        # Render descendants
+        for desc_node in node.descendants:
+            depth_indent = indent_unit * desc_node.depth
+            console.print(
+                f"{depth_indent}[{c['lineage']}]↓ descendant[/{c['lineage']}]"
+            )
+            _render_task_line(desc_node.task, indent=depth_indent)
+
+        print()
 
     # Check for orphaned tasks (only when no status filter is active)
     orphaned: list[DbTask] = []
@@ -930,53 +999,68 @@ def cmd_history(args: argparse.Namespace) -> int:
         registry = WorkerRegistry(config.workers_path)
         orphaned = _get_orphaned_tasks(registry, store)
 
-    if not recent and not orphaned:
-        status_msg = f" with status '{status}'" if status else ""
-        type_msg = f" with type '{task_type}'" if task_type else ""
-        console.print(f"No completed or failed tasks{status_msg}{type_msg}")
-        return 0
+    if lineage_depth > 0:
+        nodes = query_history_with_lineage(store, f)
+        if not nodes and not orphaned:
+            _print_history_empty_message(status, task_type, incomplete, lookback_days)
+            return 0
+        # Show orphaned tasks at the top
+        for task in orphaned:
+            _render_orphaned_task(task, c)
+        for node in nodes:
+            _render_lineage_node(node)
+    else:
+        recent = query_history(store, f)
+        if not recent and not orphaned:
+            _print_history_empty_message(status, task_type, incomplete, lookback_days)
+            return 0
 
-    c = HISTORY_COLORS  # shorthand
+        # Show orphaned tasks at the top so they're immediately visible
+        for task in orphaned:
+            _render_orphaned_task(task, c)
 
-    # Show orphaned tasks at the top so they're immediately visible
-    for task in orphaned:
-        status_icon = f"[{c['orphaned']}]⚠ orphaned[/{c['orphaned']}]"
-        date_str = ""
-        if task.started_at:
-            date_str = f"[{c['task_id']}](started {task.started_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]"
-        type_label = f" \\[{task.task_type}]"
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        console.print(f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}")
-        if task.branch:
-            console.print(f"    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
-        console.print(f"    [{c['task_id']}]Run 'gza work {task.id}' to resume[/{c['task_id']}]")
-        print()
+        for task in recent:
+            _render_task_line(task)
+            print()
 
-    for task in recent:
-        if task.merge_status == "unmerged":
-            status_icon = f"[{c['unmerged']}]⚡[/{c['unmerged']}]"
-        elif task.status == "completed":
-            status_icon = f"[{c['success']}]✓[/{c['success']}]"
-        else:
-            # Show failure reason if it's not UNKNOWN or NULL
-            if task.failure_reason and task.failure_reason != "UNKNOWN":
-                status_icon = f"[{c['failure']}]✗ failed ({task.failure_reason})[/{c['failure']}]"
-            else:
-                status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
-        date_str = f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if task.completed_at else ""
-        type_label = f" \\[{task.task_type}]"
-        merge_label = " \\[merged]" if task.merge_status == "merged" else ""
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        console.print(f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}")
-        if task.branch:
-            console.print(f"    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
-        if task.report_file:
-            console.print(f"    report: [{c['task_id']}]{task.report_file}[/{c['task_id']}]")
-        stats_str = format_stats(task)
-        if stats_str:
-            console.print(f"    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
-        print()
     return 0
+
+
+def _print_history_empty_message(
+    status: str | None,
+    task_type: str | None,
+    incomplete: bool,
+    lookback_days: int | None,
+) -> None:
+    """Print an appropriate 'no tasks found' message for gza history."""
+    status_msg = f" with status '{status}'" if status else ""
+    type_msg = f" with type '{task_type}'" if task_type else ""
+    incomplete_msg = " (incomplete only)" if incomplete else ""
+    lookback_msg = f" in the last {lookback_days} days" if lookback_days is not None else ""
+    console.print(
+        f"No completed or failed tasks{status_msg}{type_msg}{incomplete_msg}{lookback_msg}"
+    )
+
+
+def _render_orphaned_task(task: "DbTask", c: dict) -> None:
+    """Render a single orphaned task entry for gza history."""
+    status_icon = f"[{c['orphaned']}]⚠ orphaned[/{c['orphaned']}]"
+    date_str = ""
+    if task.started_at:
+        date_str = (
+            f"[{c['task_id']}](started {task.started_at.strftime('%Y-%m-%d %H:%M')})"
+            f"[/{c['task_id']}]"
+        )
+    type_label = f" \\[{task.task_type}]"
+    prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+    console.print(
+        f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
+        f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}"
+    )
+    if task.branch:
+        console.print(f"    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
+    console.print(f"    [{c['task_id']}]Run 'gza work {task.id}' to resume[/{c['task_id']}]")
+    print()
 
 
 def cmd_unmerged(args: argparse.Namespace) -> int:
@@ -6229,6 +6313,32 @@ def main() -> int:
         type=str,
         choices=["task", "explore", "plan", "implement", "review", "improve"],
         help="Filter tasks by task_type (e.g., task, explore, plan, implement, review, improve)",
+    )
+    history_parser.add_argument(
+        "--incomplete",
+        action="store_true",
+        help=(
+            "Show only tasks that have not been fully resolved "
+            "(failed tasks, or completed tasks with unmerged commits)"
+        ),
+    )
+    history_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        dest="lookback_days",
+        metavar="N",
+        help="Show only tasks completed or created within the last N days",
+    )
+    history_parser.add_argument(
+        "--lineage-depth",
+        type=int,
+        dest="lineage_depth",
+        default=0,
+        metavar="N",
+        help=(
+            "Expand lineage N levels for each matching task, showing ancestors "
+            "(via based_on) and descendants"
+        ),
     )
 
     # unmerged command

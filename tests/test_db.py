@@ -2,7 +2,7 @@
 
 import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -3225,3 +3225,101 @@ class TestComputePercentiles:
         assert result is not None
         # p90_idx = max(0, int(0.9 * 10) - 1) = 8, sorted[8] = 9
         assert result["p90"] == 9.0
+
+
+class TestGetHistorySinceParam:
+    """Tests for the since parameter of SqliteTaskStore.get_history()."""
+
+    def test_since_excludes_old_tasks(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+
+        # Old task (10 days ago)
+        old = store.add("old task")
+        old.status = "completed"
+        old.completed_at = now - timedelta(days=10)
+        store.update(old)
+
+        # Recent task (1 day ago)
+        recent = store.add("recent task")
+        recent.status = "completed"
+        recent.completed_at = now - timedelta(days=1)
+        store.update(recent)
+
+        cutoff = now - timedelta(days=5)
+        results = store.get_history(limit=None, since=cutoff)
+        prompts = [t.prompt for t in results]
+        assert "recent task" in prompts
+        assert "old task" not in prompts
+
+    def test_since_includes_tasks_exactly_at_cutoff(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=5)
+
+        task = store.add("boundary task")
+        task.status = "completed"
+        # Set completed_at to exactly the cutoff time
+        task.completed_at = cutoff
+        store.update(task)
+
+        results = store.get_history(limit=None, since=cutoff)
+        prompts = [t.prompt for t in results]
+        assert "boundary task" in prompts
+
+    def test_since_none_returns_all(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+
+        for i in range(3):
+            t = store.add(f"task {i}")
+            t.status = "completed"
+            t.completed_at = now - timedelta(days=i * 10)
+            store.update(t)
+
+        results = store.get_history(limit=None, since=None)
+        assert len(results) == 3
+
+
+class TestGetBasedOnChildren:
+    """Tests for SqliteTaskStore.get_based_on_children()."""
+
+    def test_returns_direct_children(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent task")
+        child1 = store.add("child 1", based_on=parent.id)
+        child2 = store.add("child 2", based_on=parent.id)
+
+        children = store.get_based_on_children(parent.id)
+        child_ids = {c.id for c in children}
+        assert child1.id in child_ids
+        assert child2.id in child_ids
+
+    def test_returns_empty_when_no_children(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("standalone task")
+
+        children = store.get_based_on_children(task.id)
+        assert children == []
+
+    def test_does_not_return_grandchildren(self, tmp_path: Path):
+        """get_based_on_children returns only direct children, not transitive."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        grandparent = store.add("grandparent")
+        parent = store.add("parent", based_on=grandparent.id)
+        store.add("child", based_on=parent.id)
+
+        children = store.get_based_on_children(grandparent.id)
+        assert len(children) == 1
+        assert children[0].id == parent.id
+
+    def test_ordered_by_id_ascending(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent")
+        c1 = store.add("first child", based_on=parent.id)
+        c2 = store.add("second child", based_on=parent.id)
+        c3 = store.add("third child", based_on=parent.id)
+
+        children = store.get_based_on_children(parent.id)
+        ids = [c.id for c in children]
+        assert ids == [c1.id, c2.id, c3.id]
