@@ -3677,8 +3677,16 @@ def _extract_task_slug(task: DbTask) -> str | None:
 
 
 def cmd_implement(args: argparse.Namespace) -> int:
-    """Create an implementation task from a completed plan task."""
+    """Create an implementation task from a completed plan task and run it."""
     config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
     store = get_store(config)
 
     plan_task = store.get(args.plan_task_id)
@@ -3700,13 +3708,46 @@ def cmd_implement(args: argparse.Namespace) -> int:
         else:
             prompt = f"Implement plan from task #{plan_task.id}"
 
-    add_args = argparse.Namespace(**vars(args))
-    add_args.prompt = prompt
-    add_args.type = "implement"
-    add_args.based_on = plan_task.id
-    add_args.explore = False
-    add_args.edit = False
-    return cmd_add(add_args)
+    group = args.group if hasattr(args, 'group') and args.group else None
+    depends_on = args.depends_on if hasattr(args, 'depends_on') and args.depends_on else None
+    create_review = args.review if hasattr(args, 'review') and args.review else False
+    same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
+    branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
+    model = args.model if hasattr(args, 'model') and args.model else None
+    provider = args.provider if hasattr(args, 'provider') and args.provider else None
+    skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
+
+    impl_task = store.add(
+        prompt,
+        task_type="implement",
+        based_on=plan_task.id,
+        group=group,
+        depends_on=depends_on,
+        create_review=create_review,
+        same_branch=same_branch,
+        task_type_hint=branch_type,
+        model=model,
+        provider=provider,
+        skip_learnings=skip_learnings,
+    )
+
+    print(f"✓ Created implement task #{impl_task.id}")
+    print(f"  Based on: plan #{plan_task.id}")
+
+    # Handle background mode - spawn worker to run the implement task
+    if hasattr(args, 'background') and args.background:
+        assert impl_task.id is not None
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [impl_task.id]
+        return _spawn_background_worker(worker_args, config, task_id=impl_task.id)
+
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    # Default: run the implement task immediately
+    print(f"\nRunning implement task #{impl_task.id}...")
+    return run(config, task_id=impl_task.id)
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -6984,6 +7025,27 @@ def main() -> int:
         action="store_true",
         dest="skip_learnings",
         help="Skip injecting .gza/learnings.md context into this task's prompt",
+    )
+    implement_parser.add_argument(
+        "--queue", "-q",
+        action="store_true",
+        help="Add task to queue without executing immediately",
+    )
+    implement_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    implement_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
+    )
+    implement_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
     )
     add_common_args(implement_parser)
 

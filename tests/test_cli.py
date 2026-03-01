@@ -5719,7 +5719,7 @@ class TestImplementCommand:
     """Tests for 'gza implement' command."""
 
     def test_implement_creates_task_from_completed_plan(self, tmp_path: Path):
-        """Implement command creates an implementation task using add workflow."""
+        """Implement command creates an implementation task and queues it."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -5737,12 +5737,13 @@ class TestImplementCommand:
             str(plan_task.id),
             "Implement auth rollout",
             "--review",
+            "--queue",
             "--project",
             str(tmp_path),
         )
 
         assert result.returncode == 0
-        assert "Added task #2" in result.stdout
+        assert "Created implement task #2" in result.stdout
 
         impl_task = store.get(2)
         assert impl_task is not None
@@ -5810,10 +5811,10 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(timezone.utc)
         store.update(plan_task)
 
-        result = run_gza("implement", str(plan_task.id), "--project", str(tmp_path))
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Added task #2" in result.stdout
+        assert "Created implement task #2" in result.stdout
 
         impl_task = store.get(2)
         assert impl_task is not None
