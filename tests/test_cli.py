@@ -3935,6 +3935,113 @@ class TestPsCommand:
         registry.remove("w-test-order-a")
         registry.remove("w-test-order-b")
 
+    def test_ps_poll_default_interval(self, tmp_path: Path):
+        """--poll without a value uses 5-second default interval."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=5,  # const value when --poll given without argument
+        )
+
+        call_count = 0
+        sleep_calls: list[float] = []
+
+        def fake_sleep(n: float) -> None:
+            nonlocal call_count
+            sleep_calls.append(n)
+            call_count += 1
+            if call_count >= 2:
+                raise KeyboardInterrupt
+
+        import unittest.mock as mock
+        with mock.patch("time.sleep", side_effect=fake_sleep):
+            result = cmd_ps(args)
+
+        assert result == 0
+        assert all(s == 5 for s in sleep_calls)
+
+    def test_ps_poll_custom_interval(self, tmp_path: Path):
+        """--poll N uses the specified interval."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=10,
+        )
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(n: float) -> None:
+            sleep_calls.append(n)
+            raise KeyboardInterrupt
+
+        import unittest.mock as mock
+        with mock.patch("time.sleep", side_effect=fake_sleep):
+            result = cmd_ps(args)
+
+        assert result == 0
+        assert sleep_calls == [10]
+
+    def test_ps_poll_shows_timestamp_header(self, tmp_path: Path, capsys):
+        """Poll mode prints the refresh interval and timestamp in the header."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=3,
+        )
+
+        import unittest.mock as mock
+        with mock.patch("time.sleep", side_effect=KeyboardInterrupt):
+            result = cmd_ps(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Refreshing every 3s" in captured.out
+        assert "last updated:" in captured.out
+        assert "Ctrl+C to exit" in captured.out
+
+    def test_ps_no_poll_behaves_as_before(self, tmp_path: Path, capsys):
+        """Without --poll the command runs once and exits immediately."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=None,
+        )
+
+        import unittest.mock as mock
+        with mock.patch("time.sleep") as mock_sleep:
+            result = cmd_ps(args)
+
+        assert result == 0
+        mock_sleep.assert_not_called()
+
 
 class TestHelpOutput:
     """Tests for CLI help output."""

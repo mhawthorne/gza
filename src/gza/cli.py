@@ -4085,31 +4085,34 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_ps(args: argparse.Namespace) -> int:
-    """List running and completed workers."""
-    config = Config.load(args.project_dir)
-    registry = WorkerRegistry(config.workers_path)
-    store = get_store(config)
+def _print_ps_output(args: argparse.Namespace, registry: "WorkerRegistry", store: "SqliteTaskStore", poll_interval: int | None = None) -> None:
+    """Print ps output once. Used by cmd_ps directly and in poll loop."""
+    import datetime
     show_all = args.all if hasattr(args, "all") else False
     rows, _ = _build_ps_rows(registry, store, include_completed=show_all)
+
+    if poll_interval is not None:
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"Refreshing every {poll_interval}s — last updated: {now}  (Ctrl+C to exit)")
+        print()
 
     if not rows:
         if show_all:
             print("No workers or in-progress tasks found")
         else:
             print("No running workers or in-progress tasks (use --all to see completed)")
-        return 0
+        return
 
     if hasattr(args, "quiet") and args.quiet:
         for row in rows:
             if row["worker_id"] != "-":
                 print(row["worker_id"])
-        return 0
+        return
 
     if hasattr(args, "json") and args.json:
         import json as json_lib
         print(json_lib.dumps(rows, indent=2))
-        return 0
+        return
 
     print(
         f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'SOURCE':<7} {'TASK ID':<10} "
@@ -4124,6 +4127,26 @@ def cmd_ps(args: argparse.Namespace) -> int:
             f"{task_id_display:<10} {row['status']:<12} {row['flags']:<12} "
             f"{row['task']:<30} {row['started']:<20} {row['duration']:<10}"
         )
+
+
+def cmd_ps(args: argparse.Namespace) -> int:
+    """List running and completed workers."""
+    import time
+    config = Config.load(args.project_dir)
+    registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
+    poll_interval: int | None = getattr(args, "poll", None)
+
+    if poll_interval is not None:
+        try:
+            while True:
+                print("\033[2J\033[H", end="")  # clear screen, move cursor to top
+                _print_ps_output(args, registry, store, poll_interval=poll_interval)
+                time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            return 0
+    else:
+        _print_ps_output(args, registry, store)
 
     return 0
 
@@ -7112,6 +7135,14 @@ def main() -> int:
         "--json",
         action="store_true",
         help="Output as JSON",
+    )
+    ps_parser.add_argument(
+        "--poll",
+        nargs="?",
+        const=5,
+        type=int,
+        metavar="SECS",
+        help="Refresh output every SECS seconds (default: 5 if flag given without value)",
     )
     add_common_args(ps_parser)
 
