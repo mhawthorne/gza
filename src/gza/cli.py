@@ -38,6 +38,19 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+class DuplicateReviewError(ValueError):
+    """Raised when a review already exists for an implementation task.
+
+    Carries the active review task so callers do not need to re-query the DB.
+    """
+
+    def __init__(self, active_review: DbTask) -> None:
+        super().__init__(
+            f"A review task already exists: #{active_review.id} (status: {active_review.status})"
+        )
+        self.active_review = active_review
+
+
 
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None) -> int:
     """Spawn a background worker process.
@@ -689,11 +702,7 @@ def _create_review_task(store: SqliteTaskStore, impl_task: DbTask) -> DbTask:
     existing_reviews = store.get_reviews_for_task(impl_task.id)
     active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
     if active_reviews:
-        review = active_reviews[0]
-        raise ValueError(
-            f"A review task already exists for implementation #{impl_task.id}: "
-            f"#{review.id} (status: {review.status})"
-        )
+        raise DuplicateReviewError(active_reviews[0])
 
     review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
     return store.add(
@@ -1949,8 +1958,8 @@ def _cmd_stats_cycles(config: Config, store: "SqliteTaskStore", as_json: bool) -
         print("  No cycles found. Run 'gza cycle <impl-id>' to start one.")
         return 0
 
-    print("  Iterations to approval (approved cycles only):")
-    print(_format_percentile_row("  iterations_to_approval", agg["iterations_to_approval"]))
+    print("  Improves before approval (approved cycles only):")
+    print(_format_percentile_row("  improves_before_approval", agg["improves_before_approval"]))
     print()
     print("  Per-cycle review/improve counts (all closed cycles):")
     print(_format_percentile_row("  reviews_per_cycle", agg["reviews_per_cycle"]))
@@ -4547,16 +4556,14 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Create review task (using shared helper)
     try:
         review_task = _create_review_task(store, impl_task)
+    except DuplicateReviewError as e:
+        review = e.active_review
+        print(f"Warning: A review task already exists for implementation #{impl_task.id}")
+        print(f"  Existing review: #{review.id} (status: {review.status})")
+        print(f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
+        return 1
     except ValueError as e:
-        existing_reviews = store.get_reviews_for_task(impl_task.id) if impl_task.id else []
-        active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
-        if active_reviews:
-            review = active_reviews[0]
-            print(f"Warning: A review task already exists for implementation #{impl_task.id}")
-            print(f"  Existing review: #{review.id} (status: {review.status})")
-            print(f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
-        else:
-            print(f"Error: {e}")
+        print(f"Error: {e}")
         return 1
 
     print(f"✓ Created review task #{review_task.id}")
@@ -4631,6 +4638,11 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         existing_iterations = store.get_cycle_iterations(cycle.id)
         if existing_iterations:
             max_index = max(it.iteration_index for it in existing_iterations)
+            # Resumption always starts a brand-new iteration at max_index + 1.
+            # If the last recorded iteration was only partially executed (e.g.
+            # the process was killed mid-run), we do NOT re-run it; we advance
+            # to the next index instead.  This keeps iteration records monotone
+            # and avoids re-submitting work that may have already been queued.
             iteration = max_index + 1
         else:
             iteration = 0
@@ -4654,6 +4666,10 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     summary_rows: list[tuple[int, int | None, str | None, int | None]] = []
 
     final_status = "blocked"
+    # "unknown" is a safe fallback init value; in practice every code path
+    # inside the loop sets final_stop_reason before breaking, and the loop
+    # guard (iteration < max_iterations) ensures at least one iteration runs
+    # when max_iterations > 0 (enforced by `or 3` above).
     final_stop_reason = "unknown"
 
     while iteration < max_iterations:
@@ -4728,6 +4744,9 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
         # --- IMPROVE PHASE ---
         try:
+            # create_review is intentionally omitted (defaults to False) here:
+            # the cycle loop manages the review/improve cadence itself, so the
+            # improve task must NOT auto-create a follow-up review on completion.
             improve_task = _create_improve_task(store, impl_task, review_task)
         except ValueError as e:
             print(f"  Error creating improve: {e}")
@@ -5684,13 +5703,10 @@ def _cmd_advance_plans(
     """
     all_completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
 
-    # Find plans that have no implement task pointing at them (via based_on)
-    all_tasks = store.get_all()
-    impl_based_on_ids: set[int] = {
-        t.based_on
-        for t in all_tasks
-        if t.task_type == "implement" and t.based_on is not None
-    }
+    # Find plans that have no implement task pointing at them (via based_on).
+    # Use a targeted query instead of a full table scan to avoid loading every
+    # task (including output_content blobs) into memory.
+    impl_based_on_ids: set[int] = store.get_impl_based_on_ids()
 
     pending_plans = [p for p in all_completed_plans if p.id not in impl_based_on_ids]
 

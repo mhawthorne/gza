@@ -22,6 +22,12 @@ def _compute_percentiles(values: list[float]) -> dict | None:
     """Compute min/max/avg/median/p90 for a list of numeric values.
 
     Returns None if the list is empty.
+
+    Note: For samples with fewer than 10 values, ``p90`` equals ``max``.
+    This is a deliberate conservative choice — the nearest-rank formula
+    would give the same result for most small samples anyway, and returning
+    ``max`` avoids the misleading impression of a precise 90th-percentile
+    estimate from very few data points.
     """
     if not values:
         return None
@@ -149,8 +155,14 @@ class TaskCycleIteration:
     ended_at: datetime | None
 
 
+# Migration from v18 to v19
+MIGRATION_V18_TO_V19 = """
+CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cycle_iterations(cycle_id, iteration_index);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -291,7 +303,9 @@ CREATE TABLE IF NOT EXISTS task_cycle_iterations (
 CREATE INDEX IF NOT EXISTS idx_task_cycles_impl_id ON task_cycles(implementation_task_id);
 CREATE INDEX IF NOT EXISTS idx_task_cycles_status ON task_cycles(status);
 CREATE INDEX IF NOT EXISTS idx_task_cycle_iterations_cycle_idx ON task_cycle_iterations(cycle_id, iteration_index);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cycle_iterations(cycle_id, iteration_index);
 CREATE INDEX IF NOT EXISTS idx_tasks_cycle_id ON tasks(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
 """
 
 # Migration from v1 to v2
@@ -783,6 +797,19 @@ class SqliteTaskStore:
                                 pass
                     conn.execute("UPDATE schema_version SET version = ?", (18,))
                     current_version = 18
+
+                if current_version < 19:
+                    # Run migration v18 -> v19
+                    for stmt in MIGRATION_V18_TO_V19.strip().split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            try:
+                                conn.execute(stmt)
+                            except sqlite3.OperationalError:
+                                # Index might already exist
+                                pass
+                    conn.execute("UPDATE schema_version SET version = ?", (19,))
+                    current_version = 19
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -1415,7 +1442,7 @@ class SqliteTaskStore:
         """Get aggregate cycle stats across all closed approved cycles.
 
         Returns a dict with percentile distributions for:
-        - iterations_to_approval (improve count before first approval)
+        - improves_before_approval (improve task count before first approval in approved cycles)
         - reviews_per_cycle
         - improves_per_cycle
         - cycle_duration_seconds
@@ -1425,14 +1452,14 @@ class SqliteTaskStore:
             return {
                 "total_cycles": 0,
                 "approved_cycles": 0,
-                "iterations_to_approval": None,
+                "improves_before_approval": None,
                 "reviews_per_cycle": None,
                 "improves_per_cycle": None,
                 "cycle_duration_seconds": None,
             }
 
         approved = [c for c in cycles if c.status == "approved"]
-        iterations_vals: list[float] = []
+        improves_before_approval_vals: list[float] = []
         reviews_vals: list[float] = []
         improves_vals: list[float] = []
         duration_vals: list[float] = []
@@ -1446,12 +1473,12 @@ class SqliteTaskStore:
 
         for cycle in approved:
             iters = self.get_cycle_iterations(cycle.id)
-            iterations_vals.append(sum(1 for it in iters if it.improve_task_id is not None))
+            improves_before_approval_vals.append(sum(1 for it in iters if it.improve_task_id is not None))
 
         return {
             "total_cycles": len(cycles),
             "approved_cycles": len(approved),
-            "iterations_to_approval": _compute_percentiles(iterations_vals) if iterations_vals else None,
+            "improves_before_approval": _compute_percentiles(improves_before_approval_vals) if improves_before_approval_vals else None,
             "reviews_per_cycle": _compute_percentiles(reviews_vals) if reviews_vals else None,
             "improves_per_cycle": _compute_percentiles(improves_vals) if improves_vals else None,
             "cycle_duration_seconds": _compute_percentiles(duration_vals) if duration_vals else None,
@@ -1662,6 +1689,19 @@ class SqliteTaskStore:
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC")
             return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def get_impl_based_on_ids(self) -> set[int]:
+        """Return the set of based_on IDs used by implement tasks.
+
+        Issues a targeted query instead of a full table scan, suitable for
+        determining which plan tasks already have an implementation.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT based_on FROM tasks"
+                " WHERE task_type = 'implement' AND based_on IS NOT NULL"
+            )
+            return {row[0] for row in cur.fetchall()}
 
     def get_reviews_for_task(self, task_id: int) -> list[Task]:
         """Get all review tasks that depend on the given task, ordered by completed_at DESC.

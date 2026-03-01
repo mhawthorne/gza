@@ -407,7 +407,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -517,7 +517,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -702,7 +702,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -887,7 +887,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1222,7 +1222,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1687,7 +1687,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1858,7 +1858,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1938,7 +1938,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2467,7 +2467,7 @@ class TestStepColumnsMigration:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 18
+        assert version == 19
 
         migrated = store.get(1)
         assert migrated is not None
@@ -2498,7 +2498,7 @@ class TestRunStepPersistence:
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
-        assert version == 18
+        assert version == 19
 
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('run_steps', 'run_substeps')"
@@ -2766,7 +2766,7 @@ class TestRunStepPersistence:
         value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 1").fetchone()[0]
         conn.close()
 
-        assert version == 18
+        assert version == 19
         assert value == 1
 
     def test_set_log_schema_version_updates_task(self, tmp_path: Path):
@@ -2864,7 +2864,7 @@ class TestCycleOrchestratorSchema:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 18
+        assert version == 19
         assert "task_cycles" in tables
         assert "task_cycle_iterations" in tables
         assert "idx_task_cycles_impl_id" in indexes
@@ -2895,6 +2895,53 @@ class TestCycleOrchestratorSchema:
         assert retrieved.cycle_id == 42
         assert retrieved.cycle_iteration_index == 2
         assert retrieved.cycle_role == "review"
+
+    def test_migration_v18_to_v19_adds_indexes(self, tmp_path: Path):
+        """Migration v18->v19 adds idx_tasks_type_based_on and the unique constraint."""
+        import sqlite3
+        from gza.db import SqliteTaskStore
+
+        db_path = tmp_path / "test.db"
+        # Bootstrap as a v18 database (full fresh schema minus the v19 additions)
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (18)")
+        # Minimal task_cycle_iterations table (no UNIQUE constraint yet)
+        conn.execute("""
+            CREATE TABLE task_cycle_iterations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                iteration_index INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'review_created',
+                started_at TEXT NOT NULL
+            )
+        """)
+        # Minimal tasks table
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                based_on INTEGER
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Opening with SqliteTaskStore should run the v18->v19 migration
+        store = SqliteTaskStore(db_path)
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        indexes = {row[1] for row in conn.execute("SELECT * FROM sqlite_master WHERE type='index'")}
+        conn.close()
+
+        assert version == 19
+        assert "idx_tasks_type_based_on" in indexes
+        assert "uq_task_cycle_iterations_cycle_iter" in indexes
 
 
 class TestCycleStoreAPIs:
@@ -3031,7 +3078,7 @@ class TestCycleStoreAPIs:
 
         assert stats["total_cycles"] == 0
         assert stats["approved_cycles"] == 0
-        assert stats["iterations_to_approval"] is None
+        assert stats["improves_before_approval"] is None
 
     def test_cycle_aggregate_stats_with_data(self, tmp_path: Path):
         """get_cycle_aggregate_stats computes correct stats from cycle data."""
@@ -3070,12 +3117,76 @@ class TestCycleStoreAPIs:
         stats = store.get_cycle_aggregate_stats()
         assert stats["total_cycles"] == 2
         assert stats["approved_cycles"] == 1
-        # Only cycle1 is approved: 1 improve -> iterations_to_approval = 1
-        assert stats["iterations_to_approval"] is not None
-        assert stats["iterations_to_approval"]["min"] == 1.0
+        # Only cycle1 is approved: 1 improve -> improves_before_approval = 1
+        assert stats["improves_before_approval"] is not None
+        assert stats["improves_before_approval"]["min"] == 1.0
         # Both cycles have 2 reviews each
         assert stats["reviews_per_cycle"] is not None
         assert stats["reviews_per_cycle"]["min"] == 2.0
+
+    def test_improves_before_approval_two_iteration_cycle(self, tmp_path: Path):
+        """improves_before_approval counts improve tasks, not total iterations."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        # Cycle: iter 0 has review+improve (CHANGES_REQUESTED), iter 1 has review-only (APPROVED)
+        impl = store.add("Impl", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+
+        review0 = store.add("Review 0", task_type="review")
+        improve0 = store.add("Improve 0", task_type="improve")
+        assert review0.id is not None and improve0.id is not None
+        it0 = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(
+            it0.id,
+            review_task_id=review0.id,
+            improve_task_id=improve0.id,
+            state="improve_completed",
+            review_verdict="CHANGES_REQUESTED",
+        )
+
+        review1 = store.add("Review 1", task_type="review")
+        assert review1.id is not None
+        it1 = store.append_cycle_iteration(cycle.id, 1)
+        store.update_cycle_iteration(
+            it1.id,
+            review_task_id=review1.id,
+            state="terminal",
+            review_verdict="APPROVED",
+        )
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        stats = store.get_cycle_aggregate_stats()
+        assert stats["approved_cycles"] == 1
+        # One improve ran before approval
+        assert stats["improves_before_approval"] is not None
+        assert stats["improves_before_approval"]["min"] == 1.0
+        assert stats["improves_before_approval"]["max"] == 1.0
+
+    def test_get_impl_based_on_ids_returns_targeted_set(self, tmp_path: Path):
+        """get_impl_based_on_ids returns only based_on IDs from implement tasks."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        plan1 = store.add("Plan 1", task_type="plan")
+        plan2 = store.add("Plan 2", task_type="plan")
+        plan3 = store.add("Plan 3", task_type="plan")
+        assert plan1.id is not None and plan2.id is not None and plan3.id is not None
+
+        # Only plan1 has an implement task based on it
+        store.add("Impl 1", task_type="implement", based_on=plan1.id)
+        # A review task with based_on should NOT be included
+        store.add("Review of plan2", task_type="review", based_on=plan2.id)
+        # A plain task with no based_on
+        store.add("Task no based_on", task_type="task")
+
+        result = store.get_impl_based_on_ids()
+
+        assert result == {plan1.id}
+
+    def test_get_impl_based_on_ids_empty_db(self, tmp_path: Path):
+        """get_impl_based_on_ids returns empty set when no implement tasks exist."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        assert store.get_impl_based_on_ids() == set()
 
 
 class TestComputePercentiles:

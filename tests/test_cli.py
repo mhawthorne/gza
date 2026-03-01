@@ -6058,6 +6058,74 @@ class TestReviewCommand:
         reviews = store.get_reviews_for_task(impl_task.id)
         assert len(reviews) == 2
 
+    def test_duplicate_review_uses_DuplicateReviewError_no_second_db_query(self, tmp_path: Path):
+        """cmd_review shows the warning using DuplicateReviewError without a second DB query.
+
+        After the refactor, cmd_review catches DuplicateReviewError (which carries
+        the active_review task) so store.get_reviews_for_task is called exactly once
+        (inside _create_review_task) and NOT a second time in the error handler.
+        """
+        import argparse
+        from unittest.mock import MagicMock, patch
+        from gza.cli import cmd_review, DuplicateReviewError
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        assert impl_task.id is not None
+        existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
+        # Leave as pending so it counts as active
+
+        args = argparse.Namespace(
+            task_id=impl_task.id,
+            project_dir=tmp_path,
+            no_docker=True,
+            queue=False,
+            background=False,
+            open=False,
+            pr=False,
+            no_pr=False,
+        )
+
+        mock_config = MagicMock()
+        mock_config.project_dir = tmp_path
+        mock_config.use_docker = False
+
+        # Wrap get_reviews_for_task to count calls
+        original_get_reviews = store.get_reviews_for_task
+        call_count = []
+
+        def counting_get_reviews(task_id: int):
+            call_count.append(task_id)
+            return original_get_reviews(task_id)
+
+        import io
+        output = io.StringIO()
+
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch.object(store, "get_reviews_for_task", side_effect=counting_get_reviews), \
+             patch("sys.stdout", output):
+            result = cmd_review(args)
+
+        assert result == 1
+        printed = output.getvalue()
+        assert "Warning: A review task already exists" in printed
+        assert f"#{existing_review.id}" in printed
+        # get_reviews_for_task must be called exactly once (inside _create_review_task),
+        # NOT a second time in the cmd_review error handler.
+        assert len(call_count) == 1, (
+            f"get_reviews_for_task was called {len(call_count)} times; expected exactly 1"
+        )
+
 
 class TestDiffCommand:
     """Tests for 'gza diff' command."""
@@ -9870,6 +9938,54 @@ class TestStatsCyclesCommand:
         # Should NOT show cycle analytics headers
         assert "Cycle Analytics" not in result.stdout
 
+    def test_stats_cycles_improves_before_approval_metric(self, tmp_path: Path):
+        """gza stats --cycles --json reports improves_before_approval key (not iterations_to_approval)."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+
+        # Iteration 0: review + improve (CHANGES_REQUESTED)
+        review0 = store.add("Review 0", task_type="review")
+        improve0 = store.add("Improve 0", task_type="improve")
+        assert review0.id is not None and improve0.id is not None
+        it0 = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(
+            it0.id,
+            review_task_id=review0.id,
+            improve_task_id=improve0.id,
+            state="improve_completed",
+            review_verdict="CHANGES_REQUESTED",
+        )
+
+        # Iteration 1: review only (APPROVED)
+        review1 = store.add("Review 1", task_type="review")
+        assert review1.id is not None
+        it1 = store.append_cycle_iteration(cycle.id, 1)
+        store.update_cycle_iteration(
+            it1.id,
+            review_task_id=review1.id,
+            state="terminal",
+            review_verdict="APPROVED",
+        )
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        result = run_gza("stats", "--cycles", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        # Key must be improves_before_approval, NOT iterations_to_approval
+        assert "improves_before_approval" in data
+        assert "iterations_to_approval" not in data
+        assert data["improves_before_approval"]["min"] == 1.0
+
 
 class TestAdvancePlansCommand:
     """Tests for 'gza advance --plans' command."""
@@ -9980,3 +10096,45 @@ class TestAdvancePlansCommand:
         all_tasks = store.get_all()
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 0
+
+    def test_advance_plans_targeted_query_ignores_non_plan_tasks(self, tmp_path: Path):
+        """advance --plans correctly filters plans even with many non-plan tasks present.
+
+        This exercises get_impl_based_on_ids (the targeted query path) to ensure
+        the plan-exclusion filter is based only on implement tasks, not all tasks.
+        """
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_with_impl = store.add("Plan with impl", task_type="plan")
+        plan_with_impl.status = "completed"
+        plan_with_impl.completed_at = datetime.now(timezone.utc)
+        store.update(plan_with_impl)
+
+        plan_without_impl = store.add("Plan without impl", task_type="plan")
+        plan_without_impl.status = "completed"
+        plan_without_impl.completed_at = datetime.now(timezone.utc)
+        store.update(plan_without_impl)
+
+        assert plan_with_impl.id is not None and plan_without_impl.id is not None
+
+        # Implement task based on plan_with_impl
+        store.add("Impl 1", task_type="implement", based_on=plan_with_impl.id)
+
+        # Many non-plan tasks that should NOT affect the exclusion logic
+        for i in range(20):
+            t = store.add(f"Task {i}", task_type="task")
+            t.based_on = plan_with_impl.id  # review/task based_on should be ignored
+            store.update(t)
+
+        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Only plan_without_impl should appear (plan_with_impl is excluded)
+        assert "Plan without impl" in result.stdout
+        assert "Plan with impl" not in result.stdout
