@@ -431,6 +431,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Get task info for registration
     store = get_store(config)
+
+    # Warn about orphaned tasks before starting new work (skip in resume mode)
+    is_resume = getattr(args, 'resume', False)
+    if not is_resume:
+        orphaned = _get_orphaned_tasks(registry, store)
+        if orphaned:
+            _print_orphaned_warning(orphaned)
+            print()
     task_id_for_registration = None
 
     # Check if specific task IDs were provided
@@ -568,8 +576,14 @@ def cmd_next(args: argparse.Namespace) -> int:
 
     pending = store.get_pending()
 
+    # Check for orphaned/stale tasks once, regardless of whether pending tasks exist
+    registry = WorkerRegistry(config.workers_path)
+    orphaned = _get_orphaned_tasks(registry, store)
+
     if not pending:
         print("No pending tasks")
+        if orphaned:
+            _print_orphaned_warning(orphaned)
         return 0
 
     # Filter blocked tasks unless --all is specified
@@ -613,6 +627,9 @@ def cmd_next(args: argparse.Namespace) -> int:
         count = len(blocked)
         plural = "tasks" if count != 1 else "task"
         print(f"({count} {plural} blocked by dependencies)")
+
+    if orphaned:
+        _print_orphaned_warning(orphaned)
 
     return 0
 
@@ -861,11 +878,6 @@ def cmd_history(args: argparse.Namespace) -> int:
     status = getattr(args, 'status', None)
     task_type = getattr(args, 'type', None)
     recent = store.get_history(limit=limit, status=status, task_type=task_type)
-    if not recent:
-        status_msg = f" with status '{status}'" if status else ""
-        type_msg = f" with type '{task_type}'" if task_type else ""
-        console.print(f"No completed or failed tasks{status_msg}{type_msg}")
-        return 0
 
     # Configurable colors for history output
     HISTORY_COLORS = {
@@ -876,9 +888,37 @@ def cmd_history(args: argparse.Namespace) -> int:
         "success": "green",        # green for completed (✓)
         "failure": "red",          # red for failed (✗)
         "unmerged": "yellow",      # yellow for unmerged (⚡)
+        "orphaned": "yellow",      # yellow for orphaned (⚠)
     }
 
+    # Check for orphaned tasks (only when no status filter is active)
+    orphaned: list[DbTask] = []
+    if not status:
+        registry = WorkerRegistry(config.workers_path)
+        orphaned = _get_orphaned_tasks(registry, store)
+
+    if not recent and not orphaned:
+        status_msg = f" with status '{status}'" if status else ""
+        type_msg = f" with type '{task_type}'" if task_type else ""
+        console.print(f"No completed or failed tasks{status_msg}{type_msg}")
+        return 0
+
     c = HISTORY_COLORS  # shorthand
+
+    # Show orphaned tasks at the top so they're immediately visible
+    for task in orphaned:
+        status_icon = f"[{c['orphaned']}]⚠ orphaned[/{c['orphaned']}]"
+        date_str = ""
+        if task.started_at:
+            date_str = f"[{c['task_id']}](started {task.started_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]"
+        type_label = f" \\[{task.task_type}]"
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        console.print(f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}")
+        if task.branch:
+            console.print(f"    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
+        console.print(f"    [{c['task_id']}]Run 'gza work {task.id}' to resume[/{c['task_id']}]")
+        print()
+
     for task in recent:
         if task.merge_status == "unmerged":
             status_icon = f"[{c['unmerged']}]⚡[/{c['unmerged']}]"
@@ -3996,6 +4036,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
         print(f"  {icon} {task.id}. {type_label}{prompt_display:<50} {status_display}{date_info}{blocked_info}")
 
+    # Check for orphaned tasks in this group and warn the user
+    registry = WorkerRegistry(config.workers_path)
+    orphaned = _get_orphaned_tasks(registry, store)
+    # Filter orphaned tasks to those belonging to this group
+    group_orphaned = [t for t in orphaned if t.group == group_name]
+    if group_orphaned:
+        _print_orphaned_warning(group_orphaned)
+
     return 0
 
 
@@ -4005,7 +4053,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
     show_all = args.all if hasattr(args, "all") else False
-    rows = _build_ps_rows(registry, store, include_completed=show_all)
+    rows, _ = _build_ps_rows(registry, store, include_completed=show_all)
 
     if not rows:
         if show_all:
@@ -4046,8 +4094,12 @@ def _build_ps_rows(
     registry: WorkerRegistry,
     store: SqliteTaskStore,
     include_completed: bool,
-) -> list[dict]:
-    """Build reconciled ps rows from worker registry and DB in-progress tasks."""
+) -> tuple[list[dict], list[DbTask]]:
+    """Build reconciled ps rows from worker registry and DB in-progress tasks.
+
+    Returns a tuple of (rows, in_progress_tasks) so callers can reuse the
+    already-fetched in-progress task objects without an extra DB round-trip.
+    """
     workers = registry.list_all(include_completed=include_completed)
     in_progress_tasks = store.get_in_progress()
     merged: dict[tuple[str, str], dict] = {}
@@ -4076,7 +4128,32 @@ def _build_ps_rows(
 
     rows = [_to_ps_row(item["worker"], item["task"]) for item in merged.values()]
     rows.sort(key=_ps_sort_key)
-    return rows
+    return rows, in_progress_tasks
+
+
+def _get_orphaned_tasks(registry: WorkerRegistry, store: SqliteTaskStore) -> list[DbTask]:
+    """Return in-progress tasks that have no active worker (orphaned/stale)."""
+    rows, in_progress = _build_ps_rows(registry, store, include_completed=False)
+    orphaned_task_ids = {
+        row["task_id"] for row in rows
+        if row["is_orphaned"] and row["task_id"] is not None
+    }
+    if not orphaned_task_ids:
+        return []
+    return [t for t in in_progress if t.id in orphaned_task_ids]
+
+
+def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
+    """Print a warning about orphaned tasks with a suggestion to resume."""
+    count = len(orphaned)
+    plural = "tasks" if count != 1 else "task"
+    print(f"\n⚠  {count} orphaned {plural} found (in-progress with no active worker):")
+    for task in orphaned:
+        type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+        first_line = task.prompt.split('\n')[0].strip()
+        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
+        print(f"   (#{task.id}) {type_label}{prompt_display}")
+    print("   Run 'gza work <id>' to resume, or 'gza mark-completed --force <id>' to clear.")
 
 
 def _ps_sort_key(row: dict) -> tuple[bool, str, int, str]:
