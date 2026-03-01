@@ -1431,14 +1431,19 @@ def invoke_claude_resolve(task: DbTask, branch: str, target: str, config: Config
         print(f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve.")
         return False
 
-    target_name, _ = runtime
+    target_name, runtime_dir = runtime
     if not _has_runtime_rebase_skill(config.project_dir, effective_provider):
-        print(f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'.")
-        print(
-            "Install it with: "
-            f"uv run gza skills-install --target {target_name} gza-rebase --project {config.project_dir}"
-        )
-        return False
+        # Skill may be missing because a rebase wiped the working tree copy.
+        # Auto-install from the bundled package before giving up.
+        from .skills_utils import copy_skill
+        ok, msg = copy_skill("gza-rebase", runtime_dir)
+        if not ok or not _has_runtime_rebase_skill(config.project_dir, effective_provider):
+            print(f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'.")
+            print(
+                "Install it with: "
+                f"uv run gza skills-install --target {target_name} gza-rebase --project {config.project_dir}"
+            )
+            return False
 
     resolve_config = replace(
         config,
