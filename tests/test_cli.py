@@ -858,7 +858,7 @@ class TestResumeCommand:
         assert "gza retry" in result.stdout
 
     def test_resume_non_failed_task_fails(self, tmp_path: Path):
-        """Resume command fails for non-failed tasks."""
+        """Resume command fails for non-failed, non-orphaned tasks."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "Pending task", "status": "pending"},
         ])
@@ -866,7 +866,7 @@ class TestResumeCommand:
         result = run_gza("resume", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "Can only resume failed tasks" in result.stdout
+        assert "Can only resume failed or orphaned tasks" in result.stdout
 
     def test_resume_runs_by_default(self, tmp_path: Path):
         """Resume command runs the new task immediately by default."""
@@ -976,6 +976,86 @@ class TestResumeCommand:
         assert new_task.num_turns_reported is None
         assert new_task.cost_usd is None
         assert new_task.log_file is None
+
+    def test_resume_orphaned_in_progress_task_succeeds(self, tmp_path: Path):
+        """Resume command succeeds for an orphaned in_progress task (no live worker)."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create an in_progress task with a session ID (simulating an orphaned task)
+        task = store.add("Orphaned in-progress task")
+        task.status = "in_progress"
+        task.session_id = "orphaned-session-456"
+        task.started_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # No worker files exist — task is orphaned
+
+        result = run_gza("resume", "1", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "orphaned" in result.stdout.lower()
+        assert "Created task #2 (resume of #1)" in result.stdout
+
+        # Verify original task is unchanged and new task was created
+        original = store.get(1)
+        assert original is not None
+        assert original.status == "in_progress"
+        new_task = store.get(2)
+        assert new_task is not None
+        assert new_task.based_on == 1
+        assert new_task.session_id == "orphaned-session-456"
+        assert new_task.status == "pending"
+
+    def test_resume_running_in_progress_task_fails(self, tmp_path: Path):
+        """Resume command fails for an in_progress task that has a live worker."""
+        import subprocess as sp
+
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create an in_progress task
+        task = store.add("Still-running task")
+        task.status = "in_progress"
+        task.session_id = "running-session-789"
+        task.started_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Spawn a real sleeping process to act as the live worker
+        sleeper = sp.Popen(["sleep", "30"])
+        try:
+            workers_path = tmp_path / ".gza" / "workers"
+            workers_path.mkdir(parents=True, exist_ok=True)
+            registry = WorkerRegistry(workers_path)
+            worker = WorkerMetadata(
+                worker_id="w-test-running",
+                pid=sleeper.pid,
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+            registry.register(worker)
+
+            result = run_gza("resume", "1", "--project", str(tmp_path))
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+
+        assert result.returncode == 1
+        assert "still running" in result.stdout.lower()
+        assert "w-test-running" in result.stdout
 
 
 class TestConfigRequirements:

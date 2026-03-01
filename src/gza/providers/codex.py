@@ -77,32 +77,55 @@ def _has_codex_oauth() -> bool:
     return auth_file.exists()
 
 
-def _get_docker_config(image_name: str, use_oauth: bool = True) -> DockerConfig:
+def _has_api_key() -> bool:
+    """Check if an API key is configured.
+
+    CODEX_API_KEY is the canonical variable; OPENAI_API_KEY is supported as a
+    backward-compatible alias (the underlying Codex CLI also reads this variable).
+    """
+    return bool(os.getenv("CODEX_API_KEY") or os.getenv("OPENAI_API_KEY"))
+
+
+def _get_docker_config(image_name: str) -> DockerConfig:
     """Get Docker configuration for Codex.
 
-    Auth priority: OAuth (~/.codex) if available, otherwise CODEX_API_KEY.
-    OAuth is preferred as it uses ChatGPT pricing (typically cheaper).
-
-    Args:
-        image_name: Docker image name to use.
-        use_oauth: If True and OAuth credentials exist, mount ~/.codex.
-                   If False, force API key auth (don't mount ~/.codex).
+    Auth priority: API key (CODEX_API_KEY / OPENAI_API_KEY) takes precedence
+    over OAuth (~/.codex). Explicit API key credentials are deterministic and
+    portable; OAuth is used as a fallback when no API key is configured.
     """
-    # Prefer OAuth if credentials exist, otherwise use API key
-    if use_oauth and _has_codex_oauth():
-        config_dir = ".codex"
-        env_vars = []  # Don't need API key when using OAuth
+    if _has_api_key():
+        # API key takes precedence — pass through whichever key var(s) are set.
+        env_vars: list[str] = []
+        if os.getenv("CODEX_API_KEY"):
+            env_vars.append("CODEX_API_KEY")
+        if os.getenv("OPENAI_API_KEY"):
+            env_vars.append("OPENAI_API_KEY")
+        return DockerConfig(
+            image_name=image_name,
+            npm_package="@openai/codex",
+            cli_command="codex",
+            config_dir=None,
+            env_vars=env_vars,
+        )
+    elif _has_codex_oauth():
+        # Fall back to OAuth — mount ~/.codex into the container.
+        return DockerConfig(
+            image_name=image_name,
+            npm_package="@openai/codex",
+            cli_command="codex",
+            config_dir=".codex",
+            env_vars=[],
+        )
     else:
-        config_dir = None
-        env_vars = ["CODEX_API_KEY"]
-
-    return DockerConfig(
-        image_name=image_name,
-        npm_package="@openai/codex",
-        cli_command="codex",
-        config_dir=config_dir,
-        env_vars=env_vars,
-    )
+        # No credentials found; default to API key mode (will fail at runtime
+        # with a clear error message).
+        return DockerConfig(
+            image_name=image_name,
+            npm_package="@openai/codex",
+            cli_command="codex",
+            config_dir=None,
+            env_vars=["CODEX_API_KEY"],
+        )
 
 
 class CodexProvider(Provider):
@@ -114,14 +137,21 @@ class CodexProvider(Provider):
 
     @property
     def credential_setup_hint(self) -> str:
-        return "Set OPENAI_API_KEY in ~/.gza/.env or run 'codex --login' to authenticate"
+        return (
+            "Set CODEX_API_KEY in ~/.gza/.env (OPENAI_API_KEY is also accepted as an alias) "
+            "or run 'codex --login' to authenticate with OAuth"
+        )
 
     def check_credentials(self) -> bool:
-        """Check for Codex credentials (OAuth or API key)."""
+        """Check for Codex credentials (API key or OAuth).
+
+        API key (CODEX_API_KEY or OPENAI_API_KEY alias) takes precedence.
+        OAuth (~/.codex directory) is checked as a fallback.
+        """
+        if _has_api_key():
+            return True
         codex_config = Path.home() / ".codex"
         if codex_config.is_dir():
-            return True
-        if os.getenv("CODEX_API_KEY"):
             return True
         return False
 
