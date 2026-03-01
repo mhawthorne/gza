@@ -393,16 +393,35 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
 
     included = prior_improves[:REVIEW_IMPROVE_LINEAGE_LIMIT]
     omitted_count = max(0, len(prior_improves) - len(included))
+    n_cycles = len(prior_improves)
+
+    # Build lineage chain (oldest first for readability)
+    chronological = sorted(
+        prior_improves,
+        key=lambda t: (t.created_at or datetime.min.replace(tzinfo=timezone.utc), t.id or 0),
+    )
+    chain_parts = []
+    for improve in chronological:
+        review_ref = f"Review #{improve.depends_on}" if improve.depends_on else "Review #?"
+        chain_parts.append(f"{review_ref} → Improve #{improve.id}")
+    lineage_chain = " → ".join(chain_parts)
+
+    cycle_note = (
+        f"This implementation has been through {n_cycles} prior review/improve cycle(s)"
+        + (
+            f" (showing {len(included)} most recent, {omitted_count} older omitted)"
+            if omitted_count
+            else ""
+        )
+        + ". Use `gza show <id>` to inspect prior review findings or improve task prompts."
+        " Use `cat <report_file>` to read full review reports."
+    )
 
     lines = [
         "## Improve Lineage Context",
         "",
-        (
-            f"Prior improve runs for implementation #{impl_task.id}: {len(prior_improves)} total "
-            f"(showing {len(included)} most recent"
-            + (f", {omitted_count} older omitted" if omitted_count else "")
-            + ")."
-        ),
+        cycle_note,
+        f"Lineage: {lineage_chain}",
         "",
     ]
 

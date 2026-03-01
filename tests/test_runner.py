@@ -392,13 +392,14 @@ class TestReviewContextFromChain:
         assert f"showing {REVIEW_IMPROVE_LINEAGE_LIMIT} most recent" in context
         assert "2 older omitted" in context
 
-        # Most recent improves are included.
+        # Most recent improves are included in both the lineage chain and detail bullets.
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
             assert f"Improve #{improve_id}" in context
 
-        # Older improves are not included.
-        for improve_id in improve_ids[:-REVIEW_IMPROVE_LINEAGE_LIMIT]:
-            assert f"Improve #{improve_id}" not in context
+        # Older improve IDs appear in the lineage chain line but their summaries are omitted.
+        omitted_count = len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT
+        for idx in range(omitted_count):
+            assert f"Improve summary {idx}" not in context
 
     def test_review_context_includes_retry_improves_in_same_chain(self, tmp_path: Path):
         """Review context includes retry/resume improve attempts chained from prior improves."""
@@ -482,8 +483,11 @@ class TestReviewContextFromChain:
 
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
             assert f"Improve #{improve_id}" in context
-        for improve_id in improve_ids[:-REVIEW_IMPROVE_LINEAGE_LIMIT]:
-            assert f"Improve #{improve_id}" not in context
+
+        # Older improve IDs appear in the lineage chain but their summaries are omitted.
+        omitted_count = len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT
+        for idx in range(omitted_count):
+            assert f"Mixed improve summary {idx}" not in context
 
     def test_review_context_excludes_equal_timestamp_later_improve(self, tmp_path: Path):
         """Equal-timestamp improves created after the review are excluded."""
@@ -527,6 +531,100 @@ class TestReviewContextFromChain:
         assert "older improve" in context
         assert f"Improve #{later_improve.id}" not in context
         assert "later improve" not in context
+
+    def test_review_context_includes_tool_hints_when_prior_cycles_exist(self, tmp_path: Path):
+        """Review context includes gza show / cat hints when prior review/improve cycles exist."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with hints", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        store.update(review1)
+
+        improve1 = store.add(
+            prompt="Improve 1",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review1.id,
+        )
+        improve1.status = "completed"
+        improve1.output_content = "- Fixed the issue\n"
+        store.update(improve1)
+
+        current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
+        context = _build_context_from_chain(current_review, store, tmp_path, git=None)
+
+        assert "gza show <id>" in context
+        assert "cat <report_file>" in context
+        assert "1 prior review/improve cycle" in context
+
+    def test_review_context_includes_lineage_chain_with_review_and_improve_ids(self, tmp_path: Path):
+        """Review context includes explicit lineage chain listing review and improve IDs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement for chain", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        store.update(review1)
+
+        improve1 = store.add(
+            prompt="Improve 1",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review1.id,
+        )
+        improve1.status = "completed"
+        improve1.output_content = "- Round 1 fix\n"
+        store.update(improve1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        store.update(review2)
+
+        improve2 = store.add(
+            prompt="Improve 2",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+        )
+        improve2.status = "completed"
+        improve2.output_content = "- Round 2 fix\n"
+        store.update(improve2)
+
+        current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
+        context = _build_context_from_chain(current_review, store, tmp_path, git=None)
+
+        # Lineage chain shows review and improve IDs in order
+        assert f"Review #{review1.id}" in context
+        assert f"Improve #{improve1.id}" in context
+        assert f"Review #{review2.id}" in context
+        assert f"Improve #{improve2.id}" in context
+        assert "Lineage:" in context
+        assert "2 prior review/improve cycle" in context
+
+    def test_first_review_has_no_tool_hints(self, tmp_path: Path):
+        """First-time review (no prior cycles) does not include tool hints or lineage."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement fresh", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        first_review = store.add(prompt="Review first", task_type="review", depends_on=impl_task.id)
+        context = _build_context_from_chain(first_review, store, tmp_path, git=None)
+
+        assert "gza show <id>" not in context
+        assert "prior review/improve cycle" not in context
+        assert "Lineage:" not in context
 
 
 class TestSummaryDirectory:
