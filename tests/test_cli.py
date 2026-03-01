@@ -545,6 +545,106 @@ class TestShowCommand:
         assert "Failure Reason:" not in result.stdout
         assert "Failure Summary:" not in result.stdout
 
+    def test_show_plan_lineage_includes_downstream_implement(self, tmp_path: Path):
+        """Show for a plan task includes downstream implement task in lineage."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Design the feature", task_type="plan")
+        assert plan.id is not None
+        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+
+        result = run_gza("show", str(plan.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{plan.id}" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+
+    def test_show_implement_lineage_includes_plan_and_review_improve_chain(self, tmp_path: Path):
+        """Show for an implement task (based on a plan) includes plan, review, and improve."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Design the feature", task_type="plan")
+        assert plan.id is not None
+        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        review = store.add("Review the feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        improve = store.add("Fix review issues", task_type="improve", based_on=impl.id)
+        assert improve.id is not None
+
+        result = run_gza("show", str(impl.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{plan.id}" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+        assert f"#{review.id}" in result.stdout
+        assert f"#{improve.id}" in result.stdout
+
+    def test_show_multi_level_dependency_lineage(self, tmp_path: Path):
+        """Lineage traverses multi-level dependency chains (plan->impl->sub-impl)."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Top-level plan", task_type="plan")
+        assert plan.id is not None
+        impl1 = store.add("First implement", task_type="implement", based_on=plan.id)
+        assert impl1.id is not None
+        impl2 = store.add("Second implement based on first", task_type="implement", based_on=impl1.id)
+        assert impl2.id is not None
+
+        result = run_gza("show", str(plan.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{plan.id}" in result.stdout
+        assert f"#{impl1.id}" in result.stdout
+        assert f"#{impl2.id}" in result.stdout
+
+    def test_show_depended_on_by_field(self, tmp_path: Path):
+        """Show displays 'Depended on by' listing tasks that reference the displayed task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Design the feature", task_type="plan")
+        assert plan.id is not None
+        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        review = store.add("Review the feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+
+        # Show the plan: it should list impl as "Depended on by"
+        result_plan = run_gza("show", str(plan.id), "--project", str(tmp_path))
+        assert result_plan.returncode == 0
+        assert "Depended on by:" in result_plan.stdout
+        assert f"#{impl.id}[implement]" in result_plan.stdout
+
+        # Show the impl: it should list review as "Depended on by"
+        result_impl = run_gza("show", str(impl.id), "--project", str(tmp_path))
+        assert result_impl.returncode == 0
+        assert "Depended on by:" in result_impl.stdout
+        assert f"#{review.id}[review]" in result_impl.stdout
+
 
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""

@@ -793,23 +793,42 @@ def _get_improves_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> li
     ]
 
 
-def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
-    """Build deduplicated lineage tasks for a root implementation chain."""
-    reviews = _get_reviews_for_root_task(store, root_task)
-    improve_tasks = _get_improves_for_root_task(store, root_task)
-    lineage_tasks: list[DbTask] = [root_task]
-    lineage_tasks.extend(reviews)
-    lineage_tasks.extend(improve_tasks)
-    lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
+def _get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[DbTask]:
+    """Get implement tasks that depend on or are based on a given task."""
+    return [
+        t for t in store.get_all()
+        if t.task_type == "implement"
+        and (t.based_on == task_id or t.depends_on == task_id)
+    ]
 
+
+def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
+    """Build deduplicated lineage tasks for a root task, including dependency chains."""
     seen_ids: set[int] = set()
-    deduped: list[DbTask] = []
-    for lineage_task in lineage_tasks:
-        if lineage_task.id is None or lineage_task.id in seen_ids:
-            continue
-        seen_ids.add(lineage_task.id)
-        deduped.append(lineage_task)
-    return deduped
+    all_tasks: list[DbTask] = []
+
+    def _collect(task: DbTask) -> None:
+        if task.id is None or task.id in seen_ids:
+            return
+        seen_ids.add(task.id)
+        all_tasks.append(task)
+
+        for review in _get_reviews_for_root_task(store, task):
+            if review.id is not None and review.id not in seen_ids:
+                seen_ids.add(review.id)
+                all_tasks.append(review)
+
+        for improve in _get_improves_for_root_task(store, task):
+            if improve.id is not None and improve.id not in seen_ids:
+                seen_ids.add(improve.id)
+                all_tasks.append(improve)
+
+        if task.id is not None:
+            for downstream in _get_downstream_impls(store, task.id):
+                _collect(downstream)
+
+    _collect(root_task)
+    return sorted(all_tasks, key=_task_time_for_lineage)
 
 
 def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc") -> str:
@@ -826,29 +845,32 @@ def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc")
 
 
 def _resolve_lineage_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    """Resolve the root implementation task for lineage display."""
+    """Resolve the root task for lineage display, walking up through dependency links."""
+    # For review tasks, navigate to the implementation they review
     if task.task_type == "review" and task.depends_on:
         depends = store.get(task.depends_on)
         if depends is not None:
-            return depends
+            task = depends
 
+    # For improve tasks, navigate to the implementation they improve
     if task.task_type == "improve" and task.based_on:
         based = store.get(task.based_on)
         if based is not None:
-            return based
+            task = based
 
+    # Walk the based_on chain upward to find the topmost ancestor (e.g. a plan)
     current = task
     seen: set[int] = set()
+    if current.id is not None:
+        seen.add(current.id)
     while current.based_on:
         next_task = store.get(current.based_on)
         if next_task is None or next_task.id is None or next_task.id in seen:
             break
         seen.add(next_task.id)
-        if next_task.task_type == "implement":
-            return next_task
         current = next_task
 
-    return task
+    return current
 
 
 def cmd_history(args: argparse.Namespace) -> int:
@@ -5127,6 +5149,14 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task #{task.based_on}[/{c['value']}]")
     if task.depends_on:
         console.print(f"[{c['label']}]Depends on:[/{c['label']}] [{c['value']}]task #{task.depends_on}[/{c['value']}]")
+    if task.id is not None:
+        depended_on_by = [
+            t for t in store.get_all()
+            if t.depends_on == task.id or t.based_on == task.id
+        ]
+        if depended_on_by:
+            dep_parts = [f"#{t.id}[{t.task_type}]" for t in depended_on_by if t.id is not None]
+            console.print(f"[{c['label']}]Depended on by:[/{c['label']}] [{c['value']}]{', '.join(dep_parts)}[/{c['value']}]")
     if task.group:
         console.print(f"[{c['label']}]Group:[/{c['label']}] [{c['value']}]{task.group}[/{c['value']}]")
     if task.spec:
