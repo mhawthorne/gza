@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -247,6 +249,7 @@ class GeminiProvider(Provider):
                 data["_current_step_event"] = None
                 data["_turn_count"] = 0
                 data["_legacy_event_count_by_turn"] = {}
+                data["start_time"] = time.time()
 
         def _step_count(data: dict) -> int:
             return len(data.get("run_step_events", []))
@@ -304,6 +307,20 @@ class GeminiProvider(Provider):
                                 current_step["summary"] = None
                             else:
                                 _start_step(data, content)
+                                # Print step header and log timestamp for each new step
+                                step_num = data["_turn_count"]
+                                elapsed_seconds = int(time.time() - data.get("start_time", time.time()))
+                                formatter.print_step_header(
+                                    step_num,
+                                    0,
+                                    0.0,
+                                    elapsed_seconds,
+                                    blank_line_before=step_num > 1,
+                                )
+                                if log_handle:
+                                    timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                                    log_handle.write(f"--- Step {step_num} at {timestamp_str} ---\n")
+                                    log_handle.flush()
                             # Display text to console (configurable length, 0 = unlimited)
                             if chat_text_display_length == 0:
                                 # Show full text

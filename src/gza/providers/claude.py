@@ -371,14 +371,14 @@ class ClaudeProvider(Provider):
                             model,
                         )
 
-                        # Log timestamp to log file at start of each turn
+                        # Log timestamp to log file at start of each step
                         if log_handle:
                             timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                            log_handle.write(f"--- Turn {turn_count} at {timestamp_str} ---\n")
+                            log_handle.write(f"--- Step {turn_count} at {timestamp_str} ---\n")
                             log_handle.flush()
 
-                        # Add blank line before turn (except first turn)
-                        formatter.print_turn_header(
+                        # Add blank line before step (except first step)
+                        formatter.print_step_header(
                             turn_count,
                             total_tokens,
                             cost,

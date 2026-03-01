@@ -202,18 +202,35 @@ class TestSharedStreamOutputFormatter:
         assert format_token_count(12_000) == "12k tokens"
         assert truncate_text("abcdefghijklmnopqrstuvwxyz", 8) == "abcde..."
 
-    def test_turn_header_is_colorized(self):
-        """Turn headers should include ANSI color sequences."""
+    def test_step_header_is_colorized(self):
+        """Step headers should include ANSI color sequences."""
         output = io.StringIO()
         console = Console(file=output, force_terminal=True, color_system="truecolor")
         formatter = StreamOutputFormatter(console=console)
 
-        formatter.print_turn_header(2, 1500, 0.1234, 65)
+        formatter.print_step_header(2, 1500, 0.1234, 65)
 
         rendered = output.getvalue()
         plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
-        assert "| Turn 2 | 1k tokens | $0.12 | 1m 5s |" in plain
+        assert "| Step 2 | 1k tokens | $0.12 | 1m 5s |" in plain
         assert "\x1b[" in rendered
+
+    def test_turn_header_is_alias_for_step_header(self):
+        """print_turn_header should produce the same output as print_step_header."""
+        output1 = io.StringIO()
+        output2 = io.StringIO()
+        console1 = Console(file=output1, force_terminal=True, color_system="truecolor")
+        console2 = Console(file=output2, force_terminal=True, color_system="truecolor")
+        formatter1 = StreamOutputFormatter(console=console1)
+        formatter2 = StreamOutputFormatter(console=console2)
+
+        formatter1.print_step_header(3, 1500, 0.05, 10)
+        formatter2.print_turn_header(3, 1500, 0.05, 10)
+
+        plain1 = re.sub(r"\x1b\[[0-9;]*m", "", output1.getvalue())
+        plain2 = re.sub(r"\x1b\[[0-9;]*m", "", output2.getvalue())
+        assert "| Step 3 |" in plain1
+        assert plain1 == plain2
 
     def test_key_event_lines_are_colorized(self):
         """Tool, assistant, and error lines should all be colorized."""
@@ -1752,11 +1769,11 @@ class TestClaudeToolLogging:
         assert "→ SomeTool\n" in captured.out
 
 
-class TestTurnTimestampLogging:
+class TestStepTimestampLogging:
     """Tests for timestamp logging at the start of each turn in the log file."""
 
-    def test_logs_timestamp_to_log_file_on_new_turn(self, tmp_path):
-        """Should write a turn timestamp line to the log file when a new turn starts."""
+    def test_logs_timestamp_to_log_file_on_new_step(self, tmp_path):
+        """Should write a step timestamp line to the log file when a new step starts."""
         import json
         from gza.providers.claude import ClaudeProvider
 
@@ -1790,10 +1807,10 @@ class TestTurnTimestampLogging:
             )
 
         log_content = log_file.read_text()
-        assert "--- Turn 1 at " in log_content
+        assert "--- Step 1 at " in log_content
 
-    def test_logs_timestamp_for_each_turn(self, tmp_path):
-        """Should write a timestamp line for each new turn."""
+    def test_logs_timestamp_for_each_step(self, tmp_path):
+        """Should write a timestamp line for each new step."""
         import json
         from gza.providers.claude import ClaudeProvider
 
@@ -1831,8 +1848,8 @@ class TestTurnTimestampLogging:
             )
 
         log_content = log_file.read_text()
-        assert "--- Turn 1 at " in log_content
-        assert "--- Turn 2 at " in log_content
+        assert "--- Step 1 at " in log_content
+        assert "--- Step 2 at " in log_content
 
     def test_timestamp_format_matches_expected_pattern(self, tmp_path):
         """Timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
@@ -1870,8 +1887,8 @@ class TestTurnTimestampLogging:
             )
 
         log_content = log_file.read_text()
-        # Pattern: "--- Turn 1 at 2026-02-23 12:34:56 PST ---"
-        pattern = r"--- Turn 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        # Pattern: "--- Step 1 at 2026-02-23 12:34:56 PST ---"
+        pattern = r"--- Step 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
         assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
 
     def test_no_duplicate_timestamps_for_same_message_id(self, tmp_path):
@@ -1914,9 +1931,305 @@ class TestTurnTimestampLogging:
             )
 
         log_content = log_file.read_text()
-        # Only one Turn 1 timestamp, no Turn 2
-        assert log_content.count("--- Turn ") == 1
-        assert "--- Turn 2 at " not in log_content
+        # Only one Step 1 timestamp, no Step 2
+        assert log_content.count("--- Step ") == 1
+        assert "--- Step 2 at " not in log_content
+
+
+class TestCodexStepTimestampLogging:
+    """Tests for step header and timestamp logging in the Codex provider."""
+
+    def test_logs_timestamp_to_log_file_on_turn_start(self, tmp_path):
+        """Should write a step timestamp line to the log file at turn.started."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "done"},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        assert "--- Step 1 at " in log_content
+
+    def test_logs_timestamp_for_each_turn(self, tmp_path):
+        """Should write a timestamp line for each turn.started event."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "first"},
+            }) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "second"},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        assert "--- Step 1 at " in log_content
+        assert "--- Step 2 at " in log_content
+
+    def test_step_timestamp_format_matches_expected_pattern(self, tmp_path):
+        """Codex step timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
+        import json
+        import re
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        pattern = r"--- Step 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
+
+    def test_uses_step_header_not_turn_header(self, tmp_path, capsys):
+        """Codex live output should say Step N not Turn N."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "Step 1" in captured.out
+        assert "Turn" not in captured.out
+
+
+class TestGeminiStepHeaderAndTimestampLogging:
+    """Tests for step header and timestamp logging in the Gemini provider."""
+
+    def test_prints_step_header_on_new_assistant_message(self, tmp_path, capsys):
+        """Should print a step header when a new assistant message step begins."""
+        import json
+        from gza.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": "Hello world"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "--yolo"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        captured = capsys.readouterr()
+        assert "Step 1" in captured.out
+
+    def test_logs_timestamp_to_log_file_on_new_step(self, tmp_path):
+        """Should write a step timestamp line to the log file when a new assistant step starts."""
+        import json
+        from gza.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": "Hello world"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "--yolo"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        log_content = log_file.read_text()
+        assert "--- Step 1 at " in log_content
+
+    def test_logs_timestamp_for_each_step(self, tmp_path):
+        """Should write a timestamp line for each new assistant step."""
+        import json
+        from gza.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "user", "content": "go"}) + "\n",
+            json.dumps({"type": "message", "role": "assistant", "content": "step one"}) + "\n",
+            json.dumps({"type": "message", "role": "user", "content": "more"}) + "\n",
+            json.dumps({"type": "message", "role": "assistant", "content": "step two"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 200, "output_tokens": 100}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "--yolo"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        log_content = log_file.read_text()
+        assert "--- Step 1 at " in log_content
+        assert "--- Step 2 at " in log_content
+
+    def test_step_timestamp_format_matches_expected_pattern(self, tmp_path):
+        """Gemini step timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
+        import json
+        import re
+        from gza.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": "hi"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 10, "output_tokens": 5}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "--yolo"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        log_content = log_file.read_text()
+        pattern = r"--- Step 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
+
+    def test_no_step_header_for_existing_step_text_update(self, tmp_path, capsys):
+        """Should not print extra step header when existing step's text is updated."""
+        import json
+        from gza.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        # Tool use creates a step, then assistant message updates it (no new step header)
+        json_lines = [
+            json.dumps({"type": "tool_use", "tool_name": "Bash", "tool_input": {"command": "ls"}, "id": "c1"}) + "\n",
+            json.dumps({"type": "message", "role": "assistant", "content": "done"}) + "\n",
+            json.dumps({"type": "result", "stats": {"input_tokens": 10, "output_tokens": 5}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "--yolo"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        log_content = log_file.read_text()
+        # Only one step was truly new (from tool_use); assistant message updated it
+        assert log_content.count("--- Step ") == 0
 
 
 class TestFormatToolParam:
@@ -2636,8 +2949,8 @@ class TestCodexOutputParsing:
         assert result.num_turns_computed == 2
         assert result.num_steps_computed == 2
 
-    def test_logs_item_prefix_with_turn_and_item_index(self, tmp_path, capsys):
-        """Should include turn/item index prefix for item.completed output."""
+    def test_logs_item_prefix_with_step_and_item_index(self, tmp_path, capsys):
+        """Should include step/item index prefix for item.completed output."""
         import json
         from gza.providers.codex import CodexProvider
 
@@ -2666,7 +2979,7 @@ class TestCodexOutputParsing:
             )
 
         captured = capsys.readouterr()
-        assert "[T1.1]" in captured.out
+        assert "[S1.1]" in captured.out
         assert "→ Bash ls -la" in captured.out
 
     def test_does_not_print_startup_non_json_line_twice(self, tmp_path, capsys):
@@ -2844,7 +3157,7 @@ class TestCodexOutputParsing:
                     timeout_minutes=30,
                 )
 
-        mock_formatter.print_turn_header.assert_called_once()
+        mock_formatter.print_step_header.assert_called_once()
         mock_formatter.print_tool_event.assert_called()
         mock_formatter.print_agent_message.assert_called()
         mock_formatter.print_error.assert_called()

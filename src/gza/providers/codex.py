@@ -407,7 +407,15 @@ class CodexProvider(Provider):
                         data.get("output_tokens", 0),
                         model,
                     )
-                    formatter.print_turn_header(
+
+                    # Log timestamp to log file at start of each step
+                    if log_handle:
+                        from datetime import datetime
+                        timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                        log_handle.write(f"--- Step {data['turn_count']} at {timestamp_str} ---\n")
+                        log_handle.flush()
+
+                    formatter.print_step_header(
                         data["turn_count"],
                         total_tokens,
                         cost,
@@ -422,7 +430,7 @@ class CodexProvider(Provider):
                     data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
                     turn_count = data.get("turn_count", 0)
                     item_idx = data.get("item_count_in_turn", 0)
-                    item_prefix = f"[T{turn_count}.{item_idx}] " if turn_count > 0 else ""
+                    item_prefix = f"[S{turn_count}.{item_idx}] " if turn_count > 0 else ""
 
                     if item_type == "command_execution":
                         command = item.get("command", "")
