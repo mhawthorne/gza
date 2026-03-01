@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Backfill the model column on tasks by parsing log file init lines."""
+"""Backfill the model and provider columns on tasks by parsing log file init lines."""
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -12,8 +13,19 @@ def get_db_path() -> Path:
     return Path(".gza") / "gza.db"
 
 
-def extract_model_from_log(log_path: Path) -> str | None:
-    """Extract model from the init JSON line in a log file."""
+def infer_provider_from_model(model: str) -> str | None:
+    """Infer provider name from model identifier patterns."""
+    if re.match(r"claude-", model, re.IGNORECASE):
+        return "claude"
+    if re.match(r"gpt-|o1|o3", model, re.IGNORECASE):
+        return "codex"
+    if re.match(r"gemini-", model, re.IGNORECASE):
+        return "gemini"
+    return None
+
+
+def extract_model_and_provider_from_log(log_path: Path) -> tuple[str | None, str | None]:
+    """Extract model and provider from the init JSON line in a log file."""
     try:
         with open(log_path) as f:
             for line in f:
@@ -23,12 +35,16 @@ def extract_model_from_log(log_path: Path) -> str | None:
                 try:
                     d = json.loads(line)
                     if d.get("type") == "system" and d.get("subtype") == "init":
-                        return d.get("model")
+                        model = d.get("model")
+                        provider = d.get("provider")
+                        if model and not provider:
+                            provider = infer_provider_from_model(model)
+                        return model, provider
                 except json.JSONDecodeError:
                     continue
     except (OSError, UnicodeDecodeError):
         pass
-    return None
+    return None, None
 
 
 def main() -> int:
@@ -47,7 +63,7 @@ def main() -> int:
     conn.row_factory = sqlite3.Row
 
     rows = conn.execute(
-        "SELECT id, log_file FROM tasks WHERE log_file IS NOT NULL AND model IS NULL"
+        "SELECT id, log_file FROM tasks WHERE log_file IS NOT NULL AND (model IS NULL OR provider IS NULL)"
     ).fetchall()
 
     updated = 0
@@ -57,16 +73,17 @@ def main() -> int:
         log_file = row["log_file"]
         log_path = Path(log_file)
 
-        model = extract_model_from_log(log_path)
-        if model is None:
+        model, provider = extract_model_and_provider_from_log(log_path)
+        if model is None and provider is None:
             missing += 1
             continue
 
         if args.dry_run:
-            print(f"  Task {row['id']}: {model}")
+            print(f"  Task {row['id']}: model={model} provider={provider}")
         else:
             conn.execute(
-                "UPDATE tasks SET model = ? WHERE id = ?", (model, row["id"])
+                "UPDATE tasks SET model = COALESCE(model, ?), provider = COALESCE(provider, ?) WHERE id = ?",
+                (model, provider, row["id"]),
             )
         updated += 1
 

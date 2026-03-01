@@ -1542,6 +1542,9 @@ class TestResumeVerificationPrompt:
         config.branch_strategy = Mock()
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
 
         # Mock provider to capture the prompt
         captured_prompts = []
@@ -2065,6 +2068,9 @@ class TestNoChangesWithExistingCommits:
         config.branch_strategy = Mock()
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
         return config
 
     def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
