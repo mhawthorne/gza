@@ -11,6 +11,9 @@ gza.local.yaml
 # Gza runtime data
 .gza/
 
+# Claude Code local skills (removed from git, kept locally)
+.claude/skills/
+
 # AI-generated artifacts (should not be created, but ignore as safety net)
 IMPLEMENTATION_SUMMARY.md
 CHANGES.md
