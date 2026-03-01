@@ -22,7 +22,7 @@ from .console import (
     MAX_PR_TITLE_LENGTH,
     MAX_PR_BODY_LENGTH,
 )
-from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask
+from .db import SqliteTaskStore, add_task_interactive, edit_task_interactive, validate_prompt, Task as DbTask, TaskCycle, TaskCycleIteration
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .importer import parse_import_file, validate_import, import_tasks
@@ -36,6 +36,19 @@ from .workers import WorkerMetadata, WorkerRegistry
 def get_store(config: Config) -> SqliteTaskStore:
     """Get the SQLite task store."""
     return SqliteTaskStore(config.db_path)
+
+
+class DuplicateReviewError(ValueError):
+    """Raised when a review already exists for an implementation task.
+
+    Carries the active review task so callers do not need to re-query the DB.
+    """
+
+    def __init__(self, active_review: DbTask) -> None:
+        super().__init__(
+            f"A review task already exists: #{active_review.id} (status: {active_review.status})"
+        )
+        self.active_review = active_review
 
 
 
@@ -665,8 +678,86 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
     return None
 
 
+def _create_review_task(store: SqliteTaskStore, impl_task: DbTask) -> DbTask:
+    """Create a review task for an implementation task.
+
+    Validates that:
+    - impl_task is an 'implement' task
+    - impl_task is completed
+    - No active review already exists
+
+    Returns the created review task, or raises ValueError with an error message.
+    """
+    if impl_task.task_type != "implement":
+        raise ValueError(
+            f"Task #{impl_task.id} is a {impl_task.task_type} task. "
+            "Expected an implementation task."
+        )
+    if impl_task.status != "completed":
+        raise ValueError(
+            f"Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks."
+        )
+
+    assert impl_task.id is not None
+    existing_reviews = store.get_reviews_for_task(impl_task.id)
+    active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
+    if active_reviews:
+        raise DuplicateReviewError(active_reviews[0])
+
+    review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
+    return store.add(
+        prompt=review_prompt,
+        task_type="review",
+        depends_on=impl_task.id,
+        group=impl_task.group,
+        based_on=impl_task.based_on,
+    )
+
+
+def _create_improve_task(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    review_task: DbTask,
+    create_review: bool = False,
+) -> DbTask:
+    """Create an improve task for an implementation task based on a review.
+
+    Validates that no duplicate improve task already exists.
+    Returns the created improve task, or raises ValueError with an error message.
+    """
+    assert impl_task.id is not None
+    assert review_task.id is not None
+
+    existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
+    if existing:
+        existing_task = existing[0]
+        raise ValueError(
+            f"An improve task already exists for implementation #{impl_task.id} "
+            f"and review #{review_task.id}: #{existing_task.id} (status: {existing_task.status})"
+        )
+
+    prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
+    return store.add(
+        prompt=prompt,
+        task_type="improve",
+        depends_on=review_task.id,
+        based_on=impl_task.id,
+        same_branch=True,
+        group=impl_task.group,
+        create_review=create_review,
+    )
+
+
 def _get_task_slug(task: DbTask) -> str | None:
-    """Extract slug part from task_id (YYYYMMDD-slug -> slug)."""
+    """Return the full slug including any trailing revision suffix (e.g. 'my-feature-2').
+
+    Strips only the leading date prefix (YYYYMMDD-). Revision suffixes such as
+    '-2', '-3' are preserved so callers that need an exact match against the
+    original task_id slug string get the right value.
+
+    Use ``_extract_task_slug`` instead when you want the *base* slug with the
+    revision suffix removed (e.g. for display or for matching across revisions).
+    """
     if not task.task_id:
         return None
     match = re.match(r"^\d{8}-(.+)$", task.task_id)
@@ -702,23 +793,42 @@ def _get_improves_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> li
     ]
 
 
-def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
-    """Build deduplicated lineage tasks for a root implementation chain."""
-    reviews = _get_reviews_for_root_task(store, root_task)
-    improve_tasks = _get_improves_for_root_task(store, root_task)
-    lineage_tasks: list[DbTask] = [root_task]
-    lineage_tasks.extend(reviews)
-    lineage_tasks.extend(improve_tasks)
-    lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
+def _get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[DbTask]:
+    """Get implement tasks that depend on or are based on a given task."""
+    return [
+        t for t in store.get_all()
+        if t.task_type == "implement"
+        and (t.based_on == task_id or t.depends_on == task_id)
+    ]
 
+
+def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
+    """Build deduplicated lineage tasks for a root task, including dependency chains."""
     seen_ids: set[int] = set()
-    deduped: list[DbTask] = []
-    for lineage_task in lineage_tasks:
-        if lineage_task.id is None or lineage_task.id in seen_ids:
-            continue
-        seen_ids.add(lineage_task.id)
-        deduped.append(lineage_task)
-    return deduped
+    all_tasks: list[DbTask] = []
+
+    def _collect(task: DbTask) -> None:
+        if task.id is None or task.id in seen_ids:
+            return
+        seen_ids.add(task.id)
+        all_tasks.append(task)
+
+        for review in _get_reviews_for_root_task(store, task):
+            if review.id is not None and review.id not in seen_ids:
+                seen_ids.add(review.id)
+                all_tasks.append(review)
+
+        for improve in _get_improves_for_root_task(store, task):
+            if improve.id is not None and improve.id not in seen_ids:
+                seen_ids.add(improve.id)
+                all_tasks.append(improve)
+
+        if task.id is not None:
+            for downstream in _get_downstream_impls(store, task.id):
+                _collect(downstream)
+
+    _collect(root_task)
+    return sorted(all_tasks, key=_task_time_for_lineage)
 
 
 def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc") -> str:
@@ -735,29 +845,32 @@ def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc")
 
 
 def _resolve_lineage_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    """Resolve the root implementation task for lineage display."""
+    """Resolve the root task for lineage display, walking up through dependency links."""
+    # For review tasks, navigate to the implementation they review
     if task.task_type == "review" and task.depends_on:
         depends = store.get(task.depends_on)
         if depends is not None:
-            return depends
+            task = depends
 
+    # For improve tasks, navigate to the implementation they improve
     if task.task_type == "improve" and task.based_on:
         based = store.get(task.based_on)
         if based is not None:
-            return based
+            task = based
 
+    # Walk the based_on chain upward to find the topmost ancestor (e.g. a plan)
     current = task
     seen: set[int] = set()
+    if current.id is not None:
+        seen.add(current.id)
     while current.based_on:
         next_task = store.get(current.based_on)
         if next_task is None or next_task.id is None or next_task.id in seen:
             break
         seen.add(next_task.id)
-        if next_task.task_type == "implement":
-            return next_task
         current = next_task
 
-    return task
+    return current
 
 
 def cmd_history(args: argparse.Namespace) -> int:
@@ -1834,14 +1947,135 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
 
+def _format_percentile_row(label: str, pdata: dict | None) -> str:
+    """Format a percentile stats row for display."""
+    if pdata is None:
+        return f"  {label:<28} (no data)"
+    return (
+        f"  {label:<28} min={pdata['min']:.1f}  avg={pdata['avg']:.1f}  "
+        f"median={pdata['median']:.1f}  p90={pdata['p90']:.1f}  max={pdata['max']:.1f}  "
+        f"(n={pdata['count']})"
+    )
+
+
+def _cmd_stats_cycles(config: Config, store: "SqliteTaskStore", as_json: bool) -> int:
+    """Show project-wide cycle analytics."""
+    agg = store.get_cycle_aggregate_stats()
+
+    if as_json:
+        print(json.dumps(agg, indent=2))
+        return 0
+
+    total = agg["total_cycles"]
+    approved = agg["approved_cycles"]
+    print("Cycle Analytics")
+    print("=" * 60)
+    print(f"  Total cycles:    {total}")
+    print(f"  Approved:        {approved}")
+    if total > 0:
+        other = total - approved
+        print(f"  Other (blocked/maxed): {other}")
+    print()
+    if total == 0:
+        print("  No cycles found. Run 'gza cycle <impl-id>' to start one.")
+        return 0
+
+    print("  Improves before approval (approved cycles only):")
+    print(_format_percentile_row("  improves_before_approval", agg["improves_before_approval"]))
+    print()
+    print("  Per-cycle review/improve counts (all closed cycles):")
+    print(_format_percentile_row("  reviews_per_cycle", agg["reviews_per_cycle"]))
+    print(_format_percentile_row("  improves_per_cycle", agg["improves_per_cycle"]))
+    print()
+    print("  Cycle duration (seconds, all closed cycles):")
+    print(_format_percentile_row("  cycle_duration_seconds", agg["cycle_duration_seconds"]))
+    return 0
+
+
+def _cmd_stats_cycles_task(config: Config, store: "SqliteTaskStore", impl_task_id: int, as_json: bool) -> int:
+    """Show per-implementation cycle analytics."""
+    impl_task = store.get(impl_task_id)
+    if not impl_task:
+        print(f"Error: Task #{impl_task_id} not found")
+        return 1
+
+    cycles = store.get_cycles_for_impl(impl_task_id)
+
+    if as_json:
+        result: dict = {
+            "impl_task_id": impl_task_id,
+            "cycle_count": len(cycles),
+            "cycles": [],
+        }
+        for cycle in cycles:
+            iters = store.get_cycle_iterations(cycle.id)
+            result["cycles"].append({
+                "id": cycle.id,
+                "status": cycle.status,
+                "stop_reason": cycle.stop_reason,
+                "max_iterations": cycle.max_iterations,
+                "started_at": cycle.started_at.isoformat(),
+                "ended_at": cycle.ended_at.isoformat() if cycle.ended_at else None,
+                "iterations": [
+                    {
+                        "iteration_index": it.iteration_index,
+                        "review_task_id": it.review_task_id,
+                        "review_verdict": it.review_verdict,
+                        "improve_task_id": it.improve_task_id,
+                        "state": it.state,
+                    }
+                    for it in iters
+                ],
+            })
+        print(json.dumps(result, indent=2))
+        return 0
+
+    print(f"Cycle History for Implementation #{impl_task_id}")
+    print(f"  Prompt: {impl_task.prompt[:80]}{'...' if len(impl_task.prompt) > 80 else ''}")
+    print("=" * 60)
+    if not cycles:
+        print("  No cycles found.")
+        return 0
+
+    for cycle in cycles:
+        iters = store.get_cycle_iterations(cycle.id)
+        duration_str = ""
+        if cycle.ended_at and cycle.started_at:
+            duration_s = (cycle.ended_at - cycle.started_at).total_seconds()
+            duration_str = f"  ({format_duration(duration_s, verbose=True)})"
+        print(f"\nCycle #{cycle.id}  status={cycle.status}  stop={cycle.stop_reason or '-'}{duration_str}")
+        print(f"  {'Iter':<6} {'Review':>8} {'Verdict':<22} {'Improve':>8} State")
+        for it in iters:
+            iter_str = str(it.iteration_index + 1)
+            rev_str = f"#{it.review_task_id}" if it.review_task_id else "-"
+            verdict_str = it.review_verdict or "-"
+            imp_str = f"#{it.improve_task_id}" if it.improve_task_id else "-"
+            print(f"  {iter_str:<6} {rev_str:>8} {verdict_str:<22} {imp_str:>8} {it.state}")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     """Show cost and usage statistics."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
+    show_cycles: bool = getattr(args, 'cycles', False)
+    as_json: bool = getattr(args, 'json', False)
+    cycle_task_id: int | None = getattr(args, 'cycle_task_id', None)
+
+    # --cycles mode: show cycle analytics
+    if show_cycles:
+        if cycle_task_id is not None:
+            return _cmd_stats_cycles_task(config, store, cycle_task_id, as_json)
+        return _cmd_stats_cycles(config, store, as_json)
+
     stats = store.get_stats()
     if stats["completed"] == 0 and stats["failed"] == 0:
         print("No completed or failed tasks")
+        return 0
+
+    if as_json:
+        print(json.dumps(stats, indent=2))
         return 0
 
     tasks_with_cost = stats["completed"] + stats["failed"]
@@ -3370,13 +3604,20 @@ def _display_conversation_turns(entries: list[dict]) -> None:
 
 
 def _extract_task_slug(task: DbTask) -> str | None:
-    """Extract slug from task_id (YYYYMMDD-slug or YYYYMMDD-slug-N)."""
-    if not task.task_id:
+    """Return the *base* slug with any trailing revision suffix stripped.
+
+    Calls ``_get_task_slug`` to strip the leading date prefix, then removes a
+    trailing numeric revision suffix (e.g. 'my-feature-2' -> 'my-feature').
+    Use this when you want a canonical slug that matches across revisions of the
+    same task.
+
+    Use ``_get_task_slug`` instead when the exact, revision-preserving slug is
+    required (e.g. when matching against the literal task_id string).
+    """
+    full_slug = _get_task_slug(task)
+    if full_slug is None:
         return None
-    parts = task.task_id.split("-", 1)
-    if len(parts) != 2:
-        return None
-    return re.sub(r"-\d+$", "", parts[1])
+    return re.sub(r"-\d+$", "", full_slug)
 
 
 def cmd_implement(args: argparse.Namespace) -> int:
@@ -4261,26 +4502,17 @@ def cmd_improve(args: argparse.Namespace) -> int:
     if review_task.status != "completed":
         print(f"Warning: Review #{review_task.id} is {review_task.status}. The improve task will be blocked until it completes.")
 
-    # Check for duplicate improve task
-    assert review_task.id is not None
-    existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
-    if existing:
-        existing_task = existing[0]
-        print(f"Error: An improve task already exists for implementation #{impl_task.id} and review #{review_task.id}")
-        print(f"  Existing task: #{existing_task.id} (status: {existing_task.status})")
+    # Create improve task (using shared helper)
+    try:
+        improve_task = _create_improve_task(
+            store,
+            impl_task,
+            review_task,
+            create_review=args.review if hasattr(args, 'review') and args.review else False,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
         return 1
-
-    # Create improve task
-    prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
-    improve_task = store.add(
-        prompt=prompt,
-        task_type="improve",
-        depends_on=review_task.id,  # Block until review complete, provides context
-        based_on=impl_task.id,  # Provides branch reference
-        same_branch=True,  # Continue on implementation's branch
-        group=impl_task.group,  # Inherit group from implementation
-        create_review=args.review if hasattr(args, 'review') and args.review else False,
-    )
 
     print(f"✓ Created improve task #{improve_task.id}")
     print(f"  Based on: implementation #{impl_task.id}")
@@ -4343,27 +4575,18 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks.")
         return 1
 
-    # Check for existing non-completed review tasks to prevent duplicates
-    assert impl_task.id is not None
-    existing_reviews = store.get_reviews_for_task(impl_task.id)
-    active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
-    if active_reviews:
-        review = active_reviews[0]
+    # Create review task (using shared helper)
+    try:
+        review_task = _create_review_task(store, impl_task)
+    except DuplicateReviewError as e:
+        review = e.active_review
         print(f"Warning: A review task already exists for implementation #{impl_task.id}")
         print(f"  Existing review: #{review.id} (status: {review.status})")
         print(f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
         return 1
-
-    # Create review task
-    review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
-
-    review_task = store.add(
-        prompt=review_prompt,
-        task_type="review",
-        depends_on=impl_task.id,
-        group=impl_task.group,
-        based_on=impl_task.based_on,  # Inherit based_on to find plan
-    )
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
 
     print(f"✓ Created review task #{review_task.id}")
     print(f"  Implementation: #{impl_task.id}")
@@ -4386,6 +4609,225 @@ def cmd_review(args: argparse.Namespace) -> int:
     print(f"\nRunning review task #{review_task.id}...")
     open_after = hasattr(args, 'open') and args.open
     return run(config, task_id=review_task.id, open_after=open_after)
+
+
+def cmd_cycle(args: argparse.Namespace) -> int:
+    """Run an automated review/improve cycle for an implementation task.
+
+    Loops: create+run review -> parse verdict -> if CHANGES_REQUESTED create+run improve -> repeat.
+    Stops on APPROVED, max iterations reached, NEEDS_DISCUSSION, or failure.
+    """
+    from datetime import datetime, timezone
+
+    config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
+    store = get_store(config)
+    max_iterations: int = getattr(args, 'max_iterations', 3) or 3
+    dry_run: bool = getattr(args, 'dry_run', False)
+    continue_existing: bool = getattr(args, 'continue_cycle', False)
+
+    impl_task = store.get(args.impl_task_id)
+    if not impl_task:
+        print(f"Error: Task #{args.impl_task_id} not found")
+        return 1
+    if impl_task.task_type != "implement":
+        print(f"Error: Task #{impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
+        return 1
+    if impl_task.status != "completed":
+        print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only cycle completed tasks.")
+        return 1
+
+    assert impl_task.id is not None
+
+    # Handle --continue: resume an existing active cycle
+    cycle: TaskCycle
+    if continue_existing:
+        existing = store.get_active_cycle_for_impl(impl_task.id)
+        if not existing:
+            print(f"Error: No active cycle found for implementation #{impl_task.id}")
+            return 1
+        cycle = existing
+        # Honor the original cycle's max_iterations, not the CLI arg
+        max_iterations = cycle.max_iterations
+
+        if dry_run:
+            print(f"[dry-run] Would resume cycle #{cycle.id} for implementation #{impl_task.id}")
+            return 0
+
+        # Determine next iteration index by inspecting existing iteration records
+        existing_iterations = store.get_cycle_iterations(cycle.id)
+        if existing_iterations:
+            max_index = max(it.iteration_index for it in existing_iterations)
+            # Resumption always starts a brand-new iteration at max_index + 1.
+            # If the last recorded iteration was only partially executed (e.g.
+            # the process was killed mid-run), we do NOT re-run it; we advance
+            # to the next index instead.  This keeps iteration records monotone
+            # and avoids re-submitting work that may have already been queued.
+            iteration = max_index + 1
+        else:
+            iteration = 0
+
+        print(f"Resuming cycle #{cycle.id} for implementation #{impl_task.id} from iteration {iteration + 1}...")
+    else:
+        if dry_run:
+            print(f"[dry-run] Would start cycle for implementation #{impl_task.id} (max {max_iterations} iterations)")
+            return 0
+
+        # Start a new cycle (raises ValueError if one already exists)
+        try:
+            cycle = store.start_cycle(impl_task.id, max_iterations=max_iterations)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+        print(f"Starting cycle #{cycle.id} for implementation #{impl_task.id} (max {max_iterations} iterations)...")
+        iteration = 0
+
+    # Summary rows collected as we run: (iteration, review_id, verdict, improve_id)
+    summary_rows: list[tuple[int, int | None, str | None, int | None]] = []
+
+    final_status = "blocked"
+    # "unknown" is a safe fallback init value; in practice every code path
+    # inside the loop sets final_stop_reason before breaking, and the loop
+    # guard (iteration < max_iterations) ensures at least one iteration runs
+    # when max_iterations > 0 (enforced by `or 3` above).
+    final_stop_reason = "unknown"
+
+    while iteration < max_iterations:
+        print(f"\n[Cycle #{cycle.id}] Iteration {iteration + 1}/{max_iterations}")
+
+        # Create iteration record
+        iter_record = store.append_cycle_iteration(cycle.id, iteration)
+
+        # --- REVIEW PHASE ---
+        try:
+            review_task = _create_review_task(store, impl_task)
+        except ValueError as e:
+            print(f"  Error creating review: {e}")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "blocked"
+            final_stop_reason = "review_failed"
+            summary_rows.append((iteration, None, None, None))
+            break
+
+        # Tag review task with cycle metadata
+        review_task.cycle_id = cycle.id
+        review_task.cycle_iteration_index = iteration
+        review_task.cycle_role = "review"
+        store.update(review_task)
+
+        assert review_task.id is not None
+        store.update_cycle_iteration(iter_record.id, review_task_id=review_task.id)
+
+        print(f"  Running review #{review_task.id}...")
+        rc = run(config, task_id=review_task.id)
+        if rc != 0:
+            print(f"  Review #{review_task.id} failed (exit code {rc})")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "blocked"
+            final_stop_reason = "review_failed"
+            summary_rows.append((iteration, review_task.id, None, None))
+            break
+
+        # Re-fetch review task to get updated output_content
+        review_task = store.get(review_task.id) or review_task
+        store.update_cycle_iteration(iter_record.id, state="review_completed")
+
+        # Parse verdict
+        verdict = get_review_verdict(config, review_task)
+        if verdict:
+            store.update_cycle_iteration(iter_record.id, review_verdict=verdict)
+
+        print(f"  Review #{review_task.id}: verdict={verdict or '(none)'}")
+
+        if verdict == "APPROVED":
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "approved"
+            final_stop_reason = "approved"
+            summary_rows.append((iteration, review_task.id, verdict, None))
+            break
+
+        if verdict == "NEEDS_DISCUSSION" or verdict is None:
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "blocked"
+            final_stop_reason = "needs_discussion" if verdict == "NEEDS_DISCUSSION" else "no_verdict"
+            summary_rows.append((iteration, review_task.id, verdict, None))
+            break
+
+        # verdict == "CHANGES_REQUESTED"
+        if iteration >= max_iterations - 1:
+            # This was the last iteration
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "maxed_out"
+            final_stop_reason = "max_iterations"
+            summary_rows.append((iteration, review_task.id, verdict, None))
+            break
+
+        # --- IMPROVE PHASE ---
+        try:
+            # create_review is intentionally omitted (defaults to False) here:
+            # the cycle loop manages the review/improve cadence itself, so the
+            # improve task must NOT auto-create a follow-up review on completion.
+            improve_task = _create_improve_task(store, impl_task, review_task)
+        except ValueError as e:
+            print(f"  Error creating improve: {e}")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "blocked"
+            final_stop_reason = "improve_failed"
+            summary_rows.append((iteration, review_task.id, verdict, None))
+            break
+
+        # Tag improve task with cycle metadata
+        improve_task.cycle_id = cycle.id
+        improve_task.cycle_iteration_index = iteration
+        improve_task.cycle_role = "improve"
+        store.update(improve_task)
+
+        assert improve_task.id is not None
+        store.update_cycle_iteration(iter_record.id, improve_task_id=improve_task.id, state="improve_created")
+
+        print(f"  Running improve #{improve_task.id}...")
+        rc = run(config, task_id=improve_task.id)
+        if rc != 0:
+            print(f"  Improve #{improve_task.id} failed (exit code {rc})")
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            final_status = "blocked"
+            final_stop_reason = "improve_failed"
+            summary_rows.append((iteration, review_task.id, verdict, improve_task.id))
+            break
+
+        store.update_cycle_iteration(iter_record.id, state="improve_completed", ended_at=datetime.now(timezone.utc))
+        summary_rows.append((iteration, review_task.id, verdict, improve_task.id))
+
+        # Reviews in subsequent iterations still target the original impl_task because
+        # improve runs on same_branch=True, so the branch already has the latest code.
+        iteration += 1
+
+    store.close_cycle(cycle.id, status=final_status, stop_reason=final_stop_reason)
+
+    # Print summary table
+    print(f"\n{'=' * 60}")
+    print(f"Cycle #{cycle.id} complete: {final_status.upper()} ({final_stop_reason})")
+    print(f"{'=' * 60}")
+    print(f"{'Iter':<6} {'Review':>8} {'Verdict':<22} {'Improve':>8}")
+    print(f"{'-' * 6} {'-' * 8} {'-' * 22} {'-' * 8}")
+    for (iter_idx, rev_id, verdict, imp_id) in summary_rows:
+        iter_str = str(iter_idx + 1)
+        rev_str = f"#{rev_id}" if rev_id else "-"
+        verdict_str = verdict or "(none)"
+        imp_str = f"#{imp_id}" if imp_id else "-"
+        print(f"{iter_str:<6} {rev_str:>8} {verdict_str:<22} {imp_str:>8}")
+    print()
+
+    if final_status == "approved":
+        return 0
+    elif final_status == "maxed_out":
+        print(f"Max iterations ({max_iterations}) reached. Run 'gza cycle {impl_task.id} --continue' to continue.")
+        return 2
+    else:
+        print(f"Cycle blocked: {final_stop_reason}. Manual review required.")
+        return 3
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -4707,6 +5149,14 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task #{task.based_on}[/{c['value']}]")
     if task.depends_on:
         console.print(f"[{c['label']}]Depends on:[/{c['label']}] [{c['value']}]task #{task.depends_on}[/{c['value']}]")
+    if task.id is not None:
+        depended_on_by = [
+            t for t in store.get_all()
+            if t.depends_on == task.id or t.based_on == task.id
+        ]
+        if depended_on_by:
+            dep_parts = [f"#{t.id}[{t.task_type}]" for t in depended_on_by if t.id is not None]
+            console.print(f"[{c['label']}]Depended on by:[/{c['label']}] [{c['value']}]{', '.join(dep_parts)}[/{c['value']}]")
     if task.group:
         console.print(f"[{c['label']}]Group:[/{c['label']}] [{c['value']}]{task.group}[/{c['value']}]")
     if task.spec:
@@ -4793,6 +5243,33 @@ def cmd_show(args: argparse.Namespace) -> int:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:
                 console.print(f"[{c['value']}]  - {command}[/{c['value']}]")
+
+    # Show cycle state for implement tasks (Phase 4)
+    if task.task_type == "implement" and task.id is not None:
+        cycles = store.get_cycles_for_impl(task.id)
+        if cycles:
+            latest_cycle = cycles[0]
+            cycle_color_map = {
+                "active": c["status_running"],
+                "approved": c["status_completed"],
+                "maxed_out": "yellow",
+                "blocked": "red",
+            }
+            cycle_color = cycle_color_map.get(latest_cycle.status, c["value"])
+            console.print(
+                f"[{c['label']}]Latest Cycle:[/{c['label']}] "
+                f"[{cycle_color}]#{latest_cycle.id} {latest_cycle.status}[/{cycle_color}]"
+                + (f" ({latest_cycle.stop_reason})" if latest_cycle.stop_reason else "")
+            )
+            iters = store.get_cycle_iterations(latest_cycle.id)
+            if iters:
+                for it in iters:
+                    verdict_str = it.review_verdict or "-"
+                    imp_str = f"  improve #{it.improve_task_id}" if it.improve_task_id else ""
+                    console.print(
+                        f"[{c['value']}]  iter {it.iteration_index + 1}: "
+                        f"review #{it.review_task_id} [{verdict_str}]{imp_str}[/{c['value']}]"
+                    )
 
     return 0
 
@@ -5244,6 +5721,65 @@ def _determine_advance_action(
     }
 
 
+def _cmd_advance_plans(
+    config: "Config",
+    store: SqliteTaskStore,
+    dry_run: bool = False,
+    create: bool = False,
+) -> int:
+    """List completed plans that have no implementation task.
+
+    With --create, creates queued implement tasks for each such plan.
+    """
+    all_completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
+
+    # Find plans that have no implement task pointing at them (via based_on).
+    # Use a targeted query instead of a full table scan to avoid loading every
+    # task (including output_content blobs) into memory.
+    impl_based_on_ids: set[int] = store.get_impl_based_on_ids()
+
+    pending_plans = [p for p in all_completed_plans if p.id not in impl_based_on_ids]
+
+    if not pending_plans:
+        print("No completed plans without implementation tasks.")
+        return 0
+
+    print(f"Completed plans without implementation ({len(pending_plans)}):")
+    print()
+    for plan in pending_plans:
+        assert plan.id is not None
+        prompt_display = truncate(plan.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        print(f"  #{plan.id}  {prompt_display}")
+        print(f"       → gza implement {plan.id}")
+    print()
+
+    if not create:
+        print("Run with --create to queue implement tasks for all listed plans.")
+        return 0
+
+    # Create queued implement tasks
+    created_count = 0
+    for plan in pending_plans:
+        assert plan.id is not None
+        if dry_run:
+            print(f"[dry-run] Would create implement task for plan #{plan.id}")
+            continue
+        slug = _extract_task_slug(plan)
+        prompt_text = f"Implement plan from task #{plan.id}: {slug}" if slug else f"Implement plan from task #{plan.id}"
+        impl_task = store.add(
+            prompt=prompt_text,
+            task_type="implement",
+            based_on=plan.id,
+            group=plan.group,
+        )
+        print(f"✓ Created implement task #{impl_task.id} for plan #{plan.id}")
+        created_count += 1
+
+    if not dry_run:
+        print(f"\nCreated {created_count} implement task(s). Run 'gza work' to execute them.")
+    return 0
+
+
 def cmd_advance(args: argparse.Namespace) -> int:
     """Intelligently progress unmerged tasks through their lifecycle."""
     config = Config.load(args.project_dir)
@@ -5253,6 +5789,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
     dry_run: bool = args.dry_run
     max_tasks: int | None = getattr(args, 'max', None)
     task_id: int | None = getattr(args, 'task_id', None)
+    plans_mode: bool = getattr(args, 'plans', False)
+    create_mode: bool = getattr(args, 'create', False)
+
+    # --plans mode: list completed plans without implementations
+    if plans_mode:
+        return _cmd_advance_plans(config, store, dry_run=dry_run, create=create_mode)
 
     # Determine which tasks to advance
     if task_id is not None:
@@ -5553,6 +6095,16 @@ def main() -> int:
         action="store_true",
         help="Run workers directly instead of in Docker",
     )
+    advance_parser.add_argument(
+        "--plans",
+        action="store_true",
+        help="List completed plans that have no implementation task yet",
+    )
+    advance_parser.add_argument(
+        "--create",
+        action="store_true",
+        help="With --plans: create queued implement tasks for all listed plans",
+    )
 
     # refresh command
     refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
@@ -5700,6 +6252,23 @@ def main() -> int:
         default=5,
         metavar="N",
         help="Show last N tasks (default: 5)",
+    )
+    stats_parser.add_argument(
+        "--cycles",
+        action="store_true",
+        help="Show cycle analytics (review/improve iteration statistics)",
+    )
+    stats_parser.add_argument(
+        "--task",
+        type=int,
+        dest="cycle_task_id",
+        metavar="ID",
+        help="Show cycle analytics for a specific implementation task (use with --cycles)",
+    )
+    stats_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as machine-readable JSON",
     )
 
     # validate command
@@ -6128,6 +6697,45 @@ def main() -> int:
     )
     add_common_args(improve_parser)
 
+    # cycle command
+    cycle_parser = subparsers.add_parser(
+        "cycle",
+        help="Run an automated review/improve cycle for an implementation task",
+    )
+    cycle_parser.add_argument(
+        "impl_task_id",
+        type=int,
+        help="Implementation task ID to cycle",
+    )
+    cycle_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=3,
+        dest="max_iterations",
+        metavar="N",
+        help="Maximum review/improve iterations (default: 3)",
+    )
+    cycle_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Preview what would happen without executing",
+    )
+    cycle_parser.add_argument(
+        "--continue",
+        action="store_true",
+        dest="continue_cycle",
+        help="Resume an existing active cycle instead of starting a new one",
+    )
+    cycle_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker",
+    )
+    # TODO: Phase 1 deferred — add --queue (create chain without running immediately)
+    # and --background flags as specified in the design plan.
+    add_common_args(cycle_parser)
+
     # implement command
     implement_parser = subparsers.add_parser(
         "implement",
@@ -6395,6 +7003,8 @@ def main() -> int:
             return cmd_retry(args)
         elif args.command == "improve":
             return cmd_improve(args)
+        elif args.command == "cycle":
+            return cmd_cycle(args)
         elif args.command == "implement":
             return cmd_implement(args)
         elif args.command == "review":

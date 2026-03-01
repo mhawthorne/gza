@@ -545,6 +545,106 @@ class TestShowCommand:
         assert "Failure Reason:" not in result.stdout
         assert "Failure Summary:" not in result.stdout
 
+    def test_show_plan_lineage_includes_downstream_implement(self, tmp_path: Path):
+        """Show for a plan task includes downstream implement task in lineage."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Design the feature", task_type="plan")
+        assert plan.id is not None
+        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+
+        result = run_gza("show", str(plan.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{plan.id}" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+
+    def test_show_implement_lineage_includes_plan_and_review_improve_chain(self, tmp_path: Path):
+        """Show for an implement task (based on a plan) includes plan, review, and improve."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Design the feature", task_type="plan")
+        assert plan.id is not None
+        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        review = store.add("Review the feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        improve = store.add("Fix review issues", task_type="improve", based_on=impl.id)
+        assert improve.id is not None
+
+        result = run_gza("show", str(impl.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{plan.id}" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+        assert f"#{review.id}" in result.stdout
+        assert f"#{improve.id}" in result.stdout
+
+    def test_show_multi_level_dependency_lineage(self, tmp_path: Path):
+        """Lineage traverses multi-level dependency chains (plan->impl->sub-impl)."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Top-level plan", task_type="plan")
+        assert plan.id is not None
+        impl1 = store.add("First implement", task_type="implement", based_on=plan.id)
+        assert impl1.id is not None
+        impl2 = store.add("Second implement based on first", task_type="implement", based_on=impl1.id)
+        assert impl2.id is not None
+
+        result = run_gza("show", str(plan.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"#{plan.id}" in result.stdout
+        assert f"#{impl1.id}" in result.stdout
+        assert f"#{impl2.id}" in result.stdout
+
+    def test_show_depended_on_by_field(self, tmp_path: Path):
+        """Show displays 'Depended on by' listing tasks that reference the displayed task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Design the feature", task_type="plan")
+        assert plan.id is not None
+        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        review = store.add("Review the feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+
+        # Show the plan: it should list impl as "Depended on by"
+        result_plan = run_gza("show", str(plan.id), "--project", str(tmp_path))
+        assert result_plan.returncode == 0
+        assert "Depended on by:" in result_plan.stdout
+        assert f"#{impl.id}[implement]" in result_plan.stdout
+
+        # Show the impl: it should list review as "Depended on by"
+        result_impl = run_gza("show", str(impl.id), "--project", str(tmp_path))
+        assert result_impl.returncode == 0
+        assert "Depended on by:" in result_impl.stdout
+        assert f"#{review.id}[review]" in result_impl.stdout
+
 
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""
@@ -6058,6 +6158,74 @@ class TestReviewCommand:
         reviews = store.get_reviews_for_task(impl_task.id)
         assert len(reviews) == 2
 
+    def test_duplicate_review_uses_DuplicateReviewError_no_second_db_query(self, tmp_path: Path):
+        """cmd_review shows the warning using DuplicateReviewError without a second DB query.
+
+        After the refactor, cmd_review catches DuplicateReviewError (which carries
+        the active_review task) so store.get_reviews_for_task is called exactly once
+        (inside _create_review_task) and NOT a second time in the error handler.
+        """
+        import argparse
+        from unittest.mock import MagicMock, patch
+        from gza.cli import cmd_review, DuplicateReviewError
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        assert impl_task.id is not None
+        existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
+        # Leave as pending so it counts as active
+
+        args = argparse.Namespace(
+            task_id=impl_task.id,
+            project_dir=tmp_path,
+            no_docker=True,
+            queue=False,
+            background=False,
+            open=False,
+            pr=False,
+            no_pr=False,
+        )
+
+        mock_config = MagicMock()
+        mock_config.project_dir = tmp_path
+        mock_config.use_docker = False
+
+        # Wrap get_reviews_for_task to count calls
+        original_get_reviews = store.get_reviews_for_task
+        call_count = []
+
+        def counting_get_reviews(task_id: int):
+            call_count.append(task_id)
+            return original_get_reviews(task_id)
+
+        import io
+        output = io.StringIO()
+
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch.object(store, "get_reviews_for_task", side_effect=counting_get_reviews), \
+             patch("sys.stdout", output):
+            result = cmd_review(args)
+
+        assert result == 1
+        printed = output.getvalue()
+        assert "Warning: A review task already exists" in printed
+        assert f"#{existing_review.id}" in printed
+        # get_reviews_for_task must be called exactly once (inside _create_review_task),
+        # NOT a second time in the cmd_review error handler.
+        assert len(call_count) == 1, (
+            f"get_reviews_for_task was called {len(call_count)} times; expected exactly 1"
+        )
+
 
 class TestDiffCommand:
     """Tests for 'gza diff' command."""
@@ -9521,3 +9689,552 @@ class TestStatsCommand:
         assert result.returncode == 0
         assert "Total steps:  5" in result.stdout
         assert re.search(r"✓\s+#1\s+implement\s+\$0\.1200\s+5\s", result.stdout)
+
+
+class TestCycleCommand:
+    """Tests for 'gza cycle' command."""
+
+    def _make_completed_impl(self, store, prompt: str = "Implement feature") -> object:
+        """Create and return a completed implement task."""
+        from datetime import datetime, timezone
+        impl = store.add(prompt, task_type="implement")
+        impl.status = "completed"
+        impl.branch = f"test-project/20260101-impl"
+        impl.completed_at = datetime.now(timezone.utc)
+        store.update(impl)
+        return impl
+
+    def test_cycle_dry_run(self, tmp_path: Path):
+        """gza cycle --dry-run prints preview and exits 0."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        impl = self._make_completed_impl(store)
+
+        result = run_gza("cycle", str(impl.id), "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "dry-run" in result.stdout.lower()
+
+    def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
+        """gza cycle rejects tasks that are not implement type."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add("A plan", task_type="plan")
+
+        result = run_gza("cycle", str(plan_task.id), "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "implement" in result.stdout.lower() or "implement" in result.stderr.lower()
+
+    def test_cycle_rejects_incomplete_task(self, tmp_path: Path):
+        """gza cycle rejects implementation tasks that are not completed."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")  # status = 'pending'
+
+        result = run_gza("cycle", str(impl.id), "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "pending" in result.stdout or "pending" in result.stderr
+
+    def test_cycle_start_and_close_in_db(self, tmp_path: Path):
+        """start_cycle + close_cycle flow creates correct DB records."""
+        from gza.db import SqliteTaskStore
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+
+        cycle = store.start_cycle(impl.id, max_iterations=2)
+        it = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(it.id, state="terminal", review_verdict="APPROVED")
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        cycles = store.get_cycles_for_impl(impl.id)
+        assert len(cycles) == 1
+        assert cycles[0].status == "approved"
+        assert cycles[0].stop_reason == "approved"
+
+        iterations = store.get_cycle_iterations(cycle.id)
+        assert len(iterations) == 1
+        assert iterations[0].review_verdict == "APPROVED"
+
+    def test_cycle_blocked_on_active_cycle_without_continue(self, tmp_path: Path):
+        """gza cycle errors if an active cycle exists without --continue."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        # Pre-create an active cycle
+        store.start_cycle(impl.id, max_iterations=3)
+
+        result = run_gza("cycle", str(impl.id), "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "active cycle" in result.stdout.lower() or "already has an active cycle" in result.stdout.lower()
+
+    def test_cycle_continue_dry_run_shows_resume_message(self, tmp_path: Path):
+        """gza cycle --continue --dry-run shows 'resume' message, not 'start' message."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        cycle = store.start_cycle(impl.id, max_iterations=3)
+
+        result = run_gza("cycle", str(impl.id), "--continue", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Must say "resume", not "start", when --continue is given
+        assert "resume" in result.stdout.lower()
+        assert "No active cycle" not in result.stdout
+        # The active cycle should still be there (dry-run doesn't mutate state)
+        active = store.get_active_cycle_for_impl(impl.id)
+        assert active is not None
+        assert active.id == cycle.id
+
+    def test_cycle_continue_resumes_existing_active_cycle(self, tmp_path: Path):
+        """--continue resumes at next iteration and APPROVED verdict closes cycle correctly.
+
+        This is a unit test that calls cmd_cycle() directly so that unittest.mock.patch
+        is effective. (run_gza spawns a subprocess where in-process patches have no effect.)
+        """
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_cycle
+        from unittest.mock import patch, MagicMock
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        cycle = store.start_cycle(impl.id, max_iterations=3)
+        # Simulate one completed iteration already recorded so resume starts at index 1
+        it = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
+
+        # Create a completed review task in the store with an APPROVED verdict in output_content.
+        # _create_review_task will be patched to return this pre-seeded task, and run() will
+        # return 0 (success), so get_review_verdict will read output_content and return APPROVED.
+        fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
+        fake_review.status = "completed"
+        fake_review.completed_at = datetime.now(timezone.utc)
+        fake_review.output_content = "**Verdict: APPROVED**"
+        store.update(fake_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=3,
+            dry_run=False,
+            continue_cycle=True,
+            project_dir=tmp_path,
+            no_docker=True,
+        )
+
+        mock_config = MagicMock()
+        mock_config.project_dir = tmp_path
+        mock_config.use_docker = False
+
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._create_review_task", return_value=fake_review), \
+             patch("gza.cli.run", return_value=0):
+            result = cmd_cycle(args)
+
+        # The cycle should complete as approved
+        assert result == 0
+        # Verify iteration records: seeded index=0 plus new index=1 from the resumed run
+        iterations = store.get_cycle_iterations(cycle.id)
+        assert len(iterations) == 2
+        assert iterations[0].iteration_index == 0
+        assert iterations[1].iteration_index == 1
+        # Verify the cycle was closed with approved status
+        cycles = store.get_cycles_for_impl(impl.id)
+        assert len(cycles) == 1
+        assert cycles[0].status == "approved"
+        assert cycles[0].stop_reason == "approved"
+
+    def test_cycle_continue_no_active_cycle_returns_error(self, tmp_path: Path):
+        """gza cycle --continue with no active cycle returns non-zero exit code and error message."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        # No active cycle exists for this implementation
+
+        result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "No active cycle" in result.stdout or "No active cycle" in result.stderr
+
+    def test_cycle_continue_respects_original_max_iterations(self, tmp_path: Path):
+        """gza cycle --continue uses cycle.max_iterations, not the CLI default of 3.
+
+        With max_iterations=5 and 3 iterations already completed, resuming without
+        --max-iterations must enter the loop (iteration=3 < 5) rather than exiting
+        immediately (iteration=3 < 3 is False under the buggy CLI-default behaviour).
+        """
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = self._make_completed_impl(store)
+        # Start cycle with max_iterations=5 (higher than the CLI default of 3)
+        cycle = store.start_cycle(impl.id, max_iterations=5)
+        # Simulate 3 completed iterations (at CLI default, resuming would skip the loop entirely)
+        for i in range(3):
+            it = store.append_cycle_iteration(cycle.id, i)
+            store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
+
+        # Resume without --max-iterations; the subprocess honours cycle.max_iterations=5
+        result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+
+        # With the bug (CLI default max_iterations=3), iteration starts at 3 and
+        # `while 3 < 3` is immediately False — no new iteration record is created.
+        # With the fix (cycle.max_iterations=5), the loop body executes at least once,
+        # appending iteration_index=3 before any runner/verdict logic is attempted.
+        all_iterations = store.get_cycle_iterations(cycle.id)
+        # With the bug: `while 3 < 3` is immediately False → loop body never runs → still 3 records.
+        # With the fix: `while 3 < 5` → loop body executes at least once →
+        # append_cycle_iteration(cycle.id, 3) is called before any runner/verdict logic.
+        assert len(all_iterations) >= 4, (
+            f"Expected >=4 iteration records (3 seeded + >=1 from resume), got {len(all_iterations)}. "
+            f"stdout: {result.stdout!r}"
+        )
+
+
+class TestStatsCyclesCommand:
+    """Tests for 'gza stats --cycles' command."""
+
+    def test_stats_cycles_no_data(self, tmp_path: Path):
+        """gza stats --cycles with no cycles prints zero-data message."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "--cycles", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No cycles found" in result.stdout or "0" in result.stdout
+
+    def test_stats_cycles_with_approved_cycle(self, tmp_path: Path):
+        """gza stats --cycles reports correct counts for an approved cycle."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+        it = store.append_cycle_iteration(cycle.id, 0)
+        review = store.add("Review", task_type="review")
+        assert review.id is not None
+        store.update_cycle_iteration(it.id, review_task_id=review.id, state="terminal", review_verdict="APPROVED")
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        result = run_gza("stats", "--cycles", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "1" in result.stdout  # at least 1 cycle shown
+        assert "approved" in result.stdout.lower() or "Approved" in result.stdout
+
+    def test_stats_cycles_json_output(self, tmp_path: Path):
+        """gza stats --cycles --json outputs valid JSON."""
+        import json
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "--cycles", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert "total_cycles" in data
+        assert "approved_cycles" in data
+
+    def test_stats_cycles_task_json(self, tmp_path: Path):
+        """gza stats --cycles --task <id> --json outputs per-impl cycle data."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+        store.close_cycle(cycle.id, status="maxed_out", stop_reason="max_iterations")
+
+        result = run_gza(
+            "stats", "--cycles", "--task", str(impl.id), "--json",
+            "--project", str(tmp_path)
+        )
+
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["impl_task_id"] == impl.id
+        assert data["cycle_count"] == 1
+        assert data["cycles"][0]["status"] == "maxed_out"
+
+    def test_stats_without_cycles_flag_unchanged(self, tmp_path: Path):
+        """gza stats without --cycles shows the normal task stats table."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("A task", task_type="task")
+        store.mark_completed(
+            task,
+            has_commits=False,
+            stats=TaskStats(num_steps_computed=3, cost_usd=0.05, duration_seconds=10.0),
+        )
+
+        result = run_gza("stats", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Total cost" in result.stdout
+        assert "Recent Tasks" in result.stdout
+        # Should NOT show cycle analytics headers
+        assert "Cycle Analytics" not in result.stdout
+
+    def test_stats_cycles_improves_before_approval_metric(self, tmp_path: Path):
+        """gza stats --cycles --json reports improves_before_approval key (not iterations_to_approval)."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+
+        # Iteration 0: review + improve (CHANGES_REQUESTED)
+        review0 = store.add("Review 0", task_type="review")
+        improve0 = store.add("Improve 0", task_type="improve")
+        assert review0.id is not None and improve0.id is not None
+        it0 = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(
+            it0.id,
+            review_task_id=review0.id,
+            improve_task_id=improve0.id,
+            state="improve_completed",
+            review_verdict="CHANGES_REQUESTED",
+        )
+
+        # Iteration 1: review only (APPROVED)
+        review1 = store.add("Review 1", task_type="review")
+        assert review1.id is not None
+        it1 = store.append_cycle_iteration(cycle.id, 1)
+        store.update_cycle_iteration(
+            it1.id,
+            review_task_id=review1.id,
+            state="terminal",
+            review_verdict="APPROVED",
+        )
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        result = run_gza("stats", "--cycles", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        # Key must be improves_before_approval, NOT iterations_to_approval
+        assert "improves_before_approval" in data
+        assert "iterations_to_approval" not in data
+        assert data["improves_before_approval"]["min"] == 1.0
+
+
+class TestAdvancePlansCommand:
+    """Tests for 'gza advance --plans' command."""
+
+    def test_advance_plans_lists_completed_plans_without_impl(self, tmp_path: Path):
+        """advance --plans lists completed plans with no implement task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add a completed plan task
+        plan = store.add("Design the authentication system", task_type="plan")
+        plan.status = "completed"
+        from datetime import datetime, timezone
+        plan.completed_at = datetime.now(timezone.utc)
+        store.update(plan)
+
+        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert str(plan.id) in result.stdout
+        assert "gza implement" in result.stdout
+
+    def test_advance_plans_excludes_plans_with_impl(self, tmp_path: Path):
+        """advance --plans excludes plans that already have an implement task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        from datetime import datetime, timezone
+
+        plan = store.add("A plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(timezone.utc)
+        store.update(plan)
+
+        impl = store.add("Implement plan", task_type="implement", based_on=plan.id)
+        impl.status = "completed"
+        impl.completed_at = datetime.now(timezone.utc)
+        store.update(impl)
+
+        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No completed plans without implementation" in result.stdout
+
+    def test_advance_plans_create_queues_implement_tasks(self, tmp_path: Path):
+        """advance --plans --create creates implement tasks for each listed plan."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        from datetime import datetime, timezone
+
+        plan1 = store.add("Plan A", task_type="plan")
+        plan1.status = "completed"
+        plan1.completed_at = datetime.now(timezone.utc)
+        store.update(plan1)
+
+        plan2 = store.add("Plan B", task_type="plan")
+        plan2.status = "completed"
+        plan2.completed_at = datetime.now(timezone.utc)
+        store.update(plan2)
+
+        result = run_gza("advance", "--plans", "--create", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created" in result.stdout
+
+        # Verify impl tasks were created with based_on pointing to plans
+        all_tasks = store.get_all()
+        impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
+        assert len(impl_tasks) == 2
+        based_on_ids = {t.based_on for t in impl_tasks}
+        assert plan1.id in based_on_ids
+        assert plan2.id in based_on_ids
+
+    def test_advance_plans_dry_run_no_create(self, tmp_path: Path):
+        """advance --plans --create --dry-run shows preview but creates nothing."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        from datetime import datetime, timezone
+
+        plan = store.add("Plan C", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(timezone.utc)
+        store.update(plan)
+
+        result = run_gza("advance", "--plans", "--create", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "dry-run" in result.stdout.lower() or "Would create" in result.stdout
+
+        all_tasks = store.get_all()
+        impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
+        assert len(impl_tasks) == 0
+
+    def test_advance_plans_targeted_query_ignores_non_plan_tasks(self, tmp_path: Path):
+        """advance --plans correctly filters plans even with many non-plan tasks present.
+
+        This exercises get_impl_based_on_ids (the targeted query path) to ensure
+        the plan-exclusion filter is based only on implement tasks, not all tasks.
+        """
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_with_impl = store.add("Plan with impl", task_type="plan")
+        plan_with_impl.status = "completed"
+        plan_with_impl.completed_at = datetime.now(timezone.utc)
+        store.update(plan_with_impl)
+
+        plan_without_impl = store.add("Plan without impl", task_type="plan")
+        plan_without_impl.status = "completed"
+        plan_without_impl.completed_at = datetime.now(timezone.utc)
+        store.update(plan_without_impl)
+
+        assert plan_with_impl.id is not None and plan_without_impl.id is not None
+
+        # Implement task based on plan_with_impl
+        store.add("Impl 1", task_type="implement", based_on=plan_with_impl.id)
+
+        # Many non-plan tasks that should NOT affect the exclusion logic
+        for i in range(20):
+            t = store.add(f"Task {i}", task_type="task")
+            t.based_on = plan_with_impl.id  # review/task based_on should be ignored
+            store.update(t)
+
+        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Only plan_without_impl should appear (plan_with_impl is excluded)
+        assert "Plan without impl" in result.stdout
+        assert "Plan with impl" not in result.stdout

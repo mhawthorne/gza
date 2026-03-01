@@ -407,7 +407,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -517,7 +517,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -702,7 +702,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -887,7 +887,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1222,7 +1222,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1687,7 +1687,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1858,7 +1858,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1938,7 +1938,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2467,7 +2467,7 @@ class TestStepColumnsMigration:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 17
+        assert version == 19
 
         migrated = store.get(1)
         assert migrated is not None
@@ -2498,7 +2498,7 @@ class TestRunStepPersistence:
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
-        assert version == 17
+        assert version == 19
 
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('run_steps', 'run_substeps')"
@@ -2766,7 +2766,7 @@ class TestRunStepPersistence:
         value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 1").fetchone()[0]
         conn.close()
 
-        assert version == 17
+        assert version == 19
         assert value == 1
 
     def test_set_log_schema_version_updates_task(self, tmp_path: Path):
@@ -2779,3 +2779,449 @@ class TestRunStepPersistence:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.log_schema_version == 2
+
+
+class TestCycleOrchestratorSchema:
+    """Tests for v17->v18 migration creating cycle tables and indexes."""
+
+    def test_migration_v17_to_v18_creates_cycle_tables(self, tmp_path: Path):
+        """Migration from v17 to v18 creates task_cycles and task_cycle_iterations tables."""
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_path = tmp_path / "test.db"
+
+        # Bootstrap a v17 DB manually
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE schema_version (version INTEGER);
+        """)
+        conn.execute("INSERT INTO schema_version VALUES (17)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at TEXT NOT NULL DEFAULT '',
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER,
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                merge_status TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                log_schema_version INTEGER DEFAULT 1
+            )
+        """)
+        conn.execute("INSERT INTO tasks (id, prompt, status, created_at) VALUES (1, 'Test', 'completed', ?)",
+                     (datetime.now(timezone.utc).isoformat(),))
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteTaskStore to trigger migration
+        store = SqliteTaskStore(db_path)
+
+        # Verify schema version updated to 18
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+
+        # Verify new tables exist
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        indexes = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )}
+        # Verify new task columns exist
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 19
+        assert "task_cycles" in tables
+        assert "task_cycle_iterations" in tables
+        assert "idx_task_cycles_impl_id" in indexes
+        assert "idx_task_cycles_status" in indexes
+        assert "idx_task_cycle_iterations_cycle_idx" in indexes
+        assert "idx_tasks_cycle_id" in indexes
+        assert "cycle_id" in columns
+        assert "cycle_iteration_index" in columns
+        assert "cycle_role" in columns
+
+    def test_cycle_columns_on_task(self, tmp_path: Path):
+        """Cycle columns on tasks table persist correctly."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.cycle_id is None
+        assert task.cycle_iteration_index is None
+        assert task.cycle_role is None
+
+        task.cycle_id = 42
+        task.cycle_iteration_index = 2
+        task.cycle_role = "review"
+        store.update(task)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.cycle_id == 42
+        assert retrieved.cycle_iteration_index == 2
+        assert retrieved.cycle_role == "review"
+
+    def test_migration_v18_to_v19_adds_indexes(self, tmp_path: Path):
+        """Migration v18->v19 adds idx_tasks_type_based_on and the unique constraint."""
+        import sqlite3
+        from gza.db import SqliteTaskStore
+
+        db_path = tmp_path / "test.db"
+        # Bootstrap as a v18 database (full fresh schema minus the v19 additions)
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (18)")
+        # Minimal task_cycle_iterations table (no UNIQUE constraint yet)
+        conn.execute("""
+            CREATE TABLE task_cycle_iterations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                iteration_index INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'review_created',
+                started_at TEXT NOT NULL
+            )
+        """)
+        # Minimal tasks table
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                based_on INTEGER
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Opening with SqliteTaskStore should run the v18->v19 migration
+        store = SqliteTaskStore(db_path)
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        indexes = {row[1] for row in conn.execute("SELECT * FROM sqlite_master WHERE type='index'")}
+        conn.close()
+
+        assert version == 19
+        assert "idx_tasks_type_based_on" in indexes
+        assert "uq_task_cycle_iterations_cycle_iter" in indexes
+
+
+class TestCycleStoreAPIs:
+    """Tests for cycle store APIs: start_cycle, append_cycle_iteration, etc."""
+
+    def test_start_cycle_creates_active_cycle(self, tmp_path: Path):
+        """start_cycle creates a new active cycle for an implementation task."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+
+        cycle = store.start_cycle(impl.id, max_iterations=5)
+
+        assert cycle.id is not None
+        assert cycle.implementation_task_id == impl.id
+        assert cycle.status == "active"
+        assert cycle.max_iterations == 5
+        assert cycle.stop_reason is None
+        assert cycle.ended_at is None
+
+    def test_start_cycle_enforces_uniqueness(self, tmp_path: Path):
+        """start_cycle raises ValueError if an active cycle already exists."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+
+        store.start_cycle(impl.id)
+        with pytest.raises(ValueError, match="already has an active cycle"):
+            store.start_cycle(impl.id)
+
+    def test_get_active_cycle_for_impl(self, tmp_path: Path):
+        """get_active_cycle_for_impl returns the active cycle."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+
+        assert store.get_active_cycle_for_impl(impl.id) is None
+
+        cycle = store.start_cycle(impl.id)
+        active = store.get_active_cycle_for_impl(impl.id)
+        assert active is not None
+        assert active.id == cycle.id
+
+    def test_append_and_get_cycle_iterations(self, tmp_path: Path):
+        """append_cycle_iteration creates iteration records retrievable via get_cycle_iterations."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+
+        it0 = store.append_cycle_iteration(cycle.id, iteration_index=0)
+        it1 = store.append_cycle_iteration(cycle.id, iteration_index=1)
+
+        assert it0.cycle_id == cycle.id
+        assert it0.iteration_index == 0
+        assert it0.state == "review_created"
+        assert it1.iteration_index == 1
+
+        iters = store.get_cycle_iterations(cycle.id)
+        assert len(iters) == 2
+        assert iters[0].iteration_index == 0
+        assert iters[1].iteration_index == 1
+
+    def test_update_cycle_iteration_fields(self, tmp_path: Path):
+        """update_cycle_iteration persists changes to verdict, state, and task IDs."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement", task_type="implement")
+        assert impl.id is not None
+        review = store.add("Review", task_type="review")
+        improve = store.add("Improve", task_type="improve")
+        assert review.id is not None and improve.id is not None
+
+        cycle = store.start_cycle(impl.id)
+        it = store.append_cycle_iteration(cycle.id, iteration_index=0)
+
+        from datetime import datetime, timezone
+        store.update_cycle_iteration(
+            it.id,
+            review_task_id=review.id,
+            review_verdict="CHANGES_REQUESTED",
+            improve_task_id=improve.id,
+            state="improve_completed",
+            ended_at=datetime.now(timezone.utc),
+        )
+
+        iters = store.get_cycle_iterations(cycle.id)
+        assert len(iters) == 1
+        updated = iters[0]
+        assert updated.review_task_id == review.id
+        assert updated.review_verdict == "CHANGES_REQUESTED"
+        assert updated.improve_task_id == improve.id
+        assert updated.state == "improve_completed"
+        assert updated.ended_at is not None
+
+    def test_close_cycle_updates_status(self, tmp_path: Path):
+        """close_cycle sets status, stop_reason, and ended_at."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement", task_type="implement")
+        assert impl.id is not None
+
+        cycle = store.start_cycle(impl.id)
+        assert cycle.status == "active"
+        assert cycle.ended_at is None
+
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        cycles = store.get_cycles_for_impl(impl.id)
+        assert len(cycles) == 1
+        closed = cycles[0]
+        assert closed.status == "approved"
+        assert closed.stop_reason == "approved"
+        assert closed.ended_at is not None
+
+    def test_get_cycles_for_impl_newest_first(self, tmp_path: Path):
+        """get_cycles_for_impl returns cycles ordered newest first."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement", task_type="implement")
+        assert impl.id is not None
+
+        cycle1 = store.start_cycle(impl.id)
+        store.close_cycle(cycle1.id, status="maxed_out", stop_reason="max_iterations")
+
+        cycle2 = store.start_cycle(impl.id)
+
+        cycles = store.get_cycles_for_impl(impl.id)
+        assert len(cycles) == 2
+        assert cycles[0].id == cycle2.id  # newest first
+        assert cycles[1].id == cycle1.id
+
+    def test_cycle_aggregate_stats_empty(self, tmp_path: Path):
+        """get_cycle_aggregate_stats returns sensible empty result."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        stats = store.get_cycle_aggregate_stats()
+
+        assert stats["total_cycles"] == 0
+        assert stats["approved_cycles"] == 0
+        assert stats["improves_before_approval"] is None
+
+    def test_cycle_aggregate_stats_with_data(self, tmp_path: Path):
+        """get_cycle_aggregate_stats computes correct stats from cycle data."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        # Cycle 1: approved after 2 improves
+        impl1 = store.add("Impl 1", task_type="implement")
+        assert impl1.id is not None
+        cycle1 = store.start_cycle(impl1.id)
+        review1 = store.add("Review 1", task_type="review")
+        improve1 = store.add("Improve 1", task_type="improve")
+        assert review1.id is not None and improve1.id is not None
+        it1 = store.append_cycle_iteration(cycle1.id, 0)
+        store.update_cycle_iteration(it1.id, review_task_id=review1.id, improve_task_id=improve1.id, state="improve_completed")
+        review2 = store.add("Review 2", task_type="review")
+        assert review2.id is not None
+        it2 = store.append_cycle_iteration(cycle1.id, 1)
+        store.update_cycle_iteration(it2.id, review_task_id=review2.id, state="terminal", review_verdict="APPROVED")
+        store.close_cycle(cycle1.id, status="approved", stop_reason="approved")
+
+        # Cycle 2: maxed_out (1 improve)
+        impl2 = store.add("Impl 2", task_type="implement")
+        assert impl2.id is not None
+        cycle2 = store.start_cycle(impl2.id)
+        review3 = store.add("Review 3", task_type="review")
+        improve3 = store.add("Improve 3", task_type="improve")
+        assert review3.id is not None and improve3.id is not None
+        it3 = store.append_cycle_iteration(cycle2.id, 0)
+        store.update_cycle_iteration(it3.id, review_task_id=review3.id, improve_task_id=improve3.id, state="improve_completed")
+        review4 = store.add("Review 4", task_type="review")
+        assert review4.id is not None
+        it4 = store.append_cycle_iteration(cycle2.id, 1)
+        store.update_cycle_iteration(it4.id, review_task_id=review4.id, state="terminal")
+        store.close_cycle(cycle2.id, status="maxed_out", stop_reason="max_iterations")
+
+        stats = store.get_cycle_aggregate_stats()
+        assert stats["total_cycles"] == 2
+        assert stats["approved_cycles"] == 1
+        # Only cycle1 is approved: 1 improve -> improves_before_approval = 1
+        assert stats["improves_before_approval"] is not None
+        assert stats["improves_before_approval"]["min"] == 1.0
+        # Both cycles have 2 reviews each
+        assert stats["reviews_per_cycle"] is not None
+        assert stats["reviews_per_cycle"]["min"] == 2.0
+
+    def test_improves_before_approval_two_iteration_cycle(self, tmp_path: Path):
+        """improves_before_approval counts improve tasks, not total iterations."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        # Cycle: iter 0 has review+improve (CHANGES_REQUESTED), iter 1 has review-only (APPROVED)
+        impl = store.add("Impl", task_type="implement")
+        assert impl.id is not None
+        cycle = store.start_cycle(impl.id)
+
+        review0 = store.add("Review 0", task_type="review")
+        improve0 = store.add("Improve 0", task_type="improve")
+        assert review0.id is not None and improve0.id is not None
+        it0 = store.append_cycle_iteration(cycle.id, 0)
+        store.update_cycle_iteration(
+            it0.id,
+            review_task_id=review0.id,
+            improve_task_id=improve0.id,
+            state="improve_completed",
+            review_verdict="CHANGES_REQUESTED",
+        )
+
+        review1 = store.add("Review 1", task_type="review")
+        assert review1.id is not None
+        it1 = store.append_cycle_iteration(cycle.id, 1)
+        store.update_cycle_iteration(
+            it1.id,
+            review_task_id=review1.id,
+            state="terminal",
+            review_verdict="APPROVED",
+        )
+        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
+
+        stats = store.get_cycle_aggregate_stats()
+        assert stats["approved_cycles"] == 1
+        # One improve ran before approval
+        assert stats["improves_before_approval"] is not None
+        assert stats["improves_before_approval"]["min"] == 1.0
+        assert stats["improves_before_approval"]["max"] == 1.0
+
+    def test_get_impl_based_on_ids_returns_targeted_set(self, tmp_path: Path):
+        """get_impl_based_on_ids returns only based_on IDs from implement tasks."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        plan1 = store.add("Plan 1", task_type="plan")
+        plan2 = store.add("Plan 2", task_type="plan")
+        plan3 = store.add("Plan 3", task_type="plan")
+        assert plan1.id is not None and plan2.id is not None and plan3.id is not None
+
+        # Only plan1 has an implement task based on it
+        store.add("Impl 1", task_type="implement", based_on=plan1.id)
+        # A review task with based_on should NOT be included
+        store.add("Review of plan2", task_type="review", based_on=plan2.id)
+        # A plain task with no based_on
+        store.add("Task no based_on", task_type="task")
+
+        result = store.get_impl_based_on_ids()
+
+        assert result == {plan1.id}
+
+    def test_get_impl_based_on_ids_empty_db(self, tmp_path: Path):
+        """get_impl_based_on_ids returns empty set when no implement tasks exist."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        assert store.get_impl_based_on_ids() == set()
+
+
+class TestComputePercentiles:
+    """Tests for _compute_percentiles helper."""
+
+    def test_empty_list_returns_none(self):
+        from gza.db import _compute_percentiles
+        assert _compute_percentiles([]) is None
+
+    def test_single_value(self):
+        from gza.db import _compute_percentiles
+        result = _compute_percentiles([5.0])
+        assert result is not None
+        assert result["min"] == 5.0
+        assert result["max"] == 5.0
+        assert result["avg"] == 5.0
+        assert result["median"] == 5.0
+        assert result["count"] == 1
+
+    def test_odd_count_median(self):
+        from gza.db import _compute_percentiles
+        result = _compute_percentiles([1.0, 3.0, 5.0])
+        assert result is not None
+        assert result["median"] == 3.0
+
+    def test_even_count_median(self):
+        from gza.db import _compute_percentiles
+        result = _compute_percentiles([1.0, 2.0, 3.0, 4.0])
+        assert result is not None
+        assert result["median"] == 2.5
+
+    def test_p90_with_large_sample(self):
+        from gza.db import _compute_percentiles
+        values = list(range(1, 11))  # 1..10
+        result = _compute_percentiles([float(v) for v in values])
+        assert result is not None
+        # p90_idx = max(0, int(0.9 * 10) - 1) = 8, sorted[8] = 9
+        assert result["p90"] == 9.0
