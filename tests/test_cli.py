@@ -645,6 +645,75 @@ class TestShowCommand:
         assert "Depended on by:" in result_impl.stdout
         assert f"#{review.id}[review]" in result_impl.stdout
 
+    def test_show_truncates_long_output(self, tmp_path: Path):
+        """gza show truncates output >30 lines to 20 with a remainder hint."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        long_content = "\n".join(f"line {i}" for i in range(1, 52))  # 51 lines
+        task = store.add("Plan with long output", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.output_content = long_content
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "line 20" in result.stdout
+        assert "line 21" not in result.stdout
+        assert "truncated" in result.stdout
+        assert "31 more lines" in result.stdout
+        assert f"gza show {task.id} --full" in result.stdout
+
+    def test_show_full_flag_shows_complete_output(self, tmp_path: Path):
+        """gza show --full bypasses truncation and displays all lines."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        long_content = "\n".join(f"line {i}" for i in range(1, 52))  # 51 lines
+        task = store.add("Plan with long output", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.output_content = long_content
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--full", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "line 51" in result.stdout
+        assert "truncated" not in result.stdout
+
+    def test_show_short_output_not_truncated(self, tmp_path: Path):
+        """gza show does not truncate output with exactly 30 lines."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        content_30_lines = "\n".join(f"line {i}" for i in range(1, 31))  # exactly 30 lines
+        task = store.add("Plan with 30-line output", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.output_content = content_30_lines
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "line 30" in result.stdout
+        assert "truncated" not in result.stdout
+
 
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""
@@ -8831,6 +8900,238 @@ class TestMergeStatusTracking:
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Skip Learnings" not in result.stdout
+
+    def test_cmd_show_warning_when_disk_report_newer(self, tmp_path: Path):
+        """gza show displays a warning when the report file on disk is newer than task completion."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed plan task with output_content in DB
+        task = store.add("Plan something", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Original plan content"
+        task.report_file = ".gza/plans/20260101-plan-something.md"
+        store.update(task)
+
+        # Write a newer version of the report file to disk (after completed_at)
+        report_path = tmp_path / ".gza" / "plans" / "20260101-plan-something.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("Modified plan content on disk")
+        # Set mtime to 2 seconds after completed_at to guarantee drift detection
+        future_ts = task.completed_at.timestamp() + 2
+        os.utime(report_path, (future_ts, future_ts))
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Report on disk has been modified since task completion" in result.stdout
+
+    def test_cmd_show_no_warning_when_disk_not_newer(self, tmp_path: Path):
+        """gza show does not show drift warning when disk report is not newer than completion."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a completed task with a future completed_at
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Plan content"
+        task.report_file = ".gza/plans/20260101-plan-task.md"
+        store.update(task)
+
+        # Write report file and set its mtime to 2 seconds BEFORE completed_at
+        report_path = tmp_path / ".gza" / "plans" / "20260101-plan-task.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("Plan content")
+        past_ts = task.completed_at.timestamp() - 2
+        os.utime(report_path, (past_ts, past_ts))
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Report on disk has been modified since task completion" not in result.stdout
+
+    def test_cmd_show_displays_disk_content_when_newer(self, tmp_path: Path):
+        """gza show displays the disk version of the report when it is newer than DB content."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Explore something", task_type="explore")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Original DB content"
+        task.report_file = ".gza/explorations/20260101-explore-something.md"
+        store.update(task)
+
+        # Write newer disk content with mtime 2 seconds after completed_at
+        report_path = tmp_path / ".gza" / "explorations" / "20260101-explore-something.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("Updated disk content")
+        future_ts = task.completed_at.timestamp() + 2
+        os.utime(report_path, (future_ts, future_ts))
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Updated disk content" in result.stdout
+        assert "Original DB content" not in result.stdout
+
+
+class TestSyncReportCommand:
+    """Tests for 'gza sync-report' command."""
+
+    def test_sync_report_updates_db_from_disk_for_plan(self, tmp_path: Path):
+        """sync-report copies disk content into DB output_content for plan tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Plan something", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Old plan content in DB"
+        task.report_file = ".gza/plans/20260101-plan-something.md"
+        store.update(task)
+
+        report_path = tmp_path / ".gza" / "plans" / "20260101-plan-something.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("New plan content on disk")
+
+        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Synced" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.output_content == "New plan content on disk"
+
+    def test_sync_report_updates_db_from_disk_for_review(self, tmp_path: Path):
+        """sync-report copies disk content into DB output_content for review tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Review feature", task_type="review")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Old review content"
+        task.report_file = ".gza/reviews/20260101-review-feature.md"
+        store.update(task)
+
+        report_path = tmp_path / ".gza" / "reviews" / "20260101-review-feature.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("Updated review content on disk")
+
+        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Synced" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.output_content == "Updated review content on disk"
+
+    def test_sync_report_updates_db_from_disk_for_explore(self, tmp_path: Path):
+        """sync-report copies disk content into DB output_content for explore tasks."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Explore codebase", task_type="explore")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Old exploration content"
+        task.report_file = ".gza/explorations/20260101-explore-codebase.md"
+        store.update(task)
+
+        report_path = tmp_path / ".gza" / "explorations" / "20260101-explore-codebase.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("New exploration findings on disk")
+
+        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Synced" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.output_content == "New exploration findings on disk"
+
+    def test_sync_report_noop_when_already_in_sync(self, tmp_path: Path):
+        """sync-report is a no-op when disk content matches DB output_content."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.output_content = "Identical content"
+        task.report_file = ".gza/plans/20260101-plan-task.md"
+        store.update(task)
+
+        report_path = tmp_path / ".gza" / "plans" / "20260101-plan-task.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("Identical content")
+
+        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "already in sync" in result.stdout
+
+        # Verify DB content is unchanged
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.output_content == "Identical content"
+
+    def test_sync_report_error_no_report_file(self, tmp_path: Path):
+        """sync-report returns error when task has no report_file."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Code task", task_type="implement")
+        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "no report file" in result.stdout
+
+    def test_sync_report_error_task_not_found(self, tmp_path: Path):
+        """sync-report returns error when task does not exist."""
+        setup_config(tmp_path)
+        (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("sync-report", "999", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "not found" in result.stdout
 
 
 class TestEditCommandWithNoLearnings:
