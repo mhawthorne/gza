@@ -1758,6 +1758,32 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_improve_tasks_by_root(self, root_task_id: int) -> list[Task]:
+        """Get all improve tasks whose based_on points to root_task_id."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE task_type = 'improve' AND based_on = ?
+                ORDER BY created_at DESC
+                """,
+                (root_task_id,),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def get_impl_tasks_by_depends_on_or_based_on(self, task_id: int) -> list[Task]:
+        """Get implement tasks that depend on or are based on a given task."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE task_type = 'implement' AND (based_on = ? OR depends_on = ?)
+                ORDER BY created_at ASC
+                """,
+                (task_id, task_id),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_stats(self) -> dict:
         """Get aggregate statistics."""
         with self._connect() as conn:
