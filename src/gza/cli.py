@@ -502,6 +502,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             for task_id in args.task_ids:
                 if tasks_completed > 0:
                     print(task_separator)
+                    # Update worker registry to track the current task
+                    worker.task_id = task_id
+                    registry.update(worker)
                 result = run(config, task_id=task_id)
                 if result != 0:
                     if tasks_completed == 0:
@@ -550,10 +553,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             if i < count - 1:  # Not the last iteration
                 from .db import SqliteTaskStore
                 store = SqliteTaskStore(config.db_path)
-                if not store.get_next_pending():
+                next_task = store.get_next_pending()
+                if not next_task:
                     elapsed = format_duration(time.time() - start_time)
                     print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")
                     break
+                # Update worker registry to track the next task
+                worker.task_id = next_task.id
+                registry.update(worker)
 
         if tasks_completed > 1:
             elapsed = format_duration(time.time() - start_time)
