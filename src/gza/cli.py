@@ -4436,6 +4436,7 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     if mode == "force":
         old_status = task.status
         store.mark_completed(task, branch=task.branch if task.branch else None)
+        _cleanup_worker_registry(config, args.task_id)
         print(f"✓ Task #{args.task_id} status changed: {old_status} → completed (status-only)")
         return 0
 
@@ -4454,13 +4455,30 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
         store.mark_completed(task, branch=task.branch, has_commits=False)
+        _cleanup_worker_registry(config, args.task_id)
         print(f"✓ Task #{args.task_id} marked as completed")
         return 0
 
     store.mark_completed(task, branch=task.branch, has_commits=True)
+    _cleanup_worker_registry(config, args.task_id)
     print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
+
+
+def _cleanup_worker_registry(config: "Config", task_id: int) -> None:
+    """Mark any running worker for a task as completed in the worker registry.
+
+    Looks up the most recent worker associated with the task and calls
+    registry.mark_completed() to update worker metadata and remove the PID file.
+    If no worker exists for the task, this is a no-op.
+    """
+    registry = WorkerRegistry(config.workers_path)
+    worker = _latest_worker_for_task(registry, task_id)
+    if worker is None:
+        return
+    if worker.status in ("running", "stale"):
+        registry.mark_completed(worker.worker_id, exit_code=0, status="completed")
 
 
 def cmd_improve(args: argparse.Namespace) -> int:

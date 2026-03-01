@@ -8510,6 +8510,115 @@ class TestMarkCompletedCommand:
         assert result.returncode == 0
         assert "Warning" not in result.stdout
 
+    def test_mark_completed_cleans_up_running_worker(self, tmp_path: Path):
+        """mark-completed calls registry.mark_completed() for a running worker."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        git._run("checkout", "-b", "gza/1-worker-task")
+        git._run("checkout", "main")
+
+        task = store.add("Failed task with worker")
+        task.status = "failed"
+        task.branch = "gza/1-worker-task"
+        store.update(task)
+
+        # Register a running worker for this task
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-20260301-120000",
+            pid=99999,  # non-existent PID
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-03-01T12:00:00+00:00",
+            status="running",
+            log_file=None,
+            worktree=None,
+            is_background=True,
+        )
+        registry.register(worker)
+
+        # Verify PID file exists before
+        pid_path = workers_path / "w-20260301-120000.pid"
+        assert pid_path.exists()
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        # Worker metadata should be updated to completed and PID file removed
+        updated_worker = registry.get("w-20260301-120000")
+        assert updated_worker is not None
+        assert updated_worker.status == "completed"
+        assert not pid_path.exists()
+
+    def test_mark_completed_no_worker_is_graceful(self, tmp_path: Path):
+        """mark-completed succeeds when no worker exists for the task."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Review task no worker", "status": "failed", "task_type": "review"},
+        ])
+
+        # No workers directory / no registry entry — should still succeed
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "status-only" in result.stdout
+
+    def test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
+        """mark-completed leaves an already-completed worker unchanged."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        git._run("checkout", "-b", "gza/1-already-done-branch")
+        git._run("checkout", "main")
+
+        task = store.add("Failed task with done worker")
+        task.status = "failed"
+        task.branch = "gza/1-already-done-branch"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-20260301-130000",
+            pid=99998,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-03-01T13:00:00+00:00",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            is_background=True,
+            exit_code=1,
+            completed_at="2026-03-01T13:05:00+00:00",
+        )
+        registry.register(worker)
+
+        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Worker that was already failed should remain failed (not touched)
+        updated_worker = registry.get("w-20260301-130000")
+        assert updated_worker is not None
+        assert updated_worker.status == "failed"
+
 
 class TestForceCompleteRemoval:
     """Tests for removed force-complete command."""
