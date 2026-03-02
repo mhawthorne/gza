@@ -5942,9 +5942,11 @@ def cmd_skills_install(
         copy_skill,
     )
 
+    public_only = not getattr(args, "dev", False)
+
     # Handle --list flag
     if args.list:
-        available = get_available_skills(public_only=True)
+        available = get_available_skills(public_only=public_only)
         if not available:
             print("No skills available")
             return 0
@@ -5958,8 +5960,7 @@ def cmd_skills_install(
         return 0
 
     # Determine which skills to install
-    # Default to public skills only
-    available = get_available_skills(public_only=True)
+    available = get_available_skills(public_only=public_only)
 
     if args.skills:
         # When specific skills are requested, check against public skills
@@ -6091,6 +6092,11 @@ def _add_skills_install_args(
         "--list", "-l",
         action="store_true",
         help="List available skills without installing",
+    )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Include dev (non-public) skills",
     )
 
 
