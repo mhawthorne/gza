@@ -11746,8 +11746,7 @@ class TestAdvanceCommand:
             max_review_cycles=None,
         )
 
-        import io as _io
-        with patch("sys.stdout", new_callable=_io.StringIO) as mock_stdout:
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
             rc = cmd_advance(args)
             output = mock_stdout.getvalue()
 

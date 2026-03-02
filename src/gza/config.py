@@ -466,7 +466,7 @@ class Config:
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review", "max_resume_attempts",
+            "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -960,7 +960,7 @@ class Config:
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review",
+            "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
         }
 
         for key in data.keys():
