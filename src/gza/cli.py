@@ -6169,6 +6169,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Worker-spawning actions: check batch limit before proceeding
         if action_type in ('run_review', 'run_improve', 'create_review', 'improve'):
             if batch_limit is not None and workers_started >= batch_limit:
+                print(f"  #{task.id} {prompt_display}")
+                print(f"      — batch limit reached ({workers_started}/{batch_limit}), skipping")
+                print()
                 skip_count += 1
                 continue
 
@@ -6224,10 +6227,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started review worker")
                 success_count += 1
-                workers_started += 1
             else:
                 print(f"      ✗ Failed to start review worker")
                 error_count += 1
@@ -6241,10 +6244,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started review worker for #{review_task.id}")
                 success_count += 1
-                workers_started += 1
             else:
                 print(f"      ✗ Failed to start review worker for #{review_task.id}")
                 error_count += 1
@@ -6272,10 +6275,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started improve worker")
                 success_count += 1
-                workers_started += 1
             else:
                 print(f"      ✗ Failed to start improve worker")
                 error_count += 1
@@ -6289,10 +6292,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started improve worker for #{improve_task.id}")
                 success_count += 1
-                workers_started += 1
             else:
                 print(f"      ✗ Failed to start improve worker for #{improve_task.id}")
                 error_count += 1

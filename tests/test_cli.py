@@ -10907,12 +10907,18 @@ class TestAdvanceCommand:
             no_docker=True,
         )
 
+        import io
         with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
-            rc = cmd_advance(args)
+            with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                rc = cmd_advance(args)
+                output = mock_stdout.getvalue()
 
         assert rc == 0
         # Only 2 workers should have been started, not 3
         assert len(spawn_calls) == 2
+        # The third task should show a batch limit message
+        assert "batch limit reached" in output
+        assert f"#{tasks[2].id}" in output
 
     def test_advance_batch_merge_does_not_count_toward_limit(self, tmp_path: Path):
         """advance --batch B: merge actions don't count toward the worker limit."""
@@ -10967,6 +10973,51 @@ class TestAdvanceCommand:
         for t in merge_tasks:
             assert store.get(t.id).merge_status == "merged"
         # Only 1 worker should have been spawned (batch=1)
+        assert len(spawn_calls) == 1
+
+    def test_advance_batch_enforced_on_failed_spawn(self, tmp_path: Path):
+        """advance --batch 1 attempts only one spawn even when the first spawn fails."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create 2 implement tasks, each with a pending review (triggers run_review)
+        for i in range(2):
+            task = self._create_implement_task_with_branch(store, git, tmp_path, f"Feature {i}")
+            store.add(
+                f"Review #{task.id}",
+                task_type="review",
+                depends_on=task.id,
+            )
+
+        spawn_calls = []
+
+        def fake_spawn_first_fails(worker_args, config, task_id):
+            spawn_calls.append(task_id)
+            # First call fails, second would succeed — but with batch=1 it should never be called
+            return 1 if len(spawn_calls) == 1 else 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            max=None,
+            batch=1,
+            no_docker=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn_first_fails):
+            rc = cmd_advance(args)
+
+        # With batch=1, the failed spawn still counts toward the limit,
+        # so only 1 spawn attempt should be made (not 2)
         assert len(spawn_calls) == 1
 
     def test_advance_spawn_worker_failure_increments_error_count(self, tmp_path: Path):
