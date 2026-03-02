@@ -859,7 +859,7 @@ def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> 
     return sorted(all_tasks, key=_task_time_for_lineage)
 
 
-def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc") -> str:
+def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "dim") -> str:
     """Format lineage tasks as a linear #id[type] chain."""
     lineage_parts: list[str] = []
     for lineage_task in lineage_tasks:
