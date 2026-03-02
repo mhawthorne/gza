@@ -52,8 +52,11 @@ def get_improves_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]
     return store.get_improve_tasks_by_root(root_task.id)
 
 
-def get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[Task]:
-    """Get implement tasks that depend on or are based on a given task."""
+def _get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[Task]:
+    """Get implement tasks that depend on or are based on a given task.
+
+    Internal helper used only within this module; not part of the public API.
+    """
     return store.get_impl_tasks_by_depends_on_or_based_on(task_id)
 
 
@@ -79,7 +82,7 @@ def build_lineage(store: SqliteTaskStore, root_task: Task) -> list[Task]:
                 all_tasks.append(improve)
 
         if task.id is not None:
-            for downstream in get_downstream_impls(store, task.id):
+            for downstream in _get_downstream_impls(store, task.id):
                 _collect(downstream)
 
     _collect(root_task)

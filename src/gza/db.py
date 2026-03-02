@@ -1151,7 +1151,7 @@ class SqliteTaskStore:
         """Get all pending tasks."""
         with self._connect() as conn:
             query = "SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at ASC"
-            if limit:
+            if limit is not None:
                 query += f" LIMIT {limit}"
             cur = conn.execute(query)
             return [self._row_to_task(row) for row in cur.fetchall()]

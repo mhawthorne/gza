@@ -278,6 +278,15 @@ class TestGetPending:
         pending = client.get_pending(limit=None)
         assert len(pending) == 5
 
+    def test_limit_zero_returns_empty(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        for i in range(3):
+            store.add(f"Task {i}")
+        client = make_client(tmp_path)
+        result = client.get_pending(limit=0)
+        assert result == []
+
     def test_excludes_non_pending_tasks(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
