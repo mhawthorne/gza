@@ -4202,15 +4202,15 @@ def _print_ps_output(
 
     print(
         f"{'TASK ID':<10} {'WORKER ID':<20} {'PID':<8} {'TYPE':<6} "
-        f"{'STATUS':<12} {'STARTED':<20} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+        f"{'STATUS':<12} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
-    print("-" * 120)
+    print("-" * 124)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
         print(
             f"{task_id_display:<10} {row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} "
-            f"{row['status']:<12} {row['started']:<20} {row['steps']:<7} {row['duration']:<10} {row['task']}"
+            f"{row['status']:<12} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} {row['task']}"
         )
 
 
