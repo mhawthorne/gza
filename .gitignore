@@ -17,3 +17,6 @@ gza.local.yaml
 # AI-generated artifacts (should not be created, but ignore as safety net)
 IMPLEMENTATION_SUMMARY.md
 CHANGES.md
+
+# Test artifacts from WorkerRegistry using MagicMock paths
+MagicMock/
