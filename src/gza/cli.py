@@ -4649,11 +4649,6 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
 def cmd_set_status(args: argparse.Namespace) -> int:
     """Manually force a task's status to any valid value."""
-    valid_statuses = {"pending", "in_progress", "completed", "failed"}
-    if args.status not in valid_statuses:
-        print(f"Error: Invalid status '{args.status}'. Must be one of: {', '.join(sorted(valid_statuses))}")
-        return 1
-
     if args.reason and args.status != "failed":
         print(f"Warning: --reason is only meaningful for 'failed' status (current target: '{args.status}')")
 
@@ -4675,6 +4670,8 @@ def cmd_set_status(args: argparse.Namespace) -> int:
 
     if args.status == "failed" and args.reason:
         task.failure_reason = args.reason
+    elif args.status != "failed":
+        task.failure_reason = None
 
     store.update(task)
     _cleanup_worker_registry(config, args.task_id)
@@ -7493,6 +7490,8 @@ def main() -> int:
     set_status_parser.add_argument(
         "status",
         choices=["pending", "in_progress", "completed", "failed"],
+        # 'unmerged' is intentionally excluded: that transition is managed
+        # exclusively by the 'advance' workflow and should not be forced manually.
         help="New status for the task",
     )
     set_status_parser.add_argument(

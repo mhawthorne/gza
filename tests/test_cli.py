@@ -12022,8 +12022,6 @@ class TestSetStatusCommand:
 
     def test_set_status_to_failed(self, tmp_path: Path):
         """set-status can mark a pending task as failed."""
-        from gza.db import SqliteTaskStore
-
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
@@ -12043,8 +12041,6 @@ class TestSetStatusCommand:
 
     def test_set_status_to_completed(self, tmp_path: Path):
         """set-status can mark a task as completed."""
-        from gza.db import SqliteTaskStore
-
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
@@ -12063,8 +12059,6 @@ class TestSetStatusCommand:
 
     def test_set_status_to_pending_clears_completed_at(self, tmp_path: Path):
         """set-status clears completed_at when transitioning back to pending."""
-        from gza.db import SqliteTaskStore
-
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "failed"},
         ])
@@ -12083,8 +12077,6 @@ class TestSetStatusCommand:
 
     def test_set_status_to_in_progress_clears_completed_at(self, tmp_path: Path):
         """set-status clears completed_at when transitioning to in_progress."""
-        from gza.db import SqliteTaskStore
-
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "failed"},
         ])
@@ -12102,8 +12094,6 @@ class TestSetStatusCommand:
 
     def test_set_status_with_reason_for_failed(self, tmp_path: Path):
         """set-status --reason sets failure_reason for failed status."""
-        from gza.db import SqliteTaskStore
-
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
@@ -12143,3 +12133,26 @@ class TestSetStatusCommand:
         result = run_gza("set-status", "1", "bogus", "--project", str(tmp_path))
 
         assert result.returncode != 0
+
+    def test_set_status_clears_failure_reason_on_non_failed_transition(self, tmp_path: Path):
+        """set-status clears failure_reason when transitioning away from failed."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "failed"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        # Set failure_reason on the existing failed task
+        task = store.get(1)
+        assert task is not None
+        task.failure_reason = "Original error"
+        store.update(task)
+
+        result = run_gza("set-status", "1", "pending", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.failure_reason is None
