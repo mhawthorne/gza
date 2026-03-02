@@ -6081,6 +6081,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     plans_mode: bool = getattr(args, 'plans', False)
     create_mode: bool = getattr(args, 'create', False)
 
+    if batch_limit is not None and batch_limit < 1:
+        print("Error: --batch must be a positive integer", file=sys.stderr)
+        return 1
+
     # --plans mode: list completed plans without implementations
     if plans_mode:
         return _cmd_advance_plans(config, store, dry_run=dry_run, create=create_mode)
@@ -6495,8 +6499,7 @@ def main() -> int:
         "--batch",
         type=int,
         metavar="B",
-        dest="batch",
-        help="Stop after spawning B workers (run_review, run_improve, create_review, improve actions)",
+        help="Stop after spawning B background workers. Merge actions do not count toward this limit.",
     )
 
     # refresh command
