@@ -1307,8 +1307,19 @@ def _run_inner(
     else:
         prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
+    def _on_session_id(session_id: str) -> None:
+        """Persist session_id to the task record as soon as it is first seen.
+
+        This ensures that even if the run is killed mid-stream (e.g. Ctrl+C),
+        the session_id is already saved and ``gza resume`` can still work.
+        """
+        if task.session_id == session_id:
+            return
+        task.session_id = session_id
+        store.update(task)
+
     try:
-        result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
+        result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
@@ -1317,8 +1328,8 @@ def _run_inner(
         if has_step_events:
             task.log_schema_version = 2
 
-        # Store session_id if available
-        if result.session_id:
+        # Store session_id if available and not already persisted by _on_session_id callback
+        if result.session_id and result.session_id != task.session_id:
             task.session_id = result.session_id
             store.update(task)
 
@@ -1578,8 +1589,16 @@ def _run_non_code_task(
         else:
             prompt = build_prompt(task, config, store, report_path=prompt_report_path, git=git)
         hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
+
+        def _on_session_id_non_code(session_id: str) -> None:
+            """Persist session_id as soon as it is first seen during streaming."""
+            if task.session_id == session_id:
+                return
+            task.session_id = session_id
+            store.update(task)
+
         try:
-            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None)
+            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code)
         except KeyboardInterrupt:
             console.print("\nInterrupted")
             return 130
@@ -1593,8 +1612,8 @@ def _run_non_code_task(
         if has_step_events:
             task.log_schema_version = 2
 
-        # Store session_id if available
-        if result.session_id:
+        # Store session_id if available and not already persisted by _on_session_id_non_code callback
+        if result.session_id and result.session_id != task.session_id:
             task.session_id = result.session_id
             store.update(task)
 

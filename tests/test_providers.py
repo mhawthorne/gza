@@ -1302,6 +1302,127 @@ class TestClaudeStepMapping:
         assert result.num_steps_computed == 0
         assert result.num_steps_reported == 0
 
+    def test_captures_session_id_from_system_init_event(self, tmp_path):
+        """Should capture session_id from system/init event early in stream."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "ses_early_abc123", "tools": []}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_1", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 1, "total_cost_usd": 0.01}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.session_id == "ses_early_abc123"
+
+    def test_on_session_id_callback_called_from_system_init(self, tmp_path):
+        """on_session_id callback should be invoked as soon as system/init event is parsed."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        captured: list[str] = []
+
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "ses_callback_xyz", "tools": []}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_1", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 1, "total_cost_usd": 0.01}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_session_id=captured.append,
+            )
+
+        assert captured == ["ses_callback_xyz"]
+
+    def test_on_session_id_callback_called_only_once(self, tmp_path):
+        """on_session_id callback should only be called once even if session_id appears in both system and result events."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        captured: list[str] = []
+
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "ses_once", "tools": []}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 1, "total_cost_usd": 0.0, "session_id": "ses_once"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_session_id=captured.append,
+            )
+
+        assert captured == ["ses_once"]
+
+    def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
+        """session_id should still be captured from result event when no system/init event is present."""
+        import json
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        captured: list[str] = []
+
+        json_lines = [
+            json.dumps({"type": "assistant", "message": {"id": "msg_1", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 1, "total_cost_usd": 0.0, "session_id": "ses_from_result"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_session_id=captured.append,
+            )
+
+        assert result.session_id == "ses_from_result"
+        assert captured == ["ses_from_result"]
+
 
 class TestClaudeToolLogging:
     """Tests for enhanced Claude provider tool logging."""
@@ -3236,6 +3357,69 @@ class TestCodexOutputParsing:
         assert result.cost_usd is not None
         assert result.tokens_estimated is True
         assert result.cost_estimated is True
+
+    def test_on_session_id_callback_called_from_thread_started(self, tmp_path):
+        """on_session_id callback should be invoked when thread.started event is parsed."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        captured: list[str] = []
+
+        json_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread_early_456"}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_session_id=captured.append,
+            )
+
+        assert captured == ["thread_early_456"]
+        assert result.session_id == "thread_early_456"
+
+    def test_on_session_id_callback_called_only_once_for_codex(self, tmp_path):
+        """on_session_id callback should only be called once even if thread.started appears twice."""
+        import json
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        captured: list[str] = []
+
+        json_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread_once"}) + "\n",
+            json.dumps({"type": "thread.started", "thread_id": "thread_once"}) + "\n",
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_session_id=captured.append,
+            )
+
+        assert captured == ["thread_once"]
 
 
 class TestSyncKeychainCredentials:

@@ -6,9 +6,10 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from .base import (
     Provider,
@@ -159,6 +160,7 @@ class GeminiProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
+        on_session_id: Optional[Callable[[str], None]] = None,
     ) -> RunResult:
         """Run Gemini to execute a task."""
         # Note: Gemini doesn't currently support session resumption
