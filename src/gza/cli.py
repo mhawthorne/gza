@@ -6007,7 +6007,8 @@ def _determine_advance_action(
                 'type': 'create_review',
                 'description': 'Create review (no review yet)',
             }
-        # Non-implement types (plan, explore, etc.) go straight to merge.
+        # Non-implement types (plan, explore, improve, etc.) go straight to merge.
+        # improve tasks are already produced by a review cycle; they merge directly.
         return {
             'type': 'merge',
             'description': 'Merge task (no review yet)',
