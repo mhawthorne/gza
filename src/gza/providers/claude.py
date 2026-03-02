@@ -328,6 +328,7 @@ class ClaudeProvider(Provider):
                 "legacy_turn_id": legacy_turn_id,
                 "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
                 "substeps": [],
+                "_seen_tool_use_ids": set(),
                 "outcome": "completed",
                 "summary": None,
             }
@@ -401,11 +402,17 @@ class ClaudeProvider(Provider):
                         if content.get("type") == "tool_use":
                             tool_name = content.get("name", "unknown")
                             tool_input = content.get("input", {})
+                            call_id = content.get("id")
+                            seen_tool_use_ids = current_step.setdefault("_seen_tool_use_ids", set())
+                            dedupe_key = call_id or f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+                            if dedupe_key in seen_tool_use_ids:
+                                continue
+                            seen_tool_use_ids.add(dedupe_key)
                             current_step["substeps"].append(
                                 {
                                     "type": "tool_call",
                                     "source": "provider",
-                                    "call_id": content.get("id"),
+                                    "call_id": call_id,
                                     "payload": {
                                         "tool_name": tool_name,
                                         "tool_input": tool_input,
