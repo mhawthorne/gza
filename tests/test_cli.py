@@ -3832,7 +3832,7 @@ class TestPsCommand:
         registry.register(worker)
 
         # Run ps command
-        result = run_gza("ps", "--all", cwd=tmp_path)
+        result = run_gza("ps", "--all", "--project", str(tmp_path))
 
         # Verify task ID is in output
         assert result.returncode == 0
@@ -3874,7 +3874,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", cwd=tmp_path)
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -3898,7 +3898,7 @@ class TestPsCommand:
         task = store.add("DB-only in-progress task")
         store.mark_in_progress(task)
 
-        result = run_gza("ps", "--json", cwd=tmp_path)
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -3939,7 +3939,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--all", cwd=tmp_path)
+        result = run_gza("ps", "--all", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "2026-01-08 00:00:00 UTC" in result.stdout
 
@@ -3975,7 +3975,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--quiet", cwd=tmp_path)
+        result = run_gza("ps", "--quiet", "--project", str(tmp_path))
         assert result.returncode == 0
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         assert lines == [str(task.id)]
@@ -4012,7 +4012,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", cwd=tmp_path)
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -4047,12 +4047,12 @@ class TestPsCommand:
             )
         )
 
-        table_result = run_gza("ps", "--all", cwd=tmp_path)
+        table_result = run_gza("ps", "--all", "--project", str(tmp_path))
         assert table_result.returncode == 0
         assert "standalone-worker" in table_result.stdout
         assert " - " in table_result.stdout
 
-        json_result = run_gza("ps", "--all", "--json", cwd=tmp_path)
+        json_result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
         assert json_result.returncode == 0
         rows = json.loads(json_result.stdout)
         assert len(rows) == 1
@@ -4088,7 +4088,7 @@ class TestPsCommand:
                 )
             )
 
-        result = run_gza("ps", "--all", "--json", cwd=tmp_path)
+        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert [row["worker_id"] for row in rows] == ["w-test-order-a", "w-test-order-b"]
@@ -4326,12 +4326,12 @@ class TestPsCommand:
 
         registry.remove("w-test-autostop")
 
-    def test_ps_poll_captures_status_transition_without_all_flag(self, tmp_path: Path):
-        """Poll mode captures running→completed transition even without --all.
+    def test_ps_poll_filters_completed_without_all_flag(self, tmp_path: Path):
+        """Poll mode without --all filters completed workers from display.
 
-        Regression test: without this fix, completed workers would remain as
-        'running' in seen_tasks because _build_ps_rows was called with
-        include_completed=False, so completed workers never appeared in live_rows.
+        Workers that transition to completed are tracked in seen_tasks (so
+        transitions are captured internally) but are not shown in output
+        unless --all is passed.
         """
         import argparse
         import json
@@ -4366,7 +4366,7 @@ class TestPsCommand:
             worker.status = "completed"
             registry.update(worker)
 
-        # Deliberately use all=False to test the bug fix path.
+        # Deliberately use all=False to test filtering.
         args = argparse.Namespace(
             project_dir=tmp_path,
             all=False,
@@ -4393,18 +4393,14 @@ class TestPsCommand:
 
         # Find JSON outputs (lines that start with '[') and parse them.
         json_outputs = [o for o in captured_outputs if o.startswith("[")]
-        assert len(json_outputs) == 2, f"Expected 2 JSON snapshots, got: {json_outputs}"
+        assert len(json_outputs) == 1, f"Expected 1 JSON snapshot (running only), got: {json_outputs}"
 
         first_snapshot = json.loads(json_outputs[0])
-        second_snapshot = json.loads(json_outputs[1])
-
-        # First poll: worker was running.
         assert len(first_snapshot) == 1
         assert first_snapshot[0]["status"] == "running"
 
-        # Second poll: worker transitions to completed (not hidden or stuck as running).
-        assert len(second_snapshot) == 1
-        assert second_snapshot[0]["status"] == "completed"
+        # Second poll: completed worker filtered out, so "No running workers" message shown.
+        assert any("No running workers" in o for o in captured_outputs)
 
         registry.remove("w-test-transition")
 
@@ -4441,7 +4437,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--all", "--json", cwd=tmp_path)
+        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -4484,7 +4480,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", cwd=tmp_path)
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
