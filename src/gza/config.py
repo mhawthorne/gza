@@ -39,6 +39,7 @@ DEFAULT_CLAUDE_ARGS = [
 ]
 DEFAULT_ADVANCE_CREATE_REVIEWS = True
 DEFAULT_ADVANCE_REQUIRES_REVIEW = True
+DEFAULT_MAX_RESUME_ATTEMPTS = 1
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -84,6 +85,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     },
     "chat_text_display_length": None,
     "verify_command": None,
+    "max_resume_attempts": None,
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
@@ -269,6 +271,7 @@ class Config:
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
     advance_requires_review: bool = DEFAULT_ADVANCE_REQUIRES_REVIEW
+    max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -460,7 +463,7 @@ class Config:
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review",
+            "advance_create_reviews", "advance_requires_review", "max_resume_attempts",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -872,6 +875,12 @@ class Config:
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
 
+        max_resume_attempts = int(data.get("max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS))
+        env_max_resume_attempts = os.getenv("GZA_MAX_RESUME_ATTEMPTS")
+        if env_max_resume_attempts:
+            max_resume_attempts = int(env_max_resume_attempts)
+            source_map["max_resume_attempts"] = "env"
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -898,6 +907,7 @@ class Config:
             verify_command=data.get("verify_command", ""),
             advance_create_reviews=advance_create_reviews,
             advance_requires_review=advance_requires_review,
+            max_resume_attempts=max_resume_attempts,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,

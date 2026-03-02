@@ -11633,6 +11633,224 @@ class TestAdvanceCommand:
         assert action['type'] == 'create_review'
 
 
+    def _create_failed_task(self, store, session_id="sess-abc", failure_reason="MAX_STEPS", prompt="Implement feature"):
+        """Create a failed task with given failure_reason and session_id."""
+        task = store.add(prompt, task_type="implement")
+        task.status = "failed"
+        task.failure_reason = failure_reason
+        task.session_id = session_id
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = f"feat/task-{task.id}"
+        store.update(task)
+        return task
+
+    def test_advance_resumes_max_steps_failed_task(self, tmp_path: Path):
+        """advance creates a resume child task and spawns worker for MAX_STEPS failed task."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume" in result.stdout
+        assert "Created resume task" in result.stdout
+
+        # Verify a resume child task was created
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+        child = children[0]
+        assert child.based_on == failed_task.id
+        assert child.session_id == failed_task.session_id
+
+    def test_advance_resumes_max_turns_failed_task(self, tmp_path: Path):
+        """advance creates a resume child task and spawns worker for MAX_TURNS failed task."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-xyz", failure_reason="MAX_TURNS")
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+        assert children[0].session_id == "sess-xyz"
+
+    def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
+        """advance skips a failed task when chain depth >= max_resume_attempts."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        # Create a chain: original (MAX_STEPS) → first_resume (MAX_STEPS)
+        original = self._create_failed_task(store, session_id="sess-1", failure_reason="MAX_STEPS")
+        first_resume = store.add("Implement feature", task_type="implement")
+        first_resume.status = "failed"
+        first_resume.failure_reason = "MAX_STEPS"
+        first_resume.session_id = "sess-2"
+        first_resume.based_on = original.id
+        first_resume.completed_at = datetime.now(timezone.utc)
+        store.update(first_resume)
+
+        # Default max_resume_attempts=1; original (depth=0) gets resumed,
+        # first_resume (depth=1) gets skipped
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "max resume attempts" in result.stdout
+
+        # Only the original should have a new resume child
+        original_children = store.get_based_on_children(original.id)
+        resume_children = [c for c in original_children if c.id != first_resume.id]
+        assert len(resume_children) == 1  # original got resumed
+        # first_resume should not have any new children
+        first_resume_children = store.get_based_on_children(first_resume.id)
+        assert len(first_resume_children) == 0
+
+    def test_advance_skips_failed_task_with_existing_resume_child(self, tmp_path: Path):
+        """advance skips a failed task that already has a pending/in_progress child."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        # Create an existing pending resume child
+        child = store.add("Implement feature", task_type="implement")
+        child.based_on = failed_task.id
+        child.status = "pending"
+        store.update(child)
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # No new child should have been created (still just the one pre-existing)
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1  # only the pre-existing child
+
+    def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
+        """advance --no-resume-failed excludes failed tasks from processing."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--auto", "--no-resume-failed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No eligible tasks" in result.stdout
+
+    def test_advance_dry_run_shows_resume_action(self, tmp_path: Path):
+        """advance --dry-run shows resume action without executing."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance" in result.stdout
+        assert "Resume" in result.stdout
+
+        # No resume child should have been created
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 0
+
+    def test_advance_specific_failed_task_id(self, tmp_path: Path):
+        """advance with a specific failed resumable task ID works."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", str(failed_task.id), "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+
+    def test_advance_skips_failed_task_without_session_id(self, tmp_path: Path):
+        """advance skips failed tasks without session_id (not resumable)."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        # Task with no session_id — not resumable
+        self._create_failed_task(store, session_id=None, failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No eligible tasks" in result.stdout
+
+    def test_advance_max_resume_attempts_flag_overrides_config(self, tmp_path: Path):
+        """advance --max-resume-attempts N overrides the config value."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        # Create a chain of depth 1: original (MAX_STEPS) → first_resume (MAX_STEPS)
+        original = self._create_failed_task(store, session_id="sess-1", failure_reason="MAX_STEPS")
+        first_resume = store.add("Implement feature", task_type="implement")
+        first_resume.status = "failed"
+        first_resume.failure_reason = "MAX_STEPS"
+        first_resume.session_id = "sess-2"
+        first_resume.based_on = original.id
+        first_resume.completed_at = datetime.now(timezone.utc)
+        store.update(first_resume)
+
+        # With --max-resume-attempts 2, first_resume (depth=1) should still be resumed
+        result = run_gza("advance", "--auto", "--max-resume-attempts", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume" in result.stdout
+        # Both original and first_resume should have new resume children
+        original_children = store.get_based_on_children(original.id)
+        new_children_of_original = [c for c in original_children if c.id != first_resume.id]
+        assert len(new_children_of_original) == 1  # original got a new resume child
+        first_resume_children = store.get_based_on_children(first_resume.id)
+        assert len(first_resume_children) == 1  # first_resume also got a resume child
+
+
 class TestStatsCommand:
     """Tests for 'gza stats' command."""
 

@@ -1244,6 +1244,71 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_resumable_failed_tasks(self) -> list[Task]:
+        """Return failed tasks that can be auto-resumed.
+
+        A task is resumable if:
+        - status = 'failed'
+        - failure_reason IN ('MAX_STEPS', 'MAX_TURNS')
+        - session_id IS NOT NULL
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'failed'
+                AND failure_reason IN ('MAX_STEPS', 'MAX_TURNS')
+                AND session_id IS NOT NULL
+                ORDER BY completed_at DESC, id DESC
+                """
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def count_resume_chain_depth(self, task_id: int) -> int:
+        """Count consecutive failed ancestors with resumable failure reasons.
+
+        Walks the based_on chain upward from task_id's parent, counting how many
+        consecutive failed ancestors have failure_reason in ('MAX_STEPS', 'MAX_TURNS').
+        This tells us how many times we've already tried resuming (not counting task_id itself).
+
+        Examples:
+          - Task #1 failed MAX_STEPS, based_on=None → depth=0 (no prior attempts)
+          - Task #2 failed MAX_STEPS, based_on=#1 (also MAX_STEPS) → depth=1 (one prior attempt)
+          - Task #3 failed MAX_STEPS, based_on=#2 → depth=2 (two prior attempts)
+        """
+        seen_ids: set[int] = set()
+        seen_ids.add(task_id)
+        # Start from the parent (based_on of task_id)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT based_on FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0
+            current_id: int | None = row["based_on"]
+
+            depth = 0
+            while current_id is not None:
+                if current_id in seen_ids:
+                    break  # Cycle detected
+                seen_ids.add(current_id)
+                cur = conn.execute(
+                    "SELECT based_on, status, failure_reason FROM tasks WHERE id = ?",
+                    (current_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    break
+                based_on, status, failure_reason = row["based_on"], row["status"], row["failure_reason"]
+                if status == "failed" and failure_reason in ("MAX_STEPS", "MAX_TURNS"):
+                    depth += 1
+                    current_id = based_on
+                else:
+                    break
+        return depth
+
     def get_recent_completed(self, limit: int = 15) -> list[Task]:
         """Get recent completed tasks, most recent first."""
         with self._connect() as conn:

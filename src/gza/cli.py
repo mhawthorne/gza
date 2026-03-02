@@ -5129,6 +5129,35 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         return 3
 
 
+def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
+    """Create a new resume task pointing to the original failed task.
+
+    Copies prompt, task_type, group, session_id, branch, model, provider, etc.
+    Sets based_on to original_task.id to track resume lineage.
+    """
+    assert original_task.id is not None
+    new_task = store.add(
+        prompt=original_task.prompt,
+        task_type=original_task.task_type,
+        group=original_task.group,
+        spec=original_task.spec,
+        depends_on=original_task.depends_on,
+        create_review=original_task.create_review,
+        same_branch=original_task.same_branch,
+        task_type_hint=original_task.task_type_hint,
+        based_on=original_task.id,  # Track resume lineage (points to failed task)
+        model=original_task.model,
+        provider=original_task.provider,
+    )
+    # Copy session_id and branch from original task so the resumed run
+    # continues the Claude Code session and uses the same branch.
+    assert new_task.id is not None
+    new_task.session_id = original_task.session_id
+    new_task.branch = original_task.branch
+    store.update(new_task)
+    return new_task
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     """Resume a failed or orphaned task from where it left off."""
     config = Config.load(args.project_dir)
@@ -5169,26 +5198,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     # Create a new task (like retry) to track this resumed run.
     # The original task stays failed with its stats preserved.
-    new_task = store.add(
-        prompt=task.prompt,
-        task_type=task.task_type,
-        group=task.group,
-        spec=task.spec,
-        depends_on=task.depends_on,
-        create_review=task.create_review,
-        same_branch=task.same_branch,
-        task_type_hint=task.task_type_hint,
-        based_on=args.task_id,  # Track resume lineage (points to failed task)
-        model=task.model,
-        provider=task.provider,
-    )
-
-    # Copy session_id and branch from original task so the resumed run
-    # continues the Claude Code session and uses the same branch.
+    new_task = _create_resume_task(store, task)
     assert new_task.id is not None
-    new_task.session_id = task.session_id
-    new_task.branch = task.branch
-    store.update(new_task)
 
     print(f"✓ Created task #{new_task.id} (resume of #{args.task_id})")
 
@@ -6242,6 +6253,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
     task_id: int | None = getattr(args, 'task_id', None)
     plans_mode: bool = getattr(args, 'plans', False)
     create_mode: bool = getattr(args, 'create', False)
+    no_resume_failed: bool = getattr(args, 'no_resume_failed', False)
+    max_resume_attempts_override: int | None = getattr(args, 'max_resume_attempts', None)
+
+    # Determine effective max_resume_attempts
+    max_resume_attempts = max_resume_attempts_override if max_resume_attempts_override is not None else config.max_resume_attempts
 
     if batch_limit is not None and batch_limit < 1:
         print("Error: --batch must be a positive integer", file=sys.stderr)
@@ -6257,19 +6273,35 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if not task:
             print(f"Error: Task #{task_id} not found")
             return 1
-        if task.status != 'completed':
-            print(f"Error: Task #{task_id} is not completed (status: {task.status})")
-            return 1
-        if task.merge_status == 'merged':
-            print(f"Task #{task_id} is already merged")
-            return 0
-        tasks = [task]
+        if task.status == 'failed':
+            # Allow a specific failed task if it's resumable
+            is_resumable = (
+                task.failure_reason in ('MAX_STEPS', 'MAX_TURNS')
+                and task.session_id is not None
+                and not no_resume_failed
+            )
+            if not is_resumable:
+                print(f"Error: Task #{task_id} is not completed (status: {task.status})")
+                return 1
+            tasks = []
+            failed_tasks: list[DbTask] = [task]
+        else:
+            if task.status != 'completed':
+                print(f"Error: Task #{task_id} is not completed (status: {task.status})")
+                return 1
+            if task.merge_status == 'merged':
+                print(f"Task #{task_id} is already merged")
+                return 0
+            tasks = [task]
+            failed_tasks = []
     else:
         # Get all unmerged completed tasks
         all_unmerged = store.get_unmerged()
         tasks = [t for t in all_unmerged if t.status == 'completed']
+        # Also collect resumable failed tasks (unless disabled)
+        failed_tasks = [] if no_resume_failed else store.get_resumable_failed_tasks()
 
-    if not tasks:
+    if not tasks and not failed_tasks:
         print("No eligible tasks to advance")
         return 0
 
@@ -6282,11 +6314,35 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # always merge into the canonical default branch (main/master).
     default_branch = git.default_branch()
 
-    # Analyze each task to determine the next action
+    # Analyze each completed task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
         action = _determine_advance_action(config, store, git, task, default_branch)
         plan.append((task, action))
+
+    # Analyze each resumable failed task
+    for failed_task in failed_tasks:
+        assert failed_task.id is not None
+        failure_reason = failed_task.failure_reason or "UNKNOWN"
+        # Check for an already-pending/in_progress resume child
+        children = store.get_based_on_children(failed_task.id)
+        active_children = [c for c in children if c.status in ('pending', 'in_progress')]
+        if active_children:
+            # Already has a live resume attempt — skip silently
+            continue
+        # Check resume chain depth
+        depth = store.count_resume_chain_depth(failed_task.id)
+        if depth >= max_resume_attempts:
+            plan.append((failed_task, {
+                'type': 'skip',
+                'description': f"SKIP: max resume attempts ({max_resume_attempts}) reached",
+            }))
+        else:
+            attempt_num = depth + 1
+            plan.append((failed_task, {
+                'type': 'resume',
+                'description': f"Resume (failed: {failure_reason}, attempt {attempt_num}/{max_resume_attempts})",
+            }))
 
     # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
     # the rationale. The sort is stable, preserving DB order within each group.
@@ -6338,7 +6394,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
-        if action_type in ('run_review', 'run_improve', 'create_review', 'improve'):
+        if action_type in ('run_review', 'run_improve', 'create_review', 'improve', 'resume'):
             if batch_limit is not None and workers_started >= batch_limit:
                 print(f"  #{task.id} {prompt_display}")
                 print(f"      — batch limit reached ({workers_started}/{batch_limit}), skipping")
@@ -6469,6 +6525,24 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 success_count += 1
             else:
                 print(f"      ✗ Failed to start improve worker for #{improve_task.id}")
+                error_count += 1
+
+        elif action_type == 'resume':
+            # Create a resume task and spawn a background worker for it
+            resume_task = _create_resume_task(store, task)
+            assert resume_task.id is not None
+            print(f"      ✓ Created resume task #{resume_task.id}")
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+            )
+            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id)
+            workers_started += 1
+            if rc == 0:
+                print(f"      ✓ Started resume worker")
+                success_count += 1
+            else:
+                print(f"      ✗ Failed to start resume worker")
                 error_count += 1
 
         print()
@@ -6667,6 +6741,19 @@ def main() -> int:
         type=int,
         metavar="B",
         help="Stop after spawning B background workers. Merge actions do not count toward this limit.",
+    )
+    advance_parser.add_argument(
+        "--no-resume-failed",
+        action="store_true",
+        dest="no_resume_failed",
+        help="Skip auto-resume of failed tasks (do not create resume tasks for MAX_STEPS/MAX_TURNS failures)",
+    )
+    advance_parser.add_argument(
+        "--max-resume-attempts",
+        type=int,
+        metavar="N",
+        dest="max_resume_attempts",
+        help="Override max_resume_attempts config value for this run",
     )
 
     # refresh command
