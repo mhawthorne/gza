@@ -1724,15 +1724,18 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_impl_based_on_ids(self) -> set[int]:
-        """Return the set of based_on IDs used by implement tasks.
+        """Return the set of plan IDs that already have an implement task.
 
-        Issues a targeted query instead of a full table scan, suitable for
-        determining which plan tasks already have an implementation.
+        Checks both based_on and depends_on, since implement tasks may
+        reference their plan via either column.
         """
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT DISTINCT based_on FROM tasks"
                 " WHERE task_type = 'implement' AND based_on IS NOT NULL"
+                " UNION"
+                " SELECT DISTINCT depends_on FROM tasks"
+                " WHERE task_type = 'implement' AND depends_on IS NOT NULL"
             )
             return {row[0] for row in cur.fetchall()}
 
