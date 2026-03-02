@@ -4042,6 +4042,75 @@ class TestPsCommand:
         assert result == 0
         mock_sleep.assert_not_called()
 
+    def test_ps_poll_negative_value_returns_error(self, tmp_path: Path, capsys):
+        """Negative --poll value returns exit code 1 with an error message."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=-1,
+        )
+
+        result = cmd_ps(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "error" in captured.err
+        assert "--poll" in captured.err
+        assert "-1" in captured.err
+
+    def test_ps_poll_zero_value_returns_error(self, tmp_path: Path, capsys):
+        """Zero --poll value returns exit code 1 with an error message."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=0,
+        )
+
+        result = cmd_ps(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "error" in captured.err
+
+    def test_ps_poll_no_ansi_codes_when_not_tty(self, tmp_path: Path, capsys):
+        """ANSI escape codes are not emitted when stdout is not a TTY."""
+        import argparse
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=False,
+            poll=5,
+        )
+
+        import unittest.mock as mock
+        with mock.patch("time.sleep", side_effect=KeyboardInterrupt):
+            result = cmd_ps(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        # capsys captures a non-TTY stream, so ANSI codes must be absent
+        assert "\033[2J" not in captured.out
+        assert "\033[H" not in captured.out
+
 
 class TestHelpOutput:
     """Tests for CLI help output."""

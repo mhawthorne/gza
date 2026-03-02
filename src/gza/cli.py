@@ -4138,9 +4138,13 @@ def cmd_ps(args: argparse.Namespace) -> int:
     poll_interval: int | None = getattr(args, "poll", None)
 
     if poll_interval is not None:
+        if poll_interval < 1:
+            print(f"error: --poll value must be at least 1 second (got {poll_interval})", file=sys.stderr)
+            return 1
         try:
             while True:
-                print("\033[2J\033[H", end="")  # clear screen, move cursor to top
+                if sys.stdout.isatty():
+                    print("\033[2J\033[H", end="")  # clear screen, move cursor to top
                 _print_ps_output(args, registry, store, poll_interval=poll_interval)
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
