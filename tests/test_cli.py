@@ -11894,18 +11894,17 @@ class TestAdvanceCommand:
         first_resume.completed_at = datetime.now(timezone.utc)
         store.update(first_resume)
 
-        # Default max_resume_attempts=1; original (depth=0) gets resumed,
-        # first_resume (depth=1) gets skipped
+        # Default max_resume_attempts=1; original is skipped (already has a child),
+        # first_resume (depth=1) is skipped (at max attempts)
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "max resume attempts" in result.stdout
 
-        # Only the original should have a new resume child
+        # Original should NOT get a new resume child (it already has first_resume)
         original_children = store.get_based_on_children(original.id)
-        resume_children = [c for c in original_children if c.id != first_resume.id]
-        assert len(resume_children) == 1  # original got resumed
-        # first_resume should not have any new children
+        assert len(original_children) == 1  # only the pre-existing first_resume
+        # first_resume should not have any new children (at max attempts)
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
 
@@ -11932,6 +11931,58 @@ class TestAdvanceCommand:
         # No new child should have been created (still just the one pre-existing)
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 1  # only the pre-existing child
+
+    def test_advance_skips_failed_task_with_completed_resume_child(self, tmp_path: Path):
+        """advance skips a failed task whose resume child already completed."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        # Create a completed resume child (simulating a successful resume)
+        child = store.add("Implement feature", task_type="implement")
+        child.based_on = failed_task.id
+        child.status = "completed"
+        store.update(child)
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # No new child should have been created
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1  # only the pre-existing completed child
+
+    def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
+        """advance skips a failed task whose resume child also failed (no double-resume of root)."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        self._setup_git_repo(tmp_path)
+
+        # Original task #198 equivalent — failed with MAX_STEPS
+        original = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        # Resume child #213 equivalent — also failed with MAX_STEPS
+        child = store.add("Implement feature", task_type="implement")
+        child.based_on = original.id
+        child.status = "failed"
+        child.failure_reason = "MAX_STEPS"
+        child.session_id = "sess-abc"
+        store.update(child)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # The original should NOT appear in the plan — only the child should
+        # (and the child should be skipped due to max resume attempts)
+        assert f"#{original.id}" not in result.stdout
+        assert "SKIP: max resume attempts" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
@@ -12025,17 +12076,18 @@ class TestAdvanceCommand:
         first_resume.completed_at = datetime.now(timezone.utc)
         store.update(first_resume)
 
-        # With --max-resume-attempts 2, first_resume (depth=1) should still be resumed
+        # With --max-resume-attempts 2, original is skipped (has child),
+        # first_resume (depth=1 < 2) gets resumed
         result = run_gza("advance", "--auto", "--max-resume-attempts", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Resume" in result.stdout
-        # Both original and first_resume should have new resume children
+        # Original should NOT get a new child (already has first_resume)
         original_children = store.get_based_on_children(original.id)
-        new_children_of_original = [c for c in original_children if c.id != first_resume.id]
-        assert len(new_children_of_original) == 1  # original got a new resume child
+        assert len(original_children) == 1  # only the pre-existing first_resume
+        # first_resume should get a new resume child (depth=1 < max=2)
         first_resume_children = store.get_based_on_children(first_resume.id)
-        assert len(first_resume_children) == 1  # first_resume also got a resume child
+        assert len(first_resume_children) == 1
 
 
 class TestStatsCommand:

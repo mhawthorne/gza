@@ -6405,11 +6405,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     for failed_task in failed_tasks:
         assert failed_task.id is not None
         failure_reason = failed_task.failure_reason or "UNKNOWN"
-        # Check for an already-pending/in_progress resume child
+        # If this task already has any resume children, skip it — the child
+        # task is what should be evaluated for further resume attempts, not this one.
         children = store.get_based_on_children(failed_task.id)
-        active_children = [c for c in children if c.status in ('pending', 'in_progress')]
-        if active_children:
-            # Already has a live resume attempt — skip silently
+        if children:
             continue
         # Check resume chain depth
         depth = store.count_resume_chain_depth(failed_task.id)
@@ -6429,6 +6428,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # the rationale. The sort is stable, preserving DB order within each group.
     # dry-run output inherits this order, so it accurately reflects execution.
     plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[1]['type'], 1))
+
+    # If the plan is empty or every item is a skip, there's nothing actionable.
+    if not plan or all(action['type'] == 'skip' for _, action in plan):
+        print("No eligible tasks to advance")
+        if plan:
+            print()
+            for task, action in plan:
+                prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+                print(f"  #{task.id} {prompt_display}")
+                print(f"      → {action['description']}")
+            print()
+        return 0
 
     if dry_run:
         print(f"Would advance {len(plan)} task(s):\n")
