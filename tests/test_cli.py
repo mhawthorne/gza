@@ -4328,6 +4328,88 @@ class TestPsCommand:
 
         registry.remove("w-test-autostop")
 
+    def test_ps_poll_captures_status_transition_without_all_flag(self, tmp_path: Path):
+        """Poll mode captures running→completed transition even without --all.
+
+        Regression test: without this fix, completed workers would remain as
+        'running' in seen_tasks because _build_ps_rows was called with
+        include_completed=False, so completed workers never appeared in live_rows.
+        """
+        import argparse
+        import json
+        import os
+        import unittest.mock as mock
+        from gza.cli import cmd_ps
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        worker = WorkerMetadata(
+            worker_id="w-test-transition",
+            pid=os.getpid(),
+            task_id=None,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(worker)
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(n: float) -> None:
+            sleep_calls.append(n)
+            # Transition worker to completed during the sleep after poll 1.
+            worker.status = "completed"
+            registry.update(worker)
+
+        # Deliberately use all=False to test the bug fix path.
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=False,
+            quiet=False,
+            json=True,
+            poll=2,
+        )
+
+        captured_outputs: list[str] = []
+        original_print = print
+
+        def capturing_print(*a, **kw):
+            if a:
+                captured_outputs.append(str(a[0]))
+            original_print(*a, **kw)
+
+        with mock.patch("builtins.print", side_effect=capturing_print):
+            with mock.patch("time.sleep", side_effect=fake_sleep):
+                result = cmd_ps(args)
+
+        assert result == 0
+        # Poll exited after one sleep (transition observed on second poll).
+        assert len(sleep_calls) == 1
+
+        # Find JSON outputs (lines that start with '[') and parse them.
+        json_outputs = [o for o in captured_outputs if o.startswith("[")]
+        assert len(json_outputs) == 2, f"Expected 2 JSON snapshots, got: {json_outputs}"
+
+        first_snapshot = json.loads(json_outputs[0])
+        second_snapshot = json.loads(json_outputs[1])
+
+        # First poll: worker was running.
+        assert len(first_snapshot) == 1
+        assert first_snapshot[0]["status"] == "running"
+
+        # Second poll: worker transitions to completed (not hidden or stuck as running).
+        assert len(second_snapshot) == 1
+        assert second_snapshot[0]["status"] == "completed"
+
+        registry.remove("w-test-transition")
+
     def test_ps_steps_column_uses_num_steps_computed_for_completed_task(self, tmp_path: Path):
         """STEPS column shows num_steps_computed for a completed task, without hitting the DB."""
         import json

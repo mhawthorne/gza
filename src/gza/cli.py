@@ -4250,7 +4250,10 @@ def _print_ps_output(
     """
     import datetime
     show_all = args.all if hasattr(args, "all") else False
-    live_rows, _ = _build_ps_rows(registry, store, include_completed=show_all)
+    # In poll mode, always include completed so we capture status transitions
+    # (running → completed) and don't lose tasks that finish between polls.
+    include_completed_for_query = True if seen_tasks is not None else show_all
+    live_rows, _ = _build_ps_rows(registry, store, include_completed=include_completed_for_query)
 
     # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
     if seen_tasks is not None:
