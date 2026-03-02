@@ -1082,6 +1082,67 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
     task_header(task.prompt, task.task_id or "", task.task_type)
 
+    # Register a foreground worker so `gza ps` can see this task is running.
+    # Background workers are already registered by _spawn_background_worker(),
+    # so we only register if no worker exists yet for this task.
+    fg_worker_id = _maybe_register_foreground_worker(config, task)
+
+    try:
+        return _run_inner(task, task_config, config, store, provider, git, resume=resume, open_after=open_after)
+    finally:
+        if fg_worker_id:
+            _cleanup_foreground_worker(config, fg_worker_id)
+
+
+def _maybe_register_foreground_worker(config: Config, task: "Task") -> str | None:
+    """Register a foreground worker entry if no worker already exists for this task.
+
+    Returns the worker_id if registered, None if a worker already existed.
+    """
+    from .workers import WorkerRegistry, WorkerMetadata
+
+    registry = WorkerRegistry(config.workers_path)
+
+    # Check if a background worker is already registered for this task
+    for w in registry.list_all(include_completed=False):
+        if w.task_id == task.id and w.status == "running":
+            return None
+
+    worker_id = registry.generate_worker_id()
+    worker = WorkerMetadata(
+        worker_id=worker_id,
+        pid=os.getpid(),
+        task_id=task.id,
+        task_slug=task.task_id,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status="running",
+        log_file=None,
+        worktree=None,
+        is_background=False,
+    )
+    registry.register(worker)
+    return worker_id
+
+
+def _cleanup_foreground_worker(config: Config, worker_id: str) -> None:
+    """Remove the foreground worker entry after task completes."""
+    from .workers import WorkerRegistry
+
+    registry = WorkerRegistry(config.workers_path)
+    registry.remove(worker_id)
+
+
+def _run_inner(
+    task: "Task",
+    task_config: Config,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: "Provider",
+    git: "Git | None",
+    resume: bool = False,
+    open_after: bool = False,
+) -> int:
+    """Inner task execution logic, split out to allow foreground worker cleanup."""
     # For explore, plan, and review tasks, run in project dir without creating a branch
     if task.task_type in ("explore", "plan", "review"):
         return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
