@@ -54,6 +54,22 @@ class DuplicateReviewError(ValueError):
         self.active_review = active_review
 
 
+# Shared color palette for history and stats output (readable on dark and light terminals)
+TASK_COLORS: dict[str, str] = {
+    "task_id": "#aaaaaa",   # light gray for task ID and date
+    "prompt": "#ff99cc",    # pink for prompt text
+    "branch": "cyan",       # cyan for branch name
+    "stats": "cyan",        # cyan for stats line
+    "success": "green",     # green for completed (✓)
+    "failure": "red",       # red for failed (✗)
+    "unmerged": "yellow",   # yellow for unmerged (⚡)
+    "orphaned": "yellow",   # yellow for orphaned (⚠)
+    "lineage": "#aaaaaa",   # light gray for lineage relationship labels
+    "header": "bold",       # bold for section headers
+    "label": "#aaaaaa",     # light gray for labels
+    "value": "white",       # white for values
+}
+
 
 def _run_foreground(
     config: Config,
@@ -885,31 +901,23 @@ def cmd_history(args: argparse.Namespace) -> int:
     status = getattr(args, 'status', None)
     task_type = getattr(args, 'type', None)
     incomplete = getattr(args, 'incomplete', False)
-    lookback_days = getattr(args, 'lookback_days', None)
+    days = getattr(args, 'days', None)
+    start_date = getattr(args, 'start_date', None)
+    end_date = getattr(args, 'end_date', None)
     lineage_depth = getattr(args, 'lineage_depth', 0)
 
     f = HistoryFilter(
-        limit=None if args.all else args.limit,
+        limit=None if args.all else args.last,
         status=status,
         task_type=task_type,
         incomplete=incomplete,
-        lookback_days=lookback_days,
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
         lineage_depth=lineage_depth,
     )
 
-    # Configurable colors for history output
-    HISTORY_COLORS = {
-        "task_id": "dim",          # dim for task ID and date (adapts to terminal background)
-        "prompt": "#ff99cc",       # pink for prompt text (works on dark and light)
-        "branch": "cyan",          # cyan for branch name (visible on dark and light)
-        "stats": "cyan",           # cyan for stats (visible on dark and light)
-        "success": "green",        # green for completed (✓)
-        "failure": "red",          # red for failed (✗)
-        "unmerged": "yellow",      # yellow for unmerged (⚡)
-        "orphaned": "yellow",      # yellow for orphaned (⚠)
-        "lineage": "dim",          # dim for lineage relationship labels
-    }
-    c = HISTORY_COLORS
+    c = TASK_COLORS
 
     def _render_task_line(task: DbTask, indent: str = "") -> None:
         """Render a single task entry."""
@@ -989,7 +997,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     if lineage_depth > 0:
         nodes = query_history_with_lineage(store, f)
         if not nodes and not orphaned:
-            _print_history_empty_message(status, task_type, incomplete, lookback_days)
+            _print_history_empty_message(status, task_type, incomplete, days)
             return 0
         # Show orphaned tasks at the top
         for task in orphaned:
@@ -999,7 +1007,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     else:
         recent = query_history(store, f)
         if not recent and not orphaned:
-            _print_history_empty_message(status, task_type, incomplete, lookback_days)
+            _print_history_empty_message(status, task_type, incomplete, days)
             return 0
 
         # Show orphaned tasks at the top so they're immediately visible
@@ -1017,13 +1025,13 @@ def _print_history_empty_message(
     status: str | None,
     task_type: str | None,
     incomplete: bool,
-    lookback_days: int | None,
+    days: int | None,
 ) -> None:
     """Print an appropriate 'no tasks found' message for gza history."""
     status_msg = f" with status '{status}'" if status else ""
     type_msg = f" with type '{task_type}'" if task_type else ""
     incomplete_msg = " (incomplete only)" if incomplete else ""
-    lookback_msg = f" in the last {lookback_days} days" if lookback_days is not None else ""
+    lookback_msg = f" in the last {days} days" if days is not None else ""
     console.print(
         f"No completed or failed tasks{status_msg}{type_msg}{incomplete_msg}{lookback_msg}"
     )
@@ -2199,6 +2207,8 @@ def _cmd_stats_cycles_task(config: Config, store: "SqliteTaskStore", impl_task_i
 
 def cmd_stats(args: argparse.Namespace) -> int:
     """Show cost and usage statistics."""
+    from gza.query import HistoryFilter, query_history
+
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -2212,40 +2222,66 @@ def cmd_stats(args: argparse.Namespace) -> int:
             return _cmd_stats_cycles_task(config, store, cycle_task_id, as_json)
         return _cmd_stats_cycles(config, store, as_json)
 
-    stats = store.get_stats()
-    if stats["completed"] == 0 and stats["failed"] == 0:
-        print("No completed or failed tasks")
+    # Build filter from shared query args
+    limit: int | None = None if getattr(args, 'all', False) else getattr(args, 'last', 5)
+    task_type: str | None = getattr(args, 'type', None)
+    days: int | None = getattr(args, 'days', None)
+    start_date: str | None = getattr(args, 'start_date', None)
+    end_date: str | None = getattr(args, 'end_date', None)
+
+    f = HistoryFilter(
+        limit=limit,
+        task_type=task_type,
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    tasks = query_history(store, f)
+
+    if not tasks:
+        console.print("No completed or failed tasks")
         return 0
 
     if as_json:
+        stats = store.get_stats()
         print(json.dumps(stats, indent=2))
         return 0
 
-    tasks_with_cost = stats["completed"] + stats["failed"]
-    avg_cost = stats["total_cost"] / tasks_with_cost if tasks_with_cost else 0
+    # Compute summary from filtered task list
+    c = TASK_COLORS
+    n_completed = sum(1 for t in tasks if t.status == "completed")
+    n_failed = sum(1 for t in tasks if t.status != "completed")
+    total_cost = sum(t.cost_usd or 0 for t in tasks)
+    total_duration = sum(t.duration_seconds or 0 for t in tasks)
+    total_steps = sum((get_task_step_count(t) or 0) for t in tasks)
+    tasks_with_cost = n_completed + n_failed
+    avg_cost = total_cost / tasks_with_cost if tasks_with_cost else 0
 
-    # Print summary
-    print("Summary")
-    print("=" * 50)
-    print(f"  Tasks:        {stats['completed']} completed, {stats['failed']} failed")
-    print(f"  Total cost:   ${stats['total_cost']:.2f}")
-    print(f"  Total time:   {format_duration(stats['total_duration'], verbose=True)}")
-    print(f"  Total steps:  {stats['total_steps']}")
+    # Section header
+    console.print(f"[{c['header']}]Summary[/{c['header']}]")
+    console.print("=" * 50)
+    console.print(
+        f"  [{c['label']}]Tasks:[/{c['label']}]       "
+        f"  [{c['success']}]{n_completed} completed[/{c['success']}]"
+        f", [{c['failure']}]{n_failed} failed[/{c['failure']}]"
+    )
+    console.print(
+        f"  [{c['label']}]Total cost:[/{c['label']}]   [{c['value']}]${total_cost:.2f}[/{c['value']}]"
+    )
+    console.print(
+        f"  [{c['label']}]Total time:[/{c['label']}]   [{c['value']}]{format_duration(total_duration, verbose=True)}[/{c['value']}]"
+    )
+    console.print(
+        f"  [{c['label']}]Total steps:[/{c['label']}]  [{c['value']}]{total_steps}[/{c['value']}]"
+    )
     if tasks_with_cost:
-        print(f"  Avg cost:     ${avg_cost:.2f}/task")
-    print()
+        console.print(
+            f"  [{c['label']}]Avg cost:[/{c['label']}]     [{c['value']}]${avg_cost:.2f}/task[/{c['value']}]"
+        )
+    console.print()
 
-    # Print recent tasks
-    limit = args.last
-    recent = store.get_history(limit=limit)
-
-    print(f"Recent Tasks (last {len(recent)})")
-    print("=" * 50)
-
-    # Import get_terminal_width
+    # Task table
     from .console import get_terminal_width
-
-    # Calculate available width (80% of terminal)
     terminal_width = get_terminal_width()
     table_width = int(terminal_width * 0.8)
 
@@ -2259,35 +2295,45 @@ def cmd_stats(args: argparse.Namespace) -> int:
     len_width = 5
 
     # Calculate remaining space for prompt column
-    fixed_width = status_width + id_width + type_width + cost_width + turns_width + time_width + len_width + 7  # 7 spaces between columns
-    prompt_width = max(20, table_width - fixed_width)  # At least 20 chars for prompt
+    fixed_width = status_width + id_width + type_width + cost_width + turns_width + time_width + len_width + 7
+    prompt_width = max(20, table_width - fixed_width)
 
-    # Table header
+    label = "All" if getattr(args, 'all', False) else f"Last {len(tasks)}"
+    console.print(f"[{c['header']}]{label} Tasks[/{c['header']}]")
+    console.print("=" * 50)
+
+    # Table header (plain text for alignment)
     print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Steps':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
     print("-" * table_width)
 
-    for task in recent:
-        status = "✓" if task.status == "completed" else "✗"
+    for task in tasks:
+        is_ok = task.status == "completed"
+        status_str = "✓" if is_ok else "✗"
+        status_col = f"[{c['success']}]{status_str}[/{c['success']}]" if is_ok else f"[{c['failure']}]{status_str}[/{c['failure']}]"
         id_str = f"#{task.id}" if task.id is not None else "-"
         type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
         resolved_steps = get_task_step_count(task)
         turns_str = str(resolved_steps) if resolved_steps is not None else "-"
         time_str = format_duration(task.duration_seconds, verbose=True) if task.duration_seconds else "-"
-
-        # Calculate prompt length
         prompt_len = len(task.prompt)
         len_str = str(prompt_len)
-
-        # Truncate prompt to fit calculated width
         prompt = task.prompt
         if len(prompt) > prompt_width:
             prompt = prompt[:prompt_width - 3] + "..."
 
-        print(f"{status:<{status_width}} {id_str:>{id_width}} {type_str:<{type_width}} {cost_str:>{cost_width}} {turns_str:>{turns_width}} {time_str:>{time_width}} {len_str:>{len_width}}  {prompt}")
+        # Use console.print for colorized status; pad manually to preserve alignment
+        id_col = f"[{c['task_id']}]{id_str:>{id_width}}[/{c['task_id']}]"
+        type_col = f"[{c['stats']}]{type_str:<{type_width}}[/{c['stats']}]"
+        prompt_col = f"[{c['prompt']}]{prompt}[/{c['prompt']}]"
+        console.print(
+            f"{status_col:<{status_width}} {id_col} {type_col} {cost_str:>{cost_width}} {turns_str:>{turns_width}} {time_str:>{time_width}} {len_str:>{len_width}}  {prompt_col}"
+        )
 
-    print()
-    print(f"Total for shown: ${sum(t.cost_usd or 0 for t in recent):.2f}")
+    console.print()
+    console.print(
+        f"[{c['label']}]Total for shown:[/{c['label']}] [{c['value']}]${sum(t.cost_usd or 0 for t in tasks):.2f}[/{c['value']}]"
+    )
 
     return 0
 
@@ -6775,6 +6821,46 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared query/filter arguments to a subparser (history, stats, etc.)."""
+    parser.add_argument(
+        "--last",
+        "-n",
+        type=int,
+        metavar="N",
+        help="Show last N tasks",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all tasks (no limit)",
+    )
+    parser.add_argument(
+        "--type",
+        type=str,
+        choices=["explore", "plan", "implement", "review", "improve"],
+        help="Filter tasks by task_type",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        help="Show only tasks from the last N days",
+    )
+    parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or after this date",
+    )
+    parser.add_argument(
+        "--end-date",
+        dest="end_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or before this date",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Gza - AI agent task runner",
@@ -6836,29 +6922,13 @@ def main() -> int:
     # history command
     history_parser = subparsers.add_parser("history", help="List recent completed/failed tasks")
     add_common_args(history_parser)
-    history_parser.add_argument(
-        "--limit",
-        "-n",
-        type=int,
-        default=10,
-        help="Number of recent tasks to show (default: 10)",
-    )
-    history_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Show all completed/failed tasks (no limit)",
-    )
+    _add_query_filter_args(history_parser)
+    history_parser.set_defaults(last=10)
     history_parser.add_argument(
         "--status",
         type=str,
         choices=["completed", "failed", "unmerged"],
         help="Filter tasks by status (e.g., completed, failed, unmerged)",
-    )
-    history_parser.add_argument(
-        "--type",
-        type=str,
-        choices=["explore", "plan", "implement", "review", "improve"],
-        help="Filter tasks by task_type (e.g., explore, plan, implement, review, improve)",
     )
     history_parser.add_argument(
         "--incomplete",
@@ -6867,13 +6937,6 @@ def main() -> int:
             "Show only tasks that have not been fully resolved "
             "(failed tasks, or completed tasks with unmerged commits)"
         ),
-    )
-    history_parser.add_argument(
-        "--lookback-days",
-        type=int,
-        dest="lookback_days",
-        metavar="N",
-        help="Show only tasks completed or created within the last N days",
     )
     history_parser.add_argument(
         "--lineage-depth",
@@ -7121,13 +7184,8 @@ def main() -> int:
     # stats command
     stats_parser = subparsers.add_parser("stats", help="Show cost and usage statistics")
     add_common_args(stats_parser)
-    stats_parser.add_argument(
-        "--last",
-        type=int,
-        default=5,
-        metavar="N",
-        help="Show last N tasks (default: 5)",
-    )
+    _add_query_filter_args(stats_parser)
+    stats_parser.set_defaults(last=5)
     stats_parser.add_argument(
         "--cycles",
         action="store_true",

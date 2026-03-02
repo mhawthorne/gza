@@ -1179,6 +1179,7 @@ class SqliteTaskStore:
         status: str | None = None,
         task_type: str | None = None,
         since: "datetime | None" = None,
+        until: "datetime | None" = None,
     ) -> list[Task]:
         """Get completed/failed tasks, most recent first.
 
@@ -1189,6 +1190,8 @@ class SqliteTaskStore:
             task_type: Filter by specific task_type (e.g., 'task', 'explore', 'plan', 'implement', 'review', 'improve')
                       If None, returns all task types
             since: If specified, only return tasks where completed_at >= since
+                   (falls back to created_at when completed_at is NULL)
+            until: If specified, only return tasks where completed_at <= until
                    (falls back to created_at when completed_at is NULL)
         """
         with self._connect() as conn:
@@ -1212,6 +1215,13 @@ class SqliteTaskStore:
                     "(completed_at >= ? OR (completed_at IS NULL AND created_at >= ?))"
                 )
                 params.extend([since_str, since_str])
+
+            if until is not None:
+                until_str = until.isoformat()
+                where_clauses.append(
+                    "(completed_at <= ? OR (completed_at IS NULL AND created_at <= ?))"
+                )
+                params.extend([until_str, until_str])
 
             where_clause = "WHERE " + " AND ".join(where_clauses)
 

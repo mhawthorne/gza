@@ -25,8 +25,24 @@ The `--project` (or `-C`) option specifies the target project directory and can 
 Options for `init`:
 - `--force` - Overwrite existing gza.yaml file
 
+Options for `history`:
+- `--last N` / `-n N` - Show last N tasks (default: 10)
+- `--all` - Show all tasks (no limit)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve)
+- `--days N` - Show only tasks from the last N days
+- `--start-date YYYY-MM-DD` - Show only tasks on or after this date
+- `--end-date YYYY-MM-DD` - Show only tasks on or before this date
+- `--status STATUS` - Filter by status (completed, failed, unmerged)
+- `--incomplete` - Show only unresolved tasks (failed or unmerged)
+- `--lineage-depth N` - Expand lineage N levels for each task
+
 Options for `stats`:
-- `--last N` - Show last N tasks (default: 5)
+- `--last N` / `-n N` - Show last N tasks (default: 5)
+- `--all` - Show all tasks (no limit)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve)
+- `--days N` - Show only tasks from the last N days
+- `--start-date YYYY-MM-DD` - Show only tasks on or after this date
+- `--end-date YYYY-MM-DD` - Show only tasks on or before this date
 
 ## Installing Claude Code Skills
 

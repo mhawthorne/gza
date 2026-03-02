@@ -21,7 +21,9 @@ class HistoryFilter:
     status: str | None = None  # 'completed' | 'failed' | 'unmerged'
     task_type: str | None = None  # 'task' | 'implement' | 'review' | ...
     incomplete: bool = False  # Only tasks not yet merged/resolved
-    lookback_days: int | None = None  # Only tasks within the last N days
+    days: int | None = None  # Only tasks within the last N days
+    start_date: str | None = None  # Only tasks on or after this date (YYYY-MM-DD)
+    end_date: str | None = None  # Only tasks on or before this date (YYYY-MM-DD)
     lineage_depth: int = 0  # Expand lineage N levels (0 = flat)
 
 
@@ -74,8 +76,16 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     gza scale (typically <1000 tasks).
     """
     since: datetime | None = None
-    if f.lookback_days is not None:
-        since = datetime.now(timezone.utc) - timedelta(days=f.lookback_days)
+    if f.days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=f.days)
+    elif f.start_date is not None:
+        since = datetime.fromisoformat(f.start_date).replace(tzinfo=timezone.utc)
+
+    until: datetime | None = None
+    if f.end_date is not None:
+        until = datetime.fromisoformat(f.end_date).replace(tzinfo=timezone.utc)
+        # Include the full end date day
+        until = until.replace(hour=23, minute=59, second=59)
 
     # When post-filtering for incomplete, defer the limit to after filtering
     effective_limit = None if f.incomplete else f.limit
@@ -85,6 +95,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
         status=f.status,
         task_type=f.task_type,
         since=since,
+        until=until,
     )
 
     if f.incomplete:
