@@ -37,6 +37,8 @@ DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
 DEFAULT_CLAUDE_ARGS = [
     "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash",
 ]
+DEFAULT_ADVANCE_CREATE_REVIEWS = True
+DEFAULT_ADVANCE_REQUIRES_REVIEW = True
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -265,6 +267,8 @@ class Config:
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
     docker_setup_command: str = ""  # Command to run inside container before CLI starts
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
+    advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
+    advance_requires_review: bool = DEFAULT_ADVANCE_REQUIRES_REVIEW
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -455,7 +459,8 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
-            "defaults", "task_types", "providers", "branch_strategy", "verify_command"
+            "defaults", "task_types", "providers", "branch_strategy", "verify_command",
+            "advance_create_reviews", "advance_requires_review",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -864,6 +869,9 @@ class Config:
             elif data.get("model"):
                 source_map["model"] = source_map.get("model", "base")
 
+        advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
+        advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -888,6 +896,8 @@ class Config:
             branch_strategy=branch_strategy,
             chat_text_display_length=chat_text_display_length,
             verify_command=data.get("verify_command", ""),
+            advance_create_reviews=advance_create_reviews,
+            advance_requires_review=advance_requires_review,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
@@ -930,7 +940,8 @@ class Config:
             "project_name", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
-            "defaults", "task_types", "providers", "branch_strategy", "verify_command"
+            "defaults", "task_types", "providers", "branch_strategy", "verify_command",
+            "advance_create_reviews", "advance_requires_review",
         }
 
         for key in data.keys():
@@ -1075,6 +1086,12 @@ class Config:
 
         if "verify_command" in data and not isinstance(data["verify_command"], str):
             errors.append("'verify_command' must be a string")
+
+        if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
+            errors.append("'advance_create_reviews' must be a boolean (true/false)")
+
+        if "advance_requires_review" in data and not isinstance(data["advance_requires_review"], bool):
+            errors.append("'advance_requires_review' must be a boolean (true/false)")
 
         # Validate defaults section
         if "defaults" in data:

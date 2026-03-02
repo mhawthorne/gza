@@ -6016,25 +6016,41 @@ def _determine_advance_action(
                     'review_task': latest_review,
                 }
 
-    # No reviews, or review was cleared by improve.
-    if not reviews:
-        # No review exists yet — create one for task types that support review.
-        if task.task_type == 'implement':
-            return {
-                'type': 'create_review',
-                'description': 'Create review (no review yet)',
-            }
-        # Non-implement types (plan, explore, improve, etc.) go straight to merge.
-        # improve tasks are already produced by a review cycle; they merge directly.
+    # Review was cleared by an improve task — always mergeable regardless of config.
+    if reviews:
+        return {
+            'type': 'merge',
+            'description': 'Merge (previous review addressed)',
+        }
+
+    # Reached only when no reviews exist (all earlier paths with reviews have returned).
+    # Non-implement types (plan, explore, improve, etc.) go straight to merge.
+    # improve tasks are already produced by a review cycle; they merge directly.
+    if task.task_type != 'implement':
         return {
             'type': 'merge',
             'description': 'Merge task (no review yet)',
         }
 
-    # review was cleared by improve (review_cleared=True) — merge directly.
+    # implement task with no review — consult config flags.
+    # Note: advance_create_reviews is only consulted when advance_requires_review=True.
+    # When advance_requires_review=False, tasks merge directly regardless of advance_create_reviews
+    # (there is no review gate, so creating one informally is not relevant).
+    if config.advance_requires_review:
+        if config.advance_create_reviews:
+            return {
+                'type': 'create_review',
+                'description': 'Create review (required before merge)',
+            }
+        else:
+            return {
+                'type': 'skip',
+                'description': 'SKIP: no review exists and advance_create_reviews=false (run gza review manually)',
+            }
+    # advance_requires_review=false — merge directly without a review.
     return {
         'type': 'merge',
-        'description': 'Merge (previous review addressed)',
+        'description': 'Merge task (no review yet)',
     }
 
 
