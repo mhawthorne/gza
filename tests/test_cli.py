@@ -12931,13 +12931,13 @@ class TestFormatLogEntry:
         """gza entry with subtype is formatted as [gza:subtype] message."""
         entry = {"type": "gza", "subtype": "branch", "message": "Branch: feat/foo", "branch": "feat/foo"}
         result = _format_log_entry(entry)
-        assert result == "[gza:branch] Branch: feat/foo"
+        assert result == r"[cyan]\[gza:branch][/cyan] Branch: feat/foo"
 
     def test_gza_entry_without_subtype_renders_correctly(self) -> None:
         """gza entry without subtype is formatted as [gza] message."""
         entry = {"type": "gza", "message": "Some info"}
         result = _format_log_entry(entry)
-        assert result == "[gza] Some info"
+        assert result == r"[cyan]\[gza][/cyan] Some info"
 
     def test_gza_entry_with_empty_message_returns_none(self) -> None:
         """gza entry with empty message returns None (should be skipped)."""
@@ -12949,13 +12949,13 @@ class TestFormatLogEntry:
         """gza outcome entry renders with subtype label."""
         entry = {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0}
         result = _format_log_entry(entry)
-        assert result == "[gza:outcome] Outcome: completed"
+        assert result == r"[cyan]\[gza:outcome][/cyan] Outcome: completed"
 
     def test_gza_entry_stats_renders_with_subtype(self) -> None:
         """gza stats entry renders with subtype label."""
         entry = {"type": "gza", "subtype": "stats", "message": "Stats: 5 steps, 12.3s, $0.0042", "duration_seconds": 12.3, "cost_usd": 0.0042, "num_steps": 5}
         result = _format_log_entry(entry)
-        assert result == "[gza:stats] Stats: 5 steps, 12.3s, $0.0042"
+        assert result == r"[cyan]\[gza:stats][/cyan] Stats: 5 steps, 12.3s, $0.0042"
 
     def test_gza_log_entry_renders_in_gza_log_output(self, tmp_path: Path) -> None:
         """Integration: gza log renders gza entries from a JSONL log file."""

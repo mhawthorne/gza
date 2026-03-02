@@ -12,6 +12,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape as rich_escape
+
 from .config import Config, ConfigError
 from .console import (
     console,
@@ -3080,22 +3082,22 @@ def _display_step_timeline(entries: list[dict], *, verbose: bool) -> None:
     """Render a step-first timeline in compact or verbose mode."""
     steps = _build_step_timeline(entries)
     if not steps:
-        print("No step entries found.")
+        console.print("No step entries found.", soft_wrap=True)
         return
 
     for step in steps:
-        title = f"[Step {step['step_id']}]"
+        title = f"[cyan]\\[Step {step['step_id']}][/cyan]"
         message_text = step.get("message_text")
         summary = step.get("summary")
         if message_text:
-            print(f"{title} {message_text}")
+            console.print(f"{title} {rich_escape(message_text)}", soft_wrap=True)
         elif summary:
-            print(f"{title} {summary}")
+            console.print(f"{title} {rich_escape(summary)}", soft_wrap=True)
         else:
-            print(title)
+            console.print(title, soft_wrap=True)
         if verbose:
             for substep in step["substeps"]:
-                print(f"  [{substep['substep_id']}] {substep['detail']}")
+                console.print(f"  [green]\\[{substep['substep_id']}][/green] {rich_escape(substep['detail'])}", soft_wrap=True)
 
 
 def _format_log_entry(entry: dict) -> str | None:
@@ -3108,8 +3110,8 @@ def _format_log_entry(entry: dict) -> str | None:
     if entry_type == "system":
         subtype = entry.get("subtype", "")
         if subtype == "init":
-            model = entry.get("model", "unknown")
-            return f"[system] Session initialized (model: {model})"
+            model = rich_escape(str(entry.get("model", "unknown")))
+            return f"[cyan]\\[system][/cyan] Session initialized (model: {model})"
         return None  # Skip other system messages
 
     elif entry_type == "user":
@@ -3118,14 +3120,13 @@ def _format_log_entry(entry: dict) -> str | None:
         parts = []
         for item in content:
             if item.get("type") == "tool_result":
-                tool_id = item.get("tool_use_id", "")[:8]
                 result = item.get("content", "")
                 if isinstance(result, str):
                     # Unescape literal \n from double-escaped JSON (Claude Code logging artifact)
                     result = result.replace("\\n", "\n").replace("\\t", "\t")
                     if len(result) > 200:
                         result = result[:200] + "..."
-                parts.append(f"[tool result {tool_id}] {result}")
+                parts.append(rich_escape(str(result)))
         if parts:
             return "\n".join(parts)
         return None
@@ -3136,52 +3137,52 @@ def _format_log_entry(entry: dict) -> str | None:
         for item in content:
             if item.get("type") == "text":
                 text = item.get("text", "")
-                parts.append(text)
+                parts.append(rich_escape(text))
             elif item.get("type") == "tool_use":
-                name = item.get("name", "unknown")
+                name = rich_escape(item.get("name", "unknown"))
                 tool_input = item.get("input", {})
                 # Show condensed tool use info
-                if name == "Bash":
+                if item.get("name") == "Bash":
                     cmd = tool_input.get("command", "")
                     if len(cmd) > 100:
                         cmd = cmd[:100] + "..."
-                    parts.append(f"[tool: {name}] {cmd}")
-                elif name == "Read":
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(cmd)}")
+                elif item.get("name") == "Read":
                     path = tool_input.get("file_path", "")
-                    parts.append(f"[tool: {name}] {path}")
-                elif name == "Edit":
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(path)}")
+                elif item.get("name") == "Edit":
                     path = tool_input.get("file_path", "")
-                    parts.append(f"[tool: {name}] {path}")
-                elif name == "Write":
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(path)}")
+                elif item.get("name") == "Write":
                     path = tool_input.get("file_path", "")
-                    parts.append(f"[tool: {name}] {path}")
-                elif name == "Grep":
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(path)}")
+                elif item.get("name") == "Grep":
                     pattern = tool_input.get("pattern", "")
                     path = tool_input.get("path", "")
                     glob = tool_input.get("glob", "")
                     type_filter = tool_input.get("type", "")
 
                     # Format: pattern [path] (filter)
-                    output = f"[tool: {name}] {pattern}"
+                    detail = rich_escape(pattern)
                     if path:
-                        output += f" [{path}]"
+                        detail += f" \\[{rich_escape(path)}]"
                     if glob:
-                        output += f" (glob: {glob})"
+                        detail += f" (glob: {rich_escape(glob)})"
                     elif type_filter:
-                        output += f" (type: {type_filter})"
-                    parts.append(output)
-                elif name == "Glob":
+                        detail += f" (type: {rich_escape(type_filter)})"
+                    parts.append(f"[green]\\[tool: {name}][/green] {detail}")
+                elif item.get("name") == "Glob":
                     pattern = tool_input.get("pattern", "")
-                    parts.append(f"[tool: {name}] {pattern}")
-                elif name == "TodoWrite":
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(pattern)}")
+                elif item.get("name") == "TodoWrite":
                     todos = tool_input.get("todos", [])
                     in_progress = [t for t in todos if t.get("status") == "in_progress"]
                     if in_progress:
-                        parts.append(f"[tool: {name}] {in_progress[0].get('activeForm', '')}")
+                        parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(in_progress[0].get('activeForm', ''))}")
                     else:
-                        parts.append(f"[tool: {name}]")
+                        parts.append(f"[green]\\[tool: {name}][/green]")
                 else:
-                    parts.append(f"[tool: {name}]")
+                    parts.append(f"[green]\\[tool: {name}][/green]")
         if parts:
             return "\n".join(parts)
         return None
@@ -3191,18 +3192,18 @@ def _format_log_entry(entry: dict) -> str | None:
         is_error = entry.get("is_error", False)
         subtype = str(entry.get("subtype") or "")
         if is_error:
-            return f"[result] ERROR: {result}"
+            return f"[red]\\[result] ERROR:[/red] {rich_escape(str(result))}"
         if subtype and subtype != "success":
             if isinstance(result, str) and result.strip():
-                return f"[result] {subtype}: {result.strip()}"
-            return f"[result] {subtype}"
+                return f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result.strip())}"
+            return f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]"
         # For success, show summary if available
         duration = entry.get("duration_ms", 0)
         num_steps = _result_step_count(entry) or 0
         cost = entry.get("total_cost_usd", 0)
-        summary = f"[result] Completed in {num_steps} steps, {duration/1000:.1f}s, ${cost:.4f}"
+        summary = f"[green]\\[result][/green] Completed in {num_steps} steps, {duration/1000:.1f}s, ${cost:.4f}"
         if isinstance(result, str) and result.strip():
-            return f"{summary}\n{result.strip()}"
+            return f"{summary}\n{rich_escape(result.strip())}"
         return summary
 
     elif entry_type == "gza":
@@ -3211,8 +3212,8 @@ def _format_log_entry(entry: dict) -> str | None:
         if not message:
             return None
         if subtype:
-            return f"[gza:{subtype}] {message}"
-        return f"[gza] {message}"
+            return f"[cyan]\\[gza:{rich_escape(subtype)}][/cyan] {rich_escape(message)}"
+        return f"[cyan]\\[gza][/cyan] {rich_escape(message)}"
 
     return None
 
@@ -3534,36 +3535,41 @@ def cmd_log(args: argparse.Namespace) -> int:
         if log_data is None and not entries:
             # If we have content but couldn't parse any JSON, it's likely a startup error
             if content:
-                print("Task failed during startup (no Claude session):")
+                console.print("[red]Task failed during startup (no Claude session):[/red]", soft_wrap=True)
                 # Display the raw error message, indented for clarity
                 for line in content.split('\n'):
-                    print(f"  {line}")
+                    console.print(f"  {rich_escape(line)}", soft_wrap=True)
                 return 1
             else:
-                print("Error: No log entries found in log file")
+                console.print("Error: No log entries found in log file", soft_wrap=True)
                 return 1
     except Exception as e:
         print(f"Error: Failed to read log file: {e}")
         return 1
 
     # Display header
-    print("=" * 70)
+    _sep = "[cyan]" + "━" * 70 + "[/cyan]"
+    console.print(_sep, soft_wrap=True)
     if task:
         prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
-        print(f"Task: {prompt_display}")
-        print(f"ID: {task.id} | Slug: {task.task_id}")
-        print(f"Status: {task.status}")
+        console.print(f"[#ff99cc]Task: {rich_escape(prompt_display)}[/#ff99cc]", soft_wrap=True)
+        console.print(f"[cyan]ID:[/cyan] {task.id} | [cyan]Slug:[/cyan] {rich_escape(task.task_id or '')}", soft_wrap=True)
+        _status_color = {"completed": "green", "unmerged": "green", "failed": "red", "in_progress": "yellow"}.get(task.status, "")
+        _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
+        console.print(f"[cyan]Status:[/cyan] {_status_val}", soft_wrap=True)
         if resolution_note:
-            print(f"Run selection: {resolution_note}")
-        print(f"Log: {log_path}")
+            console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
+        console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
         if task.branch:
-            print(f"Branch: {task.branch}")
+            console.print(f"[cyan]Branch:[/cyan] {rich_escape(task.branch)}", soft_wrap=True)
     elif worker:
-        print(f"Worker: {worker.worker_id}")
-        print(f"Status: {'running' if is_running else 'completed'}")
-        print(f"Log: {log_path}")
-    print("=" * 70)
-    print()
+        console.print(f"[cyan]Worker:[/cyan] {rich_escape(worker.worker_id)}", soft_wrap=True)
+        _w_status = "running" if is_running else "completed"
+        _w_color = "yellow" if is_running else "green"
+        console.print(f"[cyan]Status:[/cyan] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
+        console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+    console.print(_sep, soft_wrap=True)
+    console.print()
 
     timeline_mode = getattr(args, "timeline_mode", None)
     if timeline_mode and entries:
@@ -3573,46 +3579,46 @@ def cmd_log(args: argparse.Namespace) -> int:
         rendered = [line for line in formatted_entries if line]
         if rendered:
             for line in rendered:
-                print(line)
+                console.print(line, soft_wrap=True)
         elif log_data:
             if "result" in log_data:
-                print(log_data["result"])
+                console.print(rich_escape(log_data["result"]), soft_wrap=True)
             else:
                 subtype = log_data.get("subtype", "unknown")
-                print(f"Run ended with: {subtype}")
+                console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
                 if log_data.get("errors"):
-                    print(f"Errors: {log_data['errors']}")
+                    console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
         else:
-            print("No displayable log entries found.")
+            console.print("No displayable log entries found.", soft_wrap=True)
     elif log_data:
         # Extract and display the result field (which contains markdown)
         if "result" in log_data:
-            print(log_data["result"])
+            console.print(rich_escape(log_data["result"]), soft_wrap=True)
         else:
             # No result - show the subtype (e.g., error_max_turns)
             subtype = log_data.get("subtype", "unknown")
-            print(f"Run ended with: {subtype}")
+            console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
             if log_data.get("errors"):
-                print(f"Errors: {log_data['errors']}")
+                console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
     else:
         # No result entry yet - show compact step timeline
         _display_step_timeline(entries, verbose=False)
 
-    print()
-    print("=" * 70)
+    console.print()
+    console.print(_sep, soft_wrap=True)
 
     # Display summary stats if available
     if log_data:
         if "duration_ms" in log_data:
             duration_sec = log_data["duration_ms"] / 1000
-            print(f"Duration: {format_duration(duration_sec, verbose=True)}")
+            console.print(f"[cyan]Duration:[/cyan] {format_duration(duration_sec, verbose=True)}", soft_wrap=True)
         step_count = _result_step_count(log_data)
         if step_count is not None:
-            print(f"Steps: {step_count}")
+            console.print(f"[cyan]Steps:[/cyan] {step_count}", soft_wrap=True)
             if "num_steps" not in log_data and "num_steps_reported" not in log_data and "num_turns" in log_data:
-                print(f"Legacy turns: {log_data['num_turns']}")
+                console.print(f"[cyan]Legacy turns:[/cyan] {log_data['num_turns']}", soft_wrap=True)
         if "total_cost_usd" in log_data:
-            print(f"Cost: ${log_data['total_cost_usd']:.4f}")
+            console.print(f"[cyan]Cost:[/cyan] ${log_data['total_cost_usd']:.4f}", soft_wrap=True)
 
     return 0
 
@@ -3669,13 +3675,13 @@ def _tail_log_file(
                     if output:
                         formatted.append(output)
                 except json.JSONDecodeError:
-                    formatted.append(line)
+                    formatted.append(rich_escape(line))
             return formatted
 
         # Initial read
         formatted = read_and_format_lines(log_path, tail_lines)
         for line in formatted:
-            print(line)
+            console.print(line, soft_wrap=True)
 
         if not follow:
             return 0
@@ -3705,9 +3711,9 @@ def _tail_log_file(
                         entry = json.loads(line)
                         output = _format_log_entry(entry)
                         if output:
-                            print(output)
+                            console.print(output, soft_wrap=True)
                     except json.JSONDecodeError:
-                        print(line)
+                        console.print(rich_escape(line), soft_wrap=True)
 
             # Check if worker is still running
             if worker_id and not registry.is_running(worker_id):
@@ -3723,9 +3729,9 @@ def _tail_log_file(
                         entry = json.loads(line)
                         output = _format_log_entry(entry)
                         if output:
-                            print(output)
+                            console.print(output, soft_wrap=True)
                     except json.JSONDecodeError:
-                        print(line)
+                        console.print(rich_escape(line), soft_wrap=True)
                 break
 
             # Fallback for task-based follow without a running worker ID.
@@ -3744,9 +3750,9 @@ def _tail_log_file(
                             entry = json.loads(line)
                             output = _format_log_entry(entry)
                             if output:
-                                print(output)
+                                console.print(output, soft_wrap=True)
                         except json.JSONDecodeError:
-                            print(line)
+                            console.print(rich_escape(line), soft_wrap=True)
                     break
 
         return 0
