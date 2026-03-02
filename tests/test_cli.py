@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import json
 import re
 import subprocess
 import os
@@ -12363,9 +12364,6 @@ class TestFormatLogEntry:
 
     def test_gza_log_entry_renders_in_gza_log_output(self, tmp_path: Path) -> None:
         """Integration: gza log renders gza entries from a JSONL log file."""
-        import json
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -12391,3 +12389,38 @@ class TestFormatLogEntry:
         assert result.returncode == 0
         assert "Branch: feat/test" in result.stdout
         assert "Outcome: completed" in result.stdout
+
+
+class TestBuildStepTimeline:
+    """Tests for _build_step_timeline with gza entries."""
+
+    def test_gza_metadata_subtypes_do_not_produce_timeline_steps(self) -> None:
+        """branch, stats, and outcome entries are not added as timeline steps."""
+        entries = [
+            {"type": "gza", "subtype": "branch", "message": "Branch: feat/foo", "branch": "feat/foo"},
+            {"type": "gza", "subtype": "stats", "message": "Stats: 3 steps, 10.0s, $0.001", "num_steps": 3},
+            {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0},
+        ]
+        steps = _build_step_timeline(entries)
+        assert steps == []
+
+    def test_gza_info_subtype_produces_timeline_step(self) -> None:
+        """info entries are added as timeline steps."""
+        entries = [
+            {"type": "gza", "subtype": "info", "message": "Task: #1 20260101-test-task"},
+        ]
+        steps = _build_step_timeline(entries)
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "[gza:info] Task: #1 20260101-test-task"
+
+    def test_gza_metadata_mixed_with_info_only_info_appears(self) -> None:
+        """Only info entries appear in timeline when mixed with metadata entries."""
+        entries = [
+            {"type": "gza", "subtype": "branch", "message": "Branch: feat/foo"},
+            {"type": "gza", "subtype": "info", "message": "Task: #1 slug"},
+            {"type": "gza", "subtype": "stats", "message": "Stats: 1 step, 5.0s, $0.0001"},
+            {"type": "gza", "subtype": "outcome", "message": "Outcome: completed"},
+        ]
+        steps = _build_step_timeline(entries)
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "[gza:info] Task: #1 slug"

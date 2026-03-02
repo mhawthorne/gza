@@ -2981,11 +2981,14 @@ def _build_step_timeline(entries: list[dict]) -> list[dict]:
             current_step = None
 
         elif entry_type == "gza":
-            message = entry.get("message", "")
             subtype = entry.get("subtype", "")
-            if message:
-                label = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
-                current_step = _append_timeline_step(steps, label)
+            if subtype in ("branch", "stats", "outcome"):
+                pass  # metadata only — skip timeline
+            else:
+                message = entry.get("message", "")
+                if message:
+                    label = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
+                    current_step = _append_timeline_step(steps, label)
 
         elif entry_type == "item.completed":
             item = entry.get("item", {})
