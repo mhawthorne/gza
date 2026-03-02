@@ -309,7 +309,7 @@ class TestPromptBuilderReviewTask:
         """Test that review task prompt references the implementation task ID."""
         result = PromptBuilder().review_task_prompt(impl_task_id=15)
         assert "15" in result
-        assert "implementation" in result.lower()
+        assert result.startswith("Review task #15")
 
     def test_review_task_prompt_with_impl_prompt(self):
         """Test that review task prompt includes implementation prompt excerpt."""
@@ -338,7 +338,7 @@ class TestPromptBuilderReviewTask:
     def test_review_task_prompt_format_without_impl_prompt(self):
         """Test the format when no impl prompt is given includes self-contained diff guidance."""
         result = PromptBuilder().review_task_prompt(impl_task_id=3)
-        assert result.startswith("Review the implementation from task #3")
+        assert result.startswith("Review task #3")
         assert "changed-files list" in result
         assert "inline diff/context" in result
         assert "git discovery commands" in result
