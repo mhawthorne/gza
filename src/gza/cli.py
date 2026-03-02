@@ -5912,10 +5912,16 @@ def _determine_advance_action(
 
         if not review_cleared:
             # Active (non-cleared) review exists
-            if latest_review.status in ('pending', 'in_progress'):
+            if latest_review.status == 'pending':
+                return {
+                    'type': 'run_review',
+                    'description': f'Spawn worker for pending review #{latest_review.id}',
+                    'review_task': latest_review,
+                }
+            if latest_review.status == 'in_progress':
                 return {
                     'type': 'wait_review',
-                    'description': f'SKIP: review #{latest_review.id} is {latest_review.status}',
+                    'description': f'SKIP: review #{latest_review.id} is in_progress',
                     'review_task': latest_review,
                 }
 
@@ -5930,11 +5936,18 @@ def _determine_advance_action(
                 # Check if an improve task is already pending/in_progress
                 assert latest_review.id is not None
                 existing_improve = store.get_improve_tasks_for(task.id, latest_review.id)
-                active_improve = [t for t in existing_improve if t.status in ('pending', 'in_progress')]
-                if active_improve:
+                active_improve_running = [t for t in existing_improve if t.status == 'in_progress']
+                if active_improve_running:
                     return {
                         'type': 'wait_improve',
-                        'description': f'SKIP: improve task #{active_improve[0].id} already {active_improve[0].status}',
+                        'description': f'SKIP: improve task #{active_improve_running[0].id} is in_progress',
+                    }
+                active_improve_pending = [t for t in existing_improve if t.status == 'pending']
+                if active_improve_pending:
+                    return {
+                        'type': 'run_improve',
+                        'description': f'Spawn worker for pending improve #{active_improve_pending[0].id}',
+                        'improve_task': active_improve_pending[0],
                     }
                 return {
                     'type': 'improve',
@@ -6153,6 +6166,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print(f"      ✗ Failed to start review worker")
                 error_count += 1
 
+        elif action_type == 'run_review':
+            # Spawn worker for an existing pending review task
+            review_task = action['review_task']
+            assert review_task.id is not None
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+            )
+            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            if rc == 0:
+                print(f"      ✓ Started review worker for #{review_task.id}")
+                success_count += 1
+            else:
+                print(f"      ✗ Failed to start review worker for #{review_task.id}")
+                error_count += 1
+
         elif action_type == 'improve':
             review_task = action['review_task']
             assert review_task.id is not None
@@ -6181,6 +6210,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 success_count += 1
             else:
                 print(f"      ✗ Failed to start improve worker")
+                error_count += 1
+
+        elif action_type == 'run_improve':
+            # Spawn worker for an existing pending improve task
+            improve_task = action['improve_task']
+            assert improve_task.id is not None
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+            )
+            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            if rc == 0:
+                print(f"      ✓ Started improve worker for #{improve_task.id}")
+                success_count += 1
+            else:
+                print(f"      ✗ Failed to start improve worker for #{improve_task.id}")
                 error_count += 1
 
         print()

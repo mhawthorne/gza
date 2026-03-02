@@ -10160,8 +10160,8 @@ class TestAdvanceCommand:
         )
         assert merged_count == 2
 
-    def test_advance_skips_pending_review(self, tmp_path: Path):
-        """advance skips a task whose review is still pending."""
+    def test_advance_spawns_worker_for_pending_review(self, tmp_path: Path):
+        """advance spawns a worker for a pending review instead of skipping."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -10181,8 +10181,32 @@ class TestAdvanceCommand:
 
         result = run_gza("advance", "--project", str(tmp_path))
         assert result.returncode == 0
+        assert "Started review worker" in result.stdout
+
+    def test_advance_waits_for_in_progress_review(self, tmp_path: Path):
+        """advance skips a task whose review is in_progress."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create an in_progress review
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "in_progress"
+        store.update(review_task)
+
+        result = run_gza("advance", "--project", str(tmp_path))
+        assert result.returncode == 0
         assert "SKIP" in result.stdout
-        assert "pending" in result.stdout
+        assert "in_progress" in result.stdout
 
     def test_advance_task_not_found(self, tmp_path: Path):
         """advance with non-existent task ID returns error."""
