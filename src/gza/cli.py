@@ -52,6 +52,67 @@ class DuplicateReviewError(ValueError):
 
 
 
+def _run_foreground(
+    config: Config,
+    task_id: int | None,
+    resume: bool = False,
+    open_after: bool = False,
+) -> int:
+    """Run a task in the foreground with worker registration.
+
+    Wraps run() with foreground worker registration so that gza ps/next/history
+    can correctly identify actively running foreground tasks.
+
+    Args:
+        config: Configuration object
+        task_id: Task ID to run
+        resume: Whether this is a resume run
+        open_after: Whether to open the output after completion
+    """
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = registry.generate_worker_id()
+
+    worker = WorkerMetadata(
+        worker_id=worker_id,
+        pid=os.getpid(),
+        task_id=task_id,
+        task_slug=None,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status="running",
+        log_file=None,
+        worktree=None,
+        is_background=False,
+    )
+    registry.register(worker)
+
+    # Save original signal handlers so we can restore them in the finally block
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _cleanup(signum, frame):
+        registry.mark_completed(worker_id, exit_code=1, status="failed")
+        # Restore original handlers and re-raise so caller can handle
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
+
+    exit_code = 1
+    try:
+        exit_code = run(config, task_id=task_id, resume=resume, open_after=open_after)
+        status = "completed" if exit_code == 0 else "failed"
+        registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+        return exit_code
+    except KeyboardInterrupt:
+        registry.mark_completed(worker_id, exit_code=1, status="failed")
+        return 130
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None) -> int:
     """Spawn a background worker process.
 
@@ -3791,7 +3852,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
 
     # Default: run the implement task immediately
     print(f"\nRunning implement task #{impl_task.id}...")
-    return run(config, task_id=impl_task.id)
+    return _run_foreground(config, task_id=impl_task.id)
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -4638,7 +4699,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     # Default: run the new task immediately
     print(f"\nRunning task #{new_task.id}...")
-    return run(config, task_id=new_task.id)
+    return _run_foreground(config, task_id=new_task.id)
 
 
 def _default_mark_completed_mode(task_type: str) -> str:
@@ -4829,7 +4890,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     # Default: run the improve task immediately
     print(f"\nRunning improve task #{improve_task.id}...")
-    return run(config, task_id=improve_task.id)
+    return _run_foreground(config, task_id=improve_task.id)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -4907,7 +4968,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     print(f"\nRunning review task #{review_task.id}...")
     open_after = hasattr(args, 'open') and args.open
-    return run(config, task_id=review_task.id, open_after=open_after)
+    return _run_foreground(config, task_id=review_task.id, open_after=open_after)
 
 
 def cmd_iterate(args: argparse.Namespace) -> int:
@@ -5020,7 +5081,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         store.update_cycle_iteration(iter_record.id, review_task_id=review_task.id)
 
         print(f"  Running review #{review_task.id}...")
-        rc = run(config, task_id=review_task.id)
+        rc = _run_foreground(config, task_id=review_task.id)
         if rc != 0:
             print(f"  Review #{review_task.id} failed (exit code {rc})")
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
@@ -5087,7 +5148,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         store.update_cycle_iteration(iter_record.id, improve_task_id=improve_task.id, state="improve_created")
 
         print(f"  Running improve #{improve_task.id}...")
-        rc = run(config, task_id=improve_task.id)
+        rc = _run_foreground(config, task_id=improve_task.id)
         if rc != 0:
             print(f"  Improve #{improve_task.id} failed (exit code {rc})")
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
@@ -5212,7 +5273,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 0
 
     # Default: run the new resume task immediately
-    return run(config, task_id=new_task.id, resume=True)
+    return _run_foreground(config, task_id=new_task.id, resume=True)
 
 
 def _resolve_task_log_path(config: Config, task: DbTask) -> Path | None:

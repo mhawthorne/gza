@@ -12966,3 +12966,112 @@ class TestBuildStepTimeline:
         steps = _build_step_timeline(entries)
         assert len(steps) == 1
         assert steps[0]["message_text"] == "[gza:info] Task: #1 slug"
+
+
+class TestRunForeground:
+    """Tests for _run_foreground() helper."""
+
+    def test_run_foreground_registers_and_completes_worker(self, tmp_path: Path):
+        """_run_foreground registers a worker before running and marks it completed after."""
+        from gza.cli import _run_foreground
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Test foreground task")
+        assert task.id is not None
+
+        workers_path = config.workers_path
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        with patch("gza.cli.run", return_value=0) as mock_run:
+            rc = _run_foreground(config, task_id=task.id)
+
+        assert rc == 0
+        mock_run.assert_called_once_with(config, task_id=task.id, resume=False, open_after=False)
+
+        # Worker should now be marked completed
+        registry = WorkerRegistry(workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        w = workers[0]
+        assert w.task_id == task.id
+        assert w.status == "completed"
+        assert w.exit_code == 0
+        assert w.is_background is False
+
+    def test_run_foreground_marks_failed_on_nonzero_exit(self, tmp_path: Path):
+        """_run_foreground marks worker as failed when run() returns non-zero."""
+        from gza.cli import _run_foreground
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Test failing task")
+        assert task.id is not None
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+
+        with patch("gza.cli.run", return_value=1):
+            rc = _run_foreground(config, task_id=task.id)
+
+        assert rc == 1
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        w = workers[0]
+        assert w.status == "failed"
+        assert w.exit_code == 1
+
+    def test_run_foreground_passes_resume_and_open_after(self, tmp_path: Path):
+        """_run_foreground correctly passes resume and open_after to run()."""
+        from gza.cli import _run_foreground
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Test task")
+        assert task.id is not None
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+
+        with patch("gza.cli.run", return_value=0) as mock_run:
+            rc = _run_foreground(config, task_id=task.id, resume=True, open_after=True)
+
+        assert rc == 0
+        mock_run.assert_called_once_with(config, task_id=task.id, resume=True, open_after=True)
+
+    def test_run_foreground_marks_failed_on_keyboard_interrupt(self, tmp_path: Path):
+        """_run_foreground marks worker as failed when interrupted."""
+        from gza.cli import _run_foreground
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Test interrupt task")
+        assert task.id is not None
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+
+        with patch("gza.cli.run", side_effect=KeyboardInterrupt):
+            rc = _run_foreground(config, task_id=task.id)
+
+        assert rc == 130
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        w = workers[0]
+        assert w.status == "failed"
