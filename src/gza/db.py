@@ -833,7 +833,7 @@ class SqliteTaskStore:
         """Convert a database row to a Task."""
         return Task(
             id=row["id"],
-            prompt=row["prompt"],
+            prompt=row["prompt"].decode("utf-8", errors="replace") if isinstance(row["prompt"], bytes) else row["prompt"],
             status=row["status"],
             task_type=row["task_type"],
             task_id=row["task_id"],
