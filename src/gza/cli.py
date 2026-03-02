@@ -4265,6 +4265,10 @@ def _print_ps_output(
     else:
         rows = live_rows
 
+    # Unless --all, filter out completed/failed tasks from display
+    if not show_all:
+        rows = [r for r in rows if r["status"] not in ("completed", "failed")]
+
     if poll_interval is not None:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         print(f"Refreshing every {poll_interval}s — last updated: {now}  (Ctrl+C to exit)")
