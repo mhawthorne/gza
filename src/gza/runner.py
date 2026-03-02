@@ -236,6 +236,7 @@ def generate_task_id(
     log_path: Path | None = None,
     git: Git | None = None,
     project_name: str | None = None,
+    slug_override: str | None = None,
 ) -> str:
     """Generate a task ID in YYYYMMDD-slug format, with suffix for retries."""
     if existing_id:
@@ -244,7 +245,7 @@ def generate_task_id(
     else:
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
-        slug = slugify(prompt)
+        slug = slug_override if slug_override is not None else slugify(prompt)
         base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
@@ -258,6 +259,43 @@ def generate_task_id(
         suffix += 1
         new_id = f"{base_id}-{suffix}"
     return new_id
+
+
+def _slug_from_task_id(task_id: str) -> str:
+    """Extract the slug portion from a task_id (strips date prefix and retry suffix)."""
+    parts = task_id.split('-', 1)
+    if len(parts) == 2:
+        slug = parts[1]
+        # Remove retry suffix (-2, -3, etc.)
+        slug = re.sub(r'-\d+$', '', slug)
+        return slug
+    return task_id
+
+
+def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
+    """Compute a slug_override for review/implement/improve tasks.
+
+    Uses a type prefix ('rev', 'impl', 'impr') followed by the root task's slug.
+    Returns None for other task types (slug is derived from prompt as usual).
+    """
+    prefix_map = {
+        "review": "rev",
+        "implement": "impl",
+        "improve": "impr",
+    }
+    prefix = prefix_map.get(task.task_type)
+    if prefix is None:
+        return None
+
+    from . import _query
+    root = _query.resolve_lineage_root(store, task)
+
+    if root.task_id:
+        root_slug = _slug_from_task_id(root.task_id)
+    else:
+        root_slug = slugify(root.prompt)
+
+    return f"{prefix}-{root_slug}"
 
 
 def _task_id_exists(task_id: str, log_path: Path | None, git: Git | None, project_name: str | None) -> bool:
@@ -1083,12 +1121,14 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     # Always generate when task_id is not set (new tasks, including new resume tasks).
     # Keep existing task_id only when resuming a task that already has one assigned.
     if task.task_id is None:
+        slug_override = _compute_slug_override(task, store)
         task.task_id = generate_task_id(
             task.prompt,
             existing_id=None,
             log_path=config.log_path,
             git=git,
             project_name=config.project_name,
+            slug_override=slug_override,
         )
 
     task_header(task.prompt, task.task_id or "", task.task_type)
