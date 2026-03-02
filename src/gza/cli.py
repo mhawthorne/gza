@@ -5958,8 +5958,8 @@ def _determine_advance_action(
                 if t.status == 'completed' and t.completed_at is not None
             ]
             if completed_improves:
-                latest_improve = max(completed_improves, key=lambda t: t.completed_at)
-                if latest_improve.completed_at > latest_review.completed_at:
+                latest_improve = max(completed_improves, key=lambda t: t.completed_at or datetime.min)
+                if latest_improve.completed_at is not None and latest_improve.completed_at > latest_review.completed_at:
                     return {
                         'type': 'create_review',
                         'description': 'Create review (code changed since last review)',
