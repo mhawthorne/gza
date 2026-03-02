@@ -1010,12 +1010,6 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     # Get effective model and provider for this task
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
-    # Log if per-task overrides differ from resolved values (defensive; should not normally differ)
-    if task.model and task.model != effective_model:
-        console.print(f"Task model override: {task.model} -> resolved: {effective_model}")
-    if task.provider and task.provider != effective_provider:
-        console.print(f"Task provider override: {task.provider} -> resolved: {effective_provider}")
-
     # Persist resolved model and provider to the task DB row immediately so analytics
     # can track which model actually ran the task, even if it crashes before completion.
     task.model = effective_model

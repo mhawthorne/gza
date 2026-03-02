@@ -1745,6 +1745,112 @@ class TestResumeVerificationPrompt:
         assert "Complete this task: Implement feature Y" in prompt
 
 
+class TestPersistResolvedConfig:
+    """Tests for persisting resolved model and provider to the task DB row."""
+
+    def test_resolved_model_and_provider_persisted_before_provider_runs(self, tmp_path: Path):
+        """Test that resolved model and provider are written to the DB before the provider runs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Create a pending task with no model/provider set
+        task = store.add(prompt="Implement feature Z", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
+        config.get_max_steps_for_task.return_value = 50
+
+        # Track store.update calls and what task.model/provider looked like at call time
+        persisted_states: list[dict] = []
+        original_update = store.update
+
+        def spy_update(t):
+            persisted_states.append({"model": t.model, "provider": t.provider})
+            return original_update(t)
+
+        store.update = spy_update  # type: ignore[method-assign]
+
+        provider_called_after_update = []
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None):
+            # Record whether store.update was already called with persisted values
+            provider_called_after_update.append(
+                any(s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude" for s in persisted_states)
+            )
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=3,
+                cost_usd=0.01,
+                session_id="session-xyz",
+                error_type=None,
+            )
+
+        with patch("gza.runner.get_provider") as mock_get_provider, \
+             patch("gza.runner.Git") as mock_git_class, \
+             patch("gza.runner.load_dotenv"), \
+             patch("gza.runner.SqliteTaskStore", return_value=store):
+
+            mock_provider = Mock()
+            mock_provider.name = "claude"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = False
+            mock_git.worktree_add = Mock()
+            mock_git.worktree_list.return_value = []
+            mock_git.count_commits_ahead.return_value = 0
+
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = False
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = ""
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            run(config, task_id=task.id)
+
+        # store.update must have been called with the resolved model and provider
+        assert any(
+            s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude"
+            for s in persisted_states
+        ), f"Expected store.update called with resolved model/provider, got: {persisted_states}"
+
+        # The persist must have happened before the provider ran
+        assert provider_called_after_update and provider_called_after_update[0], \
+            "store.update with resolved values must occur before provider.run is called"
+
+        # Verify the task in the DB has the resolved values
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.model == "claude-sonnet-4-6"
+        assert updated_task.provider == "claude"
+
+
 class TestWIPFunctionality:
     """Tests for WIP (Work In Progress) save/restore functionality."""
 
