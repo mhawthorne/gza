@@ -1,12 +1,18 @@
 """Tests for the CLI commands."""
 
+import argparse
+import io
 import re
 import subprocess
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+
+from gza.db import SqliteTaskStore
+from gza.cli import cmd_advance
 
 LOG_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "logs"
 
@@ -10929,12 +10935,165 @@ class TestAdvanceCommand:
         assert len(all_reviews) == 1  # only the original review
         assert store.get(task.id).merge_status == "merged"
 
+    def test_advance_batch_limits_worker_spawning(self, tmp_path: Path):
+        """advance --batch B stops after B workers have been started."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create 3 implement tasks, each with a pending review (triggers run_review)
+        tasks = []
+        for i in range(3):
+            task = self._create_implement_task_with_branch(store, git, tmp_path, f"Feature {i}")
+            store.add(
+                f"Review #{task.id}",
+                task_type="review",
+                depends_on=task.id,
+            )
+            tasks.append(task)
+
+        spawn_calls = []
+
+        def fake_spawn(worker_args, config, task_id):
+            spawn_calls.append(task_id)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=2,
+            no_docker=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                rc = cmd_advance(args)
+                output = mock_stdout.getvalue()
+
+        assert rc == 0
+        # Only 2 workers should have been started, not 3
+        assert len(spawn_calls) == 2
+        # The third task should show a batch limit message
+        assert "batch limit reached" in output
+        assert f"#{tasks[2].id}" in output
+
+    def test_advance_batch_merge_does_not_count_toward_limit(self, tmp_path: Path):
+        """advance --batch B: merge actions don't count toward the worker limit."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create 2 tasks that will merge (no reviews)
+        merge_tasks = [
+            self._create_implement_task_with_branch(store, git, tmp_path, f"Merge {i}")
+            for i in range(2)
+        ]
+
+        # Create 2 tasks with pending reviews (will spawn workers)
+        worker_tasks = []
+        for i in range(2):
+            task = self._create_implement_task_with_branch(store, git, tmp_path, f"Worker {i}")
+            store.add(
+                f"Review #{task.id}",
+                task_type="review",
+                depends_on=task.id,
+            )
+            worker_tasks.append(task)
+
+        spawn_calls = []
+
+        def fake_spawn(worker_args, config, task_id):
+            spawn_calls.append(task_id)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            no_docker=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        # Both merge tasks should be merged (they don't count toward batch)
+        for t in merge_tasks:
+            assert store.get(t.id).merge_status == "merged"
+        # Only 1 worker should have been spawned (batch=1)
+        assert len(spawn_calls) == 1
+
+    def test_advance_batch_enforced_on_failed_spawn(self, tmp_path: Path):
+        """advance --batch 1 attempts only one spawn even when the first spawn fails."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create 2 implement tasks, each with a pending review (triggers run_review)
+        for i in range(2):
+            task = self._create_implement_task_with_branch(store, git, tmp_path, f"Feature {i}")
+            store.add(
+                f"Review #{task.id}",
+                task_type="review",
+                depends_on=task.id,
+            )
+
+        spawn_calls = []
+
+        def fake_spawn_first_fails(worker_args, config, task_id):
+            spawn_calls.append(task_id)
+            # First call fails, second would succeed — but with batch=1 it should never be called
+            return 1 if len(spawn_calls) == 1 else 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            no_docker=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn_first_fails):
+            rc = cmd_advance(args)
+
+        # With batch=1, the failed spawn still counts toward the limit,
+        # so only 1 spawn attempt should be made (not 2)
+        assert len(spawn_calls) == 1
+
+    def test_advance_batch_zero_returns_error(self, tmp_path: Path):
+        """advance --batch 0 is rejected with an error message."""
+        setup_config(tmp_path)
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=0,
+            no_docker=True,
+        )
+        rc = cmd_advance(args)
+        assert rc == 1
+
     def test_advance_spawn_worker_failure_increments_error_count(self, tmp_path: Path):
         """advance returns 1 when _spawn_background_worker fails for an improve task."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -10971,10 +11130,6 @@ class TestAdvanceCommand:
 
     def test_advance_interactive_shows_plan_and_prompts(self, tmp_path: Path):
         """advance without --auto shows plan and prompts for confirmation."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11004,10 +11159,6 @@ class TestAdvanceCommand:
 
     def test_advance_interactive_aborts_on_no(self, tmp_path: Path):
         """advance without --auto exits without executing when user answers 'n'."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11042,10 +11193,6 @@ class TestAdvanceCommand:
 
     def test_advance_interactive_eof_aborts(self, tmp_path: Path):
         """advance without --auto exits cleanly when stdin is closed (EOFError)."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11070,10 +11217,6 @@ class TestAdvanceCommand:
 
     def test_advance_auto_flag_skips_prompt(self, tmp_path: Path):
         """advance --auto executes without prompting."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)

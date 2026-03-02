@@ -6113,9 +6113,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
     dry_run: bool = args.dry_run
     auto: bool = getattr(args, 'auto', False)
     max_tasks: int | None = getattr(args, 'max', None)
+    batch_limit: int | None = getattr(args, 'batch', None)
     task_id: int | None = getattr(args, 'task_id', None)
     plans_mode: bool = getattr(args, 'plans', False)
     create_mode: bool = getattr(args, 'create', False)
+
+    if batch_limit is not None and batch_limit < 1:
+        print("Error: --batch must be a positive integer", file=sys.stderr)
+        return 1
 
     # --plans mode: list completed plans without implementations
     if plans_mode:
@@ -6194,6 +6199,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     success_count = 0
     skip_count = 0
     error_count = 0
+    workers_started = 0
 
     for task, action in plan:
         assert task.id is not None
@@ -6205,6 +6211,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"      {action['description']}")
             skip_count += 1
             continue
+
+        # Worker-spawning actions: check batch limit before proceeding
+        if action_type in ('run_review', 'run_improve', 'create_review', 'improve'):
+            if batch_limit is not None and workers_started >= batch_limit:
+                print(f"  #{task.id} {prompt_display}")
+                print(f"      — batch limit reached ({workers_started}/{batch_limit}), skipping")
+                print()
+                skip_count += 1
+                continue
 
         print(f"  #{task.id} {prompt_display}")
         print(f"      → {action['description']}")
@@ -6258,6 +6273,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started review worker")
                 success_count += 1
@@ -6274,6 +6290,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started review worker for #{review_task.id}")
                 success_count += 1
@@ -6304,6 +6321,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started improve worker")
                 success_count += 1
@@ -6320,6 +6338,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_turns=None,
             )
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            workers_started += 1
             if rc == 0:
                 print(f"      ✓ Started improve worker for #{improve_task.id}")
                 success_count += 1
@@ -6517,6 +6536,12 @@ def main() -> int:
         action="store_true",
         dest="auto",
         help="Skip confirmation prompt and execute immediately (for scripts/cron)",
+    )
+    advance_parser.add_argument(
+        "--batch",
+        type=int,
+        metavar="B",
+        help="Stop after spawning B background workers. Merge actions do not count toward this limit.",
     )
 
     # refresh command
