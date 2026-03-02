@@ -5,14 +5,17 @@ import io
 import re
 import subprocess
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from gza.cli import _determine_advance_action, cmd_advance
+from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.cli import cmd_advance
+from gza.git import Git
 
 LOG_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "logs"
 
@@ -11329,10 +11332,6 @@ class TestAdvanceCommand:
 
     def test_advance_requires_review_true_create_true_creates_review_for_unreviewed(self, tmp_path: Path):
         """advance creates a review when advance_requires_review=True, advance_create_reviews=True."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\n"
@@ -11353,6 +11352,7 @@ class TestAdvanceCommand:
             auto=True,
             max=None,
             no_docker=True,
+            batch=None,
         )
 
         with patch("gza.cli._spawn_background_worker", return_value=0):
@@ -11366,11 +11366,6 @@ class TestAdvanceCommand:
 
     def test_advance_requires_review_true_create_false_skips_unreviewed(self, tmp_path: Path):
         """advance skips unreviewed implement tasks when advance_create_reviews=False."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import _determine_advance_action
-        from gza.config import Config
-        from gza.git import Git
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\n"
@@ -11390,9 +11385,6 @@ class TestAdvanceCommand:
 
     def test_advance_requires_review_false_merges_unreviewed(self, tmp_path: Path):
         """advance merges unreviewed implement tasks when advance_requires_review=False."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\n"
@@ -11412,6 +11404,7 @@ class TestAdvanceCommand:
             auto=True,
             max=None,
             no_docker=True,
+            batch=None,
         )
 
         rc = cmd_advance(args)
@@ -11424,11 +11417,6 @@ class TestAdvanceCommand:
 
     def test_advance_review_cleared_always_merges_regardless_of_config(self, tmp_path: Path):
         """advance merges when review is cleared by improve, even with advance_requires_review=True."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
-        import time
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\n"
@@ -11465,6 +11453,7 @@ class TestAdvanceCommand:
             auto=True,
             max=None,
             no_docker=True,
+            batch=None,
         )
 
         with patch("gza.cli._spawn_background_worker", return_value=0):
@@ -11473,13 +11462,11 @@ class TestAdvanceCommand:
         assert rc == 0
         assert store.get(task.id).merge_status == "merged"
 
+    # Planned test #5 (advance_requires_review=True, APPROVED review → merge) is covered by
+    # the pre-existing test_advance_merges_approved_task, which verifies this happy path.
+
     def test_advance_default_config_creates_review_for_unreviewed(self, tmp_path: Path):
         """advance creates a review for unreviewed implement tasks with default config."""
-        import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import _determine_advance_action
-        from gza.config import Config
-        from gza.git import Git
         # Default config — no explicit advance_* flags
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"

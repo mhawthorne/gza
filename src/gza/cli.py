@@ -6023,7 +6023,7 @@ def _determine_advance_action(
             'description': 'Merge (previous review addressed)',
         }
 
-    # No reviews at all.
+    # Reached only when no reviews exist (all earlier paths with reviews have returned).
     # Non-implement types (plan, explore, improve, etc.) go straight to merge.
     # improve tasks are already produced by a review cycle; they merge directly.
     if task.task_type != 'implement':
@@ -6033,6 +6033,9 @@ def _determine_advance_action(
         }
 
     # implement task with no review — consult config flags.
+    # Note: advance_create_reviews is only consulted when advance_requires_review=True.
+    # When advance_requires_review=False, tasks merge directly regardless of advance_create_reviews
+    # (there is no review gate, so creating one informally is not relevant).
     if config.advance_requires_review:
         if config.advance_create_reviews:
             return {
