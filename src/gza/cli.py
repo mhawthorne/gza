@@ -790,87 +790,14 @@ def _create_improve_task(
     )
 
 
-def _get_task_slug(task: DbTask) -> str | None:
-    """Return the full slug including any trailing revision suffix (e.g. 'my-feature-2').
-
-    Strips only the leading date prefix (YYYYMMDD-). Revision suffixes such as
-    '-2', '-3' are preserved so callers that need an exact match against the
-    original task_id slug string get the right value.
-
-    Use ``_extract_task_slug`` instead when you want the *base* slug with the
-    revision suffix removed (e.g. for display or for matching across revisions).
-    """
-    if not task.task_id:
-        return None
-    match = re.match(r"^\d{8}-(.+)$", task.task_id)
-    return match.group(1) if match else task.task_id
-
-
-def _get_reviews_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
-    """Get reviews for a root task, with fallback for unlinked manual reviews."""
-    if root_task.id is None:
-        return []
-    reviews = store.get_reviews_for_task(root_task.id)
-    if reviews:
-        return reviews
-
-    slug = _get_task_slug(root_task)
-    if not slug:
-        return []
-    return store.get_unlinked_reviews_for_slug(slug)
-
-
-def _task_time_for_lineage(task: DbTask) -> datetime:
-    """Return best-effort timestamp for lineage ordering."""
-    return task.completed_at or task.created_at or datetime.min
-
-
-def _get_improves_for_root_task(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
-    """Get improve tasks related to the root implementation task."""
-    if root_task.id is None:
-        return []
-    return [
-        task for task in store.get_all()
-        if task.task_type == "improve" and task.based_on == root_task.id
-    ]
-
-
-def _get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[DbTask]:
-    """Get implement tasks that depend on or are based on a given task."""
-    return [
-        t for t in store.get_all()
-        if t.task_type == "implement"
-        and (t.based_on == task_id or t.depends_on == task_id)
-    ]
-
-
-def _build_lineage_tasks_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
-    """Build deduplicated lineage tasks for a root task, including dependency chains."""
-    seen_ids: set[int] = set()
-    all_tasks: list[DbTask] = []
-
-    def _collect(task: DbTask) -> None:
-        if task.id is None or task.id in seen_ids:
-            return
-        seen_ids.add(task.id)
-        all_tasks.append(task)
-
-        for review in _get_reviews_for_root_task(store, task):
-            if review.id is not None and review.id not in seen_ids:
-                seen_ids.add(review.id)
-                all_tasks.append(review)
-
-        for improve in _get_improves_for_root_task(store, task):
-            if improve.id is not None and improve.id not in seen_ids:
-                seen_ids.add(improve.id)
-                all_tasks.append(improve)
-
-        if task.id is not None:
-            for downstream in _get_downstream_impls(store, task.id):
-                _collect(downstream)
-
-    _collect(root_task)
-    return sorted(all_tasks, key=_task_time_for_lineage)
+from gza._query import (
+    get_task_slug as _get_task_slug,
+    get_reviews_for_root as _get_reviews_for_root_task,
+    task_time_for_lineage as _task_time_for_lineage,
+    get_improves_for_root as _get_improves_for_root_task,
+    build_lineage as _build_lineage_tasks_for_root,
+    resolve_lineage_root as _resolve_lineage_root_task,
+)
 
 
 def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc") -> str:
@@ -884,35 +811,6 @@ def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "#cccccc")
             f"[dim]\\[{lineage_task.task_type}][/dim]"
         )
     return " -> ".join(lineage_parts)
-
-
-def _resolve_lineage_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    """Resolve the root task for lineage display, walking up through dependency links."""
-    # For review tasks, navigate to the implementation they review
-    if task.task_type == "review" and task.depends_on:
-        depends = store.get(task.depends_on)
-        if depends is not None:
-            task = depends
-
-    # For improve tasks, navigate to the implementation they improve
-    if task.task_type == "improve" and task.based_on:
-        based = store.get(task.based_on)
-        if based is not None:
-            task = based
-
-    # Walk the based_on chain upward to find the topmost ancestor (e.g. a plan)
-    current = task
-    seen: set[int] = set()
-    if current.id is not None:
-        seen.add(current.id)
-    while current.based_on:
-        next_task = store.get(current.based_on)
-        if next_task is None or next_task.id is None or next_task.id in seen:
-            break
-        seen.add(next_task.id)
-        current = next_task
-
-    return current
 
 
 def cmd_history(args: argparse.Namespace) -> int:
