@@ -16,6 +16,7 @@ from .config import Config, ConfigError
 from .console import (
     console,
     format_duration,
+    get_terminal_width,
     truncate,
     MAX_PROMPT_DISPLAY_SHORT,
     MAX_PROMPT_DISPLAY,
@@ -4278,17 +4279,36 @@ def _print_ps_output(
         print(json_lib.dumps(rows, indent=2))
         return
 
-    print(
+    # Color scheme for ps output
+    STATUS_COLORS = {
+        "running": "green",
+        "in_progress": "green",
+        "completed": "cyan",
+        "failed": "red",
+        "stale": "yellow",
+        "unknown": "yellow",
+    }
+
+    header = (
         f"{'TASK ID':<10} {'WORKER ID':<20} {'PID':<8} {'TYPE':<6} "
         f"{'STATUS':<12} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
-    print("-" * 124)
+    console.print(f"[bold]{header}[/bold]", soft_wrap=True)
+    console.print("[bold]" + "─" * 124 + "[/bold]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
-        print(
-            f"{task_id_display:<10} {row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} "
-            f"{row['status']:<12} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} {row['task']}"
+        status = row['status']
+        sc = STATUS_COLORS.get(status, "white")
+
+        # Escape Rich markup in task display (may contain brackets from truncation)
+        task_display = row['task'].replace('[', '\\[') if row['task'] else ''
+
+        console.print(
+            f"[cyan]{task_id_display:<10}[/cyan] {row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} "
+            f"[{sc}]{status:<12}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
+            f"[#ff99cc]{task_display}[/#ff99cc]",
+            soft_wrap=True,
         )
 
 
@@ -4382,13 +4402,13 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
     """Print a warning about orphaned tasks with a suggestion to resume."""
     count = len(orphaned)
     plural = "tasks" if count != 1 else "task"
-    print(f"\n⚠  {count} orphaned {plural} found (in-progress with no active worker):")
+    console.print(f"\n[yellow]⚠  {count} orphaned {plural} found (in-progress with no active worker):[/yellow]")
     for task in orphaned:
-        type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
+        type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        print(f"   (#{task.id}) {type_label}{prompt_display}")
-    print("   Run 'gza work <id>' to resume, or 'gza mark-completed --force <id>' to clear.")
+        console.print(f"   [cyan](#{task.id})[/cyan] {type_label}[#ff99cc]{prompt_display}[/#ff99cc]")
+    console.print("   Run [cyan]gza work <id>[/cyan] to resume, or [cyan]gza mark-completed --force <id>[/cyan] to clear.")
 
 
 def _ps_sort_key(row: dict) -> tuple[bool, str, int, str]:
@@ -6335,10 +6355,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Determine effective max_resume_attempts
     max_resume_attempts = max_resume_attempts_override if max_resume_attempts_override is not None else config.max_resume_attempts
 
+    new_mode: bool = getattr(args, 'new', False)
+
     max_review_cycles_override: int | None = getattr(args, 'max_review_cycles', None)
 
     if max_review_cycles_override is not None:
         config.max_review_cycles = max_review_cycles_override
+
+    if new_mode and batch_limit is None:
+        print("Error: --new requires --batch", file=sys.stderr)
+        return 1
 
     if batch_limit is not None and batch_limit < 1:
         print("Error: --batch must be a positive integer", file=sys.stderr)
@@ -6382,7 +6408,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Also collect resumable failed tasks (unless disabled)
         failed_tasks = [] if no_resume_failed else store.get_resumable_failed_tasks()
 
-    if not tasks and not failed_tasks:
+    if not tasks and not failed_tasks and not new_mode:
         print("No eligible tasks to advance")
         return 0
 
@@ -6429,17 +6455,27 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # dry-run output inherits this order, so it accurately reflects execution.
     plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[1]['type'], 1))
 
-    # If the plan is empty or every item is a skip, there's nothing actionable.
+    # If the plan is empty or every item is a skip, there's nothing actionable
+    # (unless --new is set, in which case we still want to start pending tasks).
     if not plan or all(action['type'] == 'skip' for _, action in plan):
-        print("No eligible tasks to advance")
-        if plan:
-            print()
-            for task, action in plan:
-                prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-                print(f"  #{task.id} {prompt_display}")
-                print(f"      → {action['description']}")
-            print()
-        return 0
+        if not new_mode:
+            print("No eligible tasks to advance")
+            if plan:
+                print()
+                for task, action in plan:
+                    prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+                    print(f"  #{task.id} {prompt_display}")
+                    print(f"      → {action['description']}")
+                print()
+            return 0
+        else:
+            # --new with no existing actions: skip straight to spawning new tasks
+            if plan:
+                for task, action in plan:
+                    prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+                    print(f"  #{task.id} {prompt_display}")
+                    print(f"      → {action['description']}")
+                print()
 
     if dry_run:
         print(f"Would advance {len(plan)} task(s):\n")
@@ -6448,17 +6484,53 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"  #{task.id} {prompt_display}")
             print(f"      → {action['description']}")
             print()
+        if new_mode and batch_limit is not None:
+            worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'improve', 'resume'})
+            planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+            remaining = max(0, batch_limit - planned_workers)
+            if remaining > 0:
+                pending_tasks = store.get_pending(limit=remaining)
+                if pending_tasks:
+                    prompt_width = int(get_terminal_width() * 0.7)
+                    print(f"Would start {len(pending_tasks)} new pending task(s):\n")
+                    for pt in pending_tasks:
+                        flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
+                        prompt_display = truncate(flat_prompt, prompt_width)
+                        console.print(f"  [cyan]#{pt.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                        console.print(f"      [cyan]→ Start new worker[/cyan]")
+                        print()
+                else:
+                    print("No pending tasks available to fill batch\n")
         return 0
 
     # Show the plan and prompt for confirmation
-    print(f"Will advance {len(plan)} task(s):\n")
-    for task, action in plan:
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        print(f"  #{task.id} {prompt_display}")
-        print(f"      → {action['description']}")
-        print()
+    actionable_plan = [item for item in plan if item[1]['type'] != 'skip']
+    if actionable_plan:
+        print(f"Will advance {len(actionable_plan)} task(s):\n")
+        for task, action in plan:
+            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+            print(f"  #{task.id} {prompt_display}")
+            print(f"      → {action['description']}")
+            print()
 
-    if not auto:
+    new_pending_tasks: list = []
+    if new_mode and batch_limit is not None:
+        worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'improve', 'resume'})
+        planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+        remaining = max(0, batch_limit - planned_workers)
+        if remaining > 0:
+            new_pending_tasks = store.get_pending(limit=remaining)
+            if new_pending_tasks:
+                prompt_width = int(get_terminal_width() * 0.7)
+                print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
+                for pt in new_pending_tasks:
+                    flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
+                    prompt_display = truncate(flat_prompt, prompt_width)
+                    console.print(f"  [cyan]#{pt.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                    console.print(f"      [cyan]→ Start new worker[/cyan]")
+                    print()
+
+    if not auto and (actionable_plan or new_mode):
         try:
             answer = input("Proceed? [Y/n] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -6643,6 +6715,24 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 error_count += 1
 
         print()
+
+    # --new: start pending tasks to fill remaining batch slots
+    if new_mode and batch_limit is not None and workers_started < batch_limit:
+        remaining = batch_limit - workers_started
+        new_started = 0
+        for _ in range(remaining):
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+            )
+            rc = _spawn_background_worker(worker_args, config)
+            if rc != 0:
+                break  # no more pending tasks or error
+            new_started += 1
+            workers_started += 1
+        if new_started > 0:
+            print(f"Started {new_started} new pending task(s) to fill batch")
+            success_count += new_started
 
     print(f"Advanced: {success_count} task(s), skipped: {skip_count}, errors: {error_count}")
 
@@ -6870,6 +6960,11 @@ def main() -> int:
         metavar="N",
         dest="max_review_cycles",
         help="Override max_review_cycles config value for this run",
+    )
+    advance_parser.add_argument(
+        "--new",
+        action="store_true",
+        help="Start new pending tasks to fill remaining --batch slots (requires --batch)",
     )
 
     # refresh command

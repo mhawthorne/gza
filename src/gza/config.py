@@ -451,14 +451,14 @@ class Config:
         config_path = cls.config_path(project_dir)
         data, source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
 
-        if local_overrides_active and local_override_path:
-            project_key = str(project_dir.resolve())
-            if project_key not in _LOCAL_OVERRIDE_NOTICE_SHOWN:
-                print(
-                    f"Notice: local config overrides active from {local_override_path.name}",
-                    file=sys.stderr,
-                )
-                _LOCAL_OVERRIDE_NOTICE_SHOWN.add(project_key)
+        # if local_overrides_active and local_override_path:
+        #     project_key = str(project_dir.resolve())
+        #     if project_key not in _LOCAL_OVERRIDE_NOTICE_SHOWN:
+        #         print(
+        #             f"Notice: local config overrides active from {local_override_path.name}",
+        #             file=sys.stderr,
+        #         )
+        #         _LOCAL_OVERRIDE_NOTICE_SHOWN.add(project_key)
 
         # Validate and warn about unknown keys
         valid_fields = {
