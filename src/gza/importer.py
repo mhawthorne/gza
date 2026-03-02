@@ -13,7 +13,7 @@ from .db import SqliteTaskStore, Task
 class ImportTask:
     """A task parsed from an import file."""
     prompt: str
-    task_type: str = "task"
+    task_type: str = "implement"
     group: str | None = None
     depends_on: int | None = None  # Local index (1-based)
     review: bool = False
@@ -107,10 +107,10 @@ def _parse_task(
         return None, errors
 
     # Optional fields
-    task_type = data.get("type", "task")
-    if task_type not in ("task", "explore", "plan", "implement", "review", "improve"):
+    task_type = data.get("type", "implement")
+    if task_type not in ("explore", "plan", "implement", "review", "improve"):
         errors.append(ValidationError(
-            f"Invalid task type '{task_type}'. Must be: task, explore, plan, implement, review, improve",
+            f"Invalid task type '{task_type}'. Must be: explore, plan, implement, review, improve",
             task_index=index
         ))
 
@@ -273,7 +273,7 @@ def import_tasks(
         if dry_run:
             # Don't create, just report what would happen
             prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt
-            type_label = f"[{import_task.task_type}] " if import_task.task_type != "task" else ""
+            type_label = f"[{import_task.task_type}] " if import_task.task_type != "implement" else ""
             group_label = f" (group: {import_task.group})" if import_task.group else ""
             dep_label = f" (depends on #{import_task.depends_on})" if import_task.depends_on else ""
             review_label = " (review: true)" if import_task.review else ""
@@ -296,7 +296,7 @@ def import_tasks(
 
             results.append(ImportResult(task=task, local_index=i))
             prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt
-            type_label = f", {import_task.task_type}" if import_task.task_type != "task" else ""
+            type_label = f", {import_task.task_type}" if import_task.task_type != "implement" else ""
             dep_label = f", depends on #{depends_on_id}" if depends_on_id else ""
             messages.append(f"  ✓ Created: {prompt_preview} (#{task.id}{type_label}{dep_label})")
 

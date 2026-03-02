@@ -40,7 +40,7 @@ class TestBuildPrompt:
 
         task = store.add(
             prompt="Implement feature X",
-            task_type="task",
+            task_type="implement",
         )
 
         config = Mock(spec=Config)
@@ -85,7 +85,7 @@ class TestBuildPrompt:
 
         task = store.add(
             prompt="Implement feature Z",
-            task_type="task",
+            task_type="implement",
         )
 
         config = Mock(spec=Config)
@@ -128,7 +128,7 @@ class TestBuildPrompt:
 
         task = store.add(
             prompt="Implement feature X",
-            task_type="task",
+            task_type="implement",
         )
 
         config = Mock(spec=Config)
@@ -152,7 +152,7 @@ class TestBuildPrompt:
 
         task = store.add(
             prompt="Implement feature X",
-            task_type="task",
+            task_type="implement",
         )
 
         config = Mock(spec=Config)
@@ -170,7 +170,7 @@ class TestBuildPrompt:
 
         task = store.add(
             prompt="One-off experimental task",
-            task_type="task",
+            task_type="implement",
             skip_learnings=True,
         )
 
@@ -193,7 +193,7 @@ class TestBuildPrompt:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        task = store.add(prompt="Implement feature Y", task_type="task")
+        task = store.add(prompt="Implement feature Y", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -212,7 +212,7 @@ class TestBuildPrompt:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        task = store.add(prompt="Implement feature Z", task_type="task")
+        task = store.add(prompt="Implement feature Z", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path

@@ -299,7 +299,7 @@ class TestTaskMethods:
         task = Task(id=1, prompt="Test", task_type="explore")
         assert task.is_explore() is True
 
-        task = Task(id=1, prompt="Test", task_type="task")
+        task = Task(id=1, prompt="Test", task_type="implement")
         assert task.is_explore() is False
 
     def test_is_blocked(self):
@@ -407,7 +407,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -517,7 +517,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -702,7 +702,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -887,7 +887,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1222,7 +1222,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1687,7 +1687,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1858,7 +1858,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1938,7 +1938,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2467,7 +2467,7 @@ class TestStepColumnsMigration:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 19
+        assert version == 20
 
         migrated = store.get(1)
         assert migrated is not None
@@ -2498,7 +2498,7 @@ class TestRunStepPersistence:
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
-        assert version == 19
+        assert version == 20
 
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('run_steps', 'run_substeps')"
@@ -2766,7 +2766,7 @@ class TestRunStepPersistence:
         value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 1").fetchone()[0]
         conn.close()
 
-        assert version == 19
+        assert version == 20
         assert value == 1
 
     def test_set_log_schema_version_updates_task(self, tmp_path: Path):
@@ -2864,7 +2864,7 @@ class TestCycleOrchestratorSchema:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 19
+        assert version == 20
         assert "task_cycles" in tables
         assert "task_cycle_iterations" in tables
         assert "idx_task_cycles_impl_id" in indexes
@@ -2939,7 +2939,7 @@ class TestCycleOrchestratorSchema:
         indexes = {row[1] for row in conn.execute("SELECT * FROM sqlite_master WHERE type='index'")}
         conn.close()
 
-        assert version == 19
+        assert version == 20
         assert "idx_tasks_type_based_on" in indexes
         assert "uq_task_cycle_iterations_cycle_iter" in indexes
 
@@ -3177,7 +3177,7 @@ class TestCycleStoreAPIs:
         # A review task with based_on should NOT be included
         store.add("Review of plan2", task_type="review", based_on=plan2.id)
         # A plain task with no based_on
-        store.add("Task no based_on", task_type="task")
+        store.add("Task no based_on", task_type="implement")
 
         result = store.get_impl_based_on_ids()
 
@@ -3323,3 +3323,122 @@ class TestGetBasedOnChildren:
         children = store.get_based_on_children(parent.id)
         ids = [c.id for c in children]
         assert ids == [c1.id, c2.id, c3.id]
+
+
+class TestMigrationV19ToV20:
+    """Tests for database migration v19 → v20 (task → implement default type)."""
+
+    def test_migration_converts_task_type_to_implement(self, tmp_path: Path):
+        """Migration v19->v20 updates existing rows with task_type='task' to 'implement'."""
+        import sqlite3
+        from gza.db import SCHEMA_VERSION
+
+        db_path = tmp_path / "test.db"
+
+        # Manually create a v19 database with a 'task' type row
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (19)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER,
+                spec TEXT,
+                create_review INTEGER NOT NULL DEFAULT 0,
+                same_branch INTEGER NOT NULL DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                merge_status TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER NOT NULL DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                log_schema_version INTEGER NOT NULL DEFAULT 1,
+                cycle_id INTEGER,
+                cycle_iteration_index INTEGER,
+                cycle_role TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                implementation_task_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                max_iterations INTEGER NOT NULL DEFAULT 3,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                stop_reason TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_cycle_iterations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                iteration_index INTEGER NOT NULL,
+                review_task_id INTEGER,
+                review_verdict TEXT,
+                improve_task_id INTEGER,
+                state TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS run_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                step_type TEXT NOT NULL,
+                payload TEXT,
+                timestamp TEXT NOT NULL,
+                legacy_turn_id INTEGER,
+                legacy_event_id INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cycle_iterations(cycle_id, iteration_index)")
+        conn.execute(
+            "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
+            ("Old task", "task", "2024-01-01T00:00:00+00:00")
+        )
+        conn.commit()
+        conn.close()
+
+        # Open the store — this triggers the migration
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_all()
+
+        assert len(tasks) == 1
+        assert tasks[0].task_type == "implement"
+
+        # Verify schema version was bumped
+        conn2 = sqlite3.connect(db_path)
+        row = conn2.execute("SELECT version FROM schema_version").fetchone()
+        conn2.close()
+        assert row[0] == SCHEMA_VERSION

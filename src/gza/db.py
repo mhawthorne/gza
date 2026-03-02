@@ -63,7 +63,7 @@ class Task:
     id: int | None  # None for unsaved tasks
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged
-    task_type: str = "task"  # task, explore, plan, implement, review, improve
+    task_type: str = "implement"  # explore, plan, implement, review, improve
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
     log_file: str | None = None
@@ -161,8 +161,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cycle_iterations(cycle_id, iteration_index);
 """
 
+# Migration from v19 to v20
+MIGRATION_V19_TO_V20 = "UPDATE tasks SET task_type='implement' WHERE task_type='task';"
+
 # Schema version for migrations
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -173,7 +176,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
-    task_type TEXT NOT NULL DEFAULT 'task',
+    task_type TEXT NOT NULL DEFAULT 'implement',
     task_id TEXT,
     branch TEXT,
     log_file TEXT,
@@ -811,6 +814,12 @@ class SqliteTaskStore:
                     conn.execute("UPDATE schema_version SET version = ?", (19,))
                     current_version = 19
 
+                if current_version < 20:
+                    # Run migration v19 -> v20: rename 'task' type to 'implement'
+                    conn.execute(MIGRATION_V19_TO_V20)
+                    conn.execute("UPDATE schema_version SET version = ?", (20,))
+                    current_version = 20
+
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
@@ -918,7 +927,7 @@ class SqliteTaskStore:
     def add(
         self,
         prompt: str,
-        task_type: str = "task",
+        task_type: str = "implement",
         based_on: int | None = None,
         group: str | None = None,
         depends_on: int | None = None,
