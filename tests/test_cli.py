@@ -12006,3 +12006,140 @@ class TestAdvancePlansCommand:
         # Only plan_without_impl should appear (plan_with_impl is excluded)
         assert "Plan without impl" in result.stdout
         assert "Plan with impl" not in result.stdout
+
+
+class TestSetStatusCommand:
+    """Tests for 'gza set-status' command."""
+
+    def test_set_status_nonexistent_task(self, tmp_path: Path):
+        """set-status errors when task does not exist."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("set-status", "999", "failed", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout
+
+    def test_set_status_to_failed(self, tmp_path: Path):
+        """set-status can mark a pending task as failed."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        result = run_gza("set-status", "1", "failed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "in_progress" in result.stdout
+        assert "failed" in result.stdout
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "failed"
+        assert task.completed_at is not None
+
+    def test_set_status_to_completed(self, tmp_path: Path):
+        """set-status can mark a task as completed."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        result = run_gza("set-status", "1", "completed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "completed" in result.stdout
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "completed"
+        assert task.completed_at is not None
+
+    def test_set_status_to_pending_clears_completed_at(self, tmp_path: Path):
+        """set-status clears completed_at when transitioning back to pending."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "failed"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        result = run_gza("set-status", "1", "pending", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "pending" in result.stdout
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.completed_at is None
+
+    def test_set_status_to_in_progress_clears_completed_at(self, tmp_path: Path):
+        """set-status clears completed_at when transitioning to in_progress."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "failed"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        result = run_gza("set-status", "1", "in_progress", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "in_progress"
+        assert task.completed_at is None
+
+    def test_set_status_with_reason_for_failed(self, tmp_path: Path):
+        """set-status --reason sets failure_reason for failed status."""
+        from gza.db import SqliteTaskStore
+
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        result = run_gza(
+            "set-status", "1", "failed", "--reason", "Process killed", "--project", str(tmp_path)
+        )
+
+        assert result.returncode == 0
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "failed"
+        assert task.failure_reason == "Process killed"
+
+    def test_set_status_reason_warns_for_non_failed(self, tmp_path: Path):
+        """set-status warns when --reason is used with a non-failed status."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+
+        result = run_gza(
+            "set-status", "1", "completed", "--reason", "Ignored reason", "--project", str(tmp_path)
+        )
+
+        assert result.returncode == 0
+        assert "Warning" in result.stdout or "warning" in result.stdout.lower()
+
+    def test_set_status_invalid_status_rejected(self, tmp_path: Path):
+        """set-status rejects unknown status values."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending"},
+        ])
+
+        result = run_gza("set-status", "1", "bogus", "--project", str(tmp_path))
+
+        assert result.returncode != 0

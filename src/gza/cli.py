@@ -4647,6 +4647,42 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_status(args: argparse.Namespace) -> int:
+    """Manually force a task's status to any valid value."""
+    valid_statuses = {"pending", "in_progress", "completed", "failed"}
+    if args.status not in valid_statuses:
+        print(f"Error: Invalid status '{args.status}'. Must be one of: {', '.join(sorted(valid_statuses))}")
+        return 1
+
+    if args.reason and args.status != "failed":
+        print(f"Warning: --reason is only meaningful for 'failed' status (current target: '{args.status}')")
+
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task = store.get(args.task_id)
+    if not task:
+        print(f"Error: Task #{args.task_id} not found")
+        return 1
+
+    old_status = task.status
+    task.status = args.status
+
+    if args.status in ("completed", "failed"):
+        task.completed_at = datetime.now(timezone.utc)
+    else:
+        task.completed_at = None
+
+    if args.status == "failed" and args.reason:
+        task.failure_reason = args.reason
+
+    store.update(task)
+    _cleanup_worker_registry(config, args.task_id)
+
+    print(f"Task #{args.task_id} status: {old_status} → {args.status}")
+    return 0
+
+
 def _cleanup_worker_registry(config: "Config", task_id: int) -> None:
     """Mark any running worker for a task as completed in the worker registry.
 
@@ -7444,6 +7480,28 @@ def main() -> int:
     )
     add_common_args(mark_completed_parser)
 
+    # set-status command
+    set_status_parser = subparsers.add_parser(
+        "set-status",
+        help="Manually force a task's status (pending, in_progress, completed, failed)",
+    )
+    set_status_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to update",
+    )
+    set_status_parser.add_argument(
+        "status",
+        choices=["pending", "in_progress", "completed", "failed"],
+        help="New status for the task",
+    )
+    set_status_parser.add_argument(
+        "--reason",
+        default=None,
+        help="Failure reason (only meaningful for failed status)",
+    )
+    add_common_args(set_status_parser)
+
     # skills-install command
     skills_install_parser = subparsers.add_parser(
         "skills-install",
@@ -7532,6 +7590,8 @@ def main() -> int:
             return cmd_stop(args)
         elif args.command == "mark-completed":
             return cmd_mark_completed(args)
+        elif args.command == "set-status":
+            return cmd_set_status(args)
         elif args.command == "learnings":
             return cmd_learnings(args)
         elif args.command == "skills-install":
