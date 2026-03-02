@@ -32,17 +32,17 @@ fi
 # Ask user which base to rebase against
 echo ""
 echo "Rebase $CURRENT_BRANCH onto:"
-echo "  1) $REMOTE/$MAIN_BRANCH (remote - default)"
-echo "  2) $MAIN_BRANCH (local)"
+echo "  1) $MAIN_BRANCH (local - default)"
+echo "  2) $REMOTE/$MAIN_BRANCH (remote)"
 echo ""
 read -p "Choose [1-2] (default: 1): " CHOICE
 
 case "$CHOICE" in
-    2)
+    1|"")
         REBASE_TARGET="$MAIN_BRANCH"
         echo "Using local $MAIN_BRANCH"
         ;;
-    1|"")
+    2)
         REBASE_TARGET="$REMOTE/$MAIN_BRANCH"
         echo "Fetching latest from $REMOTE..."
         git fetch $REMOTE $MAIN_BRANCH
@@ -60,8 +60,11 @@ if git rebase $REBASE_TARGET; then
     echo -e "${GREEN}Rebase completed successfully!${NC}"
     echo "Rebased $CURRENT_BRANCH onto $REBASE_TARGET"
     echo ""
-    echo "To push the rebased branch:"
-    echo "  git push --force-with-lease"
+    read -p "Push with --force-with-lease? [y/N]: " PUSH_CHOICE
+    if [[ "$PUSH_CHOICE" =~ ^[Yy]$ ]]; then
+        git push --force-with-lease
+        echo -e "${GREEN}Pushed successfully!${NC}"
+    fi
     exit 0
 fi
 
