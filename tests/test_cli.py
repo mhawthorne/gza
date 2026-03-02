@@ -11072,8 +11072,8 @@ class TestStatsCommand:
         assert re.search(r"✓\s+#1\s+implement\s+\$0\.1200\s+5\s", result.stdout)
 
 
-class TestCycleCommand:
-    """Tests for 'gza cycle' command."""
+class TestIterateCommand:
+    """Tests for 'gza iterate' command (formerly 'gza cycle')."""
 
     def _make_completed_impl(self, store, prompt: str = "Implement feature") -> object:
         """Create and return a completed implement task."""
@@ -11086,7 +11086,7 @@ class TestCycleCommand:
         return impl
 
     def test_cycle_dry_run(self, tmp_path: Path):
-        """gza cycle --dry-run prints preview and exits 0."""
+        """gza iterate --dry-run prints preview and exits 0."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -11095,13 +11095,13 @@ class TestCycleCommand:
         store = SqliteTaskStore(db_path)
         impl = self._make_completed_impl(store)
 
-        result = run_gza("cycle", str(impl.id), "--dry-run", "--project", str(tmp_path))
+        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "dry-run" in result.stdout.lower()
 
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
-        """gza cycle rejects tasks that are not implement type."""
+        """gza iterate rejects tasks that are not implement type."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -11111,13 +11111,13 @@ class TestCycleCommand:
 
         plan_task = store.add("A plan", task_type="plan")
 
-        result = run_gza("cycle", str(plan_task.id), "--project", str(tmp_path))
+        result = run_gza("iterate", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "implement" in result.stdout.lower() or "implement" in result.stderr.lower()
 
     def test_cycle_rejects_incomplete_task(self, tmp_path: Path):
-        """gza cycle rejects implementation tasks that are not completed."""
+        """gza iterate rejects implementation tasks that are not completed."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -11127,7 +11127,7 @@ class TestCycleCommand:
 
         impl = store.add("Implement feature", task_type="implement")  # status = 'pending'
 
-        result = run_gza("cycle", str(impl.id), "--project", str(tmp_path))
+        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "pending" in result.stdout or "pending" in result.stderr
@@ -11157,7 +11157,7 @@ class TestCycleCommand:
         assert iterations[0].review_verdict == "APPROVED"
 
     def test_cycle_blocked_on_active_cycle_without_continue(self, tmp_path: Path):
-        """gza cycle errors if an active cycle exists without --continue."""
+        """gza iterate errors if an active cycle exists without --continue."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -11169,13 +11169,13 @@ class TestCycleCommand:
         # Pre-create an active cycle
         store.start_cycle(impl.id, max_iterations=3)
 
-        result = run_gza("cycle", str(impl.id), "--project", str(tmp_path))
+        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "active cycle" in result.stdout.lower() or "already has an active cycle" in result.stdout.lower()
 
     def test_cycle_continue_dry_run_shows_resume_message(self, tmp_path: Path):
-        """gza cycle --continue --dry-run shows 'resume' message, not 'start' message."""
+        """gza iterate --continue --dry-run shows 'resume' message, not 'start' message."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -11186,7 +11186,7 @@ class TestCycleCommand:
         impl = self._make_completed_impl(store)
         cycle = store.start_cycle(impl.id, max_iterations=3)
 
-        result = run_gza("cycle", str(impl.id), "--continue", "--dry-run", "--project", str(tmp_path))
+        result = run_gza("iterate", str(impl.id), "--continue", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Must say "resume", not "start", when --continue is given
@@ -11200,12 +11200,12 @@ class TestCycleCommand:
     def test_cycle_continue_resumes_existing_active_cycle(self, tmp_path: Path):
         """--continue resumes at next iteration and APPROVED verdict closes cycle correctly.
 
-        This is a unit test that calls cmd_cycle() directly so that unittest.mock.patch
+        This is a unit test that calls cmd_iterate() directly so that unittest.mock.patch
         is effective. (run_gza spawns a subprocess where in-process patches have no effect.)
         """
         import argparse
         from gza.db import SqliteTaskStore
-        from gza.cli import cmd_cycle
+        from gza.cli import cmd_iterate
         from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
@@ -11245,7 +11245,7 @@ class TestCycleCommand:
              patch("gza.cli.get_store", return_value=store), \
              patch("gza.cli._create_review_task", return_value=fake_review), \
              patch("gza.cli.run", return_value=0):
-            result = cmd_cycle(args)
+            result = cmd_iterate(args)
 
         # The cycle should complete as approved
         assert result == 0
@@ -11261,7 +11261,7 @@ class TestCycleCommand:
         assert cycles[0].stop_reason == "approved"
 
     def test_cycle_continue_no_active_cycle_returns_error(self, tmp_path: Path):
-        """gza cycle --continue with no active cycle returns non-zero exit code and error message."""
+        """gza iterate --continue with no active cycle returns non-zero exit code and error message."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -11272,7 +11272,7 @@ class TestCycleCommand:
         impl = self._make_completed_impl(store)
         # No active cycle exists for this implementation
 
-        result = run_gza("cycle", str(impl.id), "--continue", "--project", str(tmp_path))
+        result = run_gza("iterate", str(impl.id), "--continue", "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "No active cycle" in result.stdout or "No active cycle" in result.stderr
@@ -11290,7 +11290,7 @@ class TestCycleCommand:
         """
         import argparse
         from gza.db import SqliteTaskStore
-        from gza.cli import cmd_cycle
+        from gza.cli import cmd_iterate
         from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
@@ -11336,7 +11336,7 @@ class TestCycleCommand:
              patch("gza.cli._create_review_task", return_value=fake_review), \
              patch("gza.cli._create_improve_task", return_value=fake_improve), \
              patch("gza.cli.run", return_value=0):
-            result = cmd_cycle(args)
+            result = cmd_iterate(args)
 
         # With the fix, the loop runs iterations 3 and 4, exhausts max_iterations=5,
         # and exits with code 2 (maxed_out). With the CLI-default bug it would never
@@ -11356,6 +11356,21 @@ class TestCycleCommand:
         assert len(cycles) == 1
         assert cycles[0].status == "maxed_out"
         assert cycles[0].stop_reason == "max_iterations"
+
+    def test_cycle_alias_still_works(self, tmp_path: Path):
+        """'gza cycle' backward-compat alias routes to the same handler as 'gza iterate'."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        impl = self._make_completed_impl(store)
+
+        result = run_gza("cycle", str(impl.id), "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "dry-run" in result.stdout.lower()
 
 
 class TestStatsCyclesCommand:
