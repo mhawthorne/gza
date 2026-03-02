@@ -27,6 +27,7 @@ from gza.runner import (
     _run_result_to_stats,
     post_review_to_pr,
     run,
+    write_log_entry,
 )
 
 
@@ -2797,3 +2798,36 @@ class TestSameBranchLineageWalk:
         assert result == 1
         output = capsys.readouterr().out
         assert "Cycle detected" in output
+
+
+class TestWriteLogEntry:
+    """Tests for write_log_entry helper."""
+
+    def test_creates_file_and_writes_jsonl(self, tmp_path: Path) -> None:
+        """write_log_entry creates the file and writes a valid JSONL entry."""
+        import json
+        log_file = tmp_path / "task.log"
+        entry = {"type": "gza", "subtype": "info", "message": "Hello"}
+        write_log_entry(log_file, entry)
+        assert log_file.exists()
+        line = log_file.read_text().strip()
+        assert json.loads(line) == entry
+
+    def test_appends_multiple_entries(self, tmp_path: Path) -> None:
+        """write_log_entry appends without overwriting existing content."""
+        import json
+        log_file = tmp_path / "task.log"
+        entry1 = {"type": "gza", "subtype": "info", "message": "First"}
+        entry2 = {"type": "gza", "subtype": "branch", "message": "Second", "branch": "feat/x"}
+        write_log_entry(log_file, entry1)
+        write_log_entry(log_file, entry2)
+        lines = log_file.read_text().strip().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0]) == entry1
+        assert json.loads(lines[1]) == entry2
+
+    def test_silently_suppresses_errors(self, tmp_path: Path) -> None:
+        """write_log_entry does not raise when the path is unwritable."""
+        bad_path = tmp_path / "nonexistent_dir" / "task.log"
+        # Should not raise
+        write_log_entry(bad_path, {"type": "gza", "message": "x"})

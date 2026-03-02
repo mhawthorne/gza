@@ -2980,6 +2980,13 @@ def _build_step_timeline(entries: list[dict]) -> list[dict]:
         elif entry_type == "turn.started":
             current_step = None
 
+        elif entry_type == "gza":
+            message = entry.get("message", "")
+            subtype = entry.get("subtype", "")
+            if message:
+                label = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
+                current_step = _append_timeline_step(steps, label)
+
         elif entry_type == "item.completed":
             item = entry.get("item", {})
             if not isinstance(item, dict):
@@ -3134,6 +3141,15 @@ def _format_log_entry(entry: dict) -> str | None:
         if isinstance(result, str) and result.strip():
             return f"{summary}\n{result.strip()}"
         return summary
+
+    elif entry_type == "gza":
+        subtype = entry.get("subtype", "")
+        message = entry.get("message", "")
+        if not message:
+            return None
+        if subtype:
+            return f"[gza:{subtype}] {message}"
+        return f"[gza] {message}"
 
     return None
 

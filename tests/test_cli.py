@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.cli import _determine_advance_action, cmd_advance
+from gza.cli import _determine_advance_action, cmd_advance, _format_log_entry, _build_step_timeline
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import Git
@@ -12326,3 +12326,68 @@ class TestSetStatusCommand:
         assert task is not None
         assert task.status == "pending"
         assert task.failure_reason is None
+
+
+class TestFormatLogEntry:
+    """Tests for _format_log_entry with gza entry type."""
+
+    def test_gza_entry_with_subtype_renders_correctly(self) -> None:
+        """gza entry with subtype is formatted as [gza:subtype] message."""
+        entry = {"type": "gza", "subtype": "branch", "message": "Branch: feat/foo", "branch": "feat/foo"}
+        result = _format_log_entry(entry)
+        assert result == "[gza:branch] Branch: feat/foo"
+
+    def test_gza_entry_without_subtype_renders_correctly(self) -> None:
+        """gza entry without subtype is formatted as [gza] message."""
+        entry = {"type": "gza", "message": "Some info"}
+        result = _format_log_entry(entry)
+        assert result == "[gza] Some info"
+
+    def test_gza_entry_with_empty_message_returns_none(self) -> None:
+        """gza entry with empty message returns None (should be skipped)."""
+        entry = {"type": "gza", "subtype": "info", "message": ""}
+        result = _format_log_entry(entry)
+        assert result is None
+
+    def test_gza_entry_outcome_renders_with_subtype(self) -> None:
+        """gza outcome entry renders with subtype label."""
+        entry = {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0}
+        result = _format_log_entry(entry)
+        assert result == "[gza:outcome] Outcome: completed"
+
+    def test_gza_entry_stats_renders_with_subtype(self) -> None:
+        """gza stats entry renders with subtype label."""
+        entry = {"type": "gza", "subtype": "stats", "message": "Stats: 5 steps, 12.3s, $0.0042", "duration_seconds": 12.3, "cost_usd": 0.0042, "num_steps": 5}
+        result = _format_log_entry(entry)
+        assert result == "[gza:stats] Stats: 5 steps, 12.3s, $0.0042"
+
+    def test_gza_log_entry_renders_in_gza_log_output(self, tmp_path: Path) -> None:
+        """Integration: gza log renders gza entries from a JSONL log file."""
+        import json
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Orchestration logging integration test")
+        task.status = "completed"
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {"type": "gza", "subtype": "info", "message": "Task: #1 20260101-test-task"},
+            {"type": "gza", "subtype": "branch", "message": "Branch: feat/test", "branch": "feat/test"},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Working on it"}]}},
+            {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0},
+            {"type": "result", "subtype": "success", "result": "", "num_steps": 2, "duration_ms": 5000, "total_cost_usd": 0.005},
+        ]
+        (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
+
+        result = run_gza("log", "--task", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Branch: feat/test" in result.stdout
+        assert "Outcome: completed" in result.stdout

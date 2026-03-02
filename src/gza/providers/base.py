@@ -469,7 +469,7 @@ class Provider(ABC):
         accumulated_data: dict = {}
         startup_logged = False
 
-        with open(log_file, "w") as log:
+        with open(log_file, "a") as log:
             stdin_target = subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL
             process = subprocess.Popen(
                 cmd,
