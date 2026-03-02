@@ -1294,13 +1294,22 @@ def _run_inner(
                 original_task_id = original_task.task_id
         _restore_wip_changes(task, worktree_git, config, branch_name, original_task_id=original_task_id)
 
+    # Persist branch early so it's available if the process is killed before completion
+    task.branch = branch_name
+
     # Mark task in progress (unless resuming, in which case already set)
+    # branch is set above so it gets persisted with this call
     if not resume:
         store.mark_in_progress(task)
+    else:
+        store.update(task)
 
     # Setup logging - use task_id for naming (logs stay in main project)
     config.log_path.mkdir(parents=True, exist_ok=True)
     log_file = config.log_path / f"{task.task_id}.log"
+    # Persist log_file early so it's available if the process is killed before completion
+    task.log_file = str(log_file.relative_to(config.project_dir))
+    store.update(task)
 
     # Setup summary directory and path for task/implement types
     summary_dir = config.project_dir / SUMMARY_DIR
@@ -1535,6 +1544,9 @@ def _run_non_code_task(
     # Setup logging
     config.log_path.mkdir(parents=True, exist_ok=True)
     log_file = config.log_path / f"{task.task_id}.log"
+    # Persist log_file early so it's available if the process is killed before completion
+    task.log_file = str(log_file.relative_to(config.project_dir))
+    store.update(task)
 
     # Setup report file based on task type
     if task.task_type == "explore":
