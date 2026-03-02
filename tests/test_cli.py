@@ -1816,15 +1816,15 @@ class TestLocalConfigOverrides:
         assert result.returncode == 1
         assert "Invalid local override key 'project_name'" in result.stdout
 
-    def test_notice_printed_when_local_overrides_active(self, tmp_path: Path):
-        """Commands should print a startup notice when local overrides are active."""
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+    def test_local_override_applies_to_loaded_config(self, tmp_path: Path):
+        """Local overrides should be reflected in the loaded config."""
+        (tmp_path / "gza.yaml").write_text("project_name: test\nuse_docker: true\n")
         (tmp_path / "gza.local.yaml").write_text("use_docker: false\n")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        from gza.config import Config
 
-        assert result.returncode == 0
-        assert "Notice: local config overrides active from gza.local.yaml" in result.stderr
+        cfg = Config.load(tmp_path)
+        assert cfg.use_docker is False
 
     def test_config_command_shows_effective_values_with_sources(self, tmp_path: Path):
         """gza config --json should include effective values and source attribution."""
