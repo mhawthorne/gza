@@ -2743,3 +2743,57 @@ class TestSameBranchLineageWalk:
         assert result == 1
         output = capsys.readouterr().out
         assert "no ancestor has a valid branch" in output
+
+    def test_same_branch_fails_on_cycle_in_based_on_chain(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When the based_on chain contains a cycle, fail with a clear error instead of looping forever."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task A: no branch yet
+        task_a = store.add(prompt="Task A", task_type="implement")
+        task_a.task_id = "20260301-task-a"
+        store.mark_in_progress(task_a)
+        store.mark_failed(task_a, log_file="logs/a.log", stats=None)
+
+        # Task B: based_on A, also no branch
+        task_b = store.add(prompt="Task B", task_type="improve", based_on=task_a.id, same_branch=True)
+        task_b.task_id = "20260301-task-b"
+        store.mark_in_progress(task_b)
+        store.mark_failed(task_b, log_file="logs/b.log", stats=None)
+
+        # Introduce cycle: A.based_on = B (A -> B -> A)
+        task_a_fresh = store.get(task_a.id)
+        assert task_a_fresh is not None
+        task_a_fresh.based_on = task_b.id
+        store.update(task_a_fresh)
+
+        # Task C: based_on B, same_branch=True — will walk B -> A -> B (cycle)
+        task_c = store.add(prompt="Task C", task_type="improve", based_on=task_b.id, same_branch=True)
+        task_c.task_id = "20260301-task-c"
+        store.mark_in_progress(task_c)
+
+        config = self._make_config(tmp_path, db_path)
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = False
+            mock_git.worktree_list.return_value = []
+
+            mock_git_class.return_value = mock_git
+
+            result = run(config, task_id=task_c.id)
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert "Cycle detected" in output

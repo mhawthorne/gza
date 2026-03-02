@@ -1197,6 +1197,7 @@ def _run_inner(
 
         resolved_branch: str | None = None
         visited_ids: list[int | None] = []
+        seen_ids: set[int | None] = set()
         current = source_task
         while current is not None:
             if current.branch and git.branch_exists(current.branch):
@@ -1209,10 +1210,14 @@ def _run_inner(
                 else:
                     console.print(f"    Using existing branch from task #{current.id}: [blue]{resolved_branch}[/blue]")
                 break
+            seen_ids.add(current.id)
             visited_ids.append(current.id)
-            # Walk up the based_on chain
-            if current.based_on:
+            # Walk up the based_on chain, with cycle detection
+            if current.based_on and current.based_on not in seen_ids:
                 current = store.get(current.based_on)
+            elif current.based_on:
+                error_message(f"Error: Cycle detected in based_on chain for task #{task.id}")
+                return 1
             else:
                 current = None
 
