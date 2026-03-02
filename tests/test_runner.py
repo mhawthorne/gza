@@ -768,7 +768,7 @@ class TestReviewTaskSlugGeneration:
             review_task = store.get(2)
             assert review_task is not None
             # Should use fallback format
-            assert "Review the implementation from task #1" in review_task.prompt
+            assert "Review task #1" in review_task.prompt
         finally:
             gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review

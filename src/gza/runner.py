@@ -894,10 +894,10 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
             review_prompt = f"review {slug}"
         else:
             # Fallback if task_id format is unexpected
-            review_prompt = f"Review the implementation from task #{completed_task.id}"
+            review_prompt = f"Review task #{completed_task.id}"
     else:
         # Fallback if task_id is not set
-        review_prompt = f"Review the implementation from task #{completed_task.id}"
+        review_prompt = f"Review task #{completed_task.id}"
 
     if not review_prompt.startswith("review ") and completed_task.prompt:
         review_prompt += f": {completed_task.prompt[:100]}"

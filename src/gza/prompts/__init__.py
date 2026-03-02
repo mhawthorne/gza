@@ -172,7 +172,7 @@ class PromptBuilder:
         Returns:
             Prompt string for a review task.
         """
-        prompt = f"Review the implementation from task #{impl_task_id}"
+        prompt = f"Review task #{impl_task_id}"
         if impl_prompt:
             prompt += f": {impl_prompt[:100]}"
         prompt += (
