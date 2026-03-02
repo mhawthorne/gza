@@ -19,12 +19,15 @@ from gza.runner import (
     _build_context_from_chain,
     _build_review_improve_lineage_context,
     backup_database,
+    _compute_slug_override,
     _create_and_run_review_task,
     _run_non_code_task,
     _save_wip_changes,
     _restore_wip_changes,
     _squash_wip_commits,
     _run_result_to_stats,
+    _slug_from_task_id,
+    generate_task_id,
     post_review_to_pr,
     run,
     write_log_entry,
@@ -856,6 +859,146 @@ class TestReviewTaskSlugGeneration:
             assert exit_code == 1
         finally:
             gza.runner.run = original_run
+
+
+class TestSlugFromTaskId:
+    """Tests for _slug_from_task_id helper."""
+
+    def test_strips_date_prefix(self):
+        assert _slug_from_task_id("20260129-add-docker-volumes") == "add-docker-volumes"
+
+    def test_strips_date_prefix_and_retry_suffix(self):
+        assert _slug_from_task_id("20260129-fix-auth-bug-2") == "fix-auth-bug"
+
+    def test_no_dash_returns_original(self):
+        assert _slug_from_task_id("nodash") == "nodash"
+
+
+class TestGenerateTaskIdSlugOverride:
+    """Tests for generate_task_id with slug_override parameter."""
+
+    def test_slug_override_used_instead_of_prompt(self, tmp_path: Path):
+        """slug_override replaces the slug derived from prompt."""
+        task_id = generate_task_id(
+            "some long generic prompt text",
+            slug_override="rev-add-docker-volumes",
+        )
+        assert task_id.endswith("-rev-add-docker-volumes")
+
+    def test_slug_override_none_falls_back_to_prompt(self, tmp_path: Path):
+        """When slug_override is None, slug is derived from prompt as usual."""
+        task_id = generate_task_id(
+            "Add docker volumes support",
+            slug_override=None,
+        )
+        assert "add-docker-volumes-support" in task_id
+
+    def test_slug_override_not_used_on_retry(self, tmp_path: Path):
+        """slug_override is ignored when existing_id is provided (retry path)."""
+        task_id = generate_task_id(
+            "some prompt",
+            existing_id="20260101-original-slug",
+            slug_override="rev-something-else",
+        )
+        # Should re-use the base from existing_id, not slug_override
+        assert "original-slug" in task_id
+
+
+class TestComputeSlugOverride:
+    """Tests for _compute_slug_override helper."""
+
+    def test_review_task_uses_rev_prefix(self, tmp_path: Path):
+        """Review tasks get 'rev-' prefix with root task's slug."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(prompt="Add docker volumes", task_type="implement")
+        impl_task.task_id = "20260129-add-docker-volumes"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="review add-docker-volumes",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        result = _compute_slug_override(review_task, store)
+        assert result == "rev-add-docker-volumes"
+
+    def test_implement_task_uses_impl_prefix(self, tmp_path: Path):
+        """Implement tasks get 'impl-' prefix with root task's slug."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add(prompt="Add authentication system", task_type="plan")
+        plan_task.task_id = "20260129-add-authentication-system"
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement authentication",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+
+        result = _compute_slug_override(impl_task, store)
+        assert result == "impl-add-authentication-system"
+
+    def test_improve_task_uses_impr_prefix(self, tmp_path: Path):
+        """Improve tasks get 'impr-' prefix with root task's slug."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(prompt="Add docker volumes", task_type="implement")
+        impl_task.task_id = "20260129-add-docker-volumes"
+        store.update(impl_task)
+
+        improve_task = store.add(
+            prompt="Fix the docker volume issues",
+            task_type="improve",
+            based_on=impl_task.id,
+        )
+
+        result = _compute_slug_override(improve_task, store)
+        assert result == "impr-add-docker-volumes"
+
+    def test_plain_task_returns_none(self, tmp_path: Path):
+        """Non-review/implement/improve tasks return None."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add(prompt="Do some work", task_type="task")
+        result = _compute_slug_override(task, store)
+        assert result is None
+
+    def test_explore_task_returns_none(self, tmp_path: Path):
+        """Explore tasks return None."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add(prompt="Explore codebase", task_type="explore")
+        result = _compute_slug_override(task, store)
+        assert result is None
+
+    def test_fallback_to_prompt_when_root_has_no_task_id(self, tmp_path: Path):
+        """Falls back to slugifying root prompt when root has no task_id."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add(prompt="Add authentication system", task_type="plan")
+        # No task_id set on plan_task
+
+        impl_task = store.add(
+            prompt="Implement authentication",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+
+        result = _compute_slug_override(impl_task, store)
+        assert result == "impl-add-authentication-system"
+
+    def test_review_task_with_retry_suffix_strips_it(self, tmp_path: Path):
+        """Root task_id retry suffix is stripped from slug."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(prompt="Fix auth", task_type="implement")
+        impl_task.task_id = "20260129-fix-auth-2"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="review fix-auth",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        result = _compute_slug_override(review_task, store)
+        assert result == "rev-fix-auth"
 
 
 class TestReviewNextSteps:
