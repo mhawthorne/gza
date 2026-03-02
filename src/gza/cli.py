@@ -6024,6 +6024,24 @@ def _determine_advance_action(
         # (i.e., a completed improve task exists after the latest review).
         # In that case, the review is stale and we need a new one.
         if review_cleared and latest_review.completed_at is not None:
+            # But first, check if a new review is already pending/in_progress
+            active_review = next(
+                (r for r in reviews if r.status in ('pending', 'in_progress')),
+                None,
+            )
+            if active_review:
+                if active_review.status == 'pending':
+                    return {
+                        'type': 'run_review',
+                        'description': f'Spawn worker for pending review #{active_review.id}',
+                        'review_task': active_review,
+                    }
+                return {
+                    'type': 'wait_review',
+                    'description': f'SKIP: review #{active_review.id} is in_progress',
+                    'review_task': active_review,
+                }
+
             improves = _get_improves_for_root_task(store, task)
             completed_improves = [
                 t for t in improves
