@@ -2421,3 +2421,379 @@ class TestNoChangesWithExistingCommits:
         assert result == 0
         refreshed = store.get(task.id)
         assert refreshed.status == "failed", f"Expected 'failed', got '{refreshed.status}'"
+
+
+class TestSameBranchLineageWalk:
+    """Tests for same_branch resolution walking the based_on lineage chain."""
+
+    def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
+        return config
+
+    def test_same_branch_uses_immediate_source_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When the immediate source task has a valid branch, use it directly."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task #1: implementation with a branch
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.task_id = "20260301-implement-feature"
+        impl_task.branch = "test/20260301-implement-feature"
+        store.mark_in_progress(impl_task)
+        store.mark_completed(impl_task, log_file="logs/impl.log", stats=None)
+
+        # Task #2: improve with same_branch, based_on impl_task
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        improve_task.task_id = "20260301-improve-feature"
+        store.mark_in_progress(improve_task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id="test-session",
+                error_type=None,
+            )
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = True
+            mock_git.worktree_list.return_value = []
+
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = ""
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / improve_task.task_id
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=improve_task.id)
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "test/20260301-implement-feature" in output
+        # Direct source found — no "via" message expected
+        assert "via" not in output
+
+    def test_same_branch_walks_chain_when_immediate_source_has_no_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When the immediate source task has no branch, walk based_on chain to find ancestor."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task #324: implementation with a branch
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.task_id = "20260301-implement-feature"
+        impl_task.branch = "test/20260301-implement-feature"
+        store.mark_in_progress(impl_task)
+        store.mark_completed(impl_task, log_file="logs/impl.log", stats=None)
+
+        # Task #335: killed before branch was persisted (no branch)
+        killed_task = store.add(
+            prompt="Improve feature (killed)",
+            task_type="improve",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        killed_task.task_id = "20260301-improve-killed"
+        # branch is NOT set (simulating killed before persistence)
+        store.mark_in_progress(killed_task)
+        store.mark_failed(killed_task, log_file="logs/killed.log", stats=None)
+
+        # Task #352: retry of #335, based_on=#335 (which has no branch)
+        retry_task = store.add(
+            prompt="Improve feature (retry)",
+            task_type="improve",
+            based_on=killed_task.id,
+            same_branch=True,
+        )
+        retry_task.task_id = "20260301-improve-retry"
+        store.mark_in_progress(retry_task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id="test-session",
+                error_type=None,
+            )
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = True
+            mock_git.worktree_list.return_value = []
+
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = ""
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / retry_task.task_id
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=retry_task.id)
+
+        assert result == 0
+        output = capsys.readouterr().out
+        # Should use impl_task branch, logging the "via" chain
+        assert "test/20260301-implement-feature" in output
+        assert "via" in output
+        assert f"#{killed_task.id}" in output
+
+    def test_same_branch_walks_chain_when_immediate_branch_does_not_exist(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When the immediate source task has a branch field but that branch no longer exists,
+        walk the based_on chain to find an ancestor with a valid branch."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task #1: implementation with a valid branch
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.task_id = "20260301-implement-feature"
+        impl_task.branch = "test/20260301-implement-feature"
+        store.mark_in_progress(impl_task)
+        store.mark_completed(impl_task, log_file="logs/impl.log", stats=None)
+
+        # Task #2: has a branch set, but that branch has been deleted
+        middle_task = store.add(
+            prompt="Improve feature (deleted branch)",
+            task_type="improve",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        middle_task.task_id = "20260301-improve-deleted-branch"
+        middle_task.branch = "test/20260301-improve-deleted-branch"
+        store.mark_in_progress(middle_task)
+        store.mark_failed(middle_task, log_file="logs/middle.log", stats=None)
+
+        # Task #3: retry, based on middle_task
+        retry_task = store.add(
+            prompt="Improve feature (retry)",
+            task_type="improve",
+            based_on=middle_task.id,
+            same_branch=True,
+        )
+        retry_task.task_id = "20260301-improve-retry"
+        store.mark_in_progress(retry_task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id="test-session",
+                error_type=None,
+            )
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.worktree_list.return_value = []
+            # The middle task's branch doesn't exist; the impl_task's branch does
+            def branch_exists(branch: str) -> bool:
+                return branch == "test/20260301-implement-feature"
+            mock_git.branch_exists.side_effect = branch_exists
+
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = ""
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / retry_task.task_id
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=retry_task.id)
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "test/20260301-implement-feature" in output
+        assert "via" in output
+
+    def test_same_branch_fails_when_no_ancestor_has_valid_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When no ancestor in the chain has a valid branch, fail with a clear error."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task with no branch
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.task_id = "20260301-implement-feature"
+        # branch NOT set
+        store.mark_in_progress(impl_task)
+        store.mark_failed(impl_task, log_file="logs/impl.log", stats=None)
+
+        # Improve task based on the branchless impl task
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        improve_task.task_id = "20260301-improve-feature"
+        store.mark_in_progress(improve_task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = False
+            mock_git.worktree_list.return_value = []
+
+            mock_git_class.return_value = mock_git
+
+            result = run(config, task_id=improve_task.id)
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert "no ancestor has a valid branch" in output
+
+    def test_same_branch_fails_on_cycle_in_based_on_chain(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When the based_on chain contains a cycle, fail with a clear error instead of looping forever."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Task A: no branch yet
+        task_a = store.add(prompt="Task A", task_type="implement")
+        task_a.task_id = "20260301-task-a"
+        store.mark_in_progress(task_a)
+        store.mark_failed(task_a, log_file="logs/a.log", stats=None)
+
+        # Task B: based_on A, also no branch
+        task_b = store.add(prompt="Task B", task_type="improve", based_on=task_a.id, same_branch=True)
+        task_b.task_id = "20260301-task-b"
+        store.mark_in_progress(task_b)
+        store.mark_failed(task_b, log_file="logs/b.log", stats=None)
+
+        # Introduce cycle: A.based_on = B (A -> B -> A)
+        task_a_fresh = store.get(task_a.id)
+        assert task_a_fresh is not None
+        task_a_fresh.based_on = task_b.id
+        store.update(task_a_fresh)
+
+        # Task C: based_on B, same_branch=True — will walk B -> A -> B (cycle)
+        task_c = store.add(prompt="Task C", task_type="improve", based_on=task_b.id, same_branch=True)
+        task_c.task_id = "20260301-task-c"
+        store.mark_in_progress(task_c)
+
+        config = self._make_config(tmp_path, db_path)
+
+        with patch('gza.runner.get_provider') as mock_get_provider, \
+             patch('gza.runner.Git') as mock_git_class, \
+             patch('gza.runner.load_dotenv'):
+
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = False
+            mock_git.worktree_list.return_value = []
+
+            mock_git_class.return_value = mock_git
+
+            result = run(config, task_id=task_c.id)
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert "Cycle detected" in output
