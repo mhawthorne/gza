@@ -159,7 +159,7 @@ class TestSkillsInstallClaudeTarget:
         setup_config(project_dir)
 
         # Run from tmp_path but target project_dir
-        result = run_gza("skills-install", "--target", "claude", "--project", str(project_dir), cwd=tmp_path)
+        result = run_gza("skills-install", "--target", "claude", "--project", str(project_dir))
         assert result.returncode == 0
 
         # Verify skills were created in project_dir
