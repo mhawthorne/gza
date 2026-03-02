@@ -9831,6 +9831,57 @@ class TestRefreshCommand:
         assert "Refreshed 2 task(s)" in result.stdout
 
 
+class TestGetReviewVerdict:
+    """Tests for get_review_verdict()."""
+
+    def _setup(self, tmp_path: Path):
+        from gza.cli import get_review_verdict
+        from gza.db import SqliteTaskStore
+        from gza.config import Config
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        config = Config.load(tmp_path)
+        return get_review_verdict, config, store
+
+    def test_inline_verdict(self, tmp_path: Path):
+        """Parses inline **Verdict: APPROVED** format."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = "Some review text.\n\n**Verdict: APPROVED**\n"
+        store.update(task)
+        assert get_review_verdict(config, task) == "APPROVED"
+
+    def test_heading_verdict(self, tmp_path: Path):
+        """Parses ## Verdict heading with verdict on following line."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = "Some review.\n\n## Verdict\n\n**CHANGES_REQUESTED**\n"
+        store.update(task)
+        assert get_review_verdict(config, task) == "CHANGES_REQUESTED"
+
+    def test_heading_verdict_no_bold(self, tmp_path: Path):
+        """Parses ## Verdict heading with plain verdict on following line."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = "Review.\n\n## Verdict\n\nNEEDS_DISCUSSION\n"
+        store.update(task)
+        assert get_review_verdict(config, task) == "NEEDS_DISCUSSION"
+
+    def test_no_verdict_returns_none(self, tmp_path: Path):
+        """Returns None when no verdict pattern is found."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = "I have some thoughts but no verdict."
+        store.update(task)
+        assert get_review_verdict(config, task) is None
+
+
 class TestAdvanceCommand:
     """Tests for 'gza advance' command."""
 

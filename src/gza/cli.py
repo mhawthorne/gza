@@ -692,10 +692,17 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
     else:
         return None
 
-    # Look for verdict pattern: **Verdict: APPROVED** or Verdict: CHANGES_REQUESTED
+    # Look for verdict pattern in two formats:
+    # 1. Inline:  **Verdict: APPROVED** or Verdict: CHANGES_REQUESTED
+    # 2. Heading: ## Verdict\n\n**CHANGES_REQUESTED**
     import re
-    # Match both **Verdict: XXX** and Verdict: XXX patterns
+    # Inline pattern
     match = re.search(r'\*{0,2}Verdict:\s*(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    # Heading pattern: "## Verdict" followed by the verdict on a subsequent line
+    match = re.search(r'##\s+Verdict\s*\n+\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
     if match:
         return match.group(1).upper()
 
