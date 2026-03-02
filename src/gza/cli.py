@@ -4151,11 +4151,31 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_ps_output(args: argparse.Namespace, registry: "WorkerRegistry", store: "SqliteTaskStore", poll_interval: int | None = None) -> None:
-    """Print ps output once. Used by cmd_ps directly and in poll loop."""
+def _print_ps_output(
+    args: argparse.Namespace,
+    registry: "WorkerRegistry",
+    store: "SqliteTaskStore",
+    poll_interval: int | None = None,
+    seen_tasks: "dict | None" = None,
+) -> None:
+    """Print ps output once. Used by cmd_ps directly and in poll loop.
+
+    When seen_tasks is provided (poll mode), rows from this dict are merged with
+    live results so that completed/failed tasks remain visible.
+    """
     import datetime
     show_all = args.all if hasattr(args, "all") else False
-    rows, _ = _build_ps_rows(registry, store, include_completed=show_all)
+    live_rows, _ = _build_ps_rows(registry, store, include_completed=show_all)
+
+    # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
+    if seen_tasks is not None:
+        for row in live_rows:
+            key = row["task_id"] if row["task_id"] is not None else row["worker_id"]
+            seen_tasks[key] = row
+        rows = list(seen_tasks.values())
+        rows.sort(key=_ps_sort_key)
+    else:
+        rows = live_rows
 
     if poll_interval is not None:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -4181,17 +4201,16 @@ def _print_ps_output(args: argparse.Namespace, registry: "WorkerRegistry", store
         return
 
     print(
-        f"{'WORKER ID':<20} {'PID':<8} {'TYPE':<6} {'SOURCE':<7} {'TASK ID':<10} "
-        f"{'STATUS':<12} {'FLAGS':<12} {'TASK':<30} {'STARTED':<20} {'DURATION':<10}"
+        f"{'TASK ID':<10} {'WORKER ID':<20} {'PID':<8} {'TYPE':<6} "
+        f"{'STATUS':<12} {'STARTED':<20} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
-    print("-" * 154)
+    print("-" * 120)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
         print(
-            f"{row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} {row['source']:<7} "
-            f"{task_id_display:<10} {row['status']:<12} {row['flags']:<12} "
-            f"{row['task']:<30} {row['started']:<20} {row['duration']:<10}"
+            f"{task_id_display:<10} {row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} "
+            f"{row['status']:<12} {row['started']:<20} {row['steps']:<7} {row['duration']:<10} {row['task']}"
         )
 
 
@@ -4207,11 +4226,18 @@ def cmd_ps(args: argparse.Namespace) -> int:
         if poll_interval < 1:
             print(f"error: --poll value must be at least 1 second (got {poll_interval})", file=sys.stderr)
             return 1
+        seen_tasks: dict = {}
         try:
             while True:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")  # clear screen, move cursor to top
-                _print_ps_output(args, registry, store, poll_interval=poll_interval)
+                _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks)
+                # Stop polling once all seen tasks have finished (no running/in_progress).
+                if seen_tasks and not any(
+                    r["status"] in ("running", "in_progress")
+                    for r in seen_tasks.values()
+                ):
+                    break
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
             return 0
@@ -4257,7 +4283,7 @@ def _build_ps_rows(
         else:
             merged[key] = {"worker": None, "task": task}
 
-    rows = [_to_ps_row(item["worker"], item["task"]) for item in merged.values()]
+    rows = [_to_ps_row(item["worker"], item["task"], store) for item in merged.values()]
     rows.sort(key=_ps_sort_key)
     return rows, in_progress_tasks
 
@@ -4315,7 +4341,19 @@ def _prefer_worker(existing: WorkerMetadata, candidate: WorkerMetadata) -> bool:
     return False
 
 
-def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
+def _get_ps_steps(task: "DbTask | None", store: "SqliteTaskStore | None") -> str:
+    """Return step count for display: use num_steps_computed when available, else count DB rows."""
+    if task is None or task.id is None:
+        return "-"
+    if task.num_steps_computed is not None:
+        return str(task.num_steps_computed)
+    if store is not None:
+        count = store.count_steps(task.id)
+        return str(count) if count > 0 else "-"
+    return "-"
+
+
+def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "SqliteTaskStore | None" = None) -> dict:
     """Convert a reconciled worker/task pair into display data."""
     source = "both" if worker and task else "worker" if worker else "db"
 
@@ -4373,6 +4411,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None) -> dict:
         "task": task_display,
         "started": _format_started(started),
         "started_at": started.isoformat() if started else None,
+        "steps": _get_ps_steps(task, store),
         "duration": duration,
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,

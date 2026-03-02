@@ -1675,6 +1675,16 @@ class SqliteTaskStore:
             if cur.rowcount == 0:
                 raise ValueError(f"Unknown step reference: {step_ref.id}")
 
+    def count_steps(self, run_id: int) -> int:
+        """Count the number of run_steps rows for a given run_id."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM run_steps WHERE run_id = ?",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            return int(row["cnt"]) if row else 0
+
     def get_run_steps(self, run_id: int) -> list[RunStep]:
         """Get all stored run steps for a run, ordered by step index."""
         with self._connect() as conn:
