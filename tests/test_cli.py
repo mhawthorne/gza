@@ -13713,6 +13713,92 @@ class TestSetStatusCommand:
         assert task.status == "pending"
         assert task.failure_reason is None
 
+    def test_set_status_to_dropped(self, tmp_path: Path):
+        """set-status can mark a task as dropped and sets completed_at."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        result = run_gza("set-status", "1", "dropped", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "dropped" in result.stdout
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "dropped"
+        assert task.completed_at is not None
+
+    def test_set_status_dropped_clears_failure_reason(self, tmp_path: Path):
+        """set-status to dropped clears failure_reason on a previously-failed task."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "failed"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.get(1)
+        assert task is not None
+        task.failure_reason = "Some error"
+        store.update(task)
+
+        result = run_gza("set-status", "1", "dropped", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        task = store.get(1)
+        assert task is not None
+        assert task.status == "dropped"
+        assert task.failure_reason is None
+
+    def test_set_status_dropped_accepted_as_valid_choice(self, tmp_path: Path):
+        """set-status accepts 'dropped' without argparse rejecting it."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending"},
+        ])
+
+        result = run_gza("set-status", "1", "dropped", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+    def test_advance_skips_dropped_tasks(self, tmp_path: Path):
+        """Dropped tasks do not appear in advance merge candidates or failed-resume candidates."""
+        from gza.db import SqliteTaskStore as _Store
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Dropped task", "status": "dropped"},
+        ])
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = _Store(db_path)
+
+        # Dropped tasks should not appear in resumable failed tasks
+        resumable = store.get_resumable_failed_tasks()
+        assert all(t.status != "dropped" for t in resumable)
+
+        # Dropped tasks should not appear in unmerged (completed) tasks
+        unmerged = store.get_unmerged()
+        assert all(t.status != "dropped" for t in unmerged)
+
+    def test_dropped_task_blocks_dependent(self, tmp_path: Path):
+        """A task that depends_on a dropped task is reported as blocked."""
+        from gza.db import SqliteTaskStore as _Store
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = _Store(db_path)
+
+        prereq = store.add("Dropped prereq")
+        prereq.status = "dropped"
+        store.update(prereq)
+
+        dependent = store.add("Dependent task", depends_on=prereq.id)
+
+        is_blocked, blocked_by_id, blocked_by_status = store.is_task_blocked(dependent)
+        assert is_blocked is True
+        assert blocked_by_id == prereq.id
+        assert blocked_by_status == "dropped"
+
 
 class TestFormatLogEntry:
     """Tests for _format_log_entry with gza entry type."""

@@ -4390,7 +4390,7 @@ def cmd_groups(args: argparse.Namespace) -> int:
 
         # Build status summary
         parts = []
-        for status in ["pending", "in_progress", "completed", "failed", "unmerged"]:
+        for status in ["pending", "in_progress", "completed", "failed", "unmerged", "dropped"]:
             if status in status_counts and status_counts[status] > 0:
                 parts.append(f"{status_counts[status]} {status}")
 
@@ -4401,7 +4401,7 @@ def cmd_groups(args: argparse.Namespace) -> int:
     if ungrouped_counts:
         total = sum(ungrouped_counts.values())
         parts = []
-        for status in ["pending", "in_progress", "completed", "failed", "unmerged"]:
+        for status in ["pending", "in_progress", "completed", "failed", "unmerged", "dropped"]:
             if status in ungrouped_counts and ungrouped_counts[status] > 0:
                 parts.append(f"{ungrouped_counts[status]} {status}")
 
@@ -5047,7 +5047,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     old_status = task.status
     task.status = args.status
 
-    if args.status in ("completed", "failed"):
+    if args.status in ("completed", "failed", "dropped"):
         task.completed_at = datetime.now(timezone.utc)
     else:
         task.completed_at = None
@@ -5781,6 +5781,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         "completed": c["status_completed"],
         "failed": c["status_failed"],
         "unmerged": c["status_pending"],
+        "dropped": c["status_failed"],
     }
     status_color = status_color_map.get(task.status, c["status_default"])
 
@@ -8243,7 +8244,7 @@ def main() -> int:
     # set-status command
     set_status_parser = subparsers.add_parser(
         "set-status",
-        help="Manually force a task's status (pending, in_progress, completed, failed)",
+        help="Manually force a task's status (pending, in_progress, completed, failed, dropped)",
     )
     set_status_parser.add_argument(
         "task_id",
@@ -8252,7 +8253,7 @@ def main() -> int:
     )
     set_status_parser.add_argument(
         "status",
-        choices=["pending", "in_progress", "completed", "failed"],
+        choices=["pending", "in_progress", "completed", "failed", "dropped"],
         # 'unmerged' is intentionally excluded: that transition is managed
         # exclusively by the 'advance' workflow and should not be forced manually.
         help="New status for the task",

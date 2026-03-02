@@ -62,7 +62,7 @@ class Task:
     """A task in the database."""
     id: int | None  # None for unsaved tasks
     prompt: str
-    status: str = "pending"  # pending, in_progress, completed, failed, unmerged
+    status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
     task_type: str = "implement"  # explore, plan, implement, review, improve
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
