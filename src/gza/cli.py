@@ -90,8 +90,7 @@ def _run_foreground(
     original_sigterm = signal.getsignal(signal.SIGTERM)
 
     def _cleanup(signum, frame):
-        registry.mark_completed(worker_id, exit_code=1, status="failed")
-        # Restore original handlers and re-raise so caller can handle
+        # Restore original handlers and re-raise so the except block handles cleanup
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
         raise KeyboardInterrupt
@@ -99,14 +98,13 @@ def _run_foreground(
     signal.signal(signal.SIGINT, _cleanup)
     signal.signal(signal.SIGTERM, _cleanup)
 
-    exit_code = 1
     try:
         exit_code = run(config, task_id=task_id, resume=resume, open_after=open_after)
         status = "completed" if exit_code == 0 else "failed"
         registry.mark_completed(worker_id, exit_code=exit_code, status=status)
         return exit_code
     except KeyboardInterrupt:
-        registry.mark_completed(worker_id, exit_code=1, status="failed")
+        registry.mark_completed(worker_id, exit_code=130, status="failed")
         return 130
     finally:
         signal.signal(signal.SIGINT, original_sigint)

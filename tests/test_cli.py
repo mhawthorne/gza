@@ -13,10 +13,11 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.cli import _determine_advance_action, cmd_advance, _format_log_entry, _build_step_timeline
+from gza.cli import _determine_advance_action, _run_foreground, cmd_advance, _format_log_entry, _build_step_timeline
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import Git
+from gza.workers import WorkerRegistry
 
 LOG_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "logs"
 
@@ -12973,11 +12974,6 @@ class TestRunForeground:
 
     def test_run_foreground_registers_and_completes_worker(self, tmp_path: Path):
         """_run_foreground registers a worker before running and marks it completed after."""
-        from gza.cli import _run_foreground
-        from gza.config import Config
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry
-
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -13005,11 +13001,6 @@ class TestRunForeground:
 
     def test_run_foreground_marks_failed_on_nonzero_exit(self, tmp_path: Path):
         """_run_foreground marks worker as failed when run() returns non-zero."""
-        from gza.cli import _run_foreground
-        from gza.config import Config
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry
-
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -13032,10 +13023,6 @@ class TestRunForeground:
 
     def test_run_foreground_passes_resume_and_open_after(self, tmp_path: Path):
         """_run_foreground correctly passes resume and open_after to run()."""
-        from gza.cli import _run_foreground
-        from gza.config import Config
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -13052,11 +13039,6 @@ class TestRunForeground:
 
     def test_run_foreground_marks_failed_on_keyboard_interrupt(self, tmp_path: Path):
         """_run_foreground marks worker as failed when interrupted."""
-        from gza.cli import _run_foreground
-        from gza.config import Config
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry
-
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -13075,3 +13057,41 @@ class TestRunForeground:
         assert len(workers) == 1
         w = workers[0]
         assert w.status == "failed"
+        assert w.exit_code == 130
+
+    def test_run_foreground_signal_calls_mark_completed_once(self, tmp_path: Path):
+        """Signal delivery via _cleanup raises KeyboardInterrupt; mark_completed is called exactly once."""
+        import signal as signal_mod
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Test signal task")
+        assert task.id is not None
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+
+        # Capture the installed SIGINT handler so we can call _cleanup directly
+        installed_handlers: dict = {}
+        original_signal = signal_mod.signal
+
+        def capture_signal(signum, handler):
+            installed_handlers[signum] = handler
+            return original_signal(signum, handler)
+
+        with patch("gza.cli.signal.signal", side_effect=capture_signal):
+            with patch("gza.workers.WorkerRegistry.mark_completed") as mock_mark:
+                def run_then_signal(*args, **kwargs):
+                    # Simulate SIGINT arriving while run() is executing
+                    cleanup = installed_handlers.get(signal_mod.SIGINT)
+                    if cleanup and callable(cleanup):
+                        cleanup(signal_mod.SIGINT, None)
+
+                with patch("gza.cli.run", side_effect=run_then_signal):
+                    rc = _run_foreground(config, task_id=task.id)
+
+        assert rc == 130
+        # mark_completed must be called exactly once, not twice
+        assert mock_mark.call_count == 1
+        assert mock_mark.call_args.kwargs.get("status") == "failed"
+        assert mock_mark.call_args.kwargs.get("exit_code") == 130
