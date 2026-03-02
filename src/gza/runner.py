@@ -1187,19 +1187,39 @@ def _run_inner(
         )
         console.print(f"    Resuming on branch: [blue]{branch_name}[/blue]")
     elif task.same_branch:
-        # Use the branch from based_on task (for improve tasks) or depends_on task (fallback)
+        # Use the branch from based_on task (for improve tasks) or depends_on task (fallback).
+        # Walk the based_on chain until we find an ancestor with a valid, existing branch.
         source_task = None
         if task.based_on:
             source_task = store.get(task.based_on)
         elif task.depends_on:
             source_task = store.get(task.depends_on)
 
-        if source_task and source_task.branch:
-            branch_name = source_task.branch
-            console.print(f"    Using existing branch from task #{source_task.id}: [blue]{branch_name}[/blue]")
-        else:
-            error_message(f"Error: Task #{task.id} has same_branch=True but source task has no branch")
+        resolved_branch: str | None = None
+        visited_ids: list[int | None] = []
+        current = source_task
+        while current is not None:
+            if current.branch and git.branch_exists(current.branch):
+                resolved_branch = current.branch
+                if visited_ids:
+                    via = " -> ".join(f"#{i}" for i in visited_ids)
+                    console.print(
+                        f"    Using branch from task #{current.id} (via {via}): [blue]{resolved_branch}[/blue]"
+                    )
+                else:
+                    console.print(f"    Using existing branch from task #{current.id}: [blue]{resolved_branch}[/blue]")
+                break
+            visited_ids.append(current.id)
+            # Walk up the based_on chain
+            if current.based_on:
+                current = store.get(current.based_on)
+            else:
+                current = None
+
+        if resolved_branch is None:
+            error_message(f"Error: Task #{task.id} has same_branch=True but no ancestor has a valid branch")
             return 1
+        branch_name = resolved_branch
     elif config.branch_mode == "single":
         branch_name = f"{config.project_name}/gza-work"
     else:  # multi
