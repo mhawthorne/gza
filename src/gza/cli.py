@@ -650,7 +650,7 @@ def cmd_next(args: argparse.Namespace) -> int:
     orphaned = _get_orphaned_tasks(registry, store)
 
     if not pending:
-        print("No pending tasks")
+        console.print("No pending tasks")
         if orphaned:
             _print_orphaned_warning(orphaned)
         return 0
@@ -668,34 +668,68 @@ def cmd_next(args: argparse.Namespace) -> int:
         else:
             runnable.append(task)
 
+    # Colors consistent with cmd_history
+    c = {
+        "task_id": "dim",
+        "prompt": "#ff99cc",
+        "type": "magenta",
+        "blocked": "yellow",
+        "index": "dim",
+    }
+
+    # Terminal-width-aware column widths
+    terminal_width = get_terminal_width()
+    idx_width = 3
+    id_width = 6    # e.g. "#1234" fits in 6 chars
+    type_width = 12  # e.g. "[implement]" = 11 chars + 1 space padding
+    # 2 spaces between each column (3 gaps)
+    fixed_cols = idx_width + 2 + id_width + 2 + type_width + 2
+    prompt_width = max(20, terminal_width - fixed_cols)
+
+    def _print_task_row(i: int, task: DbTask, blocking_id: int | None = None) -> None:
+        idx_str = str(i)
+        id_str = f"#{task.id}"
+        type_str = task.task_type or "implement"
+        # Build visible type label with brackets, padded to fixed width
+        type_visible = f"[{type_str}]"
+        type_padded = f"{type_visible:<{type_width}}"
+        first_line = task.prompt.split('\n')[0].strip()
+        blocked_label = (
+            f" [{c['blocked']}](blocked by #{blocking_id})[/{c['blocked']}]"
+            if blocking_id else ""
+        )
+        blocked_raw_len = len(f" (blocked by #{blocking_id})") if blocking_id else 0
+        avail = max(10, prompt_width - blocked_raw_len)
+        prompt_display = truncate(first_line, avail)
+        console.print(
+            f"[{c['index']}]{idx_str:>{idx_width}}[/{c['index']}]"
+            f"  [{c['task_id']}]{id_str:<{id_width}}[/{c['task_id']}]"
+            f"  [{c['type']}]{rich_escape(type_padded)}[/{c['type']}]"
+            f"  [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
+            f"{blocked_label}"
+        )
+
     # Show runnable tasks
     if runnable:
         for i, task in enumerate(runnable, 1):
-            type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
-            # Get first line only, then truncate
-            first_line = task.prompt.split('\n')[0].strip()
-            prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-            print(f"{i}. (#{task.id}) {type_label}{prompt_display}")
+            _print_task_row(i, task)
     else:
         if not show_all:
-            print("No runnable tasks")
+            console.print("No runnable tasks")
 
     # Show blocked tasks if --all is specified
     if show_all and blocked:
         if runnable:
-            print()
+            console.print()
         for i, (task, blocking_id) in enumerate(blocked, len(runnable) + 1):
-            type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
-            first_line = task.prompt.split('\n')[0].strip()
-            prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-            print(f"{i}. (#{task.id}) {type_label}{prompt_display} (blocked by #{blocking_id})")
+            _print_task_row(i, task, blocking_id)
 
     # Show blocked count at the bottom (only if not showing all)
     if not show_all and blocked:
-        print()
+        console.print()
         count = len(blocked)
         plural = "tasks" if count != 1 else "task"
-        print(f"({count} {plural} blocked by dependencies)")
+        console.print(f"[{c['blocked']}]({count} {plural} blocked by dependencies)[/{c['blocked']}]")
 
     if orphaned:
         _print_orphaned_warning(orphaned)
