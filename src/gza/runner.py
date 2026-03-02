@@ -48,22 +48,6 @@ def _persist_run_steps_from_result(
                     event["outcome"] = fallback_outcome
                     break
 
-    has_non_completed = any(
-        isinstance(event, dict) and str(event.get("outcome") or "completed") != "completed"
-        for event in events
-    )
-    fallback_outcome: str | None = None
-    if not has_non_completed:
-        if result.error_type in ("max_steps", "max_turns"):
-            fallback_outcome = "interrupted"
-        elif result.error_type is not None or result.exit_code != 0:
-            fallback_outcome = "failed"
-        if fallback_outcome is not None:
-            for event in reversed(events):
-                if isinstance(event, dict):
-                    event["outcome"] = fallback_outcome
-                    break
-
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -1347,6 +1331,13 @@ def _run_inner(
         task.session_id = session_id
         store.update(task)
 
+    # Ensure all bundled skills are available in the worktree
+    from .skills_utils import ensure_all_skills
+    skills_dir = worktree_path / ".claude" / "skills"
+    n_installed = ensure_all_skills(skills_dir)
+    if n_installed:
+        console.print(f"Installed {n_installed} skill(s) into worktree")
+
     try:
         result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id)
 
@@ -1620,6 +1611,13 @@ def _run_non_code_task(
             prompt = PromptBuilder().resume_prompt()
         else:
             prompt = build_prompt(task, config, store, report_path=prompt_report_path, git=git)
+        # Ensure all bundled skills are available in the worktree
+        from .skills_utils import ensure_all_skills
+        skills_dir = worktree_path / ".claude" / "skills"
+        n_installed = ensure_all_skills(skills_dir)
+        if n_installed:
+            console.print(f"Installed {n_installed} skill(s) into worktree")
+
         hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
 
         def _on_session_id_non_code(session_id: str) -> None:

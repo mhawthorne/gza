@@ -10992,11 +10992,20 @@ class TestAdvanceCommand:
 
         git = self._setup_git_repo(tmp_path)
 
-        # Create 2 tasks that will merge (no reviews)
-        merge_tasks = [
-            self._create_implement_task_with_branch(store, git, tmp_path, f"Merge {i}")
-            for i in range(2)
-        ]
+        # Create 2 tasks that will merge (with APPROVED reviews)
+        merge_tasks = []
+        for i in range(2):
+            task = self._create_implement_task_with_branch(store, git, tmp_path, f"Merge {i}")
+            review_task = store.add(
+                f"Review #{task.id}",
+                task_type="review",
+                depends_on=task.id,
+            )
+            review_task.status = "completed"
+            review_task.completed_at = datetime.now(timezone.utc)
+            review_task.output_content = "**Verdict: APPROVED**"
+            store.update(review_task)
+            merge_tasks.append(task)
 
         # Create 2 tasks with pending reviews (will spawn workers)
         worker_tasks = []

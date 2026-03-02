@@ -128,6 +128,31 @@ def get_skill_public(skill_name: str) -> bool:
     return public.lower() == 'true' if public else False
 
 
+def ensure_all_skills(target_dir: Path) -> int:
+    """Ensure all bundled skills are installed in the target directory.
+
+    Installs any missing skills (both public and internal) without overwriting
+    existing ones. This is intended to be called before task execution so that
+    skills removed from git (e.g. .claude/skills/) are always available.
+
+    Args:
+        target_dir: Target skills directory (e.g. .claude/skills/).
+
+    Returns:
+        Number of skills newly installed.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    installed = 0
+    for skill_name in get_available_skills(public_only=False):
+        skill_path = target_dir / skill_name / "SKILL.md"
+        if skill_path.exists():
+            continue
+        ok, _ = copy_skill(skill_name, target_dir)
+        if ok:
+            installed += 1
+    return installed
+
+
 def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[bool, str]:
     """Copy a skill from the package to the target directory atomically.
 
