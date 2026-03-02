@@ -1459,15 +1459,6 @@ def _resolve_runtime_skill_dir(project_dir: Path, provider: str) -> tuple[str, P
     return target_map.get(provider)
 
 
-def _has_runtime_rebase_skill(project_dir: Path, provider: str) -> bool:
-    """Return True when gza-rebase skill is available for the provider runtime."""
-    runtime = _resolve_runtime_skill_dir(project_dir, provider)
-    if not runtime:
-        return False
-    _, runtime_dir = runtime
-    return (runtime_dir / "gza-rebase" / "SKILL.md").exists()
-
-
 def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
     """Ensure a skill is available for the provider runtime, installing if missing.
 
