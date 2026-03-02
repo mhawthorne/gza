@@ -4270,6 +4270,144 @@ class TestPsCommand:
         assert "\033[2J" not in captured.out
         assert "\033[H" not in captured.out
 
+    def test_ps_poll_auto_stops_when_all_tasks_complete(self, tmp_path: Path):
+        """Poll mode exits automatically once all seen tasks leave running/in_progress."""
+        import argparse
+        import os
+        import unittest.mock as mock
+        from gza.cli import cmd_ps
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        worker = WorkerMetadata(
+            worker_id="w-test-autostop",
+            pid=os.getpid(),  # Real PID so is_running() returns True
+            task_id=None,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(worker)
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(n: float) -> None:
+            sleep_calls.append(n)
+            # Transition the worker to completed so the next poll sees it as done.
+            worker.status = "completed"
+            registry.update(worker)
+
+        # Use --all so that completed workers remain visible in live_rows and
+        # seen_tasks is updated with the final "completed" status on the second poll.
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            all=True,
+            quiet=False,
+            json=False,
+            poll=2,
+        )
+
+        with mock.patch("time.sleep", side_effect=fake_sleep):
+            result = cmd_ps(args)
+
+        assert result == 0
+        # sleep was called exactly once: after poll 1 (running), before poll 2 (completed→break)
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 2
+
+        registry.remove("w-test-autostop")
+
+    def test_ps_steps_column_uses_num_steps_computed_for_completed_task(self, tmp_path: Path):
+        """STEPS column shows num_steps_computed for a completed task, without hitting the DB."""
+        import json
+        import unittest.mock as mock
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Completed task with steps")
+        store.mark_in_progress(task)
+        # Set num_steps_computed before marking completed so it persists via update().
+        task.num_steps_computed = 7
+        store.mark_completed(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-steps-computed",
+                pid=99999,
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--all", "--json", cwd=tmp_path)
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["steps"] == "7"
+
+        registry.remove("w-test-steps-computed")
+
+    def test_ps_steps_column_uses_live_count_for_in_progress_task(self, tmp_path: Path):
+        """STEPS column shows live DB row count for an in-progress task."""
+        import json
+        import os
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("In-progress task with live steps")
+        store.mark_in_progress(task)
+        assert task.id is not None
+
+        # Emit 3 run_steps rows for this task.
+        for i in range(3):
+            store.emit_step(task.id, f"Step {i + 1}", provider="claude")
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-steps-live",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--json", cwd=tmp_path)
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["steps"] == "3"
+
+        registry.remove("w-test-steps-live")
+
 
 class TestHelpOutput:
     """Tests for CLI help output."""

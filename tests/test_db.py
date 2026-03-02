@@ -2650,6 +2650,21 @@ class TestRunStepPersistence:
         with pytest.raises(ValueError, match="Step reference index mismatch"):
             store.get_run_substeps(tampered)
 
+    def test_count_steps_returns_correct_count_and_zero_for_empty(self, tmp_path: Path):
+        """count_steps returns N for a task with N run_steps rows and 0 when none exist."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task_a = store.add("Task with steps")
+        task_b = store.add("Task without steps")
+        assert task_a.id is not None
+        assert task_b.id is not None
+
+        # Emit 4 steps for task_a.
+        for i in range(4):
+            store.emit_step(task_a.id, f"Step {i + 1}", provider="claude")
+
+        assert store.count_steps(task_a.id) == 4
+        assert store.count_steps(task_b.id) == 0
+
     def test_migration_v15_to_v16_is_idempotent(self, tmp_path: Path):
         """Running v15->v16 migration twice should not duplicate indexes/tables."""
         import sqlite3
