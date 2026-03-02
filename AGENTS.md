@@ -76,6 +76,8 @@ Gza is configured via `gza.yaml` in the project root. Key fields:
 | `task_types` | dict | `{}` | Per-task-type overrides for `model` and `max_turns` |
 | `branch_strategy` | string or dict | `"monorepo"` | Branch naming strategy (presets: `monorepo`, `conventional`, `simple`, `date_slug`) |
 | `work_count` | int | 1 | Number of tasks to run in a single work session |
+| `advance_create_reviews` | bool | `true` | When `true`, `gza advance` automatically creates a review task and spawns a worker for completed implement tasks that have no review yet |
+| `advance_requires_review` | bool | `true` | When `true`, `gza advance` refuses to merge an implement task that has no passing (APPROVED) review. Set both flags to `false` for legacy merge-without-review behavior |
 
 ### verify_command
 
