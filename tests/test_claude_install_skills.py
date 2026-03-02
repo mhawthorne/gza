@@ -62,6 +62,24 @@ class TestSkillsInstallClaudeTarget:
         assert (skills_dir / "gza-task-info" / "SKILL.md").exists()
         assert (skills_dir / "gza-plan-review" / "SKILL.md").exists()
 
+    def test_install_dev_skills(self, tmp_path: Path):
+        """Install with --dev includes non-public skills."""
+        setup_config(tmp_path)
+        result = run_gza("skills-install", "--target", "claude", "--dev", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        skills_dir = tmp_path / ".claude" / "skills"
+        assert (skills_dir / "gza-test-and-fix" / "SKILL.md").exists()
+
+    def test_dev_skills_excluded_by_default(self, tmp_path: Path):
+        """Non-public skills are not installed without --dev."""
+        setup_config(tmp_path)
+        result = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        skills_dir = tmp_path / ".claude" / "skills"
+        assert not (skills_dir / "gza-test-and-fix").exists()
+
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
         setup_config(tmp_path)
