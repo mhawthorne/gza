@@ -1110,7 +1110,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
         report_file = worktree_review_dir / f"{review_task.task_id}.md"
 
-        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None):
+        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             assert not (worktree_path / ".git").exists()
             assert (worktree_path / ".git.gza-host-worktree").exists()
             report_file.write_text("# Review\n\nVerdict: APPROVED")
@@ -1606,6 +1606,71 @@ class TestRunStepPersistenceIntegration:
             "tool_input": {"command": "ls -la"},
         }
 
+    def test_on_step_count_updates_task_num_steps_computed_in_real_time(self, tmp_path: Path):
+        """on_step_count callback should update task.num_steps_computed in DB during streaming."""
+        import json
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.task_id = "20260302-plan-task"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.model = ""
+        config.chat_text_display_length = 80
+        config.claude = Mock(args=[])
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        # Use two steps so we can verify intermediate DB state
+        intermediate_counts: list[int] = []
+
+        def capturing_store_update(t: Task) -> None:
+            if t.num_steps_computed is not None:
+                intermediate_counts.append(t.num_steps_computed)
+            original_update(t)
+
+        original_update = store.update
+        store.update = capturing_store_update  # type: ignore[method-assign]
+
+        provider = ClaudeProvider()
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_1", "content": [], "usage": {}},
+            }) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "msg_2", "content": [], "usage": {}},
+            }) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 2, "total_cost_usd": 0.0}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen, patch("gza.runner.console"):
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            exit_code = _run_non_code_task(task, config, store, provider, mock_git, resume=False)
+
+        assert exit_code == 0
+        # The callback should have been called for each step (1, then 2)
+        assert 1 in intermediate_counts
+        assert 2 in intermediate_counts
+
 
 class TestResumeVerificationPrompt:
     """Tests for resume verification prompt injection."""
@@ -1650,7 +1715,7 @@ class TestResumeVerificationPrompt:
         # Mock provider to capture the prompt
         captured_prompts = []
 
-        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             captured_prompts.append({
                 'prompt': prompt,
                 'resume_session_id': resume_session_id
@@ -1764,7 +1829,7 @@ class TestResumeVerificationPrompt:
         # Mock provider to capture the prompt
         captured_prompts = []
 
-        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             captured_prompts.append({
                 'prompt': prompt,
                 'resume_session_id': resume_session_id
@@ -1890,7 +1955,7 @@ class TestPersistResolvedConfig:
 
         provider_called_after_update = []
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             # Record whether store.update was already called with persisted values
             provider_called_after_update.append(
                 any(s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude" for s in persisted_states)
@@ -2301,7 +2366,7 @@ class TestNoChangesWithExistingCommits:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -2373,7 +2438,7 @@ class TestNoChangesWithExistingCommits:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -2474,7 +2539,7 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -2559,7 +2624,7 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -2646,7 +2711,7 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,

@@ -161,12 +161,13 @@ class GeminiProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Gemini to execute a task."""
         # Note: Gemini doesn't currently support session resumption
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir)
-        return self._run_direct(config, prompt, log_file, work_dir)
+            return self._run_docker(config, prompt, log_file, work_dir, on_step_count=on_step_count)
+        return self._run_direct(config, prompt, log_file, work_dir, on_step_count=on_step_count)
 
     def _run_docker(
         self,
@@ -174,6 +175,7 @@ class GeminiProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Gemini in Docker container."""
         # Use gemini-specific image name
@@ -204,6 +206,7 @@ class GeminiProvider(Provider):
             config.timeout_minutes,
             config.model,
             max_steps=config.max_steps,
+            on_step_count=on_step_count,
         )
 
     def _run_direct(
@@ -212,6 +215,7 @@ class GeminiProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Gemini directly."""
         cmd = [
@@ -230,6 +234,7 @@ class GeminiProvider(Provider):
             cmd, log_file, config.timeout_minutes, config.model, cwd=work_dir,
             chat_text_display_length=config.chat_text_display_length,
             max_steps=config.max_steps,
+            on_step_count=on_step_count,
         )
 
     def _run_with_output_parsing(
@@ -241,6 +246,7 @@ class GeminiProvider(Provider):
         cwd: Path | None = None,
         chat_text_display_length: int = 0,
         max_steps: int = 50,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
         formatter = StreamOutputFormatter()
@@ -282,6 +288,8 @@ class GeminiProvider(Provider):
             }
             data["run_step_events"].append(event)
             data["_current_step_event"] = event
+            if on_step_count:
+                on_step_count(len(data["run_step_events"]))
             return event
 
         def parse_gemini_output(line: str, data: dict, log_handle=None) -> None:

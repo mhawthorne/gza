@@ -3961,3 +3961,126 @@ class TestProviderScopedConfig:
         )
         config = Config.load(tmp_path)
         assert config.get_max_steps_for_task("review", "claude") == 11
+
+
+class TestOnStepCountCallback:
+    """Tests for on_step_count callback in all three providers."""
+
+    def test_claude_on_step_count_called_for_each_step(self, tmp_path):
+        """on_step_count should be called each time a new step starts in Claude."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "ses1", "tools": []}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_1", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_2", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 2, "total_cost_usd": 0.01}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_step_count=counts.append,
+            )
+
+        assert counts == [1, 2]
+
+    def test_claude_on_step_count_not_called_when_no_steps(self, tmp_path):
+        """on_step_count should not be called when there are no assistant steps."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        json_lines = [
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 0, "total_cost_usd": 0.0}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_step_count=counts.append,
+            )
+
+        assert counts == []
+
+    def test_codex_on_step_count_called_for_each_step(self, tmp_path):
+        """on_step_count should be called each time a new step starts in Codex."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "step 1"},
+            }) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "step 2"},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_step_count=counts.append,
+            )
+
+        assert counts == [1, 2]
+
+    def test_gemini_on_step_count_called_for_each_step(self, tmp_path):
+        """on_step_count should be called each time a new step starts in Gemini."""
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        json_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": "First response"}) + "\n",
+            json.dumps({"type": "message", "role": "user", "content": "ok"}) + "\n",
+            json.dumps({"type": "message", "role": "assistant", "content": "Second response"}) + "\n",
+            json.dumps({"type": "result", "stats": {}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.0-flash",
+                on_step_count=counts.append,
+            )
+
+        assert counts == [1, 2]

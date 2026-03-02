@@ -209,11 +209,12 @@ class CodexProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Codex to execute a task."""
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
-        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
+            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
+        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
 
     def _run_docker(
         self,
@@ -223,6 +224,7 @@ class CodexProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Codex in Docker container."""
         docker_config = _get_docker_config(config.docker_image)
@@ -261,6 +263,7 @@ class CodexProvider(Provider):
             cmd, log_file, config.timeout_minutes, stdin_input=prompt,
             model=config.model, max_steps=config.max_steps,
             on_session_id=on_session_id,
+            on_step_count=on_step_count,
         )
 
     def _run_direct(
@@ -271,6 +274,7 @@ class CodexProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Codex directly (no Docker)."""
         cmd = [
@@ -306,6 +310,7 @@ class CodexProvider(Provider):
             stdin_input=prompt, model=config.model,
             max_steps=config.max_steps,
             on_session_id=on_session_id,
+            on_step_count=on_step_count,
         )
 
     def _run_with_output_parsing(
@@ -318,6 +323,7 @@ class CodexProvider(Provider):
         model: str = "",
         max_steps: int = 50,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
         formatter = StreamOutputFormatter()
@@ -370,6 +376,8 @@ class CodexProvider(Provider):
             }
             data["run_step_events"].append(event)
             data["_current_step_event"] = event
+            if on_step_count:
+                on_step_count(len(data["run_step_events"]))
             return event
 
         def parse_codex_output(line: str, data: dict, log_handle=None) -> None:
