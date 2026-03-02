@@ -6138,6 +6138,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         action = _determine_advance_action(config, store, git, task, default_branch)
         plan.append((task, action))
 
+    # Run merges first (fast, synchronous) so freshly merged code is on the
+    # default branch before any review/improve workers are spawned.
+    plan.sort(key=lambda item: 0 if item[1]['type'] == 'merge' else 1)
+
     if dry_run:
         print(f"Would advance {len(plan)} task(s):\n")
         for task, action in plan:
