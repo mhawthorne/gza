@@ -9,7 +9,7 @@ tmp/
 gza.local.yaml
 
 # Gza runtime data
-.gza/
+.gza
 
 # Claude Code local skills (removed from git, kept locally)
 .claude/skills/
