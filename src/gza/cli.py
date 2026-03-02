@@ -3100,6 +3100,178 @@ def _display_step_timeline(entries: list[dict], *, verbose: bool) -> None:
                 console.print(f"  [green]\\[{substep['substep_id']}][/green] {rich_escape(substep['detail'])}", soft_wrap=True)
 
 
+class _LiveLogPrinter:
+    """Stateful printer that renders log entries using the same style as ``gza work``.
+
+    Tracks step boundaries so it can emit step headers with token/cost/runtime
+    info, while also showing tool results (which ``gza work`` omits).
+    """
+
+    def __init__(self, *, live: bool = True) -> None:
+        from .providers.output_formatter import StreamOutputFormatter, truncate_text as _trunc
+        self._fmt = StreamOutputFormatter(console=console)
+        self._trunc = _trunc
+        self._live = live
+        self._seen_msg_ids: set[str] = set()
+        self._step_count = 0
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._start_time: float | None = None
+
+    def process(self, entry: dict) -> None:
+        """Process a single JSON log entry and print it."""
+        entry_type = entry.get("type")
+
+        if entry_type == "system":
+            subtype = entry.get("subtype", "")
+            if subtype == "init":
+                model = entry.get("model", "unknown")
+                self._fmt.print_agent_message(f"Session initialized (model: {model})")
+
+        elif entry_type == "assistant":
+            message = entry.get("message", {})
+            msg_id = message.get("id")
+
+            if self._start_time is None:
+                self._start_time = time.time()
+
+            # New step on new message ID
+            if msg_id and msg_id not in self._seen_msg_ids:
+                self._seen_msg_ids.add(msg_id)
+                self._step_count += 1
+
+                if self._step_count > 1:
+                    console.print()
+
+                if self._live:
+                    usage = message.get("usage", {})
+                    self._total_input_tokens += usage.get("input_tokens", 0)
+                    self._total_input_tokens += usage.get("cache_creation_input_tokens", 0)
+                    self._total_input_tokens += usage.get("cache_read_input_tokens", 0)
+                    self._total_output_tokens += usage.get("output_tokens", 0)
+
+                    total_tokens = self._total_input_tokens + self._total_output_tokens
+                    elapsed = int(time.time() - self._start_time)
+
+                    self._fmt.print_step_header(
+                        self._step_count, total_tokens, 0.0, elapsed,
+                        blank_line_before=False,
+                    )
+                else:
+                    console.print(
+                        f"| Step {self._step_count} |",
+                        style="blue",
+                    )
+
+            raw_content = message.get("content", [])
+            if isinstance(raw_content, str):
+                # Simple string content (e.g. "Working...")
+                if raw_content.strip():
+                    self._fmt.print_agent_message(raw_content.strip())
+            elif isinstance(raw_content, list):
+                for content in raw_content:
+                    if not isinstance(content, dict):
+                        continue
+                    if content.get("type") == "tool_use":
+                        self._print_tool_use(content)
+                    elif content.get("type") == "text":
+                        text = content.get("text", "").strip()
+                        if text:
+                            self._fmt.print_agent_message(text)
+
+        elif entry_type == "user":
+            # Tool results
+            content_items = _message_content_items(entry)
+            for item in content_items:
+                if item.get("type") == "tool_result":
+                    result = item.get("content", "")
+                    is_error = item.get("is_error", False)
+                    if isinstance(result, str):
+                        result = result.replace("\\n", "\n").replace("\\t", "\t")
+                        if len(result) > 200:
+                            result = result[:200] + "..."
+                        if is_error:
+                            self._fmt.print_error(result)
+                        else:
+                            console.print(f"  {rich_escape(result)}", style="dim", soft_wrap=True)
+
+        elif entry_type == "gza":
+            subtype = entry.get("subtype", "")
+            message = entry.get("message", "")
+            if message:
+                if subtype:
+                    console.print(f"[cyan]\\[gza:{rich_escape(subtype)}][/cyan] {rich_escape(message)}", soft_wrap=True)
+                else:
+                    console.print(f"[cyan]\\[gza][/cyan] {rich_escape(message)}", soft_wrap=True)
+
+        elif entry_type == "result":
+            is_error = entry.get("is_error", False)
+            subtype = str(entry.get("subtype") or "")
+            result_text = entry.get("result", "")
+            if is_error:
+                self._fmt.print_error(f"[result] ERROR: {result_text}")
+            elif subtype and subtype != "success":
+                if isinstance(result_text, str) and result_text.strip():
+                    console.print(f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text.strip())}", soft_wrap=True)
+                else:
+                    console.print(f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]", soft_wrap=True)
+            else:
+                # Success result
+                if isinstance(result_text, str) and result_text.strip():
+                    console.print(f"[green]\\[result][/green] {rich_escape(result_text.strip())}", soft_wrap=True)
+
+    def _print_tool_use(self, content: dict) -> None:
+        tool_name = content.get("name", "unknown")
+        tool_input = content.get("input", {})
+
+        if tool_name == "Bash":
+            cmd = tool_input.get("command", "")
+            self._fmt.print_tool_event(tool_name, self._trunc(cmd, 80))
+        elif tool_name == "Edit":
+            parts = [tool_name]
+            file_path = tool_input.get("file_path", "")
+            if file_path:
+                parts.append(file_path)
+            old_string = tool_input.get("old_string", "")
+            new_string = tool_input.get("new_string", "")
+            old_lines = old_string.count("\n") + (1 if old_string else 0)
+            new_lines = new_string.count("\n") + (1 if new_string else 0)
+            if old_lines > 0 or new_lines > 0:
+                added = max(0, new_lines - old_lines)
+                removed = max(0, old_lines - new_lines)
+                if added > 0 and removed > 0:
+                    parts.append(f"(+{added}/-{removed} lines)")
+                elif added > 0:
+                    parts.append(f"(+{added} lines)")
+                elif removed > 0:
+                    parts.append(f"(-{removed} lines)")
+            if tool_input.get("replace_all"):
+                parts.append("[replace_all]")
+            self._fmt.print_tool_event(" ".join(parts))
+        elif tool_name == "Glob":
+            self._fmt.print_tool_event(tool_name, tool_input.get("pattern", ""))
+        elif tool_name == "Grep":
+            pattern = tool_input.get("pattern", "")
+            path = tool_input.get("path", "")
+            detail = pattern
+            if path:
+                detail += f" [{path}]"
+            self._fmt.print_tool_event(tool_name, detail)
+        elif tool_name == "TodoWrite":
+            todos = tool_input.get("todos", [])
+            self._fmt.print_tool_event(tool_name, f"{len(todos)} todos")
+            for todo in todos:
+                status = todo.get("status", "pending")
+                todo_content = todo.get("content", "")
+                self._fmt.print_todo(status, self._trunc(todo_content, 60))
+        else:
+            file_path = tool_input.get("file_path") or tool_input.get("path")
+            if file_path:
+                self._fmt.print_tool_event(tool_name, file_path)
+            else:
+                self._fmt.print_tool_event(tool_name)
+
+
 def _format_log_entry(entry: dict) -> str | None:
     """Format a single JSON log entry for display.
 
@@ -3575,12 +3747,12 @@ def cmd_log(args: argparse.Namespace) -> int:
     if timeline_mode and entries:
         _display_step_timeline(entries, verbose=timeline_mode == "verbose")
     elif entries:
-        formatted_entries = [_format_log_entry(entry) for entry in entries]
-        rendered = [line for line in formatted_entries if line]
-        if rendered:
-            for line in rendered:
-                console.print(line, soft_wrap=True)
-        elif log_data:
+        printer = _LiveLogPrinter(live=False)
+        any_printed = False
+        for entry in entries:
+            printer.process(entry)
+            any_printed = True
+        if not any_printed and log_data:
             if "result" in log_data:
                 console.print(rich_escape(log_data["result"]), soft_wrap=True)
             else:
@@ -3655,33 +3827,29 @@ def _tail_log_file(
     # Formatted output mode
     try:
         tail_lines = args.tail if hasattr(args, 'tail') and args.tail else None
+        printer = _LiveLogPrinter()
 
-        def read_and_format_lines(file_path: Path, num_lines: int | None = None) -> list[str]:
-            """Read lines from file and return formatted output."""
-            with open(file_path, 'r') as f:
-                lines = f.readlines()
-
-            if num_lines:
-                lines = lines[-num_lines:]
-
-            formatted = []
-            for line in lines:
+        def _process_lines(raw_lines: list[str]) -> None:
+            """Parse JSON lines and feed them to the live printer."""
+            for line in raw_lines:
                 line = line.strip()
                 if not line:
                     continue
+                if line.startswith("---"):
+                    # Skip step timestamp markers written by the runner
+                    continue
                 try:
                     entry = json.loads(line)
-                    output = _format_log_entry(entry)
-                    if output:
-                        formatted.append(output)
+                    printer.process(entry)
                 except json.JSONDecodeError:
-                    formatted.append(rich_escape(line))
-            return formatted
+                    console.print(rich_escape(line), soft_wrap=True)
 
         # Initial read
-        formatted = read_and_format_lines(log_path, tail_lines)
-        for line in formatted:
-            console.print(line, soft_wrap=True)
+        with open(log_path, 'r') as f:
+            lines = f.readlines()
+        if tail_lines:
+            lines = lines[-tail_lines:]
+        _process_lines(lines)
 
         if not follow:
             return 0
@@ -3702,36 +3870,14 @@ def _tail_log_file(
                 new_lines = lines[last_line_count:]
                 last_line_count = len(lines)
                 last_size = current_size
-
-                for line in new_lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        output = _format_log_entry(entry)
-                        if output:
-                            console.print(output, soft_wrap=True)
-                    except json.JSONDecodeError:
-                        console.print(rich_escape(line), soft_wrap=True)
+                _process_lines(new_lines)
 
             # Check if worker is still running
             if worker_id and not registry.is_running(worker_id):
                 time.sleep(0.5)
                 with open(log_path, 'r') as f:
                     lines = f.readlines()
-                new_lines = lines[last_line_count:]
-                for line in new_lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        output = _format_log_entry(entry)
-                        if output:
-                            console.print(output, soft_wrap=True)
-                    except json.JSONDecodeError:
-                        console.print(rich_escape(line), soft_wrap=True)
+                _process_lines(lines[last_line_count:])
                 break
 
             # Fallback for task-based follow without a running worker ID.
@@ -3741,18 +3887,7 @@ def _tail_log_file(
                     time.sleep(0.5)
                     with open(log_path, 'r') as f:
                         lines = f.readlines()
-                    new_lines = lines[last_line_count:]
-                    for line in new_lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            output = _format_log_entry(entry)
-                            if output:
-                                console.print(output, soft_wrap=True)
-                        except json.JSONDecodeError:
-                            console.print(rich_escape(line), soft_wrap=True)
+                    _process_lines(lines[last_line_count:])
                     break
 
         return 0
