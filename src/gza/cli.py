@@ -6097,6 +6097,13 @@ def _cmd_advance_plans(
     return 0
 
 
+# Maps advance action types to their execution priority (lower = runs first).
+# 'merge' actions are fast and synchronous; running them first ensures freshly
+# merged code is on the default branch before any review/improve workers are
+# spawned, reducing rebase conflicts for those workers.
+_ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
+
+
 def cmd_advance(args: argparse.Namespace) -> int:
     """Intelligently progress unmerged tasks through their lifecycle."""
     config = Config.load(args.project_dir)
@@ -6150,6 +6157,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
     for task in tasks:
         action = _determine_advance_action(config, store, git, task, default_branch)
         plan.append((task, action))
+
+    # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
+    # the rationale. The sort is stable, preserving DB order within each group.
+    # dry-run output inherits this order, so it accurately reflects execution.
+    plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[1]['type'], 1))
 
     if dry_run:
         print(f"Would advance {len(plan)} task(s):\n")

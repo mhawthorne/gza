@@ -11095,6 +11095,80 @@ class TestAdvanceCommand:
         mock_input.assert_not_called()
         assert store.get(task.id).merge_status == "merged"
 
+    def test_advance_merges_run_before_workers(self, tmp_path: Path):
+        """advance executes all merge actions before spawning any background workers.
+
+        This test fails if the sort line in cmd_advance is removed: get_unmerged()
+        returns tasks ORDER BY completed_at DESC, so task_spawn (the newer task)
+        appears first. Without the sort, spawn happens before merge. The sort
+        reorders so merge runs first.
+        """
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        from datetime import datetime, timezone
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # task_merge: APPROVED review → 'merge' action.
+        # Given an EARLIER completed_at so it appears second in DB order (DESC).
+        task_merge = self._create_implement_task_with_branch(store, git, tmp_path, "Feature merge")
+        approved_review = store.add(
+            f"Review #{task_merge.id}", task_type="review", depends_on=task_merge.id
+        )
+        approved_review.status = "completed"
+        approved_review.completed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        approved_review.output_content = "**Verdict: APPROVED**\n\nLooks great."
+        store.update(approved_review)
+        task_merge.completed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store.update(task_merge)
+
+        # task_spawn: pending review → 'run_review' action (spawns a worker).
+        # Given a LATER completed_at so it appears first in DB order (DESC).
+        # Without the sort, this causes spawn to execute before merge.
+        task_spawn = self._create_implement_task_with_branch(store, git, tmp_path, "Feature spawn")
+        store.add(f"Review #{task_spawn.id}", task_type="review", depends_on=task_spawn.id)
+        # Leave review status as default 'pending' — this triggers run_review action.
+        task_spawn.completed_at = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        store.update(task_spawn)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+        )
+
+        call_log: list[str] = []
+
+        def fake_merge(task_id, config, store, git, merge_args, default_branch):
+            call_log.append('merge')
+            return 0
+
+        def fake_spawn(spawn_args, config, task_id=None):
+            call_log.append('spawn')
+            return 0
+
+        with patch("gza.cli._merge_single_task", side_effect=fake_merge):
+            with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+                rc = cmd_advance(args)
+
+        assert rc == 0
+        assert 'merge' in call_log, "Expected at least one merge call"
+        assert 'spawn' in call_log, "Expected at least one worker spawn call"
+        # All merges must complete before the first spawn
+        last_merge_index = max(i for i, v in enumerate(call_log) if v == 'merge')
+        first_spawn_index = min(i for i, v in enumerate(call_log) if v == 'spawn')
+        assert last_merge_index < first_spawn_index, (
+            f"Expected all merges before first spawn, got call order: {call_log}"
+        )
 
 class TestStatsCommand:
     """Tests for 'gza stats' command."""
