@@ -7,6 +7,7 @@ Percentile stats only include tasks that had at least one review.
 """
 
 import argparse
+import re
 import sqlite3
 import sys
 from collections import Counter, defaultdict
@@ -31,6 +32,24 @@ def percentile(sorted_vals: list[int], p: float) -> int:
     return sorted_vals[k]
 
 
+def count_review_issues(content: str) -> tuple[int, int]:
+    """Parse review markdown and return (must_fix_count, suggestion_count).
+
+    Heuristic: counts ### headings that match known patterns for must-fix
+    issues (### 1., ### M1, etc.) and suggestions (### S1, ### S2, etc.).
+    Returns (0, 0) if content is empty or unparseable.
+    """
+    if not content:
+        return 0, 0
+
+    # Must-fix: ### 1. ..., ### M1 ..., ### Issue 1 ...
+    must_fix = len(re.findall(r"^###\s+(?:M?\d+[\.\s—–-]|Issue\s+\d+)", content, re.MULTILINE))
+    # Suggestions: ### S1 ..., ### S2 ...
+    suggestions = len(re.findall(r"^###\s+S\d+[\.\s—–-]", content, re.MULTILINE))
+
+    return must_fix, suggestions
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -45,10 +64,15 @@ def main() -> int:
         default=None,
         help="End date (YYYYmmdd). Default: today",
     )
+    parser.add_argument(
+        "--issues",
+        action="store_true",
+        help="Show per-model issue counts parsed from review content",
+    )
     args = parser.parse_args()
 
     today = date.today()
-    end_date = parse_date(args.end) if args.end else today
+    end_date = parse_date(args.end) if args.end else today + timedelta(days=1)
     start_date = parse_date(args.start) if args.start else end_date - timedelta(days=14)
 
     start_iso = start_date.isoformat()
@@ -104,6 +128,21 @@ def main() -> int:
         """,
         (start_iso, end_iso),
     ).fetchall()
+
+    # Load review content for issue counting (only when --issues)
+    review_content: dict[int, str] = {}
+    if args.issues:
+        content_rows = conn.execute(
+            """
+            SELECT id, output_content
+            FROM tasks
+            WHERE task_type = 'review'
+              AND output_content IS NOT NULL
+              AND created_at >= ? AND created_at < ?
+            """,
+            (start_iso, end_iso),
+        ).fetchall()
+        review_content = {r["id"]: r["output_content"] for r in content_rows}
 
     conn.close()
 
@@ -237,6 +276,45 @@ def main() -> int:
             p90 = percentile(cycles, 90)
             mx = max(cycles)
             print(f"{model:<35} {len(cycles):>5} {med:>5} {p90:>5} {mx:>5}")
+
+    # Per-model issue counts (parsed from review markdown)
+    if args.issues and review_content:
+        model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for ri in ri_tasks:
+            if ri["task_type"] != "review":
+                continue
+            content = review_content.get(ri["id"])
+            if content is None:
+                continue
+            must_fix, sugg = count_review_issues(content)
+            model = ri["model"] or "unknown"
+            model_issues[model].append((must_fix, sugg))
+
+        if model_issues:
+            print(f"\nIssue counts per review (parsed from markdown)")
+            print(f"{'Review model':<35} {'Rvws':>5} {'Fix/rv':>6} {'Sug/rv':>6} {'All/rv':>6}  {'Fix Σ':>6} {'Sug Σ':>6}")
+            print("-" * 83)
+            all_must_fix = 0
+            all_sugg = 0
+            all_reviews = 0
+            for model in sorted(model_issues):
+                pairs = model_issues[model]
+                n = len(pairs)
+                mf_total = sum(mf for mf, _ in pairs)
+                sg_total = sum(sg for _, sg in pairs)
+                all_must_fix += mf_total
+                all_sugg += sg_total
+                all_reviews += n
+                mf_avg = mf_total / n
+                sg_avg = sg_total / n
+                tot_avg = (mf_total + sg_total) / n
+                print(f"{model:<35} {n:>5} {mf_avg:>6.1f} {sg_avg:>6.1f} {tot_avg:>6.1f}  {mf_total:>6} {sg_total:>6}")
+            if len(model_issues) > 1:
+                print("-" * 83)
+                mf_avg = all_must_fix / all_reviews if all_reviews else 0
+                sg_avg = all_sugg / all_reviews if all_reviews else 0
+                tot_avg = (all_must_fix + all_sugg) / all_reviews if all_reviews else 0
+                print(f"{'Total':<35} {all_reviews:>5} {mf_avg:>6.1f} {sg_avg:>6.1f} {tot_avg:>6.1f}  {all_must_fix:>6} {all_sugg:>6}")
 
     return 0
 
