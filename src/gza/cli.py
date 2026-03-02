@@ -7416,40 +7416,44 @@ def main() -> int:
     groups_parser = subparsers.add_parser("groups", help="List all groups with task counts")
     add_common_args(groups_parser)
 
-    # status command
-    status_parser = subparsers.add_parser("status", help="Show tasks in a group")
-    status_parser.add_argument(
+    # group command
+    group_parser = subparsers.add_parser("group", help="Show tasks in a group")
+    group_parser.add_argument(
         "group",
         help="Group name to show tasks for",
     )
-    add_common_args(status_parser)
+    add_common_args(group_parser)
 
-    # ps command
-    ps_parser = subparsers.add_parser("ps", help="List running workers")
-    ps_parser.add_argument(
-        "--all", "-a",
-        action="store_true",
-        help="Include completed/failed workers",
-    )
-    ps_parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Only show worker IDs",
-    )
-    ps_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output as JSON",
-    )
-    ps_parser.add_argument(
-        "--poll",
-        nargs="?",
-        const=5,
-        type=int,
-        metavar="SECS",
-        help="Refresh output every SECS seconds (default: 5 if flag given without value)",
-    )
-    add_common_args(ps_parser)
+    # ps command (status is an alias for ps)
+    for ps_cmd in ("ps", "status"):
+        ps_parser = subparsers.add_parser(
+            ps_cmd,
+            help="List running workers" if ps_cmd == "ps" else "List running workers (alias for ps)",
+        )
+        ps_parser.add_argument(
+            "--all", "-a",
+            action="store_true",
+            help="Include completed/failed workers",
+        )
+        ps_parser.add_argument(
+            "--quiet", "-q",
+            action="store_true",
+            help="Only show worker IDs",
+        )
+        ps_parser.add_argument(
+            "--json",
+            action="store_true",
+            help="Output as JSON",
+        )
+        ps_parser.add_argument(
+            "--poll",
+            nargs="?",
+            const=5,
+            type=int,
+            metavar="SECS",
+            help="Refresh output every SECS seconds (default: 5 if flag given without value)",
+        )
+        add_common_args(ps_parser)
 
     # stop command
     stop_parser = subparsers.add_parser("stop", help="Stop a running worker")
@@ -7597,9 +7601,9 @@ def main() -> int:
             return cmd_import(args)
         elif args.command == "groups":
             return cmd_groups(args)
-        elif args.command == "status":
+        elif args.command == "group":
             return cmd_status(args)
-        elif args.command == "ps":
+        elif args.command in ("ps", "status"):
             return cmd_ps(args)
         elif args.command == "stop":
             return cmd_stop(args)
