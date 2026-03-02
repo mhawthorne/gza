@@ -376,6 +376,38 @@ class TestHistoryCommand:
         assert "Child task" in result.stdout
         assert "ancestor" in result.stdout
 
+    def test_history_lineage_depth_two(self, tmp_path: Path):
+        """--lineage-depth 2 renders all three levels of a grandparent→parent→child chain."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        grandparent = store.add("Grandparent task")
+        grandparent.status = "completed"
+        grandparent.completed_at = datetime.now(timezone.utc)
+        store.update(grandparent)
+
+        parent = store.add("Parent task", based_on=grandparent.id)
+        parent.status = "completed"
+        parent.completed_at = datetime.now(timezone.utc)
+        store.update(parent)
+
+        child = store.add("Child task", based_on=parent.id)
+        child.status = "completed"
+        child.completed_at = datetime.now(timezone.utc)
+        store.update(child)
+
+        result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # All three levels of the chain must appear in the output
+        assert "Grandparent task" in result.stdout
+        assert "Parent task" in result.stdout
+        assert "Child task" in result.stdout
+
     def test_history_incomplete_with_lookback(self, tmp_path: Path):
         """--incomplete combined with --lookback-days applies both filters."""
         from gza.db import SqliteTaskStore

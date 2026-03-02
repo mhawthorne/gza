@@ -968,12 +968,20 @@ def cmd_history(args: argparse.Namespace) -> int:
         if stats_str:
             console.print(f"{indent}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
 
-    def _render_lineage_node(node: TaskLineageNode, is_root: bool = False) -> None:
+    def _render_lineage_node(node: TaskLineageNode) -> None:
         """Render a TaskLineageNode with ancestors above and descendants below."""
         indent_unit = "  "
 
-        # Render ancestors (oldest first so root is closest to the task)
-        for ancestor_node in reversed(node.ancestors):
+        # Collect all ancestors by walking the chain (parent → grandparent → ...)
+        all_ancestors: list[TaskLineageNode] = []
+        current = node
+        while current.ancestors:
+            ancestor = current.ancestors[0]
+            all_ancestors.append(ancestor)
+            current = ancestor
+
+        # Render ancestors oldest first (deepest depth = oldest)
+        for ancestor_node in reversed(all_ancestors):
             depth_indent = indent_unit * ancestor_node.depth
             console.print(
                 f"{depth_indent}[{c['lineage']}]↑ ancestor[/{c['lineage']}]"
@@ -983,13 +991,18 @@ def cmd_history(args: argparse.Namespace) -> int:
         # Render the root task itself
         _render_task_line(node.task)
 
-        # Render descendants
-        for desc_node in node.descendants:
+        # Render descendants recursively so all levels beyond depth=1 are shown
+        def _render_desc_subtree(desc_node: TaskLineageNode) -> None:
             depth_indent = indent_unit * desc_node.depth
             console.print(
                 f"{depth_indent}[{c['lineage']}]↓ descendant[/{c['lineage']}]"
             )
             _render_task_line(desc_node.task, indent=depth_indent)
+            for child in desc_node.descendants:
+                _render_desc_subtree(child)
+
+        for desc_node in node.descendants:
+            _render_desc_subtree(desc_node)
 
         print()
 
