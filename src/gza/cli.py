@@ -2058,7 +2058,7 @@ def _cmd_stats_cycles(config: Config, store: "SqliteTaskStore", as_json: bool) -
         print(f"  Other (blocked/maxed): {other}")
     print()
     if total == 0:
-        print("  No cycles found. Run 'gza cycle <impl-id>' to start one.")
+        print("  No cycles found. Run 'gza iterate <impl-id>' to start one.")
         return 0
 
     print("  Improves before approval (approved cycles only):")
@@ -4819,7 +4819,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     return run(config, task_id=review_task.id, open_after=open_after)
 
 
-def cmd_cycle(args: argparse.Namespace) -> int:
+def cmd_iterate(args: argparse.Namespace) -> int:
     """Run an automated review/improve cycle for an implementation task.
 
     Loops: create+run review -> parse verdict -> if CHANGES_REQUESTED create+run improve -> repeat.
@@ -4861,7 +4861,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         max_iterations = cycle.max_iterations
 
         if dry_run:
-            print(f"[dry-run] Would resume cycle #{cycle.id} for implementation #{impl_task.id}")
+            print(f"[dry-run] Would resume iteration #{cycle.id} for implementation #{impl_task.id}")
             return 0
 
         # Determine next iteration index by inspecting existing iteration records
@@ -4877,10 +4877,10 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         else:
             iteration = 0
 
-        print(f"Resuming cycle #{cycle.id} for implementation #{impl_task.id} from iteration {iteration + 1}...")
+        print(f"Resuming iteration #{cycle.id} for implementation #{impl_task.id} from iteration {iteration + 1}...")
     else:
         if dry_run:
-            print(f"[dry-run] Would start cycle for implementation #{impl_task.id} (max {max_iterations} iterations)")
+            print(f"[dry-run] Would start iteration for implementation #{impl_task.id} (max {max_iterations} iterations)")
             return 0
 
         # Start a new cycle (raises ValueError if one already exists)
@@ -4889,7 +4889,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
         except ValueError as e:
             print(f"Error: {e}")
             return 1
-        print(f"Starting cycle #{cycle.id} for implementation #{impl_task.id} (max {max_iterations} iterations)...")
+        print(f"Starting iteration #{cycle.id} for implementation #{impl_task.id} (max {max_iterations} iterations)...")
         iteration = 0
 
     # Summary rows collected as we run: (iteration, review_id, verdict, improve_id)
@@ -5016,7 +5016,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
     # Print summary table
     print(f"\n{'=' * 60}")
-    print(f"Cycle #{cycle.id} complete: {final_status.upper()} ({final_stop_reason})")
+    print(f"Iteration #{cycle.id} complete: {final_status.upper()} ({final_stop_reason})")
     print(f"{'=' * 60}")
     print(f"{'Iter':<6} {'Review':>8} {'Verdict':<22} {'Improve':>8}")
     print(f"{'-' * 6} {'-' * 8} {'-' * 22} {'-' * 8}")
@@ -5031,7 +5031,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     if final_status == "approved":
         return 0
     elif final_status == "maxed_out":
-        print(f"Max iterations ({max_iterations}) reached. Run 'gza cycle {impl_task.id} --continue' to continue.")
+        print(f"Max iterations ({max_iterations}) reached. Run 'gza iterate {impl_task.id} --continue' to continue.")
         return 2
     else:
         print(f"Cycle blocked: {final_stop_reason}. Manual review required.")
@@ -7095,9 +7095,10 @@ def main() -> int:
     )
     add_common_args(improve_parser)
 
-    # cycle command
+    # iterate command (formerly "cycle"; "cycle" kept as a hidden alias for backward compatibility)
     cycle_parser = subparsers.add_parser(
-        "cycle",
+        "iterate",
+        aliases=["cycle"],
         help="Run an automated review/improve cycle for an implementation task",
     )
     cycle_parser.add_argument(
@@ -7457,8 +7458,8 @@ def main() -> int:
             return cmd_retry(args)
         elif args.command == "improve":
             return cmd_improve(args)
-        elif args.command == "cycle":
-            return cmd_cycle(args)
+        elif args.command in ("iterate", "cycle"):
+            return cmd_iterate(args)
         elif args.command == "implement":
             return cmd_implement(args)
         elif args.command == "review":
