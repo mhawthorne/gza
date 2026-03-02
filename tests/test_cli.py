@@ -10354,7 +10354,7 @@ class TestAdvanceCommand:
         review_task.output_content = "**Verdict: APPROVED**\n\nLooks good!"
         store.update(review_task)
 
-        result = run_gza("advance", "--project", str(tmp_path))
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Merged" in result.stdout or "merged" in result.stdout
 
@@ -10395,7 +10395,7 @@ class TestAdvanceCommand:
         task.has_commits = True
         store.update(task)
 
-        result = run_gza("advance", "--project", str(tmp_path))
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "needs" in result.stdout.lower() and "rebase" in result.stdout.lower()
 
@@ -10422,6 +10422,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10465,6 +10466,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10500,7 +10502,7 @@ class TestAdvanceCommand:
         store.update(review)
 
         # Advance only task1
-        result = run_gza("advance", str(task1.id), "--project", str(tmp_path))
+        result = run_gza("advance", str(task1.id), "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
 
         # task1 should be merged, task2 should still be unmerged
@@ -10527,6 +10529,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=2,
             no_docker=True,
         )
@@ -10562,7 +10565,7 @@ class TestAdvanceCommand:
         )
         # review_task.status is 'pending' by default
 
-        result = run_gza("advance", "--project", str(tmp_path))
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Started review worker" in result.stdout
 
@@ -10586,7 +10589,7 @@ class TestAdvanceCommand:
         review_task.status = "in_progress"
         store.update(review_task)
 
-        result = run_gza("advance", "--project", str(tmp_path))
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "SKIP" in result.stdout
         assert "in_progress" in result.stdout
@@ -10654,6 +10657,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10692,6 +10696,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10733,6 +10738,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10781,6 +10787,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10847,6 +10854,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10889,6 +10897,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
@@ -10898,6 +10907,143 @@ class TestAdvanceCommand:
             rc = cmd_advance(args)
 
         assert rc == 1
+
+    def test_advance_interactive_shows_plan_and_prompts(self, tmp_path: Path):
+        """advance without --auto shows plan and prompts for confirmation."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=False,
+            max=None,
+            no_docker=True,
+        )
+
+        # Simulate user confirming with 'y'
+        with patch("builtins.input", return_value="y") as mock_input:
+            with patch("gza.cli._spawn_background_worker", return_value=0):
+                rc = cmd_advance(args)
+
+        assert rc == 0
+        mock_input.assert_called_once()
+        call_args = mock_input.call_args[0][0]
+        assert "Proceed" in call_args
+
+    def test_advance_interactive_aborts_on_no(self, tmp_path: Path):
+        """advance without --auto exits without executing when user answers 'n'."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Add approved review so action would be merge
+        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=False,
+            max=None,
+            no_docker=True,
+        )
+
+        with patch("builtins.input", return_value="n"):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        # Task should NOT have been merged
+        updated_task = store.get(task.id)
+        assert updated_task.merge_status == "unmerged"
+
+    def test_advance_interactive_eof_aborts(self, tmp_path: Path):
+        """advance without --auto exits cleanly when stdin is closed (EOFError)."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        self._create_implement_task_with_branch(store, git, tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=False,
+            max=None,
+            no_docker=True,
+        )
+
+        with patch("builtins.input", side_effect=EOFError):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+
+    def test_advance_auto_flag_skips_prompt(self, tmp_path: Path):
+        """advance --auto executes without prompting."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from unittest.mock import patch
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Add approved review so action is merge
+        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+        )
+
+        with patch("builtins.input") as mock_input:
+            with patch("gza.cli._spawn_background_worker", return_value=0):
+                rc = cmd_advance(args)
+
+        assert rc == 0
+        mock_input.assert_not_called()
+        assert store.get(task.id).merge_status == "merged"
 
 
 class TestStatsCommand:

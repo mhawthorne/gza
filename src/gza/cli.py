@@ -6074,6 +6074,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
 
     dry_run: bool = args.dry_run
+    auto: bool = getattr(args, 'auto', False)
     max_tasks: int | None = getattr(args, 'max', None)
     task_id: int | None = getattr(args, 'task_id', None)
     plans_mode: bool = getattr(args, 'plans', False)
@@ -6128,6 +6129,24 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"      → {action['description']}")
             print()
         return 0
+
+    # Show the plan and prompt for confirmation
+    print(f"Will advance {len(plan)} task(s):\n")
+    for task, action in plan:
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        print(f"  #{task.id} {prompt_display}")
+        print(f"      → {action['description']}")
+        print()
+
+    if not auto:
+        try:
+            answer = input("Proceed? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if answer not in ('', 'y', 'yes'):
+            print("Aborted.")
+            return 0
 
     # Execute actions
     success_count = 0
@@ -6449,6 +6468,13 @@ def main() -> int:
         "--create",
         action="store_true",
         help="With --plans: create queued implement tasks for all listed plans",
+    )
+    advance_parser.add_argument(
+        "--auto",
+        "-y",
+        action="store_true",
+        dest="auto",
+        help="Skip confirmation prompt and execute immediately (for scripts/cron)",
     )
 
     # refresh command
