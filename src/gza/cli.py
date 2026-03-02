@@ -3419,43 +3419,6 @@ def cmd_log(args: argparse.Namespace) -> int:
             log_path = config.log_path / f"{task.task_id}.log"
         worker_id_for_follow = worker.worker_id
 
-    elif args.task:
-        # Look up by numeric task ID
-        try:
-            task_id = int(query)
-            requested_task = store.get(task_id)
-        except ValueError:
-            print(f"Error: '{query}' is not a valid task ID (must be numeric)")
-            return 1
-        if not requested_task:
-            print(f"Error: Task {query} not found")
-            return 1
-
-        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
-        if requested_task.id != task.id and task.id is not None:
-            resolution_note = (
-                f"Resolved to latest run attempt: task #{task.id} "
-                "(latest same-type retry/resume in based_on chain)"
-            )
-
-        slug_candidate_paths: list[Path] = []
-        slug_candidate_paths.extend(_task_log_candidates(config, task))
-        for attempt in attempts:
-            if attempt.id == task.id:
-                continue
-            slug_candidate_paths.extend(_task_log_candidates(config, attempt))
-
-        for candidate in slug_candidate_paths:
-            if candidate.exists():
-                log_path = candidate
-                break
-        if log_path is None and slug_candidate_paths:
-            log_path = slug_candidate_paths[0]
-
-        if task.id is not None:
-            worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
-            is_running = worker_id_for_follow is not None
-
     elif args.slug:
         # Look up by slug (exact or partial match)
         requested_task = store.get_by_task_id(query)
@@ -3490,6 +3453,43 @@ def cmd_log(args: argparse.Namespace) -> int:
                 break
         if log_path is None and candidate_paths:
             log_path = candidate_paths[0]
+
+        if task.id is not None:
+            worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
+            is_running = worker_id_for_follow is not None
+
+    else:
+        # Default: look up by numeric task ID
+        try:
+            task_id = int(query)
+            requested_task = store.get(task_id)
+        except ValueError:
+            print(f"Error: '{query}' is not a valid task ID (must be numeric)")
+            return 1
+        if not requested_task:
+            print(f"Error: Task {query} not found")
+            return 1
+
+        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
+        if requested_task.id != task.id and task.id is not None:
+            resolution_note = (
+                f"Resolved to latest run attempt: task #{task.id} "
+                "(latest same-type retry/resume in based_on chain)"
+            )
+
+        slug_candidate_paths: list[Path] = []
+        slug_candidate_paths.extend(_task_log_candidates(config, task))
+        for attempt in attempts:
+            if attempt.id == task.id:
+                continue
+            slug_candidate_paths.extend(_task_log_candidates(config, attempt))
+
+        for candidate in slug_candidate_paths:
+            if candidate.exists():
+                log_path = candidate
+                break
+        if log_path is None and slug_candidate_paths:
+            log_path = slug_candidate_paths[0]
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
@@ -7120,20 +7120,14 @@ def main() -> int:
     log_parser = subparsers.add_parser("log", help="Display log for a task or worker")
     log_parser.add_argument(
         "identifier",
-        help="Task ID, slug, or worker ID",
+        help="Task ID (numeric), slug, or worker ID",
     )
-    log_type_group = log_parser.add_mutually_exclusive_group(required=True)
-    log_type_group.add_argument(
-        "--task", "-t",
-        action="store_true",
-        help="Look up by task ID (numeric). Resolves to latest same-type retry/resume run in queried lineage",
-    )
-    log_type_group.add_argument(
+    log_parser.add_argument(
         "--slug", "-s",
         action="store_true",
         help="Look up by task slug (supports partial match)",
     )
-    log_type_group.add_argument(
+    log_parser.add_argument(
         "--worker", "-w",
         action="store_true",
         help="Look up by worker ID",
