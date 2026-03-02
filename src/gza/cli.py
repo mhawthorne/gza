@@ -4279,8 +4279,8 @@ def _print_ps_output(
 
     if hasattr(args, "quiet") and args.quiet:
         for row in rows:
-            if row["worker_id"] != "-":
-                print(row["worker_id"])
+            if row["task_id"] is not None:
+                print(row["task_id"])
         return
 
     if hasattr(args, "json") and args.json:
@@ -4299,11 +4299,11 @@ def _print_ps_output(
     }
 
     header = (
-        f"{'TASK ID':<10} {'WORKER ID':<20} {'PID':<8} {'TYPE':<6} "
+        f"{'TASK ID':<10} {'TYPE':<10} "
         f"{'STATUS':<12} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
     console.print(f"[bold]{header}[/bold]", soft_wrap=True)
-    console.print("[bold]" + "─" * 124 + "[/bold]", soft_wrap=True)
+    console.print("[bold]" + "─" * 94 + "[/bold]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
@@ -4314,7 +4314,7 @@ def _print_ps_output(
         task_display = row['task'].replace('[', '\\[') if row['task'] else ''
 
         console.print(
-            f"[cyan]{task_id_display:<10}[/cyan] {row['worker_id']:<20} {row['pid']:<8} {row['type']:<6} "
+            f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
             f"[{sc}]{status:<12}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
             f"[#ff99cc]{task_display}[/#ff99cc]",
             soft_wrap=True,
@@ -4488,9 +4488,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
     worker_id = worker.worker_id if worker else "-"
     pid = str(worker.pid) if worker else "-"
-    worker_type = (
-        "fg" if worker and hasattr(worker, "is_background") and not worker.is_background else "bg"
-    ) if worker else "-"
+    task_type_display = task.task_type if task else "-"
 
     task_id = task.id if task and task.id is not None else worker.task_id if worker else None
     task_display = ""
@@ -4510,7 +4508,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
     return {
         "worker_id": worker_id,
         "pid": pid,
-        "type": worker_type,
+        "type": task_type_display,
         "source": source,
         "task_id": task_id,
         "status": status,
@@ -5617,7 +5615,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         latest_worker = _latest_worker_for_task(WorkerRegistry(config.workers_path), task.id)
         if latest_worker:
             run_mode = "background" if latest_worker.is_background else "foreground"
-            worker_label = f"{run_mode} ({latest_worker.worker_id})"
+            pid_part = f", PID {latest_worker.pid}" if latest_worker.pid else ""
+            worker_label = f"{run_mode} ({latest_worker.worker_id}){pid_part}"
             console.print(f"[{c['label']}]Run Context:[/{c['label']}] [{c['value']}]{worker_label}[/{c['value']}]")
 
     if task.status == "failed":
