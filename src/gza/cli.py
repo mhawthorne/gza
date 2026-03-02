@@ -6006,6 +6006,16 @@ def _add_skills_install_args(
     )
 
 
+def _count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: int) -> int:
+    """Count completed review/improve cycles for an implementation task.
+
+    Counts completed improve tasks for the root task, since each improve
+    corresponds to one completed review→changes_requested→improve cycle.
+    """
+    improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
+    return sum(1 for t in improve_tasks if t.status == 'completed')
+
+
 def _determine_advance_action(
     config: Config,
     store: SqliteTaskStore,
@@ -6108,6 +6118,13 @@ def _determine_advance_action(
                     'review_task': latest_review,
                 }
             elif verdict == 'CHANGES_REQUESTED':
+                # Check cycle limit before creating a new improve
+                completed_cycles = _count_completed_review_cycles(store, task.id)
+                if completed_cycles >= config.max_review_cycles:
+                    return {
+                        'type': 'max_cycles_reached',
+                        'description': f'SKIP: max review cycles ({config.max_review_cycles}) reached, needs manual intervention',
+                    }
                 # Check if an improve task is already pending/in_progress
                 assert latest_review.id is not None
                 existing_improve = store.get_improve_tasks_for(task.id, latest_review.id)
@@ -6259,6 +6276,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Determine effective max_resume_attempts
     max_resume_attempts = max_resume_attempts_override if max_resume_attempts_override is not None else config.max_resume_attempts
 
+    max_review_cycles_override: int | None = getattr(args, 'max_review_cycles', None)
+
+    if max_review_cycles_override is not None:
+        config.max_review_cycles = max_review_cycles_override
+
     if batch_limit is not None and batch_limit < 1:
         print("Error: --batch must be a positive integer", file=sys.stderr)
         return 1
@@ -6381,16 +6403,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
     skip_count = 0
     error_count = 0
     workers_started = 0
+    # Track tasks skipped for actionable reasons (needs human attention)
+    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'})
+    attention_tasks: list[tuple[DbTask, dict]] = []
 
     for task, action in plan:
         assert task.id is not None
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         action_type = action['type']
 
-        if action_type in ('needs_rebase', 'wait_review', 'wait_improve', 'needs_discussion', 'skip'):
+        if action_type in ('needs_rebase', 'wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
             print(f"  #{task.id} {prompt_display}")
             print(f"      {action['description']}")
             skip_count += 1
+            if action_type in _ACTIONABLE_SKIP_TYPES:
+                attention_tasks.append((task, action))
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
@@ -6548,6 +6575,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print()
 
     print(f"Advanced: {success_count} task(s), skipped: {skip_count}, errors: {error_count}")
+
+    if attention_tasks:
+        print(f"\nNeeds attention ({len(attention_tasks)} task{'s' if len(attention_tasks) != 1 else ''}):")
+        for atask, aaction in attention_tasks:
+            prompt_display = truncate(atask.prompt, MAX_PROMPT_DISPLAY_SHORT)
+            # Strip leading "SKIP: " prefix from description for display
+            desc = aaction['description']
+            if desc.startswith('SKIP: '):
+                desc = desc[len('SKIP: '):]
+            print(f"  #{atask.id}  {prompt_display}")
+            print(f"       → {desc}")
+
     return 0 if error_count == 0 else 1
 
 
@@ -6754,6 +6793,13 @@ def main() -> int:
         metavar="N",
         dest="max_resume_attempts",
         help="Override max_resume_attempts config value for this run",
+    )
+    advance_parser.add_argument(
+        "--max-review-cycles",
+        type=int,
+        metavar="N",
+        dest="max_review_cycles",
+        help="Override max_review_cycles config value for this run",
     )
 
     # refresh command

@@ -11632,6 +11632,192 @@ class TestAdvanceCommand:
         action = _determine_advance_action(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
+    def _create_completed_improve(self, store, impl_task, review_task):
+        """Create a completed improve task for the given impl and review tasks."""
+        improve = store.add(
+            f"Improve #{impl_task.id}",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        improve.status = "completed"
+        improve.completed_at = datetime.now(timezone.utc)
+        store.update(improve)
+        return improve
+
+    def test_advance_skips_task_at_max_review_cycles(self, tmp_path: Path):
+        """advance skips task when completed improve count >= max_review_cycles."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\nmax_review_cycles: 2\n"
+        )
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a CHANGES_REQUESTED review
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        # Create 2 completed improve tasks (= max_review_cycles)
+        self._create_completed_improve(store, task, review_task)
+        self._create_completed_improve(store, task, review_task)
+
+        config = Config.load(tmp_path)
+        assert config.max_review_cycles == 2
+
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'max_cycles_reached'
+        assert 'max review cycles' in action['description']
+        assert '2' in action['description']
+
+    def test_advance_creates_improve_when_under_cycle_limit(self, tmp_path: Path):
+        """advance creates an improve task when completed cycles < max_review_cycles."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\nmax_review_cycles: 3\n"
+        )
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a CHANGES_REQUESTED review
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        # Create 1 completed improve (below limit of 3)
+        self._create_completed_improve(store, task, review_task)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'improve'
+
+    def test_advance_needs_attention_summary_printed(self, tmp_path: Path):
+        """advance prints Needs attention section for actionable skips."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\nmax_review_cycles: 1\n"
+        )
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a CHANGES_REQUESTED review and 1 completed improve (= max_review_cycles=1)
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+        self._create_completed_improve(store, task, review_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            max_review_cycles=None,
+        )
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            rc = cmd_advance(args)
+            output = mock_stdout.getvalue()
+
+        assert rc == 0
+        assert "Needs attention" in output
+        assert f"#{task.id}" in output
+        assert "max review cycles" in output
+
+    def test_advance_max_review_cycles_cli_override(self, tmp_path: Path):
+        """--max-review-cycles overrides the config value."""
+        # Config has default max_review_cycles=3; 2 completed improves would normally allow more
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        # Create 2 completed improves
+        self._create_completed_improve(store, task, review_task)
+        self._create_completed_improve(store, task, review_task)
+
+        # With default max_review_cycles=3, action would be 'improve' (2 < 3)
+        config = Config.load(tmp_path)
+        action_default = _determine_advance_action(config, store, git, task, "main")
+        assert action_default['type'] == 'improve'
+
+        # Override to 2 — now 2 completed improves == limit → max_cycles_reached
+        config.max_review_cycles = 2
+        action_override = _determine_advance_action(config, store, git, task, "main")
+        assert action_override['type'] == 'max_cycles_reached'
+
+    def test_advance_max_review_cycles_dry_run(self, tmp_path: Path):
+        """advance --dry-run shows max_cycles_reached action without executing."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\nmax_review_cycles: 1\n"
+        )
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+        self._create_completed_improve(store, task, review_task)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Would advance" in result.stdout
+        assert "max review cycles" in result.stdout
+
 
     def _create_failed_task(self, store, session_id="sess-abc", failure_reason="MAX_STEPS", prompt="Implement feature"):
         """Create a failed task with given failure_reason and session_id."""
