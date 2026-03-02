@@ -1372,6 +1372,11 @@ def _run_inner(
         task.session_id = session_id
         store.update(task)
 
+    def _on_step_count(count: int) -> None:
+        """Update task.num_steps_computed in real time during streaming."""
+        task.num_steps_computed = count
+        store.update(task)
+
     # Ensure all bundled skills are available in the worktree
     from .skills_utils import ensure_all_skills
     skills_dir = worktree_path / ".claude" / "skills"
@@ -1380,7 +1385,7 @@ def _run_inner(
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
     try:
-        result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id)
+        result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id, on_step_count=_on_step_count)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
@@ -1685,8 +1690,13 @@ def _run_non_code_task(
             task.session_id = session_id
             store.update(task)
 
+        def _on_step_count_non_code(count: int) -> None:
+            """Update task.num_steps_computed in real time during streaming."""
+            task.num_steps_computed = count
+            store.update(task)
+
         try:
-            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code)
+            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code, on_step_count=_on_step_count_non_code)
         except KeyboardInterrupt:
             console.print("\nInterrupted")
             return 130

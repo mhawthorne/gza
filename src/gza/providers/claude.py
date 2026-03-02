@@ -221,11 +221,12 @@ class ClaudeProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Claude to execute a task."""
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
-        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id)
+            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
+        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
 
     def _run_docker(
         self,
@@ -235,6 +236,7 @@ class ClaudeProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
         if config.claude.fetch_auth_token_from_keychain:
@@ -258,6 +260,7 @@ class ClaudeProvider(Provider):
             cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
+            on_step_count=on_step_count,
         )
 
     def _run_direct(
@@ -268,6 +271,7 @@ class ClaudeProvider(Provider):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
         cmd = [
@@ -286,6 +290,7 @@ class ClaudeProvider(Provider):
             cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
+            on_step_count=on_step_count,
         )
 
     def _run_with_output_parsing(
@@ -298,6 +303,7 @@ class ClaudeProvider(Provider):
         model: str = "",
         chat_text_display_length: int = 0,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
         formatter = StreamOutputFormatter()
@@ -336,6 +342,8 @@ class ClaudeProvider(Provider):
             data["_current_step_event"] = event
             if msg_id:
                 data["_step_by_msg_id"][msg_id] = event
+            if on_step_count:
+                on_step_count(len(data["run_step_events"]))
             return event
 
         def parse_claude_output(line: str, data: dict, log_handle=None) -> None:

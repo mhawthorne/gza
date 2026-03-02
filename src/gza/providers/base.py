@@ -413,6 +413,7 @@ class Provider(ABC):
         work_dir: Path,
         resume_session_id: str | None = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run the provider to execute a task.
 
@@ -426,6 +427,9 @@ class Provider(ABC):
                 as it is first observed in the streaming output.  Use this to
                 persist the session_id before the run completes so that
                 interrupted tasks can still be resumed.
+            on_step_count: Optional callback invoked with the current step count
+                whenever the step count changes during streaming.  Use this to
+                update the task record in real time.
 
         Returns:
             RunResult with exit code and statistics
