@@ -1147,6 +1147,10 @@ def _run_inner(
     if task.task_type in ("explore", "plan", "review"):
         return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
 
+    # Code tasks (implement/improve) require git
+    assert git is not None, "git is required for code tasks"
+    default_branch = git.default_branch()
+
     # Determine branch name based on resume, same_branch, and branch_mode
     if resume and task.branch:
         # Resume uses the existing branch from the failed task

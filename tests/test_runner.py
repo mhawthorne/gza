@@ -1632,6 +1632,8 @@ class TestResumeVerificationPrompt:
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
         config.max_turns = 50
         config.timeout_minutes = 60
@@ -1861,6 +1863,8 @@ class TestPersistResolvedConfig:
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
         config.max_turns = 50
         config.timeout_minutes = 60
@@ -1885,7 +1889,7 @@ class TestPersistResolvedConfig:
 
         provider_called_after_update = []
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None):
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None):
             # Record whether store.update was already called with persisted values
             provider_called_after_update.append(
                 any(s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude" for s in persisted_states)
@@ -2264,6 +2268,8 @@ class TestNoChangesWithExistingCommits:
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
         config.max_turns = 50
         config.timeout_minutes = 60

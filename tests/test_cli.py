@@ -8800,6 +8800,16 @@ class TestCleanupCommand:
         """Cleanup command dry run works."""
         from gza.config import Config
         from gza.workers import WorkerRegistry
+        from gza.git import Git
+
+        # Initialize git repo (needed for worktree cleanup)
+        git = Git(tmp_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (tmp_path / "README.md").write_text("# Test")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
@@ -10435,6 +10445,7 @@ class TestAdvanceCommand:
             project_dir=tmp_path,
             task_id=None,
             dry_run=False,
+            auto=True,
             max=None,
             no_docker=True,
         )
