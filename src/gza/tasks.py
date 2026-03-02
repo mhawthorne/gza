@@ -123,7 +123,7 @@ class Task:
             "description": desc,
             "status": self.status.value if isinstance(self.status, TaskStatus) else self.status,
         }
-        if self.task_type != "task":
+        if self.task_type != "implement":
             result["type"] = self.task_type
         if self.task_id:
             result["task_id"] = self.task_id

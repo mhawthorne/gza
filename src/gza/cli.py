@@ -609,7 +609,7 @@ def cmd_next(args: argparse.Namespace) -> int:
     # Show runnable tasks
     if runnable:
         for i, task in enumerate(runnable, 1):
-            type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+            type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
             # Get first line only, then truncate
             first_line = task.prompt.split('\n')[0].strip()
             prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
@@ -623,7 +623,7 @@ def cmd_next(args: argparse.Namespace) -> int:
         if runnable:
             print()
         for i, (task, blocking_id) in enumerate(blocked, len(runnable) + 1):
-            type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+            type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
             first_line = task.prompt.split('\n')[0].strip()
             prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
             print(f"{i}. (#{task.id}) {type_label}{prompt_display} (blocked by #{blocking_id})")
@@ -3786,10 +3786,10 @@ def cmd_add(args: argparse.Namespace) -> int:
     elif args.explore:
         task_type = "explore"
     else:
-        task_type = "task"
+        task_type = "implement"
 
     # Validate task type
-    valid_types = ["task", "explore", "plan", "implement", "review", "improve"]
+    valid_types = ["explore", "plan", "implement", "review", "improve"]
     if task_type not in valid_types:
         print(f"Error: Invalid task type '{task_type}'. Must be one of: {', '.join(valid_types)}")
         return 1
@@ -3981,7 +3981,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     # Handle type conversion without opening editor
     if args.explore or args.task:
-        new_type = "explore" if args.explore else "task"
+        new_type = "explore" if args.explore else "implement"
         if task.task_type == new_type:
             print(f"Task #{task.id} is already a {new_type}")
             return 0
@@ -4117,7 +4117,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             icon = "○"
 
         # Task type label
-        type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+        type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
 
         # Get first line of prompt
         first_line = task.prompt.split('\n')[0].strip()
@@ -4280,7 +4280,7 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
     plural = "tasks" if count != 1 else "task"
     print(f"\n⚠  {count} orphaned {plural} found (in-progress with no active worker):")
     for task in orphaned:
-        type_label = f"[{task.task_type}] " if task.task_type != "task" else ""
+        type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
         print(f"   (#{task.id}) {type_label}{prompt_display}")
@@ -6365,8 +6365,8 @@ def main() -> int:
     history_parser.add_argument(
         "--type",
         type=str,
-        choices=["task", "explore", "plan", "implement", "review", "improve"],
-        help="Filter tasks by task_type (e.g., task, explore, plan, implement, review, improve)",
+        choices=["explore", "plan", "implement", "review", "improve"],
+        help="Filter tasks by task_type (e.g., explore, plan, implement, review, improve)",
     )
     history_parser.add_argument(
         "--incomplete",
@@ -6771,8 +6771,8 @@ def main() -> int:
     )
     add_parser.add_argument(
         "--type",
-        choices=["task", "explore", "plan", "implement", "review", "improve"],
-        help="Set task type (default: task)",
+        choices=["explore", "plan", "implement", "review", "improve"],
+        help="Set task type (default: implement)",
     )
     add_parser.add_argument(
         "--branch-type",

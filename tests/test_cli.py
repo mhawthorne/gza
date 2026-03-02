@@ -40,7 +40,7 @@ def setup_db_with_tasks(tmp_path: Path, tasks: list[dict]) -> None:
     store = SqliteTaskStore(db_path)
 
     for task_data in tasks:
-        task = store.add(task_data["prompt"], task_type=task_data.get("task_type", "task"))
+        task = store.add(task_data["prompt"], task_type=task_data.get("task_type", "implement"))
         task.status = task_data.get("status", "pending")
         if task.status in ("completed", "failed"):
             task.completed_at = datetime.now(timezone.utc)
@@ -148,7 +148,7 @@ class TestHistoryCommand:
     def test_history_filter_by_task_type(self, tmp_path: Path):
         """History command filters by task_type."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
+            {"prompt": "Regular task", "status": "completed", "task_type": "plan"},
             {"prompt": "Explore task", "status": "completed", "task_type": "explore"},
             {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
             {"prompt": "Implement task", "status": "completed", "task_type": "implement"},
@@ -169,7 +169,7 @@ class TestHistoryCommand:
     def test_history_filter_by_multiple_types(self, tmp_path: Path):
         """History command filters by task_type for different types."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
+            {"prompt": "Regular task", "status": "completed", "task_type": "implement"},
             {"prompt": "Explore task 1", "status": "completed", "task_type": "explore"},
             {"prompt": "Explore task 2", "status": "completed", "task_type": "explore"},
             {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
@@ -201,7 +201,7 @@ class TestHistoryCommand:
     def test_history_filter_by_type_no_matching_tasks(self, tmp_path: Path):
         """History command handles no tasks matching type filter."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
+            {"prompt": "Regular task", "status": "completed", "task_type": "implement"},
         ])
 
         result = run_gza("history", "--type", "review", "--project", str(tmp_path))
@@ -210,17 +210,17 @@ class TestHistoryCommand:
         assert "No completed or failed tasks with type 'review'" in result.stdout
 
     def test_history_shows_task_type_labels(self, tmp_path: Path):
-        """History command displays task type labels for all task types, including task."""
+        """History command displays task type labels for all task types."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "Regular task", "status": "completed", "task_type": "task"},
             {"prompt": "Implement task", "status": "completed", "task_type": "implement"},
+            {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
         ])
 
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Regular task [task]" in result.stdout
         assert "Implement task [implement]" in result.stdout
+        assert "Plan task [plan]" in result.stdout
 
     def test_history_shows_orphaned_tasks_at_top(self, tmp_path: Path):
         """History command includes orphaned in-progress tasks at the top."""
@@ -2310,14 +2310,14 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        root = store.add("Original task", task_type="task")
+        root = store.add("Original task", task_type="implement")
         assert root.id is not None
         root.status = "failed"
         root.log_file = ".gza/logs/root.log"
         root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
         store.update(root)
 
-        retry = store.add("Retry task", based_on=root.id, task_type="task")
+        retry = store.add("Retry task", based_on=root.id, task_type="implement")
         assert retry.id is not None
         retry.status = "completed"
         retry.log_file = ".gza/logs/retry.log"
@@ -2364,25 +2364,25 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        root = store.add("Root task", task_type="task")
+        root = store.add("Root task", task_type="implement")
         assert root.id is not None
         root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
         root.status = "failed"
         store.update(root)
 
-        chain_a = store.add("Chain A", based_on=root.id, task_type="task")
+        chain_a = store.add("Chain A", based_on=root.id, task_type="implement")
         assert chain_a.id is not None
         chain_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
         chain_a.status = "failed"
         store.update(chain_a)
 
-        chain_a_resume = store.add("Chain A Resume", based_on=chain_a.id, task_type="task")
+        chain_a_resume = store.add("Chain A Resume", based_on=chain_a.id, task_type="implement")
         assert chain_a_resume.id is not None
         chain_a_resume.started_at = datetime(2026, 2, 26, 12, 10, tzinfo=timezone.utc)
         chain_a_resume.status = "completed"
         store.update(chain_a_resume)
 
-        sibling_chain = store.add("Sibling Chain", based_on=root.id, task_type="task")
+        sibling_chain = store.add("Sibling Chain", based_on=root.id, task_type="implement")
         assert sibling_chain.id is not None
         sibling_chain.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
         sibling_chain.status = "completed"
@@ -6099,7 +6099,7 @@ class TestImplementCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        task = store.add("Not a plan", task_type="task")
+        task = store.add("Not a plan", task_type="implement")
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
@@ -6107,7 +6107,7 @@ class TestImplementCommand:
         result = run_gza("implement", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task #{task.id} is a task task" in result.stdout
+        assert f"Error: Task #{task.id} is a implement task" in result.stdout
 
     def test_implement_fails_for_incomplete_plan_task(self, tmp_path: Path):
         """Implement command requires the plan task to be completed."""
@@ -7080,7 +7080,7 @@ class TestDiffCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
-        task = store.add("Test task", task_type="task")
+        task = store.add("Test task", task_type="implement")
         task.branch = "task-1-test"
         store.update(task)
 
@@ -7126,7 +7126,7 @@ class TestDiffCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
-        task = store.add("Test task", task_type="task")
+        task = store.add("Test task", task_type="implement")
         # Don't set task.branch
 
         # Run diff with task ID that has no branch
@@ -9130,7 +9130,7 @@ class TestMarkCompletedCommand:
 
         self._setup_git_repo(tmp_path)
 
-        task = store.add("Code task with no branch", task_type="task")
+        task = store.add("Code task with no branch", task_type="implement")
         task.status = "failed"
         store.update(task)
 
@@ -11300,7 +11300,7 @@ class TestStatsCyclesCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        task = store.add("A task", task_type="task")
+        task = store.add("A task", task_type="implement")
         store.mark_completed(
             task,
             has_commits=False,
@@ -11557,7 +11557,7 @@ class TestAdvancePlansCommand:
 
         # Many non-plan tasks that should NOT affect the exclusion logic
         for i in range(20):
-            t = store.add(f"Task {i}", task_type="task")
+            t = store.add(f"Task {i}", task_type="implement")
             t.based_on = plan_with_impl.id  # review/task based_on should be ignored
             store.update(t)
 

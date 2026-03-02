@@ -17,7 +17,7 @@ class TestPromptBuilderBuild:
         """Test that build() includes the task prompt in the output."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Do something useful", task_type="task")
+        task = store.add(prompt="Do something useful", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -29,7 +29,7 @@ class TestPromptBuilderBuild:
         """Test that task type includes summary instructions."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Implement feature X", task_type="task")
+        task = store.add(prompt="Implement feature X", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -45,7 +45,7 @@ class TestPromptBuilderBuild:
         """Test that task type without summary includes fallback message."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Implement feature Z", task_type="task")
+        task = store.add(prompt="Implement feature Z", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -196,7 +196,7 @@ class TestPromptBuilderBuild:
         """Test that unknown task types get a fallback message."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Do something", task_type="task")
+        task = store.add(prompt="Do something", task_type="implement")
         # Manually override task_type to an unknown value
         task.task_type = "unknown_type"
 
@@ -406,7 +406,7 @@ class TestVerifyCommandInjection:
         """Test that verify_command is appended for task type."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Do something", task_type="task")
+        task = store.add(prompt="Do something", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -451,7 +451,7 @@ class TestVerifyCommandInjection:
         """Test that no verification instruction is added when verify_command is empty."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Do something", task_type="task")
+        task = store.add(prompt="Do something", task_type="implement")
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path

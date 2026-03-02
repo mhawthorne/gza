@@ -128,7 +128,7 @@ tasks:
         assert tasks[0].task_type == "plan"
         assert tasks[1].task_type == "implement"
         assert tasks[2].task_type == "review"
-        assert tasks[3].task_type == "task"
+        assert tasks[3].task_type == "implement"
 
     def test_parse_with_review_flag(self, tmp_path: Path):
         """Parse tasks with review flag."""
