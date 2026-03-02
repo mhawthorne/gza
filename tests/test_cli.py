@@ -3945,8 +3945,8 @@ class TestPsCommand:
 
         registry.remove("w-test-start-format")
 
-    def test_ps_quiet_shows_only_worker_ids(self, tmp_path: Path):
-        """PS quiet output should only include real worker IDs."""
+    def test_ps_quiet_shows_only_task_ids(self, tmp_path: Path):
+        """PS quiet output should include task IDs (not worker IDs)."""
         from gza.db import SqliteTaskStore
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -3955,9 +3955,9 @@ class TestPsCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        # DB-only in-progress task must not appear in quiet mode.
-        db_only_task = store.add("DB-only in-progress task")
-        store.mark_in_progress(db_only_task)
+        # Task with an associated worker.
+        task = store.add("Task with worker")
+        store.mark_in_progress(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
@@ -3966,7 +3966,7 @@ class TestPsCommand:
             WorkerMetadata(
                 worker_id="w-test-quiet",
                 pid=os.getpid(),
-                task_id=None,
+                task_id=task.id,
                 task_slug=None,
                 started_at=datetime.now(timezone.utc).isoformat(),
                 status="running",
@@ -3978,8 +3978,7 @@ class TestPsCommand:
         result = run_gza("ps", "--quiet", cwd=tmp_path)
         assert result.returncode == 0
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        assert lines == ["w-test-quiet"]
-        assert all(not line.startswith("db:") for line in lines)
+        assert lines == [str(task.id)]
 
         registry.remove("w-test-quiet")
 
@@ -4050,7 +4049,6 @@ class TestPsCommand:
 
         table_result = run_gza("ps", "--all", cwd=tmp_path)
         assert table_result.returncode == 0
-        assert "w-test-no-start" in table_result.stdout
         assert "standalone-worker" in table_result.stdout
         assert " - " in table_result.stdout
 
