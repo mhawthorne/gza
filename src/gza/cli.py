@@ -5948,6 +5948,23 @@ def _determine_advance_action(
             and task.review_cleared_at >= latest_review.completed_at
         )
 
+        # If review was cleared, check if code changed since the review
+        # (i.e., a completed improve task exists after the latest review).
+        # In that case, the review is stale and we need a new one.
+        if review_cleared and latest_review.completed_at is not None:
+            improves = _get_improves_for_root_task(store, task)
+            completed_improves = [
+                t for t in improves
+                if t.status == 'completed' and t.completed_at is not None
+            ]
+            if completed_improves:
+                latest_improve = max(completed_improves, key=lambda t: t.completed_at)
+                if latest_improve.completed_at > latest_review.completed_at:
+                    return {
+                        'type': 'create_review',
+                        'description': 'Create review (code changed since last review)',
+                    }
+
         if not review_cleared:
             # Active (non-cleared) review exists
             if latest_review.status == 'pending':
