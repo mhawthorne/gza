@@ -2934,10 +2934,10 @@ class TestGroupsCommand:
 
 
 class TestStatusCommand:
-    """Tests for 'gza status <group>' command."""
+    """Tests for 'gza group <group>' command."""
 
     def test_status_with_group(self, tmp_path: Path):
-        """Status command shows tasks in a group."""
+        """Group command shows tasks in a group."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -2952,7 +2952,7 @@ class TestStatusCommand:
         store.update(task1)
         store.add("Second task", group="test-group", depends_on=task1.id)
 
-        result = run_gza("status", "test-group", "--project", str(tmp_path))
+        result = run_gza("group", "test-group", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "test-group" in result.stdout
@@ -2960,7 +2960,7 @@ class TestStatusCommand:
         assert "Second task" in result.stdout
 
     def test_status_warns_about_orphaned_tasks_in_group(self, tmp_path: Path):
-        """Status command warns about orphaned tasks belonging to the viewed group."""
+        """Group command warns about orphaned tasks belonging to the viewed group."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -2977,7 +2977,7 @@ class TestStatusCommand:
         orphaned_task = store.add("Orphaned in-progress task", group="my-group")
         store.mark_in_progress(orphaned_task)
 
-        result = run_gza("status", "my-group", "--project", str(tmp_path))
+        result = run_gza("group", "my-group", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout
@@ -2985,7 +2985,7 @@ class TestStatusCommand:
         assert "gza work" in result.stdout
 
     def test_status_no_orphaned_warning_for_other_groups(self, tmp_path: Path):
-        """Status command does not show orphaned warning for tasks in other groups."""
+        """Group command does not show orphaned warning for tasks in other groups."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -3000,7 +3000,7 @@ class TestStatusCommand:
         store.add("Task in group B", group="group-b")  # pending in group-b
 
         # View group-b - should NOT show orphaned warning for group-a task
-        result = run_gza("status", "group-b", "--project", str(tmp_path))
+        result = run_gza("group", "group-b", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "orphaned" not in result.stdout
