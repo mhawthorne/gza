@@ -1210,8 +1210,12 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 files_changed = root_task.diff_files_changed
                 insertions = root_task.diff_lines_added or 0
                 deletions = root_task.diff_lines_removed or 0
+                commit_count = git.count_commits_ahead(branch, default_branch)
+                commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
-                branch_detail = f"[{c['task_id']}]{diff_str}[/{c['task_id']}]" if diff_str else f"[{c['task_id']}]cached stats[/{c['task_id']}]"
+                branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
+                if diff_str:
+                    branch_detail += f", [{c['task_id']}]{diff_str}[/{c['task_id']}]"
             else:
                 revision_range = f"{default_branch}...{branch}"
                 files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
