@@ -1,5 +1,6 @@
 """Main Gza runner orchestration."""
 
+import json
 import os
 import re
 import shutil
@@ -15,6 +16,16 @@ from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
+
+
+def write_log_entry(log_file: "Path", entry: dict) -> None:
+    """Append a JSONL entry to the task log file, silently suppressing errors."""
+    try:
+        with open(log_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 def _persist_run_steps_from_result(
@@ -1320,6 +1331,11 @@ def _run_inner(
     task.log_file = str(log_file.relative_to(config.project_dir))
     store.update(task)
 
+    # Write orchestration pre-run entries
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}"})
+
     # Setup summary directory and path for task/implement types
     summary_dir = config.project_dir / SUMMARY_DIR
     summary_dir.mkdir(parents=True, exist_ok=True)
@@ -1392,6 +1408,8 @@ def _run_inner(
             # Check log for agent-written marker; prefer MAX_STEPS for provider-detected over-budget failures.
             detected = extract_failure_reason(log_file)
             failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:
@@ -1404,7 +1422,10 @@ def _run_inner(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
+            failure_reason = extract_failure_reason(log_file)
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
         elif exit_code != 0:
             # Save WIP changes before marking failed
@@ -1416,7 +1437,10 @@ def _run_inner(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
+            failure_reason = extract_failure_reason(log_file)
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (exit_code={exit_code})", "exit_code": exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
 
         # For regular tasks: require code changes
@@ -1435,7 +1459,10 @@ def _run_inner(
                     (f"gza retry {task.id}", "retry from scratch"),
                     (f"gza resume {task.id}", "resume from where it left off"),
                 ])
-                store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=extract_failure_reason(log_file))
+                failure_reason = extract_failure_reason(log_file)
+                write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (no changes made)", "exit_code": exit_code, "failure_reason": failure_reason})
+                write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+                store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
                 return 0
             # else: branch has commits from a previous run - treat as success without committing
 
@@ -1483,6 +1510,8 @@ def _run_inner(
             diff_lines_added=diff_added,
             diff_lines_removed=diff_removed,
         )
+        write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
+        write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
         # Clear review state on the based_on implementation task after improve completes.
@@ -1563,6 +1592,10 @@ def _run_non_code_task(
     # Persist log_file early so it's available if the process is killed before completion
     task.log_file = str(log_file.relative_to(config.project_dir))
     store.update(task)
+
+    # Write orchestration pre-run entries
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}"})
 
     # Setup report file based on task type
     if task.task_type == "explore":
@@ -1683,6 +1716,8 @@ def _run_non_code_task(
             ])
             detected = extract_failure_reason(log_file)
             failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:
@@ -1693,7 +1728,10 @@ def _run_non_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=extract_failure_reason(log_file))
+            failure_reason = extract_failure_reason(log_file)
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
         elif exit_code != 0:
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
@@ -1703,7 +1741,10 @@ def _run_non_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=extract_failure_reason(log_file))
+            failure_reason = extract_failure_reason(log_file)
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (exit_code={exit_code})", "exit_code": exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
 
         # Copy report file from worktree to main project directory
@@ -1733,6 +1774,8 @@ def _run_non_code_task(
             has_commits=False,
             stats=stats,
         )
+        write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
+        write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
         # For review tasks, post to PR if applicable
