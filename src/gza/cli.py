@@ -5999,12 +5999,24 @@ def _determine_advance_action(
                     'review_task': latest_review,
                 }
 
-    # No reviews, or review was cleared by improve — merge directly.
-    # When reviews is non-empty here, the latest review was cleared (review_cleared=True),
-    # meaning an improve task completed after the review.
+    # No reviews, or review was cleared by improve.
+    if not reviews:
+        # No review exists yet — create one for task types that support review.
+        if task.task_type == 'implement':
+            return {
+                'type': 'create_review',
+                'description': 'Create review (no review yet)',
+            }
+        # Non-implement types (plan, explore, etc.) go straight to merge.
+        return {
+            'type': 'merge',
+            'description': 'Merge task (no review yet)',
+        }
+
+    # review was cleared by improve (review_cleared=True) — merge directly.
     return {
         'type': 'merge',
-        'description': 'Merge task' + (' (previous review addressed)' if reviews else ' (no review yet)'),
+        'description': 'Merge (previous review addressed)',
     }
 
 
