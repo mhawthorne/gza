@@ -32,7 +32,7 @@ If errors remain in changed files after 2 iterations, note them but continue to 
 
 Repeat up to **2 times**:
 
-1. Run `uv run pytest` and capture the output.
+1. Run `uv run pytest -x` and capture the output.
 2. Filter the failures to only those whose test file path (or the source file under test) is in the changed-files list.
    - A failure is relevant if the test file itself is in the changed files list, **or** if the error traceback references a changed source file.
 3. If there are no relevant failures, stop the pytest loop.
