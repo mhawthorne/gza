@@ -137,8 +137,11 @@ def _extract_review_verdict(content: str | None) -> str | None:
     """Extract review verdict from markdown content."""
     if not content:
         return None
+    # Try two inline formats:
+    # 1. **Verdict: APPROVED** (bold wraps whole phrase)
+    # 2. **Verdict**: APPROVED (bold wraps only the label)
     match = re.search(
-        r"\*{0,2}Verdict:\s*(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
+        r"\*{0,2}Verdict\*{0,2}:\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
         content,
         re.IGNORECASE,
     )

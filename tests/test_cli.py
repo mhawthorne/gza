@@ -10490,6 +10490,15 @@ class TestGetReviewVerdict:
         store.update(task)
         assert get_review_verdict(config, task) == "NEEDS_DISCUSSION"
 
+    def test_bold_label_only_verdict(self, tmp_path: Path):
+        """Parses **Verdict**: CHANGES_REQUESTED format (bold wraps only label)."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = "Some review text.\n\n**Verdict**: CHANGES_REQUESTED\n"
+        store.update(task)
+        assert get_review_verdict(config, task) == "CHANGES_REQUESTED"
+
     def test_no_verdict_returns_none(self, tmp_path: Path):
         """Returns None when no verdict pattern is found."""
         get_review_verdict, config, store = self._setup(tmp_path)
