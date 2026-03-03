@@ -62,7 +62,7 @@ class Task:
     """A task in the database."""
     id: int | None  # None for unsaved tasks
     prompt: str
-    status: str = "pending"  # pending, in_progress, completed, failed, unmerged
+    status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
     task_type: str = "implement"  # explore, plan, implement, review, improve
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
@@ -1203,7 +1203,7 @@ class SqliteTaskStore:
                 where_clauses.append("status = ?")
                 params.append(status)
             else:
-                where_clauses.append("status IN ('completed', 'failed', 'unmerged')")
+                where_clauses.append("status IN ('completed', 'failed', 'unmerged', 'dropped')")
 
             if task_type:
                 where_clauses.append("task_type = ?")
@@ -1914,6 +1914,7 @@ class SqliteTaskStore:
                     COUNT(*) FILTER (WHERE status = 'completed') as completed,
                     COUNT(*) FILTER (WHERE status = 'failed') as failed,
                     COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                    COUNT(*) FILTER (WHERE status = 'dropped') as dropped,
                     SUM(cost_usd) as total_cost,
                     SUM(duration_seconds) as total_duration,
                     SUM(COALESCE(num_steps_reported, num_steps_computed, num_turns_reported)) as total_steps,
@@ -1928,6 +1929,7 @@ class SqliteTaskStore:
                 "completed": row["completed"] or 0,
                 "failed": row["failed"] or 0,
                 "pending": row["pending"] or 0,
+                "dropped": row["dropped"] or 0,
                 "total_cost": row["total_cost"] or 0,
                 "total_duration": row["total_duration"] or 0,
                 "total_steps": row["total_steps"] or 0,
@@ -1994,6 +1996,10 @@ class SqliteTaskStore:
         Follows based_on links forward (task_id → retries → retries of retries)
         and returns True if any task in that tree has status='completed'.
         No data is mutated; this is a read-only query-time check.
+
+        NOTE: 'dropped' nodes in the retry chain are intentionally not treated as
+        successful retries. A dropped task means the work was deliberately abandoned,
+        not completed. Only status='completed' unblocks a dependency chain.
         """
         visited: set[int] = set()
         queue = [task_id]
@@ -2044,6 +2050,13 @@ class SqliteTaskStore:
         A task is unblocked (and therefore not counted) if its dependency is
         completed OR if the dependency is failed but a completed retry exists
         anywhere in the based_on chain.
+
+        NOTE: This SQL intentionally mirrors the Python logic in is_task_blocked():
+        both treat only 'completed' (or 'failed' with a successful retry) as
+        unblocking. A 'dropped' dependency is therefore counted as blocking here,
+        consistent with is_task_blocked() returning (True, ...) for dropped deps.
+        If the semantics of dropped-unblocks-dependents ever change, both sites
+        must be updated together.
         """
         with self._connect() as conn:
             cur = conn.execute(
