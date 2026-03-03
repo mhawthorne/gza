@@ -41,6 +41,7 @@ DEFAULT_ADVANCE_CREATE_REVIEWS = True
 DEFAULT_ADVANCE_REQUIRES_REVIEW = True
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
+DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -88,6 +89,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "verify_command": None,
     "max_resume_attempts": None,
     "max_review_cycles": None,
+    "interactive_worktree_dir": None,
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
@@ -275,6 +277,7 @@ class Config:
     advance_requires_review: bool = DEFAULT_ADVANCE_REQUIRES_REVIEW
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
+    interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -467,6 +470,7 @@ class Config:
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
+            "interactive_worktree_dir",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -889,6 +893,11 @@ class Config:
             max_resume_attempts = int(env_max_resume_attempts)
             source_map["max_resume_attempts"] = "env"
 
+        interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
+        if os.getenv("GZA_INTERACTIVE_WORKTREE_DIR"):
+            interactive_worktree_dir = os.getenv("GZA_INTERACTIVE_WORKTREE_DIR")
+            source_map["interactive_worktree_dir"] = "env"
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -917,6 +926,7 @@ class Config:
             advance_requires_review=advance_requires_review,
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
+            interactive_worktree_dir=interactive_worktree_dir,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
@@ -961,6 +971,7 @@ class Config:
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
+            "interactive_worktree_dir",
         }
 
         for key in data.keys():
@@ -1105,6 +1116,9 @@ class Config:
 
         if "verify_command" in data and not isinstance(data["verify_command"], str):
             errors.append("'verify_command' must be a string")
+
+        if "interactive_worktree_dir" in data and not isinstance(data["interactive_worktree_dir"], str):
+            errors.append("'interactive_worktree_dir' must be a string")
 
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             errors.append("'advance_create_reviews' must be a boolean (true/false)")

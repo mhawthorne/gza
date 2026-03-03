@@ -18,6 +18,7 @@ from gza.runner import (
     BACKUP_DIR,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
+    _extract_review_verdict,
     backup_database,
     _compute_slug_override,
     _create_and_run_review_task,
@@ -3039,3 +3040,22 @@ class TestWriteLogEntry:
         bad_path = tmp_path / "nonexistent_dir" / "task.log"
         # Should not raise
         write_log_entry(bad_path, {"type": "gza", "message": "x"})
+
+
+class TestExtractReviewVerdict:
+    """Tests for _extract_review_verdict()."""
+
+    def test_bold_wrapped_verdict(self) -> None:
+        assert _extract_review_verdict("**Verdict: APPROVED**") == "APPROVED"
+
+    def test_bold_label_only_verdict(self) -> None:
+        assert _extract_review_verdict("**Verdict**: CHANGES_REQUESTED") == "CHANGES_REQUESTED"
+
+    def test_plain_verdict(self) -> None:
+        assert _extract_review_verdict("Verdict: NEEDS_DISCUSSION") == "NEEDS_DISCUSSION"
+
+    def test_none_content(self) -> None:
+        assert _extract_review_verdict(None) is None
+
+    def test_no_verdict(self) -> None:
+        assert _extract_review_verdict("Just some review text") is None
