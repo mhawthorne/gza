@@ -12579,7 +12579,7 @@ class TestStatsCommand:
         result = run_gza("stats", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "No completed or failed tasks" in result.stdout
+        assert "No completed, failed, or dropped tasks" in result.stdout
 
     def test_stats_status_column_alignment(self, tmp_path: Path):
         """gza stats renders status symbol with correct column spacing (M1 fix)."""

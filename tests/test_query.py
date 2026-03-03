@@ -135,23 +135,23 @@ class TestQueryHistory:
         results = query_history(store, f)
         assert len(results) == 0
 
-    def test_lookback_days_excludes_old_tasks(self, tmp_path: Path):
+    def test_days_excludes_old_tasks(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         self._add_completed(store, "old task", days_ago=10)
         self._add_completed(store, "recent task", days_ago=1)
 
-        f = HistoryFilter(lookback_days=5, limit=None)
+        f = HistoryFilter(days=5, limit=None)
         results = query_history(store, f)
         prompts = [t.prompt for t in results]
         assert "recent task" in prompts
         assert "old task" not in prompts
 
-    def test_lookback_days_includes_recent_tasks(self, tmp_path: Path):
+    def test_days_includes_recent_tasks(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         self._add_completed(store, "today task", days_ago=0)
         self._add_completed(store, "week ago task", days_ago=7)
 
-        f = HistoryFilter(lookback_days=3, limit=None)
+        f = HistoryFilter(days=3, limit=None)
         results = query_history(store, f)
         prompts = [t.prompt for t in results]
         assert "today task" in prompts
@@ -166,7 +166,7 @@ class TestQueryHistory:
         # recent + complete (excluded by incomplete filter)
         self._add_completed(store, "recent merged", merge_status="merged")
 
-        f = HistoryFilter(incomplete=True, lookback_days=7, limit=None)
+        f = HistoryFilter(incomplete=True, days=7, limit=None)
         results = query_history(store, f)
         prompts = [t.prompt for t in results]
         assert "recent failed" in prompts
