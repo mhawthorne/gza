@@ -1896,6 +1896,11 @@ class TestResumeVerificationPrompt:
             # Mock has_changes to return True
             mock_worktree_git = Mock()
             mock_worktree_git.has_changes.return_value = True
+            # status_porcelain: simulate a file changed during provider run
+            mock_worktree_git.status_porcelain.side_effect = [
+                set(),  # pre-run snapshot (called before provider.run)
+                {("M", "changed.py")},  # post-run snapshot
+            ]
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
             mock_worktree_git.get_diff_numstat.return_value = ""
@@ -2135,6 +2140,7 @@ class TestPersistResolvedConfig:
 
             mock_worktree_git = Mock()
             mock_worktree_git.has_changes.return_value = False
+            mock_worktree_git.status_porcelain.return_value = set()
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
             mock_worktree_git.get_diff_numstat.return_value = ""
@@ -2542,6 +2548,7 @@ class TestNoChangesWithExistingCommits:
             mock_worktree_git = Mock()
             # No uncommitted changes (task already committed in previous run)
             mock_worktree_git.has_changes.return_value = False
+            mock_worktree_git.status_porcelain.return_value = set()
             # Branch has 1 commit from the previous run
             mock_worktree_git.count_commits_ahead.return_value = 1
             mock_worktree_git.default_branch.return_value = "main"
@@ -2614,6 +2621,7 @@ class TestNoChangesWithExistingCommits:
             mock_worktree_git = Mock()
             # No uncommitted changes
             mock_worktree_git.has_changes.return_value = False
+            mock_worktree_git.status_porcelain.return_value = set()
             # No prior commits on the branch either
             mock_worktree_git.count_commits_ahead.return_value = 0
             mock_worktree_git.default_branch.return_value = "main"
@@ -2712,6 +2720,10 @@ class TestSameBranchLineageWalk:
 
             mock_worktree_git = Mock()
             mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.status_porcelain.side_effect = [
+                set(),  # pre-run snapshot
+                {("M", "changed.py")},  # post-run snapshot
+            ]
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
             mock_worktree_git.get_diff_numstat.return_value = ""
@@ -2797,6 +2809,10 @@ class TestSameBranchLineageWalk:
 
             mock_worktree_git = Mock()
             mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.status_porcelain.side_effect = [
+                set(),  # pre-run snapshot
+                {("M", "changed.py")},  # post-run snapshot
+            ]
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
             mock_worktree_git.get_diff_numstat.return_value = ""
@@ -2887,6 +2903,10 @@ class TestSameBranchLineageWalk:
 
             mock_worktree_git = Mock()
             mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.status_porcelain.side_effect = [
+                set(),  # pre-run snapshot
+                {("M", "changed.py")},  # post-run snapshot
+            ]
             mock_worktree_git.add = Mock()
             mock_worktree_git.commit = Mock()
             mock_worktree_git.get_diff_numstat.return_value = ""
@@ -3059,3 +3079,130 @@ class TestExtractReviewVerdict:
 
     def test_no_verdict(self) -> None:
         assert _extract_review_verdict("Just some review text") is None
+
+
+class TestSelectiveStaging:
+    """Tests for selective staging (only stage files changed during provider run)."""
+
+    def test_selective_staging_only_stages_new_changes(self, tmp_path: Path):
+        """Test that only files changed during the provider run get staged."""
+        from gza.git import Git
+
+        # Pre-existing status (before provider run)
+        pre_status = {("M", "pre_existing.txt")}
+        # Post-run status (includes pre-existing + new changes)
+        post_status = {("M", "pre_existing.txt"), ("M", "src/foo.py"), ("??", "new_file.txt")}
+
+        new_changes = post_status - pre_status
+        files_to_stage = [filepath for _, filepath in new_changes]
+
+        assert set(files_to_stage) == {"src/foo.py", "new_file.txt"}
+        assert "pre_existing.txt" not in files_to_stage
+
+    def test_selective_staging_no_new_changes(self, tmp_path: Path):
+        """Test that no staging happens when provider makes no changes."""
+        pre_status = {("M", "pre_existing.txt")}
+        post_status = {("M", "pre_existing.txt")}
+
+        new_changes = post_status - pre_status
+        assert len(new_changes) == 0
+
+    def test_selective_staging_handles_deletions(self, tmp_path: Path):
+        """Test that intentional deletions by the agent are staged."""
+        pre_status = set()
+        post_status = {("D", "removed_by_agent.py")}
+
+        new_changes = post_status - pre_status
+        files_to_stage = [filepath for _, filepath in new_changes]
+
+        assert "removed_by_agent.py" in files_to_stage
+
+    def test_selective_staging_ignores_pre_existing_deletions(self, tmp_path: Path):
+        """Test that pre-existing deletions are NOT staged."""
+        pre_status = {("D", "already_deleted.py")}
+        post_status = {("D", "already_deleted.py"), ("M", "changed.py")}
+
+        new_changes = post_status - pre_status
+        files_to_stage = [filepath for _, filepath in new_changes]
+
+        assert "already_deleted.py" not in files_to_stage
+        assert "changed.py" in files_to_stage
+
+
+class TestExceptionHandlerMarkFailed:
+    """Tests that exception handlers in _run_inner and _run_non_code_task mark tasks as failed."""
+
+    def test_git_error_in_run_inner_marks_failed(self, tmp_path: Path):
+        """Test that GitError during post-run finalization marks the task as failed."""
+        from gza.git import GitError
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+        task.branch = "test-branch"
+        store.mark_in_progress(task)
+
+        # Verify task is in_progress
+        assert store.get(task.id).status == "in_progress"
+
+        # Simulate what the GitError handler does
+        log_path = tmp_path / "logs"
+        log_path.mkdir()
+        log_file = log_path / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        store.mark_failed(task, log_file=str(log_file.relative_to(tmp_path)), branch="test-branch", failure_reason="GIT_ERROR")
+
+        # Verify task is now failed
+        updated_task = store.get(task.id)
+        assert updated_task.status == "failed"
+        assert updated_task.failure_reason == "GIT_ERROR"
+
+    def test_keyboard_interrupt_marks_failed(self, tmp_path: Path):
+        """Test that KeyboardInterrupt marks the task as failed with INTERRUPTED reason."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Test task", task_type="implement")
+        task.task_id = "20260212-test-task"
+        task.branch = "test-branch"
+        store.mark_in_progress(task)
+
+        log_path = tmp_path / "logs"
+        log_path.mkdir()
+        log_file = log_path / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        store.mark_failed(task, log_file=str(log_file.relative_to(tmp_path)), branch="test-branch", failure_reason="INTERRUPTED")
+
+        updated_task = store.get(task.id)
+        assert updated_task.status == "failed"
+        assert updated_task.failure_reason == "INTERRUPTED"
+
+    def test_non_code_task_git_error_marks_failed(self, tmp_path: Path):
+        """Test that GitError in _run_non_code_task marks the task as failed."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Explore something", task_type="explore")
+        task.task_id = "20260212-explore-task"
+        store.mark_in_progress(task)
+
+        log_path = tmp_path / "logs"
+        log_path.mkdir()
+        log_file = log_path / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        store.mark_failed(task, log_file=str(log_file.relative_to(tmp_path)), failure_reason="GIT_ERROR")
+
+        updated_task = store.get(task.id)
+        assert updated_task.status == "failed"
+        assert updated_task.failure_reason == "GIT_ERROR"

@@ -726,8 +726,13 @@ def _save_wip_changes(
     wip_dir = config.project_dir / WIP_DIR
     wip_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get the diff for backup
-    worktree_git.add(".")
+    # Stage tracked modifications/deletions only (avoid staging unrelated files)
+    worktree_git._run("add", "--update", ".", check=False)
+    # Also stage any new untracked files (agent-created files)
+    untracked = worktree_git._run("ls-files", "--others", "--exclude-standard", check=False).stdout
+    for f in untracked.splitlines():
+        if f.strip():
+            worktree_git.add(f.strip())
     diff = worktree_git._run("diff", "--cached", check=False).stdout
 
     # Save diff to backup file
@@ -1427,6 +1432,9 @@ def _run_inner(
     if n_installed:
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
+    # Snapshot worktree state before provider runs so we can selectively stage only new changes
+    pre_run_status = worktree_git.status_porcelain()
+
     try:
         result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id, on_step_count=_on_step_count)
 
@@ -1491,8 +1499,11 @@ def _run_inner(
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
 
-        # For regular tasks: require code changes
-        has_uncommitted = worktree_git.has_changes(".")
+        # Compute which files changed during the provider run (selective staging)
+        post_run_status = worktree_git.status_porcelain()
+        new_changes = post_run_status - pre_run_status
+        has_uncommitted = bool(new_changes)
+
         if not has_uncommitted:
             # Check if branch already has commits from a previous run
             default_branch = worktree_git.default_branch()
@@ -1518,8 +1529,10 @@ def _run_inner(
             # Squash any WIP commits before creating final commit
             _squash_wip_commits(worktree_git, task)
 
-            # Commit changes in worktree
-            worktree_git.add(".")
+            # Stage only files that changed during the provider run
+            files_to_stage = [filepath for _, filepath in new_changes]
+            for f in files_to_stage:
+                worktree_git.add(f)
 
             # Build commit message with trailer for improve tasks
             commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
@@ -1600,10 +1613,12 @@ def _run_inner(
 
     except GitError as e:
         error_message(f"Git error: {e}")
+        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason="GIT_ERROR")
         return 1
     except KeyboardInterrupt:
         # Save WIP changes before returning
         _save_wip_changes(task, worktree_git, config, branch_name)
+        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason="INTERRUPTED")
         console.print("\nInterrupted")
         return 130
 
@@ -1741,6 +1756,7 @@ def _run_non_code_task(
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code, on_step_count=_on_step_count_non_code)
         except KeyboardInterrupt:
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason="INTERRUPTED")
             console.print("\nInterrupted")
             return 130
         finally:
@@ -1893,4 +1909,5 @@ def _run_non_code_task(
 
     except GitError as e:
         error_message(f"Git error: {e}")
+        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason="GIT_ERROR")
         return 1

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from rich.console import Console
+from rich.markup import escape as rich_escape
 
 
 @dataclass(frozen=True)
@@ -91,16 +92,16 @@ class StreamOutputFormatter:
 
     def print_tool_event(self, label: str, detail: str = "", *, prefix: str = "") -> None:
         """Print a colorized tool usage line."""
-        suffix = f" {detail}" if detail else ""
-        self.console.print(f"{prefix}→ {label}{suffix}", style=self.styles.tool_use)
+        suffix = f" {rich_escape(detail)}" if detail else ""
+        self.console.print(f"{prefix}→ {rich_escape(label)}{suffix}", style=self.styles.tool_use)
 
     def print_agent_message(self, text: str, *, prefix: str = "") -> None:
         """Print a colorized assistant message line."""
-        self.console.print(f"{prefix}{text}", style=self.styles.assistant_text)
+        self.console.print(f"{prefix}{rich_escape(text)}", style=self.styles.assistant_text)
 
     def print_error(self, message: str, *, prefix: str = "") -> None:
         """Print a colorized error line."""
-        self.console.print(f"{prefix}{message}", style=self.styles.error)
+        self.console.print(f"{prefix}{rich_escape(message)}", style=self.styles.error)
 
     def print_todo(self, status: str, content: str, *, prefix: str = "  ") -> None:
         """Print a TodoWrite entry with status color and icon."""
@@ -111,4 +112,4 @@ class StreamOutputFormatter:
         }
         icon = status_icons.get(status, "○")
         style = getattr(self.styles, f"todo_{status}", self.styles.todo_pending)
-        self.console.print(f"{prefix}{icon} {content}", style=style)
+        self.console.print(f"{prefix}{icon} {rich_escape(content)}", style=style)

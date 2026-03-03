@@ -1133,3 +1133,71 @@ class TestGetDiffNumstat:
             result = git.get_diff_numstat("main...feature")
 
         assert result == ""
+
+
+class TestStatusPorcelain:
+    """Tests for status_porcelain method."""
+
+    def test_empty_status(self, tmp_path: Path):
+        """Test status_porcelain returns empty set when no changes."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            result = git.status_porcelain()
+
+        assert result == set()
+
+    def test_modified_file(self, tmp_path: Path):
+        """Test status_porcelain detects modified files."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=" M src/foo.py\n", stderr="")
+            result = git.status_porcelain()
+
+        assert result == {("M", "src/foo.py")}
+
+    def test_untracked_file(self, tmp_path: Path):
+        """Test status_porcelain detects untracked files."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="?? new_file.txt\n", stderr="")
+            result = git.status_porcelain()
+
+        assert result == {("??", "new_file.txt")}
+
+    def test_multiple_changes(self, tmp_path: Path):
+        """Test status_porcelain with multiple change types."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=" M src/foo.py\n?? new.txt\n D deleted.py\n",
+                stderr="",
+            )
+            result = git.status_porcelain()
+
+        assert result == {("M", "src/foo.py"), ("??", "new.txt"), ("D", "deleted.py")}
+
+    def test_renamed_file(self, tmp_path: Path):
+        """Test status_porcelain handles renames correctly."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="R  old.py -> new.py\n", stderr="")
+            result = git.status_porcelain()
+
+        assert result == {("R", "new.py")}

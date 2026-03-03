@@ -132,6 +132,26 @@ class Git:
         has_untracked = bool(untracked.stdout.strip())
         return has_tracked_changes or has_untracked
 
+    def status_porcelain(self) -> set[tuple[str, str]]:
+        """Return set of (status, filepath) tuples from git status --porcelain.
+
+        Each entry is a tuple like ('M', 'src/foo.py') or ('??', 'new_file.txt').
+        The status codes follow git's porcelain format (M, A, D, ??, etc.).
+        """
+        result = self._run("status", "--porcelain", check=False)
+        entries: set[tuple[str, str]] = set()
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            # Porcelain format: XY filename (or XY orig -> renamed)
+            status = line[:2].strip()
+            filepath = line[3:]
+            # Handle renames: "R  old -> new"
+            if " -> " in filepath:
+                filepath = filepath.split(" -> ", 1)[1]
+            entries.add((status, filepath))
+        return entries
+
     def add(self, path: str = ".") -> None:
         """Stage changes."""
         self._run("add", path)
