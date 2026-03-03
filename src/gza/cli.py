@@ -6639,6 +6639,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if max_review_cycles_override is not None:
         config.max_review_cycles = max_review_cycles_override
 
+    squash_threshold_override: int | None = getattr(args, 'squash_threshold', None)
+    if squash_threshold_override is not None:
+        config.merge_squash_threshold = squash_threshold_override
+
     if new_mode and batch_limit is None:
         print("Error: --new requires --batch", file=sys.stderr)
         return 1
@@ -6786,7 +6790,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
         for task, action in plan:
             prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
             print(f"  #{task.id} {prompt_display}")
-            print(f"      → {action['description']}")
+            description = action['description']
+            if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
+                commit_count = git.count_commits_ahead(task.branch, default_branch)
+                if commit_count >= config.merge_squash_threshold:
+                    description = f"{description} (auto-squash, {commit_count} commits)"
+            print(f"      → {description}")
             print()
         if new_mode and batch_limit is not None:
             worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'})
@@ -6879,10 +6888,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print(f"      → {action['description']}")
 
         if action_type == 'merge':
+            # Determine whether to auto-squash based on commit count and threshold
+            should_squash = False
+            if config.merge_squash_threshold > 0 and task.branch:
+                commit_count = git.count_commits_ahead(task.branch, default_branch)
+                if commit_count >= config.merge_squash_threshold:
+                    should_squash = True
             # Build a minimal args namespace for _merge_single_task
             merge_args = argparse.Namespace(
                 rebase=False,
-                squash=False,
+                squash=should_squash,
                 delete=False,
                 mark_only=False,
                 remote=False,
@@ -7318,6 +7333,18 @@ def main() -> int:
         choices=["plan", "implement"],
         dest="advance_type",
         help="Only advance tasks of this type (plan: create+start implement tasks; implement: review/merge lifecycle)",
+    )
+    advance_parser.add_argument(
+        "--squash-threshold",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="squash_threshold",
+        help=(
+            "Override merge_squash_threshold for this run. "
+            "Squash-merge branches with N or more commits. "
+            "0 disables auto-squash. Default: from gza.yaml."
+        ),
     )
 
     # refresh command

@@ -42,6 +42,7 @@ DEFAULT_ADVANCE_REQUIRES_REVIEW = True
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
+DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -90,6 +91,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "max_resume_attempts": None,
     "max_review_cycles": None,
     "interactive_worktree_dir": None,
+    "merge_squash_threshold": None,
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
@@ -278,6 +280,7 @@ class Config:
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
+    merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -471,6 +474,7 @@ class Config:
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
             "interactive_worktree_dir",
+            "merge_squash_threshold",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -898,6 +902,22 @@ class Config:
             interactive_worktree_dir = os.getenv("GZA_INTERACTIVE_WORKTREE_DIR")
             source_map["interactive_worktree_dir"] = "env"
 
+        try:
+            merge_squash_threshold = int(data.get("merge_squash_threshold", DEFAULT_MERGE_SQUASH_THRESHOLD))
+        except (TypeError, ValueError):
+            raise ConfigError("merge_squash_threshold must be a non-negative integer")
+        if merge_squash_threshold < 0:
+            raise ConfigError("merge_squash_threshold must be a non-negative integer")
+        env_merge_squash_threshold = os.getenv("GZA_MERGE_SQUASH_THRESHOLD")
+        if env_merge_squash_threshold:
+            try:
+                merge_squash_threshold = int(env_merge_squash_threshold)
+            except ValueError:
+                raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
+            if merge_squash_threshold < 0:
+                raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
+            source_map["merge_squash_threshold"] = "env"
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -927,6 +947,7 @@ class Config:
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
             interactive_worktree_dir=interactive_worktree_dir,
+            merge_squash_threshold=merge_squash_threshold,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
@@ -972,6 +993,7 @@ class Config:
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
             "interactive_worktree_dir",
+            "merge_squash_threshold",
         }
 
         for key in data.keys():
