@@ -335,7 +335,7 @@ class TestHistoryCommand:
         assert "Merged task" not in result.stdout
 
     def test_history_lookback_days(self, tmp_path: Path):
-        """--lookback-days excludes old tasks and includes recent ones."""
+        """--days excludes old tasks and includes recent ones."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -355,7 +355,7 @@ class TestHistoryCommand:
         recent.completed_at = now - timedelta(days=1)
         store.update(recent)
 
-        result = run_gza("history", "--lookback-days", "7", "--project", str(tmp_path))
+        result = run_gza("history", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recent task" in result.stdout
@@ -420,7 +420,7 @@ class TestHistoryCommand:
         assert "Child task" in result.stdout
 
     def test_history_incomplete_with_lookback(self, tmp_path: Path):
-        """--incomplete combined with --lookback-days applies both filters."""
+        """--incomplete combined with --days applies both filters."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -450,7 +450,7 @@ class TestHistoryCommand:
         store.update(recent_merged)
 
         result = run_gza(
-            "history", "--incomplete", "--lookback-days", "7",
+            "history", "--incomplete", "--days", "7",
             "--project", str(tmp_path)
         )
 
@@ -458,6 +458,91 @@ class TestHistoryCommand:
         assert "Recent failed" in result.stdout
         assert "Old failed" not in result.stdout
         assert "Recent merged" not in result.stdout
+
+    def test_history_last_flag(self, tmp_path: Path):
+        """--last limits the number of tasks shown."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task 1", "status": "completed"},
+            {"prompt": "Task 2", "status": "completed"},
+            {"prompt": "Task 3", "status": "completed"},
+        ])
+
+        result = run_gza("history", "--last", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Exactly 2 tasks shown (the 2 most recent)
+        assert result.stdout.count("Task ") == 2
+
+    def test_history_n_shorthand(self, tmp_path: Path):
+        """-n is shorthand for --last."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Task A", "status": "completed"},
+            {"prompt": "Task B", "status": "completed"},
+            {"prompt": "Task C", "status": "completed"},
+        ])
+
+        result = run_gza("history", "-n", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.count("Task ") == 1
+
+    def test_history_start_date(self, tmp_path: Path):
+        """--start-date excludes tasks before the given date."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        old = store.add("Old task")
+        old.status = "completed"
+        old.completed_at = now - timedelta(days=30)
+        store.update(old)
+
+        recent = store.add("Recent task")
+        recent.status = "completed"
+        recent.completed_at = now - timedelta(days=1)
+        store.update(recent)
+
+        # Use a date 7 days ago as start date
+        start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        result = run_gza("history", "--start-date", start, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Recent task" in result.stdout
+        assert "Old task" not in result.stdout
+
+    def test_history_end_date(self, tmp_path: Path):
+        """--end-date excludes tasks after the given date."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        old = store.add("Old task")
+        old.status = "completed"
+        old.completed_at = now - timedelta(days=30)
+        store.update(old)
+
+        recent = store.add("Recent task")
+        recent.status = "completed"
+        recent.completed_at = now - timedelta(days=1)
+        store.update(recent)
+
+        # Use a date 7 days ago as end date — only old task should appear
+        end = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        result = run_gza("history", "--end-date", end, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Old task" in result.stdout
+        assert "Recent task" not in result.stdout
 
 
 class TestNextCommand:
@@ -12199,6 +12284,155 @@ class TestStatsCommand:
         assert "Total steps:  5" in result.stdout
         assert re.search(r"✓\s+#1\s+implement\s+\$0\.1200\s+5\s", result.stdout)
 
+    def test_stats_summary_computed_from_filtered_tasks(self, tmp_path: Path):
+        """gza stats --last N computes summary only from the N filtered tasks."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Add 3 tasks with distinct costs
+        for i, cost in enumerate([0.10, 0.20, 0.30], start=1):
+            t = store.add(f"Task {i}", task_type="implement")
+            store.mark_completed(
+                t,
+                has_commits=False,
+                stats=TaskStats(cost_usd=cost, duration_seconds=10.0),
+            )
+
+        # Show only last 1 — summary should reflect only the most recent task ($0.30)
+        result = run_gza("stats", "--last", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Total cost in summary should match only the 1 shown task
+        assert "$0.30" in result.stdout
+
+    def test_stats_all_flag_shows_all_tasks(self, tmp_path: Path):
+        """gza stats --all shows every task without a limit."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        for i in range(8):
+            t = store.add(f"Task {i}", task_type="implement")
+            store.mark_completed(t, has_commits=False, stats=TaskStats(cost_usd=0.01))
+
+        result = run_gza("stats", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        for i in range(8):
+            assert f"Task {i}" in result.stdout
+
+    def test_stats_type_filter(self, tmp_path: Path):
+        """gza stats --type filters to matching task type."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.05))
+
+        rev = store.add("Review code", task_type="review")
+        store.mark_completed(rev, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "--type", "review", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Review code" in result.stdout
+        assert "Implement feature" not in result.stdout
+
+    def test_stats_no_tasks_message(self, tmp_path: Path):
+        """gza stats prints a message when no matching tasks exist."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No completed or failed tasks" in result.stdout
+
+    def test_stats_status_column_alignment(self, tmp_path: Path):
+        """gza stats renders status symbol with correct column spacing (M1 fix)."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Alignment test task", task_type="implement")
+        store.mark_completed(
+            task,
+            has_commits=False,
+            stats=TaskStats(cost_usd=0.12, duration_seconds=30.0),
+        )
+
+        result = run_gza("stats", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Status symbol followed by whitespace then task ID — no markup bleed
+        assert re.search(r"✓\s+#\d+\s+", result.stdout)
+
+    def test_stats_dropped_task_not_counted_as_failed(self, tmp_path: Path):
+        """gza stats counts only 'failed' tasks as failed, not 'dropped' (M2 fix)."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        completed = store.add("Completed task", task_type="implement")
+        store.mark_completed(
+            completed,
+            has_commits=False,
+            stats=TaskStats(cost_usd=0.05),
+        )
+
+        # Mark a task as dropped via set-status
+        dropped = store.add("Dropped task", task_type="implement")
+        dropped.status = "dropped"
+        store.update(dropped)
+
+        result = run_gza("stats", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # 1 completed, 0 failed — dropped must not inflate failed count
+        assert "1 completed" in result.stdout
+        assert "0 failed" in result.stdout
+
+    def test_stats_json_respects_type_filter(self, tmp_path: Path):
+        """gza stats --type --json returns only matching task types (M3 fix)."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.05))
+
+        rev = store.add("Review code", task_type="review")
+        store.mark_completed(rev, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "--type", "review", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["task_type"] == "review"
+
 
 class TestIterateCommand:
     """Tests for 'gza iterate' command (formerly 'gza cycle')."""
@@ -12600,7 +12834,7 @@ class TestStatsCyclesCommand:
 
         assert result.returncode == 0
         assert "Total cost" in result.stdout
-        assert "Recent Tasks" in result.stdout
+        assert "Tasks" in result.stdout
         # Should NOT show cycle analytics headers
         assert "Cycle Analytics" not in result.stdout
 
