@@ -2243,14 +2243,27 @@ def cmd_stats(args: argparse.Namespace) -> int:
         return 0
 
     if as_json:
-        stats = store.get_stats()
-        print(json.dumps(stats, indent=2))
+        json_tasks = [
+            {
+                "id": t.id,
+                "task_id": t.task_id,
+                "status": t.status,
+                "task_type": t.task_type,
+                "prompt": t.prompt,
+                "cost_usd": t.cost_usd,
+                "duration_seconds": t.duration_seconds,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+            }
+            for t in tasks
+        ]
+        print(json.dumps(json_tasks, indent=2))
         return 0
 
     # Compute summary from filtered task list
     c = TASK_COLORS
     n_completed = sum(1 for t in tasks if t.status == "completed")
-    n_failed = sum(1 for t in tasks if t.status != "completed")
+    n_failed = sum(1 for t in tasks if t.status == "failed")
     total_cost = sum(t.cost_usd or 0 for t in tasks)
     total_duration = sum(t.duration_seconds or 0 for t in tasks)
     total_steps = sum((get_task_step_count(t) or 0) for t in tasks)
@@ -2302,14 +2315,17 @@ def cmd_stats(args: argparse.Namespace) -> int:
     console.print(f"[{c['header']}]{label} Tasks[/{c['header']}]")
     console.print("=" * 50)
 
-    # Table header (plain text for alignment)
-    print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Steps':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
-    print("-" * table_width)
+    # Table header
+    console.print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Steps':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
+    console.print("-" * table_width)
 
     for task in tasks:
         is_ok = task.status == "completed"
         status_str = "✓" if is_ok else "✗"
-        status_col = f"[{c['success']}]{status_str}[/{c['success']}]" if is_ok else f"[{c['failure']}]{status_str}[/{c['failure']}]"
+        status_col = (
+            f"[{c['success']}]{status_str:<{status_width}}[/{c['success']}]" if is_ok
+            else f"[{c['failure']}]{status_str:<{status_width}}[/{c['failure']}]"
+        )
         id_str = f"#{task.id}" if task.id is not None else "-"
         type_str = task.task_type[:type_width] if task.task_type else "-"
         cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
@@ -2327,7 +2343,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
         type_col = f"[{c['stats']}]{type_str:<{type_width}}[/{c['stats']}]"
         prompt_col = f"[{c['prompt']}]{prompt}[/{c['prompt']}]"
         console.print(
-            f"{status_col:<{status_width}} {id_col} {type_col} {cost_str:>{cost_width}} {turns_str:>{turns_width}} {time_str:>{time_width}} {len_str:>{len_width}}  {prompt_col}"
+            f"{status_col} {id_col} {type_col} {cost_str:>{cost_width}} {turns_str:>{turns_width}} {time_str:>{time_width}} {len_str:>{len_width}}  {prompt_col}"
         )
 
     console.print()

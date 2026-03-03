@@ -470,8 +470,8 @@ class TestHistoryCommand:
         result = run_gza("history", "--last", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        # At most 2 tasks shown (the 2 most recent)
-        assert result.stdout.count("Task ") <= 2
+        # Exactly 2 tasks shown (the 2 most recent)
+        assert result.stdout.count("Task ") == 2
 
     def test_history_n_shorthand(self, tmp_path: Path):
         """-n is shorthand for --last."""
@@ -12354,6 +12354,79 @@ class TestStatsCommand:
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
+
+    def test_stats_status_column_alignment(self, tmp_path: Path):
+        """gza stats renders status symbol with correct column spacing (M1 fix)."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Alignment test task", task_type="implement")
+        store.mark_completed(
+            task,
+            has_commits=False,
+            stats=TaskStats(cost_usd=0.12, duration_seconds=30.0),
+        )
+
+        result = run_gza("stats", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Status symbol followed by whitespace then task ID — no markup bleed
+        assert re.search(r"✓\s+#\d+\s+", result.stdout)
+
+    def test_stats_dropped_task_not_counted_as_failed(self, tmp_path: Path):
+        """gza stats counts only 'failed' tasks as failed, not 'dropped' (M2 fix)."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        completed = store.add("Completed task", task_type="implement")
+        store.mark_completed(
+            completed,
+            has_commits=False,
+            stats=TaskStats(cost_usd=0.05),
+        )
+
+        # Mark a task as dropped via set-status
+        dropped = store.add("Dropped task", task_type="implement")
+        dropped.status = "dropped"
+        store.update(dropped)
+
+        result = run_gza("stats", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # 1 completed, 0 failed — dropped must not inflate failed count
+        assert "1 completed" in result.stdout
+        assert "0 failed" in result.stdout
+
+    def test_stats_json_respects_type_filter(self, tmp_path: Path):
+        """gza stats --type --json returns only matching task types (M3 fix)."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.05))
+
+        rev = store.add("Review code", task_type="review")
+        store.mark_completed(rev, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "--type", "review", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["task_type"] == "review"
 
 
 class TestIterateCommand:
