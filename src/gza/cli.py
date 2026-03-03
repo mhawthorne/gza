@@ -960,6 +960,8 @@ def cmd_history(args: argparse.Namespace) -> int:
             status_icon = f"[{c['unmerged']}]⚡[/{c['unmerged']}]"
         elif task.status == "completed":
             status_icon = f"[{c['success']}]✓[/{c['success']}]"
+        elif task.status == "dropped":
+            status_icon = f"[{c['failure']}]⊘ dropped[/{c['failure']}]"
         else:
             if task.failure_reason and task.failure_reason != "UNKNOWN":
                 status_icon = f"[{c['failure']}]✗ failed ({task.failure_reason})[/{c['failure']}]"
@@ -2278,7 +2280,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     tasks = query_history(store, f)
 
     if not tasks:
-        console.print("No completed or failed tasks")
+        console.print("No completed, failed, or dropped tasks")
         return 0
 
     if as_json:
@@ -2303,19 +2305,22 @@ def cmd_stats(args: argparse.Namespace) -> int:
     c = TASK_COLORS
     n_completed = sum(1 for t in tasks if t.status == "completed")
     n_failed = sum(1 for t in tasks if t.status == "failed")
+    n_dropped = sum(1 for t in tasks if t.status == "dropped")
     total_cost = sum(t.cost_usd or 0 for t in tasks)
     total_duration = sum(t.duration_seconds or 0 for t in tasks)
     total_steps = sum((get_task_step_count(t) or 0) for t in tasks)
-    tasks_with_cost = n_completed + n_failed
+    tasks_with_cost = n_completed + n_failed + n_dropped
     avg_cost = total_cost / tasks_with_cost if tasks_with_cost else 0
 
     # Section header
     console.print(f"[{c['header']}]Summary[/{c['header']}]")
     console.print("=" * 50)
+    dropped_str = f", [{c['failure']}]{n_dropped} dropped[/{c['failure']}]" if n_dropped > 0 else ""
     console.print(
         f"  [{c['label']}]Tasks:[/{c['label']}]       "
         f"  [{c['success']}]{n_completed} completed[/{c['success']}]"
         f", [{c['failure']}]{n_failed} failed[/{c['failure']}]"
+        f"{dropped_str}"
     )
     console.print(
         f"  [{c['label']}]Total cost:[/{c['label']}]   [{c['value']}]${total_cost:.2f}[/{c['value']}]"
@@ -3827,7 +3832,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
         console.print(f"[#ff99cc]Task: {rich_escape(prompt_display)}[/#ff99cc]", soft_wrap=True)
         console.print(f"[cyan]ID:[/cyan] {task.id} | [cyan]Slug:[/cyan] {rich_escape(task.task_id or '')}", soft_wrap=True)
-        _status_color = {"completed": "green", "unmerged": "green", "failed": "red", "in_progress": "yellow"}.get(task.status, "")
+        _status_color = {"completed": "green", "unmerged": "green", "failed": "red", "dropped": "red", "in_progress": "yellow"}.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
         console.print(f"[cyan]Status:[/cyan] {_status_val}", soft_wrap=True)
         if resolution_note:

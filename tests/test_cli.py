@@ -13764,21 +13764,33 @@ class TestSetStatusCommand:
         assert result.returncode == 0
 
     def test_advance_skips_dropped_tasks(self, tmp_path: Path):
-        """Dropped tasks do not appear in advance merge candidates or failed-resume candidates."""
+        """gza advance does not act on dropped tasks."""
         from gza.db import SqliteTaskStore as _Store
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Dropped task", "status": "dropped"},
-        ])
+        from gza.git import Git
+        setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         store = _Store(db_path)
 
-        # Dropped tasks should not appear in resumable failed tasks
-        resumable = store.get_resumable_failed_tasks()
-        assert all(t.status != "dropped" for t in resumable)
+        # Set up a minimal git repo so advance can run
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
 
-        # Dropped tasks should not appear in unmerged (completed) tasks
-        unmerged = store.get_unmerged()
-        assert all(t.status != "dropped" for t in unmerged)
+        # Add a dropped task (it has no branch, no unmerged state)
+        task = store.add("Dropped task", task_type="implement")
+        task.status = "dropped"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # gza advance should report no eligible tasks — the dropped task is not actionable
+        result = run_gza("advance", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "No eligible tasks" in result.stdout
 
     def test_dropped_task_blocks_dependent(self, tmp_path: Path):
         """A task that depends_on a dropped task is reported as blocked."""
@@ -13798,6 +13810,44 @@ class TestSetStatusCommand:
         assert is_blocked is True
         assert blocked_by_id == prereq.id
         assert blocked_by_status == "dropped"
+
+    def test_next_all_shows_blocked_annotation_for_dropped_dependency(self, tmp_path: Path):
+        """gza next --all shows blocked annotation for a task blocked by a dropped dependency."""
+        from gza.db import SqliteTaskStore as _Store
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = _Store(db_path)
+
+        prereq = store.add("Dropped prereq")
+        prereq.status = "dropped"
+        prereq.completed_at = datetime.now(timezone.utc)
+        store.update(prereq)
+
+        store.add("Dependent task", depends_on=prereq.id)
+
+        result = run_gza("next", "--all", "--project", str(tmp_path))
+        assert result.returncode == 0
+        # The dependent task should appear with a blocked annotation
+        assert "Dependent task" in result.stdout
+        assert "blocked" in result.stdout.lower()
+
+    def test_history_shows_dropped_tasks(self, tmp_path: Path):
+        """gza history includes dropped tasks after fix to get_history() default filter."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from gza.db import SqliteTaskStore as _Store
+        store = _Store(db_path)
+
+        task = store.add("Task to be dropped")
+        task.status = "dropped"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("history", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Task to be dropped" in result.stdout
 
 
 class TestFormatLogEntry:

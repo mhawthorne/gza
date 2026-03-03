@@ -18,7 +18,7 @@ class HistoryFilter:
     """Query parameters for task history. Designed for promotion to gza.api.v0."""
 
     limit: int | None = 10
-    status: str | None = None  # 'completed' | 'failed' | 'unmerged'
+    status: str | None = None  # 'completed' | 'failed' | 'unmerged' | 'dropped'
     task_type: str | None = None  # 'task' | 'implement' | 'review' | ...
     incomplete: bool = False  # Only tasks not yet merged/resolved
     days: int | None = None  # Only tasks within the last N days
