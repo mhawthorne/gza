@@ -80,6 +80,7 @@ Gza is configured via `gza.yaml` in the project root. Key fields:
 | `advance_requires_review` | bool | `true` | When `true`, `gza advance` refuses to merge an implement task that has no passing (APPROVED) review. Set both flags to `false` for legacy merge-without-review behavior |
 | `max_resume_attempts` | int | `1` | Maximum number of times `gza advance` will auto-resume a failed task (for MAX_STEPS or MAX_TURNS failures). Configurable via `GZA_MAX_RESUME_ATTEMPTS` env var. Can be overridden per-run with `--max-resume-attempts N`. |
 | `max_review_cycles` | int | `3` | Maximum number of review/improve cycles before `gza advance` stops and flags a task for human intervention. Overridable per-run with `--max-review-cycles N`. Also configurable via `GZA_MAX_REVIEW_CYCLES` env var. |
+| `merge_squash_threshold` | int | `0` | When > 0, `gza advance` squash-merges branches with this many commits or more. `0` disables auto-squash (default). `1` = always squash. Overridable per-run with `--squash-threshold N` or env var `GZA_MERGE_SQUASH_THRESHOLD`. |
 
 ### verify_command
 

@@ -902,10 +902,20 @@ class Config:
             interactive_worktree_dir = os.getenv("GZA_INTERACTIVE_WORKTREE_DIR")
             source_map["interactive_worktree_dir"] = "env"
 
-        merge_squash_threshold = int(data.get("merge_squash_threshold", DEFAULT_MERGE_SQUASH_THRESHOLD))
+        try:
+            merge_squash_threshold = int(data.get("merge_squash_threshold", DEFAULT_MERGE_SQUASH_THRESHOLD))
+        except (TypeError, ValueError):
+            raise ConfigError("merge_squash_threshold must be a non-negative integer")
+        if merge_squash_threshold < 0:
+            raise ConfigError("merge_squash_threshold must be a non-negative integer")
         env_merge_squash_threshold = os.getenv("GZA_MERGE_SQUASH_THRESHOLD")
         if env_merge_squash_threshold:
-            merge_squash_threshold = int(env_merge_squash_threshold)
+            try:
+                merge_squash_threshold = int(env_merge_squash_threshold)
+            except ValueError:
+                raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
+            if merge_squash_threshold < 0:
+                raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
             source_map["merge_squash_threshold"] = "env"
 
         return cls(

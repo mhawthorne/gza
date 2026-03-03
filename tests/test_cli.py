@@ -12313,13 +12313,20 @@ class TestAdvanceMergeSquashThreshold:
         assert kwargs.get("squash", False) is False
 
     def test_advance_squash_threshold_cli_override(self, tmp_path: Path):
-        """--squash-threshold N overrides config.merge_squash_threshold."""
-        from gza.config import Config
+        """--squash-threshold N overrides config.merge_squash_threshold: dry-run shows auto-squash."""
+        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        # 2 commits; passing --squash-threshold 2 on the CLI should trigger auto-squash
+        task = self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=2)
 
         result = run_gza("advance", "--dry-run", "--squash-threshold", "2", "--project", str(tmp_path))
-        # No tasks to advance, but the arg should be accepted without error
         assert result.returncode == 0
+        assert "auto-squash" in result.stdout
 
     def test_advance_dry_run_shows_squash_annotation(self, tmp_path: Path):
         """Dry-run output includes '(auto-squash, N commits)' when threshold is met."""
@@ -12361,6 +12368,31 @@ class TestAdvanceMergeSquashThreshold:
         monkeypatch.setenv("GZA_MERGE_SQUASH_THRESHOLD", "5")
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 5
+
+    def test_invalid_type_raises_config_error(self, tmp_path: Path):
+        """Non-integer merge_squash_threshold in yaml raises ConfigError, not bare ValueError."""
+        import pytest
+        from gza.config import Config, ConfigError
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: two\n")
+        with pytest.raises(ConfigError):
+            Config.load(tmp_path)
+
+    def test_negative_value_raises_config_error(self, tmp_path: Path):
+        """Negative merge_squash_threshold in yaml raises ConfigError."""
+        import pytest
+        from gza.config import Config, ConfigError
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: -1\n")
+        with pytest.raises(ConfigError):
+            Config.load(tmp_path)
+
+    def test_invalid_env_var_raises_config_error(self, tmp_path: Path, monkeypatch):
+        """Non-integer GZA_MERGE_SQUASH_THRESHOLD env var raises ConfigError."""
+        import pytest
+        from gza.config import Config, ConfigError
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        monkeypatch.setenv("GZA_MERGE_SQUASH_THRESHOLD", "abc")
+        with pytest.raises(ConfigError):
+            Config.load(tmp_path)
 
 
 class TestStatsCommand:
