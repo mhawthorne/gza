@@ -6292,16 +6292,38 @@ def _determine_advance_action(
     git: Git,
     task: DbTask,
     default_branch: str,
+    impl_based_on_ids: set[int] | None = None,
 ) -> dict:
     """Determine the next action needed to advance a task.
 
     Returns a dict with:
-        type: action type ('merge', 'create_review', 'improve', 'needs_rebase',
-                           'wait_review', 'wait_improve', 'needs_discussion', 'skip')
+        type: action type ('merge', 'create_review', 'create_implement', 'improve',
+                           'needs_rebase', 'wait_review', 'wait_improve',
+                           'needs_discussion', 'skip')
         description: human-readable description of the action
         review_task: (optional) the review task involved
+
+    Args:
+        impl_based_on_ids: Pre-computed set of plan IDs that already have an
+            implement task.  Pass this to avoid repeated DB queries when
+            processing many plan tasks.  If *None*, it will be fetched on
+            demand for plan tasks.
     """
     assert task.id is not None
+
+    # Completed plan tasks: check if an implement child already exists
+    if task.task_type == 'plan':
+        if impl_based_on_ids is None:
+            impl_based_on_ids = store.get_impl_based_on_ids()
+        if task.id not in impl_based_on_ids:
+            return {
+                'type': 'create_implement',
+                'description': 'Create and start implement task',
+            }
+        return {
+            'type': 'skip',
+            'description': 'SKIP: implement task already exists for this plan',
+        }
 
     # Tasks with no branch (no commits) cannot be merged or reviewed
     if not task.branch:
@@ -6494,7 +6516,7 @@ def _cmd_advance_plans(
     print()
 
     if not create:
-        print("Run with --create to queue implement tasks for all listed plans.")
+        print("Run 'gza advance' or 'gza advance --type plan' to create and start implement tasks.")
         return 0
 
     # Create queued implement tasks
@@ -6542,6 +6564,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     create_mode: bool = getattr(args, 'create', False)
     no_resume_failed: bool = getattr(args, 'no_resume_failed', False)
     max_resume_attempts_override: int | None = getattr(args, 'max_resume_attempts', None)
+    advance_type: str | None = getattr(args, 'advance_type', None)
 
     # Determine effective max_resume_attempts
     max_resume_attempts = max_resume_attempts_override if max_resume_attempts_override is not None else config.max_resume_attempts
@@ -6564,6 +6587,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # --plans mode: list completed plans without implementations
     if plans_mode:
         return _cmd_advance_plans(config, store, dry_run=dry_run, create=create_mode)
+
+    # Pre-compute the set of plan IDs that already have implement children
+    # to avoid repeated DB queries in _determine_advance_action.
+    impl_based_on_ids: set[int] = store.get_impl_based_on_ids()
 
     # Determine which tasks to advance
     if task_id is not None:
@@ -6599,6 +6626,29 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Also collect resumable failed tasks (unless disabled)
         failed_tasks = [] if no_resume_failed else store.get_resumable_failed_tasks()
 
+        # Also fetch completed plans that have no implement child yet.
+        # These are invisible to get_unmerged() (no branch/merge_status)
+        # but can be auto-advanced by creating implement tasks.
+        if advance_type != 'implement':
+            completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
+            pending_plans = [
+                p for p in completed_plans
+                if p.id not in impl_based_on_ids
+            ]
+            # Avoid duplicates: only add plans not already in the unmerged list
+            existing_ids = {t.id for t in tasks}
+            for p in pending_plans:
+                if p.id not in existing_ids:
+                    tasks.append(p)
+
+        # Apply --type filter
+        if advance_type == 'plan':
+            tasks = [t for t in tasks if t.task_type == 'plan']
+            failed_tasks = []  # plans don't have failed/resume logic
+        elif advance_type == 'implement':
+            tasks = [t for t in tasks if t.task_type == 'implement']
+            failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
+
     if not tasks and not failed_tasks and not new_mode:
         print("No eligible tasks to advance")
         return 0
@@ -6615,7 +6665,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Analyze each completed task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
-        action = _determine_advance_action(config, store, git, task, default_branch)
+        action = _determine_advance_action(config, store, git, task, default_branch, impl_based_on_ids=impl_based_on_ids)
         plan.append((task, action))
 
     # Analyze each resumable failed task
@@ -6676,7 +6726,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"      → {action['description']}")
             print()
         if new_mode and batch_limit is not None:
-            worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'improve', 'resume'})
+            worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'})
             planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
             remaining = max(0, batch_limit - planned_workers)
             if remaining > 0:
@@ -6754,7 +6804,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
-        if action_type in ('run_review', 'run_improve', 'create_review', 'improve', 'resume'):
+        if action_type in ('run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
             if batch_limit is not None and workers_started >= batch_limit:
                 print(f"  #{task.id} {prompt_display}")
                 print(f"      — batch limit reached ({workers_started}/{batch_limit}), skipping")
@@ -6903,6 +6953,32 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 success_count += 1
             else:
                 print(f"      ✗ Failed to start resume worker")
+                error_count += 1
+
+        elif action_type == 'create_implement':
+            # Create an implement task for a completed plan and spawn a worker
+            slug = _extract_task_slug(task)
+            prompt_text = f"Implement plan from task #{task.id}: {slug}" if slug else f"Implement plan from task #{task.id}"
+            impl_task = store.add(
+                prompt=prompt_text,
+                task_type="implement",
+                based_on=task.id,
+                group=task.group,
+            )
+            print(f"      ✓ Created implement task #{impl_task.id}")
+
+            assert impl_task.id is not None
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+            )
+            rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id)
+            workers_started += 1
+            if rc == 0:
+                print(f"      ✓ Started implement worker")
+                success_count += 1
+            else:
+                print(f"      ✗ Failed to start implement worker")
                 error_count += 1
 
         print()
@@ -7156,6 +7232,12 @@ def main() -> int:
         "--new",
         action="store_true",
         help="Start new pending tasks to fill remaining --batch slots (requires --batch)",
+    )
+    advance_parser.add_argument(
+        "--type",
+        choices=["plan", "implement"],
+        dest="advance_type",
+        help="Only advance tasks of this type (plan: create+start implement tasks; implement: review/merge lifecycle)",
     )
 
     # refresh command
