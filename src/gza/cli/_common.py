@@ -1,0 +1,1014 @@
+"""Shared helpers, constants, and lightweight utilities used across CLI sub-modules."""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from ..config import Config
+from ..console import (
+    truncate,
+    MAX_PROMPT_DISPLAY,
+)
+from ..db import SqliteTaskStore, Task as DbTask
+from ..prompts import PromptBuilder
+from ..runner import run
+from ..workers import WorkerMetadata, WorkerRegistry
+
+
+def get_store(config: Config) -> SqliteTaskStore:
+    """Get the SQLite task store."""
+    return SqliteTaskStore(config.db_path)
+
+
+class DuplicateReviewError(ValueError):
+    """Raised when a review already exists for an implementation task.
+
+    Carries the active review task so callers do not need to re-query the DB.
+    """
+
+    def __init__(self, active_review: DbTask) -> None:
+        super().__init__(
+            f"A review task already exists: #{active_review.id} (status: {active_review.status})"
+        )
+        self.active_review = active_review
+
+
+# Shared color palette for history and stats output (readable on dark and light terminals)
+TASK_COLORS: dict[str, str] = {
+    "task_id": "#aaaaaa",   # light gray for task ID and date
+    "prompt": "#ff99cc",    # pink for prompt text
+    "branch": "cyan",       # cyan for branch name
+    "stats": "cyan",        # cyan for stats line
+    "success": "green",     # green for completed (✓)
+    "failure": "red",       # red for failed (✗)
+    "unmerged": "yellow",   # yellow for unmerged (⚡)
+    "orphaned": "yellow",   # yellow for orphaned (⚠)
+    "lineage": "#aaaaaa",   # light gray for lineage relationship labels
+    "header": "bold",       # bold for section headers
+    "label": "#aaaaaa",     # light gray for labels
+    "value": "white",       # white for values
+}
+
+
+def _run_foreground(
+    config: Config,
+    task_id: int | None,
+    resume: bool = False,
+    open_after: bool = False,
+) -> int:
+    """Run a task in the foreground with worker registration.
+
+    Wraps run() with foreground worker registration so that gza ps/next/history
+    can correctly identify actively running foreground tasks.
+
+    Args:
+        config: Configuration object
+        task_id: Task ID to run
+        resume: Whether this is a resume run
+        open_after: Whether to open the output after completion
+    """
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = registry.generate_worker_id()
+
+    worker = WorkerMetadata(
+        worker_id=worker_id,
+        pid=os.getpid(),
+        task_id=task_id,
+        task_slug=None,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status="running",
+        log_file=None,
+        worktree=None,
+        is_background=False,
+    )
+    registry.register(worker)
+
+    # Save original signal handlers so we can restore them in the finally block
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _cleanup(signum, frame):
+        # Restore original handlers and re-raise so the except block handles cleanup
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
+
+    try:
+        exit_code = run(config, task_id=task_id, resume=resume, open_after=open_after)
+        status = "completed" if exit_code == 0 else "failed"
+        registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+        return exit_code
+    except KeyboardInterrupt:
+        registry.mark_completed(worker_id, exit_code=130, status="failed")
+        return 130
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+
+def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None) -> int:
+    """Spawn a background worker process.
+
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+        task_id: Specific task ID to run (optional)
+    """
+    # Initialize worker registry
+    registry = WorkerRegistry(config.workers_path)
+
+    # Get task to run (either specific or next pending)
+    store = get_store(config)
+    if task_id:
+        task = store.get(task_id)
+        if not task:
+            print(f"Error: Task #{task_id} not found")
+            return 1
+
+        if task.status != "pending":
+            print(f"Error: Task #{task_id} is not pending (status: {task.status})")
+            return 1
+
+        # Check if task is blocked
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        if is_blocked:
+            print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            return 1
+    else:
+        # Atomically claim next task
+        task = store.claim_next_pending_task()
+        if not task:
+            print("No pending tasks found")
+            return 0
+        assert task.id is not None
+        task_id = task.id
+
+    # Build command for worker subprocess
+    cmd = [
+        sys.executable, "-m", "gza",
+        "work",
+        "--worker-mode",
+    ]
+
+    if task_id:
+        cmd.append(str(task_id))
+
+    if args.no_docker:
+        cmd.append("--no-docker")
+
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        cmd.extend(["--max-turns", str(args.max_turns)])
+
+    # Add project directory
+    cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    # Spawn detached process
+    try:
+        # Use nohup to detach from terminal
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+
+        # Generate worker ID
+        worker_id = registry.generate_worker_id()
+
+        # Register worker
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=proc.pid,
+            task_id=task.id,
+            task_slug=None,  # Will be set when runner starts
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,  # Will be set when runner starts
+            worktree=None,  # Will be set when runner starts
+        )
+        registry.register(worker)
+
+        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"  Task: #{task.id}")
+        if task.prompt:
+            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
+            print(f"  Prompt: {prompt_display}")
+        print()
+        print(f"Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error spawning background worker: {e}")
+        return 1
+
+
+def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
+    """Run in worker mode (called internally by background workers)."""
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = None
+
+    # Find our worker entry by PID
+    my_pid = os.getpid()
+    workers = registry.list_all(include_completed=False)
+    for w in workers:
+        if w.pid == my_pid:
+            worker_id = w.worker_id
+            break
+
+    # Set up signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        print("\nReceived shutdown signal, cleaning up...")
+        if worker_id:
+            registry.mark_completed(worker_id, exit_code=1, status="failed")
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Run the task normally
+    exit_code = 1
+    try:
+        resume = hasattr(args, 'resume') and args.resume
+        if hasattr(args, 'task_ids') and args.task_ids:
+            # Worker mode only runs one task at a time
+            exit_code = run(config, task_id=args.task_ids[0], resume=resume)
+        else:
+            exit_code = run(config, resume=resume)
+
+        # Update worker status on completion
+        if worker_id:
+            status = "completed" if exit_code == 0 else "failed"
+            registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+
+        return exit_code
+
+    except Exception as e:
+        print(f"Worker error: {e}")
+        if worker_id:
+            registry.mark_completed(worker_id, exit_code=1, status="failed")
+        return 1
+
+
+def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: int) -> int:
+    """Spawn a background worker to run a resume task.
+
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+        new_task_id: ID of the new resume task (created by cmd_resume)
+
+    Returns:
+        0 on success, 1 on error
+    """
+    # Initialize worker registry
+    registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
+
+    # Get the new resume task
+    task = store.get(new_task_id)
+    if not task:
+        print(f"Error: Task #{new_task_id} not found")
+        return 1
+
+    # Build command for worker subprocess
+    cmd = [
+        sys.executable, "-m", "gza",
+        "work",
+        "--worker-mode",
+        "--resume",
+        str(new_task_id),
+    ]
+
+    if args.no_docker:
+        cmd.append("--no-docker")
+
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        cmd.extend(["--max-turns", str(args.max_turns)])
+
+    # Add project directory
+    cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    # Spawn detached process
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+
+        # Generate worker ID
+        worker_id = registry.generate_worker_id()
+
+        # Register worker
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=proc.pid,
+            task_id=task.id,
+            task_slug=None,  # Will be set when runner starts
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,  # Will be set when runner starts
+            worktree=None,  # Will be set when runner starts
+        )
+        registry.register(worker)
+
+        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"  Task: #{task.id} (resuming)")
+        if task.prompt:
+            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
+            print(f"  Prompt: {prompt_display}")
+        print()
+        print(f"Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error spawning background worker: {e}")
+        return 1
+
+
+def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) -> int:
+    """Spawn a background worker to perform a rebase.
+
+    Args:
+        args: Command-line arguments (task_id, onto, remote, force, resolve)
+        config: Configuration object
+
+    Returns:
+        0 on success, 1 on error
+    """
+    registry = WorkerRegistry(config.workers_path)
+
+    # Build command: gza rebase <task_id> [options] (without --background)
+    cmd = [
+        sys.executable, "-m", "gza",
+        "rebase",
+        str(args.task_id),
+    ]
+
+    if getattr(args, 'onto', None):
+        cmd.extend(["--onto", args.onto])
+
+    if getattr(args, 'remote', False):
+        cmd.append("--remote")
+
+    if getattr(args, 'force', False):
+        cmd.append("--force")
+
+    if getattr(args, 'resolve', False):
+        cmd.append("--resolve")
+
+    # Add project directory
+    cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    # Spawn detached process
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+
+        # Generate worker ID
+        worker_id = registry.generate_worker_id()
+
+        # Register worker
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            pid=proc.pid,
+            task_id=args.task_id,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(worker)
+
+        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"  Rebasing task: #{args.task_id}")
+        print()
+        print(f"Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error spawning background worker: {e}")
+        return 1
+
+
+def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
+    """Spawn N background workers in parallel.
+
+    Args:
+        args: Command-line arguments including count and task_ids
+        config: Configuration object
+
+    Returns:
+        0 on success, 1 on error
+    """
+    # Determine how many workers to spawn
+    count = args.count if args.count is not None else 1
+
+    # If specific task_ids are provided, spawn one worker per task ID
+    if hasattr(args, 'task_ids') and args.task_ids:
+        if count > 1:
+            print("Warning: --count is ignored when specific task IDs are provided")
+
+        # Spawn one worker per task ID
+        spawned_count = 0
+        for task_id in args.task_ids:
+            result = _spawn_background_worker(args, config, task_id=task_id)
+            if result == 0:
+                spawned_count += 1
+
+        if len(args.task_ids) > 1:
+            print(f"\n=== Spawned {spawned_count} background worker(s) for {len(args.task_ids)} task(s) ===")
+
+        return 0
+
+    # Spawn N workers - each will atomically claim a pending task
+    # If there are fewer pending tasks than requested, some spawns will
+    # find no tasks and exit gracefully
+    spawned_count = 0
+
+    for i in range(count):
+        # _spawn_background_worker will atomically claim next pending task
+        # It returns 0 if successful OR if no tasks are available
+        # It returns 1 only on actual errors
+        result = _spawn_background_worker(args, config)
+        if result == 0:
+            spawned_count += 1
+
+    # Since _spawn_background_worker prints its own output for each worker,
+    # we just print a summary if multiple workers were requested
+    if count > 1:
+        print(f"\n=== Attempted to spawn {count} background worker(s) ===")
+
+    return 0
+
+
+def format_stats(task: DbTask) -> str:
+    """Format task stats as a compact string."""
+    parts = []
+    if task.duration_seconds is not None:
+        if task.duration_seconds < 60:
+            parts.append(f"{task.duration_seconds:.0f}s")
+        else:
+            mins = int(task.duration_seconds // 60)
+            secs = int(task.duration_seconds % 60)
+            parts.append(f"{mins}m{secs}s")
+    resolved_steps = get_task_step_count(task)
+    if resolved_steps is not None:
+        parts.append(f"{resolved_steps} steps")
+    if task.cost_usd is not None:
+        parts.append(f"${task.cost_usd:.4f}")
+    return " | ".join(parts) if parts else ""
+
+
+def get_task_step_count(task: DbTask) -> int | None:
+    """Return a task's canonical step count using step-first fallback."""
+    if task.num_steps_reported is not None:
+        return task.num_steps_reported
+    if task.num_steps_computed is not None:
+        return task.num_steps_computed
+    if task.num_turns_reported is not None:
+        return task.num_turns_reported
+    return None
+
+
+def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
+    """Extract verdict from a review file.
+
+    Args:
+        config: Configuration object
+        review_task: Review task
+
+    Returns:
+        Verdict string ('APPROVED', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
+    """
+    # First try output_content (cached in DB)
+    if review_task.output_content:
+        content = review_task.output_content
+    # Then try reading from report_file
+    elif review_task.report_file:
+        review_path = config.project_dir / review_task.report_file
+        if not review_path.exists():
+            return None
+        content = review_path.read_text()
+    else:
+        return None
+
+    # Look for verdict pattern in three formats:
+    # 1. Inline:  **Verdict: APPROVED** (bold wraps whole phrase)
+    # 2. Inline:  **Verdict**: APPROVED (bold wraps only label)
+    # 3. Heading: ## Verdict\n\n**CHANGES_REQUESTED**
+    import re
+    # Inline pattern (handles both bold-wrapping styles)
+    match = re.search(r'\*{0,2}Verdict\*{0,2}:\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    # Heading pattern: "## Verdict" followed by the verdict on a subsequent line
+    match = re.search(r'##\s+Verdict\s*\n+\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    return None
+
+
+def _create_review_task(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    model: str | None = None,
+    provider: str | None = None,
+) -> DbTask:
+    """Create a review task for an implementation task.
+
+    Validates that:
+    - impl_task is an 'implement' task
+    - impl_task is completed
+    - No active review already exists
+
+    Returns the created review task, or raises ValueError with an error message.
+    """
+    if impl_task.task_type != "implement":
+        raise ValueError(
+            f"Task #{impl_task.id} is a {impl_task.task_type} task. "
+            "Expected an implementation task."
+        )
+    if impl_task.status != "completed":
+        raise ValueError(
+            f"Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks."
+        )
+
+    assert impl_task.id is not None
+    existing_reviews = store.get_reviews_for_task(impl_task.id)
+    active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
+    if active_reviews:
+        raise DuplicateReviewError(active_reviews[0])
+
+    review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
+    return store.add(
+        prompt=review_prompt,
+        task_type="review",
+        depends_on=impl_task.id,
+        group=impl_task.group,
+        based_on=impl_task.based_on,
+        model=model,
+        provider=provider,
+    )
+
+
+def _create_improve_task(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    review_task: DbTask,
+    create_review: bool = False,
+    model: str | None = None,
+    provider: str | None = None,
+) -> DbTask:
+    """Create an improve task for an implementation task based on a review.
+
+    Validates that no duplicate improve task already exists.
+    Returns the created improve task, or raises ValueError with an error message.
+    """
+    assert impl_task.id is not None
+    assert review_task.id is not None
+
+    existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
+    if existing:
+        existing_task = existing[0]
+        raise ValueError(
+            f"An improve task already exists for implementation #{impl_task.id} "
+            f"and review #{review_task.id}: #{existing_task.id} (status: {existing_task.status})"
+        )
+
+    prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
+    return store.add(
+        prompt=prompt,
+        task_type="improve",
+        depends_on=review_task.id,
+        based_on=impl_task.id,
+        same_branch=True,
+        group=impl_task.group,
+        create_review=create_review,
+        model=model,
+        provider=provider,
+    )
+
+
+from .._query import (
+    get_task_slug as _get_task_slug,
+    get_reviews_for_root as _get_reviews_for_root_task,
+    task_time_for_lineage as _task_time_for_lineage,
+    get_improves_for_root as _get_improves_for_root_task,
+    build_lineage as _build_lineage_tasks_for_root,
+    resolve_lineage_root as _resolve_lineage_root_task,
+)
+
+
+def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "dim") -> str:
+    """Format lineage tasks as a linear #id[type] chain."""
+    lineage_parts: list[str] = []
+    for lineage_task in lineage_tasks:
+        if lineage_task.id is None:
+            continue
+        lineage_parts.append(
+            f"[{task_id_color}]#{lineage_task.id}[/{task_id_color}]"
+            f"[dim]\\[{lineage_task.task_type}][/dim]"
+        )
+    return " -> ".join(lineage_parts)
+
+
+def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
+    """Create a new resume task pointing to the original failed task.
+
+    Copies prompt, task_type, group, session_id, branch, model, provider, etc.
+    Sets based_on to original_task.id to track resume lineage.
+    """
+    assert original_task.id is not None
+    new_task = store.add(
+        prompt=original_task.prompt,
+        task_type=original_task.task_type,
+        group=original_task.group,
+        spec=original_task.spec,
+        depends_on=original_task.depends_on,
+        create_review=original_task.create_review,
+        same_branch=original_task.same_branch,
+        task_type_hint=original_task.task_type_hint,
+        based_on=original_task.id,  # Track resume lineage (points to failed task)
+        model=original_task.model,
+        provider=original_task.provider,
+    )
+    # Copy session_id and branch from original task so the resumed run
+    # continues the Claude Code session and uses the same branch.
+    assert new_task.id is not None
+    new_task.session_id = original_task.session_id
+    new_task.branch = original_task.branch
+    store.update(new_task)
+    return new_task
+
+
+def _resolve_task_log_path(config: Config, task: DbTask) -> Path | None:
+    """Resolve best log path for a task from explicit and inferred candidates."""
+    from .log import _task_log_candidates
+
+    candidates = _task_log_candidates(config, task)
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _looks_like_verify_command(command: str, verify_command: str | None) -> bool:
+    """Heuristic match for verification-related command invocations."""
+    normalized = command.lower()
+    if verify_command and verify_command.strip() and verify_command.strip().lower() in normalized:
+        return True
+
+    verify_tokens = [
+        "pytest",
+        "mypy",
+        "ruff",
+        "uv run pytest",
+        "uv run mypy",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "cargo test",
+    ]
+    return any(token in normalized for token in verify_tokens)
+
+
+def _looks_like_failure_output(text: str) -> bool:
+    """Heuristic match for command output that indicates failure."""
+    lowered = text.lower()
+    markers = ["failed", "error", "traceback", "assertionerror", "exit code", "exception"]
+    return any(marker in lowered for marker in markers)
+
+
+def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> tuple[str | None, str | None]:
+    """Extract last failing verify snippet and last result context from log."""
+    from .log import _load_log_file_entries, _message_content_items
+
+    try:
+        log_data, entries, content = _load_log_file_entries(log_path)
+    except OSError:
+        return None, None
+
+    if not entries and content:
+        last_line = content.splitlines()[-1].strip()
+        return None, truncate(last_line, 180) if last_line else None
+
+    tool_calls: dict[str, str] = {}
+    last_verify_failure: str | None = None
+    last_result_context: str | None = None
+
+    def _result_snippet(value: Any, limit: int = 160) -> str:
+        if isinstance(value, str):
+            return truncate(value.replace("\\n", "\n"), limit)
+        return truncate(json.dumps(value, ensure_ascii=True), limit)
+
+    def _record_verify_failure(command: str, output: Any, *, is_error: bool) -> None:
+        nonlocal last_verify_failure
+        snippet = _result_snippet(output)
+        if _looks_like_verify_command(command, verify_command) and (is_error or _looks_like_failure_output(snippet)):
+            last_verify_failure = f"{truncate(command, 120)} => {snippet}"
+
+    def _store_tool_command(tool_id: str, command: str) -> None:
+        if tool_id and command:
+            tool_calls[tool_id] = command
+
+    def _extract_command(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                return command.strip()
+        return ""
+
+    def _resolve_tool_command(entry: dict) -> str:
+        tool_id = str(entry.get("id") or entry.get("call_id") or entry.get("tool_use_id") or "")
+        command = tool_calls.get(tool_id, "")
+        if command:
+            return command
+        return _extract_command(entry.get("tool_input"))
+
+    for entry in entries:
+        entry_type = entry.get("type")
+        if entry_type == "assistant":
+            for item in _message_content_items(entry):
+                if item.get("type") != "tool_use":
+                    continue
+                if str(item.get("name")) != "Bash":
+                    continue
+                tool_id = str(item.get("id") or "")
+                tool_input = item.get("input", {})
+                if not isinstance(tool_input, dict):
+                    continue
+                command = str(tool_input.get("command") or "").strip()
+                _store_tool_command(tool_id, command)
+        elif entry_type == "user":
+            for item in _message_content_items(entry):
+                if item.get("type") != "tool_result":
+                    continue
+                tool_id = str(item.get("tool_use_id") or "")
+                command = tool_calls.get(tool_id, "")
+                if not command:
+                    continue
+                is_error = bool(item.get("is_error", False))
+                _record_verify_failure(command, item.get("content", ""), is_error=is_error)
+        elif entry_type == "tool_use":
+            tool_name = str(entry.get("tool_name") or "")
+            if tool_name != "Bash":
+                continue
+            command = _resolve_tool_command(entry)
+            tool_id = str(entry.get("id") or entry.get("call_id") or "")
+            _store_tool_command(tool_id, command)
+        elif entry_type in {"tool_output", "tool_error"}:
+            command = _resolve_tool_command(entry)
+            if not command:
+                continue
+            is_error = entry_type == "tool_error"
+            if not is_error:
+                is_error = bool(entry.get("is_error"))
+            if not is_error:
+                exit_code = entry.get("exit_code")
+                is_error = isinstance(exit_code, int) and exit_code != 0
+            output = entry.get("content")
+            if output is None:
+                output = entry.get("output")
+            if output is None:
+                payload = {k: v for k, v in entry.items() if k not in {"type", "id", "call_id", "tool_use_id"}}
+                output = payload
+            _record_verify_failure(command, output, is_error=is_error)
+        elif entry_type == "item.completed":
+            item = entry.get("item", {})
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "command_execution":
+                continue
+            command = str(item.get("command") or "").strip()
+            if not command:
+                continue
+            exit_code = item.get("exit_code")
+            is_error = isinstance(exit_code, int) and exit_code != 0
+            output = item.get("aggregated_output")
+            if output is None:
+                output = item.get("output")
+            _record_verify_failure(command, output or "", is_error=is_error)
+        elif entry_type == "result":
+            subtype = str(entry.get("subtype") or "unknown")
+            if subtype == "success":
+                continue
+            result_text = entry.get("result", "")
+            if isinstance(result_text, str) and result_text.strip():
+                detail = truncate(result_text.replace("\\n", "\n"), 180)
+            elif entry.get("errors"):
+                detail = truncate(json.dumps(entry.get("errors"), ensure_ascii=True), 180)
+            else:
+                detail = ""
+            if detail:
+                last_result_context = f"{subtype}: {detail}"
+            else:
+                last_result_context = subtype
+
+    if last_result_context is None and log_data:
+        subtype = str(log_data.get("subtype") or "")
+        if subtype and subtype != "success":
+            last_result_context = subtype
+
+    return last_verify_failure, last_result_context
+
+
+def _failure_summary(reason: str) -> str:
+    """Build short human-readable failure summary."""
+    summaries = {
+        "MAX_STEPS": "Stopped due to max steps limit.",
+        "MAX_TURNS": "Stopped due to max steps limit.",
+        "TEST_FAILURE": "Stopped due to verification/test failure.",
+        "UNKNOWN": "Task failed; inspect log output for details.",
+    }
+    return summaries.get(reason, f"Task failed: {reason}")
+
+
+def _failure_next_steps(task: DbTask, reason: str) -> list[str]:
+    """Return concrete next-step commands for a failed task."""
+    if task.id is None:
+        return []
+
+    steps = [f"gza log -t {task.id} --steps-verbose"]
+    if reason in {"MAX_STEPS", "MAX_TURNS"}:
+        if task.session_id:
+            steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if reason == "TEST_FAILURE":
+        if task.session_id:
+            steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if task.session_id:
+        steps.append(f"gza resume {task.id}")
+    steps.append(f"gza retry {task.id}")
+    return steps
+
+
+class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Custom help formatter that sorts subcommands alphabetically."""
+
+    def _iter_indented_subactions(self, action):
+        """Override to sort subactions alphabetically by their command name."""
+        try:
+            # Get the subactions (subcommands)
+            subactions = action._get_subactions()
+        except AttributeError:
+            # If no _get_subactions, fall back to default behavior
+            subactions = super()._iter_indented_subactions(action)
+        else:
+            # Sort subcommands alphabetically by their metavar (command name)
+            subactions = sorted(subactions, key=lambda x: x.metavar if x.metavar else "")
+
+        # Yield sorted subactions with indentation
+        for subaction in subactions:
+            yield subaction
+
+    def _metavar_formatter(self, action, default_metavar):
+        """Override to sort choices alphabetically in usage string."""
+        if action.metavar is not None:
+            result = action.metavar
+        elif action.choices is not None:
+            # Sort choices alphabetically
+            choice_strs = sorted(str(choice) for choice in action.choices)
+            result = '{%s}' % ','.join(choice_strs)
+        else:
+            result = default_metavar
+
+        def format(tuple_size):
+            if isinstance(result, tuple):
+                return result
+            else:
+                return (result, ) * tuple_size
+        return format
+
+
+def _add_skills_install_args(
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Add common arguments for skills install commands."""
+    parser.add_argument(
+        "skills",
+        nargs="*",
+        help="Specific skills to install (installs all public skills if not specified)",
+    )
+    parser.add_argument(
+        "--target",
+        choices=["claude", "codex", "gemini", "all"],
+        action="append",
+        help="Install target(s): claude, codex, gemini, or all (default depends on command)",
+    )
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing skills",
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List available skills without installing",
+    )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Include dev (non-public) skills",
+    )
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp safely."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add common arguments to a subparser."""
+    parser.add_argument(
+        "--project",
+        "-C",
+        dest="project_dir",
+        default=".",
+        help="Target project directory (default: current directory)",
+    )
+
+
+def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared query/filter arguments to a subparser (history, stats, etc.)."""
+    parser.add_argument(
+        "--last",
+        "-n",
+        type=int,
+        metavar="N",
+        help="Show last N tasks",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all tasks (no limit)",
+    )
+    parser.add_argument(
+        "--type",
+        type=str,
+        choices=["explore", "plan", "implement", "review", "improve", "learn"],
+        help="Filter tasks by task_type",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        help="Show only tasks from the last N days",
+    )
+    parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or after this date",
+    )
+    parser.add_argument(
+        "--end-date",
+        dest="end_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or before this date",
+    )
