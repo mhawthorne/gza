@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -124,3 +125,202 @@ def test_regenerate_learnings_writes_history_log(tmp_path: Path):
     assert "retained_count" in record
     assert "churn_percent" in record
     assert record["learnings_file"] == ".gza/learnings.md"
+
+
+def test_llm_path_calls_runner_and_parses_output(tmp_path: Path):
+    """LLM summarization should call runner.run and parse bullet points from output."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Implement auth flow", task_type="implement")
+    store.mark_completed(task, output_content="# Summary\n- Use JWT tokens\n", has_commits=False)
+
+    def mock_run(cfg, task_id=None, **kwargs):
+        learn_task = store.get(task_id)
+        assert learn_task is not None
+        learn_task.status = "completed"
+        learn_task.output_content = "- Use pytest fixtures\n- Always run type checks\n"
+        store.update(learn_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=mock_run):
+        result = regenerate_learnings(store, config, window=10)
+
+    assert result.tasks_used == 1
+    content = result.path.read_text()
+    assert "Use pytest fixtures" in content
+    assert "Always run type checks" in content
+
+
+def test_llm_path_fallback_on_runner_failure(tmp_path: Path):
+    """If runner.run returns non-zero, fall back to regex extraction."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task one", task_type="implement")
+    store.mark_completed(task, output_content="- Regex pattern found\n", has_commits=False)
+
+    with patch("gza.runner.run", return_value=1):
+        result = regenerate_learnings(store, config, window=10)
+
+    assert result.tasks_used == 1
+    content = result.path.read_text()
+    assert "Regex pattern found" in content
+
+
+def test_llm_path_fallback_on_runner_exception(tmp_path: Path):
+    """If runner.run raises an exception, fall back to regex extraction."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task one", task_type="implement")
+    store.mark_completed(task, output_content="- Regex pattern found\n", has_commits=False)
+
+    with patch("gza.runner.run", side_effect=RuntimeError("provider failure")):
+        result = regenerate_learnings(store, config, window=10)
+
+    assert result.tasks_used == 1
+    content = result.path.read_text()
+    assert "Regex pattern found" in content
+
+
+def test_learn_task_has_skip_learnings_flag(tmp_path: Path):
+    """The learn task created during summarization must have skip_learnings=True."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task", task_type="implement")
+    store.mark_completed(task, output_content="- Some pattern\n", has_commits=False)
+
+    created_learn_tasks: list = []
+
+    def mock_run(cfg, task_id=None, **kwargs):
+        learn_task = store.get(task_id)
+        assert learn_task is not None
+        created_learn_tasks.append(learn_task)
+        learn_task.status = "completed"
+        learn_task.output_content = "- LLM learning\n"
+        store.update(learn_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=mock_run):
+        regenerate_learnings(store, config, window=10)
+
+    assert len(created_learn_tasks) == 1
+    assert created_learn_tasks[0].task_type == "learn"
+    assert created_learn_tasks[0].skip_learnings is True
+
+
+def test_learn_task_deleted_from_store_after_regeneration(tmp_path: Path):
+    """The learn task created during summarization must be deleted from the store after use."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task", task_type="implement")
+    store.mark_completed(task, output_content="- Some pattern\n", has_commits=False)
+
+    captured_learn_task_id: list = []
+
+    def mock_run(cfg, task_id=None, **kwargs):
+        learn_task = store.get(task_id)
+        assert learn_task is not None
+        captured_learn_task_id.append(task_id)
+        learn_task.status = "completed"
+        learn_task.output_content = "- LLM learning\n"
+        store.update(learn_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=mock_run):
+        regenerate_learnings(store, config, window=10)
+
+    assert len(captured_learn_task_id) == 1
+    # The learn task must be deleted from the store after use
+    assert store.get(captured_learn_task_id[0]) is None
+
+
+def test_learn_task_not_in_get_recent_completed(tmp_path: Path):
+    """Completed learn tasks must not appear in get_recent_completed() to avoid polluting the summarization window."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    impl_task = store.add("Normal task", task_type="implement")
+    store.mark_completed(impl_task, output_content="- Pattern from work\n", has_commits=False)
+
+    learn_task = store.add("Learn prompt", task_type="learn", skip_learnings=True)
+    store.mark_completed(learn_task, output_content="- Meta learning\n", has_commits=False)
+
+    recent = store.get_recent_completed(limit=10)
+    task_types = [t.task_type for t in recent]
+    assert "learn" not in task_types
+    assert "implement" in task_types
+
+
+def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
+    """Completing a learn task (skip_learnings=True) must not trigger maybe_auto_regenerate_learnings.
+
+    This test calls through the real _run_non_code_task code path so that the guard
+    in runner.py is actually exercised (not just replicated inline).
+    """
+    from unittest.mock import Mock
+    from gza.runner import _run_non_code_task
+    from gza.providers.base import RunResult
+
+    store = _new_store(tmp_path)
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    config.log_path = tmp_path / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.worktree_path = tmp_path / "worktrees"
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    config.use_docker = False
+
+    learn_task = store.add("Learn prompt", task_type="learn", skip_learnings=True)
+    learn_task.task_id = "20260101-learn-prompt"
+    store.update(learn_task)
+
+    mock_provider = Mock()
+    mock_provider.name = "MockProvider"
+    mock_provider.run.return_value = RunResult(
+        exit_code=0,
+        duration_seconds=1.0,
+        num_turns_reported=1,
+        cost_usd=0.001,
+        session_id="test-session",
+        error_type=None,
+    )
+
+    mock_git = Mock()
+    mock_git.default_branch.return_value = "main"
+    mock_git._run.return_value = Mock(returncode=0)
+
+    # Create the report file the runner expects to copy from worktree
+    report_dir = tmp_path / "worktrees" / f"{learn_task.task_id}-learn" / ".gza" / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / f"{learn_task.task_id}.md").write_text("# Learn report\n")
+
+    with patch("gza.runner.console"), \
+         patch("gza.runner.maybe_auto_regenerate_learnings") as mock_auto:
+        _run_non_code_task(learn_task, config, store, mock_provider, mock_git)
+
+    mock_auto.assert_not_called()
+
+
+def test_learn_task_deleted_on_runner_failure(tmp_path: Path):
+    """The learn task must be deleted from store even when runner.run returns non-zero."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task", task_type="implement")
+    store.mark_completed(task, output_content="- Pattern\n", has_commits=False)
+
+    captured_learn_task_id: list = []
+
+    def mock_run_fail(cfg, task_id=None, **kwargs):
+        captured_learn_task_id.append(task_id)
+        return 1  # failure
+
+    with patch("gza.runner.run", side_effect=mock_run_fail):
+        regenerate_learnings(store, config, window=10)
+
+    assert len(captured_learn_task_id) == 1
+    assert store.get(captured_learn_task_id[0]) is None

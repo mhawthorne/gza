@@ -1202,8 +1202,8 @@ def _run_inner(
     open_after: bool = False,
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
-    # For explore, plan, and review tasks, run in project dir without creating a branch
-    if task.task_type in ("explore", "plan", "review"):
+    # For explore, plan, review, and learn tasks, run in project dir without creating a branch
+    if task.task_type in ("explore", "plan", "review", "learn"):
         return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
 
     # Code tasks (implement/improve) require git
@@ -1845,7 +1845,9 @@ def _run_non_code_task(
         )
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-        auto_learnings = maybe_auto_regenerate_learnings(store, config)
+        auto_learnings = None
+        if not task.skip_learnings:
+            auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
         # For review tasks, post to PR if applicable
         if task.task_type == "review" and task.depends_on:
