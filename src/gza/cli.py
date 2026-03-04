@@ -2540,6 +2540,44 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _find_removable_workers(registry: WorkerRegistry, store: "SqliteTaskStore") -> "list[WorkerMetadata]":
+    """Find worker files that can be safely removed.
+
+    A worker is removable if:
+    - Its status is completed or failed (finished normally), OR
+    - Its process is no longer running (stale), OR
+    - It has a task_id whose DB task is already completed/failed
+      (zombie worker — PID may have been reused by another process)
+
+    Reads worker JSON directly and only checks PID liveness when needed,
+    avoiding the expensive PID checks for workers we can decide on via DB alone.
+    """
+    import json as json_lib
+    from .workers import WorkerMetadata
+    removable = []
+    for metadata_path in registry.workers_dir.glob("w-*.json"):
+        try:
+            with open(metadata_path) as f:
+                data = json_lib.load(f)
+            worker = WorkerMetadata.from_dict(data)
+        except (OSError, json_lib.JSONDecodeError, KeyError):
+            continue
+
+        if worker.status in ("completed", "failed"):
+            removable.append(worker)
+        elif worker.task_id is not None:
+            # Check DB first (cheap) — if the task is done, this is a zombie
+            task = store.get(worker.task_id)
+            if task and task.status in ("completed", "failed"):
+                removable.append(worker)
+            elif not registry.is_running(worker.worker_id):
+                removable.append(worker)
+        elif not registry.is_running(worker.worker_id):
+            # No task_id — fall back to PID check
+            removable.append(worker)
+    return removable
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     """Clean up stale worktrees, old logs, and stale worker metadata."""
     from datetime import timedelta
@@ -2548,8 +2586,9 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
+    registry = WorkerRegistry(config.workers_path)
 
-    days = args.days
+    days = args.days if args.days is not None else config.cleanup_days
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
@@ -2559,52 +2598,83 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     cleaned_workers = 0
     errors: list[tuple[str, Exception]] = []
 
-    # 1. Clean up stale worktrees
+    # 1. Lineage-aware worktree cleanup
     if args.worktrees or not (args.logs or args.workers):
+        from gza._query import resolve_lineage_root, build_lineage, task_time_for_lineage
+
+        print("Scanning worktrees...")
         worktree_dir = config.worktree_path
+        # Collect worktrees to remove (with reasons) before prompting
+        pending_worktree_removals: list[tuple[Path, str]] = []
         if worktree_dir.exists():
             try:
+                worktrees = git.worktree_list()
+                worktree_paths = {Path(wt["path"]) for wt in worktrees if wt.get("path")}
+
                 for worktree_path in worktree_dir.iterdir():
                     if not worktree_path.is_dir():
                         continue
 
-                    # Check if worktree still exists in git's worktree list
-                    worktrees = git.worktree_list()
-                    worktree_paths = {Path(wt["path"]) for wt in worktrees if wt.get("path")}
-
-                    should_remove = False
-                    reason = ""
-
                     if worktree_path not in worktree_paths:
-                        # Worktree not in git's list - stale
-                        should_remove = True
-                        reason = "not in git worktree list"
-                    else:
-                        # Check if worktree is old
-                        if worktree_path.stat().st_mtime < cutoff_timestamp:
-                            should_remove = True
-                            reason = f"older than {days} days"
+                        # Orphaned directory not in git's worktree list
+                        pending_worktree_removals.append((worktree_path, "orphaned"))
+                        continue
 
-                    if should_remove:
-                        if args.dry_run:
-                            cleaned_worktrees.append((worktree_path.name, reason))
-                        else:
-                            try:
-                                # Try to remove via git worktree remove
-                                git.worktree_remove(worktree_path, force=True)
-                                cleaned_worktrees.append((worktree_path.name, reason))
-                            except GitError:
-                                # If git fails, try direct removal
-                                try:
-                                    shutil.rmtree(worktree_path)
-                                    cleaned_worktrees.append((worktree_path.name, reason))
-                                except OSError as e:
-                                    errors.append((worktree_path.name, e))
+                    # Git-tracked worktree — check lineage age
+                    wt_name = worktree_path.name
+                    task = store.get_by_task_id(wt_name)
+                    if task is None:
+                        # No task in DB for this worktree — treat as orphaned
+                        pending_worktree_removals.append((worktree_path, "no task in DB"))
+                        continue
+
+                    # Resolve lineage and check most recent activity
+                    root = resolve_lineage_root(store, task)
+                    lineage = build_lineage(store, root)
+                    most_recent = max(
+                        (task_time_for_lineage(t) for t in lineage),
+                        default=datetime.min,
+                    )
+                    # Make cutoff_time naive if most_recent is naive (DB timestamps may lack tz)
+                    cutoff_naive = cutoff_time.replace(tzinfo=None) if most_recent.tzinfo is None else cutoff_time
+                    if most_recent < cutoff_naive:
+                        pending_worktree_removals.append((worktree_path, f"lineage inactive >{days}d"))
+                    # else: lineage still active, skip
+
             except Exception as e:
                 errors.append((str(worktree_dir), e))
 
+        # Confirmation prompt before removing worktrees
+        if pending_worktree_removals and not args.dry_run:
+            if not args.force:
+                print(f"\nWorktrees to remove ({len(pending_worktree_removals)}):")
+                for wt_path, reason in pending_worktree_removals:
+                    print(f"  - {wt_path.name} ({reason})")
+                try:
+                    answer = input(f"\nRemove {len(pending_worktree_removals)} worktree(s)? [y/N] ")
+                except EOFError:
+                    answer = ""
+                if answer.strip().lower() != "y":
+                    print("Skipped worktree removal.")
+                    pending_worktree_removals = []
+
+        # Execute removals
+        for worktree_path, reason in pending_worktree_removals:
+            if args.dry_run:
+                cleaned_worktrees.append((worktree_path.name, reason))
+            else:
+                try:
+                    git.worktree_remove(worktree_path, force=True)
+                    # worktree_remove uses check=False, so check if dir still exists
+                    if worktree_path.exists():
+                        shutil.rmtree(worktree_path)
+                    cleaned_worktrees.append((worktree_path.name, reason))
+                except OSError as e:
+                    errors.append((worktree_path.name, e))
+
     # 2. Clean up old log files
     if args.logs or not (args.worktrees or args.workers):
+        print("Scanning logs...")
         if config.log_path.exists():
             # Get list of unmerged tasks if --keep-unmerged is set
             unmerged_task_ids = set()
@@ -2647,15 +2717,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                         except OSError as e:
                             errors.append((log_file.name, e))
 
-    # 3. Clean up stale worker metadata
+    # 3. Clean up worker metadata for finished/stale/zombie workers
     if args.workers or not (args.worktrees or args.logs):
-        registry = WorkerRegistry(config.workers_path)
+        print("Scanning workers...")
+        removable = _find_removable_workers(registry, store)
+        if removable:
+            print(f"Found {len(removable)} worker file(s) to clean up...")
         if args.dry_run:
-            # Count stale workers for dry run
-            stale_count = sum(1 for w in registry.list_all(include_completed=True) if w.status == "stale")
-            cleaned_workers = stale_count
+            cleaned_workers = len(removable)
         else:
-            cleaned_workers = registry.cleanup_stale()
+            for worker in removable:
+                registry.remove(worker.worker_id)
+                cleaned_workers += 1
 
     # Report results
     if args.dry_run:
@@ -2684,7 +2757,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         print()
 
     if args.workers or not (args.worktrees or args.logs):
-        print(f"Stale worker metadata cleaned: {cleaned_workers}")
+        print(f"Worker files cleaned: {cleaned_workers}")
         print()
 
     # Report errors
@@ -4506,13 +4579,13 @@ def _print_ps_output(
                 seen_tasks[key] = row
             live_keys.add(key)
 
-        # Re-fetch DB status for tracked tasks that vanished from live_rows.
-        # This happens when a task completes and has no worker — it drops out
-        # of get_in_progress() results, leaving seen_tasks with stale status.
+        # Re-fetch DB status for ALL tracked tasks that still appear active.
+        # This catches status transitions regardless of whether the task is
+        # still in live_rows (e.g. worker exists but task completed in DB).
         for key, row in list(seen_tasks.items()):
-            if key not in live_keys and isinstance(key, int) and row["status"] in ("running", "in_progress"):
+            if isinstance(key, int) and row["status"] in ("running", "in_progress"):
                 task = store.get(key)
-                if task and task.status != "in_progress":
+                if task and task.status in ("completed", "failed"):
                     row["status"] = task.status
 
         rows = list(seen_tasks.values())
@@ -4584,6 +4657,14 @@ def cmd_ps(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
+    # Auto-clean zombie workers: "running" workers whose DB task already finished.
+    # These accumulate when PIDs get reused by other processes.
+    # Don't remove stale workers here — they indicate orphaned tasks worth showing.
+    for w in registry.list_all(include_completed=True):
+        if w.status == "running" and w.task_id is not None:
+            task = store.get(w.task_id)
+            if task and task.status in ("completed", "failed"):
+                registry.remove(w.worker_id)
     poll_interval: int | None = getattr(args, "poll", None)
 
     if poll_interval is not None:
@@ -7168,7 +7249,7 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--type",
         type=str,
-        choices=["explore", "plan", "implement", "review", "improve"],
+        choices=["explore", "plan", "implement", "review", "improve", "learn"],
         help="Filter tasks by task_type",
     )
     parser.add_argument(
@@ -7585,9 +7666,9 @@ def main() -> int:
     cleanup_parser.add_argument(
         "--days",
         type=int,
-        default=30,
+        default=None,
         metavar="N",
-        help="Remove worktrees/logs older than N days (default: 30)",
+        help="Remove worktrees/logs older than N days (default: from config cleanup_days, or 30)",
     )
     cleanup_parser.add_argument(
         "--keep-unmerged",
@@ -7598,6 +7679,11 @@ def main() -> int:
         "--dry-run",
         action="store_true",
         help="Show what would be cleaned without actually doing it",
+    )
+    cleanup_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt before removing worktrees",
     )
     add_common_args(cleanup_parser)
 

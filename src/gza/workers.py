@@ -235,16 +235,24 @@ class WorkerRegistry:
         count = 0
         for worker in self.list_all(include_completed=True):
             if worker.status == "stale":
-                # Remove metadata file
-                metadata_path = self._metadata_path(worker.worker_id)
-                if metadata_path.exists():
-                    metadata_path.unlink()
+                self.remove(worker.worker_id)
+                count += 1
 
-                # Remove PID file if it exists
-                pid_path = self._pid_path(worker.worker_id)
-                if pid_path.exists():
-                    pid_path.unlink()
+        return count
 
+    def cleanup_finished(self) -> int:
+        """Remove metadata for completed and failed workers.
+
+        These workers have finished and their files serve no purpose.
+        Call this periodically to prevent worker file accumulation.
+
+        Returns:
+            Number of finished workers cleaned up
+        """
+        count = 0
+        for worker in self.list_all(include_completed=True):
+            if worker.status in ("completed", "failed"):
+                self.remove(worker.worker_id)
                 count += 1
 
         return count

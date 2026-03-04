@@ -4533,6 +4533,119 @@ class TestPsCommand:
         statuses4 = {r["status"] for r in snap4}
         assert statuses4 == {"completed"}, f"Poll 4: expected all completed, got {statuses4}"
 
+    def test_ps_poll_detects_completion_with_workers(self, tmp_path: Path):
+        """Poll mode detects task completion even when workers are present.
+
+        When a task has a worker registered, it appears in live_rows via the
+        worker loop (not just get_in_progress). The poll must still detect
+        when the DB task status transitions to completed, even though the
+        task never "vanishes" from live_rows.
+
+        Scenario:
+        - 2 tasks running with workers (task_id set on worker)
+        - Poll 1: both show as running
+        - Both tasks complete in DB during sleep
+        - Poll 2: both show as completed (not running)
+        """
+        import argparse
+        import json
+        import os
+        import unittest.mock as mock
+        from gza.cli import cmd_ps
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create 2 in_progress tasks
+        task1 = store.add("Learn task 1", task_type="learn")
+        task2 = store.add("Learn task 2", task_type="learn")
+        store.mark_in_progress(task1)
+        store.mark_in_progress(task2)
+
+        # Register workers for both tasks (simulates gza work running them)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        w1 = WorkerMetadata(
+            worker_id="w-learn-1",
+            pid=os.getpid(),
+            task_id=task1.id,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        w2 = WorkerMetadata(
+            worker_id="w-learn-2",
+            pid=os.getpid(),
+            task_id=task2.id,
+            task_slug=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(w1)
+        registry.register(w2)
+
+        sleep_count = 0
+
+        def fake_sleep(n: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count == 1:
+                # After poll 1: both tasks complete in DB
+                store.mark_completed(task1)
+                store.mark_completed(task2)
+            elif sleep_count >= 2:
+                raise KeyboardInterrupt
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            quiet=False,
+            json=True,
+            poll=2,
+        )
+
+        captured_outputs: list[str] = []
+        original_print = print
+
+        def capturing_print(*a, **kw):
+            if a:
+                captured_outputs.append(str(a[0]))
+            original_print(*a, **kw)
+
+        with mock.patch("builtins.print", side_effect=capturing_print):
+            with mock.patch("time.sleep", side_effect=fake_sleep):
+                result = cmd_ps(args)
+
+        assert result == 0
+
+        json_outputs = [o for o in captured_outputs if o.startswith("[")]
+        assert len(json_outputs) >= 2, f"Expected at least 2 JSON snapshots, got {len(json_outputs)}"
+
+        # Poll 1: both tasks running
+        snap1 = json.loads(json_outputs[0])
+        assert len(snap1) == 2, f"Poll 1: expected 2 tasks, got {len(snap1)}: {snap1}"
+        statuses1 = {r["status"] for r in snap1}
+        assert statuses1 == {"running"}, f"Poll 1: expected all running, got {statuses1}"
+
+        # Poll 2: both tasks completed (DB is source of truth)
+        snap2 = json.loads(json_outputs[1])
+        assert len(snap2) == 2, f"Poll 2: expected 2 tasks, got {len(snap2)}: {snap2}"
+        statuses2 = {r["status"] for r in snap2}
+        assert statuses2 == {"completed"}, f"Poll 2: expected all completed, got {statuses2}"
+
+        # Cleanup
+        registry.remove("w-learn-1")
+        registry.remove("w-learn-2")
+
     def test_ps_poll_shows_steps_for_completed_task(self, tmp_path: Path):
         """STEPS column shows num_steps_computed for a completed task in poll mode."""
         import argparse
@@ -9301,7 +9414,7 @@ class TestCleanupCommand:
         result = run_gza("cleanup", "--workers", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "worker metadata cleaned" in result.stdout.lower()
+        assert "worker files cleaned" in result.stdout.lower()
         # Worker metadata should be cleaned up
         assert not worker_file.exists()
 
@@ -9364,6 +9477,165 @@ class TestCleanupCommand:
         assert unmerged_log.exists()
         # Merged task log should be removed
         assert not merged_log.exists()
+
+    def test_cleanup_lineage_aware_preserves_recent(self, tmp_path: Path):
+        """Worktrees with recent lineage activity are preserved."""
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (tmp_path / "README.md").write_text("# Test")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        wt_base = tmp_path / "worktrees"
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+        config = Config.load(tmp_path)
+
+        # Create a task with recent activity
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Recent feature", task_type="implement")
+        task.task_id = "20260301-recent-feature"
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Create a worktree directory tracked by git
+        worktree_dir = config.worktree_path
+        worktree_dir.mkdir(parents=True, exist_ok=True)
+        wt_path = worktree_dir / "20260301-recent-feature"
+        git._run("worktree", "add", str(wt_path), "-b", "wt-recent")
+
+        result = run_gza("cleanup", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Worktree should be preserved — lineage is recent
+        assert wt_path.exists()
+
+    def test_cleanup_lineage_aware_removes_old(self, tmp_path: Path):
+        """Worktrees with old lineage activity are removed."""
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (tmp_path / "README.md").write_text("# Test")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        wt_base = tmp_path / "worktrees"
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+        config = Config.load(tmp_path)
+
+        # Create a task with old activity
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Old feature", task_type="implement")
+        task.task_id = "20250101-old-feature"
+        task.status = "completed"
+        task.completed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        store.update(task)
+
+        # Create a worktree directory tracked by git
+        worktree_dir = config.worktree_path
+        worktree_dir.mkdir(parents=True, exist_ok=True)
+        wt_path = worktree_dir / "20250101-old-feature"
+        git._run("worktree", "add", str(wt_path), "-b", "wt-old")
+
+        result = run_gza("cleanup", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Worktree should be removed — lineage is old
+        assert not wt_path.exists()
+        assert "lineage inactive" in result.stdout
+
+    def test_cleanup_force_skips_prompt(self, tmp_path: Path):
+        """--force flag skips the confirmation prompt."""
+        from gza.config import Config
+        from gza.git import Git
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (tmp_path / "README.md").write_text("# Test")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        wt_base = tmp_path / "worktrees"
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+        config = Config.load(tmp_path)
+
+        # Create an orphaned worktree directory (not in git worktree list)
+        worktree_dir = config.worktree_path
+        worktree_dir.mkdir(parents=True, exist_ok=True)
+        orphan = worktree_dir / "orphaned-dir"
+        orphan.mkdir()
+        (orphan / "dummy.txt").write_text("dummy")
+
+        # With --force, no stdin needed — should succeed without hanging
+        result = run_gza("cleanup", "--worktrees", "--force", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert not orphan.exists()
+        assert "orphaned" in result.stdout
+
+    def test_cleanup_no_force_denies_removal(self, tmp_path: Path):
+        """Without --force, answering 'n' skips worktree removal."""
+        from gza.config import Config
+        from gza.git import Git
+
+        # Initialize git repo
+        git = Git(tmp_path)
+        git._run("init")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+        (tmp_path / "README.md").write_text("# Test")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        wt_base = tmp_path / "worktrees"
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+        config = Config.load(tmp_path)
+
+        # Create an orphaned worktree directory
+        worktree_dir = config.worktree_path
+        worktree_dir.mkdir(parents=True, exist_ok=True)
+        orphan = worktree_dir / "orphaned-dir"
+        orphan.mkdir()
+        (orphan / "dummy.txt").write_text("dummy")
+
+        # Provide 'n' via stdin
+        result = run_gza("cleanup", "--worktrees", "--project", str(tmp_path), stdin_input="n\n")
+
+        assert result.returncode == 0
+        # Orphan should still exist — user said no
+        assert orphan.exists()
+        assert "Skipped worktree removal" in result.stdout
+
+    def test_cleanup_uses_config_cleanup_days(self, tmp_path: Path):
+        """Cleanup uses cleanup_days from config when --days not specified."""
+        from gza.config import Config
+
+        # Create config with custom cleanup_days
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: test-project\ncleanup_days: 7\n")
+
+        config = Config.load(tmp_path)
+        assert config.cleanup_days == 7
 
 
 class TestRebaseHelpers:

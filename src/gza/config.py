@@ -43,6 +43,7 @@ DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
+DEFAULT_CLEANUP_DAYS = 30
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -92,6 +93,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "max_review_cycles": None,
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
+    "cleanup_days": None,
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
@@ -281,6 +283,7 @@ class Config:
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
+    cleanup_days: int = DEFAULT_CLEANUP_DAYS
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -475,6 +478,7 @@ class Config:
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
             "interactive_worktree_dir",
             "merge_squash_threshold",
+            "cleanup_days",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -918,6 +922,22 @@ class Config:
                 raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
             source_map["merge_squash_threshold"] = "env"
 
+        try:
+            cleanup_days = int(data.get("cleanup_days", DEFAULT_CLEANUP_DAYS))
+        except (TypeError, ValueError):
+            raise ConfigError("cleanup_days must be a positive integer")
+        if cleanup_days < 1:
+            raise ConfigError("cleanup_days must be a positive integer")
+        env_cleanup_days = os.getenv("GZA_CLEANUP_DAYS")
+        if env_cleanup_days:
+            try:
+                cleanup_days = int(env_cleanup_days)
+            except ValueError:
+                raise ConfigError("GZA_CLEANUP_DAYS must be a positive integer")
+            if cleanup_days < 1:
+                raise ConfigError("GZA_CLEANUP_DAYS must be a positive integer")
+            source_map["cleanup_days"] = "env"
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -948,6 +968,7 @@ class Config:
             max_review_cycles=max_review_cycles,
             interactive_worktree_dir=interactive_worktree_dir,
             merge_squash_threshold=merge_squash_threshold,
+            cleanup_days=cleanup_days,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
