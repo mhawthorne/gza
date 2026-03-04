@@ -116,6 +116,11 @@ class PromptBuilder:
                     f"\n\nBefore finishing, run the following verification command"
                     f" and fix any errors: `{config.verify_command}`"
                 )
+        elif task.task_type == "learn":
+            if report_path:
+                base_prompt += "\n\n" + _load_template("learn.txt").format(
+                    report_path=report_path
+                )
         else:
             base_prompt += "\n\nWhen you are done, report what you accomplished."
 

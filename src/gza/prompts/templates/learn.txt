@@ -1,0 +1,7 @@
+Write your output to:
+  {report_path}
+
+Output format: One learning per line, starting with "- "
+Be concise (max 20 words per learning).
+Only include learnings that generalize beyond these specific tasks.
+Do not include task-specific details that won't apply to future work.
