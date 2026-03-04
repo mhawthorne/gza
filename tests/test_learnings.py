@@ -299,7 +299,7 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     (report_dir / f"{learn_task.task_id}.md").write_text("# Learn report\n")
 
     with patch("gza.runner.console"), \
-         patch("gza.learnings.maybe_auto_regenerate_learnings") as mock_auto:
+         patch("gza.runner.maybe_auto_regenerate_learnings") as mock_auto:
         _run_non_code_task(learn_task, config, store, mock_provider, mock_git)
 
     mock_auto.assert_not_called()

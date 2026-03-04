@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .console import console
 from .db import SqliteTaskStore, Task
 
 if TYPE_CHECKING:
@@ -125,9 +126,12 @@ def _build_summarization_prompt(tasks: list[Task]) -> str:
         output = task.output_content or ""
         if len(output) > 1500:
             output = output[:1500] + "\n... [truncated]"
+        prompt_text = task.prompt or ""
+        if len(prompt_text) > 300:
+            prompt_text = prompt_text[:300] + "... [truncated]"
         task_sections.append(
             f"### Task #{task.id} ({task.task_type})\n"
-            f"**Prompt**: {task.prompt}\n\n"
+            f"**Prompt**: {prompt_text}\n\n"
             f"**Output**:\n{output}"
         )
     tasks_text = "\n\n---\n\n".join(task_sections)
@@ -172,7 +176,8 @@ def _run_learnings_task(
 
     try:
         exit_code = _runner_mod.run(config, task_id=learn_task_id)
-    except Exception:
+    except Exception as exc:
+        console.print(f"[yellow]LLM learnings summarization failed: {exc}; falling back to regex extraction.[/yellow]")
         store.delete(learn_task_id)
         return None
 
@@ -226,7 +231,7 @@ def regenerate_learnings(
             for task in recent_tasks:
                 if task.output_content:
                     raw_learnings.extend(_extract_learnings_from_output(task.output_content))
-                if not task.output_content:
+                else:
                     raw_learnings.append(_fallback_learning(task))
 
     learnings = _dedupe(raw_learnings)
