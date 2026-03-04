@@ -139,11 +139,10 @@ class TestBuildPrompt:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
 
-        # Create .gza/learnings.md
+        # Create .gza/learnings.md (content doesn't matter; prompt only references the path)
         gza_dir = tmp_path / ".gza"
         gza_dir.mkdir(parents=True, exist_ok=True)
-        learnings_content = "# Project Learnings\n\n- Use pytest fixtures for database setup\n"
-        (gza_dir / "learnings.md").write_text(learnings_content)
+        (gza_dir / "learnings.md").write_text("")
 
         prompt = build_prompt(task, config, store)
 

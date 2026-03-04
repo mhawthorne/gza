@@ -1,19 +1,19 @@
 ---
 name: gza-interactive-review
-description: Review changes on current branch, optionally create/update PR, and post review comments
+description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
 allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
-version: 1.0.0
+version: 2.0.0
 public: false
 ---
 
 # Interactive Code Review
 
-Review committed changes on the current feature branch, ensure a PR exists, and post a structured review as a PR comment.
+Review committed changes on the current feature branch and output a structured review.
 
-## Prerequisites
+## Arguments
 
-- You must be on a feature branch (not main/master)
-- Changes must be committed and pushed
+- `--pr` — Post the review as a PR comment (requires an existing PR on the branch)
+- No arguments — Just output the review locally, no PR interaction
 
 ## Process
 
@@ -22,26 +22,17 @@ Review committed changes on the current feature branch, ensure a PR exists, and 
 1. Check current branch: `git branch --show-current`
    - If on `main` or `master`, stop and tell the user to switch to a feature branch
 2. Check for uncommitted changes: `git status --porcelain`
-   - If there are uncommitted changes, ask the user if they want to proceed anyway or commit first
-3. Check if branch is pushed: `git log @{u}..HEAD 2>/dev/null`
-   - If there are unpushed commits, tell the user to push first: `git push -u origin <branch>`
+   - If there are uncommitted changes, warn the user but proceed with reviewing committed changes
+3. Check if branch has commits ahead of main: `git log main..HEAD --oneline`
+   - If no commits ahead, stop and tell the user there's nothing to review
 
-### Step 2: Ask about PR
+### Step 2: Find PR (only if --pr flag is set)
 
-Use `AskUserQuestion` to ask: "Do you want to create or update a PR for this review?"
-- **Yes** — proceed to Step 3
-- **No** — skip to Step 4 (review only, no PR)
+1. Look up existing PR: `gh pr view --json number,url,title 2>/dev/null`
+2. If no PR exists, stop and tell the user to create one first (do NOT create a PR automatically)
+3. Capture the PR number and URL
 
-### Step 3: Ensure a PR exists
-
-1. Try to view existing PR: `gh pr view --json number,url,title 2>/dev/null`
-2. If no PR exists, create one:
-   ```bash
-   gh pr create --fill --draft
-   ```
-3. Capture the PR number and URL for later use
-
-### Step 4: Run the review
+### Step 3: Run the review
 
 Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt:
 
@@ -77,23 +68,23 @@ git diff main...HEAD
 <Brief justification>
 ```
 
-**Step 4**: If a PR exists, post the review as a PR comment:
+**Step 4**: If a PR number is provided, post the review as a PR comment:
 ```bash
 gh pr comment <PR_NUMBER> --body "<review content>"
 ```
 
 Use a heredoc for the body to handle multi-line content properly.
 
-If no PR was created, just output the review directly to the user.
+If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the PR number (or null if no PR) to the subagent.
+Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent.
 
-### Step 5: Report back
+### Step 4: Report back
 
 After the subagent completes:
 - Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
 - Print a brief summary of findings
 - If changes were requested, tell the user: "Fix the issues above, commit, push, then run `/gza-interactive-review` again."
-- If a PR exists, include a link to it
+- If a PR was used, include a link to it

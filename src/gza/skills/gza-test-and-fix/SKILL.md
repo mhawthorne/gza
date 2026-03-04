@@ -1,7 +1,7 @@
 ---
 name: gza-test-and-fix
 description: Run verify_command from gza.yaml, fix any errors found in files changed on the current branch, then commit all fixes.
-allowed-tools: Read, Edit, Glob, Grep, Bash(uv run gza:*), Bash(uv run mypy:*), Bash(uv run pytest:*), Bash(git:*)
+allowed-tools: Read, Edit, Glob, Grep, Bash(uv run gza config:*), Bash(uv run:*), Bash(git:*)
 version: 2.0.0
 public: false
 ---
@@ -14,7 +14,7 @@ Run the project's `verify_command` (from `gza.yaml`), fix any errors in files ch
 
 ### Step 1: Get verify_command
 
-Run `uv run gza config` and extract the `verify_command` value. If it is empty or not set, fall back to `uv run mypy src/ && uv run pytest tests/ -x -q`.
+Run `uv run gza config` and extract the `verify_command` value. If it is empty or not set, stop and tell the user to set `verify_command` in `gza.yaml`.
 
 ### Step 2: Get changed files
 
