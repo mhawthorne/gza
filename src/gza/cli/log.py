@@ -1,0 +1,1046 @@
+"""Log display and timeline rendering for ``gza log``."""
+
+import argparse
+import json
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from rich.markup import escape as rich_escape
+
+from ..config import Config
+from ..console import console, format_duration, truncate
+from ..db import SqliteTaskStore, Task as DbTask
+from ..workers import WorkerMetadata, WorkerRegistry
+from ._common import get_store, _parse_iso
+
+
+def _result_step_count(result_entry: dict) -> int | None:
+    """Resolve a result entry's step count using step-first fallback."""
+    num_steps = result_entry.get("num_steps")
+    if isinstance(num_steps, int):
+        return num_steps
+    num_steps_reported = result_entry.get("num_steps_reported")
+    if isinstance(num_steps_reported, int):
+        return num_steps_reported
+    num_turns = result_entry.get("num_turns")
+    if isinstance(num_turns, int):
+        return num_turns
+    return None
+
+
+def _summarize_tool_detail(tool_name: str, tool_input: dict) -> str:
+    """Build a compact one-line tool summary for timeline rendering."""
+    if tool_name == "Bash":
+        cmd = str(tool_input.get("command", ""))
+        return truncate(cmd, 100) if cmd else "Bash"
+    if tool_name in {"Read", "Edit", "Write"}:
+        path = str(tool_input.get("file_path", ""))
+        return f"{tool_name} {path}".strip()
+    if tool_name == "Grep":
+        pattern = str(tool_input.get("pattern", ""))
+        path = str(tool_input.get("path", ""))
+        detail = f"{pattern} [{path}]".strip()
+        return f"Grep {detail}".strip()
+    if tool_name == "Glob":
+        pattern = str(tool_input.get("pattern", ""))
+        return f"Glob {pattern}".strip()
+    if tool_name == "TodoWrite":
+        todos = tool_input.get("todos", [])
+        if isinstance(todos, list):
+            return f"TodoWrite {len(todos)} todos"
+        return "TodoWrite"
+    return tool_name
+
+
+def _append_timeline_step(steps: list[dict], message_text: str | None, summary: str | None = None) -> dict:
+    """Append a timeline step and return it."""
+    step_index = len(steps) + 1
+    step: dict = {
+        "step_id": f"S{step_index}",
+        "message_text": (message_text or "").strip() or None,
+        "summary": summary,
+        "substeps": [],
+    }
+    steps.append(step)
+    return step
+
+
+def _append_substep(step: dict, detail: str) -> None:
+    """Append a substep line to a timeline step."""
+    detail = detail.strip()
+    if not detail:
+        return
+    substeps = step["substeps"]
+    substeps.append(
+        {
+            "substep_id": f"{step['step_id']}.{len(substeps) + 1}",
+            "detail": detail,
+        }
+    )
+
+
+def _ensure_current_step(steps: list[dict], current_step: dict | None) -> dict:
+    """Ensure a current step exists for pre-message tool activity."""
+    if current_step is not None:
+        return current_step
+    return _append_timeline_step(steps, None, summary="Pre-message tool activity")
+
+
+def _message_content_items(entry: dict) -> list[dict]:
+    """Normalize assistant/user message content into a list of content items."""
+    message = entry.get("message", {})
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content", [])
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, dict):
+        return [content]
+    if isinstance(content, list):
+        return [item for item in content if isinstance(item, dict)]
+    return []
+
+
+def _build_step_timeline(entries: list[dict]) -> list[dict]:
+    """Build step-first timeline model from mixed historical log entry shapes."""
+    steps: list[dict] = []
+    current_step: dict | None = None
+
+    for entry in entries:
+        entry_type = entry.get("type")
+
+        if entry_type == "assistant":
+            content_items = _message_content_items(entry)
+            text_chunks: list[str] = []
+            tool_items: list[dict] = []
+            for item in content_items:
+                item_type = item.get("type")
+                if item_type == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        text_chunks.append(text.strip())
+                elif item_type == "tool_use":
+                    tool_items.append(item)
+
+            if text_chunks:
+                current_step = _append_timeline_step(steps, "\n".join(text_chunks))
+            elif tool_items:
+                current_step = _ensure_current_step(steps, current_step)
+
+            for item in tool_items:
+                if current_step is None:
+                    current_step = _ensure_current_step(steps, current_step)
+                tool_name = str(item.get("name", "unknown"))
+                tool_input = item.get("input", {})
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                _append_substep(current_step, f"tool_call {_summarize_tool_detail(tool_name, tool_input)}")
+
+        elif entry_type == "user":
+            content_items = _message_content_items(entry)
+            for item in content_items:
+                if item.get("type") != "tool_result":
+                    continue
+                current_step = _ensure_current_step(steps, current_step)
+                is_error = bool(item.get("is_error", False))
+                result_type = "tool_error" if is_error else "tool_output"
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    detail = truncate(content.replace("\\n", "\n"), 120)
+                else:
+                    detail = truncate(json.dumps(content, ensure_ascii=True), 120)
+                _append_substep(current_step, f"{result_type} {detail}".strip())
+
+        elif entry_type == "message":
+            role = entry.get("role")
+            if role == "user":
+                current_step = None
+                continue
+            if role == "assistant":
+                content = entry.get("content", "")
+                if isinstance(content, str) and content.strip() and not entry.get("delta"):
+                    current_step = _append_timeline_step(steps, content.strip())
+
+        elif entry_type == "tool_use":
+            current_step = _ensure_current_step(steps, current_step)
+            tool_name = str(entry.get("tool_name", "unknown"))
+            tool_input = entry.get("tool_input", {})
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            _append_substep(current_step, f"tool_call {_summarize_tool_detail(tool_name, tool_input)}")
+
+        elif entry_type in {"tool_output", "tool_error", "tool_retry"}:
+            current_step = _ensure_current_step(steps, current_step)
+            payload = {
+                key: value
+                for key, value in entry.items()
+                if key not in {"type", "id", "call_id"}
+            }
+            detail = truncate(json.dumps(payload, ensure_ascii=True), 120)
+            _append_substep(current_step, f"{entry_type} {detail}".strip())
+
+        elif entry_type == "turn.started":
+            current_step = None
+
+        elif entry_type == "gza":
+            subtype = entry.get("subtype", "")
+            if subtype in ("branch", "stats", "outcome"):
+                pass  # metadata only — skip timeline
+            else:
+                message = entry.get("message", "")
+                if message:
+                    label = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
+                    current_step = _append_timeline_step(steps, label)
+
+        elif entry_type == "item.completed":
+            item = entry.get("item", {})
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    current_step = _append_timeline_step(steps, text.strip())
+            elif item_type == "command_execution":
+                current_step = _ensure_current_step(steps, current_step)
+                command = truncate(str(item.get("command", "")), 100)
+                _append_substep(current_step, f"tool_call Bash {command}".strip())
+                if "aggregated_output" in item or "exit_code" in item:
+                    exit_code = item.get("exit_code")
+                    is_error = isinstance(exit_code, int) and exit_code != 0
+                    substep_type = "tool_error" if is_error else "tool_output"
+                    output = str(item.get("aggregated_output", ""))
+                    _append_substep(
+                        current_step,
+                        f"{substep_type} {truncate(output, 120)}".strip(),
+                    )
+
+    return steps
+
+
+def _display_step_timeline(entries: list[dict], *, verbose: bool) -> None:
+    """Render a step-first timeline in compact or verbose mode."""
+    steps = _build_step_timeline(entries)
+    if not steps:
+        console.print("No step entries found.", soft_wrap=True)
+        return
+
+    for step in steps:
+        title = f"[cyan]\\[Step {step['step_id']}][/cyan]"
+        message_text = step.get("message_text")
+        summary = step.get("summary")
+        if message_text:
+            console.print(f"{title} {rich_escape(message_text)}", soft_wrap=True)
+        elif summary:
+            console.print(f"{title} {rich_escape(summary)}", soft_wrap=True)
+        else:
+            console.print(title, soft_wrap=True)
+        if verbose:
+            for substep in step["substeps"]:
+                console.print(f"  [green]\\[{substep['substep_id']}][/green] {rich_escape(substep['detail'])}", soft_wrap=True)
+
+
+class _LiveLogPrinter:
+    """Stateful printer that renders log entries using the same style as ``gza work``.
+
+    Tracks step boundaries so it can emit step headers with token/cost/runtime
+    info, while also showing tool results (which ``gza work`` omits).
+    """
+
+    def __init__(self, *, live: bool = True) -> None:
+        from ..providers.output_formatter import StreamOutputFormatter, truncate_text as _trunc
+        self._fmt = StreamOutputFormatter(console=console)
+        self._trunc = _trunc
+        self._live = live
+        self._seen_msg_ids: set[str] = set()
+        self._step_count = 0
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._start_time: float | None = None
+
+    def process(self, entry: dict) -> None:
+        """Process a single JSON log entry and print it."""
+        entry_type = entry.get("type")
+
+        if entry_type == "system":
+            subtype = entry.get("subtype", "")
+            if subtype == "init":
+                model = entry.get("model", "unknown")
+                self._fmt.print_agent_message(f"Session initialized (model: {model})")
+
+        elif entry_type == "assistant":
+            message = entry.get("message", {})
+            msg_id = message.get("id")
+
+            if self._start_time is None:
+                self._start_time = time.time()
+
+            # New step on new message ID
+            if msg_id and msg_id not in self._seen_msg_ids:
+                self._seen_msg_ids.add(msg_id)
+                self._step_count += 1
+
+                if self._step_count > 1:
+                    console.print()
+
+                if self._live:
+                    usage = message.get("usage", {})
+                    self._total_input_tokens += usage.get("input_tokens", 0)
+                    self._total_input_tokens += usage.get("cache_creation_input_tokens", 0)
+                    self._total_input_tokens += usage.get("cache_read_input_tokens", 0)
+                    self._total_output_tokens += usage.get("output_tokens", 0)
+
+                    total_tokens = self._total_input_tokens + self._total_output_tokens
+                    elapsed = int(time.time() - self._start_time)
+
+                    self._fmt.print_step_header(
+                        self._step_count, total_tokens, 0.0, elapsed,
+                        blank_line_before=False,
+                    )
+                else:
+                    console.print(
+                        f"| Step {self._step_count} |",
+                        style="blue",
+                    )
+
+            raw_content = message.get("content", [])
+            if isinstance(raw_content, str):
+                # Simple string content (e.g. "Working...")
+                if raw_content.strip():
+                    self._fmt.print_agent_message(raw_content.strip())
+            elif isinstance(raw_content, list):
+                for content in raw_content:
+                    if not isinstance(content, dict):
+                        continue
+                    if content.get("type") == "tool_use":
+                        self._print_tool_use(content)
+                    elif content.get("type") == "text":
+                        text = content.get("text", "").strip()
+                        if text:
+                            self._fmt.print_agent_message(text)
+
+        elif entry_type == "user":
+            # Tool results
+            content_items = _message_content_items(entry)
+            for item in content_items:
+                if item.get("type") == "tool_result":
+                    result = item.get("content", "")
+                    is_error = item.get("is_error", False)
+                    if isinstance(result, str):
+                        result = result.replace("\\n", "\n").replace("\\t", "\t")
+                        if len(result) > 200:
+                            result = result[:200] + "..."
+                        if is_error:
+                            self._fmt.print_error(result)
+                        else:
+                            console.print(f"  {rich_escape(result)}", style="dim", soft_wrap=True)
+
+        elif entry_type == "gza":
+            subtype = entry.get("subtype", "")
+            message = entry.get("message", "")
+            if message:
+                if subtype:
+                    console.print(f"[cyan]\\[gza:{rich_escape(subtype)}][/cyan] {rich_escape(message)}", soft_wrap=True)
+                else:
+                    console.print(f"[cyan]\\[gza][/cyan] {rich_escape(message)}", soft_wrap=True)
+
+        elif entry_type == "result":
+            is_error = entry.get("is_error", False)
+            subtype = str(entry.get("subtype") or "")
+            result_text = entry.get("result", "")
+            if is_error:
+                self._fmt.print_error(f"[result] ERROR: {result_text}")
+            elif subtype and subtype != "success":
+                if isinstance(result_text, str) and result_text.strip():
+                    console.print(f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text.strip())}", soft_wrap=True)
+                else:
+                    console.print(f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]", soft_wrap=True)
+            else:
+                # Success result
+                if isinstance(result_text, str) and result_text.strip():
+                    console.print(f"[green]\\[result][/green] {rich_escape(result_text.strip())}", soft_wrap=True)
+
+    def _print_tool_use(self, content: dict) -> None:
+        tool_name = content.get("name", "unknown")
+        tool_input = content.get("input", {})
+
+        if tool_name == "Bash":
+            cmd = tool_input.get("command", "")
+            self._fmt.print_tool_event(tool_name, self._trunc(cmd, 80))
+        elif tool_name == "Edit":
+            parts = [tool_name]
+            file_path = tool_input.get("file_path", "")
+            if file_path:
+                parts.append(file_path)
+            old_string = tool_input.get("old_string", "")
+            new_string = tool_input.get("new_string", "")
+            old_lines = old_string.count("\n") + (1 if old_string else 0)
+            new_lines = new_string.count("\n") + (1 if new_string else 0)
+            if old_lines > 0 or new_lines > 0:
+                added = max(0, new_lines - old_lines)
+                removed = max(0, old_lines - new_lines)
+                if added > 0 and removed > 0:
+                    parts.append(f"(+{added}/-{removed} lines)")
+                elif added > 0:
+                    parts.append(f"(+{added} lines)")
+                elif removed > 0:
+                    parts.append(f"(-{removed} lines)")
+            if tool_input.get("replace_all"):
+                parts.append("[replace_all]")
+            self._fmt.print_tool_event(" ".join(parts))
+        elif tool_name == "Glob":
+            self._fmt.print_tool_event(tool_name, tool_input.get("pattern", ""))
+        elif tool_name == "Grep":
+            pattern = tool_input.get("pattern", "")
+            path = tool_input.get("path", "")
+            detail = pattern
+            if path:
+                detail += f" [{path}]"
+            self._fmt.print_tool_event(tool_name, detail)
+        elif tool_name == "TodoWrite":
+            todos = tool_input.get("todos", [])
+            self._fmt.print_tool_event(tool_name, f"{len(todos)} todos")
+            for todo in todos:
+                status = todo.get("status", "pending")
+                todo_content = todo.get("content", "")
+                self._fmt.print_todo(status, self._trunc(todo_content, 60))
+        else:
+            file_path = tool_input.get("file_path") or tool_input.get("path")
+            if file_path:
+                self._fmt.print_tool_event(tool_name, file_path)
+            else:
+                self._fmt.print_tool_event(tool_name)
+
+
+def _format_log_entry(entry: dict) -> str | None:
+    """Format a single JSON log entry for display.
+
+    Returns formatted string or None to skip the entry.
+    """
+    entry_type = entry.get("type")
+
+    if entry_type == "system":
+        subtype = entry.get("subtype", "")
+        if subtype == "init":
+            model = rich_escape(str(entry.get("model", "unknown")))
+            return f"[cyan]\\[system][/cyan] Session initialized (model: {model})"
+        return None  # Skip other system messages
+
+    elif entry_type == "user":
+        # User messages contain tool results
+        content = _message_content_items(entry)
+        parts = []
+        for item in content:
+            if item.get("type") == "tool_result":
+                result = item.get("content", "")
+                if isinstance(result, str):
+                    # Unescape literal \n from double-escaped JSON (Claude Code logging artifact)
+                    result = result.replace("\\n", "\n").replace("\\t", "\t")
+                    if len(result) > 200:
+                        result = result[:200] + "..."
+                parts.append(rich_escape(str(result)))
+        if parts:
+            return "\n".join(parts)
+        return None
+
+    elif entry_type == "assistant":
+        content = _message_content_items(entry)
+        parts = []
+        for item in content:
+            if item.get("type") == "text":
+                text = item.get("text", "")
+                parts.append(rich_escape(text))
+            elif item.get("type") == "tool_use":
+                name = rich_escape(item.get("name", "unknown"))
+                tool_input = item.get("input", {})
+                # Show condensed tool use info
+                if item.get("name") == "Bash":
+                    cmd = tool_input.get("command", "")
+                    if len(cmd) > 100:
+                        cmd = cmd[:100] + "..."
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(cmd)}")
+                elif item.get("name") == "Read":
+                    path = tool_input.get("file_path", "")
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(path)}")
+                elif item.get("name") == "Edit":
+                    path = tool_input.get("file_path", "")
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(path)}")
+                elif item.get("name") == "Write":
+                    path = tool_input.get("file_path", "")
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(path)}")
+                elif item.get("name") == "Grep":
+                    pattern = tool_input.get("pattern", "")
+                    path = tool_input.get("path", "")
+                    glob = tool_input.get("glob", "")
+                    type_filter = tool_input.get("type", "")
+
+                    # Format: pattern [path] (filter)
+                    detail = rich_escape(pattern)
+                    if path:
+                        detail += f" \\[{rich_escape(path)}]"
+                    if glob:
+                        detail += f" (glob: {rich_escape(glob)})"
+                    elif type_filter:
+                        detail += f" (type: {rich_escape(type_filter)})"
+                    parts.append(f"[green]\\[tool: {name}][/green] {detail}")
+                elif item.get("name") == "Glob":
+                    pattern = tool_input.get("pattern", "")
+                    parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(pattern)}")
+                elif item.get("name") == "TodoWrite":
+                    todos = tool_input.get("todos", [])
+                    in_progress = [t for t in todos if t.get("status") == "in_progress"]
+                    if in_progress:
+                        parts.append(f"[green]\\[tool: {name}][/green] {rich_escape(in_progress[0].get('activeForm', ''))}")
+                    else:
+                        parts.append(f"[green]\\[tool: {name}][/green]")
+                else:
+                    parts.append(f"[green]\\[tool: {name}][/green]")
+        if parts:
+            return "\n".join(parts)
+        return None
+
+    elif entry_type == "result":
+        result = entry.get("result", "")
+        is_error = entry.get("is_error", False)
+        subtype = str(entry.get("subtype") or "")
+        if is_error:
+            return f"[red]\\[result] ERROR:[/red] {rich_escape(str(result))}"
+        if subtype and subtype != "success":
+            if isinstance(result, str) and result.strip():
+                return f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result.strip())}"
+            return f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]"
+        # For success, show summary if available
+        duration = entry.get("duration_ms", 0)
+        num_steps = _result_step_count(entry) or 0
+        cost = entry.get("total_cost_usd", 0)
+        summary = f"[green]\\[result][/green] Completed in {num_steps} steps, {duration/1000:.1f}s, ${cost:.4f}"
+        if isinstance(result, str) and result.strip():
+            return f"{summary}\n{rich_escape(result.strip())}"
+        return summary
+
+    elif entry_type == "gza":
+        subtype = entry.get("subtype", "")
+        message = entry.get("message", "")
+        if not message:
+            return None
+        if subtype:
+            return f"[cyan]\\[gza:{rich_escape(subtype)}][/cyan] {rich_escape(message)}"
+        return f"[cyan]\\[gza][/cyan] {rich_escape(message)}"
+
+    return None
+
+
+def _task_run_sort_key(task: DbTask) -> tuple[datetime, int]:
+    """Sort key for selecting latest task run attempt deterministically."""
+    timestamp = task.started_at or task.completed_at or task.created_at or datetime.min.replace(tzinfo=timezone.utc)
+    return (timestamp, task.id or -1)
+
+
+def _task_has_run_artifacts(task: DbTask) -> bool:
+    """Return True if task appears to have executed at least once."""
+    return (
+        task.status in {"in_progress", "completed", "failed", "unmerged"}
+        or task.log_file is not None
+        or task.started_at is not None
+        or task.completed_at is not None
+    )
+
+
+def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tuple[DbTask, list[DbTask]]:
+    """Resolve latest same-type retry/resume attempt for a task.
+
+    Rule: stay within the queried task's same-type retry/resume lineage.
+    Include same-type ancestors of the queried task, plus same-type descendants
+    branching from the queried task itself. Exclude sibling/parallel branches
+    that only share an older ancestor with the queried task.
+
+    Choose the newest task with run artifacts. If none have artifacts, choose
+    newest task by timestamp/id.
+    """
+    if task.id is None:
+        return task, [task]
+    assert task.id is not None
+
+    all_tasks = store.get_all()
+    by_parent: dict[int, list[DbTask]] = {}
+    for candidate in all_tasks:
+        if candidate.based_on is None:
+            continue
+        by_parent.setdefault(candidate.based_on, []).append(candidate)
+
+    by_id: dict[int, DbTask] = {t.id: t for t in all_tasks if t.id is not None}
+
+    # Collect same-type ancestors up from queried task (retry/resume chain backtracking).
+    related: list[DbTask] = []
+    ancestor_seen: set[int] = set()
+    current = task
+    while current.id is not None and current.id not in ancestor_seen:
+        ancestor_seen.add(current.id)
+        if current.task_type == task.task_type:
+            related.append(current)
+        if current.based_on is None:
+            break
+        parent = by_id.get(current.based_on)
+        if parent is None or parent.task_type != task.task_type:
+            break
+        current = parent
+
+    # Collect same-type descendants only from the queried task forward.
+    queue = [task.id]
+    seen: set[int] = set()
+    while queue:
+        parent_id = queue.pop(0)
+        if parent_id in seen:
+            continue
+        seen.add(parent_id)
+        for child in by_parent.get(parent_id, []):
+            if child.id is None or child.task_type != task.task_type:
+                continue
+            related.append(child)
+            queue.append(child.id)
+
+    # Deduplicate while preserving traversal order.
+    deduped_related: list[DbTask] = []
+    related_seen: set[int] = set()
+    for candidate in related:
+        if candidate.id is None:
+            continue
+        if candidate.id in related_seen:
+            continue
+        related_seen.add(candidate.id)
+        deduped_related.append(candidate)
+
+    # Preserve queried task in candidate set for edge-cases.
+    if task.id not in related_seen:
+        deduped_related.append(task)
+
+    related_sorted = sorted(deduped_related, key=_task_run_sort_key, reverse=True)
+    for candidate in related_sorted:
+        if _task_has_run_artifacts(candidate):
+            return candidate, related_sorted
+    return related_sorted[0], related_sorted
+
+
+def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
+    """Build ordered candidate log paths for a task."""
+    candidates: list[Path] = []
+
+    if task.log_file:
+        path = Path(task.log_file)
+        if not path.is_absolute():
+            path = config.project_dir / path
+        candidates.append(path)
+
+    if task.task_id:
+        inferred = config.log_path / f"{task.task_id}.log"
+        candidates.append(inferred)
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMetadata | None:
+    """Return most recent worker metadata for a task."""
+    workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
+    if not workers:
+        return None
+    workers.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
+    return workers[-1]
+
+
+def _running_worker_id_for_task(registry: WorkerRegistry, task_id: int) -> str | None:
+    """Return a running worker ID for a task when available."""
+    workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
+    running = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
+    if not running:
+        return None
+    running.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
+    return running[-1].worker_id
+
+
+def _load_log_file_entries(log_path: Path) -> tuple[dict | None, list[dict], str]:
+    """Load log file as old JSON object or JSONL entries."""
+    with open(log_path) as f:
+        content = f.read().strip()
+
+    log_data = None
+    entries: list[dict] = []
+
+    if not content:
+        return None, [], content
+
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            log_data = parsed
+            if parsed.get("type"):
+                entries.append(parsed)
+            return log_data, entries, content
+    except json.JSONDecodeError:
+        pass
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            if not isinstance(entry, dict):
+                continue
+            entries.append(entry)
+            if entry.get("type") == "result":
+                log_data = entry
+        except json.JSONDecodeError:
+            continue
+
+    return log_data, entries, content
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    """Display the log for a task or worker."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    registry = WorkerRegistry(config.workers_path)
+
+    query = args.identifier
+    task = None
+    requested_task = None
+    resolution_note = None
+    worker = None
+    log_path = None
+    is_running = False
+    worker_id_for_follow: str | None = None
+
+    if args.worker:
+        # Look up by worker ID
+        worker = registry.get(query)
+        if not worker:
+            print(f"Error: Worker '{query}' not found")
+            return 1
+        is_running = registry.is_running(query)
+        if worker.task_id:
+            task = store.get(worker.task_id)
+        if task and task.log_file:
+            log_path = config.project_dir / task.log_file
+        elif task and task.task_id:
+            log_path = config.log_path / f"{task.task_id}.log"
+        worker_id_for_follow = worker.worker_id
+
+    elif args.slug:
+        # Look up by slug (exact or partial match)
+        requested_task = store.get_by_task_id(query)
+        if not requested_task:
+            # Try partial match
+            all_tasks = store.get_all()
+            for t in all_tasks:
+                if t.task_id and query in t.task_id:
+                    requested_task = t
+                    break
+        if not requested_task:
+            print(f"Error: No task found matching slug '{query}'")
+            return 1
+
+        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
+        if requested_task.id != task.id and task.id is not None:
+            resolution_note = (
+                f"Resolved to latest run attempt: task #{task.id} "
+                "(latest same-type retry/resume in based_on chain)"
+            )
+
+        candidate_paths: list[Path] = []
+        candidate_paths.extend(_task_log_candidates(config, task))
+        for attempt in attempts:
+            if attempt.id == task.id:
+                continue
+            candidate_paths.extend(_task_log_candidates(config, attempt))
+
+        for candidate in candidate_paths:
+            if candidate.exists():
+                log_path = candidate
+                break
+        if log_path is None and candidate_paths:
+            log_path = candidate_paths[0]
+
+        if task.id is not None:
+            worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
+            is_running = worker_id_for_follow is not None
+
+    else:
+        # Default: look up by numeric task ID
+        try:
+            task_id = int(query)
+            requested_task = store.get(task_id)
+        except ValueError:
+            print(f"Error: '{query}' is not a valid task ID (must be numeric)")
+            return 1
+        if not requested_task:
+            print(f"Error: Task {query} not found")
+            return 1
+
+        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
+        if requested_task.id != task.id and task.id is not None:
+            resolution_note = (
+                f"Resolved to latest run attempt: task #{task.id} "
+                "(latest same-type retry/resume in based_on chain)"
+            )
+
+        slug_candidate_paths: list[Path] = []
+        slug_candidate_paths.extend(_task_log_candidates(config, task))
+        for attempt in attempts:
+            if attempt.id == task.id:
+                continue
+            slug_candidate_paths.extend(_task_log_candidates(config, attempt))
+
+        for candidate in slug_candidate_paths:
+            if candidate.exists():
+                log_path = candidate
+                break
+        if log_path is None and slug_candidate_paths:
+            log_path = slug_candidate_paths[0]
+
+        if task.id is not None:
+            worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
+            is_running = worker_id_for_follow is not None
+
+    if not log_path:
+        print(f"Error: No log file found")
+        return 1
+
+    if not log_path.exists():
+        if is_running:
+            print(f"Log file not yet created: {log_path}")
+            print("Worker is still starting up...")
+        else:
+            print(f"Error: Log file not found at {log_path}")
+        return 1
+
+    # Determine mode: follow (live tail) vs static display
+    follow = hasattr(args, 'follow') and args.follow
+    if follow and not is_running:
+        follow = False  # Can't follow a completed task
+
+    # Check for raw mode
+    raw_mode = hasattr(args, 'raw') and args.raw
+
+    if follow or raw_mode:
+        # Live streaming mode - use the formatted streaming output
+        return _tail_log_file(
+            log_path,
+            args,
+            registry,
+            worker_id_for_follow if is_running else None,
+            task.id if task else None,
+            store if task else None,
+        )
+
+    # Static display mode - show summary or full turns
+    try:
+        log_data, entries, content = _load_log_file_entries(log_path)
+
+        if log_data is None and not entries:
+            # If we have content but couldn't parse any JSON, it's likely a startup error
+            if content:
+                console.print("[red]Task failed during startup (no Claude session):[/red]", soft_wrap=True)
+                # Display the raw error message, indented for clarity
+                for line in content.split('\n'):
+                    console.print(f"  {rich_escape(line)}", soft_wrap=True)
+                return 1
+            else:
+                console.print("Error: No log entries found in log file", soft_wrap=True)
+                return 1
+    except Exception as e:
+        print(f"Error: Failed to read log file: {e}")
+        return 1
+
+    # Display header
+    _sep = "[cyan]" + "━" * 70 + "[/cyan]"
+    console.print(_sep, soft_wrap=True)
+    if task:
+        prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
+        console.print(f"[#ff99cc]Task: {rich_escape(prompt_display)}[/#ff99cc]", soft_wrap=True)
+        console.print(f"[cyan]ID:[/cyan] {task.id} | [cyan]Slug:[/cyan] {rich_escape(task.task_id or '')}", soft_wrap=True)
+        _status_color = {"completed": "green", "unmerged": "green", "failed": "red", "dropped": "red", "in_progress": "yellow"}.get(task.status, "")
+        _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
+        console.print(f"[cyan]Status:[/cyan] {_status_val}", soft_wrap=True)
+        if resolution_note:
+            console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
+        console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+        if task.branch:
+            console.print(f"[cyan]Branch:[/cyan] {rich_escape(task.branch)}", soft_wrap=True)
+    elif worker:
+        console.print(f"[cyan]Worker:[/cyan] {rich_escape(worker.worker_id)}", soft_wrap=True)
+        _w_status = "running" if is_running else "completed"
+        _w_color = "yellow" if is_running else "green"
+        console.print(f"[cyan]Status:[/cyan] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
+        console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+    console.print(_sep, soft_wrap=True)
+    console.print()
+
+    timeline_mode = getattr(args, "timeline_mode", None)
+    if timeline_mode and entries:
+        _display_step_timeline(entries, verbose=timeline_mode == "verbose")
+    elif entries:
+        printer = _LiveLogPrinter(live=False)
+        any_printed = False
+        for entry in entries:
+            printer.process(entry)
+            any_printed = True
+        if not any_printed and log_data:
+            if "result" in log_data:
+                console.print(rich_escape(log_data["result"]), soft_wrap=True)
+            else:
+                subtype = log_data.get("subtype", "unknown")
+                console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
+                if log_data.get("errors"):
+                    console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
+        else:
+            console.print("No displayable log entries found.", soft_wrap=True)
+    elif log_data:
+        # Extract and display the result field (which contains markdown)
+        if "result" in log_data:
+            console.print(rich_escape(log_data["result"]), soft_wrap=True)
+        else:
+            # No result - show the subtype (e.g., error_max_turns)
+            subtype = log_data.get("subtype", "unknown")
+            console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
+            if log_data.get("errors"):
+                console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
+    else:
+        # No result entry yet - show compact step timeline
+        _display_step_timeline(entries, verbose=False)
+
+    console.print()
+    console.print(_sep, soft_wrap=True)
+
+    # Display summary stats if available
+    if log_data:
+        if "duration_ms" in log_data:
+            duration_sec = log_data["duration_ms"] / 1000
+            console.print(f"[cyan]Duration:[/cyan] {format_duration(duration_sec, verbose=True)}", soft_wrap=True)
+        step_count = _result_step_count(log_data)
+        if step_count is not None:
+            console.print(f"[cyan]Steps:[/cyan] {step_count}", soft_wrap=True)
+            if "num_steps" not in log_data and "num_steps_reported" not in log_data and "num_turns" in log_data:
+                console.print(f"[cyan]Legacy turns:[/cyan] {log_data['num_turns']}", soft_wrap=True)
+        if "total_cost_usd" in log_data:
+            console.print(f"[cyan]Cost:[/cyan] ${log_data['total_cost_usd']:.4f}", soft_wrap=True)
+
+    return 0
+
+
+def _tail_log_file(
+    log_path: Path,
+    args: argparse.Namespace,
+    registry: WorkerRegistry,
+    worker_id: str | None,
+    task_id: int | None = None,
+    store: SqliteTaskStore | None = None,
+) -> int:
+    """Tail a log file with optional follow mode."""
+    raw_mode = hasattr(args, 'raw') and args.raw
+    follow = hasattr(args, 'follow') and args.follow
+
+    if raw_mode:
+        # Use tail directly for raw JSON output
+        try:
+            cmd = ["tail"]
+            if hasattr(args, 'tail') and args.tail:
+                cmd.extend(["-n", str(args.tail)])
+            if follow:
+                cmd.append("-f")
+            cmd.append(str(log_path))
+            subprocess.run(cmd)
+            return 0
+        except KeyboardInterrupt:
+            return 0
+        except Exception as e:
+            print(f"Error tailing log: {e}")
+            return 1
+
+    # Formatted output mode
+    try:
+        tail_lines = args.tail if hasattr(args, 'tail') and args.tail else None
+        printer = _LiveLogPrinter()
+
+        def _process_lines(raw_lines: list[str]) -> None:
+            """Parse JSON lines and feed them to the live printer."""
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("---"):
+                    # Skip step timestamp markers written by the runner
+                    continue
+                try:
+                    entry = json.loads(line)
+                    printer.process(entry)
+                except json.JSONDecodeError:
+                    console.print(rich_escape(line), soft_wrap=True)
+
+        # Initial read
+        with open(log_path, 'r') as f:
+            lines = f.readlines()
+        if tail_lines:
+            lines = lines[-tail_lines:]
+        _process_lines(lines)
+
+        if not follow:
+            return 0
+
+        # Follow mode - watch for new lines
+        last_size = log_path.stat().st_size
+        with open(log_path) as f:
+            last_line_count = sum(1 for _ in f)
+
+        while True:
+            time.sleep(0.5)
+
+            current_size = log_path.stat().st_size
+            if current_size > last_size:
+                with open(log_path, 'r') as f:
+                    lines = f.readlines()
+
+                new_lines = lines[last_line_count:]
+                last_line_count = len(lines)
+                last_size = current_size
+                _process_lines(new_lines)
+
+            # Check if worker is still running
+            if worker_id and not registry.is_running(worker_id):
+                time.sleep(0.5)
+                with open(log_path, 'r') as f:
+                    lines = f.readlines()
+                _process_lines(lines[last_line_count:])
+                break
+
+            # Fallback for task-based follow without a running worker ID.
+            if task_id is not None and store is not None and worker_id is None:
+                latest_task = store.get(task_id)
+                if latest_task is None or latest_task.status != "in_progress":
+                    time.sleep(0.5)
+                    with open(log_path, 'r') as f:
+                        lines = f.readlines()
+                    _process_lines(lines[last_line_count:])
+                    break
+
+        return 0
+
+    except KeyboardInterrupt:
+        return 0
+    except Exception as e:
+        print(f"Error tailing log: {e}")
+        return 1
+
+
+def _display_conversation_turns(entries: list[dict]) -> None:
+    """Deprecated compatibility wrapper for legacy call sites."""
+    _display_step_timeline(entries, verbose=True)
