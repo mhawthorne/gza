@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -124,3 +125,87 @@ def test_regenerate_learnings_writes_history_log(tmp_path: Path):
     assert "retained_count" in record
     assert "churn_percent" in record
     assert record["learnings_file"] == ".gza/learnings.md"
+
+
+def test_llm_path_calls_runner_and_parses_output(tmp_path: Path):
+    """LLM summarization should call runner.run and parse bullet points from output."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Implement auth flow", task_type="implement")
+    store.mark_completed(task, output_content="# Summary\n- Use JWT tokens\n", has_commits=False)
+
+    def mock_run(cfg, task_id=None, **kwargs):
+        learn_task = store.get(task_id)
+        assert learn_task is not None
+        learn_task.status = "completed"
+        learn_task.output_content = "- Use pytest fixtures\n- Always run type checks\n"
+        store.update(learn_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=mock_run):
+        result = regenerate_learnings(store, config, window=10)
+
+    assert result.tasks_used == 1
+    content = result.path.read_text()
+    assert "Use pytest fixtures" in content
+    assert "Always run type checks" in content
+
+
+def test_llm_path_fallback_on_runner_failure(tmp_path: Path):
+    """If runner.run returns non-zero, fall back to regex extraction."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task one", task_type="implement")
+    store.mark_completed(task, output_content="- Regex pattern found\n", has_commits=False)
+
+    with patch("gza.runner.run", return_value=1):
+        result = regenerate_learnings(store, config, window=10)
+
+    assert result.tasks_used == 1
+    content = result.path.read_text()
+    assert "Regex pattern found" in content
+
+
+def test_llm_path_fallback_on_runner_exception(tmp_path: Path):
+    """If runner.run raises an exception, fall back to regex extraction."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task one", task_type="implement")
+    store.mark_completed(task, output_content="- Regex pattern found\n", has_commits=False)
+
+    with patch("gza.runner.run", side_effect=RuntimeError("provider failure")):
+        result = regenerate_learnings(store, config, window=10)
+
+    assert result.tasks_used == 1
+    content = result.path.read_text()
+    assert "Regex pattern found" in content
+
+
+def test_learn_task_has_skip_learnings_flag(tmp_path: Path):
+    """The learn task created during summarization must have skip_learnings=True."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    task = store.add("Task", task_type="implement")
+    store.mark_completed(task, output_content="- Some pattern\n", has_commits=False)
+
+    created_learn_tasks: list = []
+
+    def mock_run(cfg, task_id=None, **kwargs):
+        learn_task = store.get(task_id)
+        assert learn_task is not None
+        created_learn_tasks.append(learn_task)
+        learn_task.status = "completed"
+        learn_task.output_content = "- LLM learning\n"
+        store.update(learn_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=mock_run):
+        regenerate_learnings(store, config, window=10)
+
+    assert len(created_learn_tasks) == 1
+    assert created_learn_tasks[0].task_type == "learn"
+    assert created_learn_tasks[0].skip_learnings is True

@@ -1202,8 +1202,8 @@ def _run_inner(
     open_after: bool = False,
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
-    # For explore, plan, and review tasks, run in project dir without creating a branch
-    if task.task_type in ("explore", "plan", "review"):
+    # For explore, plan, review, and learn tasks, run in project dir without creating a branch
+    if task.task_type in ("explore", "plan", "review", "learn"):
         return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
 
     # Code tasks (implement/improve) require git

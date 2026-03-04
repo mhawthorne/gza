@@ -118,6 +118,74 @@ def _extract_existing_file_learnings(path: Path) -> list[str]:
     return _dedupe(items)
 
 
+def _build_summarization_prompt(tasks: list[Task]) -> str:
+    """Build LLM prompt for consolidating learnings from recent task outputs."""
+    task_sections = []
+    for task in tasks:
+        output = task.output_content or ""
+        if len(output) > 1500:
+            output = output[:1500] + "\n... [truncated]"
+        task_sections.append(
+            f"### Task #{task.id} ({task.task_type})\n"
+            f"**Prompt**: {task.prompt}\n\n"
+            f"**Output**:\n{output}"
+        )
+    tasks_text = "\n\n---\n\n".join(task_sections)
+    return (
+        "Analyze these completed tasks and extract 5-15 key learnings that would be useful for future tasks.\n\n"
+        f"{tasks_text}\n\n"
+        "Focus on:\n"
+        "- Reusable patterns (testing, code style, architecture)\n"
+        "- Project-specific conventions (directory structure, naming)\n"
+        "- Common mistakes to avoid\n"
+        "- Tool usage tips (CLI commands, workflows)\n\n"
+        "Output format: One learning per line, starting with \"- \"\n"
+        "Be concise (max 20 words per learning).\n"
+        "Only include learnings that generalize beyond these specific tasks.\n"
+        "Do not include task-specific details that won't apply to future work.\n"
+    )
+
+
+def _run_learnings_task(
+    store: SqliteTaskStore,
+    config: "Config",
+    recent_tasks: list[Task],
+) -> list[str] | None:
+    """Run an LLM 'learn' task to consolidate learnings from recent task outputs.
+
+    Creates a learn task in DB with skip_learnings=True, runs it via the standard
+    runner, then parses bullet points from output_content.
+    Returns None if the task fails or produces no output.
+    """
+    from .runner import run  # deferred to avoid circular import
+
+    prompt = _build_summarization_prompt(recent_tasks)
+    learn_task = store.add(
+        prompt=prompt,
+        task_type="learn",
+        skip_learnings=True,
+    )
+
+    learn_task_id = learn_task.id
+    if learn_task_id is None:
+        return None
+
+    try:
+        exit_code = run(config, task_id=learn_task_id)
+    except Exception:
+        return None
+
+    refreshed = store.get(learn_task_id)
+    if exit_code != 0 or refreshed is None or refreshed.status != "completed":
+        return None
+
+    if not refreshed.output_content:
+        return None
+
+    learnings = _extract_learnings_from_output(refreshed.output_content)
+    return learnings if learnings else None
+
+
 def _append_history_entry(config: "Config", entry: dict) -> None:
     """Append a JSONL history record for learnings regeneration.
 
@@ -146,11 +214,16 @@ def regenerate_learnings(
     learnings_path = config.project_dir / ".gza" / "learnings.md"
     previous_learnings = _extract_existing_file_learnings(learnings_path)
 
-    for task in recent_tasks:
-        if task.output_content:
-            raw_learnings.extend(_extract_learnings_from_output(task.output_content))
-        if not task.output_content:
-            raw_learnings.append(_fallback_learning(task))
+    if recent_tasks:
+        llm_learnings = _run_learnings_task(store, config, recent_tasks)
+        if llm_learnings is not None:
+            raw_learnings = llm_learnings
+        else:
+            for task in recent_tasks:
+                if task.output_content:
+                    raw_learnings.extend(_extract_learnings_from_output(task.output_content))
+                if not task.output_content:
+                    raw_learnings.append(_fallback_learning(task))
 
     learnings = _dedupe(raw_learnings)
     if not learnings:
