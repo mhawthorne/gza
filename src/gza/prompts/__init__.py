@@ -64,15 +64,22 @@ class PromptBuilder:
                     f"{spec_content}"
                 )
 
-        # Include learnings file if it exists and task doesn't opt out
+        # Mention learnings file if it exists and task doesn't opt out
         if not task.skip_learnings:
             learnings_path = config.project_dir / ".gza" / "learnings.md"
             if learnings_path.exists():
-                try:
-                    learnings = learnings_path.read_text()
-                    base_prompt += f"\n\n## Accumulated Project Learnings\n\n{learnings}"
-                except OSError:
-                    pass
+                base_prompt += (
+                    "\n\nProject learnings from previous tasks are available at"
+                    " `.gza/learnings.md`. Consult it for relevant patterns and conventions."
+                )
+
+        # Point agents to internal docs if the directory exists
+        docs_internal = config.project_dir / "docs" / "internal"
+        if docs_internal.is_dir():
+            base_prompt += (
+                "\n\nArchitectural notes and internal documentation are available in"
+                " `docs/internal/`. Consult relevant files when making design decisions."
+            )
 
         # Add context from based_on chain (walk up the chain to find plan tasks)
         if task.based_on or task.task_type in ("implement", "review"):

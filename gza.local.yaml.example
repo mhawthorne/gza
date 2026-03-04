@@ -11,3 +11,4 @@
 # model: o4-mini
 # docker_volumes:
 #   - ~/datasets:/datasets:ro
+# cleanup_days: 30
