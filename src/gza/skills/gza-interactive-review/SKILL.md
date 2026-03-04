@@ -68,7 +68,7 @@ git diff main...HEAD
 <Brief justification>
 ```
 
-**Step 4**: If a PR number is provided, post the review as a PR comment:
+If a PR number is provided, post the review as a PR comment:
 ```bash
 gh pr comment <PR_NUMBER> --body "<review content>"
 ```

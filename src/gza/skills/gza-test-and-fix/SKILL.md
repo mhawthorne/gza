@@ -1,7 +1,7 @@
 ---
 name: gza-test-and-fix
 description: Run verify_command from gza.yaml, fix any errors found in files changed on the current branch, then commit all fixes.
-allowed-tools: Read, Edit, Glob, Grep, Bash(uv run gza config:*), Bash(uv run:*), Bash(git:*)
+allowed-tools: Read, Edit, Glob, Grep, Bash(uv run:*), Bash(git:*)
 version: 2.0.0
 public: false
 ---
