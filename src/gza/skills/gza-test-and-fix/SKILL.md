@@ -1,49 +1,41 @@
 ---
 name: gza-test-and-fix
-description: Run mypy and pytest, fix any errors found in files changed on the current branch, then commit all fixes.
-allowed-tools: Read, Edit, Glob, Grep, Bash(uv run mypy:*), Bash(uv run pytest:*), Bash(git:*)
-version: 1.0.0
+description: Run verify_command from gza.yaml, fix any errors found in files changed on the current branch, then commit all fixes.
+allowed-tools: Read, Edit, Glob, Grep, Bash(uv run:*), Bash(git:*)
+version: 2.0.0
 public: false
 ---
 
 # Test and Fix
 
-Run `uv run mypy` and `uv run pytest`, fix any errors found in files changed on the current branch (compared to `main`), and commit all fixes at the end.
+Run the project's `verify_command` (from `gza.yaml`), fix any errors in files changed on the current branch, and commit all fixes.
 
 ## Process
 
-### Step 1: Get changed files
+### Step 1: Get verify_command
 
-Run `git diff --name-only main...HEAD` to get the list of files changed on the current branch compared to `main`. Store this list — it will be used to filter errors throughout.
+Run `uv run gza config` and extract the `verify_command` value. If it is empty or not set, stop and tell the user to set `verify_command` in `gza.yaml`.
 
-### Step 2: Run mypy and fix errors (max 2 iterations)
+### Step 2: Get changed files
 
-Repeat up to **2 times**:
+Run `git diff --name-only main...HEAD` to get the list of files changed on the current branch compared to `main`. Store this list — it will be used to scope fixes (but NOT to filter which errors to report).
 
-1. Run `uv run mypy` and capture the output.
-2. Filter the output to only include errors for files in the changed-files list.
-3. If there are no relevant errors, stop the mypy loop.
-4. Fix each relevant error by reading the affected file and editing it to resolve the type error.
-5. After fixing, increment the iteration counter and continue to the next iteration.
+### Step 3: Run verify_command and fix errors (max 3 iterations)
 
-If errors remain in changed files after 2 iterations, note them but continue to the pytest step.
+Repeat up to **3 times**:
 
-### Step 3: Run pytest and fix failures (max 2 iterations)
+1. Run the verify_command and capture the output.
+2. If there are no errors or failures, stop.
+3. Fix errors by reading the affected files and editing them. **Only edit files that are in the changed-files list** — do not modify files that weren't changed on this branch.
+4. After fixing, increment the iteration counter and continue to the next iteration.
 
-Repeat up to **2 times**:
+**Important**: Run the **full** verify_command each iteration. Do NOT filter or skip test files. All errors and failures are relevant — even if the failing test file itself wasn't changed, the failure may be caused by a change you made to a source file. Fix the root cause in the changed source file, not the test.
 
-1. Run `uv run pytest -x` and capture the output.
-2. Filter the failures to only those whose test file path (or the source file under test) is in the changed-files list.
-   - A failure is relevant if the test file itself is in the changed files list, **or** if the error traceback references a changed source file.
-3. If there are no relevant failures, stop the pytest loop.
-4. Fix each relevant failure by reading the affected test and/or source files and editing them.
-5. After fixing, increment the iteration counter and continue to the next iteration.
-
-If failures remain in changed files after 2 iterations, note them but continue.
+If errors remain after 3 iterations, report them to the user.
 
 ### Step 4: Commit all fixes
 
-If any files were modified during Steps 2–3:
+If any files were modified during Step 3:
 
 1. Run `git diff --name-only` to see what changed.
 2. Stage all modified files with `git add <file>` for each file (do not use `git add -A`).
@@ -60,8 +52,9 @@ If no files were modified, report that no fixes were needed.
 
 ## Important notes
 
-- **Only fix errors in changed files** — do not touch files that are not in the `git diff --name-only main...HEAD` output.
-- **Maximum 2 fix iterations per tool** — do not loop indefinitely. If errors remain after 2 rounds, report them to the user.
-- **One commit at the end** — accumulate all fixes across both mypy and pytest steps before committing. Do not commit after each fix.
+- **Run the full verify_command** — do not skip tests or filter output. All failures matter.
+- **Only fix files on the changed-files list** — do not touch files that are not in the `git diff --name-only main...HEAD` output.
+- **Maximum 3 fix iterations** — do not loop indefinitely. If errors remain after 3 rounds, report them to the user.
+- **One commit at the end** — accumulate all fixes before committing. Do not commit after each fix.
 - **Do not run `git push`** — leave pushing to the user.
-- After each fix, re-run the tool to verify the fix worked before moving to the next iteration.
+- After each fix, re-run the verify_command to verify the fix worked before moving to the next iteration.

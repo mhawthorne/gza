@@ -127,7 +127,7 @@ class TestBuildPrompt:
         assert str(summary_path) not in prompt
 
     def test_build_prompt_includes_learnings_when_file_exists(self, tmp_path: Path):
-        """Test that build_prompt includes learnings.md content when it exists."""
+        """Test that build_prompt references learnings.md when it exists."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -139,16 +139,14 @@ class TestBuildPrompt:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
 
-        # Create .gza/learnings.md
+        # Create .gza/learnings.md (content doesn't matter; prompt only references the path)
         gza_dir = tmp_path / ".gza"
         gza_dir.mkdir(parents=True, exist_ok=True)
-        learnings_content = "# Project Learnings\n\n- Use pytest fixtures for database setup\n"
-        (gza_dir / "learnings.md").write_text(learnings_content)
+        (gza_dir / "learnings.md").write_text("")
 
         prompt = build_prompt(task, config, store)
 
-        assert "Project Learnings" in prompt
-        assert "Use pytest fixtures for database setup" in prompt
+        assert ".gza/learnings.md" in prompt
 
     def test_build_prompt_skips_learnings_when_no_file(self, tmp_path: Path):
         """Test that build_prompt works normally when learnings.md doesn't exist."""
@@ -165,11 +163,11 @@ class TestBuildPrompt:
 
         prompt = build_prompt(task, config, store)
 
-        assert "Project Learnings" not in prompt
+        assert "learnings.md" not in prompt
         assert "Complete this task: Implement feature X" in prompt
 
     def test_build_prompt_skips_learnings_when_skip_learnings_true(self, tmp_path: Path):
-        """Test that build_prompt skips learnings.md when task.skip_learnings is True."""
+        """Test that build_prompt skips learnings reference when task.skip_learnings is True."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -190,55 +188,8 @@ class TestBuildPrompt:
 
         prompt = build_prompt(task, config, store)
 
-        assert "Project Learnings" not in prompt
+        assert "learnings.md" not in prompt
         assert "Complete this task: One-off experimental task" in prompt
-
-    def test_build_prompt_learnings_include_preamble(self, tmp_path: Path):
-        """Test that learnings injection includes the 'Accumulated Project Learnings' preamble."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Implement feature Y", task_type="implement")
-
-        config = Mock(spec=Config)
-        config.project_dir = tmp_path
-
-        gza_dir = tmp_path / ".gza"
-        gza_dir.mkdir(parents=True, exist_ok=True)
-        (gza_dir / "learnings.md").write_text("- Always use pytest fixtures\n")
-
-        prompt = build_prompt(task, config, store)
-
-        assert "## Accumulated Project Learnings" in prompt
-        assert "Always use pytest fixtures" in prompt
-
-    def test_build_prompt_learnings_unreadable_file_does_not_crash(self, tmp_path: Path):
-        """Test that an unreadable learnings.md doesn't crash prompt building."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Implement feature Z", task_type="implement")
-
-        config = Mock(spec=Config)
-        config.project_dir = tmp_path
-
-        gza_dir = tmp_path / ".gza"
-        gza_dir.mkdir(parents=True, exist_ok=True)
-        learnings_path = gza_dir / "learnings.md"
-        learnings_path.write_text("- Some learning\n")
-
-        # Mock read_text to raise PermissionError (chmod 0o000 doesn't work as root)
-        original_read_text = Path.read_text
-        def mock_read_text(self, *args, **kwargs):
-            if self == learnings_path:
-                raise PermissionError("Permission denied")
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, "read_text", mock_read_text):
-            prompt = build_prompt(task, config, store)
-            # Should not crash; learnings simply omitted
-            assert "Some learning" not in prompt
-            assert "Complete this task: Implement feature Z" in prompt
 
 
 class TestReviewContextFromChain:
