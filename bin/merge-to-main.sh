@@ -41,8 +41,14 @@ REPO_ROOT=$(git rev-parse --path-format=absolute --git-common-dir | sed 's|/.git
 echo -e "${CYAN}=== Merging ${BRANCH} into ${MAIN_BRANCH} ===${NC}"
 echo ""
 
-# Show commit log
+# Check if there are any changes to merge
 COMMIT_COUNT=$(git rev-list --count "$MAIN_BRANCH".."$BRANCH")
+if [[ "$COMMIT_COUNT" -eq 0 ]]; then
+    echo -e "${YELLOW}No new commits on ${BRANCH} relative to ${MAIN_BRANCH}. Nothing to merge.${NC}"
+    exit 0
+fi
+
+# Show commit log
 echo -e "${YELLOW}Commits ($COMMIT_COUNT):${NC}"
 git log --oneline "$MAIN_BRANCH".."$BRANCH"
 echo ""

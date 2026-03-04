@@ -4506,8 +4506,10 @@ def _print_ps_output(
     else:
         rows = live_rows
 
-    # Unless --all, filter out completed/failed tasks from display
-    if not show_all:
+    # Unless --all or poll mode, filter out completed/failed tasks from display.
+    # In poll mode, completed tasks should remain visible so users can see
+    # task transitions (running → completed) without them vanishing.
+    if not show_all and seen_tasks is None:
         rows = [r for r in rows if r["status"] not in ("completed", "failed")]
 
     if poll_interval is not None:
@@ -4711,9 +4713,20 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
     status = "unknown"
     if source == "db":
-        status = "in_progress"
+        # Use actual DB status instead of assuming in_progress — the task
+        # may have already completed/failed by the time the worker is gone.
+        status = task.status if task and task.status else "in_progress"
     elif source == "worker" and worker is not None:
         status = worker.status
+    elif worker is not None and task is not None:
+        # Both worker and task exist. Prefer DB terminal status over a
+        # stale worker status — the DB is the source of truth for completion.
+        if task.status in ("completed", "failed"):
+            status = task.status
+        elif worker.status in ("completed", "failed", "stale"):
+            status = worker.status
+        else:
+            status = "running"
     elif worker is not None:
         if worker.status in ("completed", "failed", "stale"):
             status = worker.status

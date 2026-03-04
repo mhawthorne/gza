@@ -4411,12 +4411,12 @@ class TestPsCommand:
 
         registry.remove("w-test-autostop")
 
-    def test_ps_poll_filters_completed_without_all_flag(self, tmp_path: Path):
-        """Poll mode without --all filters completed workers from display.
+    def test_ps_poll_keeps_completed_tasks_visible(self, tmp_path: Path):
+        """Poll mode keeps completed tasks visible so users see transitions.
 
-        Workers that transition to completed are tracked in seen_tasks (so
-        transitions are captured internally) but are not shown in output
-        unless --all is passed.
+        Workers that transition to completed remain in the display (via
+        seen_tasks) instead of vanishing. The poll loop exits once all
+        seen tasks have finished.
         """
         import argparse
         import json
@@ -4451,7 +4451,6 @@ class TestPsCommand:
             worker.status = "completed"
             registry.update(worker)
 
-        # Deliberately use all=False to test filtering.
         args = argparse.Namespace(
             project_dir=tmp_path,
             all=False,
@@ -4478,14 +4477,16 @@ class TestPsCommand:
 
         # Find JSON outputs (lines that start with '[') and parse them.
         json_outputs = [o for o in captured_outputs if o.startswith("[")]
-        assert len(json_outputs) == 1, f"Expected 1 JSON snapshot (running only), got: {json_outputs}"
+        assert len(json_outputs) == 2, f"Expected 2 JSON snapshots, got: {json_outputs}"
 
         first_snapshot = json.loads(json_outputs[0])
         assert len(first_snapshot) == 1
         assert first_snapshot[0]["status"] == "running"
 
-        # Second poll: completed worker filtered out, so "No running workers" message shown.
-        assert any("No running workers" in o for o in captured_outputs)
+        # Second poll: completed worker remains visible (not filtered out).
+        second_snapshot = json.loads(json_outputs[1])
+        assert len(second_snapshot) == 1
+        assert second_snapshot[0]["status"] == "completed"
 
         registry.remove("w-test-transition")
 
