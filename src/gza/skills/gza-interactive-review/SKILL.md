@@ -1,6 +1,6 @@
 ---
 name: gza-interactive-review
-description: Review changes on current branch, create/update PR, and post review comments
+description: Review changes on current branch, optionally create/update PR, and post review comments
 allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
 version: 1.0.0
 public: false
@@ -26,7 +26,13 @@ Review committed changes on the current feature branch, ensure a PR exists, and 
 3. Check if branch is pushed: `git log @{u}..HEAD 2>/dev/null`
    - If there are unpushed commits, tell the user to push first: `git push -u origin <branch>`
 
-### Step 2: Ensure a PR exists
+### Step 2: Ask about PR
+
+Use `AskUserQuestion` to ask: "Do you want to create or update a PR for this review?"
+- **Yes** — proceed to Step 3
+- **No** — skip to Step 4 (review only, no PR)
+
+### Step 3: Ensure a PR exists
 
 1. Try to view existing PR: `gh pr view --json number,url,title 2>/dev/null`
 2. If no PR exists, create one:
@@ -35,7 +41,7 @@ Review committed changes on the current feature branch, ensure a PR exists, and 
    ```
 3. Capture the PR number and URL for later use
 
-### Step 3: Run the review
+### Step 4: Run the review
 
 Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt:
 
@@ -71,21 +77,23 @@ git diff main...HEAD
 <Brief justification>
 ```
 
-**Step 4**: Post the review as a PR comment:
+**Step 4**: If a PR exists, post the review as a PR comment:
 ```bash
 gh pr comment <PR_NUMBER> --body "<review content>"
 ```
 
 Use a heredoc for the body to handle multi-line content properly.
 
+If no PR was created, just output the review directly to the user.
+
 ---
 
-Pass the PR number to the subagent so it can post the comment.
+Pass the PR number (or null if no PR) to the subagent.
 
-### Step 4: Report back
+### Step 5: Report back
 
 After the subagent completes:
 - Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
 - Print a brief summary of findings
 - If changes were requested, tell the user: "Fix the issues above, commit, push, then run `/gza-interactive-review` again."
-- Include a link to the PR
+- If a PR exists, include a link to it
