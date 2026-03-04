@@ -256,27 +256,53 @@ def test_learn_task_not_in_get_recent_completed(tmp_path: Path):
 
 
 def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
-    """Completing a learn task (skip_learnings=True) must not trigger maybe_auto_regenerate_learnings."""
-    from gza.learnings import maybe_auto_regenerate_learnings as real_fn
+    """Completing a learn task (skip_learnings=True) must not trigger maybe_auto_regenerate_learnings.
+
+    This test calls through the real _run_non_code_task code path so that the guard
+    in runner.py is actually exercised (not just replicated inline).
+    """
+    from unittest.mock import Mock
+    from gza.runner import _run_non_code_task
+    from gza.providers.base import RunResult
 
     store = _new_store(tmp_path)
-    config = Config(project_dir=tmp_path, project_name="test")
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    config.log_path = tmp_path / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.worktree_path = tmp_path / "worktrees"
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    config.use_docker = False
 
-    call_count = [0]
-
-    def counting_maybe_auto(*args, **kwargs):
-        call_count[0] += 1
-        return None
-
-    # Simulate what _run_non_code_task does: only call maybe_auto_regenerate_learnings
-    # when task.skip_learnings is False.
     learn_task = store.add("Learn prompt", task_type="learn", skip_learnings=True)
+    learn_task.task_id = "20260101-learn-prompt"
+    store.update(learn_task)
 
-    # Replicate the guard from _run_non_code_task
-    if not learn_task.skip_learnings:
-        counting_maybe_auto(store, config)
+    mock_provider = Mock()
+    mock_provider.name = "MockProvider"
+    mock_provider.run.return_value = RunResult(
+        exit_code=0,
+        duration_seconds=1.0,
+        num_turns_reported=1,
+        cost_usd=0.001,
+        session_id="test-session",
+        error_type=None,
+    )
 
-    assert call_count[0] == 0, "maybe_auto_regenerate_learnings must not be called for skip_learnings tasks"
+    mock_git = Mock()
+    mock_git.default_branch.return_value = "main"
+    mock_git._run.return_value = Mock(returncode=0)
+
+    # Create the report file the runner expects to copy from worktree
+    report_dir = tmp_path / "worktrees" / f"{learn_task.task_id}-learn" / ".gza" / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / f"{learn_task.task_id}.md").write_text("# Learn report\n")
+
+    with patch("gza.runner.console"), \
+         patch("gza.learnings.maybe_auto_regenerate_learnings") as mock_auto:
+        _run_non_code_task(learn_task, config, store, mock_provider, mock_git)
+
+    mock_auto.assert_not_called()
 
 
 def test_learn_task_deleted_on_runner_failure(tmp_path: Path):

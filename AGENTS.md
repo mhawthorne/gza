@@ -28,7 +28,7 @@ Options for `init`:
 Options for `history`:
 - `--last N` / `-n N` - Show last N tasks (default: 10)
 - `--all` - Show all tasks (no limit)
-- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, learn)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
@@ -39,7 +39,7 @@ Options for `history`:
 Options for `stats`:
 - `--last N` / `-n N` - Show last N tasks (default: 5)
 - `--all` - Show all tasks (no limit)
-- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, learn)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
@@ -97,6 +97,22 @@ Gza is configured via `gza.yaml` in the project root. Key fields:
 | `max_resume_attempts` | int | `1` | Maximum number of times `gza advance` will auto-resume a failed task (for MAX_STEPS or MAX_TURNS failures). Configurable via `GZA_MAX_RESUME_ATTEMPTS` env var. Can be overridden per-run with `--max-resume-attempts N`. |
 | `max_review_cycles` | int | `3` | Maximum number of review/improve cycles before `gza advance` stops and flags a task for human intervention. Overridable per-run with `--max-review-cycles N`. Also configurable via `GZA_MAX_REVIEW_CYCLES` env var. |
 | `merge_squash_threshold` | int | `0` | When > 0, `gza advance` squash-merges branches with this many commits or more. `0` disables auto-squash (default). `1` = always squash. Overridable per-run with `--squash-threshold N` or env var `GZA_MERGE_SQUASH_THRESHOLD`. |
+
+### LLM-Powered Learnings Summarization
+
+After each completed non-learn task, gza can automatically update `.gza/learnings.md` by running an LLM to consolidate patterns from recent completed tasks. This uses the `learn` task type internally.
+
+**How it works**:
+1. A disposable `learn` task is created with `skip_learnings=True` (to prevent recursion) and run via the standard runner.
+2. The LLM produces bullet-point learnings from recent task outputs; these replace/merge into `.gza/learnings.md`.
+3. On any failure (non-zero exit, exception), gza falls back to the existing regex-based extraction.
+4. The `learn` task is deleted from the store after use, so it does not pollute history or stats windows.
+
+**Task type**: `learn` tasks are used internally for summarization. They do not create branches and run in the project directory.  You can filter history and stats for them with `--type learn`.
+
+**`skip_learnings` field** (on `db.Task`): When `True`, the task's completion will not trigger `maybe_auto_regenerate_learnings`. This is set automatically on all `learn` tasks to prevent infinite recursion. It can also be set manually on any task type to suppress learnings updates.
+
+**Model configuration**: Uses `task_types.learn.model` in `gza.yaml`, falling back to the project default if not configured.
 
 ### verify_command
 
