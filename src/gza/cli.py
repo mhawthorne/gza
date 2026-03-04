@@ -4500,15 +4500,18 @@ def _print_ps_output(
     if seen_tasks is not None:
         for row in live_rows:
             key = row["task_id"] if row["task_id"] is not None else row["worker_id"]
-            seen_tasks[key] = row
+            # Only adopt a row into seen_tasks if it's currently active OR
+            # we're already tracking it (status transition). Don't adopt old
+            # completed tasks from the registry that we never saw running.
+            if key in seen_tasks or row["status"] in ("running", "in_progress"):
+                seen_tasks[key] = row
         rows = list(seen_tasks.values())
         rows.sort(key=_ps_sort_key)
     else:
         rows = live_rows
 
-    # Unless --all or poll mode, filter out completed/failed tasks from display.
-    # In poll mode, completed tasks should remain visible so users can see
-    # task transitions (running → completed) without them vanishing.
+    # Unless --all, filter out completed/failed tasks from non-poll display.
+    # In poll mode, seen_tasks already handles visibility correctly.
     if not show_all and seen_tasks is None:
         rows = [r for r in rows if r["status"] not in ("completed", "failed")]
 
@@ -6000,6 +6003,14 @@ def cmd_learnings(args: argparse.Namespace) -> int:
     """Handle learnings subcommands."""
     config = Config.load(args.project_dir)
     subcommand = args.learnings_command
+
+    if not subcommand:
+        print("usage: gza learnings <subcommand>")
+        print()
+        print("Available subcommands:")
+        print("  show     Display the current learnings file")
+        print("  update   Regenerate learnings from recent completed tasks")
+        return 0
 
     if subcommand == "show":
         learnings_path = config.project_dir / ".gza" / "learnings.md"
