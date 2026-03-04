@@ -1,7 +1,7 @@
 ---
 name: gza-worktree-create
 description: Create an isolated git worktree for interactive development
-allowed-tools: Bash(git:*), Bash(uv run python:*), Bash(cd:*), Read, AskUserQuestion
+allowed-tools: Bash(git:*), Bash(uv run python:*), Bash(cd:*), Bash(ln:*), Read, AskUserQuestion
 version: 1.0.0
 public: false
 ---
@@ -55,7 +55,25 @@ If the branch already exists, try without `-b`:
 git worktree add <dir>/<branch> <branch>
 ```
 
-### Step 4: Report result
+### Step 4: Symlink .gza directory
+
+The worktree needs access to the main checkout's `.gza` directory so gza can run and observe tasks.
+
+Find the main checkout path:
+
+```bash
+git rev-parse --git-common-dir
+```
+
+Strip the trailing `/.git` to get the main checkout root. Then symlink:
+
+```bash
+ln -s <main-checkout>/.gza <worktree-path>/.gza
+```
+
+If `<main-checkout>/.gza` doesn't exist, skip this step silently (the main checkout may not have run gza yet).
+
+### Step 5: Report result
 
 Print:
 - The full path to the new worktree
