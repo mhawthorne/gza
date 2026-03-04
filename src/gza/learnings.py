@@ -142,11 +142,7 @@ def _build_summarization_prompt(tasks: list[Task]) -> str:
         "- Reusable patterns (testing, code style, architecture)\n"
         "- Project-specific conventions (directory structure, naming)\n"
         "- Common mistakes to avoid\n"
-        "- Tool usage tips (CLI commands, workflows)\n\n"
-        "Output format: One learning per line, starting with \"- \"\n"
-        "Be concise (max 20 words per learning).\n"
-        "Only include learnings that generalize beyond these specific tasks.\n"
-        "Do not include task-specific details that won't apply to future work.\n"
+        "- Tool usage tips (CLI commands, workflows)\n"
     )
 
 
@@ -155,13 +151,15 @@ def _run_learnings_task(
     config: "Config",
     recent_tasks: list[Task],
 ) -> list[str] | None:
-    """Run an LLM 'learn' task to consolidate learnings from recent task outputs.
+    """Run a learn task to summarize learnings from recent task outputs.
 
-    Creates a learn task in DB with skip_learnings=True, runs it via the standard
-    runner, then parses bullet points from output_content.
-    Returns None if the task fails or produces no output.
+    Creates a ``learn`` task and runs it via the standard runner (same as
+    explore/plan/review tasks — worktree, provider, status transitions).
+    The task is kept in the DB for observability.
+
+    Returns extracted bullet-point learnings, or None on any failure.
     """
-    from . import runner as _runner_mod  # deferred module import; accessing .run at call time ensures patch("gza.runner.run") works
+    from . import runner as _runner_mod
 
     prompt = _build_summarization_prompt(recent_tasks)
     learn_task = store.add(
@@ -178,20 +176,16 @@ def _run_learnings_task(
         exit_code = _runner_mod.run(config, task_id=learn_task_id)
     except Exception as exc:
         console.print(f"[yellow]LLM learnings summarization failed: {exc}; falling back to regex extraction.[/yellow]")
-        store.delete(learn_task_id)
         return None
 
     refreshed = store.get(learn_task_id)
     if exit_code != 0 or refreshed is None or refreshed.status != "completed":
-        store.delete(learn_task_id)
         return None
 
     if not refreshed.output_content:
-        store.delete(learn_task_id)
         return None
 
     learnings = _extract_learnings_from_output(refreshed.output_content)
-    store.delete(learn_task_id)
     return learnings if learnings else None
 
 
