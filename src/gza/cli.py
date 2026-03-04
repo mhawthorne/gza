@@ -4490,14 +4490,13 @@ def _print_ps_output(
     live results so that completed/failed tasks remain visible.
     """
     import datetime
-    show_all = args.all if hasattr(args, "all") else False
-    # In poll mode, always include completed so we capture status transitions
-    # (running → completed) and don't lose tasks that finish between polls.
-    include_completed_for_query = True if seen_tasks is not None else show_all
+    # In poll mode, include completed workers so we capture status transitions.
+    include_completed_for_query = seen_tasks is not None
     live_rows, _ = _build_ps_rows(registry, store, include_completed=include_completed_for_query)
 
     # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
     if seen_tasks is not None:
+        live_keys = set()
         for row in live_rows:
             key = row["task_id"] if row["task_id"] is not None else row["worker_id"]
             # Only adopt a row into seen_tasks if it's currently active OR
@@ -4505,14 +4504,25 @@ def _print_ps_output(
             # completed tasks from the registry that we never saw running.
             if key in seen_tasks or row["status"] in ("running", "in_progress"):
                 seen_tasks[key] = row
+            live_keys.add(key)
+
+        # Re-fetch DB status for tracked tasks that vanished from live_rows.
+        # This happens when a task completes and has no worker — it drops out
+        # of get_in_progress() results, leaving seen_tasks with stale status.
+        for key, row in list(seen_tasks.items()):
+            if key not in live_keys and isinstance(key, int) and row["status"] in ("running", "in_progress"):
+                task = store.get(key)
+                if task and task.status != "in_progress":
+                    row["status"] = task.status
+
         rows = list(seen_tasks.values())
         rows.sort(key=_ps_sort_key)
     else:
         rows = live_rows
 
-    # Unless --all, filter out completed/failed tasks from non-poll display.
-    # In poll mode, seen_tasks already handles visibility correctly.
-    if not show_all and seen_tasks is None:
+    # Outside poll mode, filter out completed/failed tasks.
+    # In poll mode, completed tasks remain visible via seen_tasks.
+    if seen_tasks is None:
         rows = [r for r in rows if r["status"] not in ("completed", "failed")]
 
     if poll_interval is not None:
@@ -4521,10 +4531,7 @@ def _print_ps_output(
         print()
 
     if not rows:
-        if show_all:
-            print("No workers or in-progress tasks found")
-        else:
-            print("No running workers or in-progress tasks (use --all to see completed)")
+        print("No running workers or in-progress tasks (use --poll to monitor)")
         return
 
     if hasattr(args, "quiet") and args.quiet:
@@ -4583,18 +4590,14 @@ def cmd_ps(args: argparse.Namespace) -> int:
         if poll_interval < 1:
             print(f"error: --poll value must be at least 1 second (got {poll_interval})", file=sys.stderr)
             return 1
+        # Poll runs indefinitely until Ctrl+C — no auto-stop when tasks complete,
+        # since new tasks may start at any time.
         seen_tasks: dict = {}
         try:
             while True:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")  # clear screen, move cursor to top
                 _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks)
-                # Stop polling once all seen tasks have finished (no running/in_progress).
-                if seen_tasks and not any(
-                    r["status"] in ("running", "in_progress")
-                    for r in seen_tasks.values()
-                ):
-                    break
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
             return 0
@@ -4670,15 +4673,27 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
     console.print("   Run [cyan]gza work <id>[/cyan] to resume, or [cyan]gza mark-completed --force <id>[/cyan] to clear.")
 
 
-def _ps_sort_key(row: dict) -> tuple[bool, str, int, str]:
-    """Sort ps rows by start time, then stable identifiers."""
+def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
+    """Sort ps rows by status group, then by start time, then stable identifiers.
+
+    Failed tasks surface at top for immediate attention, in_progress/running
+    in the middle, completed at the bottom."""
+    status = row.get("status", "")
+    # Failed=0 (top), in_progress/running=1 (middle), completed/other=2 (bottom)
+    if status == "failed":
+        status_group = 0
+    elif status in ("running", "in_progress"):
+        status_group = 1
+    else:
+        status_group = 2
+
     sort_timestamp = row["sort_timestamp"] or ""
     has_no_timestamp = sort_timestamp == ""
 
     raw_task_id = row.get("task_id")
     task_id_sort = raw_task_id if isinstance(raw_task_id, int) else sys.maxsize
     worker_id = row.get("worker_id", "")
-    return (has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
+    return (status_group, has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
 
 
 def _prefer_worker(existing: WorkerMetadata, candidate: WorkerMetadata) -> bool:
@@ -8202,11 +8217,6 @@ def main() -> int:
         ps_parser = subparsers.add_parser(
             ps_cmd,
             help="List running workers" if ps_cmd == "ps" else "List running workers (alias for ps)",
-        )
-        ps_parser.add_argument(
-            "--all", "-a",
-            action="store_true",
-            help="Include completed/failed workers",
         )
         ps_parser.add_argument(
             "--quiet", "-q",

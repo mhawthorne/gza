@@ -3917,7 +3917,7 @@ class TestPsCommand:
         registry.register(worker)
 
         # Run ps command
-        result = run_gza("ps", "--all", "--project", str(tmp_path))
+        result = run_gza("ps", "--project", str(tmp_path))
 
         # Verify task ID is in output
         assert result.returncode == 0
@@ -4024,7 +4024,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--all", "--project", str(tmp_path))
+        result = run_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "2026-01-08 00:00:00 UTC" in result.stdout
 
@@ -4132,12 +4132,12 @@ class TestPsCommand:
             )
         )
 
-        table_result = run_gza("ps", "--all", "--project", str(tmp_path))
+        table_result = run_gza("ps", "--project", str(tmp_path))
         assert table_result.returncode == 0
         assert "standalone-worker" in table_result.stdout
         assert " - " in table_result.stdout
 
-        json_result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        json_result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert json_result.returncode == 0
         rows = json.loads(json_result.stdout)
         assert len(rows) == 1
@@ -4173,7 +4173,7 @@ class TestPsCommand:
                 )
             )
 
-        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert [row["worker_id"] for row in rows] == ["w-test-order-a", "w-test-order-b"]
@@ -4190,7 +4190,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=5,  # const value when --poll given without argument
@@ -4222,7 +4221,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=10,
@@ -4250,7 +4248,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=3,
@@ -4275,7 +4272,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=None,
@@ -4297,7 +4293,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=-1,
@@ -4320,7 +4315,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=0,
@@ -4341,7 +4335,6 @@ class TestPsCommand:
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=False,
             poll=5,
@@ -4357,66 +4350,12 @@ class TestPsCommand:
         assert "\033[2J" not in captured.out
         assert "\033[H" not in captured.out
 
-    def test_ps_poll_auto_stops_when_all_tasks_complete(self, tmp_path: Path):
-        """Poll mode exits automatically once all seen tasks leave running/in_progress."""
-        import argparse
-        import os
-        import unittest.mock as mock
-        from gza.cli import cmd_ps
-        from gza.workers import WorkerRegistry, WorkerMetadata
-
-        setup_config(tmp_path)
-
-        workers_dir = tmp_path / ".gza" / "workers"
-        workers_dir.mkdir(parents=True, exist_ok=True)
-        registry = WorkerRegistry(workers_dir)
-
-        worker = WorkerMetadata(
-            worker_id="w-test-autostop",
-            pid=os.getpid(),  # Real PID so is_running() returns True
-            task_id=None,
-            task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,
-            worktree=None,
-        )
-        registry.register(worker)
-
-        sleep_calls: list[float] = []
-
-        def fake_sleep(n: float) -> None:
-            sleep_calls.append(n)
-            # Transition the worker to completed so the next poll sees it as done.
-            worker.status = "completed"
-            registry.update(worker)
-
-        # Use --all so that completed workers remain visible in live_rows and
-        # seen_tasks is updated with the final "completed" status on the second poll.
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            all=True,
-            quiet=False,
-            json=False,
-            poll=2,
-        )
-
-        with mock.patch("time.sleep", side_effect=fake_sleep):
-            result = cmd_ps(args)
-
-        assert result == 0
-        # sleep was called exactly once: after poll 1 (running), before poll 2 (completed→break)
-        assert len(sleep_calls) == 1
-        assert sleep_calls[0] == 2
-
-        registry.remove("w-test-autostop")
-
     def test_ps_poll_keeps_completed_tasks_visible(self, tmp_path: Path):
         """Poll mode keeps completed tasks visible so users see transitions.
 
         Workers that transition to completed remain in the display (via
-        seen_tasks) instead of vanishing. The poll loop exits once all
-        seen tasks have finished.
+        seen_tasks) instead of vanishing. The poll loop continues until
+        interrupted with Ctrl+C.
         """
         import argparse
         import json
@@ -4443,17 +4382,21 @@ class TestPsCommand:
         )
         registry.register(worker)
 
-        sleep_calls: list[float] = []
+        sleep_count = 0
 
         def fake_sleep(n: float) -> None:
-            sleep_calls.append(n)
-            # Transition worker to completed during the sleep after poll 1.
-            worker.status = "completed"
-            registry.update(worker)
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count == 1:
+                # Transition worker to completed during the sleep after poll 1.
+                worker.status = "completed"
+                registry.update(worker)
+            elif sleep_count >= 2:
+                # Stop after seeing the completed state
+                raise KeyboardInterrupt
 
         args = argparse.Namespace(
             project_dir=tmp_path,
-            all=False,
             quiet=False,
             json=True,
             poll=2,
@@ -4472,12 +4415,10 @@ class TestPsCommand:
                 result = cmd_ps(args)
 
         assert result == 0
-        # Poll exited after one sleep (transition observed on second poll).
-        assert len(sleep_calls) == 1
 
         # Find JSON outputs (lines that start with '[') and parse them.
         json_outputs = [o for o in captured_outputs if o.startswith("[")]
-        assert len(json_outputs) == 2, f"Expected 2 JSON snapshots, got: {json_outputs}"
+        assert len(json_outputs) >= 2, f"Expected at least 2 JSON snapshots, got: {json_outputs}"
 
         first_snapshot = json.loads(json_outputs[0])
         assert len(first_snapshot) == 1
@@ -4490,10 +4431,115 @@ class TestPsCommand:
 
         registry.remove("w-test-transition")
 
-    def test_ps_steps_column_uses_num_steps_computed_for_completed_task(self, tmp_path: Path):
-        """STEPS column shows num_steps_computed for a completed task, without hitting the DB."""
+    def test_ps_poll_shows_tasks_from_start_to_end(self, tmp_path: Path):
+        """Poll mode tracks task lifecycle via DB status alone (workerless tasks).
+
+        Scenario:
+        - 3 tasks: pending (#1), in_progress (#2), completed (#3)
+        - Poll 1: only #2 (in_progress) is visible
+        - Transition #1 to in_progress during sleep
+        - Poll 2: #1 and #2 visible (2 in_progress tasks)
+        - Transition #2 to completed during sleep
+        - Poll 3: #1 (in_progress) and #2 (completed, still visible)
+        - Transition #1 to completed during sleep
+        - Poll 4: both completed, poll continues until Ctrl+C
+        """
+        import argparse
         import json
         import unittest.mock as mock
+        from gza.cli import cmd_ps
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create 3 tasks with different initial states
+        task_pending = store.add("Pending task")
+        task_running = store.add("Running task")
+        task_completed = store.add("Already completed task")
+
+        store.mark_in_progress(task_running)
+        store.mark_in_progress(task_completed)
+        store.mark_completed(task_completed)
+
+        # Workers dir must exist for WorkerRegistry even though we don't use workers
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+
+        sleep_count = 0
+
+        def fake_sleep(n: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count == 1:
+                # After poll 1: start the pending task
+                store.mark_in_progress(task_pending)
+            elif sleep_count == 2:
+                # After poll 2: complete the originally running task
+                store.mark_completed(task_running)
+            elif sleep_count == 3:
+                # After poll 3: complete the other task too
+                store.mark_completed(task_pending)
+            elif sleep_count >= 4:
+                # All transitions done — stop the poll loop
+                raise KeyboardInterrupt
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            quiet=False,
+            json=True,
+            poll=2,
+        )
+
+        captured_outputs: list[str] = []
+        original_print = print
+
+        def capturing_print(*a, **kw):
+            if a:
+                captured_outputs.append(str(a[0]))
+            original_print(*a, **kw)
+
+        with mock.patch("builtins.print", side_effect=capturing_print):
+            with mock.patch("time.sleep", side_effect=fake_sleep):
+                result = cmd_ps(args)
+
+        assert result == 0
+
+        json_outputs = [o for o in captured_outputs if o.startswith("[")]
+        assert len(json_outputs) >= 4, f"Expected at least 4 JSON snapshots, got {len(json_outputs)}: {json_outputs}"
+
+        # Poll 1: only the in_progress task
+        snap1 = json.loads(json_outputs[0])
+        assert len(snap1) == 1, f"Poll 1: expected 1 task, got {len(snap1)}: {snap1}"
+        assert snap1[0]["status"] == "in_progress"
+
+        # Poll 2: 2 in_progress tasks (original + newly started)
+        snap2 = json.loads(json_outputs[1])
+        assert len(snap2) == 2, f"Poll 2: expected 2 tasks, got {len(snap2)}: {snap2}"
+        statuses2 = {r["status"] for r in snap2}
+        assert statuses2 == {"in_progress"}, f"Poll 2: expected all in_progress, got {statuses2}"
+
+        # Poll 3: 1 in_progress + 1 completed (completed stays visible)
+        snap3 = json.loads(json_outputs[2])
+        assert len(snap3) == 2, f"Poll 3: expected 2 tasks, got {len(snap3)}: {snap3}"
+        statuses3 = sorted(r["status"] for r in snap3)
+        assert statuses3 == ["completed", "in_progress"], f"Poll 3: expected completed+in_progress, got {statuses3}"
+
+        # Poll 4: both completed, poll continues until interrupted
+        snap4 = json.loads(json_outputs[3])
+        assert len(snap4) == 2, f"Poll 4: expected 2 tasks, got {len(snap4)}: {snap4}"
+        statuses4 = {r["status"] for r in snap4}
+        assert statuses4 == {"completed"}, f"Poll 4: expected all completed, got {statuses4}"
+
+    def test_ps_poll_shows_steps_for_completed_task(self, tmp_path: Path):
+        """STEPS column shows num_steps_computed for a completed task in poll mode."""
+        import argparse
+        import json
+        import os
+        import unittest.mock as mock
+        from gza.cli import cmd_ps
         from gza.db import SqliteTaskStore
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -4501,35 +4547,72 @@ class TestPsCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
-        task = store.add("Completed task with steps")
+
+        task = store.add("Task with steps")
         store.mark_in_progress(task)
-        # Set num_steps_computed before marking completed so it persists via update().
-        task.num_steps_computed = 7
-        store.mark_completed(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_dir)
         registry.register(
             WorkerMetadata(
-                worker_id="w-test-steps-computed",
-                pid=99999,
+                worker_id="w-test-steps-poll",
+                pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
                 started_at=datetime.now(timezone.utc).isoformat(),
-                status="completed",
+                status="running",
                 log_file=None,
                 worktree=None,
             )
         )
 
-        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
-        assert result.returncode == 0
-        rows = json.loads(result.stdout)
-        assert len(rows) == 1
-        assert rows[0]["steps"] == "7"
+        sleep_count = 0
 
-        registry.remove("w-test-steps-computed")
+        def fake_sleep(n: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count == 1:
+                # Complete the task with num_steps_computed
+                task.num_steps_computed = 7
+                store.mark_completed(task)
+                w = registry.get("w-test-steps-poll")
+                w.status = "completed"
+                registry.update(w)
+            else:
+                raise KeyboardInterrupt
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            quiet=False,
+            json=True,
+            poll=2,
+        )
+
+        captured_outputs: list[str] = []
+        original_print = print
+
+        def capturing_print(*a, **kw):
+            if a:
+                captured_outputs.append(str(a[0]))
+            original_print(*a, **kw)
+
+        with mock.patch("builtins.print", side_effect=capturing_print):
+            with mock.patch("time.sleep", side_effect=fake_sleep):
+                result = cmd_ps(args)
+
+        assert result == 0
+
+        json_outputs = [o for o in captured_outputs if o.startswith("[")]
+        assert len(json_outputs) >= 2, f"Expected at least 2 snapshots, got {len(json_outputs)}"
+
+        # Second poll: task is completed and should show num_steps_computed
+        snap2 = json.loads(json_outputs[1])
+        assert len(snap2) == 1
+        assert snap2[0]["status"] == "completed"
+        assert snap2[0]["steps"] == "7"
+
+        registry.remove("w-test-steps-poll")
 
     def test_ps_steps_column_uses_live_count_for_in_progress_task(self, tmp_path: Path):
         """STEPS column shows live DB row count for an in-progress task."""
