@@ -157,7 +157,7 @@ def _run_learnings_task(
     runner, then parses bullet points from output_content.
     Returns None if the task fails or produces no output.
     """
-    from .runner import run  # deferred to avoid circular import
+    from . import runner as _runner_mod  # deferred module import; accessing .run at call time ensures patch("gza.runner.run") works
 
     prompt = _build_summarization_prompt(recent_tasks)
     learn_task = store.add(
@@ -171,18 +171,22 @@ def _run_learnings_task(
         return None
 
     try:
-        exit_code = run(config, task_id=learn_task_id)
+        exit_code = _runner_mod.run(config, task_id=learn_task_id)
     except Exception:
+        store.delete(learn_task_id)
         return None
 
     refreshed = store.get(learn_task_id)
     if exit_code != 0 or refreshed is None or refreshed.status != "completed":
+        store.delete(learn_task_id)
         return None
 
     if not refreshed.output_content:
+        store.delete(learn_task_id)
         return None
 
     learnings = _extract_learnings_from_output(refreshed.output_content)
+    store.delete(learn_task_id)
     return learnings if learnings else None
 
 

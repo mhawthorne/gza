@@ -1320,12 +1320,13 @@ class SqliteTaskStore:
         return depth
 
     def get_recent_completed(self, limit: int = 15) -> list[Task]:
-        """Get recent completed tasks, most recent first."""
+        """Get recent completed tasks, most recent first. Excludes internal learn tasks."""
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
                 WHERE status = 'completed'
+                  AND task_type != 'learn'
                 ORDER BY completed_at DESC, id DESC
                 LIMIT ?
                 """,
