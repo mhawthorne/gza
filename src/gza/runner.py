@@ -17,6 +17,7 @@ from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 from .review_verdict import parse_review_verdict
+from .review_tasks import DuplicateReviewError, create_review_task
 
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
@@ -928,33 +929,13 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     Returns:
         Exit code from running the review task.
     """
-    # Create review task with slug derived from implementation task
-    # Extract slug from the completed task's task_id (format: YYYYMMDD-slug or YYYYMMDD-slug-N)
-    if completed_task.task_id:
-        # Remove date prefix (YYYYMMDD-) and any retry suffix (-N)
-        parts = completed_task.task_id.split('-', 1)
-        if len(parts) == 2:
-            slug = parts[1]  # Everything after the date
-            # Remove retry suffix if present
-            slug = re.sub(r'-\d+$', '', slug)
-            review_prompt = f"review {slug}"
-        else:
-            # Fallback if task_id format is unexpected
-            review_prompt = f"Review task #{completed_task.id}"
-    else:
-        # Fallback if task_id is not set
-        review_prompt = f"Review task #{completed_task.id}"
-
-    if not review_prompt.startswith("review ") and completed_task.prompt:
-        review_prompt += f": {completed_task.prompt[:100]}"
-
-    review_task = store.add(
-        prompt=review_prompt,
-        task_type="review",
-        depends_on=completed_task.id,
-        group=completed_task.group,
-        based_on=completed_task.based_on,  # Inherit based_on to find plan
-    )
+    try:
+        review_task = create_review_task(store, completed_task, prompt_mode="auto")
+    except DuplicateReviewError as e:
+        review_task = e.active_review
+        console.print(
+            f"\n[yellow]Review task #{review_task.id} is already {review_task.status}; running it.[/yellow]"
+        )
 
     console.print(f"\n[bold cyan]=== Auto-created review task #{review_task.id} ===[/bold cyan]")
     console.print(f"Running review task...")

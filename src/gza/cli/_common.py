@@ -18,6 +18,7 @@ from ..console import (
 from ..db import SqliteTaskStore, Task as DbTask
 from ..prompts import PromptBuilder
 from ..review_verdict import parse_review_verdict
+from ..review_tasks import DuplicateReviewError, create_review_task
 from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
 
@@ -25,19 +26,6 @@ from ..workers import WorkerMetadata, WorkerRegistry
 def get_store(config: Config) -> SqliteTaskStore:
     """Get the SQLite task store."""
     return SqliteTaskStore(config.db_path)
-
-
-class DuplicateReviewError(ValueError):
-    """Raised when a review already exists for an implementation task.
-
-    Carries the active review task so callers do not need to re-query the DB.
-    """
-
-    def __init__(self, active_review: DbTask) -> None:
-        super().__init__(
-            f"A review task already exists: #{active_review.id} (status: {active_review.status})"
-        )
-        self.active_review = active_review
 
 
 # Shared color palette for history and stats output (readable on dark and light terminals)
@@ -532,36 +520,13 @@ def _create_review_task(
 ) -> DbTask:
     """Create a review task for an implementation task.
 
-    Validates that:
-    - impl_task is an 'implement' task
-    - impl_task is completed
-    - No active review already exists
-
-    Returns the created review task, or raises ValueError with an error message.
+    Shared wrapper used by CLI commands so patching ``gza.cli._create_review_task``
+    in tests continues to work after centralizing review creation logic.
     """
-    if impl_task.task_type != "implement":
-        raise ValueError(
-            f"Task #{impl_task.id} is a {impl_task.task_type} task. "
-            "Expected an implementation task."
-        )
-    if impl_task.status != "completed":
-        raise ValueError(
-            f"Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks."
-        )
-
-    assert impl_task.id is not None
-    existing_reviews = store.get_reviews_for_task(impl_task.id)
-    active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
-    if active_reviews:
-        raise DuplicateReviewError(active_reviews[0])
-
-    review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
-    return store.add(
-        prompt=review_prompt,
-        task_type="review",
-        depends_on=impl_task.id,
-        group=impl_task.group,
-        based_on=impl_task.based_on,
+    return create_review_task(
+        store,
+        impl_task,
+        prompt_mode="cli",
         model=model,
         provider=provider,
     )
