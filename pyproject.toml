@@ -61,6 +61,7 @@ version-file = "src/gza/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-n auto --dist loadscope"
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",
 ]
@@ -75,6 +76,7 @@ files = ["src/gza"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-xdist>=3.0",
     "mypy>=1.0",
     "types-PyYAML>=6.0",
 ]
