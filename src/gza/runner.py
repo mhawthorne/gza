@@ -933,6 +933,11 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
         review_task = create_review_task(store, completed_task, prompt_mode="auto")
     except DuplicateReviewError as e:
         review_task = e.active_review
+        if review_task.status == "in_progress":
+            console.print(
+                f"\n[yellow]Review task #{review_task.id} is already in progress; skipping.[/yellow]"
+            )
+            return 0
         console.print(
             f"\n[yellow]Review task #{review_task.id} is already {review_task.status}; running it.[/yellow]"
         )

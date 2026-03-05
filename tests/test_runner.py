@@ -812,6 +812,93 @@ class TestReviewTaskSlugGeneration:
         finally:
             gza.runner.run = original_run
 
+    def test_duplicate_in_progress_review_does_not_call_run(self, tmp_path: Path):
+        """Test that _create_and_run_review_task does not call run() for in_progress reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        store.update(impl_task)
+
+        # Create an in_progress review
+        review_task = store.add(
+            prompt="review add-user-authentication",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        store.mark_in_progress(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        run_calls = []
+
+        def mock_run(config, task_id):
+            run_calls.append(task_id)
+            return 0
+
+        import gza.runner
+        original_run = gza.runner.run
+        gza.runner.run = mock_run
+
+        try:
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            # Should succeed without calling run()
+            assert exit_code == 0
+            assert run_calls == [], "run() must not be called for an in_progress review"
+        finally:
+            gza.runner.run = original_run
+
+    def test_duplicate_pending_review_is_run_once(self, tmp_path: Path):
+        """Test that _create_and_run_review_task runs a pending duplicate review exactly once."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        store.update(impl_task)
+
+        # Create a pending review
+        review_task = store.add(
+            prompt="review add-user-authentication",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        # review_task is pending by default
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        run_calls = []
+
+        def mock_run(config, task_id):
+            run_calls.append(task_id)
+            return 0
+
+        import gza.runner
+        original_run = gza.runner.run
+        gza.runner.run = mock_run
+
+        try:
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            assert exit_code == 0
+            assert run_calls == [review_task.id], "run() must be called exactly once with the pending review"
+        finally:
+            gza.runner.run = original_run
+
 
 class TestSlugFromTaskId:
     """Tests for _slug_from_task_id helper."""
