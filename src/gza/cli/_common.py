@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -18,6 +17,7 @@ from ..console import (
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..prompts import PromptBuilder
+from ..review_verdict import parse_review_verdict
 from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
 
@@ -521,22 +521,7 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
     else:
         return None
 
-    # Look for verdict pattern in three formats:
-    # 1. Inline:  **Verdict: APPROVED** (bold wraps whole phrase)
-    # 2. Inline:  **Verdict**: APPROVED (bold wraps only label)
-    # 3. Heading: ## Verdict\n\n**CHANGES_REQUESTED**
-    import re
-    # Inline pattern (handles both bold-wrapping styles)
-    match = re.search(r'\*{0,2}Verdict\*{0,2}:\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-
-    # Heading pattern: "## Verdict" followed by the verdict on a subsequent line
-    match = re.search(r'##\s+Verdict\s*\n+\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}', content, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-
-    return None
+    return parse_review_verdict(content)
 
 
 def _create_review_task(
