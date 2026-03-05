@@ -1012,8 +1012,8 @@ def cmd_learnings(args: argparse.Namespace) -> int:
 
 def cmd_import(args: argparse.Namespace) -> int:
     """Import tasks from a YAML file."""
-    # Handle legacy usage: gza import <project_dir>
-    # If the file argument is a directory, treat it as project_dir
+    # Backward compatibility: if the positional argument is a directory,
+    # treat it as --project and require an explicit import file.
     if args.file and Path(args.file).is_dir():
         args.project_dir = Path(args.file).resolve()
         args.file = None

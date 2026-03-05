@@ -108,6 +108,39 @@ class TestSkillsInstallClaudeTarget:
         assert "skipped" in result2.stdout
         assert "up to date" in result2.stdout
 
+    def test_outdated_skill_shows_update_available(self, tmp_path: Path):
+        """Outdated skills are reported with an update hint when --update is not used."""
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-task-add" / "SKILL.md"
+        original_content = skill_file.read_text()
+        skill_file.write_text(f"{original_content}\n# local edit\n")
+
+        result2 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        assert result2.returncode == 0
+        assert "update available" in result2.stdout
+        assert "use --update" in result2.stdout
+
+    def test_update_flag_overwrites_outdated_skills(self, tmp_path: Path):
+        """--update refreshes outdated installed skills to bundled content."""
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-task-add" / "SKILL.md"
+        original_content = skill_file.read_text()
+        skill_file.write_text(f"{original_content}\n# local edit\n")
+
+        result2 = run_gza("skills-install", "--target", "claude", "--update", "--project", str(tmp_path))
+        assert result2.returncode == 0
+        assert "updated 1" in result2.stdout
+        assert "(updated)" in result2.stdout
+        assert skill_file.read_text() == original_content
+
     def test_overwrite_with_force_flag(self, tmp_path: Path):
         """Existing skills are overwritten with --force flag."""
         setup_config(tmp_path)

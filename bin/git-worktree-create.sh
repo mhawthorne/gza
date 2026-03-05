@@ -17,7 +17,7 @@ git worktree add -b "$branch" "$worktree_dir"
 cd "$worktree_dir" || exit 2
 uv sync --dev
 gza skills-install --dev
-ln -s "$main_checkout/.gza"
+ln -s "$main_checkout/.gza" "$worktree_dir/.gza"
 )
 
 echo
