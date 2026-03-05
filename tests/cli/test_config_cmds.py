@@ -1586,33 +1586,13 @@ class TestStatsCyclesCommand:
 class TestImportCommand:
     """Tests for 'gza import' command."""
 
-    def test_import_from_yaml(self, tmp_path: Path):
-        """Import command imports tasks from tasks.yaml."""
-        setup_config(tmp_path)
-        tasks_yaml = tmp_path / "tasks.yaml"
-        tasks_yaml.write_text("""tasks:
-- description: Task from YAML
-  status: pending
-- description: Completed YAML task
-  status: completed
-""")
-
-        result = run_gza("import", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Imported 2 tasks" in result.stdout
-
-        # Verify tasks were imported
-        result = run_gza("next", "--project", str(tmp_path))
-        assert "Task from YAML" in result.stdout
-
-    def test_import_no_yaml(self, tmp_path: Path):
-        """Import command handles missing tasks.yaml."""
+    def test_import_no_file_specified(self, tmp_path: Path):
+        """Import command requires a file argument."""
         setup_config(tmp_path)
         result = run_gza("import", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "not found" in result.stdout
+        assert "No file specified" in result.stdout
 
 
 class TestSyncReportCommand:

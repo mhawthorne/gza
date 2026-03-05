@@ -951,6 +951,11 @@ def _add_skills_install_args(
         action="store_true",
         help="Include dev (non-public) skills",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Update skills that have a newer bundled version",
+    )
 
 
 def _parse_iso(value: str | None) -> datetime | None:

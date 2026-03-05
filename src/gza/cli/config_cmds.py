@@ -13,7 +13,6 @@ from ..db import SqliteTaskStore
 from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
-from ..tasks import YamlTaskStore
 from ..workers import WorkerMetadata, WorkerRegistry
 
 from ._common import TASK_COLORS, get_store, get_task_step_count
@@ -1028,13 +1027,9 @@ def cmd_import(args: argparse.Namespace) -> int:
         if not import_path.is_absolute():
             import_path = config.project_dir / import_path
     else:
-        # Legacy: import from tasks.yaml
-        import_path = config.tasks_path
-        if not import_path.exists():
-            print(f"Error: No file specified and {import_path} not found")
-            print("Usage: gza import <file> [--dry-run] [--force]")
-            return 1
-        return _cmd_import_legacy(config, store)
+        print("Error: No file specified")
+        print("Usage: gza import <file> [--dry-run] [--force]")
+        return 1
 
     # Parse the import file
     tasks, default_group, default_spec, parse_errors = parse_import_file(import_path)
@@ -1092,49 +1087,6 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_import_legacy(config: Config, store: SqliteTaskStore) -> int:
-    """Legacy import from tasks.yaml (old format)."""
-    yaml_store = YamlTaskStore(config.tasks_path)
-    imported = 0
-    skipped = 0
-
-    for yaml_task in yaml_store._tasks:
-        # Check if already imported (by task_id)
-        if yaml_task.task_id:
-            existing = store.get_by_task_id(yaml_task.task_id)
-            if existing:
-                skipped += 1
-                continue
-
-        # Create task in SQLite (Task class uses 'prompt' and 'task_type')
-        task = store.add(yaml_task.prompt, task_type=yaml_task.task_type)
-
-        # Copy over fields - need to convert TaskStatus enum to string for status
-        status_value = yaml_task.status.value if hasattr(yaml_task.status, 'value') else yaml_task.status
-        task.status = status_value
-        task.task_id = yaml_task.task_id
-        task.branch = yaml_task.branch
-        task.log_file = yaml_task.log_file
-        task.report_file = yaml_task.report_file
-        task.has_commits = yaml_task.has_commits
-        task.duration_seconds = yaml_task.duration_seconds
-        task.num_turns_reported = yaml_task.num_turns_reported
-        task.cost_usd = yaml_task.cost_usd
-        if yaml_task.completed_at:
-            if isinstance(yaml_task.completed_at, datetime):
-                task.completed_at = yaml_task.completed_at
-            else:
-                task.completed_at = datetime.combine(yaml_task.completed_at, datetime.min.time())
-
-        store.update(task)
-        imported += 1
-
-    print(f"✓ Imported {imported} tasks")
-    if skipped:
-        print(f"  Skipped {skipped} already imported tasks")
-
-    return 0
-
 
 def _resolve_skill_install_targets(
     project_dir: Path,
@@ -1173,10 +1125,15 @@ def cmd_skills_install(
         get_available_skills,
         get_skill_description,
         get_skill_version,
+        get_skills_source_path,
+        is_skill_outdated,
+        get_installed_skill_time,
+        get_bundled_skill_time,
         copy_skill,
     )
 
     public_only = not getattr(args, "dev", False)
+    print(f"Skills source: {get_skills_source_path()}")
 
     # Handle --list flag
     if args.list:
@@ -1234,8 +1191,10 @@ def cmd_skills_install(
         print(f"Installing {len(skills_to_install)} skill(s) to {target_dir} [{target_name}]...")
 
         installed = 0
+        updated = 0
         skipped = 0
         failed = 0
+        update_mode = getattr(args, "update", False)
 
         for skill in skills_to_install:
             success, message = copy_skill(skill, target_dir, args.force)
@@ -1244,21 +1203,38 @@ def cmd_skills_install(
                 print(f"  ✓ {skill}")
                 installed += 1
             elif "already exists" in message:
-                print(f"  ⊘ {skill} ({message})")
-                skipped += 1
+                outdated = is_skill_outdated(skill, target_dir)
+                if outdated and update_mode:
+                    ok, msg = copy_skill(skill, target_dir, force=True)
+                    if ok:
+                        print(f"  ↑ {skill} (updated)")
+                        updated += 1
+                    else:
+                        print(f"  ✗ {skill} (update failed: {msg})")
+                        failed += 1
+                elif outdated:
+                    installed_time = get_installed_skill_time(skill, target_dir) or "unknown"
+                    bundled_time = get_bundled_skill_time(skill) or "unknown"
+                    print(f"  ⊘ {skill} (update available: installed {installed_time}, bundled {bundled_time}, use --update)")
+                    skipped += 1
+                else:
+                    print(f"  ⊘ {skill} (up to date)")
+                    skipped += 1
             else:
                 print(f"  ✗ {skill} ({message})")
                 failed += 1
 
         # Print summary
         print()
+        parts = [f"Installed {installed}"]
+        if updated > 0:
+            parts.append(f"updated {updated}")
+        if skipped > 0:
+            parts.append(f"skipped {skipped}")
         if failed > 0:
-            print(f"Installed {installed} skill(s), {skipped} skipped, {failed} failed [{target_name}]")
+            parts.append(f"failed {failed}")
             any_failed = True
-        elif skipped > 0:
-            print(f"Installed {installed} skill(s) ({skipped} skipped) [{target_name}]")
-        else:
-            print(f"Installed {installed} skill(s) [{target_name}]")
+        print(f"{', '.join(parts)} [{target_name}]")
         print()
 
     return 1 if any_failed else 0
