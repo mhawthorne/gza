@@ -170,6 +170,7 @@ Signs you're violating this:
 
 ## Important Guidelines
 
+- **Always run gza commands from your starting directory** - Do not `cd` to other directories before running gza commands unless explicitly instructed. Gza uses the current directory to find `gza.yaml`, `.gza/`, and the task database. Running from the wrong directory will target the wrong project or fail.
 - **Do NOT run git commands** - Gza handles all git operations (branching, committing, pushing) automatically after your task completes. Just make the code changes and let gza commit them.
 - **Run /gza-test-and-fix before completing any task** - You MUST invoke the `/gza-test-and-fix` skill before declaring a task complete. This runs mypy and pytest, automatically fixes any failures in files changed on the current branch, and commits the fixes. Do not mark a task as done until `/gza-test-and-fix` passes cleanly.
 - **Do NOT delete git branches** unless explicitly asked to. Branches should be preserved for history and reference.

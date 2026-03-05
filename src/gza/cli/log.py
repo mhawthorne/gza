@@ -346,6 +346,53 @@ class _LiveLogPrinter:
                 else:
                     console.print(f"[cyan]\\[gza][/cyan] {rich_escape(message)}", soft_wrap=True)
 
+        elif entry_type == "thread.started":
+            thread_id = entry.get("thread_id", "")
+            if thread_id:
+                self._fmt.print_agent_message(f"Session started (thread: {thread_id})")
+
+        elif entry_type == "turn.started":
+            if self._start_time is None:
+                self._start_time = time.time()
+            self._step_count += 1
+            if self._step_count > 1:
+                console.print()
+            if self._live:
+                elapsed = int(time.time() - self._start_time)
+                total_tokens = self._total_input_tokens + self._total_output_tokens
+                self._fmt.print_step_header(
+                    self._step_count, total_tokens, 0.0, elapsed,
+                    blank_line_before=False,
+                )
+            else:
+                console.print(
+                    f"| Step {self._step_count} |",
+                    style="blue",
+                )
+
+        elif entry_type == "item.completed":
+            item = entry.get("item", {})
+            if not isinstance(item, dict):
+                pass
+            elif item.get("type") == "agent_message":
+                text = item.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    self._fmt.print_agent_message(text.strip())
+            elif item.get("type") == "command_execution":
+                command = item.get("command", "")
+                self._fmt.print_tool_event("Bash", self._trunc(command, 80))
+                aggregated_output = item.get("aggregated_output", "")
+                exit_code = item.get("exit_code")
+                if isinstance(aggregated_output, str) and aggregated_output.strip():
+                    is_error = isinstance(exit_code, int) and exit_code != 0
+                    output = aggregated_output.strip()
+                    if len(output) > 200:
+                        output = output[:200] + "..."
+                    if is_error:
+                        self._fmt.print_error(output)
+                    else:
+                        console.print(f"  {rich_escape(output)}", style="dim", soft_wrap=True)
+
         elif entry_type == "result":
             is_error = entry.get("is_error", False)
             subtype = str(entry.get("subtype") or "")

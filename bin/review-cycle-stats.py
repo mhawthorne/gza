@@ -32,20 +32,75 @@ def percentile(sorted_vals: list[int], p: float) -> int:
     return sorted_vals[k]
 
 
+def _count_section_items(content: str, header_pattern: str) -> int:
+    """Count top-level list items under a section matching header_pattern.
+
+    Looks for a line matching the pattern, then counts top-level list items:
+    - Bullets at column 0: '- item'
+    - Numbered items: '1. item'
+
+    Skips blank lines, indented continuation/sub-items, and '- None.'.
+    Stops at the next section header or unrecognized top-level line.
+    """
+    lines = content.split("\n")
+    i = 0
+    count = 0
+    while i < len(lines):
+        if re.match(header_pattern, lines[i].strip(), re.IGNORECASE):
+            i += 1
+            in_numbered = False
+            while i < len(lines):
+                line = lines[i]
+                stripped = line.strip()
+                if stripped == "":
+                    i += 1
+                    continue
+                # Numbered item at any indent (1. ..., 2. ...)
+                if re.match(r"^\d+\.\s", stripped):
+                    count += 1
+                    in_numbered = True
+                    i += 1
+                # Top-level bullet (no leading whitespace)
+                elif line.startswith("- "):
+                    if in_numbered:
+                        # Sub-detail of a numbered item, skip
+                        i += 1
+                    else:
+                        item_text = stripped[2:].strip().rstrip(".")
+                        if item_text.lower() != "none":
+                            count += 1
+                        i += 1
+                # Indented line — continuation/sub-item, skip
+                elif line.startswith("  ") or line.startswith("\t"):
+                    i += 1
+                else:
+                    break
+        else:
+            i += 1
+    return count
+
+
 def count_review_issues(content: str) -> tuple[int, int]:
     """Parse review markdown and return (must_fix_count, suggestion_count).
 
-    Heuristic: counts ### headings that match known patterns for must-fix
-    issues (### 1., ### M1, etc.) and suggestions (### S1, ### S2, etc.).
+    Supports two formats:
+    - Claude: ### M1/### 1./### Issue 1 headings for must-fix, ### S1 for suggestions
+    - Codex: 'Must-fix issues' / 'Suggestions' plain-text headers with bullet lists
+
     Returns (0, 0) if content is empty or unparseable.
     """
     if not content:
         return 0, 0
 
-    # Must-fix: ### 1. ..., ### M1 ..., ### Issue 1 ...
+    # Claude format: ### headings
     must_fix = len(re.findall(r"^###\s+(?:M?\d+[\.\s—–-]|Issue\s+\d+)", content, re.MULTILINE))
-    # Suggestions: ### S1 ..., ### S2 ...
     suggestions = len(re.findall(r"^###\s+S\d+[\.\s—–-]", content, re.MULTILINE))
+
+    # Codex format: plain-text section headers with bullet lists
+    if must_fix == 0:
+        must_fix = _count_section_items(content, r"^(?:#+\s*)?must[- ]?fix(?:\s+issues?)?$")
+    if suggestions == 0:
+        suggestions = _count_section_items(content, r"^(?:#+\s*)?suggestions?$")
 
     return must_fix, suggestions
 
@@ -280,6 +335,7 @@ def main() -> int:
 
     # Per-model issue counts (parsed from review markdown)
     if args.issues and review_content:
+        print(f"\nParsing issue counts from {len(review_content)} review(s)...")
         model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
         for ri in ri_tasks:
             if ri["task_type"] != "review":
@@ -288,6 +344,8 @@ def main() -> int:
             if content is None:
                 continue
             must_fix, sugg = count_review_issues(content)
+            if must_fix == 0 and sugg == 0:
+                print(f"  warning: could not parse issues from review #{ri['id']} ({ri['model'] or 'unknown'})", file=sys.stderr)
             model = ri["model"] or "unknown"
             model_issues[model].append((must_fix, sugg))
 
