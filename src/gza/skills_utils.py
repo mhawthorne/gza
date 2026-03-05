@@ -153,6 +153,51 @@ def ensure_all_skills(target_dir: Path) -> int:
     return installed
 
 
+def is_skill_outdated(skill_name: str, target_dir: Path) -> bool:
+    """Check if an installed skill differs from the bundled one.
+
+    Compares file contents to detect changes.
+
+    Args:
+        skill_name: Name of the skill.
+        target_dir: Directory where skills are installed.
+
+    Returns:
+        True if the bundled content differs from the installed content.
+    """
+    skills_path = get_skills_source_path()
+    bundled = skills_path / skill_name / 'SKILL.md'
+    installed = target_dir / skill_name / 'SKILL.md'
+    if not bundled.exists() or not installed.exists():
+        return False
+    try:
+        return bundled.read_text() != installed.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _skill_mtime_str(path: Path) -> Optional[str]:
+    """Get the modification time of a SKILL.md file as a string."""
+    from datetime import datetime
+    if not path.exists():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    except OSError:
+        return None
+
+
+def get_installed_skill_time(skill_name: str, target_dir: Path) -> Optional[str]:
+    """Get the modification time of an installed skill."""
+    return _skill_mtime_str(target_dir / skill_name / 'SKILL.md')
+
+
+def get_bundled_skill_time(skill_name: str) -> Optional[str]:
+    """Get the modification time of a bundled skill."""
+    return _skill_mtime_str(get_skills_source_path() / skill_name / 'SKILL.md')
+
+
 def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[bool, str]:
     """Copy a skill from the package to the target directory atomically.
 

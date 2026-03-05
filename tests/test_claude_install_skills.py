@@ -87,7 +87,7 @@ class TestSkillsInstallClaudeTarget:
 
         assert result.returncode == 0
         assert "Installing 1 skill(s)" in result.stdout
-        assert "Installed 1 skill(s)" in result.stdout
+        assert "Installed 1" in result.stdout
 
         # Verify only requested skills were created
         skills_dir = tmp_path / ".claude" / "skills"
@@ -106,7 +106,7 @@ class TestSkillsInstallClaudeTarget:
         result2 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "skipped" in result2.stdout
-        assert "already exists" in result2.stdout
+        assert "up to date" in result2.stdout
 
     def test_overwrite_with_force_flag(self, tmp_path: Path):
         """Existing skills are overwritten with --force flag."""

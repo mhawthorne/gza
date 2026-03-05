@@ -267,15 +267,16 @@ def main() -> int:
             model = "unknown"
         model_cycles[model].append(cycle_count)
 
+    def _cycle_stats(vals: list[int]) -> str:
+        """Format med/p75/p90/max as a compact string."""
+        return f"{int(median(vals))}/{percentile(vals, 75)}/{percentile(vals, 90)}/{max(vals)}"
+
     if model_cycles:
-        print(f"\n{'Review model':<35} {'Impls':>5} {'Med':>5} {'P90':>5} {'Max':>5}")
-        print("-" * 58)
+        print(f"\n{'Review model':<35} {'Impls':>5}  {'med/p75/p90/max':>16}")
+        print("-" * 60)
         for model in sorted(model_cycles):
             cycles = sorted(model_cycles[model])
-            med = int(median(cycles))
-            p90 = percentile(cycles, 90)
-            mx = max(cycles)
-            print(f"{model:<35} {len(cycles):>5} {med:>5} {p90:>5} {mx:>5}")
+            print(f"{model:<35} {len(cycles):>5}  {_cycle_stats(cycles):>16}")
 
     # Per-model issue counts (parsed from review markdown)
     if args.issues and review_content:
@@ -292,29 +293,28 @@ def main() -> int:
 
         if model_issues:
             print(f"\nIssue counts per review (parsed from markdown)")
-            print(f"{'Review model':<35} {'Rvws':>5} {'Fix/rv':>6} {'Sug/rv':>6} {'All/rv':>6}  {'Fix Σ':>6} {'Sug Σ':>6}")
-            print("-" * 83)
-            all_must_fix = 0
-            all_sugg = 0
-            all_reviews = 0
+            def _stats(vals: list[int]) -> str:
+                """Format med/p75/p90/max as a compact string."""
+                return f"{int(median(vals))}/{percentile(vals, 75)}/{percentile(vals, 90)}/{max(vals)}"
+
+            print(f"{'Review model':<35} {'Rvws':>5}  {'Must-fix':>16}  {'Suggestions':>16}")
+            print(f"{'':35} {'':>5}  {'med/p75/p90/max':>16}  {'med/p75/p90/max':>16}")
+            print("-" * 77)
+            all_fixes: list[int] = []
+            all_suggs: list[int] = []
             for model in sorted(model_issues):
                 pairs = model_issues[model]
                 n = len(pairs)
-                mf_total = sum(mf for mf, _ in pairs)
-                sg_total = sum(sg for _, sg in pairs)
-                all_must_fix += mf_total
-                all_sugg += sg_total
-                all_reviews += n
-                mf_avg = mf_total / n
-                sg_avg = sg_total / n
-                tot_avg = (mf_total + sg_total) / n
-                print(f"{model:<35} {n:>5} {mf_avg:>6.1f} {sg_avg:>6.1f} {tot_avg:>6.1f}  {mf_total:>6} {sg_total:>6}")
+                fixes = sorted(mf for mf, _ in pairs)
+                suggs = sorted(sg for _, sg in pairs)
+                all_fixes.extend(fixes)
+                all_suggs.extend(suggs)
+                print(f"{model:<35} {n:>5}  {_stats(fixes):>16}  {_stats(suggs):>16}")
             if len(model_issues) > 1:
-                print("-" * 83)
-                mf_avg = all_must_fix / all_reviews if all_reviews else 0
-                sg_avg = all_sugg / all_reviews if all_reviews else 0
-                tot_avg = (all_must_fix + all_sugg) / all_reviews if all_reviews else 0
-                print(f"{'Total':<35} {all_reviews:>5} {mf_avg:>6.1f} {sg_avg:>6.1f} {tot_avg:>6.1f}  {all_must_fix:>6} {all_sugg:>6}")
+                all_fixes.sort()
+                all_suggs.sort()
+                print("-" * 77)
+                print(f"{'Total':<35} {len(all_fixes):>5}  {_stats(all_fixes):>16}  {_stats(all_suggs):>16}")
 
     return 0
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -12,10 +13,12 @@ main_checkout="$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
 
 git worktree add -b "$branch" "$worktree_dir"
 
-ln -s "$main_checkout/.gza" "$worktree_dir/.gza"
+(
+cd "$worktree_dir" || exit 2
+uv sync --dev
+gza skills-install --dev
+ln -s "$main_checkout/.gza"
+)
 
-(cd "$worktree_dir" && gza skills-install)
-
-echo ""
-echo "Worktree ready:"
-echo "  cd $worktree_dir"
+echo
+echo "worktree ready at $worktree_dir"
