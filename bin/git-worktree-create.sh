@@ -8,7 +8,7 @@ fi
 
 worktree_dir="$1"
 branch="$(basename "$worktree_dir")"
-main_checkout="$(git rev-parse --show-toplevel)"
+main_checkout="$(git worktree list --porcelain | head -1 | sed 's/^worktree //')"
 
 git worktree add -b "$branch" "$worktree_dir"
 
