@@ -1,5 +1,5 @@
 ---
-name: gza-interactive-review
+name: gza-code-review-interactive
 description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
 allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
 version: 2.0.0
@@ -86,5 +86,5 @@ Pass the PR number (if `--pr` was used and a PR was found) or nothing to the sub
 After the subagent completes:
 - Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
 - Print a brief summary of findings
-- If changes were requested, tell the user: "Fix the issues above, commit, push, then run `/gza-interactive-review` again."
+- If changes were requested, tell the user: "Fix the issues above, commit, push, then run `/gza-code-review-interactive` again."
 - If a PR was used, include a link to it

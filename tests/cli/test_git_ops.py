@@ -9,189 +9,68 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from gza.cli import _determine_advance_action, cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import run_gza, setup_config, setup_db_with_tasks, setup_git_repo_with_task_branch, LOG_FIXTURES_DIR
 
 
 class TestMergeCommand:
     """Tests for 'gza merge' command."""
 
-    def test_merge_accepts_squash_flag(self, tmp_path: Path):
-        """Merge command accepts --squash flag."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
+    @pytest.mark.parametrize(
+        "flags, allowed_error",
+        [
+            pytest.param(["--squash"], "Error merging", id="squash"),
+            pytest.param(["--rebase"], "Error during rebase", id="rebase"),
+            pytest.param(["--rebase", "--resolve"], "Error during rebase", id="rebase-resolve"),
+        ],
+    )
+    def test_merge_accepts_valid_flags(self, tmp_path: Path, flags: list[str], allowed_error: str):
+        """Merge command accepts valid flag combinations."""
+        store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test merge flags", "feature/test-flags",
+        )
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        result = run_gza("merge", str(task.id), *flags, "--project", str(tmp_path))
 
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
+        assert result.returncode == 0 or allowed_error in result.stdout
 
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
+    @pytest.mark.parametrize(
+        "flags, expected_error",
+        [
+            pytest.param(
+                ["--rebase", "--squash"],
+                "Cannot use --rebase and --squash together",
+                id="rebase-and-squash",
+            ),
+            pytest.param(
+                ["--remote"],
+                "--remote requires --rebase",
+                id="remote-without-rebase",
+            ),
+            pytest.param(
+                ["--resolve"],
+                "--resolve requires --rebase",
+                id="resolve-without-rebase",
+            ),
+        ],
+    )
+    def test_merge_rejects_invalid_flags(
+        self, tmp_path: Path, flags: list[str], expected_error: str
+    ):
+        """Merge command rejects invalid flag combinations."""
+        store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test invalid flags", "feature/test-invalid",
+        )
 
-        # Create a task with a branch
-        task = store.add("Test merge task")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-merge"
-        store.update(task)
+        result = run_gza("merge", str(task.id), *flags, "--project", str(tmp_path))
 
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-merge")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Test that --squash flag is accepted
-        result = run_gza("merge", str(task.id), "--squash", "--project", str(tmp_path))
-
-        # Verify the command doesn't fail due to argument parsing
-        assert "unrecognized arguments" not in result.stderr
-        # The merge should succeed or fail based on git operations, not argument parsing
-        assert result.returncode == 0 or "Error merging" in result.stdout
-
-    def test_merge_accepts_rebase_flag(self, tmp_path: Path):
-        """Merge command accepts --rebase flag."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase task")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-rebase"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-rebase")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Test that --rebase flag is accepted
-        result = run_gza("merge", str(task.id), "--rebase", "--project", str(tmp_path))
-
-        # Verify the command doesn't fail due to argument parsing
-        assert "unrecognized arguments" not in result.stderr
-        # The rebase should succeed or fail based on git operations, not argument parsing
-        assert result.returncode == 0 or "Error during rebase" in result.stdout
-
-    def test_merge_rejects_both_rebase_and_squash(self, tmp_path: Path):
-        """Merge command rejects --rebase and --squash together."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test conflicting flags")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-conflict"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-conflict")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Test that both flags together are rejected
-        result = run_gza("merge", str(task.id), "--rebase", "--squash", "--project", str(tmp_path))
-
-        # Verify the command fails with appropriate error message
         assert result.returncode == 1
-        assert "Cannot use --rebase and --squash together" in result.stdout
-
-    def test_merge_remote_requires_rebase(self, tmp_path: Path):
-        """Merge command rejects --remote without --rebase."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test remote without rebase")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-remote"
-        store.update(task)
-
-        # Create the branch
-        git._run("checkout", "-b", "feature/test-remote")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Test that --remote without --rebase is rejected
-        result = run_gza("merge", str(task.id), "--remote", "--project", str(tmp_path))
-
-        # Verify the command fails with appropriate error message
-        assert result.returncode == 1
-        assert "--remote requires --rebase" in result.stdout
+        assert expected_error in result.stdout
 
     def test_merge_rebase_with_remote(self, tmp_path: Path):
         """Merge command accepts --rebase --remote together."""
@@ -244,93 +123,6 @@ class TestMergeCommand:
         # Should either succeed or fail gracefully (not due to flag validation)
         assert "--remote requires --rebase" not in result.stdout
 
-    def test_merge_resolve_requires_rebase(self, tmp_path: Path):
-        """Merge command rejects --resolve without --rebase."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test resolve without rebase")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-resolve"
-        store.update(task)
-
-        # Create the branch
-        git._run("checkout", "-b", "feature/test-resolve")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Test that --resolve without --rebase is rejected
-        result = run_gza("merge", str(task.id), "--resolve", "--project", str(tmp_path))
-
-        # Verify the command fails with appropriate error message
-        assert result.returncode == 1
-        assert "--resolve requires --rebase" in result.stdout
-
-    def test_merge_resolve_with_rebase_accepted(self, tmp_path: Path):
-        """Merge command accepts --resolve --rebase together."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test resolve with rebase")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-resolve-rebase"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-resolve-rebase")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Test that --resolve --rebase is accepted (flag validation passes)
-        result = run_gza("merge", str(task.id), "--rebase", "--resolve", "--project", str(tmp_path))
-
-        # Verify no flag validation error
-        assert "unrecognized arguments" not in result.stderr
-        assert "--resolve requires --rebase" not in result.stdout
-        # Should either succeed or fail gracefully (git ops), not due to flag validation
-        assert result.returncode == 0 or "Error during rebase" in result.stdout
 
     def test_squash_merge_creates_commit(self, tmp_path: Path):
         """Squash merge creates a commit, not just staged changes."""
@@ -978,44 +770,10 @@ class TestCheckoutCommand:
 
     def test_checkout_removes_clean_worktree(self, tmp_path: Path):
         """Checkout command removes clean worktree before checking out branch."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test checkout task")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-checkout"
-        store.update(task)
-
-        # Create the branch
-        git._run("checkout", "-b", "feature/test-checkout")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create a worktree for the branch
-        worktree_path = tmp_path / "worktrees" / "test-checkout"
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), "feature/test-checkout")
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test checkout task", "feature/test-checkout",
+            worktree_name="test-checkout",
+        )
 
         # Verify worktree exists
         assert worktree_path.exists()
@@ -1031,44 +789,10 @@ class TestCheckoutCommand:
 
     def test_checkout_fails_with_dirty_worktree(self, tmp_path: Path):
         """Checkout command fails if worktree has uncommitted changes."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test checkout with dirty worktree")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-dirty"
-        store.update(task)
-
-        # Create the branch
-        git._run("checkout", "-b", "feature/test-dirty")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create a worktree for the branch
-        worktree_path = tmp_path / "worktrees" / "test-dirty"
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), "feature/test-dirty")
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test checkout with dirty worktree", "feature/test-dirty",
+            worktree_name="test-dirty",
+        )
 
         # Add uncommitted changes to the worktree
         (worktree_path / "uncommitted.txt").write_text("uncommitted")
@@ -1082,44 +806,10 @@ class TestCheckoutCommand:
 
     def test_checkout_force_removes_dirty_worktree(self, tmp_path: Path):
         """Checkout --force removes worktree even with uncommitted changes."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test checkout force")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-force"
-        store.update(task)
-
-        # Create the branch
-        git._run("checkout", "-b", "feature/test-force")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create a worktree for the branch
-        worktree_path = tmp_path / "worktrees" / "test-force"
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), "feature/test-force")
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test checkout force", "feature/test-force",
+            worktree_name="test-force",
+        )
 
         # Add uncommitted changes to the worktree
         (worktree_path / "uncommitted.txt").write_text("uncommitted")
@@ -1138,44 +828,10 @@ class TestRebaseCommand:
 
     def test_rebase_removes_clean_worktree(self, tmp_path: Path):
         """Rebase command removes clean worktree before rebasing."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase with worktree")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-rebase-wt"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-rebase-wt")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create a worktree for the branch
-        worktree_path = tmp_path / "worktrees" / "test-rebase-wt"
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), "feature/test-rebase-wt")
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase with worktree", "feature/test-rebase-wt",
+            worktree_name="test-rebase-wt",
+        )
 
         # Verify worktree exists
         assert worktree_path.exists()
@@ -1191,44 +847,10 @@ class TestRebaseCommand:
 
     def test_rebase_fails_with_dirty_worktree(self, tmp_path: Path):
         """Rebase command fails if worktree has uncommitted changes."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase with dirty worktree")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-rebase-dirty"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-rebase-dirty")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create a worktree for the branch
-        worktree_path = tmp_path / "worktrees" / "test-rebase-dirty"
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), "feature/test-rebase-dirty")
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase with dirty worktree", "feature/test-rebase-dirty",
+            worktree_name="test-rebase-dirty",
+        )
 
         # Add uncommitted changes to the worktree
         (worktree_path / "uncommitted.txt").write_text("uncommitted")
@@ -1242,44 +864,10 @@ class TestRebaseCommand:
 
     def test_rebase_force_removes_dirty_worktree(self, tmp_path: Path):
         """Rebase --force removes worktree even with uncommitted changes."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase force")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-rebase-force"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-rebase-force")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create a worktree for the branch
-        worktree_path = tmp_path / "worktrees" / "test-rebase-force"
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), "feature/test-rebase-force")
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase force", "feature/test-rebase-force",
+            worktree_name="test-rebase-force",
+        )
 
         # Add uncommitted changes to the worktree
         (worktree_path / "uncommitted.txt").write_text("uncommitted")
@@ -1294,39 +882,9 @@ class TestRebaseCommand:
 
     def test_rebase_without_worktree(self, tmp_path: Path):
         """Rebase works normally when no worktree exists."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase no worktree")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-rebase-nowt"
-        store.update(task)
-
-        # Create the branch and add a commit (no worktree)
-        git._run("checkout", "-b", "feature/test-rebase-nowt")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        _store, _git, task, _worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase no worktree", "feature/test-rebase-nowt",
+        )
 
         # Rebase should work normally
         result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
@@ -1338,39 +896,9 @@ class TestRebaseCommand:
 
     def test_rebase_logs_task_id_and_newline(self, tmp_path: Path):
         """Rebase command logs 'Rebasing task #X...' and ends with a newline."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase output format")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-rebase-output"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-rebase-output")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        _store, _git, task, _worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase output format", "feature/test-rebase-output",
+        )
 
         result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
 
@@ -1382,40 +910,9 @@ class TestRebaseCommand:
 
     def test_rebase_resolve_flag_accepted(self, tmp_path: Path):
         """Rebase command accepts --resolve flag."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
-        from unittest.mock import patch, MagicMock
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize a git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit on main
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a task with a branch
-        task = store.add("Test rebase with resolve")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test-resolve"
-        store.update(task)
-
-        # Create the branch and add a commit
-        git._run("checkout", "-b", "feature/test-resolve")
-        (tmp_path / "feature.txt").write_text("feature content")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        _store, _git, task, _worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase with resolve", "feature/test-resolve",
+        )
 
         # Mock the conflict resolution since we're just testing that the flag is accepted
         # and the basic flow works (we don't want to actually invoke Claude in tests)

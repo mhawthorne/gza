@@ -5,7 +5,9 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+import pytest
+
+from .conftest import run_gza, setup_config, setup_db_with_tasks, setup_unmerged_env, LOG_FIXTURES_DIR
 
 
 class TestHistoryCommand:
@@ -1992,212 +1994,35 @@ class TestDeleteCommand:
 class TestUnmergedReviewStatus:
     """Tests for review status display in 'gza unmerged' command."""
 
-    def test_unmerged_shows_approved_review_status(self, tmp_path: Path):
-        """Unmerged output shows approved review status."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
+    @pytest.mark.parametrize(
+        "review_output, expected_text",
+        [
+            ("# Review\n\nCode looks good!\n\n**Verdict: APPROVED**", "✓ approved"),
+            ("# Review\n\nNeeds some fixes.\n\nVerdict: CHANGES_REQUESTED", "⚠ changes requested"),
+            ("# Review\n\nThis requires team discussion.\n\n**Verdict: NEEDS_DISCUSSION**", "💬 needs discussion"),
+        ],
+        ids=["approved", "changes_requested", "needs_discussion"],
+    )
+    def test_unmerged_shows_review_verdict(self, tmp_path: Path, review_output, expected_text):
+        """Unmerged output shows the correct review verdict."""
+        store, task, git = setup_unmerged_env(tmp_path)
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task with branch
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        # Create branch with commit
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create review task with approved verdict
         review = store.add("Review implementation", task_type="review")
         review.status = "completed"
         review.completed_at = datetime.now(timezone.utc)
         review.depends_on = task.id
         review.task_id = "20260212-review-implementation"
-        review.output_content = """# Review
-
-Code looks good!
-
-**Verdict: APPROVED**"""
+        review.output_content = review_output
         store.update(review)
 
-        # Run unmerged command
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "✓ approved" in result.stdout
-
-    def test_unmerged_shows_changes_requested_review_status(self, tmp_path: Path):
-        """Unmerged output shows changes requested review status."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        # Create branch with commit
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create review task with changes requested
-        review = store.add("Review implementation", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
-        review.depends_on = task.id
-        review.task_id = "20260212-review-implementation"
-        review.output_content = """# Review
-
-Needs some fixes.
-
-Verdict: CHANGES_REQUESTED"""
-        store.update(review)
-
-        # Run unmerged command
-        result = run_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "⚠ changes requested" in result.stdout
-
-    def test_unmerged_shows_needs_discussion_review_status(self, tmp_path: Path):
-        """Unmerged output shows needs discussion review status."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        # Create branch with commit
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Create review task with needs discussion
-        review = store.add("Review implementation", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
-        review.depends_on = task.id
-        review.task_id = "20260212-review-implementation"
-        review.output_content = """# Review
-
-This requires team discussion.
-
-**Verdict: NEEDS_DISCUSSION**"""
-        store.update(review)
-
-        # Run unmerged command
-        result = run_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "💬 needs discussion" in result.stdout
+        assert expected_text in result.stdout
 
     def test_unmerged_without_review_shows_no_status(self, tmp_path: Path):
         """Unmerged output shows no review status when no review exists."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
+        store, task, git = setup_unmerged_env(tmp_path)
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        # Create branch with commit
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        # Run unmerged command (no review)
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review: no review" in result.stdout
@@ -2207,42 +2032,9 @@ This requires team discussion.
 
     def test_unmerged_uses_most_recent_review(self, tmp_path: Path):
         """Unmerged output shows status from most recent review."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         import time
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        # Create branch with commit
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         # Create first review (changes requested)
         review1 = store.add("First review", task_type="review")
@@ -2272,37 +2064,9 @@ This requires team discussion.
 
     def test_unmerged_uses_older_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
         """Unmerged scans newest-to-oldest and uses first parseable review verdict."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         import time
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         older_review = store.add("Older review", task_type="review")
         older_review.status = "completed"
@@ -2329,37 +2093,9 @@ This requires team discussion.
 
     def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
         """Staleness via review_cleared_at still suppresses older verdicts."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         import time
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         older_review = store.add("Older review", task_type="review")
         older_review.status = "completed"
@@ -2390,36 +2126,11 @@ This requires team discussion.
 
     def test_unmerged_falls_back_to_unlinked_review_slug_match(self, tmp_path: Path):
         """Unmerged should infer review status from unlinked 'review <slug>' tasks."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        task = store.add("Simplify mixer", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260225-simplify-mixer-by-removing-the-people-strategy"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Simplify mixer",
+            task_id="20260225-simplify-mixer-by-removing-the-people-strategy",
+        )
 
         # Simulate a retry-created review that lost depends_on but kept review slug.
         review = store.add("review simplify-mixer-by-removing-the-people-strategy", task_type="review")
@@ -2435,42 +2146,9 @@ This requires team discussion.
 
     def test_unmerged_marks_review_stale_after_improve_clears_it(self, tmp_path: Path):
         """After improve clears review state, unmerged marks review as stale."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         import time
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        # Create initial commit
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        # Create branch with commit
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         # Create review task with changes requested
         review = store.add("Review implementation", task_type="review")
@@ -2499,40 +2177,9 @@ This requires team discussion.
 
     def test_unmerged_shows_new_review_status_after_improve_and_re_review(self, tmp_path: Path):
         """After improve clears review state, a newer review's verdict is shown."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         import time
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Initialize git repo
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create implementation task
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260212-add-feature"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         # Create first review (changes requested)
         review1 = store.add("Review", task_type="review")
@@ -2567,38 +2214,9 @@ This requires team discussion.
 
     def test_unmerged_shows_lineage_for_review_improve_chain(self, tmp_path: Path):
         """Unmerged output includes related review/improve lineage for implementation."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         import time
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-
-        impl = store.add("Add feature", task_type="implement")
-        impl.status = "completed"
-        impl.completed_at = datetime.now(timezone.utc)
-        impl.branch = "feature/test"
-        impl.has_commits = True
-        impl.merge_status = "unmerged"
-        impl.task_id = "20260212-add-feature"
-        store.update(impl)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, impl, git = setup_unmerged_env(tmp_path)
 
         review = store.add("Review", task_type="review")
         review.status = "completed"
@@ -2636,45 +2254,16 @@ This requires team discussion.
 class TestUnmergedAllFlag:
     """Tests for 'gza unmerged --all' flag."""
 
-    def _setup_git_repo(self, tmp_path: Path):
-        """Initialize a git repo with an initial commit."""
-        from gza.git import Git
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-        return git
-
     def test_all_flag_excludes_failed_tasks(self, tmp_path: Path):
         """Failed tasks are excluded from gza unmerged (only completed tasks shown)."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        # Create a failed task with merge_status='unmerged'
-        task = store.add("Failed but useful task", task_type="implement")
-        task.status = "failed"
-        task.branch = "feature/failed-branch"
-        task.has_commits = False
-        task.merge_status = "unmerged"
-        task.task_id = "20260220-failed-task"
-        task.completed_at = datetime.now(timezone.utc)
-        store.update(task)
-
-        # Create the branch with a real commit
-        git._run("checkout", "-b", "feature/failed-branch")
-        (tmp_path / "feature.txt").write_text("useful work")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add useful work")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Failed but useful task",
+            task_id="20260220-failed-task",
+            branch="feature/failed-branch",
+            status="failed",
+            has_commits=False,
+        )
 
         # Failed task is excluded from unmerged output
         result = run_gza("unmerged", "--project", str(tmp_path))
@@ -2689,23 +2278,12 @@ class TestUnmergedAllFlag:
 
     def test_all_flag_is_noop_with_merge_status(self, tmp_path: Path):
         """--all flag is a no-op since we now use merge_status from the database."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        self._setup_git_repo(tmp_path)
-
-        # Task with merge_status='unmerged' shows up
-        task = store.add("Unmerged task", task_type="implement")
-        task.status = "completed"
-        task.branch = "feature/unmerged"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        task.task_id = "20260220-unmerged"
-        task.completed_at = datetime.now(timezone.utc)
-        store.update(task)
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Unmerged task",
+            task_id="20260220-unmerged",
+            branch="feature/unmerged",
+        )
 
         # Task without merge_status='unmerged' doesn't show up
         task2 = store.add("Merged task", task_type="implement")
@@ -2731,23 +2309,14 @@ class TestUnmergedAllFlag:
 
     def test_unmerged_excludes_tasks_without_merge_status(self, tmp_path: Path):
         """Tasks without merge_status='unmerged' are not shown."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        self._setup_git_repo(tmp_path)
-
-        # Task with merge_status=None (no commits)
-        task = store.add("No commits task", task_type="implement")
-        task.status = "completed"
-        task.branch = "feature/no-commits"
-        task.has_commits = False
-        task.merge_status = None
-        task.task_id = "20260220-no-commits"
-        task.completed_at = datetime.now(timezone.utc)
-        store.update(task)
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="No commits task",
+            task_id="20260220-no-commits",
+            branch="feature/no-commits",
+            has_commits=False,
+            merge_status=None,
+        )
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -2761,7 +2330,16 @@ class TestUnmergedAllFlag:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
-        self._setup_git_repo(tmp_path)
+
+        # We need a git repo but the task's branch won't exist
+        from gza.git import Git
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
 
         # Task with merge_status='unmerged' but branch doesn't exist
         task = store.add("Deleted branch task", task_type="implement")
@@ -2780,26 +2358,15 @@ class TestUnmergedAllFlag:
 
     def test_lazy_migration_backfills_merge_status(self, tmp_path: Path):
         """Running gza unmerged backfills merge_status for existing tasks."""
-        from gza.db import SqliteTaskStore
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Old task needing migration",
+            task_id="20260220-old-task",
+            branch="feature/old-task",
+            merge_status=None,
+        )
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        # Create a task with has_commits=True but merge_status=NULL (pre-migration state)
-        task = store.add("Old task needing migration", task_type="implement")
-        task.status = "completed"
-        task.branch = "feature/old-task"
-        task.has_commits = True
-        task.merge_status = None  # Simulates pre-migration state
-        task.task_id = "20260220-old-task"
-        task.completed_at = datetime.now(timezone.utc)
-        store.update(task)
-
-        # Create the branch with a real commit (unmerged)
-        git._run("checkout", "-b", "feature/old-task")
+        git._run("checkout", "feature/old-task")
         (tmp_path / "old.txt").write_text("old work")
         git._run("add", "old.txt")
         git._run("commit", "-m", "Old work")
@@ -2824,49 +2391,24 @@ class TestUnmergedAllFlag:
 class TestUnmergedImprovedDisplay:
     """Tests for improved unmerged display (diff stats, review prominence, completed-only)."""
 
-    def _setup_git_repo(self, tmp_path: Path):
-        """Initialize a git repo with an initial commit."""
-        from gza.git import Git
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
-        return git
-
     def test_unmerged_excludes_failed_tasks(self, tmp_path: Path):
         """Failed tasks with merge_status='unmerged' are excluded from unmerged output."""
         from gza.db import SqliteTaskStore
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
+        # Use setup_unmerged_env for the completed task (creates config, git, store)
+        store, completed_task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Completed task",
+            branch="feature/completed",
+        )
 
-        # Create a failed task
+        # Add a failed task to the same store
         failed_task = store.add("Failed task", task_type="implement")
         failed_task.status = "failed"
         failed_task.branch = "feature/failed"
         failed_task.merge_status = "unmerged"
         failed_task.completed_at = datetime.now(timezone.utc)
         store.update(failed_task)
-
-        # Create a completed task
-        completed_task = store.add("Completed task", task_type="implement")
-        completed_task.status = "completed"
-        completed_task.branch = "feature/completed"
-        completed_task.merge_status = "unmerged"
-        completed_task.completed_at = datetime.now(timezone.utc)
-        store.update(completed_task)
-
-        git._run("checkout", "-b", "feature/completed")
-        (tmp_path / "new.txt").write_text("work")
-        git._run("add", "new.txt")
-        git._run("commit", "-m", "Add work")
-        git._run("checkout", "main")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -2875,25 +2417,13 @@ class TestUnmergedImprovedDisplay:
 
     def test_unmerged_shows_diff_stats(self, tmp_path: Path):
         """Unmerged output shows diff stats (files, LOC added/removed)."""
-        from gza.db import SqliteTaskStore
+        store, task, git = setup_unmerged_env(tmp_path)
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.merge_status = "unmerged"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
+        # Add more content on the feature branch for visible diff stats
+        git._run("checkout", "feature/test")
         (tmp_path / "feature.txt").write_text("line1\nline2\nline3\n")
         git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
+        git._run("commit", "-m", "Expand feature content")
         git._run("checkout", "main")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
@@ -2904,30 +2434,17 @@ class TestUnmergedImprovedDisplay:
 
     def test_unmerged_uses_cached_diff_stats(self, tmp_path: Path):
         """gza unmerged uses cached diff stats from DB when available (no live git call)."""
-        from gza.db import SqliteTaskStore
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Cached stats task",
+            branch="feature/cached",
+        )
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        task = store.add("Cached stats task", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/cached"
-        task.merge_status = "unmerged"
         # Pre-populate cached diff stats
         task.diff_files_changed = 5
         task.diff_lines_added = 42
         task.diff_lines_removed = 7
         store.update(task)
-
-        git._run("checkout", "-b", "feature/cached")
-        (tmp_path / "cached.txt").write_text("some content\n")
-        git._run("add", "cached.txt")
-        git._run("commit", "-m", "Cached stats commit")
-        git._run("checkout", "main")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -2936,26 +2453,7 @@ class TestUnmergedImprovedDisplay:
 
     def test_unmerged_review_shown_on_own_line(self, tmp_path: Path):
         """Review status appears on its own 'review:' line."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.merge_status = "unmerged"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         review = store.add("Review feature", task_type="review")
         review.status = "completed"
@@ -2972,26 +2470,7 @@ class TestUnmergedImprovedDisplay:
 
     def test_unmerged_shows_no_review_when_missing(self, tmp_path: Path):
         """Unmerged output shows 'no review' when no review exists."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        task = store.add("Add feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
-        task.branch = "feature/test"
-        task.merge_status = "unmerged"
-        store.update(task)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
+        store, task, git = setup_unmerged_env(tmp_path)
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -3000,19 +2479,13 @@ class TestUnmergedImprovedDisplay:
 
     def test_unmerged_always_shows_completion_time(self, tmp_path: Path):
         """Completion time is shown even for tasks with improve tasks."""
-        from gza.db import SqliteTaskStore
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Root task",
+        )
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        git = self._setup_git_repo(tmp_path)
-
-        task = store.add("Root task", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime(2026, 2, 12, 10, 30, tzinfo=__import__('datetime').timezone.utc)
-        task.branch = "feature/test"
-        task.merge_status = "unmerged"
+        # Override completion time to a specific date
+        task.completed_at = datetime(2026, 2, 12, 10, 30, tzinfo=timezone.utc)
         store.update(task)
 
         improve = store.add("Improve root task", task_type="improve")
@@ -3022,12 +2495,6 @@ class TestUnmergedImprovedDisplay:
         improve.based_on = task.id
         improve.merge_status = "unmerged"
         store.update(improve)
-
-        git._run("checkout", "-b", "feature/test")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0

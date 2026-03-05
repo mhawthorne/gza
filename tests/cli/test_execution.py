@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from gza.cli import _run_foreground
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -2318,6 +2320,13 @@ class TestIterateCommand:
 class TestMarkCompletedCommand:
     """Tests for 'gza mark-completed' command."""
 
+    def _setup_store(self, tmp_path: Path) -> SqliteTaskStore:
+        """Set up config and return a SqliteTaskStore."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return SqliteTaskStore(db_path)
+
     def _setup_git_repo(self, tmp_path: Path):
         """Initialize a minimal git repo in tmp_path."""
         from gza.git import Git
@@ -2341,13 +2350,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_default_verify_git_for_code_tasks(self, tmp_path: Path):
         """Code task types default to git verification mode."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
+        store = self._setup_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         task = store.add("Code task with no branch", task_type="implement")
@@ -2393,13 +2396,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
         """mark-completed warns when task status is not failed."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
+        store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
         # Create a branch for the task
@@ -2419,13 +2416,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
         """mark-completed errors when git branch does not exist."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
+        store = self._setup_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         task = store.add("Failed task")
@@ -2441,13 +2432,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
         """mark-completed sets status='unmerged' when branch has commits."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
+        store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
         # Create branch with a commit
@@ -2475,13 +2460,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
         """mark-completed sets status='completed' when branch has no commits."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
+        store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
         # Create branch with NO commits beyond main
@@ -2506,12 +2485,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_force_stale_in_progress_recovery(self, tmp_path: Path):
         """--force supports stale in_progress recovery without git validation."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = self._setup_store(tmp_path)
 
         task = store.add("Stale worker task", task_type="implement")
         task.status = "in_progress"
@@ -2528,13 +2502,7 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
         """mark-completed does not warn when task is in failed status."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
+        store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
         git._run("checkout", "-b", "gza/1-failed-branch")
         git._run("checkout", "main")
@@ -2551,13 +2519,9 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_cleans_up_running_worker(self, tmp_path: Path):
         """mark-completed calls registry.mark_completed() for a running worker."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerMetadata, WorkerRegistry
+        from gza.workers import WorkerMetadata
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = self._setup_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         git._run("checkout", "-b", "gza/1-worker-task")
@@ -2615,13 +2579,9 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
         """mark-completed leaves an already-completed worker unchanged."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerMetadata, WorkerRegistry
+        from gza.workers import WorkerMetadata
 
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = self._setup_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         git._run("checkout", "-b", "gza/1-already-done-branch")
@@ -2671,77 +2631,33 @@ class TestSetStatusCommand:
         assert result.returncode == 1
         assert "not found" in result.stdout
 
-    def test_set_status_to_failed(self, tmp_path: Path):
-        """set-status can mark a pending task as failed."""
+    @pytest.mark.parametrize("target_status,initial_status,completed_at_set", [
+        pytest.param("failed", "in_progress", True, id="in_progress-to-failed"),
+        pytest.param("completed", "in_progress", True, id="in_progress-to-completed"),
+        pytest.param("dropped", "in_progress", True, id="in_progress-to-dropped"),
+        pytest.param("pending", "failed", False, id="failed-to-pending"),
+        pytest.param("in_progress", "failed", False, id="failed-to-in_progress"),
+    ])
+    def test_set_status_transition(self, tmp_path: Path, target_status: str, initial_status: str, completed_at_set: bool):
+        """set-status transitions correctly and manages completed_at."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "in_progress"},
+            {"prompt": "A task", "status": initial_status},
         ])
         db_path = tmp_path / ".gza" / "gza.db"
         store = SqliteTaskStore(db_path)
 
-        result = run_gza("set-status", "1", "failed", "--project", str(tmp_path))
+        result = run_gza("set-status", "1", target_status, "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "in_progress" in result.stdout
-        assert "failed" in result.stdout
+        assert target_status in result.stdout
 
         task = store.get(1)
         assert task is not None
-        assert task.status == "failed"
-        assert task.completed_at is not None
-
-    def test_set_status_to_completed(self, tmp_path: Path):
-        """set-status can mark a task as completed."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "in_progress"},
-        ])
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-
-        result = run_gza("set-status", "1", "completed", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "completed" in result.stdout
-
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "completed"
-        assert task.completed_at is not None
-
-    def test_set_status_to_pending_clears_completed_at(self, tmp_path: Path):
-        """set-status clears completed_at when transitioning back to pending."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "failed"},
-        ])
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-
-        result = run_gza("set-status", "1", "pending", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "pending" in result.stdout
-
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "pending"
-        assert task.completed_at is None
-
-    def test_set_status_to_in_progress_clears_completed_at(self, tmp_path: Path):
-        """set-status clears completed_at when transitioning to in_progress."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "failed"},
-        ])
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-
-        result = run_gza("set-status", "1", "in_progress", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "in_progress"
-        assert task.completed_at is None
+        assert task.status == target_status
+        if completed_at_set:
+            assert task.completed_at is not None
+        else:
+            assert task.completed_at is None
 
     def test_set_status_with_reason_for_failed(self, tmp_path: Path):
         """set-status --reason sets failure_reason for failed status."""
@@ -2785,7 +2701,8 @@ class TestSetStatusCommand:
 
         assert result.returncode != 0
 
-    def test_set_status_clears_failure_reason_on_non_failed_transition(self, tmp_path: Path):
+    @pytest.mark.parametrize("target_status", ["pending", "dropped"])
+    def test_set_status_clears_failure_reason(self, tmp_path: Path, target_status: str):
         """set-status clears failure_reason when transitioning away from failed."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "failed"},
@@ -2799,64 +2716,14 @@ class TestSetStatusCommand:
         task.failure_reason = "Original error"
         store.update(task)
 
-        result = run_gza("set-status", "1", "pending", "--project", str(tmp_path))
+        result = run_gza("set-status", "1", target_status, "--project", str(tmp_path))
 
         assert result.returncode == 0
 
         task = store.get(1)
         assert task is not None
-        assert task.status == "pending"
+        assert task.status == target_status
         assert task.failure_reason is None
-
-    def test_set_status_to_dropped(self, tmp_path: Path):
-        """set-status can mark a task as dropped and sets completed_at."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "in_progress"},
-        ])
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-
-        result = run_gza("set-status", "1", "dropped", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "dropped" in result.stdout
-
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "dropped"
-        assert task.completed_at is not None
-
-    def test_set_status_dropped_clears_failure_reason(self, tmp_path: Path):
-        """set-status to dropped clears failure_reason on a previously-failed task."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "failed"},
-        ])
-        db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.get(1)
-        assert task is not None
-        task.failure_reason = "Some error"
-        store.update(task)
-
-        result = run_gza("set-status", "1", "dropped", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-
-        task = store.get(1)
-        assert task is not None
-        assert task.status == "dropped"
-        assert task.failure_reason is None
-
-    def test_set_status_dropped_accepted_as_valid_choice(self, tmp_path: Path):
-        """set-status accepts 'dropped' without argparse rejecting it."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "pending"},
-        ])
-
-        result = run_gza("set-status", "1", "dropped", "--project", str(tmp_path))
-
-        assert result.returncode == 0
 
     def test_advance_skips_dropped_tasks(self, tmp_path: Path):
         """gza advance does not act on dropped tasks."""
@@ -2948,64 +2815,16 @@ class TestSetStatusCommand:
 class TestMaxTurnsFlag:
     """Tests for --max-turns flag on work, retry, and resume commands."""
 
-    def test_work_command_accepts_max_turns_flag(self, tmp_path: Path):
-        """Work command accepts --max-turns flag without error."""
-        from gza.config import Config
+    def test_max_turns_override_applies_correctly(self, tmp_path: Path):
+        """--max-turns flag overrides config value."""
         import argparse
 
-        # Create a config with a default max_steps
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nmax_steps: 50\n")
 
-        # Load config
         config = Config.load(tmp_path)
         assert config.max_turns == 50
 
-        # Apply override like cmd_run does
-        args = argparse.Namespace(max_turns=100, project_dir=config.project_dir)
-        if hasattr(args, 'max_turns') and args.max_turns is not None:
-            config.max_steps = args.max_turns
-            config.max_turns = args.max_turns
-
-        assert config.max_turns == 100
-        assert config.max_steps == 100
-
-    def test_retry_command_accepts_max_turns_flag(self, tmp_path: Path):
-        """Retry command accepts --max-turns flag without error."""
-        from gza.config import Config
-        import argparse
-
-        # Create a config with a default max_steps
-        config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_steps: 50\n")
-
-        # Load config
-        config = Config.load(tmp_path)
-        assert config.max_turns == 50
-
-        # Apply override like cmd_retry does
-        args = argparse.Namespace(max_turns=150, project_dir=config.project_dir)
-        if hasattr(args, 'max_turns') and args.max_turns is not None:
-            config.max_steps = args.max_turns
-            config.max_turns = args.max_turns
-
-        assert config.max_turns == 150
-        assert config.max_steps == 150
-
-    def test_resume_command_accepts_max_turns_flag(self, tmp_path: Path):
-        """Resume command accepts --max-turns flag without error."""
-        from gza.config import Config
-        import argparse
-
-        # Create a config with a default max_steps
-        config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_steps: 50\n")
-
-        # Load config
-        config = Config.load(tmp_path)
-        assert config.max_turns == 50
-
-        # Apply override like cmd_resume does
         args = argparse.Namespace(max_turns=200, project_dir=config.project_dir)
         if hasattr(args, 'max_turns') and args.max_turns is not None:
             config.max_steps = args.max_turns
@@ -3013,30 +2832,6 @@ class TestMaxTurnsFlag:
 
         assert config.max_turns == 200
         assert config.max_steps == 200
-
-    def test_max_turns_override_takes_precedence_over_config(self, tmp_path: Path):
-        """--max-turns flag overrides the value from gza.yaml."""
-        from gza.config import Config
-        import argparse
-
-        # Create a config with a default max_steps of 50
-        config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_steps: 50\n")
-
-        # Load config
-        config = Config.load(tmp_path)
-        before = config.max_turns
-        assert before == 50
-
-        # Apply override
-        args = argparse.Namespace(max_turns=999, project_dir=config.project_dir)
-        if hasattr(args, 'max_turns') and args.max_turns is not None:
-            config.max_steps = args.max_turns
-            config.max_turns = args.max_turns
-
-        after = config.max_turns
-        assert after == 999
-        assert before != after
 
 
 class TestRunForeground:
