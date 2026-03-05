@@ -16,6 +16,7 @@ from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
+from .review_verdict import parse_review_verdict
 
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
@@ -134,20 +135,8 @@ REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
-    """Extract review verdict from markdown content."""
-    if not content:
-        return None
-    # Try two inline formats:
-    # 1. **Verdict: APPROVED** (bold wraps whole phrase)
-    # 2. **Verdict**: APPROVED (bold wraps only the label)
-    match = re.search(
-        r"\*{0,2}Verdict\*{0,2}:\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
-        content,
-        re.IGNORECASE,
-    )
-    if not match:
-        return None
-    return match.group(1).upper()
+    """Backward-compatible wrapper around the shared verdict parser."""
+    return parse_review_verdict(content)
 
 
 def backup_database(db_path: Path, project_dir: Path) -> None:
