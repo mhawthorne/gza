@@ -3025,6 +3025,9 @@ class TestExtractReviewVerdict:
     def test_plain_verdict(self) -> None:
         assert _extract_review_verdict("Verdict: NEEDS_DISCUSSION") == "NEEDS_DISCUSSION"
 
+    def test_heading_verdict(self) -> None:
+        assert _extract_review_verdict("## Verdict\n\n**CHANGES_REQUESTED**\n") == "CHANGES_REQUESTED"
+
     def test_none_content(self) -> None:
         assert _extract_review_verdict(None) is None
 
