@@ -220,8 +220,8 @@ def _merge_single_task(
 
         if args.rebase and getattr(args, 'resolve', False):
             # --resolve: invoke Claude to fix conflicts
-            print("Conflicts detected. Invoking Claude to resolve...")
-            resolved = invoke_claude_resolve(task, task.branch, rebase_target, config)
+            print("Conflicts detected. Invoking provider to resolve...")
+            resolved = invoke_provider_resolve(task, task.branch, rebase_target, config)
 
             if not resolved:
                 print("Could not resolve conflicts automatically.")
@@ -278,6 +278,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     # Get current branch once
     current_branch = git.current_branch()
+    print(f"On branch {current_branch}")
 
     # Determine the list of task IDs to merge
     task_ids = list(args.task_ids)
@@ -376,7 +377,7 @@ def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
     return ok and skill_path.exists()
 
 
-def invoke_claude_resolve(task: DbTask, branch: str, target: str, config: Config) -> bool:
+def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Config) -> bool:
     """Invoke active provider runtime to resolve rebase conflicts via /gza-rebase."""
     from dataclasses import replace
     from ..providers import get_provider
@@ -456,6 +457,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     # Get current branch and determine rebase target
     current_branch = git.current_branch()
     default_branch = git.default_branch()
+    print(f"On branch {current_branch}")
 
     # Determine rebase target: use --onto if provided, else current branch
     rebase_target = getattr(args, 'onto', None) or current_branch
@@ -492,8 +494,9 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         print(f"✓ Successfully rebased {task.branch} onto {rebase_target}")
 
         # Switch back to original branch
-        git.checkout(current_branch)
-        print(f"✓ Switched back to {current_branch}")
+        if current_branch != "HEAD":
+            git.checkout(current_branch)
+            print(f"✓ Switched back to {current_branch}")
 
         print()
         return 0
@@ -506,24 +509,26 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             print(f"\nAborting rebase and restoring clean state...")
             try:
                 git.rebase_abort()
-                try:
-                    git.checkout(current_branch)
-                except GitError:
-                    pass  # Best effort to return to original branch
+                if current_branch != "HEAD":
+                    try:
+                        git.checkout(current_branch)
+                    except GitError:
+                        pass  # Best effort to return to original branch
                 print("✓ Rebase aborted, working directory restored")
             except GitError as abort_error:
                 print(f"Warning: Could not abort rebase: {abort_error}")
             print()
             return 1
 
-        # --resolve: invoke Claude to fix conflicts
-        print("Conflicts detected. Invoking Claude to resolve...")
-        resolved = invoke_claude_resolve(task, task.branch, rebase_target, config)
+        # --resolve: invoke provider to fix conflicts
+        print("Conflicts detected. Invoking provider to resolve...")
+        resolved = invoke_provider_resolve(task, task.branch, rebase_target, config)
 
         if not resolved:
             print("Could not resolve conflicts automatically.")
             git.rebase_abort()
-            git.checkout(current_branch)
+            if current_branch != "HEAD":
+                git.checkout(current_branch)
             print()
             return 1
 
@@ -531,8 +536,10 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         print(f"Pushing {task.branch}...")
         git.push_force_with_lease(task.branch)
 
-        # Always checkout main at the end
-        git.checkout(default_branch)
+        # Switch back to original branch
+        if current_branch != "HEAD":
+            git.checkout(current_branch)
+            print(f"✓ Switched back to {current_branch}")
 
         print(f"✓ Successfully rebased {task.branch}")
         print()
