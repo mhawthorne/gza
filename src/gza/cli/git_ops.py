@@ -30,6 +30,8 @@ from gza._query import (
 )
 
 from ._common import (
+    DuplicateReviewError,
+    _create_review_task,
     get_store,
     get_review_verdict,
     _create_resume_task,
@@ -1496,28 +1498,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 error_count += 1
 
         elif action_type == 'create_review':
-            if task.task_type != 'implement':
-                console.print(f"      [yellow]SKIP: cannot create review for task type '{task.task_type}'[/yellow]")
+            try:
+                review_task = _create_review_task(store, task)
+            except DuplicateReviewError as e:
+                review_task = e.active_review
+                console.print(f"      [yellow]SKIP: review #{review_task.id} is already {review_task.status}[/yellow]")
                 skip_count += 1
                 continue
-
-            # Check for an already-pending/in_progress review (idempotency guard)
-            existing_reviews = store.get_reviews_for_task(task.id)
-            active_reviews = [r for r in existing_reviews if r.status in ('pending', 'in_progress')]
-            if active_reviews:
-                console.print(f"      [yellow]SKIP: review #{active_reviews[0].id} is already {active_reviews[0].status}[/yellow]")
+            except ValueError as e:
+                console.print(f"      [yellow]SKIP: {e}[/yellow]")
                 skip_count += 1
                 continue
-
-            from ..prompts import PromptBuilder
-            review_prompt = PromptBuilder().review_task_prompt(task.id, task.prompt)
-            review_task = store.add(
-                prompt=review_prompt,
-                task_type='review',
-                depends_on=task.id,
-                group=task.group,
-                based_on=task.based_on,
-            )
             console.print(f"      [green]✓ Created review task #{review_task.id}[/green]")
 
             # Spawn background worker to run the review
