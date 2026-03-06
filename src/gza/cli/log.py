@@ -315,6 +315,7 @@ class _LiveLogPrinter:
                     if not isinstance(content, dict):
                         continue
                     if content.get("type") == "tool_use":
+                        console.print()
                         self._print_tool_use(content)
                     elif content.get("type") == "text":
                         text = content.get("text", "").strip()
@@ -380,6 +381,7 @@ class _LiveLogPrinter:
                     self._fmt.print_agent_message(text.strip())
             elif item.get("type") == "command_execution":
                 command = item.get("command", "")
+                console.print()
                 self._fmt.print_tool_event("Bash", self._trunc(command, 80))
                 aggregated_output = item.get("aggregated_output", "")
                 exit_code = item.get("exit_code")
