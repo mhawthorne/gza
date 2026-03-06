@@ -1148,9 +1148,10 @@ class TestMergeStatus:
         impl_task = store.add(prompt="Implement feature", task_type="implement")
         store.mark_completed(impl_task, has_commits=True, branch="feature/impl")
 
-        # Improve task with same_branch=True (commits to impl branch)
+        # Improve task with same_branch=True and based_on (commits to impl branch)
         improve_task = store.add(
-            prompt="Improve implementation", task_type="improve", same_branch=True
+            prompt="Improve implementation", task_type="improve", same_branch=True,
+            based_on=impl_task.id,
         )
         store.mark_completed(improve_task, has_commits=True, branch="feature/impl")
 

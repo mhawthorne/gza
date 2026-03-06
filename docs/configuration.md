@@ -24,7 +24,8 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
 | `timeout_minutes` | Integer | `10` | Maximum time per task in minutes |
 | `branch_mode` | String | `multi` | Branch strategy: `single` or `multi` |
-| `max_turns` | Integer | `50` | Maximum conversation turns per task |
+| `max_steps` | Integer | `50` | Maximum conversation steps per task (preferred) |
+| `max_turns` | Integer | `50` | Legacy alias for `max_steps` |
 | `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
 | `provider` | String | `claude` | AI provider: `claude`, `codex`, or `gemini` |
@@ -191,7 +192,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `task`, `explore`, `plan`, `implement`, `review`, `improve`
+Valid task types: `explore`, `plan`, `implement`, `review`, `improve`
 
 Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
 
@@ -370,7 +371,7 @@ gza add [prompt] [options]
 |--------|-------------|
 | `prompt` | Task prompt (opens $EDITOR if not provided) |
 | `--edit`, `-e` | Open $EDITOR to write the prompt |
-| `--type TYPE` | Set task type: `task`\|`explore`\|`plan`\|`implement`\|`review`\|`improve` |
+| `--type TYPE` | Set task type: `explore`\|`plan`\|`implement`\|`review`\|`improve` (default: `implement`) |
 | `--branch-type TYPE` | Set branch type hint for naming |
 | `--explore` | Create explore task (shorthand) |
 | `--group NAME` | Set task group |
@@ -380,6 +381,9 @@ gza add [prompt] [options]
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
 | `--prompt-file FILE` | Read prompt from file (for non-interactive use) |
+| `--model MODEL` | Override model for this task (e.g., `claude-3-5-haiku-latest`) |
+| `--provider PROVIDER` | Override provider for this task (`claude`, `codex`, or `gemini`) |
+| `--no-learnings` | Skip injecting `.gza/learnings.md` context into this task's prompt |
 
 ### edit
 
@@ -510,12 +514,20 @@ gza import [file] [options]
 | `--dry-run` | Preview without creating tasks |
 | `--force`, `-f` | Skip duplicate detection |
 
-### status
+### group
 
-Show tasks in a group.
+Show tasks in a specific group.
 
 ```bash
-gza status <group>
+gza group <group>
+```
+
+### status
+
+List running workers (alias for `ps`).
+
+```bash
+gza status
 ```
 
 ### ps
@@ -788,6 +800,117 @@ gza next [options]
 
 Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
 
+### implement
+
+Create an implementation task from a completed plan task.
+
+```bash
+gza implement <plan_task_id> [prompt] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `plan_task_id` | Completed plan task ID to implement |
+| `prompt` | Implementation prompt (defaults to plan-derived prompt) |
+| `--review` | Auto-create review task on completion |
+| `--group NAME` | Set task group |
+| `--depends-on ID` | Set dependency on another task |
+| `--same-branch` | Continue on depends_on task's branch instead of creating new |
+| `--branch-type TYPE` | Set branch type hint for branch naming |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
+| `--no-learnings` | Skip injecting learnings context |
+| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+
+### advance
+
+Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and resuming failed tasks.
+
+```bash
+gza advance [task_id] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Specific task ID to advance (omit to advance all eligible) |
+| `--dry-run` | Preview actions without executing them |
+| `--max N` | Limit the number of tasks to advance |
+| `--no-docker` | Run workers directly instead of in Docker |
+| `--plans` | List completed plans with no implementation task yet |
+| `--create` | With `--plans`: create queued implement tasks for listed plans |
+| `--auto`, `-y` | Skip confirmation and execute immediately |
+| `--batch B` | Stop after spawning B background workers |
+| `--no-resume-failed` | Skip auto-resume of failed tasks |
+| `--max-resume-attempts N` | Override max_resume_attempts config value |
+| `--max-review-cycles N` | Override max_review_cycles config value |
+| `--new` | Start new pending tasks to fill remaining `--batch` slots (requires `--batch`) |
+| `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |
+| `--squash-threshold N` | Squash-merge branches with N or more commits (0 disables) |
+
+### iterate
+
+Run an automated review/improve cycle for an implementation task. Alias: `cycle`.
+
+```bash
+gza iterate <impl_task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `impl_task_id` | Implementation task ID to cycle |
+| `--max-iterations N` | Maximum review/improve iterations (default: 3) |
+| `--dry-run` | Preview what would happen without executing |
+| `--continue` | Resume an existing active cycle |
+| `--no-docker` | Run Claude directly instead of in Docker |
+
+### learnings
+
+Manage project learnings accumulated from completed tasks.
+
+```bash
+gza learnings show
+gza learnings update
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `show` | Display the current learnings file |
+| `update` | Regenerate learnings from recent completed tasks |
+
+### refresh
+
+Refresh cached diff stats for unmerged tasks.
+
+```bash
+gza refresh [task_id] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Task ID to refresh (omit to refresh all unmerged tasks) |
+| `--include-failed` | Also refresh failed tasks that have branches |
+
+### set-status
+
+Manually force a task's status.
+
+```bash
+gza set-status <task_id> <status>
+```
+
+Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
+
+### sync-report
+
+Sync report file content from disk into the database `output_content` field. Useful when report files have been edited manually.
+
+```bash
+gza sync-report <task_id>
+```
+
 ---
 
 ## Task Types
@@ -796,10 +919,9 @@ Gza supports several task types, each with distinct behavior:
 
 | Type | Purpose | Output Location |
 |------|---------|-----------------|
-| `task` | General work (default) | Code changes on branch |
 | `explore` | Research and investigation | `.gza/explorations/{task_id}.md` |
 | `plan` | Design and architecture | `.gza/plans/{task_id}.md` |
-| `implement` | Build per a plan | Code changes on branch |
+| `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
 
@@ -835,6 +957,8 @@ Tasks move through these states:
 ```
 pending → in_progress → completed
                      ↘ failed
+
+Any state can be manually set to `dropped` via `gza set-status`.
 ```
 
 | State | Description |
@@ -843,6 +967,7 @@ pending → in_progress → completed
 | `in_progress` | A worker is currently executing the task |
 | `completed` | Task finished successfully |
 | `failed` | Task encountered an error or timed out |
+| `dropped` | Task was manually dropped (via `gza set-status`) |
 
 **Recovering from failures:**
 
@@ -851,7 +976,7 @@ pending → in_progress → completed
 
 **Dependencies:**
 
-Tasks with `depends_on` set will remain pending until their dependency completes. Use `gza status <group>` to see dependency chains.
+Tasks with `depends_on` set will remain pending until their dependency completes. Use `gza group <group>` to see dependency chains.
 
 ---
 

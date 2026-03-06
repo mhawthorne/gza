@@ -31,13 +31,16 @@ Practical examples showing common workflows with Gza.
 
 | Task | Command |
 |------|---------|
-| Add simple task | `gza add "prompt"` |
+| Add task | `gza add "prompt"` |
 | Add plan task | `gza add --type plan "prompt"` |
-| Add implementation | `gza add --type implement --based-on <plan_id> "prompt"` |
+| Implement a plan | `gza implement <plan_id>` |
 | Add with spec | `gza add --spec specs/design.md "prompt"` |
 | Run specific task | `gza work <task_id>` |
 | Run next task | `gza work` |
 | Run in background | `gza work --background` |
+| Advance all tasks | `gza advance --dry-run` |
+| Advance (execute) | `gza advance --auto --batch 3` |
+| Review/improve cycle | `gza iterate <impl_id>` |
 | View pending | `gza next` |
 | View running workers | `gza ps` |
 | Tail worker logs | `gza log -w <worker_id> -f` |
@@ -51,6 +54,8 @@ Practical examples showing common workflows with Gza.
 | Rebase a branch | `gza rebase <task_id>` |
 | Create PR | `gza pr <task_id>` |
 | Merge to main | `gza merge <task_id> --squash` |
-| View group status | `gza status <group>` |
+| View group tasks | `gza group <group>` |
 | View history | `gza history` |
 | View stats | `gza stats` |
+| Manage learnings | `gza learnings show` |
+| Set task status | `gza set-status <task_id> dropped` |
