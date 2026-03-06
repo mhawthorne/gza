@@ -23,3 +23,19 @@ class TestParseReviewVerdict:
 
     def test_none_content(self) -> None:
         assert parse_review_verdict(None) is None
+
+    def test_canonical_structure_with_empty_must_fix_and_suggestions(self) -> None:
+        content = (
+            "## Summary\n\n"
+            "- Looks good overall.\n\n"
+            "## Must-Fix\n\n"
+            "None.\n\n"
+            "## Suggestions\n\n"
+            "None.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "No blockers found.\n"
+            "Verdict: APPROVED\n"
+        )
+        assert parse_review_verdict(content) == "APPROVED"

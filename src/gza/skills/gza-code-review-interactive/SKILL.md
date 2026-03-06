@@ -50,22 +50,28 @@ git diff main...HEAD
 **Step 3**: Write a structured review with these sections:
 
 ```markdown
-## Review Summary
+## Summary
 
 <1-2 sentence overview of the changes>
 
-## Must-Fix Issues
+## Must-Fix
 
-<Numbered list of issues that MUST be addressed before merging. If none, write "None found.">
+<Use ### M1, ### M2, ... for blockers. If none, write "None.">
+<Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
 
 ## Suggestions
 
-<Numbered list of non-blocking suggestions for improvement. If none, write "None.">
+<Use ### S1, ### S2, ... for non-blocking suggestions. If none, write "None.">
+<Each suggestion should include Suggestion: and Why it helps:. Evidence: is optional but encouraged.>
+
+## Questions / Assumptions
+
+<Bullet list of open questions/assumptions. If none, write "None.">
 
 ## Verdict
 
-<One of: APPROVED, CHANGES_REQUESTED, or NEEDS_DISCUSSION>
 <Brief justification>
+Verdict: APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION
 ```
 
 If a PR number is provided, post the review as a PR comment:

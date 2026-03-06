@@ -3602,6 +3602,27 @@ class TestGetReviewVerdict:
         store.update(task)
         assert get_review_verdict(config, task) is None
 
+    def test_canonical_structure_with_none_sections(self, tmp_path: Path):
+        """Parses canonical review format with explicit None. sections."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = (
+            "## Summary\n\n"
+            "- Reviewed the implementation.\n\n"
+            "## Must-Fix\n\n"
+            "None.\n\n"
+            "## Suggestions\n\n"
+            "None.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Ready to merge.\n"
+            "Verdict: APPROVED\n"
+        )
+        store.update(task)
+        assert get_review_verdict(config, task) == "APPROVED"
+
 
 class TestClearReviewState:
     """Tests for SqliteTaskStore.clear_review_state()."""
@@ -3647,4 +3668,3 @@ class TestClearReviewState:
         assert second.review_cleared_at is not None
         assert first_cleared is not None
         assert second.review_cleared_at > first_cleared
-

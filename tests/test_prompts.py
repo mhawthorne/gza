@@ -150,6 +150,18 @@ class TestPromptBuilderBuild:
         assert "APPROVED" in result
         assert "CHANGES_REQUESTED" in result
         assert "Verdict:" in result
+        assert "## Summary" in result
+        assert "## Must-Fix" in result
+        assert "## Suggestions" in result
+        assert "## Questions / Assumptions" in result
+        assert "## Verdict" in result
+        assert "write exactly: None." in result
+        assert "### M1" in result
+        assert "### S1" in result
+        assert "Evidence:" in result
+        assert "Impact:" in result
+        assert "Required fix:" in result
+        assert "Required tests:" in result
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
