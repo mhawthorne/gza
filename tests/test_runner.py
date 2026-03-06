@@ -3158,11 +3158,13 @@ class TestWriteLogEntry:
         assert json.loads(lines[0]) == entry1
         assert json.loads(lines[1]) == entry2
 
-    def test_silently_suppresses_errors(self, tmp_path: Path) -> None:
-        """write_log_entry does not raise when the path is unwritable."""
+    def test_logs_warning_when_write_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """write_log_entry logs a warning and does not raise when writing fails."""
         bad_path = tmp_path / "nonexistent_dir" / "task.log"
-        # Should not raise
-        write_log_entry(bad_path, {"type": "gza", "message": "x"})
+        with caplog.at_level("WARNING"):
+            write_log_entry(bad_path, {"type": "gza", "message": "x"})
+
+        assert "Failed to write log entry" in caplog.text
 
 
 class TestExtractReviewVerdict:

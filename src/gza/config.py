@@ -1,6 +1,7 @@
 """Configuration for Gza."""
 
 import copy
+import logging
 import os
 import sys
 import warnings
@@ -12,6 +13,7 @@ import yaml
 APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -1000,6 +1002,11 @@ class Config:
             errors.append(str(e))
             return False, errors, warnings
         except Exception as e:
+            logger.error(
+                "Unexpected error while validating config at %s",
+                config_path,
+                exc_info=True,
+            )
             errors.append(f"Error reading file: {e}")
             return False, errors, warnings
 

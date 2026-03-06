@@ -1160,6 +1160,41 @@ class TestMergeStatus:
         assert impl_task.id in unmerged_ids
         assert improve_task.id not in unmerged_ids
 
+    def test_migrate_merge_status_logs_when_git_check_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
+        """Migration logs a warning and defaults to unmerged when git checks fail."""
+        from gza.db import migrate_merge_status
+        from gza.git import Git
+
+        class FakeGit(Git):
+            def __init__(self) -> None:
+                pass
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def branch_exists(self, branch: str) -> bool:
+                return True
+
+            def _run(self, *args, **kwargs):
+                raise RuntimeError("git failure")
+
+            def is_merged(self, source: str, target: str) -> bool:
+                return False
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Task with commits")
+        store.mark_completed(task, has_commits=True, branch="feature/test")
+        store.set_merge_status(task.id, None)
+
+        with caplog.at_level("WARNING"):
+            migrate_merge_status(store, FakeGit())
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.merge_status == "unmerged"
+        assert "Could not determine merge status" in caplog.text
+
     def test_migration_v9_to_v10_adds_merge_status_column(self, tmp_path: Path):
         """Migration from v9 to v10 adds merge_status column."""
         import sqlite3
