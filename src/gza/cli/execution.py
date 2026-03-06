@@ -297,7 +297,10 @@ def cmd_add(args: argparse.Namespace) -> int:
         task_type = "implement"
 
     # Validate task type
-    valid_types = ["explore", "plan", "implement", "review", "improve"]
+    valid_types = ["explore", "plan", "implement", "review"]
+    if task_type == "improve":
+        print("Error: Cannot create improve tasks directly. Use 'gza improve <task_id>' instead.")
+        return 1
     if task_type not in valid_types:
         print(f"Error: Invalid task type '{task_type}'. Must be one of: {', '.join(valid_types)}")
         return 1

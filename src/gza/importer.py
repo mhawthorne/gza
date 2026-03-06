@@ -108,9 +108,14 @@ def _parse_task(
 
     # Optional fields
     task_type = data.get("type", "implement")
-    if task_type not in ("explore", "plan", "implement", "review", "improve"):
+    if task_type == "improve":
         errors.append(ValidationError(
-            f"Invalid task type '{task_type}'. Must be: explore, plan, implement, review, improve",
+            f"Cannot import improve tasks directly. Use 'gza improve <task_id>' instead.",
+            task_index=index
+        ))
+    elif task_type not in ("explore", "plan", "implement", "review"):
+        errors.append(ValidationError(
+            f"Invalid task type '{task_type}'. Must be: explore, plan, implement, review",
             task_index=index
         ))
 
