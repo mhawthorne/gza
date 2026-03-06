@@ -387,7 +387,7 @@ class _LiveLogPrinter:
                 exit_code = item.get("exit_code")
                 if isinstance(aggregated_output, str) and aggregated_output.strip():
                     is_error = isinstance(exit_code, int) and exit_code != 0
-                    output = aggregated_output.strip()
+                    output = aggregated_output.strip("\n")
                     if len(output) > 200:
                         output = output[:200] + "..."
                     if is_error:
