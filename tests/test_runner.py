@@ -3228,6 +3228,22 @@ class TestExtractReviewVerdict:
     def test_no_verdict(self) -> None:
         assert _extract_review_verdict("Just some review text") is None
 
+    def test_canonical_review_structure_with_none_sections(self) -> None:
+        content = (
+            "## Summary\n\n"
+            "- Reviewed implementation and tests.\n\n"
+            "## Must-Fix\n\n"
+            "None.\n\n"
+            "## Suggestions\n\n"
+            "None.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "No blocking issues identified.\n"
+            "Verdict: APPROVED\n"
+        )
+        assert _extract_review_verdict(content) == "APPROVED"
+
 
 class TestSelectiveStaging:
     """Tests for selective staging (only stage files changed during provider run)."""
