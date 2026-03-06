@@ -18,6 +18,7 @@ from gza.runner import (
     BACKUP_DIR,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
+    _copy_learnings_to_worktree,
     _extract_review_verdict,
     backup_database,
     _compute_slug_override,
@@ -591,6 +592,63 @@ class TestSummaryDirectory:
         assert SUMMARY_DIR == ".gza/summaries"
 
 
+class TestCopyLearningsToWorktree:
+    """Tests for _copy_learnings_to_worktree."""
+
+    def test_copies_learnings_file(self, tmp_path: Path):
+        """Learnings file is copied from project .gza/ into worktree .gza/."""
+        project_dir = tmp_path / "project"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir()
+        worktree_dir.mkdir()
+
+        # Create learnings file in project
+        gza_dir = project_dir / ".gza"
+        gza_dir.mkdir()
+        (gza_dir / "learnings.md").write_text("- Use pytest fixtures")
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+
+        _copy_learnings_to_worktree(config, worktree_dir)
+
+        dst = worktree_dir / ".gza" / "learnings.md"
+        assert dst.exists()
+        assert dst.read_text() == "- Use pytest fixtures"
+
+    def test_noop_when_no_learnings_file(self, tmp_path: Path):
+        """No error when learnings file doesn't exist yet."""
+        project_dir = tmp_path / "project"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir()
+        worktree_dir.mkdir()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+
+        _copy_learnings_to_worktree(config, worktree_dir)
+
+        assert not (worktree_dir / ".gza" / "learnings.md").exists()
+
+    def test_creates_gza_dir_in_worktree(self, tmp_path: Path):
+        """.gza/ directory is created in worktree if it doesn't exist."""
+        project_dir = tmp_path / "project"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir()
+        worktree_dir.mkdir()
+
+        gza_dir = project_dir / ".gza"
+        gza_dir.mkdir()
+        (gza_dir / "learnings.md").write_text("content")
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+
+        assert not (worktree_dir / ".gza").exists()
+        _copy_learnings_to_worktree(config, worktree_dir)
+        assert (worktree_dir / ".gza").is_dir()
+
+
 class TestReviewTaskSlugGeneration:
     """Tests for review task slug generation."""
 
@@ -809,6 +867,93 @@ class TestReviewTaskSlugGeneration:
 
             # Verify failure code is returned
             assert exit_code == 1
+        finally:
+            gza.runner.run = original_run
+
+    def test_duplicate_in_progress_review_does_not_call_run(self, tmp_path: Path):
+        """Test that _create_and_run_review_task does not call run() for in_progress reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        store.update(impl_task)
+
+        # Create an in_progress review
+        review_task = store.add(
+            prompt="review add-user-authentication",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        store.mark_in_progress(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        run_calls = []
+
+        def mock_run(config, task_id):
+            run_calls.append(task_id)
+            return 0
+
+        import gza.runner
+        original_run = gza.runner.run
+        gza.runner.run = mock_run
+
+        try:
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            # Should succeed without calling run()
+            assert exit_code == 0
+            assert run_calls == [], "run() must not be called for an in_progress review"
+        finally:
+            gza.runner.run = original_run
+
+    def test_duplicate_pending_review_is_run_once(self, tmp_path: Path):
+        """Test that _create_and_run_review_task runs a pending duplicate review exactly once."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.task_id = "20260211-add-user-authentication"
+        store.update(impl_task)
+
+        # Create a pending review
+        review_task = store.add(
+            prompt="review add-user-authentication",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        # review_task is pending by default
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        run_calls = []
+
+        def mock_run(config, task_id):
+            run_calls.append(task_id)
+            return 0
+
+        import gza.runner
+        original_run = gza.runner.run
+        gza.runner.run = mock_run
+
+        try:
+            exit_code = _create_and_run_review_task(impl_task, config, store)
+
+            assert exit_code == 0
+            assert run_calls == [review_task.id], "run() must be called exactly once with the pending review"
         finally:
             gza.runner.run = original_run
 
@@ -3024,6 +3169,9 @@ class TestExtractReviewVerdict:
 
     def test_plain_verdict(self) -> None:
         assert _extract_review_verdict("Verdict: NEEDS_DISCUSSION") == "NEEDS_DISCUSSION"
+
+    def test_heading_verdict(self) -> None:
+        assert _extract_review_verdict("## Verdict\n\n**CHANGES_REQUESTED**\n") == "CHANGES_REQUESTED"
 
     def test_none_content(self) -> None:
         assert _extract_review_verdict(None) is None

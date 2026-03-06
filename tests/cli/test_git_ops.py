@@ -916,7 +916,7 @@ class TestRebaseCommand:
 
         # Mock the conflict resolution since we're just testing that the flag is accepted
         # and the basic flow works (we don't want to actually invoke Claude in tests)
-        with patch('gza.cli.invoke_claude_resolve', return_value=False):
+        with patch('gza.cli.invoke_provider_resolve', return_value=False):
             # This should succeed without conflicts (no --resolve needed, but flag should work)
             result = run_gza("rebase", str(task.id), "--resolve", "--project", str(tmp_path))
 
@@ -1098,9 +1098,9 @@ class TestDiffCommand:
 class TestRebaseHelpers:
     """Tests for rebase helper functions."""
 
-    def test_invoke_claude_resolve_uses_effective_codex_provider(self, tmp_path):
+    def test_invoke_provider_resolve_uses_effective_codex_provider(self, tmp_path):
         """Auto-resolve uses effective provider selection (codex override)."""
-        from gza.cli import invoke_claude_resolve
+        from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
         from types import SimpleNamespace
@@ -1116,7 +1116,7 @@ class TestRebaseHelpers:
             mock_provider.run.return_value = RunResult(exit_code=0)
             mock_get_provider.return_value = mock_provider
 
-            result = invoke_claude_resolve(task, "feature", "main", config)
+            result = invoke_provider_resolve(task, "feature", "main", config)
             assert result is True
             assert mock_get_provider.call_count == 1
             resolve_config = mock_get_provider.call_args.args[0]
@@ -1125,9 +1125,9 @@ class TestRebaseHelpers:
             mock_provider.run.assert_called_once()
             assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
 
-    def test_invoke_claude_resolve_uses_effective_gemini_provider(self, tmp_path):
+    def test_invoke_provider_resolve_uses_effective_gemini_provider(self, tmp_path):
         """Auto-resolve supports gemini provider selection from effective config."""
-        from gza.cli import invoke_claude_resolve
+        from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
         from types import SimpleNamespace
@@ -1143,7 +1143,7 @@ class TestRebaseHelpers:
             mock_provider.run.return_value = RunResult(exit_code=0)
             mock_get_provider.return_value = mock_provider
 
-            result = invoke_claude_resolve(task, "feature", "main", config)
+            result = invoke_provider_resolve(task, "feature", "main", config)
             assert result is True
             assert mock_get_provider.call_count == 1
             resolve_config = mock_get_provider.call_args.args[0]
@@ -1151,9 +1151,9 @@ class TestRebaseHelpers:
             mock_provider.run.assert_called_once()
             assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
 
-    def test_invoke_claude_resolve_fails_fast_when_skill_missing(self, tmp_path, capsys, monkeypatch):
+    def test_invoke_provider_resolve_fails_fast_when_skill_missing(self, tmp_path, capsys, monkeypatch):
         """Auto-resolve fails before provider run when runtime skill is missing and auto-install fails."""
-        from gza.cli import invoke_claude_resolve
+        from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -1165,7 +1165,7 @@ class TestRebaseHelpers:
 
         with patch("gza.cli.ensure_skill", return_value=False), \
              patch("gza.providers.get_provider") as mock_get_provider:
-            result = invoke_claude_resolve(task, "feature", "main", config)
+            result = invoke_provider_resolve(task, "feature", "main", config)
             assert result is False
             assert mock_get_provider.call_count == 0
 

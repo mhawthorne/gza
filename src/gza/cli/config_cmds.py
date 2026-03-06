@@ -395,9 +395,16 @@ def cmd_config(args: argparse.Namespace) -> int:
     effective_sources = _project_effective_source_map(effective, config.source_map)
 
     if args.json:
+        task_types = ["explore", "plan", "implement", "review", "improve", "learn"]
+        model_resolution = {}
+        for task_type in task_types:
+            provider = config.get_provider_for_task(task_type)
+            model = config.get_model_for_task(task_type, provider)
+            model_resolution[task_type] = {"provider": provider, "model": model}
         payload = {
             "effective": effective,
             "sources": effective_sources,
+            "model_resolution": model_resolution,
             "local_overrides_active": config.local_overrides_active,
             "local_override_file": (
                 config.local_override_path.name if config.local_override_path else None
@@ -408,14 +415,49 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     print("Effective Configuration")
     print("=" * 50)
+
+    # Show config file/directory sources with symlink detection
+    gza_dir = Path(args.project_dir) / ".gza"
+    if gza_dir.is_symlink():
+        print(f"Data dir: .gza -> {os.readlink(gza_dir)}")
+
+    base_path = Config.config_path(Path(args.project_dir))
+    if base_path.is_symlink():
+        print(f"Config: {base_path.name} -> {os.readlink(base_path)}")
+    else:
+        print(f"Config: {base_path.name}")
+
     if config.local_overrides_active and config.local_override_path:
-        print(f"Local overrides: active ({config.local_override_path.name})")
+        local_path = Config.local_config_path(Path(args.project_dir))
+        if local_path.is_symlink():
+            print(f"Local overrides: active ({local_path.name} -> {os.readlink(local_path)})")
+        else:
+            print(f"Local overrides: active ({local_path.name})")
     else:
         print("Local overrides: inactive")
     print()
-    for path, value in sorted(_flatten_dict(effective), key=lambda item: item[0]):
+    rows = sorted(_flatten_dict(effective), key=lambda item: item[0])
+    key_width = max((len(path) for path, _ in rows), default=0)
+    val_width = max((len(json.dumps(value)) for _, value in rows), default=0)
+    for path, value in rows:
         source = effective_sources.get(path, "default")
-        print(f"{path} = {json.dumps(value)} [{source}]")
+        print(f"{path:<{key_width}}  {json.dumps(value):<{val_width}}  [{source}]")
+
+    # Model resolution summary
+    print()
+    print("Model Resolution by Task Type")
+    print("=" * 50)
+    task_types = ["explore", "plan", "implement", "review", "improve", "learn"]
+    model_rows = []
+    for task_type in task_types:
+        provider = config.get_provider_for_task(task_type)
+        model = config.get_model_for_task(task_type, provider)
+        model_rows.append((task_type, provider, model or "(provider default)"))
+    type_width = max(len(r[0]) for r in model_rows)
+    prov_width = max(len(r[1]) for r in model_rows)
+    for task_type, provider, model_display in model_rows:
+        print(f"{task_type:<{type_width}}  {provider:<{prov_width}}  {model_display}")
+
     return 0
 
 

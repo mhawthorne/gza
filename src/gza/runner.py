@@ -16,6 +16,8 @@ from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
+from .review_verdict import parse_review_verdict
+from .review_tasks import DuplicateReviewError, create_review_task
 
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
@@ -134,20 +136,8 @@ REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
-    """Extract review verdict from markdown content."""
-    if not content:
-        return None
-    # Try two inline formats:
-    # 1. **Verdict: APPROVED** (bold wraps whole phrase)
-    # 2. **Verdict**: APPROVED (bold wraps only the label)
-    match = re.search(
-        r"\*{0,2}Verdict\*{0,2}:\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
-        content,
-        re.IGNORECASE,
-    )
-    if not match:
-        return None
-    return match.group(1).upper()
+    """Backward-compatible wrapper around the shared verdict parser."""
+    return parse_review_verdict(content)
 
 
 def backup_database(db_path: Path, project_dir: Path) -> None:
@@ -939,33 +929,18 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     Returns:
         Exit code from running the review task.
     """
-    # Create review task with slug derived from implementation task
-    # Extract slug from the completed task's task_id (format: YYYYMMDD-slug or YYYYMMDD-slug-N)
-    if completed_task.task_id:
-        # Remove date prefix (YYYYMMDD-) and any retry suffix (-N)
-        parts = completed_task.task_id.split('-', 1)
-        if len(parts) == 2:
-            slug = parts[1]  # Everything after the date
-            # Remove retry suffix if present
-            slug = re.sub(r'-\d+$', '', slug)
-            review_prompt = f"review {slug}"
-        else:
-            # Fallback if task_id format is unexpected
-            review_prompt = f"Review task #{completed_task.id}"
-    else:
-        # Fallback if task_id is not set
-        review_prompt = f"Review task #{completed_task.id}"
-
-    if not review_prompt.startswith("review ") and completed_task.prompt:
-        review_prompt += f": {completed_task.prompt[:100]}"
-
-    review_task = store.add(
-        prompt=review_prompt,
-        task_type="review",
-        depends_on=completed_task.id,
-        group=completed_task.group,
-        based_on=completed_task.based_on,  # Inherit based_on to find plan
-    )
+    try:
+        review_task = create_review_task(store, completed_task, prompt_mode="auto")
+    except DuplicateReviewError as e:
+        review_task = e.active_review
+        if review_task.status == "in_progress":
+            console.print(
+                f"\n[yellow]Review task #{review_task.id} is already in progress; skipping.[/yellow]"
+            )
+            return 0
+        console.print(
+            f"\n[yellow]Review task #{review_task.id} is already {review_task.status}; running it.[/yellow]"
+        )
 
     console.print(f"\n[bold cyan]=== Auto-created review task #{review_task.id} ===[/bold cyan]")
     console.print(f"Running review task...")
@@ -973,6 +948,23 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     # Run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     return run(config, task_id=review_task.id)
+
+
+def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
+    """Copy .gza/learnings.md into the worktree so the agent can read it.
+
+    The learnings file lives in config.project_dir/.gza/ which is gitignored
+    and not present in worktrees. The agent prompt references it as a relative
+    path, so it must exist in the worktree for the agent to find it.
+    """
+    import shutil
+
+    src = config.project_dir / ".gza" / "learnings.md"
+    if not src.exists():
+        return
+    dst_dir = worktree_path / ".gza"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst_dir / "learnings.md")
 
 
 def _hide_invalid_worktree_git_metadata_for_docker(task: Task, config: Config, worktree_path: Path) -> Path | None:
@@ -1432,6 +1424,9 @@ def _run_inner(
     if n_installed:
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
+    # Copy learnings file into worktree so the agent can read it
+    _copy_learnings_to_worktree(config, worktree_path)
+
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
 
@@ -1738,6 +1733,9 @@ def _run_non_code_task(
         n_installed = ensure_all_skills(skills_dir)
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
+
+        # Copy learnings file into worktree so the agent can read it
+        _copy_learnings_to_worktree(config, worktree_path)
 
         hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
 

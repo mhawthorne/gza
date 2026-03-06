@@ -320,6 +320,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     store = get_store(config)
     git = Git(config.project_dir)
     default_branch = git.default_branch()
+    print(f"On branch {git.current_branch()}")
 
     # Backfill merge_status for existing tasks if needed (one-time migration)
     if needs_merge_status_migration(store):
