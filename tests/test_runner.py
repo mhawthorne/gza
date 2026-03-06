@@ -18,6 +18,7 @@ from gza.runner import (
     BACKUP_DIR,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
+    _copy_learnings_to_worktree,
     _extract_review_verdict,
     backup_database,
     _compute_slug_override,
@@ -589,6 +590,63 @@ class TestSummaryDirectory:
     def test_summary_dir_constant_value(self):
         """Test that SUMMARY_DIR constant has the correct value."""
         assert SUMMARY_DIR == ".gza/summaries"
+
+
+class TestCopyLearningsToWorktree:
+    """Tests for _copy_learnings_to_worktree."""
+
+    def test_copies_learnings_file(self, tmp_path: Path):
+        """Learnings file is copied from project .gza/ into worktree .gza/."""
+        project_dir = tmp_path / "project"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir()
+        worktree_dir.mkdir()
+
+        # Create learnings file in project
+        gza_dir = project_dir / ".gza"
+        gza_dir.mkdir()
+        (gza_dir / "learnings.md").write_text("- Use pytest fixtures")
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+
+        _copy_learnings_to_worktree(config, worktree_dir)
+
+        dst = worktree_dir / ".gza" / "learnings.md"
+        assert dst.exists()
+        assert dst.read_text() == "- Use pytest fixtures"
+
+    def test_noop_when_no_learnings_file(self, tmp_path: Path):
+        """No error when learnings file doesn't exist yet."""
+        project_dir = tmp_path / "project"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir()
+        worktree_dir.mkdir()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+
+        _copy_learnings_to_worktree(config, worktree_dir)
+
+        assert not (worktree_dir / ".gza" / "learnings.md").exists()
+
+    def test_creates_gza_dir_in_worktree(self, tmp_path: Path):
+        """.gza/ directory is created in worktree if it doesn't exist."""
+        project_dir = tmp_path / "project"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir()
+        worktree_dir.mkdir()
+
+        gza_dir = project_dir / ".gza"
+        gza_dir.mkdir()
+        (gza_dir / "learnings.md").write_text("content")
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+
+        assert not (worktree_dir / ".gza").exists()
+        _copy_learnings_to_worktree(config, worktree_dir)
+        assert (worktree_dir / ".gza").is_dir()
 
 
 class TestReviewTaskSlugGeneration:

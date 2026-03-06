@@ -950,6 +950,23 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     return run(config, task_id=review_task.id)
 
 
+def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
+    """Copy .gza/learnings.md into the worktree so the agent can read it.
+
+    The learnings file lives in config.project_dir/.gza/ which is gitignored
+    and not present in worktrees. The agent prompt references it as a relative
+    path, so it must exist in the worktree for the agent to find it.
+    """
+    import shutil
+
+    src = config.project_dir / ".gza" / "learnings.md"
+    if not src.exists():
+        return
+    dst_dir = worktree_path / ".gza"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst_dir / "learnings.md")
+
+
 def _hide_invalid_worktree_git_metadata_for_docker(task: Task, config: Config, worktree_path: Path) -> Path | None:
     """Temporarily hide invalid worktree .git metadata for Docker review runs.
 
@@ -1407,6 +1424,9 @@ def _run_inner(
     if n_installed:
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
+    # Copy learnings file into worktree so the agent can read it
+    _copy_learnings_to_worktree(config, worktree_path)
+
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
 
@@ -1713,6 +1733,9 @@ def _run_non_code_task(
         n_installed = ensure_all_skills(skills_dir)
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
+
+        # Copy learnings file into worktree so the agent can read it
+        _copy_learnings_to_worktree(config, worktree_path)
 
         hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
 
