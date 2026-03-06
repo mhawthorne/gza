@@ -1182,8 +1182,15 @@ class TestReviewNextSteps:
             assert f"gza improve {impl_task.id}" in all_output
             assert f"gza improve {impl_task.id} --run" not in all_output
 
-    def test_review_completion_prints_verdict(self, tmp_path: Path):
-        """Completed review output should print parsed review verdict."""
+    @pytest.mark.parametrize(
+        ("report_content", "expected_verdict"),
+        [
+            ("# Review\n\nVerdict: CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+            ("# Review\n\n## Verdict\n\n**NEEDS_DISCUSSION**\n", "NEEDS_DISCUSSION"),
+        ],
+    )
+    def test_review_completion_prints_verdict(self, tmp_path: Path, report_content: str, expected_verdict: str):
+        """Completed review output should print parsed verdict for inline and heading markdown formats."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -1230,7 +1237,7 @@ class TestReviewNextSteps:
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
         report_file = worktree_review_dir / f"{review_task.task_id}.md"
-        report_file.write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+        report_file.write_text(report_content)
 
         printed_lines: list[str] = []
 
@@ -1246,7 +1253,7 @@ class TestReviewNextSteps:
 
         assert exit_code == 0
         assert "Verdict: " in "\n".join(printed_lines)
-        assert "CHANGES_REQUESTED" in "\n".join(printed_lines)
+        assert expected_verdict in "\n".join(printed_lines)
 
     def test_non_review_task_does_not_suggest_improve(self, tmp_path: Path):
         """Test that explore/plan task completion does NOT suggest gza improve."""
@@ -3172,6 +3179,9 @@ class TestExtractReviewVerdict:
 
     def test_heading_verdict(self) -> None:
         assert _extract_review_verdict("## Verdict\n\n**CHANGES_REQUESTED**\n") == "CHANGES_REQUESTED"
+
+    def test_heading_verdict_without_bold_token(self) -> None:
+        assert _extract_review_verdict("### Verdict\n\nNEEDS_DISCUSSION\n") == "NEEDS_DISCUSSION"
 
     def test_none_content(self) -> None:
         assert _extract_review_verdict(None) is None
