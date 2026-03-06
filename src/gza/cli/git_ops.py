@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -24,9 +23,9 @@ from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task
 
 from gza._query import (
+    get_base_task_slug as _get_base_task_slug,
     get_reviews_for_root as _get_reviews_for_root_task,
     get_improves_for_root as _get_improves_for_root_task,
-    get_task_slug as _get_task_slug,
 )
 
 from ._common import (
@@ -39,23 +38,6 @@ from ._common import (
     _spawn_background_rebase_worker,
     _spawn_background_resume_worker,
 )
-
-
-def _extract_task_slug(task: DbTask) -> str | None:
-    """Return the *base* slug with any trailing revision suffix stripped.
-
-    Calls ``_get_task_slug`` to strip the leading date prefix, then removes a
-    trailing numeric revision suffix (e.g. 'my-feature-2' -> 'my-feature').
-    Use this when you want a canonical slug that matches across revisions of the
-    same task.
-
-    Use ``_get_task_slug`` instead when the exact, revision-preserving slug is
-    required (e.g. when matching against the literal task_id string).
-    """
-    full_slug = _get_task_slug(task)
-    if full_slug is None:
-        return None
-    return re.sub(r"-\d+$", "", full_slug)
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -1165,7 +1147,7 @@ def _cmd_advance_plans(
         if dry_run:
             print(f"[dry-run] Would create implement task for plan #{plan.id}")
             continue
-        slug = _extract_task_slug(plan)
+        slug = _get_base_task_slug(plan)
         prompt_text = f"Implement plan from task #{plan.id}: {slug}" if slug else f"Implement plan from task #{plan.id}"
         impl_task = store.add(
             prompt=prompt_text,
@@ -1618,7 +1600,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         elif action_type == 'create_implement':
             # Create an implement task for a completed plan and spawn a worker
-            slug = _extract_task_slug(task)
+            slug = _get_base_task_slug(task)
             prompt_text = f"Implement plan from task #{task.id}: {slug}" if slug else f"Implement plan from task #{task.id}"
             impl_task = store.add(
                 prompt=prompt_text,

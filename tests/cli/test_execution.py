@@ -1174,6 +1174,31 @@ class TestImplementCommand:
         assert impl_task.prompt == "Implement plan from task #1: plan-auth-migration"
         assert impl_task.based_on == plan_task.id
 
+    def test_implement_derives_prompt_from_base_plan_slug_when_retry_suffix_present(self, tmp_path: Path):
+        """Implement command strips numeric retry suffix from plan slug."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        plan_task.task_id = "20260226-plan-auth-migration-2"
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(timezone.utc)
+        store.update(plan_task)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created implement task #2" in result.stdout
+
+        impl_task = store.get(2)
+        assert impl_task is not None
+        assert impl_task.prompt == "Implement plan from task #1: plan-auth-migration"
+        assert impl_task.based_on == plan_task.id
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
@@ -3647,4 +3672,3 @@ class TestClearReviewState:
         assert second.review_cleared_at is not None
         assert first_cleared is not None
         assert second.review_cleared_at > first_cleared
-

@@ -3716,6 +3716,8 @@ class TestAdvanceAutoPlans:
         self._setup_git_repo(tmp_path)
 
         plan = self._create_completed_plan(store, "Design auth system")
+        plan.task_id = "20260305-design-auth-system-2"
+        store.update(plan)
 
         spawn_calls = []
 
@@ -3747,6 +3749,7 @@ class TestAdvanceAutoPlans:
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 1
         assert impl_tasks[0].based_on == plan.id
+        assert impl_tasks[0].prompt == f"Implement plan from task #{plan.id}: design-auth-system"
 
     def test_advance_skips_plan_with_existing_implement(self, tmp_path: Path):
         """advance skips a completed plan that already has an implement child.
@@ -4151,4 +4154,3 @@ class TestRefreshCommand:
 
         assert result.returncode == 0
         assert "Refreshed 2 task(s)" in result.stdout
-

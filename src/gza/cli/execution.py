@@ -2,17 +2,16 @@
 
 import argparse
 import os
-import re
 import signal
 import sys
 import time
 from datetime import datetime, timezone
 
+from .._query import get_base_task_slug as _get_base_task_slug
 from ..config import Config
 from ..console import format_duration
 from ..db import (
     SqliteTaskStore,
-    Task as DbTask,
     TaskCycle,
     add_task_interactive,
     edit_task_interactive,
@@ -35,7 +34,7 @@ from ._common import (
     get_store,
 )
 
-from ._common import _get_task_slug, _run_as_worker
+from ._common import _run_as_worker
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
@@ -210,23 +209,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise
 
 
-def _extract_task_slug(task: DbTask) -> str | None:
-    """Return the *base* slug with any trailing revision suffix stripped.
-
-    Calls ``_get_task_slug`` to strip the leading date prefix, then removes a
-    trailing numeric revision suffix (e.g. 'my-feature-2' -> 'my-feature').
-    Use this when you want a canonical slug that matches across revisions of the
-    same task.
-
-    Use ``_get_task_slug`` instead when the exact, revision-preserving slug is
-    required (e.g. when matching against the literal task_id string).
-    """
-    full_slug = _get_task_slug(task)
-    if full_slug is None:
-        return None
-    return re.sub(r"-\d+$", "", full_slug)
-
-
 def cmd_implement(args: argparse.Namespace) -> int:
     """Create an implementation task from a completed plan task and run it."""
     config = Config.load(args.project_dir)
@@ -253,7 +235,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
 
     prompt = args.prompt
     if not prompt:
-        slug = _extract_task_slug(plan_task)
+        slug = _get_base_task_slug(plan_task)
         if slug:
             prompt = f"Implement plan from task #{plan_task.id}: {slug}"
         else:
