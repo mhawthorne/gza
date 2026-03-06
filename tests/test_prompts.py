@@ -399,6 +399,61 @@ class TestVerifyCommandConfig:
         assert not any("verify_command" in w for w in warnings)
 
 
+class TestReviewDiffThresholdConfig:
+    """Tests for review diff/context threshold fields in Config."""
+
+    def test_review_thresholds_loaded_from_yaml(self, tmp_path: Path):
+        """review diff/context threshold fields are loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "review_diff_small_threshold: 111\n"
+            "review_diff_medium_threshold: 222\n"
+            "review_context_file_limit: 7\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.review_diff_small_threshold == 111
+        assert config.review_diff_medium_threshold == 222
+        assert config.review_context_file_limit == 7
+
+    def test_review_thresholds_have_defaults(self, tmp_path: Path):
+        """review threshold fields use defaults when omitted."""
+        from gza.config import (
+            Config,
+            DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
+            DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
+            DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
+        )
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("project_name: testproject\n")
+
+        config = Config.load(tmp_path)
+        assert config.review_diff_small_threshold == DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
+        assert config.review_diff_medium_threshold == DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
+        assert config.review_context_file_limit == DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+
+    def test_review_thresholds_validation_rejects_invalid_values(self, tmp_path: Path):
+        """validate rejects non-positive values and invalid ordering."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "review_diff_small_threshold: 10\n"
+            "review_diff_medium_threshold: 5\n"
+            "review_context_file_limit: 0\n"
+        )
+
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("review_diff_medium_threshold" in e for e in errors)
+        assert any("review_context_file_limit" in e for e in errors)
+
+
 class TestVerifyCommandInjection:
     """Tests for verify_command injection into prompts."""
 

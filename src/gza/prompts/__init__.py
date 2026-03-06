@@ -84,7 +84,7 @@ class PromptBuilder:
         # Add context from based_on chain (walk up the chain to find plan tasks)
         if task.based_on or task.task_type in ("implement", "review"):
             from gza.runner import _build_context_from_chain
-            context = _build_context_from_chain(task, store, config.project_dir, git)
+            context = _build_context_from_chain(task, store, config.project_dir, git, config=config)
             if context:
                 base_prompt += "\n\n" + context
 
