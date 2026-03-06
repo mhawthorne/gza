@@ -1,6 +1,6 @@
 # OpenAI Codex Provider
 
-> **Status: Aspirational** - This spec describes a planned provider integration. The Codex provider has not been implemented yet.
+> **Status: Implemented** - Full CodexProvider exists at `src/gza/providers/codex.py` with Docker config, pricing, event parsing, and OAuth/API key authentication.
 
 Add support for OpenAI's Codex CLI as an alternative coding agent provider.
 

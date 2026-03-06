@@ -1,5 +1,7 @@
 # Review-Improve Loop
 
+> **Implementation note:** The actual implementation uses a `TaskCycle` / `TaskCycleIteration` pattern with separate review and improve tasks tracked in `task_cycles` and `task_cycle_iterations` tables, rather than the single-task `_run_with_auto_review()` approach described below. The CLI entry points are `gza iterate <impl_id>` and `gza advance`. See `src/gza/db.py` (TaskCycle, TaskCycleIteration dataclasses) and `src/gza/cli/execution.py` for the actual implementation. The `max_review_cycles` config and `cycle_id`/`cycle_role` fields on Task are implemented as described.
+
 ## Overview
 
 This spec describes an automated review-improve loop that iterates until a review passes or a maximum cycle count is reached. This builds on the `improve` task type but internalizes the loop within a single task execution.
