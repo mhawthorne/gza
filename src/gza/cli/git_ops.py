@@ -1627,9 +1627,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print()
 
     # --new: start pending tasks to fill remaining batch slots
+    new_started = 0
     if new_mode and batch_limit is not None and workers_started < batch_limit:
         remaining = batch_limit - workers_started
-        new_started = 0
         for _ in range(remaining):
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
@@ -1642,11 +1642,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
             workers_started += 1
         if new_started > 0:
             console.print(f"[green]Started {new_started} new pending task(s) to fill batch[/green]")
-            success_count += new_started
 
     parts = []
     if success_count:
         parts.append(f"[green]{success_count} advanced[/green]")
+    if new_started > 0:
+        parts.append(f"[green]{new_started} new[/green]")
     if skip_count:
         parts.append(f"[yellow]{skip_count} skipped[/yellow]")
     if error_count:
