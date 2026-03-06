@@ -155,6 +155,7 @@ class TestPromptBuilderBuild:
         assert "## Suggestions" in result
         assert "## Questions / Assumptions" in result
         assert "## Verdict" in result
+        assert "Do not rename, omit, or reorder these sections." in result
         assert "write exactly: None." in result
         assert "### M1" in result
         assert "### S1" in result
@@ -162,6 +163,21 @@ class TestPromptBuilderBuild:
         assert "Impact:" in result
         assert "Required fix:" in result
         assert "Required tests:" in result
+
+    def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
+        """Test interactive review skill scaffolding matches canonical Summary requirements."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-code-review-interactive"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert "<Provide 3-5 bullets summarizing the review>" in content
+        assert "<1-2 sentence overview of the changes>" not in content
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""

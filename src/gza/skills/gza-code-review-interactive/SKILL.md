@@ -52,7 +52,7 @@ git diff main...HEAD
 ```markdown
 ## Summary
 
-<1-2 sentence overview of the changes>
+<Provide 3-5 bullets summarizing the review>
 
 ## Must-Fix
 
