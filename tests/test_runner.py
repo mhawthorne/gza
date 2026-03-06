@@ -259,6 +259,43 @@ class TestReviewContextFromChain:
         assert "Targeted diff excerpts" in context
         assert "Additional changed files not expanded inline" not in context
 
+    def test_review_context_uses_configurable_thresholds_and_file_limit(self, tmp_path: Path):
+        """Review context should honor config-driven diff thresholds and excerpt file cap."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement configurable thresholds", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test/config-thresholds-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review configurable thresholds implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            review_diff_small_threshold=1,
+            review_diff_medium_threshold=2,
+            review_context_file_limit=1,
+        )
+
+        mock_git = Mock(spec=Git)
+        mock_git.default_branch.return_value = "main"
+        # total_lines=3 should be treated as large with thresholds above
+        mock_git.get_diff_numstat.return_value = "2\t1\tsrc/a.py\n0\t0\tsrc/b.py\n"
+        mock_git.get_diff_stat.return_value = " 2 files changed, 2 insertions(+), 1 deletion(-)"
+        mock_git._run.return_value = Mock(stdout="diff --git a/src/a.py b/src/a.py\n@@ ...", returncode=0)
+
+        context = _build_context_from_chain(review_task, store, tmp_path, mock_git, config=config)
+
+        assert "Targeted diff excerpts" in context
+        assert "Additional changed files not expanded inline: 1" in context
+        mock_git.get_diff.assert_not_called()
+
     def test_review_context_includes_compact_improve_lineage(self, tmp_path: Path):
         """Review context includes compact summaries for prior improve runs."""
         db_path = tmp_path / "test.db"
