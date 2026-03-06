@@ -1,6 +1,7 @@
 """Configuration for Gza."""
 
 import copy
+import logging
 import os
 import sys
 import warnings
@@ -12,6 +13,7 @@ import yaml
 APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -44,6 +46,9 @@ DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_CLEANUP_DAYS = 30
+DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
+DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
+DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -94,6 +99,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
     "cleanup_days": None,
+    "review_diff_small_threshold": None,
+    "review_diff_medium_threshold": None,
+    "review_context_file_limit": None,
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
@@ -284,6 +292,9 @@ class Config:
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
+    review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
+    review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
+    review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -479,6 +490,7 @@ class Config:
             "interactive_worktree_dir",
             "merge_squash_threshold",
             "cleanup_days",
+            "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -938,6 +950,38 @@ class Config:
                 raise ConfigError("GZA_CLEANUP_DAYS must be a positive integer")
             source_map["cleanup_days"] = "env"
 
+        try:
+            review_diff_small_threshold = int(
+                data.get("review_diff_small_threshold", DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("review_diff_small_threshold must be a positive integer")
+        if review_diff_small_threshold < 1:
+            raise ConfigError("review_diff_small_threshold must be a positive integer")
+
+        try:
+            review_diff_medium_threshold = int(
+                data.get("review_diff_medium_threshold", DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("review_diff_medium_threshold must be a positive integer")
+        if review_diff_medium_threshold < 1:
+            raise ConfigError("review_diff_medium_threshold must be a positive integer")
+
+        if review_diff_medium_threshold < review_diff_small_threshold:
+            raise ConfigError(
+                "review_diff_medium_threshold must be greater than or equal to review_diff_small_threshold"
+            )
+
+        try:
+            review_context_file_limit = int(
+                data.get("review_context_file_limit", DEFAULT_REVIEW_CONTEXT_FILE_LIMIT)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("review_context_file_limit must be a positive integer")
+        if review_context_file_limit < 1:
+            raise ConfigError("review_context_file_limit must be a positive integer")
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -969,6 +1013,9 @@ class Config:
             interactive_worktree_dir=interactive_worktree_dir,
             merge_squash_threshold=merge_squash_threshold,
             cleanup_days=cleanup_days,
+            review_diff_small_threshold=review_diff_small_threshold,
+            review_diff_medium_threshold=review_diff_medium_threshold,
+            review_context_file_limit=review_context_file_limit,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
@@ -1000,6 +1047,11 @@ class Config:
             errors.append(str(e))
             return False, errors, warnings
         except Exception as e:
+            logger.error(
+                "Unexpected error while validating config at %s",
+                config_path,
+                exc_info=True,
+            )
             errors.append(f"Error reading file: {e}")
             return False, errors, warnings
 
@@ -1015,6 +1067,8 @@ class Config:
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
             "interactive_worktree_dir",
             "merge_squash_threshold",
+            "cleanup_days",
+            "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
         }
 
         for key in data.keys():
@@ -1162,6 +1216,33 @@ class Config:
 
         if "interactive_worktree_dir" in data and not isinstance(data["interactive_worktree_dir"], str):
             errors.append("'interactive_worktree_dir' must be a string")
+
+        if "review_diff_small_threshold" in data:
+            if not isinstance(data["review_diff_small_threshold"], int):
+                errors.append("'review_diff_small_threshold' must be an integer")
+            elif data["review_diff_small_threshold"] <= 0:
+                errors.append("'review_diff_small_threshold' must be positive")
+
+        if "review_diff_medium_threshold" in data:
+            if not isinstance(data["review_diff_medium_threshold"], int):
+                errors.append("'review_diff_medium_threshold' must be an integer")
+            elif data["review_diff_medium_threshold"] <= 0:
+                errors.append("'review_diff_medium_threshold' must be positive")
+
+        if "review_context_file_limit" in data:
+            if not isinstance(data["review_context_file_limit"], int):
+                errors.append("'review_context_file_limit' must be an integer")
+            elif data["review_context_file_limit"] <= 0:
+                errors.append("'review_context_file_limit' must be positive")
+
+        if (
+            isinstance(data.get("review_diff_small_threshold"), int)
+            and isinstance(data.get("review_diff_medium_threshold"), int)
+            and data["review_diff_medium_threshold"] < data["review_diff_small_threshold"]
+        ):
+            errors.append(
+                "'review_diff_medium_threshold' must be greater than or equal to 'review_diff_small_threshold'"
+            )
 
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             errors.append("'advance_create_reviews' must be a boolean (true/false)")

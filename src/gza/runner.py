@@ -1,6 +1,7 @@
 """Main Gza runner orchestration."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,7 +9,13 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import APP_NAME, Config
+from .config import (
+    APP_NAME,
+    Config,
+    DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
+    DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
+    DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
+)
 from .console import console, task_header, stats_line, success_message, error_message, info_line, next_steps
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
@@ -19,15 +26,17 @@ from .providers import get_provider, Provider, RunResult
 from .review_verdict import parse_review_verdict
 from .review_tasks import DuplicateReviewError, create_review_task
 
+logger = logging.getLogger(__name__)
+
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
-    """Append a JSONL entry to the task log file, silently suppressing errors."""
+    """Append a JSONL entry to the task log file."""
     try:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
             f.flush()
     except Exception:
-        pass
+        logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
 
 
 def _persist_run_steps_from_result(
@@ -128,9 +137,9 @@ WIP_DIR = f".{APP_NAME}/wip"
 BACKUP_DIR = f".{APP_NAME}/backups"
 
 # Diff size thresholds for tiered diff strategy in review prompts
-DIFF_SMALL_THRESHOLD = 500   # lines: pass verbatim
-DIFF_MEDIUM_THRESHOLD = 2000  # lines: prepend --stat summary above full diff
-REVIEW_CONTEXT_FILE_LIMIT = 12
+DIFF_SMALL_THRESHOLD = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
+DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
+REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 4
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 
@@ -489,7 +498,15 @@ def _parse_changed_files_from_numstat(numstat_output: str) -> list[str]:
     return changed_files
 
 
-def _build_review_diff_context(git: Git, revision_range: str, branch_name: str) -> str:
+def _build_review_diff_context(
+    git: Git,
+    revision_range: str,
+    branch_name: str,
+    *,
+    diff_small_threshold: int = DIFF_SMALL_THRESHOLD,
+    diff_medium_threshold: int = DIFF_MEDIUM_THRESHOLD,
+    review_context_file_limit: int = REVIEW_CONTEXT_FILE_LIMIT,
+) -> str:
     """Build self-contained review diff context for prompts."""
     numstat_output = git.get_diff_numstat(revision_range)
     if not isinstance(numstat_output, str):
@@ -520,7 +537,7 @@ def _build_review_diff_context(git: Git, revision_range: str, branch_name: str) 
         parts.append("Diff summary:")
         parts.append(stat_summary)
 
-    if total_lines < DIFF_SMALL_THRESHOLD:
+    if total_lines < diff_small_threshold:
         diff_content = git.get_diff(revision_range)
         if not isinstance(diff_content, str):
             diff_content = ""
@@ -530,7 +547,7 @@ def _build_review_diff_context(git: Git, revision_range: str, branch_name: str) 
             parts.append(diff_content)
         return "\n".join(parts)
 
-    if total_lines < DIFF_MEDIUM_THRESHOLD:
+    if total_lines < diff_medium_threshold:
         diff_content = git.get_diff(revision_range)
         if not isinstance(diff_content, str):
             diff_content = ""
@@ -541,7 +558,7 @@ def _build_review_diff_context(git: Git, revision_range: str, branch_name: str) 
         return "\n".join(parts)
 
     # Large diff: include targeted per-file diff excerpts for the most relevant files.
-    selected_files = changed_files[:REVIEW_CONTEXT_FILE_LIMIT]
+    selected_files = changed_files[:review_context_file_limit]
     if selected_files:
         excerpt_result = git._run(
             "diff",
@@ -568,9 +585,18 @@ def _build_review_diff_context(git: Git, revision_range: str, branch_name: str) 
     return "\n".join(parts)
 
 
-def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: Path, git: Git | None) -> str:
+def _build_context_from_chain(
+    task: Task,
+    store: SqliteTaskStore,
+    project_dir: Path,
+    git: Git | None,
+    config: Config | None = None,
+) -> str:
     """Build context by walking the depends_on and based_on chain."""
     context_parts = []
+
+    def _int_or_default(value: object, default: int) -> int:
+        return value if isinstance(value, int) else default
 
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":
@@ -622,7 +648,23 @@ def _build_context_from_chain(task: Task, store: SqliteTaskStore, project_dir: P
                         default_branch = git.default_branch()
                         revision_range = f"{default_branch}...{impl_task.branch}"
                         context_parts.append(
-                            _build_review_diff_context(git, revision_range, impl_task.branch)
+                            _build_review_diff_context(
+                                git,
+                                revision_range,
+                                impl_task.branch,
+                                diff_small_threshold=_int_or_default(
+                                    getattr(config, "review_diff_small_threshold", None),
+                                    DIFF_SMALL_THRESHOLD,
+                                ),
+                                diff_medium_threshold=_int_or_default(
+                                    getattr(config, "review_diff_medium_threshold", None),
+                                    DIFF_MEDIUM_THRESHOLD,
+                                ),
+                                review_context_file_limit=_int_or_default(
+                                    getattr(config, "review_context_file_limit", None),
+                                    REVIEW_CONTEXT_FILE_LIMIT,
+                                ),
+                            )
                         )
                     except GitError:
                         pass  # Ignore git errors
@@ -1374,7 +1416,7 @@ def _run_inner(
     # Write orchestration pre-run entries
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
 
     # Setup summary directory and path for task/implement types
     summary_dir = config.project_dir / SUMMARY_DIR
@@ -1653,7 +1695,7 @@ def _run_non_code_task(
 
     # Write orchestration pre-run entries
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
 
     # Setup report file based on task type
     if task.task_type == "explore":

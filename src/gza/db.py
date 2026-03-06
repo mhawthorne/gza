@@ -1,6 +1,7 @@
 """SQLite-based task storage."""
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Known failure reason categories
@@ -1337,16 +1340,19 @@ class SqliteTaskStore:
     def get_unmerged(self) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
 
-        Excludes improve tasks since they use same_branch=True and commit to
-        the implementation task's branch. The branch is merged when the
-        implementation task is merged.
+        Excludes improve tasks that have a parent (based_on) since they
+        use same_branch=True and commit to the implementation task's branch.
+        Standalone improve tasks with their own branch are included.
         """
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
                 WHERE merge_status = 'unmerged'
-                AND task_type != 'improve'
+                AND (
+                    task_type != 'improve'
+                    OR based_on IS NULL
+                )
                 ORDER BY completed_at DESC
                 """
             )
@@ -2262,6 +2268,13 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
                 else:
                     merge_status = "unmerged"
             except Exception:
+                logger.warning(
+                    "Could not determine merge status for task_id=%s branch=%s against %s; defaulting to 'unmerged'",
+                    task_id,
+                    branch,
+                    default_branch,
+                    exc_info=True,
+                )
                 merge_status = "unmerged"
 
         store.set_merge_status(task_id, merge_status)

@@ -1052,7 +1052,19 @@ def main() -> int:
     sync_report_parser.add_argument(
         "task_id",
         type=int,
-        help="Task ID to sync",
+        nargs="?",
+        default=None,
+        help="Task ID to sync (optional if --all is used)",
+    )
+    sync_report_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Sync all tasks that have report files on disk",
+    )
+    sync_report_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be synced without making changes",
     )
     add_common_args(sync_report_parser)
 

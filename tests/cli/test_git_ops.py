@@ -1884,6 +1884,94 @@ class TestAdvanceCommand:
         assert len(improve_tasks) == 1
         assert improve_tasks[0].task_type == "improve"
 
+    def test_advance_orchestrates_implement_review_improve_merge_in_local_repo(self, tmp_path: Path):
+        """advance orchestrates implement -> review -> improve -> merge in a local fixture repo."""
+        import argparse
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        git = self._setup_git_repo(tmp_path)
+        impl_task = self._create_implement_task_with_branch(
+            store,
+            git,
+            tmp_path,
+            prompt="Implement feature via advance workflow",
+        )
+        assert impl_task.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+        )
+
+        spawned_types: list[str] = []
+
+        def fake_spawn(worker_args, config, task_id):
+            task = store.get(task_id)
+            assert task is not None
+            spawned_types.append(task.task_type)
+
+            if task.task_type == "review":
+                # First review requests changes; second review approves.
+                completed_reviews = [
+                    r for r in store.get_reviews_for_task(impl_task.id)
+                    if r.status == "completed"
+                ]
+                if completed_reviews:
+                    verdict = "**Verdict: APPROVED**\n\nLooks good."
+                else:
+                    verdict = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix nits."
+                store.mark_completed(task, output_content=verdict)
+                return 0
+
+            if task.task_type == "improve":
+                store.mark_completed(task, output_content="Applied requested fixes.")
+                store.clear_review_state(impl_task.id)
+                return 0
+
+            raise AssertionError(f"Unexpected spawned task type: {task.task_type}")
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            # 1) implement -> create+run review (CHANGES_REQUESTED)
+            assert cmd_advance(args) == 0
+            reviews_after_first = store.get_reviews_for_task(impl_task.id)
+            assert len(reviews_after_first) == 1
+            assert reviews_after_first[0].status == "completed"
+            assert "CHANGES_REQUESTED" in (reviews_after_first[0].output_content or "")
+            assert store.get(impl_task.id).merge_status == "unmerged"
+
+            # 2) changes requested -> create+run improve
+            assert cmd_advance(args) == 0
+            first_review = store.get_reviews_for_task(impl_task.id)[0]
+            improves = store.get_improve_tasks_for(impl_task.id, first_review.id)
+            assert len(improves) == 1
+            assert improves[0].status == "completed"
+            assert store.get(impl_task.id).review_cleared_at is not None
+
+            # 3) improved code -> create+run re-review (APPROVED)
+            assert cmd_advance(args) == 0
+            reviews_after_second = store.get_reviews_for_task(impl_task.id)
+            assert len(reviews_after_second) == 2
+            assert "APPROVED" in (reviews_after_second[0].output_content or "")
+
+            # 4) approved review -> merge
+            assert cmd_advance(args) == 0
+
+        updated_impl = store.get(impl_task.id)
+        assert updated_impl is not None
+        assert updated_impl.merge_status == "merged"
+        assert git.is_merged(updated_impl.branch, "main")
+        assert (tmp_path / f"feat_{impl_task.id}.txt").exists()
+        assert spawned_types == ["review", "improve", "review"]
+
     def test_advance_single_task_id(self, tmp_path: Path):
         """advance with a specific task ID only advances that task."""
         from gza.db import SqliteTaskStore
@@ -3716,6 +3804,8 @@ class TestAdvanceAutoPlans:
         self._setup_git_repo(tmp_path)
 
         plan = self._create_completed_plan(store, "Design auth system")
+        plan.task_id = "20260305-design-auth-system-2"
+        store.update(plan)
 
         spawn_calls = []
 
@@ -3747,6 +3837,7 @@ class TestAdvanceAutoPlans:
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 1
         assert impl_tasks[0].based_on == plan.id
+        assert impl_tasks[0].prompt == f"Implement plan from task #{plan.id}: design-auth-system"
 
     def test_advance_skips_plan_with_existing_implement(self, tmp_path: Path):
         """advance skips a completed plan that already has an implement child.
@@ -4151,4 +4242,3 @@ class TestRefreshCommand:
 
         assert result.returncode == 0
         assert "Refreshed 2 task(s)" in result.stdout
-

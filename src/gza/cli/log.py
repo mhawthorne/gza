@@ -315,6 +315,7 @@ class _LiveLogPrinter:
                     if not isinstance(content, dict):
                         continue
                     if content.get("type") == "tool_use":
+                        console.print()
                         self._print_tool_use(content)
                     elif content.get("type") == "text":
                         text = content.get("text", "").strip()
@@ -335,7 +336,7 @@ class _LiveLogPrinter:
                         if is_error:
                             self._fmt.print_error(result)
                         else:
-                            console.print(f"  {rich_escape(result)}", style="dim", soft_wrap=True)
+                            console.print(rich_escape(result), style="dim", soft_wrap=True)
 
         elif entry_type == "gza":
             subtype = entry.get("subtype", "")
@@ -380,18 +381,19 @@ class _LiveLogPrinter:
                     self._fmt.print_agent_message(text.strip())
             elif item.get("type") == "command_execution":
                 command = item.get("command", "")
+                console.print()
                 self._fmt.print_tool_event("Bash", self._trunc(command, 80))
                 aggregated_output = item.get("aggregated_output", "")
                 exit_code = item.get("exit_code")
                 if isinstance(aggregated_output, str) and aggregated_output.strip():
                     is_error = isinstance(exit_code, int) and exit_code != 0
-                    output = aggregated_output.strip()
+                    output = aggregated_output.strip("\n")
                     if len(output) > 200:
                         output = output[:200] + "..."
                     if is_error:
                         self._fmt.print_error(output)
                     else:
-                        console.print(f"  {rich_escape(output)}", style="dim", soft_wrap=True)
+                        console.print(rich_escape(output), style="dim", soft_wrap=True)
 
         elif entry_type == "result":
             is_error = entry.get("is_error", False)

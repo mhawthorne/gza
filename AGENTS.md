@@ -130,14 +130,11 @@ verify_command: 'uv run mypy src/ && uv run pytest tests/ -x -q'
 
 Key modules:
 - `src/gza/db.py` - SQLite task storage with `Task` class (uses `prompt` field)
-- `src/gza/tasks.py` - YAML task storage with `Task` class (uses `description` field) - LEGACY
 - `src/gza/cli.py` - CLI commands
 - `src/gza/runner.py` - Executes tasks via Claude Code
 - `src/gza/config.py` - Configuration loading
 
-**Important**: There are TWO Task classes:
-- `db.Task` (SQLite) - The primary storage, uses `prompt` field
-- `tasks.Task` (YAML) - Legacy format for `tasks.yaml` files, uses `description` field
+**Important**: `db.Task` is the single canonical task model/storage API.
 
 ## Running in Docker
 
@@ -154,7 +151,7 @@ Gza tasks run inside a Docker container. The container:
 
 When renaming a field across the codebase:
 1. Use search-and-replace across files rather than editing one occurrence at a time
-2. Check both `tasks.py` and `db.py` for Task-related changes
+2. Check `db.py` and all call sites for Task-related changes
 3. Update tests in bulk, not one test method at a time
 
 ## Code Reuse

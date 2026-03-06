@@ -150,6 +150,34 @@ class TestPromptBuilderBuild:
         assert "APPROVED" in result
         assert "CHANGES_REQUESTED" in result
         assert "Verdict:" in result
+        assert "## Summary" in result
+        assert "## Must-Fix" in result
+        assert "## Suggestions" in result
+        assert "## Questions / Assumptions" in result
+        assert "## Verdict" in result
+        assert "Do not rename, omit, or reorder these sections." in result
+        assert "write exactly: None." in result
+        assert "### M1" in result
+        assert "### S1" in result
+        assert "Evidence:" in result
+        assert "Impact:" in result
+        assert "Required fix:" in result
+        assert "Required tests:" in result
+
+    def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
+        """Test interactive review skill scaffolding matches canonical Summary requirements."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-code-review-interactive"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert "<Provide 3-5 bullets summarizing the review>" in content
+        assert "<1-2 sentence overview of the changes>" not in content
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
@@ -397,6 +425,61 @@ class TestVerifyCommandConfig:
         is_valid, errors, warnings = Config.validate(tmp_path)
         assert is_valid
         assert not any("verify_command" in w for w in warnings)
+
+
+class TestReviewDiffThresholdConfig:
+    """Tests for review diff/context threshold fields in Config."""
+
+    def test_review_thresholds_loaded_from_yaml(self, tmp_path: Path):
+        """review diff/context threshold fields are loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "review_diff_small_threshold: 111\n"
+            "review_diff_medium_threshold: 222\n"
+            "review_context_file_limit: 7\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.review_diff_small_threshold == 111
+        assert config.review_diff_medium_threshold == 222
+        assert config.review_context_file_limit == 7
+
+    def test_review_thresholds_have_defaults(self, tmp_path: Path):
+        """review threshold fields use defaults when omitted."""
+        from gza.config import (
+            Config,
+            DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
+            DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
+            DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
+        )
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("project_name: testproject\n")
+
+        config = Config.load(tmp_path)
+        assert config.review_diff_small_threshold == DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
+        assert config.review_diff_medium_threshold == DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
+        assert config.review_context_file_limit == DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+
+    def test_review_thresholds_validation_rejects_invalid_values(self, tmp_path: Path):
+        """validate rejects non-positive values and invalid ordering."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "review_diff_small_threshold: 10\n"
+            "review_diff_medium_threshold: 5\n"
+            "review_context_file_limit: 0\n"
+        )
+
+        is_valid, errors, warnings = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("review_diff_medium_threshold" in e for e in errors)
+        assert any("review_context_file_limit" in e for e in errors)
 
 
 class TestVerifyCommandInjection:

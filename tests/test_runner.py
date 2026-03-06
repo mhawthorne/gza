@@ -259,6 +259,43 @@ class TestReviewContextFromChain:
         assert "Targeted diff excerpts" in context
         assert "Additional changed files not expanded inline" not in context
 
+    def test_review_context_uses_configurable_thresholds_and_file_limit(self, tmp_path: Path):
+        """Review context should honor config-driven diff thresholds and excerpt file cap."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement configurable thresholds", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test/config-thresholds-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review configurable thresholds implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            review_diff_small_threshold=1,
+            review_diff_medium_threshold=2,
+            review_context_file_limit=1,
+        )
+
+        mock_git = Mock(spec=Git)
+        mock_git.default_branch.return_value = "main"
+        # total_lines=3 should be treated as large with thresholds above
+        mock_git.get_diff_numstat.return_value = "2\t1\tsrc/a.py\n0\t0\tsrc/b.py\n"
+        mock_git.get_diff_stat.return_value = " 2 files changed, 2 insertions(+), 1 deletion(-)"
+        mock_git._run.return_value = Mock(stdout="diff --git a/src/a.py b/src/a.py\n@@ ...", returncode=0)
+
+        context = _build_context_from_chain(review_task, store, tmp_path, mock_git, config=config)
+
+        assert "Targeted diff excerpts" in context
+        assert "Additional changed files not expanded inline: 1" in context
+        mock_git.get_diff.assert_not_called()
+
     def test_review_context_includes_compact_improve_lineage(self, tmp_path: Path):
         """Review context includes compact summaries for prior improve runs."""
         db_path = tmp_path / "test.db"
@@ -1182,8 +1219,15 @@ class TestReviewNextSteps:
             assert f"gza improve {impl_task.id}" in all_output
             assert f"gza improve {impl_task.id} --run" not in all_output
 
-    def test_review_completion_prints_verdict(self, tmp_path: Path):
-        """Completed review output should print parsed review verdict."""
+    @pytest.mark.parametrize(
+        ("report_content", "expected_verdict"),
+        [
+            ("# Review\n\nVerdict: CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+            ("# Review\n\n## Verdict\n\n**NEEDS_DISCUSSION**\n", "NEEDS_DISCUSSION"),
+        ],
+    )
+    def test_review_completion_prints_verdict(self, tmp_path: Path, report_content: str, expected_verdict: str):
+        """Completed review output should print parsed verdict for inline and heading markdown formats."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -1230,7 +1274,7 @@ class TestReviewNextSteps:
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
         report_file = worktree_review_dir / f"{review_task.task_id}.md"
-        report_file.write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+        report_file.write_text(report_content)
 
         printed_lines: list[str] = []
 
@@ -1246,7 +1290,7 @@ class TestReviewNextSteps:
 
         assert exit_code == 0
         assert "Verdict: " in "\n".join(printed_lines)
-        assert "CHANGES_REQUESTED" in "\n".join(printed_lines)
+        assert expected_verdict in "\n".join(printed_lines)
 
     def test_non_review_task_does_not_suggest_improve(self, tmp_path: Path):
         """Test that explore/plan task completion does NOT suggest gza improve."""
@@ -3151,11 +3195,13 @@ class TestWriteLogEntry:
         assert json.loads(lines[0]) == entry1
         assert json.loads(lines[1]) == entry2
 
-    def test_silently_suppresses_errors(self, tmp_path: Path) -> None:
-        """write_log_entry does not raise when the path is unwritable."""
+    def test_logs_warning_when_write_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """write_log_entry logs a warning and does not raise when writing fails."""
         bad_path = tmp_path / "nonexistent_dir" / "task.log"
-        # Should not raise
-        write_log_entry(bad_path, {"type": "gza", "message": "x"})
+        with caplog.at_level("WARNING"):
+            write_log_entry(bad_path, {"type": "gza", "message": "x"})
+
+        assert "Failed to write log entry" in caplog.text
 
 
 class TestExtractReviewVerdict:
@@ -3173,11 +3219,30 @@ class TestExtractReviewVerdict:
     def test_heading_verdict(self) -> None:
         assert _extract_review_verdict("## Verdict\n\n**CHANGES_REQUESTED**\n") == "CHANGES_REQUESTED"
 
+    def test_heading_verdict_without_bold_token(self) -> None:
+        assert _extract_review_verdict("### Verdict\n\nNEEDS_DISCUSSION\n") == "NEEDS_DISCUSSION"
+
     def test_none_content(self) -> None:
         assert _extract_review_verdict(None) is None
 
     def test_no_verdict(self) -> None:
         assert _extract_review_verdict("Just some review text") is None
+
+    def test_canonical_review_structure_with_none_sections(self) -> None:
+        content = (
+            "## Summary\n\n"
+            "- Reviewed implementation and tests.\n\n"
+            "## Must-Fix\n\n"
+            "None.\n\n"
+            "## Suggestions\n\n"
+            "None.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "No blocking issues identified.\n"
+            "Verdict: APPROVED\n"
+        )
+        assert _extract_review_verdict(content) == "APPROVED"
 
 
 class TestSelectiveStaging:
