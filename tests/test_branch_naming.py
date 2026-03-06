@@ -332,6 +332,23 @@ branch_strategy: date_slug
         assert is_valid
         assert errors == []
 
+    def test_validate_logs_unexpected_load_error(self, tmp_path, monkeypatch, caplog):
+        """validate() logs unexpected config load failures with context."""
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("project_name: test\n")
+
+        def _boom(_project_dir):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(Config, "_load_merged_config_data", classmethod(lambda cls, project_dir: _boom(project_dir)))
+
+        with caplog.at_level("ERROR"):
+            is_valid, errors, _warnings = Config.validate(tmp_path)
+
+        assert is_valid is False
+        assert errors == ["Error reading file: boom"]
+        assert "Unexpected error while validating config" in caplog.text
+
     def test_custom_without_pattern(self, tmp_path):
         """Test that custom dict without pattern raises error."""
         config_file = tmp_path / "gza.yaml"

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..workers import WorkerMetadata, WorkerRegistry
 
 from ._common import TASK_COLORS, get_store, get_task_step_count
+
+logger = logging.getLogger(__name__)
 
 
 def _format_percentile_row(label: str, pdata: dict | None) -> str:
@@ -611,9 +614,14 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                                     if task.task_id:
                                         unmerged_task_ids.add(task.task_id)
                             except Exception:
-                                # Branch might not exist anymore, skip
-                                pass
+                                logger.warning(
+                                    "Failed to check merge state for task #%s branch=%s during cleanup",
+                                    task.id,
+                                    task.branch,
+                                    exc_info=True,
+                                )
                 except Exception as e:
+                    logger.warning("Could not collect unmerged tasks during cleanup", exc_info=True)
                     print(f"Warning: Could not fetch unmerged tasks: {e}", file=sys.stderr)
 
             for log_file in config.log_path.iterdir():

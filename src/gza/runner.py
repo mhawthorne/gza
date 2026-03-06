@@ -1,6 +1,7 @@
 """Main Gza runner orchestration."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -19,15 +20,17 @@ from .providers import get_provider, Provider, RunResult
 from .review_verdict import parse_review_verdict
 from .review_tasks import DuplicateReviewError, create_review_task
 
+logger = logging.getLogger(__name__)
+
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
-    """Append a JSONL entry to the task log file, silently suppressing errors."""
+    """Append a JSONL entry to the task log file."""
     try:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
             f.flush()
     except Exception:
-        pass
+        logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
 
 
 def _persist_run_steps_from_result(
