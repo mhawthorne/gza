@@ -25,13 +25,13 @@ uv tool install gza-agent
 
 ```bash
 # Add a task
-gza task add "Add input validation to the user registration form"
+gza add "Add input validation to the user registration form"
 
-# Start a worker
-gza worker start
+# Run it
+gza work
 
 # Check status
-gza task list
+gza ps
 ```
 
 ## Documentation

@@ -11,7 +11,8 @@ Gza isn't built for the "run for hours, build a large system, get smarter along 
 | Provider | Status | Description |
 |----------|--------|-------------|
 | [Claude Code](https://claude.ai/download) | **Supported** | Default provider |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | *Experimental* | Partially implemented, coming soon |
+| [OpenAI Codex](https://github.com/openai/codex) | **Supported** | Alternative provider |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | *Experimental* | Partially implemented |
 
 ## Dependencies
 

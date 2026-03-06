@@ -24,7 +24,7 @@ tasks:
     review: true
 
   - prompt: "Add API v2 integration tests"
-    type: task
+    type: implement
     depends_on: [2, 3]
 ```
 
@@ -42,7 +42,7 @@ Would create 5 tasks:
   3. [implement] Implement product endpoints for API v2
        depends_on: 1
        auto-creates review task
-  4. [task] Add API v2 integration tests
+  4. [implement] Add API v2 integration tests
        depends_on: 2, 3
 ```
 
@@ -58,7 +58,7 @@ Created:
   20260108-review-implement-user-endpoints (review)
   20260108-implement-product-endpoints (implement)
   20260108-review-implement-product-endpoints (review)
-  20260108-add-api-v2-integration-tests (task)
+  20260108-add-api-v2-integration-tests (implement)
 ```
 
 ## Run all tasks
@@ -86,7 +86,7 @@ spec: path/to/spec.md
 
 tasks:
   - prompt: "Task description"        # Required
-    type: task                        # Optional: task|explore|plan|implement|review
+    type: implement                   # Optional: explore|plan|implement|review|improve
     depends_on: 1                     # Optional: index of task this depends on
     review: true                      # Optional: auto-create review task
     branch_type: feature              # Optional: branch type hint

@@ -24,7 +24,7 @@ npm install -g @openai/codex
 codex --version
 
 # Gemini CLI
-npm install -g @anthropic-ai/gemini-cli
+npm install -g @google/gemini-cli
 gemini --version
 ```
 
