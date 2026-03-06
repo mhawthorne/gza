@@ -336,7 +336,7 @@ class _LiveLogPrinter:
                         if is_error:
                             self._fmt.print_error(result)
                         else:
-                            console.print(f"  {rich_escape(result)}", style="dim", soft_wrap=True)
+                            console.print(rich_escape(result), style="dim", soft_wrap=True)
 
         elif entry_type == "gza":
             subtype = entry.get("subtype", "")
@@ -393,7 +393,7 @@ class _LiveLogPrinter:
                     if is_error:
                         self._fmt.print_error(output)
                     else:
-                        console.print(f"  {rich_escape(output)}", style="dim", soft_wrap=True)
+                        console.print(rich_escape(output), style="dim", soft_wrap=True)
 
         elif entry_type == "result":
             is_error = entry.get("is_error", False)

@@ -974,11 +974,67 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sync_one_report(task: "Task", config: Config, store: "SqliteTaskStore", *, dry_run: bool) -> str:
+    """Sync a single task's report file from disk to DB.
+
+    Returns a status string: 'synced', 'unchanged', 'missing', or 'no_report'.
+    """
+    if not task.report_file:
+        return "no_report"
+
+    report_path = config.project_dir / task.report_file
+    if not report_path.exists():
+        return "missing"
+
+    disk_content = report_path.read_text()
+    if task.output_content == disk_content:
+        return "unchanged"
+
+    if not dry_run:
+        task.output_content = disk_content
+        store.update(task)
+    return "synced"
+
+
 def cmd_sync_report(args: argparse.Namespace) -> int:
     """Sync report file content from disk into DB output_content."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    dry_run = getattr(args, 'dry_run', False)
+    sync_all = getattr(args, 'all', False)
 
+    if not sync_all and args.task_id is None:
+        console.print("[red]Error: provide a task_id or use --all[/red]")
+        return 1
+
+    if sync_all:
+        # Scan all tasks with report files
+        history = store.get_history(limit=None)
+        tasks_with_reports = [t for t in history if t.report_file]
+
+        if not tasks_with_reports:
+            console.print("[dim]No tasks with report files found.[/dim]")
+            return 0
+
+        synced = 0
+        unchanged = 0
+        missing = 0
+        prefix = "[dry-run] " if dry_run else ""
+
+        for task in tasks_with_reports:
+            status = _sync_one_report(task, config, store, dry_run=dry_run)
+            if status == "synced":
+                console.print(f"{prefix}[green]Synced #{task.id} ({task.report_file})[/green]")
+                synced += 1
+            elif status == "unchanged":
+                unchanged += 1
+            elif status == "missing":
+                missing += 1
+
+        console.print(f"\n{prefix}{synced} synced, {unchanged} unchanged, {missing} missing")
+        return 0
+
+    # Single task mode
     task = store.get(args.task_id)
     if not task:
         console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
@@ -988,20 +1044,16 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task #{args.task_id} has no report file[/red]")
         return 1
 
-    report_path = config.project_dir / task.report_file
-    if not report_path.exists():
+    status = _sync_one_report(task, config, store, dry_run=dry_run)
+    prefix = "[dry-run] " if dry_run else ""
+
+    if status == "missing":
         console.print(f"[red]Error: Report file not found: {task.report_file}[/red]")
         return 1
-
-    disk_content = report_path.read_text()
-
-    if task.output_content == disk_content:
+    elif status == "unchanged":
         console.print(f"[dim]Task #{args.task_id} already in sync — no changes needed.[/dim]")
-        return 0
-
-    task.output_content = disk_content
-    store.update(task)
-    console.print(f"[green]Synced report for task #{args.task_id} from disk to DB.[/green]")
+    else:
+        console.print(f"{prefix}[green]Synced report for task #{args.task_id} from disk to DB.[/green]")
     return 0
 
 

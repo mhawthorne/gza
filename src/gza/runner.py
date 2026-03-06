@@ -1374,7 +1374,7 @@ def _run_inner(
     # Write orchestration pre-run entries
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
 
     # Setup summary directory and path for task/implement types
     summary_dir = config.project_dir / SUMMARY_DIR
@@ -1653,7 +1653,7 @@ def _run_non_code_task(
 
     # Write orchestration pre-run entries
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
 
     # Setup report file based on task type
     if task.task_type == "explore":
