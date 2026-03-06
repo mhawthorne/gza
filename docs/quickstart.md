@@ -1,6 +1,6 @@
 # Quick Start
 
-Get up and running with Gza in a few steps.
+Get up and running with Gza — from install to your first merged branch.
 
 ## Prerequisites
 
@@ -13,28 +13,34 @@ Get up and running with Gza in a few steps.
 # Install Gza
 pip install gza-agent
 
-# Install ONE of the following AI CLIs:
-
-# Claude Code (default)
+# Install Claude Code (default provider)
 npm install -g @anthropic-ai/claude-code
 claude --version
+```
 
+<details>
+<summary>Other providers</summary>
+
+```bash
 # OpenAI Codex
 npm install -g @openai/codex
 codex --version
 
-# Gemini CLI
+# Gemini CLI (experimental)
 npm install -g @google/gemini-cli
 gemini --version
 ```
 
-## 2. Set up authentication
+</details>
 
-Gza needs credentials for your AI provider.
+## 2. Set up authentication
 
 **Claude:**
 - **OAuth (recommended):** Run `claude login`
 - **API key:** Set `ANTHROPIC_API_KEY` in `~/.gza/.env`
+
+<details>
+<summary>Other providers</summary>
 
 **Codex:**
 - **OAuth (recommended):** Run `codex login`
@@ -44,44 +50,147 @@ Gza needs credentials for your AI provider.
 - **OAuth:** Run `gemini login`
 - **API key:** Set `GEMINI_API_KEY` in `~/.gza/.env`
 
-Credentials are checked in this order (highest priority first):
-1. Project `.env` file
-2. Shell environment variables
-3. `~/.gza/.env` file
-4. OAuth credentials (`~/.claude/`, `~/.codex/`, `~/.gemini/`)
+</details>
 
-See [Configuration](configuration.md#provider-credentials) for details.
+See [Configuration](configuration.md#provider-credentials) for details on credential precedence.
 
 ## 3. Initialize your project
 
-In your project directory, run:
+In your project directory:
 
 ```bash
 gza init
 ```
 
-This creates a `gza.yaml` configuration file with sensible defaults. You can customize it later—see [Configuration](configuration.md) for details.
+This creates a `gza.yaml` configuration file. Key settings you may want to change:
 
-**Recommended:** Add `.gza/` to your `.gitignore`. This directory contains local state (database, logs, worker files) that shouldn't be committed:
+```yaml
+# gza.yaml
+project_name: my-app
+use_docker: true          # Set to false to run agents locally (no Docker)
+timeout_minutes: 15       # Max time per task
+max_steps: 80             # Max conversation steps per task
+```
+
+> **Docker vs local:** Docker provides isolation — each task runs in its own container and can't affect your host. Set `use_docker: false` if you don't need isolation or want faster startup. You can also pass `--no-docker` per-run: `gza work --no-docker`.
+
+Add `.gza/` to your `.gitignore` — it contains local state (database, logs) that shouldn't be committed:
 
 ```bash
 echo ".gza/" >> .gitignore
 ```
 
-## 4. Add and run a task
+## 4. Your first task
 
 ```bash
 # Add a task
 gza add "Fix the login button not responding on mobile devices"
+# Created task #1: 20260108-fix-the-login-button (implement)
 
 # Run it
 gza work
 ```
 
-That's it! Gza will execute the task, create a branch, and make the changes.
+Gza creates a git branch, runs the AI agent in Docker, and commits the changes. When it finishes:
+
+```bash
+# See what was done
+gza log -t 1
+
+# Check the branch
+gza unmerged
+#   #1 20260108-fix-the-login-button
+#      Branch: my-app/20260108-fix-the-login-button
+#      +42 -8 across 3 files
+```
+
+## 5. Review and merge
+
+For a quick fix, merge directly:
+
+```bash
+gza merge 1 --squash
+```
+
+For anything nontrivial, run a review first:
+
+```bash
+# AI reviews the implementation
+gza review 1
+# Created review task #2 — runs immediately
+
+# Read the review
+cat .gza/reviews/20260108-review-fix-the-login-button.md
+```
+
+If the review requests changes, improve and re-review:
+
+```bash
+# Address review feedback (continues on the same branch)
+gza improve 1
+
+# Review again
+gza review 1
+```
+
+When you're satisfied, merge or create a PR:
+
+```bash
+# Merge locally
+gza merge 1 --squash
+
+# Or create a GitHub PR
+gza pr 1
+```
+
+## 6. Scaling up
+
+The real power of gza is running many tasks in parallel.
+
+### Queue multiple tasks
+
+```bash
+gza add "Add input validation to the registration form"
+gza add "Refactor the payment module to use the new API"
+gza add "Add unit tests for the email service"
+```
+
+### Run them in parallel
+
+```bash
+# Run 3 tasks simultaneously in background
+gza work --background --count 3
+gza work --background --count 3
+gza work --background --count 3
+
+# Watch progress
+gza ps
+```
+
+### Let gza manage the lifecycle
+
+The `advance` command handles the full lifecycle automatically — creating reviews, running improvements, and merging approved work:
+
+```bash
+# Preview what advance would do
+gza advance --dry-run
+
+# Execute: run up to 3 workers, auto-review, auto-merge
+gza advance --auto --batch 3
+```
+
+### Automate review/improve cycles
+
+For a single implementation, run review/improve iterations until approved:
+
+```bash
+gza iterate 1 --max-iterations 3
+```
 
 ## Next steps
 
-- See [Simple Task](examples/simple-task.md) for a complete walkthrough
-- Learn about [Plan → Implement → Review](examples/plan-implement-review.md) workflows for larger features
-- Explore all [Examples](examples/README.md)
+- [Simple Task](examples/simple-task.md) — complete walkthrough of a single task
+- [Plan → Implement → Review](examples/plan-implement-review.md) — multi-phase workflow for larger features
+- [Parallel Workers](examples/parallel-workers.md) — running tasks concurrently
+- [Bulk Import](examples/bulk-import.md) — importing many tasks from YAML
+- [Configuration Reference](configuration.md) — all commands, options, and settings

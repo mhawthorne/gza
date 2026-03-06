@@ -10,7 +10,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..console import console, format_duration, get_terminal_width
-from ..db import SqliteTaskStore
+from ..db import SqliteTaskStore, Task
 from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
@@ -1043,7 +1043,7 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         return 0
 
     # Single task mode
-    task = store.get(args.task_id)
+    task = store.get(args.task_id)  # type: ignore[assignment]
     if not task:
         console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
         return 1
