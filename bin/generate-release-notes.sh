@@ -46,7 +46,7 @@ $DETAILED_COMMITS
 
 Please create well-structured release notes that:
 1. Start with a header: # Release Notes: $FROM_TAG → $TO_TAG
-2. Include a brief summary paragraph of the overall changes
+2. Include a summary section with bullet points highlighting the changes users would care about most (new commands, breaking changes, major improvements)
 3. Group changes into categories (e.g., Features, Bug Fixes, Improvements, Documentation, etc.)
 4. Use bullet points for each change
 5. Be concise but informative

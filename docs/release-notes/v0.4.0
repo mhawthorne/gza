@@ -1,0 +1,125 @@
+# Release Notes: v0.3.0 → HEAD
+
+## Summary
+
+This release brings significant orchestration improvements, expanded skill ecosystem, enhanced observability, and refined user experience. Key highlights include the new `gza advance` command for intelligent batch workflow management, LLM-powered learnings summarization, colorized terminal output with Rich formatting, and major architectural improvements including CLI package refactoring and provider-agnostic design.
+
+## Breaking Changes
+
+- **Removed legacy YAML-based task serialization**: Tasks are now stored exclusively in SQLite
+- **Deleted `src/gza/tasks.py`**: Legacy task storage module removed; use CLI or API
+- **`gza status` renamed to `gza group`**: Update scripts and workflows accordingly
+- **Require `gza improve` for task creation**: Direct improve task creation no longer allowed; use `gza improve` after task completion
+
+## New Features
+
+### Commands
+- **`gza advance`**: Intelligently orchestrate batch workflow with `--batch B` option to spawn multiple parallel workers
+- **`gza implement`**: Create and run implementation tasks from plans (replaces manual workflow)
+- **`gza iterate`**: Renamed from `gza cycle`; automated review/improve cycles with configurable max cycle limits
+- **`gza group`**: Renamed from `gza status`; display task status groupings
+- **`gza set-status`**: Manually force task status updates
+- **`gza mark-completed`**: Mark tasks as completed with cleanup
+
+### Skills
+- **`gza-code-review-full`**: Comprehensive pre-release code review with test coverage and duplication analysis
+- **`gza-plan-review`**: Interactive quality gate for plan tasks before implementation
+- **`gza-task-debug`**: Diagnose task failures with loop detection and baseline comparison
+- **`gza-task-draft`**: Guided task creation with clarification and refinement
+- **`gza-worktree-create`**: Isolated development environment creation with symlinked .gza access
+- **`gza-test-and-fix`**: Verify command execution with automated fix and commit
+
+### New Flags & Options
+- `--batch B`: Spawn B parallel workers in `gza advance`
+- `--poll N`: Refresh `gza ps` output every N seconds
+- `--model`, `--provider`: Set LLM provider for commands (add, review, improve)
+- `--resolve`: Auto-resolve conflicts in `gza merge` and `gza rebase`
+- `--all`: Apply command to all eligible tasks
+- `--background`: Run commands in background
+- `--dry-run`: Preview changes without execution
+- `--new`: Fill batch slots in `gza advance`
+- `--update`: Check for and install skill updates
+
+## Major Improvements
+
+### Observability & User Experience
+- **Colorized terminal output**: Rich formatting for `gza next`, `gza show`, `gza history`, and logs with colored status indicators
+- **Live step count updates**: Real-time step progress in `gza ps` polling
+- **Improved `gza ps` display**: Better task visibility, worker tracking, and filtering
+- **Orchestration logging**: Task lifecycle events logged to log files for debugging
+- **Orphaned task detection**: Identify and resurface tasks without active workers
+
+### Learning & Context
+- **LLM-powered learnings summarization**: Automatic pattern extraction and summarization from completed tasks with Phase 3 implementation
+- **Learnings generation**: Generate insights from task history with `gza learnings update --window N`
+- **Auto-regeneration**: Learnings automatically regenerated every 5 completed tasks
+- **Learnings in worktrees**: Copy learnings to agent worktrees for enhanced context
+
+### Task Management
+- **Dropped task status**: New task status for explicitly dropped/cancelled work
+- **Task visibility improvements**: Foreground workers now properly registered and visible in `gza ps`
+- **Auto-resume failed tasks**: Failed tasks automatically resumed in `gza advance`
+- **Improved slug generation**: Better branch naming for review, implement, and improve tasks
+- **Selective staging**: Only stage files changed during provider execution
+
+### Architecture & Code Quality
+- **CLI package refactoring**: Split monolithic `cli.py` (8,495 lines) into 7 focused modules with full backward compatibility
+- **Provider-agnostic design**: Unified review resolution and execution across providers
+- **Provider support**: Added OpenAI Codex provider implementation alongside existing Claude provider
+- **Unified log output**: LiveLogPrinter class for consistent formatting across commands
+- **Code metrics**: Worktree utilities and computation of estimated tokens/costs
+- **Test suite optimization**: Reduced wall time from ~97s to ~24s with pytest-xdist parallelization
+
+### Configuration & Flexibility
+- **`verify_command` config field**: Custom test/verification command per project
+- **`cleanup_days` configuration**: Control worktree retention (default: 30 days)
+- **Keychain support**: Fetch auth tokens from macOS keychain for Docker
+- **Model & provider persistence**: Resolved model/provider stored with task metadata
+
+## Bug Fixes
+
+- **Fixed false "No changes made" on resume**: Proper change detection during task resumption
+- **Fixed background workers silently failing**: Correct project directory argument passing
+- **Fixed merge_status tracking**: Lazy migration for existing tasks; proper branch merge detection
+- **Fixed Codex review task thrash in Docker**: Session ID and stdin prompt handling
+- **Fixed reviewer verdict parsing**: Support multiple formats (`**Verdict**: X`, `## Verdict` headings)
+- **Fixed same-branch resolution**: Walks full lineage chain for correct rebase targets
+- **Fixed gza unmerged with deleted branches**: Shows unmerged status even when branch deleted
+- **Fixed ps poll visibility**: Completed tasks remain visible; accurate status determination
+- **Improved merge-to-main handling**: Early exit check for branches with no commits
+
+## Documentation
+
+- **Expanded README**: Added "Why Gza" section explaining batch workflow benefits
+- **Detailed quickstart guide**: Step-by-step instructions with improved examples
+- **Skills documentation**: Added "Building Skills" section to AGENTS.md
+- **Task vs agent context**: Documented distinction for better prompt engineering
+- **Code review isolation**: Documentation of review environment setup
+- **Worktree lifecycle**: Clear strategy for cleanup and lineage management
+
+## Technical Details
+
+### Database & Persistence
+- **Merge status column**: Track merge state in tasks table with backfill for existing data
+- **Log file and branch persistence**: Stored in DB at task startup for observability
+- **Hourly backups**: SQLite database automatically backed up hourly
+- **Step/substep APIs**: Full storage and retrieval for step tracking
+
+### Provider Architecture
+- **Multi-provider support**: Claude and Codex providers with unified interface
+- **Provider validation**: Compatibility checking between models and providers
+- **Docker image management**: Provider-aware rebuilding and caching
+- **Model-specific configuration**: Fallback token estimation for non-claude models
+
+### Worker Management
+- **Foreground worker registration**: Direct run() calls now properly registered
+- **Worker cleanup**: Signal handlers (SIGINT/SIGTERM) for clean shutdown
+- **Zombie worker detection**: Auto-cleanup in `gza ps` command
+- **Lineage-aware removal**: Interactive prompts before removing worktrees
+
+## Dependencies & Installation
+
+- **Bundled skills**: gza-test-and-fix and other skills included in package distribution
+- **Skill auto-installation**: Bundled skills automatically installed in worktrees
+- **Update detection**: `--update` flag for skill installation checks
+- **Template-based config**: gza.yaml initialized from template for consistency
