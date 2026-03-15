@@ -524,7 +524,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
     # 1. Lineage-aware worktree cleanup
     if args.worktrees or not (args.logs or args.workers):
-        from gza._query import resolve_lineage_root, build_lineage, task_time_for_lineage
+        from gza.query import resolve_lineage_root, build_lineage, task_time_for_lineage
 
         print("Scanning worktrees...")
         worktree_dir = config.worktree_path

@@ -570,7 +570,7 @@ def _create_improve_task(
     )
 
 
-from .._query import (
+from ..query import (
     get_task_slug as _get_task_slug,
     get_reviews_for_root as _get_reviews_for_root_task,
     task_time_for_lineage as _task_time_for_lineage,

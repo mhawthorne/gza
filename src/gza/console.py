@@ -7,6 +7,24 @@ from rich.table import Table
 
 from .db import TaskStats
 
+__all__ = [
+    "console",
+    "truncate",
+    "get_terminal_width",
+    "format_duration",
+    "task_header",
+    "stats_line",
+    "success_message",
+    "error_message",
+    "warning_message",
+    "info_line",
+    "next_steps",
+    "MAX_PROMPT_DISPLAY_SHORT",
+    "MAX_PROMPT_DISPLAY",
+    "MAX_PR_TITLE_LENGTH",
+    "MAX_PR_BODY_LENGTH",
+]
+
 # Shared console instance for all output
 console = Console()
 

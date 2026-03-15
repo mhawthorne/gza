@@ -37,7 +37,7 @@ from pathlib import Path
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
-from gza import _query
+from gza import query as _query
 
 __all__ = ["GzaClient", "Task", "IncompleteSnapshot"]
 

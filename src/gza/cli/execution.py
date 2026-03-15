@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from .._query import get_base_task_slug as _get_base_task_slug
+from ..query import get_base_task_slug as _get_base_task_slug
 from ..config import Config
 from ..console import format_duration
 from ..db import (

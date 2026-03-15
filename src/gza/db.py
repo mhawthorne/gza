@@ -14,6 +14,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "KNOWN_FAILURE_REASONS",
+    "Task",
+    "TaskStats",
+    "TaskCycle",
+    "TaskCycleIteration",
+    "SqliteTaskStore",
+    "extract_failure_reason",
+]
+
 
 # Known failure reason categories
 KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "UNKNOWN"}
@@ -559,6 +569,29 @@ def extract_failure_reason(log_file_path: Path) -> str:
 
     return last_reason if last_reason is not None else "UNKNOWN"
 
+_MIGRATIONS: list[tuple[int, str]] = [
+    (2, MIGRATION_V1_TO_V2),
+    (3, MIGRATION_V2_TO_V3),
+    (4, MIGRATION_V3_TO_V4),
+    (5, MIGRATION_V4_TO_V5),
+    (6, MIGRATION_V5_TO_V6),
+    (7, MIGRATION_V6_TO_V7),
+    (8, MIGRATION_V7_TO_V8),
+    (9, MIGRATION_V8_TO_V9),
+    (10, MIGRATION_V9_TO_V10),
+    (11, MIGRATION_V10_TO_V11),
+    (12, MIGRATION_V11_TO_V12),
+    (13, MIGRATION_V12_TO_V13),
+    (14, MIGRATION_V13_TO_V14),
+    (15, MIGRATION_V14_TO_V15),
+    (16, MIGRATION_V15_TO_V16),
+    (17, MIGRATION_V16_TO_V17),
+    (18, MIGRATION_V17_TO_V18),
+    (19, MIGRATION_V18_TO_V19),
+    (20, MIGRATION_V19_TO_V20),
+]
+
+
 class SqliteTaskStore:
     """SQLite-based task storage."""
 
@@ -584,244 +617,18 @@ class SqliteTaskStore:
                 row = cur.fetchone()
                 current_version = row["version"] if row else 0
 
-                if current_version < 2:
-                    # Run migration v1 -> v2
-                    for stmt in MIGRATION_V1_TO_V2.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column/index might already exist
-                                pass
-                    current_version = 2
-                    conn.execute("UPDATE schema_version SET version = ?", (2,))
-
-                if current_version < 3:
-                    # Run migration v2 -> v3
-                    for stmt in MIGRATION_V2_TO_V3.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    current_version = 3
-                    conn.execute("UPDATE schema_version SET version = ?", (3,))
-
-                if current_version < 4:
-                    # Run migration v3 -> v4
-                    for stmt in MIGRATION_V3_TO_V4.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    current_version = 4
-                    conn.execute("UPDATE schema_version SET version = ?", (4,))
-
-                if current_version < 5:
-                    # Run migration v4 -> v5
-                    for stmt in MIGRATION_V4_TO_V5.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    current_version = 5
-                    conn.execute("UPDATE schema_version SET version = ?", (5,))
-
-                if current_version < 6:
-                    # Run migration v5 -> v6
-                    for stmt in MIGRATION_V5_TO_V6.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    current_version = 6
-                    conn.execute("UPDATE schema_version SET version = ?", (6,))
-
-                if current_version < 7:
-                    # Run migration v6 -> v7
-                    for stmt in MIGRATION_V6_TO_V7.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    current_version = 7
-                    conn.execute("UPDATE schema_version SET version = ?", (7,))
-
-                if current_version < 8:
-                    # Run migration v7 -> v8
-                    for stmt in MIGRATION_V7_TO_V8.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    current_version = 8
-                    conn.execute("UPDATE schema_version SET version = ?", (8,))
-
-                if current_version < 9:
-                    # Run migration v8 -> v9
-                    for stmt in MIGRATION_V8_TO_V9.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (9,))
-
-                if current_version < 10:
-                    # Run migration v9 -> v10
-                    for stmt in MIGRATION_V9_TO_V10.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column/index might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (10,))
-                    current_version = 10
-
-                if current_version < 11:
-                    # Run migration v10 -> v11
-                    for stmt in MIGRATION_V10_TO_V11.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (11,))
-                    current_version = 11
-
-                if current_version < 12:
-                    # Run migration v11 -> v12
-                    for stmt in MIGRATION_V11_TO_V12.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (12,))
-                    current_version = 12
-
-                if current_version < 13:
-                    # Run migration v12 -> v13
-                    for stmt in MIGRATION_V12_TO_V13.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (13,))
-                    current_version = 13
-
-                if current_version < 14:
-                    # Run migration v13 -> v14
-                    for stmt in MIGRATION_V13_TO_V14.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (14,))
-                    current_version = 14
-
-                if current_version < 15:
-                    # Run migration v14 -> v15
-                    for stmt in MIGRATION_V14_TO_V15.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (15,))
-                    current_version = 15
-
-                if current_version < 16:
-                    # Run migration v15 -> v16
-                    for stmt in MIGRATION_V15_TO_V16.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Table/index might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (16,))
-                    current_version = 16
-
-                if current_version < 17:
-                    # Run migration v16 -> v17
-                    for stmt in MIGRATION_V16_TO_V17.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (17,))
-                    current_version = 17
-
-                if current_version < 18:
-                    # Run migration v17 -> v18
-                    for stmt in MIGRATION_V17_TO_V18.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Column/table/index might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (18,))
-                    current_version = 18
-
-                if current_version < 19:
-                    # Run migration v18 -> v19
-                    for stmt in MIGRATION_V18_TO_V19.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            try:
-                                conn.execute(stmt)
-                            except sqlite3.OperationalError:
-                                # Index might already exist
-                                pass
-                    conn.execute("UPDATE schema_version SET version = ?", (19,))
-                    current_version = 19
-
-                if current_version < 20:
-                    # Run migration v19 -> v20: rename 'task' type to 'implement'
-                    conn.execute(MIGRATION_V19_TO_V20)
-                    conn.execute("UPDATE schema_version SET version = ?", (20,))
-                    current_version = 20
+                for target_version, migration_sql in _MIGRATIONS:
+                    if current_version < target_version:
+                        for stmt in migration_sql.strip().split(";"):
+                            stmt = stmt.strip()
+                            if stmt:
+                                try:
+                                    conn.execute(stmt)
+                                except sqlite3.OperationalError:
+                                    # Column/table/index might already exist
+                                    pass
+                        conn.execute("UPDATE schema_version SET version = ?", (target_version,))
+                        current_version = target_version
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -2533,12 +2340,12 @@ def get_task(task_id: int) -> dict:
     Auto-discovers the DB at .gza/gza.db relative to cwd.
 
     Raises:
-        ValueError: If task_id is not found.
+        KeyError: If task_id is not found.
     """
     store = _default_store()
     task = store.get(task_id)
     if task is None:
-        raise ValueError(f"Task {task_id} not found")
+        raise KeyError(f"Task {task_id} not found")
     return _task_to_dict(task)
 
 

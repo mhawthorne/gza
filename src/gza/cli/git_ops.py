@@ -1,9 +1,12 @@
 """Git-related CLI commands: merge, rebase, checkout, diff, PR, refresh, advance."""
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
+
+logger = logging.getLogger(__name__)
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +25,7 @@ from ..github import GitHub, GitHubError
 from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task
 
-from gza._query import (
+from gza.query import (
     get_base_task_slug as _get_base_task_slug,
     get_reviews_for_root as _get_reviews_for_root_task,
     get_improves_for_root as _get_improves_for_root_task,
@@ -701,7 +704,7 @@ def _get_pager(repo_dir: Path) -> str:
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     except Exception:
-        pass
+        logger.debug("Failed to read git core.pager config", exc_info=True)
 
     # Check $PAGER
     pager = os.environ.get('PAGER')

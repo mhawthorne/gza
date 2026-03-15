@@ -15,6 +15,16 @@ CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "APP_NAME",
+    "CONFIG_FILENAME",
+    "LOCAL_CONFIG_FILENAME",
+    "ConfigError",
+    "Config",
+    "TaskTypeConfig",
+    "BranchStrategy",
+]
+
 
 class ConfigError(Exception):
     """Raised when configuration is invalid or missing."""

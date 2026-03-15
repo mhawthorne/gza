@@ -35,7 +35,7 @@ from ._common import (
     get_review_verdict,
 )
 
-from .._query import (
+from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
     task_time_for_lineage as _task_time_for_lineage,
     get_improves_for_root as _get_improves_for_root_task,

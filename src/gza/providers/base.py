@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -58,6 +59,28 @@ class DockerConfig:
     cli_command: str
     config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+
+
+def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
+    """Return Docker -v args for mounting provider config dir and JSON file.
+
+    Handles the shutil.copy2 workaround for Docker Desktop not sharing
+    individual files.
+    """
+    if not docker_config.config_dir:
+        return []
+    args: list[str] = []
+    config_dir = Path.home() / docker_config.config_dir
+    args.extend(["-v", f"{config_dir}:/home/gza/{docker_config.config_dir}"])
+    # Also mount the config file (e.g., ~/.claude.json) if it exists
+    # Docker Desktop can't share individual files, so copy it into the config dir
+    config_file = Path.home() / f"{docker_config.config_dir}.json"
+    if config_file.exists():
+        config_dir.mkdir(parents=True, exist_ok=True)
+        dest = config_dir / f"{docker_config.config_dir}.json"
+        shutil.copy2(config_file, dest)
+        args.extend(["-v", f"{dest}:/home/gza/{docker_config.config_dir}.json"])
+    return args
 
 
 def _get_image_created_time(image_name: str) -> float | None:
@@ -219,20 +242,8 @@ def build_docker_cmd(
     ]
 
     # Mount config directory if specified (for OAuth credentials)
-    if docker_config.config_dir:
-        config_dir = Path.home() / docker_config.config_dir
-        cmd.insert(-2, "-v")
-        cmd.insert(-2, f"{config_dir}:/home/gza/{docker_config.config_dir}")
-        # Also mount the config file (e.g., ~/.claude.json) if it exists
-        # Docker Desktop can't share individual files, so copy it into the config dir
-        config_file = Path.home() / f"{docker_config.config_dir}.json"
-        if config_file.exists():
-            import shutil
-            config_dir.mkdir(parents=True, exist_ok=True)
-            dest = config_dir / f"{docker_config.config_dir}.json"
-            shutil.copy2(config_file, dest)
-            cmd.insert(-2, "-v")
-            cmd.insert(-2, f"{dest}:/home/gza/{docker_config.config_dir}.json")
+    for arg in _get_config_dir_volume_args(docker_config):
+        cmd.insert(-2, arg)
 
     # Add custom volume mounts
     if docker_volumes:
@@ -290,18 +301,7 @@ def verify_docker_credentials(
     try:
         cmd = ["docker", "run", "--rm"]
         # Mount config directory if specified (for OAuth credentials)
-        if docker_config.config_dir:
-            config_dir = Path.home() / docker_config.config_dir
-            cmd.extend(["-v", f"{config_dir}:/home/gza/{docker_config.config_dir}"])
-            # Also mount the config file (e.g., ~/.claude.json) if it exists
-            # Docker Desktop can't share individual files, so copy it into the config dir
-            config_file = Path.home() / f"{docker_config.config_dir}.json"
-            if config_file.exists():
-                import shutil
-                config_dir.mkdir(parents=True, exist_ok=True)
-                dest = config_dir / f"{docker_config.config_dir}.json"
-                shutil.copy2(config_file, dest)
-                cmd.extend(["-v", f"{dest}:/home/gza/{docker_config.config_dir}.json"])
+        cmd.extend(_get_config_dir_volume_args(docker_config))
         for env_var in docker_config.env_vars:
             if os.getenv(env_var):
                 cmd.extend(["-e", env_var])

@@ -2075,7 +2075,7 @@ class TestConvenienceFunctions:
 
         monkeypatch.chdir(tmp_path)
 
-        with pytest.raises(ValueError, match="Task 999 not found"):
+        with pytest.raises(KeyError, match="Task 999 not found"):
             get_task(999)
 
     def test_get_task_log_path_returns_log_file(self, tmp_path: Path, monkeypatch):

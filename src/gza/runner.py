@@ -28,6 +28,14 @@ from .review_tasks import DuplicateReviewError, create_review_task
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "run",
+    "build_prompt",
+    "write_log_entry",
+    "get_effective_config_for_task",
+    "post_review_to_pr",
+]
+
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
     """Append a JSONL entry to the task log file."""
@@ -289,7 +297,7 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     if prefix is None:
         return None
 
-    from . import _query
+    from . import query as _query
     root = _query.resolve_lineage_root(store, task)
 
     if root.task_id:
