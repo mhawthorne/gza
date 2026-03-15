@@ -270,10 +270,13 @@ class TestGeminiSmoke:
 class TestCodexSmoke:
     """Smoke tests for Codex provider."""
 
-    @pytest.mark.skipif(not has_codex_oauth(), reason="Codex OAuth (~/.codex/auth.json) not available")
+    @pytest.mark.skipif(not has_codex_credentials(), reason="Codex credentials not available (OAuth or API key)")
     @pytest.mark.skipif(not has_docker(), reason="Docker not available")
-    def test_codex_docker_oauth_writes_file(self, tmp_path):
-        """Codex in Docker with OAuth (~/.codex) should be able to write a file."""
+    def test_codex_docker_writes_file(self, tmp_path):
+        """Codex in Docker should be able to write a file.
+
+        Uses whatever credentials are available (OAuth or API key).
+        """
         import subprocess
 
         # Codex requires running in a git repo (unlike Claude)
@@ -284,48 +287,7 @@ class TestCodexSmoke:
 
         config = Config(
             project_dir=tmp_path,
-            project_name="smoke-test-codex-oauth",
-            provider="codex",
-            use_docker=True,
-            timeout_minutes=2,
-            max_turns=5,
-        )
-
-        provider = CodexProvider()
-        log_file = tmp_path / "test.log"
-
-        prompt = "Write the text 'hello world' to a file named result.txt. Do not write anything else."
-
-        result = provider.run(config, prompt, log_file, tmp_path)
-
-        # Check the file was created
-        result_file = tmp_path / "result.txt"
-        assert result_file.exists(), f"result.txt was not created. Exit code: {result.exit_code}"
-
-        # Check content (lenient - just needs to contain hello or world)
-        content = result_file.read_text().lower()
-        assert "hello" in content or "world" in content, f"Unexpected content: {content}"
-
-    @pytest.mark.skipif(not has_codex_api_key(), reason="CODEX_API_KEY not available")
-    @pytest.mark.skipif(not has_docker(), reason="Docker not available")
-    def test_codex_docker_api_key_writes_file(self, tmp_path, monkeypatch):
-        """Codex in Docker with CODEX_API_KEY (no OAuth) should be able to write a file."""
-        import subprocess
-
-        # Codex requires running in a git repo (unlike Claude)
-        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
-
-        # Make directory world-writable so Docker container (gza user) can write
-        tmp_path.chmod(0o777)
-
-        # Temporarily hide OAuth to force API key auth
-        # We do this by patching _has_codex_oauth to return False
-        from gza.providers import codex as codex_module
-        monkeypatch.setattr(codex_module, "_has_codex_oauth", lambda: False)
-
-        config = Config(
-            project_dir=tmp_path,
-            project_name="smoke-test-codex-apikey",
+            project_name="smoke-test-codex",
             provider="codex",
             use_docker=True,
             timeout_minutes=2,

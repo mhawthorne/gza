@@ -3561,14 +3561,6 @@ class TestAdvanceMergeSquashThreshold:
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 3
 
-    def test_env_var_overrides_merge_squash_threshold(self, tmp_path: Path, monkeypatch):
-        """GZA_MERGE_SQUASH_THRESHOLD env var overrides yaml value."""
-        from gza.config import Config
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 1\n")
-        monkeypatch.setenv("GZA_MERGE_SQUASH_THRESHOLD", "5")
-        config = Config.load(tmp_path)
-        assert config.merge_squash_threshold == 5
-
     def test_invalid_type_raises_config_error(self, tmp_path: Path):
         """Non-integer merge_squash_threshold in yaml raises ConfigError, not bare ValueError."""
         import pytest
@@ -3584,16 +3576,6 @@ class TestAdvanceMergeSquashThreshold:
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: -1\n")
         with pytest.raises(ConfigError):
             Config.load(tmp_path)
-
-    def test_invalid_env_var_raises_config_error(self, tmp_path: Path, monkeypatch):
-        """Non-integer GZA_MERGE_SQUASH_THRESHOLD env var raises ConfigError."""
-        import pytest
-        from gza.config import Config, ConfigError
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
-        monkeypatch.setenv("GZA_MERGE_SQUASH_THRESHOLD", "abc")
-        with pytest.raises(ConfigError):
-            Config.load(tmp_path)
-
 
 class TestAdvancePlansCommand:
     """Tests for 'gza advance --plans' command."""

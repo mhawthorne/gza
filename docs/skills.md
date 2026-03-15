@@ -138,11 +138,11 @@ git push --force-with-lease
 
 ---
 
-## gza-interactive-review / gza-code-review-interactive
+## gza-code-review-interactive
 
 **Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.**
 
-Use `/gza-interactive-review` for a focused review of the changes on your current branch.
+Use `/gza-code-review-interactive` for a focused review of the changes on your current branch.
 
 ---
 

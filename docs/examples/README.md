@@ -44,7 +44,7 @@ Practical examples showing common workflows with Gza.
 | View pending | `gza next` |
 | View running workers | `gza ps` |
 | Tail worker logs | `gza log -w <worker_id> -f` |
-| View task log | `gza log -t <task_id>` |
+| View task log | `gza log <task_id>` |
 | Stop a worker | `gza stop <worker_id>` |
 | Create review | `gza review <impl_id>` |
 | Address feedback | `gza improve <impl_id>` |

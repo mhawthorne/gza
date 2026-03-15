@@ -150,35 +150,6 @@ class TestValidateCommand:
 class TestConfigEnvVars:
     """Tests for environment variable overrides in config."""
 
-    def test_gza_docker_volumes_env_var(self, tmp_path: Path):
-        """GZA_DOCKER_VOLUMES environment variable overrides config."""
-        from gza.config import Config
-        import os
-
-        setup_config(tmp_path)
-
-        # Set environment variable
-        env = os.environ.copy()
-        env["GZA_DOCKER_VOLUMES"] = "/host1:/data:ro,/host2:/models"
-
-        # Use subprocess to load config with env vars
-        import subprocess
-        result = subprocess.run(
-            ["uv", "run", "python", "-c",
-             "from gza.config import Config; "
-             f"from pathlib import Path; "
-             f"c = Config.load(Path('{tmp_path}')); "
-             "print(','.join(c.docker_volumes))"],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-
-        assert result.returncode == 0
-        volumes = result.stdout.strip()
-        assert "/host1:/data:ro" in volumes
-        assert "/host2:/models" in volumes
-
     def test_docker_volumes_tilde_expansion(self, tmp_path: Path):
         """Docker volumes should expand tilde in source paths."""
         from gza.config import Config
@@ -283,24 +254,6 @@ class TestLocalConfigOverrides:
         assert config.source_map["providers.claude.task_types.review.model"] == "local"
         assert config.source_map["providers.claude.task_types.review.max_steps"] == "base"
 
-    def test_env_vars_take_precedence_over_local_overrides(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """Environment variables should override local and base config values."""
-        from gza.config import Config
-
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
-            "use_docker: true\n"
-        )
-        (tmp_path / "gza.local.yaml").write_text(
-            "use_docker: false\n"
-        )
-        monkeypatch.setenv("GZA_USE_DOCKER", "true")
-
-        config = Config.load(tmp_path)
-
-        assert config.use_docker is True
-        assert config.source_map["use_docker"] == "env"
-
     def test_local_override_guardrails_reject_disallowed_keys(self, tmp_path: Path):
         """Local overrides should reject disallowed keys like project_name."""
         from gza.config import Config, ConfigError
@@ -344,20 +297,17 @@ class TestLocalConfigOverrides:
             "use_docker: false\n"
         )
 
-        env = os.environ.copy()
-        env["GZA_TIMEOUT_MINUTES"] = "99"
         result = subprocess.run(
             ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
             capture_output=True,
             text=True,
-            env=env,
         )
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
-        assert payload["effective"]["timeout_minutes"] == 99
+        assert payload["effective"]["timeout_minutes"] == 10
         assert payload["effective"]["use_docker"] is False
-        assert payload["sources"]["timeout_minutes"] == "env"
+        assert payload["sources"]["timeout_minutes"] == "base"
         assert payload["sources"]["use_docker"] == "local"
         assert payload["local_overrides_active"] is True
         assert payload["local_override_file"] == "gza.local.yaml"

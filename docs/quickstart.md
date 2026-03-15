@@ -95,7 +95,7 @@ Gza creates a git branch, runs the AI agent in Docker, and commits the changes. 
 
 ```bash
 # See what was done
-gza log -t 1
+gza log 1
 
 # Check the branch
 gza unmerged

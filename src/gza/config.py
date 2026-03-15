@@ -507,41 +507,19 @@ class Config:
         # If "defaults" exists, use it; otherwise use top-level fields
         defaults = data.get("defaults", {})
 
-        # Environment variables override file config
         use_docker = data.get("use_docker", DEFAULT_USE_DOCKER)
-        env_use_docker = os.getenv("GZA_USE_DOCKER")
-        if env_use_docker:
-            use_docker = env_use_docker.lower() != "false"
-            source_map["use_docker"] = "env"
-
         timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
-        env_timeout = os.getenv("GZA_TIMEOUT_MINUTES")
-        if env_timeout:
-            timeout_minutes = int(env_timeout)
-            source_map["timeout_minutes"] = "env"
-
         branch_mode = data.get("branch_mode", DEFAULT_BRANCH_MODE)
-        if os.getenv("GZA_BRANCH_MODE"):
-            branch_mode = os.getenv("GZA_BRANCH_MODE")
-            source_map["branch_mode"] = "env"
 
         # max_steps (canonical): check defaults section first, then top-level
         max_steps = defaults.get("max_steps")
         if max_steps is None:
             max_steps = data.get("max_steps")
-        env_max_steps = os.getenv("GZA_MAX_STEPS")
-        if env_max_steps:
-            max_steps = int(env_max_steps)
-            source_map["max_steps"] = "env"
 
         # max_turns (legacy fallback): check defaults section first, then top-level
         max_turns = defaults.get("max_turns")
         if max_turns is None:
             max_turns = data.get("max_turns")
-        env_max_turns = os.getenv("GZA_MAX_TURNS")
-        if env_max_turns:
-            max_turns = int(env_max_turns)
-            source_map["max_turns"] = "env"
 
         # Migration behavior: if max_steps isn't set, fall back to max_turns with warning.
         if max_steps is None:
@@ -560,26 +538,9 @@ class Config:
             max_turns = max_steps
 
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
-        if os.getenv("GZA_WORKTREE_DIR"):
-            worktree_dir = os.getenv("GZA_WORKTREE_DIR")
-            source_map["worktree_dir"] = "env"
-
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
-        env_work_count = os.getenv("GZA_WORK_COUNT")
-        if env_work_count:
-            work_count = int(env_work_count)
-            source_map["work_count"] = "env"
-
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
-        env_chat_text_display_length = os.getenv("GZA_CHAT_TEXT_DISPLAY_LENGTH")
-        if env_chat_text_display_length:
-            chat_text_display_length = int(env_chat_text_display_length)
-            source_map["chat_text_display_length"] = "env"
-
         provider = data.get("provider", DEFAULT_PROVIDER)
-        if os.getenv("GZA_PROVIDER"):
-            provider = os.getenv("GZA_PROVIDER")
-            source_map["provider"] = "env"
 
         # task_providers routing
         task_providers: dict[str, str] = {}
@@ -598,17 +559,8 @@ class Config:
 
         # model: check defaults section first, then top-level
         model = defaults.get("model") or data.get("model", "")
-        if os.getenv("GZA_MODEL"):
-            model = os.getenv("GZA_MODEL")
-            source_map["model"] = "env"
 
-        # docker_volumes: can be overridden by environment variable
         docker_volumes = data.get("docker_volumes", [])
-        env_docker_volumes = os.getenv("GZA_DOCKER_VOLUMES")
-        if env_docker_volumes:
-            # Parse comma-separated volumes
-            docker_volumes = [v.strip() for v in env_docker_volumes.split(",") if v.strip()]
-            source_map["docker_volumes"] = "env"
 
         # Expand tilde in volume paths
         expanded_volumes = []
@@ -878,17 +830,13 @@ class Config:
             elif data.get("max_steps") is not None:
                 source_map["max_steps"] = source_map.get("max_steps", "base")
             elif max_turns is not None:
-                if env_max_turns:
-                    source_map["max_steps"] = "env"
-                elif defaults.get("max_turns") is not None:
+                if defaults.get("max_turns") is not None:
                     source_map["max_steps"] = source_map.get("defaults.max_turns", "base")
                 elif data.get("max_turns") is not None:
                     source_map["max_steps"] = source_map.get("max_turns", "base")
 
         if "max_turns" not in source_map:
-            if env_max_turns:
-                source_map["max_turns"] = "env"
-            elif defaults.get("max_turns") is not None:
+            if defaults.get("max_turns") is not None:
                 source_map["max_turns"] = source_map.get("defaults.max_turns", "base")
             elif data.get("max_turns") is not None:
                 source_map["max_turns"] = source_map.get("max_turns", "base")
@@ -902,21 +850,8 @@ class Config:
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
         max_review_cycles = int(data.get("max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES))
-        env_max_review_cycles = os.getenv("GZA_MAX_REVIEW_CYCLES")
-        if env_max_review_cycles:
-            max_review_cycles = int(env_max_review_cycles)
-            source_map["max_review_cycles"] = "env"
-
         max_resume_attempts = int(data.get("max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS))
-        env_max_resume_attempts = os.getenv("GZA_MAX_RESUME_ATTEMPTS")
-        if env_max_resume_attempts:
-            max_resume_attempts = int(env_max_resume_attempts)
-            source_map["max_resume_attempts"] = "env"
-
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
-        if os.getenv("GZA_INTERACTIVE_WORKTREE_DIR"):
-            interactive_worktree_dir = os.getenv("GZA_INTERACTIVE_WORKTREE_DIR")
-            source_map["interactive_worktree_dir"] = "env"
 
         try:
             merge_squash_threshold = int(data.get("merge_squash_threshold", DEFAULT_MERGE_SQUASH_THRESHOLD))
@@ -924,15 +859,6 @@ class Config:
             raise ConfigError("merge_squash_threshold must be a non-negative integer")
         if merge_squash_threshold < 0:
             raise ConfigError("merge_squash_threshold must be a non-negative integer")
-        env_merge_squash_threshold = os.getenv("GZA_MERGE_SQUASH_THRESHOLD")
-        if env_merge_squash_threshold:
-            try:
-                merge_squash_threshold = int(env_merge_squash_threshold)
-            except ValueError:
-                raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
-            if merge_squash_threshold < 0:
-                raise ConfigError("GZA_MERGE_SQUASH_THRESHOLD must be a non-negative integer")
-            source_map["merge_squash_threshold"] = "env"
 
         try:
             cleanup_days = int(data.get("cleanup_days", DEFAULT_CLEANUP_DAYS))
@@ -940,15 +866,6 @@ class Config:
             raise ConfigError("cleanup_days must be a positive integer")
         if cleanup_days < 1:
             raise ConfigError("cleanup_days must be a positive integer")
-        env_cleanup_days = os.getenv("GZA_CLEANUP_DAYS")
-        if env_cleanup_days:
-            try:
-                cleanup_days = int(env_cleanup_days)
-            except ValueError:
-                raise ConfigError("GZA_CLEANUP_DAYS must be a positive integer")
-            if cleanup_days < 1:
-                raise ConfigError("GZA_CLEANUP_DAYS must be a positive integer")
-            source_map["cleanup_days"] = "env"
 
         try:
             review_diff_small_threshold = int(

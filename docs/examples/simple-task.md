@@ -43,7 +43,7 @@ Branch: feature/fix-the-login-button
 ## View the execution log
 
 ```bash
-$ gza log -t 1
+$ gza log 1
 
 Task #1: 20260108-fix-the-login-button
 Status: completed
@@ -60,7 +60,7 @@ Summary:
 For the full conversation:
 
 ```bash
-$ gza log -t 1 --turns
+$ gza log 1 --steps
 ```
 
 ## Check unmerged work

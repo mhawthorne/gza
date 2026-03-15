@@ -9,6 +9,12 @@ git push origin v0.1.0
 gh release create v0.1.0 --title "v0.1.0" --notes-file $notes_file
 ```
 
+# Generate release notes with Claude:
+```bash
+./bin/generate-release-notes.sh v0.1.0 v0.2.0
+```
+This uses Claude to analyze commits between the two tags and writes categorized markdown to `docs/release-notes/<tag>.md`.
+
 # show all commits between 2 tags:
 ```bash
 git log v0.1.0..v0.2.0 --oneline

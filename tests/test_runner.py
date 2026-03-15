@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
@@ -3370,3 +3371,84 @@ class TestExceptionHandlerMarkFailed:
         updated_task = store.get(task.id)
         assert updated_task.status == "failed"
         assert updated_task.failure_reason == "GIT_ERROR"
+
+
+class TestLoadDotenv:
+    """Tests for load_dotenv() credential loading from .env files."""
+
+    def _setup_home(self, tmp_path: Path, monkeypatch):
+        """Create a fake ~/.gza/.env directory and patch Path.home()."""
+        gza_dir = tmp_path / ".gza"
+        gza_dir.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        return gza_dir
+
+    def test_home_env_sets_unset_vars(self, tmp_path: Path, monkeypatch):
+        """~/.gza/.env should set variables not already in the environment."""
+        from gza.runner import load_dotenv
+
+        gza_dir = self._setup_home(tmp_path, monkeypatch)
+        (gza_dir / ".env").write_text("MY_TEST_KEY=from_home\n")
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+
+        load_dotenv(tmp_path)
+
+        assert os.environ["MY_TEST_KEY"] == "from_home"
+        monkeypatch.delenv("MY_TEST_KEY")
+
+    def test_home_env_does_not_override_existing(self, tmp_path: Path, monkeypatch):
+        """~/.gza/.env should not override variables already set in the environment."""
+        from gza.runner import load_dotenv
+
+        gza_dir = self._setup_home(tmp_path, monkeypatch)
+        (gza_dir / ".env").write_text("MY_TEST_KEY=from_home\n")
+        monkeypatch.setenv("MY_TEST_KEY", "from_shell")
+
+        load_dotenv(tmp_path)
+
+        assert os.environ["MY_TEST_KEY"] == "from_shell"
+
+    def test_project_env_overrides_home_env(self, tmp_path: Path, monkeypatch):
+        """Project .env should override values from ~/.gza/.env."""
+        from gza.runner import load_dotenv
+
+        gza_dir = self._setup_home(tmp_path, monkeypatch)
+        (gza_dir / ".env").write_text("MY_TEST_KEY=from_home\n")
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / ".env").write_text("MY_TEST_KEY=from_project\n")
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+
+        load_dotenv(project_dir)
+
+        assert os.environ["MY_TEST_KEY"] == "from_project"
+        monkeypatch.delenv("MY_TEST_KEY")
+
+    def test_comments_and_blank_lines_ignored(self, tmp_path: Path, monkeypatch):
+        """Comments and blank lines in .env files should be ignored."""
+        from gza.runner import load_dotenv
+
+        gza_dir = self._setup_home(tmp_path, monkeypatch)
+        (gza_dir / ".env").write_text(
+            "# This is a comment\n"
+            "\n"
+            "MY_TEST_KEY=valid_value\n"
+            "# COMMENTED_OUT=should_not_exist\n"
+        )
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+        monkeypatch.delenv("COMMENTED_OUT", raising=False)
+
+        load_dotenv(tmp_path)
+
+        assert os.environ["MY_TEST_KEY"] == "valid_value"
+        assert "COMMENTED_OUT" not in os.environ
+        monkeypatch.delenv("MY_TEST_KEY")
+
+    def test_no_env_files_is_noop(self, tmp_path: Path, monkeypatch):
+        """load_dotenv should not fail when no .env files exist."""
+        from gza.runner import load_dotenv
+
+        self._setup_home(tmp_path, monkeypatch)
+
+        load_dotenv(tmp_path)

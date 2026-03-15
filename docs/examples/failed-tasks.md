@@ -27,7 +27,7 @@ Error: max turns of 50 exceeded
 View the conversation to understand what happened:
 
 ```bash
-$ gza log -t 5 --turns
+$ gza log 5 --steps
 ```
 
 ## Resume vs Retry
@@ -117,5 +117,5 @@ Recent failed tasks:
 
 4. **Check progress mid-task:**
    ```bash
-   $ gza log -t 5 --turns
+   $ gza log 5 --steps
    ```

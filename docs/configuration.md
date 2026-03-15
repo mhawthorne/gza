@@ -90,6 +90,11 @@ branch_strategy: conventional
 # Generates: {slug}
 # Example: add-feature
 branch_strategy: simple
+
+# Preset: date_slug
+# Generates: {date}/{slug}
+# Example: 20260108/add-feature
+branch_strategy: date_slug
 ```
 
 Or use a custom pattern:
@@ -143,13 +148,6 @@ docker_volumes:
 - `z` - SELinux label sharing (for container isolation)
 - `Z` - SELinux exclusive label (for single container)
 
-**Environment variable override:**
-```bash
-# Override config with comma-separated volumes
-export GZA_DOCKER_VOLUMES="~/data:/data:ro,~/models:/models"
-gza work
-```
-
 **Notes:**
 - Volumes are only used when `use_docker: true`
 - Tilde (`~`) in source paths is automatically expanded to your home directory
@@ -201,14 +199,14 @@ Top-level `task_types` and `model` are still supported for backward compatibilit
 Provider selection:
 1. `task.provider`
 2. `task_providers.<task_type>`
-3. `provider` (already merged with `GZA_PROVIDER`)
+3. `provider`
 
 Model selection:
 1. `task.model`
 2. `providers.<effective_provider>.task_types.<task_type>.model`
 3. `providers.<effective_provider>.model`
 4. `task_types.<task_type>.model` (legacy fallback)
-5. `model` / `defaults.model` / `GZA_MODEL` (legacy fallback)
+5. `model` / `defaults.model` (legacy fallback)
 6. Provider runtime default (if no model resolved)
 
 Max steps selection:
@@ -216,25 +214,10 @@ Max steps selection:
 2. `providers.<effective_provider>.task_types.<task_type>.max_turns` (legacy)
 3. `task_types.<task_type>.max_steps` (legacy fallback)
 4. `task_types.<task_type>.max_turns` (legacy fallback)
-5. `max_steps` / `defaults.max_steps` / `GZA_MAX_STEPS`
-6. `max_turns` / `defaults.max_turns` / `GZA_MAX_TURNS` (legacy fallback)
+5. `max_steps` / `defaults.max_steps`
+6. `max_turns` / `defaults.max_turns` (legacy fallback)
 
 ---
-
-## Environment Variables
-
-All `gza.yaml` options can be overridden via environment variables:
-
-| Environment Variable | Maps To | Description |
-|---------------------|---------|-------------|
-| `GZA_USE_DOCKER` | `use_docker` | Override Docker usage (`true`/`false`) |
-| `GZA_TIMEOUT_MINUTES` | `timeout_minutes` | Override task timeout |
-| `GZA_BRANCH_MODE` | `branch_mode` | Override branch strategy |
-| `GZA_MAX_TURNS` | `max_turns` | Override max conversation turns |
-| `GZA_WORKTREE_DIR` | `worktree_dir` | Override worktree directory |
-| `GZA_WORK_COUNT` | `work_count` | Override tasks per session |
-| `GZA_PROVIDER` | `provider` | Override AI provider |
-| `GZA_MODEL` | `model` | Override global legacy model fallback |
 
 ### Providers and Models
 
@@ -252,15 +235,6 @@ Set your provider in `gza.yaml`:
 provider: claude
 model: claude-sonnet-4-5  # optional: override the default model
 ```
-
-Or via environment variable:
-
-```bash
-export GZA_PROVIDER=claude
-export GZA_MODEL=claude-sonnet-4-5
-```
-
-`GZA_MODEL` is provider-agnostic and applies as a global legacy fallback, so it can override to a model that doesn't match the selected provider if set manually.
 
 ### Provider Credentials
 
@@ -307,13 +281,13 @@ Environment variables can be set in `.env` files:
 | `~/.gza/.env` | User-level (applies to all projects) |
 | `.env` | Project-level (overrides everything) |
 
-**Precedence order** (highest to lowest):
+These files are for **provider credentials only** (API keys, tokens). Gza configuration should go in `gza.yaml` or `gza.local.yaml`, not in `.env` files.
+
+**Credential precedence** (highest to lowest):
 
 1. **Project `.env`** - Overrides all other sources
 2. **Shell environment** - Variables exported in your shell
 3. **`~/.gza/.env`** - Only sets values not already defined
-4. **`gza.local.yaml`** - Local machine overrides
-5. **`gza.yaml`** - Base shared config
 
 This means if you have `ANTHROPIC_API_KEY` set in your shell, you don't need `~/.gza/.env` at all. The home `.env` file uses `setdefault` behavior, so it won't override existing environment variables.
 
@@ -321,8 +295,6 @@ This means if you have `ANTHROPIC_API_KEY` set in your shell, you don't need `~/
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
-GZA_MAX_TURNS=100
-GZA_TIMEOUT_MINUTES=15
 ```
 
 ---
@@ -413,15 +385,17 @@ gza log <identifier> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--task`, `-t` | Look up by task ID (mutually exclusive with -s, -w) |
-| `--slug`, `-s` | Look up by task slug (mutually exclusive with -t, -w) |
-| `--worker`, `-w` | Look up by worker ID (mutually exclusive with -t, -s) |
-| `--turns` | Show full conversation turns |
+| `identifier` | Task ID (numeric), slug, or worker ID |
+| `--slug`, `-s` | Interpret identifier as task slug (supports partial match) |
+| `--worker`, `-w` | Interpret identifier as worker ID |
+| `--steps` | Show compact step timeline |
+| `--steps-verbose` | Show verbose step timeline with substeps |
+| `--turns` | Deprecated alias for `--steps-verbose` |
 | `--follow`, `-f` | Follow log in real-time |
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
 
-**Note:** One of `--task`, `--slug`, or `--worker` is required.
+By default, the identifier is treated as a task ID (numeric).
 
 ### stats
 
@@ -433,7 +407,15 @@ gza stats [options]
 
 | Option | Description |
 |--------|-------------|
-| `--last N` | Show last N tasks (default: 5) |
+| `--last N`, `-n N` | Show last N tasks (default: 5) |
+| `--all` | Show all tasks (no limit) |
+| `--type TYPE` | Filter by task type |
+| `--days N` | Show only tasks from the last N days |
+| `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
+| `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
+| `--cycles` | Show cycle analytics (review/improve iteration statistics) |
+| `--task ID` | Show cycle analytics for a specific task (use with `--cycles`) |
+| `--json` | Output as machine-readable JSON |
 
 ### pr
 
@@ -580,8 +562,12 @@ gza config --json
 Show details of a specific task.
 
 ```bash
-gza show <task_id>
+gza show <task_id> [options]
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--full` | Show full output without truncation |
 
 ### resume
 
@@ -642,19 +628,26 @@ gza merge <task_id> [task_id...] [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Task ID(s) to merge (can specify multiple) |
+| `--all` | Merge all unmerged done tasks (task_ids optional when used) |
 | `--squash` | Squash commits into a single commit |
 | `--rebase` | Rebase onto current branch instead of merging |
 | `--delete` | Delete the branch after successful merge |
 | `--remote` | Fetch from origin and rebase against remote (requires --rebase) |
 | `--mark-only` | Mark branch as merged without performing actual merge (deletes branch) |
+| `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
 
 ### unmerged
 
 List tasks with branches that haven't been merged to main.
 
 ```bash
-gza unmerged
+gza unmerged [options]
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--commits-only` | Use commit-based detection (git cherry) instead of diff-based |
+| `--all` | Include failed tasks and check git directly for commits |
 
 For each unmerged implementation, output includes:
 - Branch diff/commit summary.
@@ -682,10 +675,15 @@ gza history [options]
 
 | Option | Description |
 |--------|-------------|
-| `--limit N`, `-n N` | Number of tasks to show (default: 10) |
+| `--last N`, `-n N` | Show last N tasks (default: 10) |
 | `--all` | Show all tasks (no limit) |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `learn` |
+| `--days N` | Show only tasks from the last N days |
+| `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
+| `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
-| `--type TYPE` | Filter by task type: `task`, `explore`, `plan`, `implement`, `review`, `improve` |
+| `--incomplete` | Show only unresolved tasks (failed or unmerged) |
+| `--lineage-depth N` | Expand lineage N levels for each task |
 
 ### checkout
 
@@ -727,6 +725,7 @@ gza rebase <task_id> [options]
 | `--remote` | Fetch from origin and rebase against remote target branch |
 | `--resolve` | Auto-resolve rebase conflicts using `/gza-rebase` in the active provider runtime |
 | `--force`, `-f` | Force remove worktree even if it has uncommitted changes |
+| `--background`, `-b` | Run rebase in background |
 
 When `--resolve` is used, gza runs the active task provider (`claude`, `codex`, or `gemini`) and sends the `/gza-rebase --auto` prompt. If the `gza-rebase` skill is missing for that runtime, gza fails fast with an install command such as:
 
@@ -750,6 +749,7 @@ gza cleanup [options]
 | `--days N` | Remove items older than N days (default: 30) |
 | `--keep-unmerged` | Keep logs for tasks that are still unmerged |
 | `--dry-run` | Show what would be cleaned without doing it |
+| `--force` | Skip confirmation prompt before removing worktrees |
 
 ### improve
 
@@ -767,6 +767,8 @@ gza improve <impl_task_id> [options]
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
 
 The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
 
@@ -787,6 +789,8 @@ gza review <task_id> [options]
 | `--no-pr` | Do not post review to PR even if one exists |
 | `--pr` | Require PR to exist (error if not found) |
 | `--open` | Open the review file in $EDITOR after completion |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
 
 When a PR exists for the implementation task, the review is automatically posted as a PR comment.
 
@@ -985,12 +989,11 @@ Tasks with `depends_on` set will remain pending until their dependency completes
 Configuration is resolved in the following order (highest to lowest priority):
 
 1. **Command-line arguments**
-2. **Environment variables** (`GZA_*`)
-3. **Project `.env` file**
-4. **Home `.env` file** (`~/.gza/.env`)
-5. **`gza.local.yaml` file** (if present)
-6. **`gza.yaml` file**
-7. **Hardcoded defaults**
+2. **`gza.local.yaml` file** (if present)
+3. **`gza.yaml` file**
+4. **Hardcoded defaults**
+
+Provider credentials (API keys) have their own precedence — see [Dotenv Files](#dotenv-files-env) above.
 
 ---
 
@@ -1082,7 +1085,7 @@ Tasks with unmet dependencies won't be picked up. Check:
 
 ```bash
 gza next          # Shows pending tasks and their dependencies
-gza status <group>  # Shows dependency chain status
+gza group <group>  # Shows tasks in a group
 ```
 
 ### Claude Code not found

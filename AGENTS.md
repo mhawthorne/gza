@@ -17,8 +17,10 @@ gza next [--project DIR]              # List upcoming pending tasks
 gza history [--project DIR]           # List recent completed/failed tasks
 gza stats [--project DIR]             # Show cost and usage statistics
 gza validate [--project DIR]          # Validate gza.yaml configuration
-gza claude-install-skills [SKILLS...] # Install gza Claude Code skills to project
+gza skills-install [SKILLS...]        # Install gza Claude Code skills to project
 ```
+
+See [Configuration Reference](docs/configuration.md) for the full command list and all options.
 
 The `--project` (or `-C`) option specifies the target project directory and can be used with any command. If not specified, the current directory is used.
 
@@ -50,16 +52,16 @@ Gza provides custom Claude Code skills that enhance the agent's ability to work 
 
 ```bash
 # List available skills
-gza claude-install-skills --list
+gza skills-install --list
 
 # Install all skills
-gza claude-install-skills
+gza skills-install
 
 # Install specific skills
-gza claude-install-skills gza-task-add gza-task-info
+gza skills-install gza-task-add gza-task-info
 
 # Force overwrite existing skills
-gza claude-install-skills --force
+gza skills-install --force
 ```
 
 Available skills:
@@ -94,9 +96,9 @@ Gza is configured via `gza.yaml` in the project root. Key fields:
 | `work_count` | int | 1 | Number of tasks to run in a single work session |
 | `advance_create_reviews` | bool | `true` | When `true` **and** `advance_requires_review` is also `true`, `gza advance` automatically creates a review task and spawns a worker for completed implement tasks that have no review yet. Has no effect when `advance_requires_review` is `false` (tasks merge directly without a review in that case). |
 | `advance_requires_review` | bool | `true` | When `true`, `gza advance` refuses to merge an implement task that has no passing (APPROVED) review. Set both flags to `false` for legacy merge-without-review behavior |
-| `max_resume_attempts` | int | `1` | Maximum number of times `gza advance` will auto-resume a failed task (for MAX_STEPS or MAX_TURNS failures). Configurable via `GZA_MAX_RESUME_ATTEMPTS` env var. Can be overridden per-run with `--max-resume-attempts N`. |
-| `max_review_cycles` | int | `3` | Maximum number of review/improve cycles before `gza advance` stops and flags a task for human intervention. Overridable per-run with `--max-review-cycles N`. Also configurable via `GZA_MAX_REVIEW_CYCLES` env var. |
-| `merge_squash_threshold` | int | `0` | When > 0, `gza advance` squash-merges branches with this many commits or more. `0` disables auto-squash (default). `1` = always squash. Overridable per-run with `--squash-threshold N` or env var `GZA_MERGE_SQUASH_THRESHOLD`. |
+| `max_resume_attempts` | int | `1` | Maximum number of times `gza advance` will auto-resume a failed task (for MAX_STEPS or MAX_TURNS failures). Can be overridden per-run with `--max-resume-attempts N`. |
+| `max_review_cycles` | int | `3` | Maximum number of review/improve cycles before `gza advance` stops and flags a task for human intervention. Overridable per-run with `--max-review-cycles N`. |
+| `merge_squash_threshold` | int | `0` | When > 0, `gza advance` squash-merges branches with this many commits or more. `0` disables auto-squash (default). `1` = always squash. Overridable per-run with `--squash-threshold N`. |
 
 ### LLM-Powered Learnings Summarization
 
@@ -118,7 +120,7 @@ The `verify_command` field ensures agents always run project-specific verificati
 
 > Before finishing, run the following verification command and fix any errors: `<verify_command>`
 
-This is NOT added to `explore`, `plan`, or `review` tasks since those don't produce code changes.
+This is NOT added to `explore`, `plan`, `review`, or `learn` tasks since those don't produce code changes.
 
 Example `gza.yaml`:
 ```yaml
@@ -304,7 +306,7 @@ When gza is installed, the `skills/` directory is included as package data. Ther
 Skills are installed to `.claude/skills/` in the target project via:
 
 ```bash
-gza claude-install-skills
+gza skills-install
 ```
 
 This copies skills from the installed gza package into the project's `.claude/skills/` directory, where Claude Code picks them up.
@@ -329,16 +331,16 @@ public: true
 | `description` | Yes | Short description shown in skill listings |
 | `allowed-tools` | Yes | Comma-separated list of tools the skill may use |
 | `version` | Yes | Semantic version string |
-| `public` | No | Set to `true` to expose the skill via `claude-install-skills`. Defaults to `false` |
+| `public` | No | Set to `true` to expose the skill via `skills-install`. Defaults to `false` |
 
 ### Public vs. Private Skills
 
 The `public` field controls which skills are exposed to end users:
 
-- **`public: true`** — Skill is included when running `gza claude-install-skills`
+- **`public: true`** — Skill is included when running `gza skills-install`
 - **`public: false` (or omitted)** — Skill is internal/developer-only and not installed by default
 
-The function `get_available_skills(public_only=True)` in `src/gza/skills_utils.py` is what `claude-install-skills` uses to determine which skills to expose.
+The function `get_available_skills(public_only=True)` in `src/gza/skills_utils.py` is what `skills-install` uses to determine which skills to expose.
 
 ### Adding a New Skill
 
