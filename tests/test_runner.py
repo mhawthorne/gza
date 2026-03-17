@@ -8,7 +8,7 @@ from unittest.mock import Mock, MagicMock, patch
 import pytest
 
 from gza.config import Config
-from gza.db import SqliteTaskStore, StepRef, Task
+from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git
 from gza.providers import RunResult, ClaudeProvider
 from gza.runner import (
@@ -23,9 +23,13 @@ from gza.runner import (
     _extract_review_verdict,
     backup_database,
     _compute_slug_override,
+    _complete_code_task,
     _create_and_run_review_task,
+    _resolve_code_task_branch_name,
     _run_non_code_task,
     _save_wip_changes,
+    _select_worktree_base_ref,
+    _setup_code_task_worktree,
     _restore_wip_changes,
     _squash_wip_commits,
     _run_result_to_stats,
@@ -3169,6 +3173,173 @@ class TestSameBranchLineageWalk:
         assert result == 1
         output = capsys.readouterr().out
         assert "Cycle detected" in output
+
+
+class TestExtractedRunInnerHelpers:
+    """Unit tests for helpers extracted from _run_inner orchestration."""
+
+    def _make_config(self, tmp_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.branch_mode = "multi"
+        config.project_name = "testproj"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        return config
+
+    def test_resolve_code_task_branch_name_walks_lineage(self, tmp_path: Path):
+        """same_branch lineage resolution should return an ancestor branch that exists."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        config = self._make_config(tmp_path)
+
+        impl = store.add(prompt="impl", task_type="implement")
+        impl.task_id = "20260317-impl"
+        impl.branch = "test/impl"
+        store.mark_in_progress(impl)
+        store.mark_completed(impl, log_file="logs/impl.log", stats=None)
+
+        failed_improve = store.add(prompt="improve1", task_type="improve", based_on=impl.id, same_branch=True)
+        failed_improve.task_id = "20260317-improve1"
+        store.mark_in_progress(failed_improve)
+        store.mark_failed(failed_improve, log_file="logs/improve1.log", stats=None)
+
+        retry = store.add(prompt="improve2", task_type="improve", based_on=failed_improve.id, same_branch=True)
+        retry.task_id = "20260317-improve2"
+
+        git = Mock(spec=Git)
+        git.branch_exists.side_effect = lambda branch: branch == "test/impl"
+
+        branch_name = _resolve_code_task_branch_name(retry, config, store, git, resume=False)
+        assert branch_name == "test/impl"
+
+    def test_select_worktree_base_ref_prefers_origin_when_origin_ahead(self):
+        """Base ref selection should choose origin/main when origin is strictly ahead."""
+        git = Mock(spec=Git)
+        git._run.return_value = Mock(returncode=0)  # origin ref exists
+
+        def count_ahead(lhs: str, rhs: str) -> int:
+            if lhs == "main" and rhs == "origin/main":
+                return 0
+            if lhs == "origin/main" and rhs == "main":
+                return 3
+            return 0
+
+        git.count_commits_ahead.side_effect = count_ahead
+
+        base_ref = _select_worktree_base_ref(git, "main")
+        assert base_ref == "origin/main"
+
+    def test_setup_code_task_worktree_resume_missing_branch_fails(self, tmp_path: Path):
+        """Resume/same_branch setup should fail early if branch no longer exists."""
+        config = self._make_config(tmp_path)
+        task = Task(id=1, prompt="resume task", task_type="implement", task_id="20260317-task")
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = False
+
+        ok = _setup_code_task_worktree(
+            task,
+            config,
+            git,
+            branch_name="missing/branch",
+            worktree_path=tmp_path / "worktrees" / "20260317-task",
+            default_branch="main",
+            resume=True,
+        )
+
+        assert ok is False
+
+    def test_complete_code_task_marks_failed_when_no_changes_and_no_commits(self, tmp_path: Path):
+        """Completion helper should fail task when provider produced neither changes nor commits."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.task_id = "20260317-impl-x"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "test/branch",
+            TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=tmp_path / "worktree-summary.md",
+            summary_path=tmp_path / ".gza" / "summaries" / f"{task.task_id}.md",
+            summary_dir=tmp_path / ".gza" / "summaries",
+        )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+
+    def test_complete_code_task_selectively_stages_new_files(self, tmp_path: Path):
+        """Completion helper should stage only provider-introduced changes."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement selective staging", task_type="implement")
+        task.task_id = "20260317-selective"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        pre_status = {("M", "pre_existing.txt")}
+        post_status = {("M", "pre_existing.txt"), ("M", "src/foo.py"), ("??", "new_file.txt")}
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n1\t0\tnew_file.txt\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.task_id}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("## Summary\n\n- done\n")
+
+        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        staged_files = [call.args[0] for call in worktree_git.add.call_args_list]
+        assert set(staged_files) == {"src/foo.py", "new_file.txt"}
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert summary_path.exists()
 
 
 class TestWriteLogEntry:

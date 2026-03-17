@@ -1236,33 +1236,25 @@ def _cleanup_foreground_worker(config: Config, worker_id: str) -> None:
     registry.remove(worker_id)
 
 
-def _run_inner(
-    task: "Task",
-    task_config: Config,
+def _resolve_code_task_branch_name(
+    task: Task,
     config: Config,
     store: SqliteTaskStore,
-    provider: "Provider",
-    git: "Git | None",
-    resume: bool = False,
-    open_after: bool = False,
-) -> int:
-    """Inner task execution logic, split out to allow foreground worker cleanup."""
-    # For explore, plan, review, and learn tasks, run in project dir without creating a branch
-    if task.task_type in ("explore", "plan", "review", "learn"):
-        return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
-
-    # Code tasks (implement/improve) require git
-    assert git is not None, "git is required for code tasks"
-    default_branch = git.default_branch()
-
-    # Determine branch name based on resume, same_branch, and branch_mode
+    git: Git,
+    *,
+    resume: bool,
+) -> str | None:
+    """Resolve the branch name for implement/improve task execution."""
     if resume and task.branch:
         # Resume uses the existing branch from the failed task
         branch_name = task.branch
         console.print(f"    Resuming on existing branch: [blue]{branch_name}[/blue]")
-    elif resume:
+        return branch_name
+
+    if resume:
         # Resume but branch wasn't saved - derive from task_id using branch naming strategy
         from gza.branch_naming import generate_branch_name
+
         assert config.branch_strategy is not None
         assert task.task_id is not None
         branch_name = generate_branch_name(
@@ -1274,7 +1266,9 @@ def _run_inner(
             explicit_type=task.task_type_hint,
         )
         console.print(f"    Resuming on branch: [blue]{branch_name}[/blue]")
-    elif task.same_branch:
+        return branch_name
+
+    if task.same_branch:
         # Use the branch from based_on task (for improve tasks) or depends_on task (fallback).
         # Walk the based_on chain until we find an ancestor with a valid, existing branch.
         source_task = None
@@ -1305,41 +1299,78 @@ def _run_inner(
                 current = store.get(current.based_on)
             elif current.based_on:
                 error_message(f"Error: Cycle detected in based_on chain for task #{task.id}")
-                return 1
+                return None
             else:
                 current = None
 
         if resolved_branch is None:
             error_message(f"Error: Task #{task.id} has same_branch=True but no ancestor has a valid branch")
-            return 1
-        branch_name = resolved_branch
-    elif config.branch_mode == "single":
-        branch_name = f"{config.project_name}/gza-work"
-    else:  # multi
-        # Use branch naming strategy
-        from gza.branch_naming import generate_branch_name
-        assert config.branch_strategy is not None
-        assert task.task_id is not None
-        branch_name = generate_branch_name(
-            pattern=config.branch_strategy.pattern,
-            project_name=config.project_name,
-            task_id=task.task_id,
-            prompt=task.prompt,
-            default_type=config.branch_strategy.default_type,
-            explicit_type=task.task_type_hint,
-        )
+            return None
+        return resolved_branch
 
-    # Create worktree path
+    if config.branch_mode == "single":
+        return f"{config.project_name}/gza-work"
+
+    # multi branch mode uses branch naming strategy
+    from gza.branch_naming import generate_branch_name
+
+    assert config.branch_strategy is not None
     assert task.task_id is not None
-    worktree_path = config.worktree_path / task.task_id
+    return generate_branch_name(
+        pattern=config.branch_strategy.pattern,
+        project_name=config.project_name,
+        task_id=task.task_id,
+        prompt=task.prompt,
+        default_type=config.branch_strategy.default_type,
+        explicit_type=task.task_type_hint,
+    )
 
-    # Handle branch and worktree creation
+
+def _select_worktree_base_ref(git: Git, default_branch: str) -> str:
+    """Select base ref for a new worktree using local/default divergence logic."""
+    base_ref = default_branch
+    origin_ref = f"origin/{default_branch}"
+
+    # Check if origin ref exists
+    origin_exists = git._run("rev-parse", "--verify", origin_ref, check=False).returncode == 0
+
+    if not origin_exists:
+        return base_ref
+
+    # Compare local vs origin - use whichever is ahead
+    local_ahead = git.count_commits_ahead(default_branch, origin_ref)
+    origin_ahead = git.count_commits_ahead(origin_ref, default_branch)
+
+    if origin_ahead > 0 and local_ahead == 0:
+        # Origin is strictly ahead, use it
+        return origin_ref
+    if local_ahead > 0 and origin_ahead == 0:
+        # Local is strictly ahead, use it
+        return default_branch
+    if local_ahead > 0 and origin_ahead > 0:
+        # Diverged - prefer local to include unpushed changes
+        return default_branch
+    # Same commit, use either (default to local)
+    return default_branch
+
+
+def _setup_code_task_worktree(
+    task: Task,
+    config: Config,
+    git: Git,
+    *,
+    branch_name: str,
+    worktree_path: Path,
+    default_branch: str,
+    resume: bool,
+) -> bool:
+    """Create or re-create a code-task worktree and check out the target branch."""
     if resume or task.same_branch:
         # Validate branch exists before attempting to check it out
         if not git.branch_exists(branch_name):
             error_message(f"Error: Branch '{branch_name}' no longer exists. Cannot resume.")
             console.print("The branch may have been deleted or merged.")
-            return 1
+            return False
 
         # Check out existing branch in worktree
         try:
@@ -1352,46 +1383,225 @@ def _run_inner(
             console.print(f"Creating worktree with existing branch: {worktree_path}")
             # For existing branch, use git worktree add <path> <branch>
             git._run("worktree", "add", str(worktree_path), branch_name)
+            return True
         except GitError as e:
             error_message(f"Error: Could not check out branch {branch_name} in worktree: {e}")
-            return 1
-    else:
-        # Delete existing branch if in single mode (worktree_add will recreate it)
-        if config.branch_mode == "single" and git.branch_exists(branch_name):
-            git._run("branch", "-D", branch_name, check=False)
+            return False
 
-        try:
-            # Create worktree with new branch based on the most up-to-date ref
-            # Compare local main vs origin/main and use whichever is ahead
-            base_ref = default_branch
-            origin_ref = f"origin/{default_branch}"
+    # Delete existing branch if in single mode (worktree_add will recreate it)
+    if config.branch_mode == "single" and git.branch_exists(branch_name):
+        git._run("branch", "-D", branch_name, check=False)
 
-            # Check if origin ref exists
-            origin_exists = git._run("rev-parse", "--verify", origin_ref, check=False).returncode == 0
+    try:
+        base_ref = _select_worktree_base_ref(git, default_branch)
+        console.print(f"Creating worktree: {worktree_path}")
+        git.worktree_add(worktree_path, branch_name, base_ref)
+        return True
+    except GitError as e:
+        error_message(f"Git error: {e}")
+        return False
 
-            if origin_exists:
-                # Compare local vs origin - use whichever is ahead
-                local_ahead = git.count_commits_ahead(default_branch, origin_ref)
-                origin_ahead = git.count_commits_ahead(origin_ref, default_branch)
 
-                if origin_ahead > 0 and local_ahead == 0:
-                    # Origin is strictly ahead, use it
-                    base_ref = origin_ref
-                elif local_ahead > 0 and origin_ahead == 0:
-                    # Local is strictly ahead, use it
-                    base_ref = default_branch
-                elif local_ahead > 0 and origin_ahead > 0:
-                    # Diverged - prefer local to include unpushed changes
-                    base_ref = default_branch
-                else:
-                    # Same commit, use either (default to local)
-                    base_ref = default_branch
+def _complete_code_task(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    worktree_git: Git,
+    log_file: Path,
+    branch_name: str,
+    stats: TaskStats,
+    exit_code: int,
+    pre_run_status: set[tuple[str, str]],
+    worktree_summary_path: Path,
+    summary_path: Path,
+    summary_dir: Path,
+) -> int:
+    """Handle successful code-task completion (staging, commit, completion state, output)."""
+    # Compute which files changed during the provider run (selective staging)
+    post_run_status = worktree_git.status_porcelain()
+    new_changes = post_run_status - pre_run_status
+    has_uncommitted = bool(new_changes)
 
-            console.print(f"Creating worktree: {worktree_path}")
-            git.worktree_add(worktree_path, branch_name, base_ref)
-        except GitError as e:
-            error_message(f"Git error: {e}")
-            return 1
+    if not has_uncommitted:
+        # Check if branch already has commits from a previous run
+        default_branch = worktree_git.default_branch()
+        commits_ahead = worktree_git.count_commits_ahead(branch_name, default_branch)
+        if commits_ahead == 0:
+            # No uncommitted changes and no commits on branch - real failure
+            # Note: No need to save WIP here since there are no changes
+            error_message("No changes made")
+            stats_line(stats, has_commits=False)
+            console.print(f"Task ID: {task.id}")
+            next_steps([
+                (f"gza retry {task.id}", "retry from scratch"),
+                (f"gza resume {task.id}", "resume from where it left off"),
+            ])
+            failure_reason = extract_failure_reason(log_file)
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "message": "Outcome: failed (no changes made)",
+                    "exit_code": exit_code,
+                    "failure_reason": failure_reason,
+                },
+            )
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "stats",
+                    "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+                    "duration_seconds": stats.duration_seconds,
+                    "cost_usd": stats.cost_usd,
+                    "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+                },
+            )
+            store.mark_failed(
+                task,
+                log_file=str(log_file.relative_to(config.project_dir)),
+                stats=stats,
+                branch=branch_name,
+                failure_reason=failure_reason,
+            )
+            return 0
+        # else: branch has commits from a previous run - treat as success without committing
+
+    if has_uncommitted:
+        # Squash any WIP commits before creating final commit
+        _squash_wip_commits(worktree_git, task)
+
+        # Stage only files that changed during the provider run
+        files_to_stage = [filepath for _, filepath in new_changes]
+        for f in files_to_stage:
+            worktree_git.add(f)
+
+        # Build commit message with trailer for improve tasks
+        commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
+
+        # Add review trailer for improve tasks
+        if task.task_type == "improve" and task.depends_on:
+            review_task = store.get(task.depends_on)
+            if review_task and review_task.task_type == "review":
+                commit_message += f"\nGza-Review: #{review_task.id}"
+
+        worktree_git.commit(commit_message)
+
+    # Copy summary file from worktree to main project directory
+    output_content = None
+    if worktree_summary_path.exists():
+        # Ensure target directory exists
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        # Copy summary content from worktree to project dir
+        summary_path.write_text(worktree_summary_path.read_text())
+        output_content = summary_path.read_text()
+
+    # Compute diff stats vs. default branch before marking completed
+    default_branch = worktree_git.default_branch()
+    numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
+    diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
+
+    # Mark completed
+    store.mark_completed(
+        task,
+        branch=branch_name,
+        log_file=str(log_file.relative_to(config.project_dir)),
+        output_content=output_content,
+        has_commits=True,
+        stats=stats,
+        diff_files_changed=diff_files,
+        diff_lines_added=diff_added,
+        diff_lines_removed=diff_removed,
+    )
+    write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "stats",
+            "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+            "duration_seconds": stats.duration_seconds,
+            "cost_usd": stats.cost_usd,
+            "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+        },
+    )
+    auto_learnings = maybe_auto_regenerate_learnings(store, config)
+
+    # Clear review state on the based_on implementation task after improve completes.
+    # The improve task has addressed the review feedback, so the old review no longer
+    # reflects the current code state.
+    if task.task_type == "improve" and task.based_on:
+        store.clear_review_state(task.based_on)
+
+    console.print("")
+    success_message("Done")
+    stats_line(stats, has_commits=True)
+    console.print(f"Task ID: {task.id}")
+    console.print(f"Branch: [blue]{branch_name}[/blue]")
+    next_steps([
+        (f"gza merge {task.id}", "merge branch for task"),
+        (f"gza pr {task.id}", "create a PR"),
+    ])
+    if auto_learnings:
+        info_line(
+            "Learnings",
+            f"updated from {auto_learnings.tasks_used} tasks "
+            f"({auto_learnings.path.relative_to(config.project_dir)}) "
+            f"+{auto_learnings.added_count}/-{auto_learnings.removed_count}/={auto_learnings.retained_count} "
+            f"churn {auto_learnings.churn_percent:.1f}%"
+        )
+    console.print("")
+    console.print("To review changes:")
+    console.print(f"  [cyan]git diff {default_branch}...{branch_name} --[/cyan]")
+    console.print("")
+    console.print("To merge:")
+    console.print(f"  [cyan]gza merge {task.id}[/cyan]  [dim]# or: git merge --squash {branch_name}[/dim]")
+
+    # Auto-create and run review task if requested
+    if task.create_review:
+        return _create_and_run_review_task(task, config, store)
+
+    return 0
+
+
+def _run_inner(
+    task: "Task",
+    task_config: Config,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: "Provider",
+    git: "Git | None",
+    resume: bool = False,
+    open_after: bool = False,
+) -> int:
+    """Inner task execution logic, split out to allow foreground worker cleanup."""
+    # For explore, plan, review, and learn tasks, run in project dir without creating a branch
+    if task.task_type in ("explore", "plan", "review", "learn"):
+        return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
+
+    # Code tasks (implement/improve) require git
+    assert git is not None, "git is required for code tasks"
+    default_branch = git.default_branch()
+
+    branch_name = _resolve_code_task_branch_name(task, config, store, git, resume=resume)
+    if branch_name is None:
+        return 1
+
+    # Create worktree path
+    assert task.task_id is not None
+    worktree_path = config.worktree_path / task.task_id
+
+    if not _setup_code_task_worktree(
+        task,
+        config,
+        git,
+        branch_name=branch_name,
+        worktree_path=worktree_path,
+        default_branch=default_branch,
+        resume=resume,
+    ):
+        return 1
 
     # Create a Git instance for the worktree
     worktree_git = Git(worktree_path)
@@ -1547,117 +1757,20 @@ def _run_inner(
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
 
-        # Compute which files changed during the provider run (selective staging)
-        post_run_status = worktree_git.status_porcelain()
-        new_changes = post_run_status - pre_run_status
-        has_uncommitted = bool(new_changes)
-
-        if not has_uncommitted:
-            # Check if branch already has commits from a previous run
-            default_branch = worktree_git.default_branch()
-            commits_ahead = worktree_git.count_commits_ahead(branch_name, default_branch)
-            if commits_ahead == 0:
-                # No uncommitted changes and no commits on branch - real failure
-                # Note: No need to save WIP here since there are no changes
-                error_message("No changes made")
-                stats_line(stats, has_commits=False)
-                console.print(f"Task ID: {task.id}")
-                next_steps([
-                    (f"gza retry {task.id}", "retry from scratch"),
-                    (f"gza resume {task.id}", "resume from where it left off"),
-                ])
-                failure_reason = extract_failure_reason(log_file)
-                write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (no changes made)", "exit_code": exit_code, "failure_reason": failure_reason})
-                write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-                store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
-                return 0
-            # else: branch has commits from a previous run - treat as success without committing
-
-        if has_uncommitted:
-            # Squash any WIP commits before creating final commit
-            _squash_wip_commits(worktree_git, task)
-
-            # Stage only files that changed during the provider run
-            files_to_stage = [filepath for _, filepath in new_changes]
-            for f in files_to_stage:
-                worktree_git.add(f)
-
-            # Build commit message with trailer for improve tasks
-            commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
-
-            # Add review trailer for improve tasks
-            if task.task_type == "improve" and task.depends_on:
-                review_task = store.get(task.depends_on)
-                if review_task and review_task.task_type == "review":
-                    commit_message += f"\nGza-Review: #{review_task.id}"
-
-            worktree_git.commit(commit_message)
-
-        # Copy summary file from worktree to main project directory
-        output_content = None
-        if worktree_summary_path.exists():
-            # Ensure target directory exists
-            summary_dir.mkdir(parents=True, exist_ok=True)
-            # Copy summary content from worktree to project dir
-            summary_path.write_text(worktree_summary_path.read_text())
-            output_content = summary_path.read_text()
-
-        # Compute diff stats vs. default branch before marking completed
-        default_branch = worktree_git.default_branch()
-        numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
-        diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
-
-        # Mark completed
-        store.mark_completed(
+        return _complete_code_task(
             task,
-            branch=branch_name,
-            log_file=str(log_file.relative_to(config.project_dir)),
-            output_content=output_content,
-            has_commits=True,
-            stats=stats,
-            diff_files_changed=diff_files,
-            diff_lines_added=diff_added,
-            diff_lines_removed=diff_removed,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            branch_name,
+            stats,
+            exit_code,
+            pre_run_status,
+            worktree_summary_path,
+            summary_path,
+            summary_dir,
         )
-        write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
-        write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-        auto_learnings = maybe_auto_regenerate_learnings(store, config)
-
-        # Clear review state on the based_on implementation task after improve completes.
-        # The improve task has addressed the review feedback, so the old review no longer
-        # reflects the current code state.
-        if task.task_type == "improve" and task.based_on:
-            store.clear_review_state(task.based_on)
-
-        console.print("")
-        success_message("Done")
-        stats_line(stats, has_commits=True)
-        console.print(f"Task ID: {task.id}")
-        console.print(f"Branch: [blue]{branch_name}[/blue]")
-        next_steps([
-            (f"gza merge {task.id}", "merge branch for task"),
-            (f"gza pr {task.id}", "create a PR"),
-        ])
-        if auto_learnings:
-            info_line(
-                "Learnings",
-                f"updated from {auto_learnings.tasks_used} tasks "
-                f"({auto_learnings.path.relative_to(config.project_dir)}) "
-                f"+{auto_learnings.added_count}/-{auto_learnings.removed_count}/={auto_learnings.retained_count} "
-                f"churn {auto_learnings.churn_percent:.1f}%"
-            )
-        console.print("")
-        console.print("To review changes:")
-        console.print(f"  [cyan]git diff {default_branch}...{branch_name} --[/cyan]")
-        console.print("")
-        console.print("To merge:")
-        console.print(f"  [cyan]gza merge {task.id}[/cyan]  [dim]# or: git merge --squash {branch_name}[/dim]")
-
-        # Auto-create and run review task if requested
-        if task.create_review:
-            return _create_and_run_review_task(task, config, store)
-
-        return 0
 
     except GitError as e:
         error_message(f"Git error: {e}")
