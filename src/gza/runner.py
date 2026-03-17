@@ -113,7 +113,7 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     """Get the effective model, provider, and max_steps for a task.
 
     Priority order for provider selection:
-    1. Task-specific provider (task.provider)
+    1. Explicit task-specific provider override (task.provider when provider_is_explicit)
     2. Task-type route (config.task_providers.<task_type>)
     3. Config default (config.provider, already env-merged in Config.load)
 
@@ -131,7 +131,8 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     Returns:
         Tuple of (model, provider, max_steps) where model can be None
     """
-    provider = task.provider if task.provider else config.get_provider_for_task(task.task_type)
+    provider_override = task.provider if task.provider_is_explicit and task.provider else None
+    provider = provider_override if provider_override else config.get_provider_for_task(task.task_type)
     model = task.model if task.model else config.get_model_for_task(task.task_type, provider)
     max_steps = config.get_max_steps_for_task(task.task_type, provider)
     return model, provider, max_steps
@@ -1128,8 +1129,10 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     # Get effective model and provider for this task
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
-    # Persist resolved model and provider to the task DB row immediately so analytics
-    # can track which model actually ran the task, even if it crashes before completion.
+    # Persist resolved model/provider to the task DB row immediately so analytics
+    # can track which configuration actually ran, even if it crashes before completion.
+    # provider_is_explicit is intentionally left unchanged so resolved provider
+    # state does not become a sticky override for future executions.
     task.model = effective_model
     task.provider = effective_provider
     store.update(task)

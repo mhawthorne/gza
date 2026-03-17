@@ -1107,7 +1107,7 @@ class TestRebaseHelpers:
         from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="claude")
-        task = SimpleNamespace(task_type="implement", provider="codex", model=None)
+        task = SimpleNamespace(task_type="implement", provider="codex", provider_is_explicit=True, model=None)
 
         with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
@@ -1134,7 +1134,7 @@ class TestRebaseHelpers:
         from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="gemini")
-        task = SimpleNamespace(task_type="implement", provider=None, model=None)
+        task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
 
         with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
@@ -1161,7 +1161,7 @@ class TestRebaseHelpers:
         codex_home = tmp_path / "codex-home"
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
-        task = SimpleNamespace(task_type="implement", provider=None, model=None)
+        task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
 
         with patch("gza.cli.ensure_skill", return_value=False), \
              patch("gza.providers.get_provider") as mock_get_provider:
@@ -1172,6 +1172,30 @@ class TestRebaseHelpers:
         out = capsys.readouterr().out
         assert "Missing required 'gza-rebase' skill for provider 'codex'" in out
         assert "uv run gza skills-install --target codex gza-rebase --project" in out
+
+    def test_invoke_provider_resolve_uses_current_config_after_provider_switch(self, tmp_path):
+        """Auto-resolve uses current config provider when task provider is non-explicit stale state."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="codex")
+        task = SimpleNamespace(task_type="implement", provider="claude", provider_is_explicit=False, model=None)
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config)
+            assert result is True
+            assert mock_get_provider.call_count == 1
+            resolve_config = mock_get_provider.call_args.args[0]
+            assert resolve_config.provider == "codex"
 
     def test_ensure_skill_returns_true_when_skill_already_present(self, tmp_path):
         """ensure_skill returns True immediately when the skill file already exists."""

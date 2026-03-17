@@ -475,6 +475,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle --provider flag
     if hasattr(args, 'provider') and args.provider is not None:
         task.provider = args.provider
+        task.provider_is_explicit = True
         store.update(task)
         print(f"✓ Set provider override to '{args.provider}' for task #{task.id}")
         return 0
@@ -590,7 +591,8 @@ def cmd_retry(args: argparse.Namespace) -> int:
         task_type_hint=task.task_type_hint,
         based_on=args.task_id,  # Track retry lineage
         model=task.model,
-        provider=task.provider,
+        provider=task.provider if task.provider_is_explicit else None,
+        provider_is_explicit=task.provider_is_explicit,
     )
 
     print(f"✓ Created task #{new_task.id} (retry of #{args.task_id})")

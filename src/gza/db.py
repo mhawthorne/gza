@@ -106,6 +106,7 @@ class Task:
     pr_number: int | None = None  # GitHub PR number
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
+    provider_is_explicit: bool = False  # True when provider was explicitly set by user input
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     failure_reason: str | None = None
     skip_learnings: bool = False
@@ -177,8 +178,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cy
 # Migration from v19 to v20
 MIGRATION_V19_TO_V20 = "UPDATE tasks SET task_type='implement' WHERE task_type='task';"
 
+# Migration from v20 to v21
+MIGRATION_V20_TO_V21 = """
+ALTER TABLE tasks ADD COLUMN provider_is_explicit INTEGER DEFAULT 0;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -223,6 +229,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- New fields for per-task model/provider overrides (v7)
     model TEXT,
     provider TEXT,
+    provider_is_explicit INTEGER DEFAULT 0,
     -- num_turns_reported and num_turns_computed added inline above (v8)
     -- Raw token counts for cost recalculation (v9)
     input_tokens INTEGER,
@@ -589,6 +596,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (18, MIGRATION_V17_TO_V18),
     (19, MIGRATION_V18_TO_V19),
     (20, MIGRATION_V19_TO_V20),
+    (21, MIGRATION_V20_TO_V21),
 ]
 
 
@@ -674,6 +682,7 @@ class SqliteTaskStore:
             pr_number=row["pr_number"] if "pr_number" in row.keys() else None,
             model=row["model"] if "model" in row.keys() else None,
             provider=row["provider"] if "provider" in row.keys() else None,
+            provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in row.keys() and row["provider_is_explicit"] is not None else False,
             merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
             failure_reason=row["failure_reason"] if "failure_reason" in row.keys() else None,
             skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in row.keys() and row["skip_learnings"] is not None else False,
@@ -747,17 +756,20 @@ class SqliteTaskStore:
         task_type_hint: str | None = None,
         model: str | None = None,
         provider: str | None = None,
+        provider_is_explicit: bool | None = None,
         skip_learnings: bool = False,
     ) -> Task:
         """Add a new task."""
         now = datetime.now(timezone.utc).isoformat()
+        if provider_is_explicit is None:
+            provider_is_explicit = provider is not None
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if skip_learnings else 0),
+                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if provider_is_explicit else 0, 1 if skip_learnings else 0),
             )
             task_id = cur.lastrowid
             assert task_id is not None
@@ -814,6 +826,7 @@ class SqliteTaskStore:
                     pr_number = ?,
                     model = ?,
                     provider = ?,
+                    provider_is_explicit = ?,
                     merge_status = ?,
                     failure_reason = ?,
                     skip_learnings = ?,
@@ -857,6 +870,7 @@ class SqliteTaskStore:
                     task.pr_number,
                     task.model,
                     task.provider,
+                    1 if task.provider_is_explicit else 0,
                     task.merge_status,
                     task.failure_reason,
                     1 if task.skip_learnings else 0,
@@ -2323,6 +2337,7 @@ def _task_to_dict(task: "Task") -> dict:
         "pr_number": task.pr_number,
         "model": task.model,
         "provider": task.provider,
+        "provider_is_explicit": task.provider_is_explicit,
         "merge_status": task.merge_status,
         "failure_reason": task.failure_reason,
         "skip_learnings": task.skip_learnings,
