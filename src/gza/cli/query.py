@@ -38,7 +38,7 @@ from ._common import (
 from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
     get_improves_for_root as _get_improves_for_root_task,
-    build_lineage as _build_lineage_tasks_for_root,
+    build_lineage_tree as _build_lineage_tree_for_root,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 
@@ -204,41 +204,25 @@ def cmd_history(args: argparse.Namespace) -> int:
             console.print(f"{indent}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
 
     def _render_lineage_node(node: TaskLineageNode) -> None:
-        """Render a TaskLineageNode with ancestors above and descendants below."""
-        indent_unit = "  "
+        """Render a lineage tree using branch connectors."""
 
-        # Collect all ancestors by walking the chain (parent → grandparent → ...)
-        all_ancestors: list[TaskLineageNode] = []
-        current = node
-        while current.ancestors:
-            ancestor = current.ancestors[0]
-            all_ancestors.append(ancestor)
-            current = ancestor
+        def _render_subtree(current: TaskLineageNode, prefix: str = "", is_last: bool = True) -> None:
+            if prefix:
+                connector = "└── " if is_last else "├── "
+                indent = f"[{c['lineage']}]{prefix}{connector}[/{c['lineage']}]"
+            else:
+                indent = ""
+            _render_task_line(current.task, indent=indent)
 
-        # Render ancestors oldest first (deepest depth = oldest)
-        for ancestor_node in reversed(all_ancestors):
-            depth_indent = indent_unit * ancestor_node.depth
-            console.print(
-                f"{depth_indent}[{c['lineage']}]↑ ancestor[/{c['lineage']}]"
-            )
-            _render_task_line(ancestor_node.task, indent=depth_indent)
+            next_prefix = f"{prefix}{'    ' if is_last else '│   '}"
+            for index, child in enumerate(current.children):
+                _render_subtree(
+                    child,
+                    prefix=next_prefix,
+                    is_last=index == (len(current.children) - 1),
+                )
 
-        # Render the root task itself
-        _render_task_line(node.task)
-
-        # Render descendants recursively so all levels beyond depth=1 are shown
-        def _render_desc_subtree(desc_node: TaskLineageNode) -> None:
-            depth_indent = indent_unit * desc_node.depth
-            console.print(
-                f"{depth_indent}[{c['lineage']}]↓ descendant[/{c['lineage']}]"
-            )
-            _render_task_line(desc_node.task, indent=depth_indent)
-            for child in desc_node.descendants:
-                _render_desc_subtree(child)
-
-        for desc_node in node.descendants:
-            _render_desc_subtree(desc_node)
-
+        _render_subtree(node)
         print()
 
     # Check for orphaned tasks (only when no status filter is active)
@@ -384,9 +368,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         reviews = _get_reviews_for_root_task(store, root_task)
         improve_tasks = _get_improves_for_root_task(store, root_task)
-        lineage_tasks = _build_lineage_tasks_for_root(store, root_task)
+        lineage_tree = _build_lineage_tree_for_root(store, root_task)
         c = UNMERGED_COLORS  # shorthand
-        lineage_str = _format_lineage(lineage_tasks, c["task_id"])
+        lineage_str = _format_lineage(lineage_tree, c["task_id"])
 
         # Classify review freshness/status for this implementation.
         latest_review = next((r for r in reviews if r.completed_at is not None), None)
@@ -463,7 +447,8 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
 
         if lineage_str:
-            console.print(f"lineage: {lineage_str}")
+            console.print("lineage:")
+            console.print(lineage_str)
 
         # Show branch with diff stats (branch may no longer exist if deleted)
         if git.branch_exists(branch):
@@ -1193,12 +1178,11 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 
     root_task = _resolve_lineage_root_task(store, task)
-    lineage_tasks = _build_lineage_tasks_for_root(store, root_task)
-    if not any(t.id == task.id for t in lineage_tasks if t.id is not None):
-        lineage_tasks.append(task)
-    lineage_str = _format_lineage(lineage_tasks, c["task_id"])
+    lineage_tree = _build_lineage_tree_for_root(store, root_task)
+    lineage_str = _format_lineage(lineage_tree, c["task_id"])
     if lineage_str:
-        console.print(f"[{c['label']}]Lineage:[/{c['label']}] {lineage_str}")
+        console.print(f"[{c['label']}]Lineage:[/{c['label']}]")
+        console.print(lineage_str)
 
     console.print()
     console.print(f"[{c['label']}]Prompt:[/{c['label']}]")

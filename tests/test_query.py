@@ -208,37 +208,24 @@ class TestGetTaskLineage:
         store.update(task)
         return task
 
-    def test_depth_zero_returns_node_with_no_lineage(self, tmp_path: Path):
+    def test_depth_zero_returns_only_root(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         parent = self._add_task(store, "parent")
         child = self._add_task(store, "child", based_on=parent.id)
 
         node = get_task_lineage(store, child.id, depth=0)
-        assert node.task.id == child.id
-        assert node.ancestors == []
-        assert node.descendants == []
+        assert node.task.id == parent.id
+        assert node.children == []
 
-    def test_depth_one_returns_direct_parent(self, tmp_path: Path):
+    def test_depth_one_returns_direct_children(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         parent = self._add_task(store, "parent")
         child = self._add_task(store, "child", based_on=parent.id)
 
         node = get_task_lineage(store, child.id, depth=1)
-        assert node.task.id == child.id
-        assert len(node.ancestors) == 1
-        assert node.ancestors[0].task.id == parent.id
-
-    def test_depth_one_returns_direct_children(self, tmp_path: Path):
-        store = self._make_store(tmp_path)
-        parent = self._add_task(store, "parent")
-        child1 = self._add_task(store, "child 1", based_on=parent.id)
-        child2 = self._add_task(store, "child 2", based_on=parent.id)
-
-        node = get_task_lineage(store, parent.id, depth=1)
         assert node.task.id == parent.id
-        desc_ids = {n.task.id for n in node.descendants}
-        assert child1.id in desc_ids
-        assert child2.id in desc_ids
+        assert len(node.children) == 1
+        assert node.children[0].task.id == child.id
 
     def test_depth_two_traverses_two_levels(self, tmp_path: Path):
         store = self._make_store(tmp_path)
@@ -247,22 +234,12 @@ class TestGetTaskLineage:
         child = self._add_task(store, "child", based_on=parent.id)
 
         node = get_task_lineage(store, child.id, depth=2)
-        assert node.task.id == child.id
-        assert len(node.ancestors) == 1
-        parent_node = node.ancestors[0]
+        assert node.task.id == grandparent.id
+        assert len(node.children) == 1
+        parent_node = node.children[0]
         assert parent_node.task.id == parent.id
-        assert len(parent_node.ancestors) == 1
-        assert parent_node.ancestors[0].task.id == grandparent.id
-
-    def test_missing_based_on_handled_gracefully(self, tmp_path: Path):
-        store = self._make_store(tmp_path)
-        task = self._add_task(store, "standalone")
-        # No based_on, no children
-
-        node = get_task_lineage(store, task.id, depth=2)
-        assert node.task.id == task.id
-        assert node.ancestors == []
-        assert node.descendants == []
+        assert len(parent_node.children) == 1
+        assert parent_node.children[0].task.id == child.id
 
     def test_raises_for_unknown_task_id(self, tmp_path: Path):
         store = self._make_store(tmp_path)
@@ -295,10 +272,10 @@ class TestQueryHistoryWithLineage:
 
         f = HistoryFilter(lineage_depth=1, limit=None)
         nodes = query_history_with_lineage(store, f)
-        # Both parent and child appear in history; child has ancestor populated
-        child_node = next(n for n in nodes if n.task.id == child.id)
-        assert len(child_node.ancestors) == 1
-        assert child_node.ancestors[0].task.id == parent.id
+        assert len(nodes) == 1
+        assert nodes[0].task.id == parent.id
+        assert len(nodes[0].children) == 1
+        assert nodes[0].children[0].task.id == child.id
 
     def test_empty_history_returns_empty_list(self, tmp_path: Path):
         store = self._make_store(tmp_path)
