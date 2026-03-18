@@ -241,18 +241,29 @@ class TestBuildLineage:
         assert len(result) == 3
         assert [t.id for t in result] == [1, 2, 3]
 
-    def test_sorted_by_time(self):
+    def test_orders_by_dependency_depth_not_completion_time(self):
         store = MagicMock()
-        root = _make_task(id=1, created_at=datetime(2026, 1, 3))
-        review = _make_task(id=2, task_type="review", created_at=datetime(2026, 1, 1))
+        root = _make_task(
+            id=1,
+            created_at=datetime(2026, 1, 1),
+            completed_at=datetime(2026, 1, 10),
+            status="completed",
+        )
+        child = _make_task(
+            id=2,
+            created_at=datetime(2026, 1, 2),
+            completed_at=None,
+            status="pending",
+        )
 
-        store.get_reviews_for_task.return_value = [review]
+        store.get_reviews_for_task.return_value = []
         store.get_improve_tasks_by_root.return_value = []
-        store.get_impl_tasks_by_depends_on_or_based_on.return_value = []
+        store.get_impl_tasks_by_depends_on_or_based_on.side_effect = (
+            lambda task_id: [child] if task_id == 1 else []
+        )
 
         result = build_lineage(store, root)
-        assert result[0] == review
-        assert result[1] == root
+        assert [t.id for t in result] == [1, 2]
 
 
 # ---------------------------------------------------------------------------

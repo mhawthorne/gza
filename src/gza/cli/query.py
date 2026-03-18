@@ -37,7 +37,6 @@ from ._common import (
 
 from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
-    task_time_for_lineage as _task_time_for_lineage,
     get_improves_for_root as _get_improves_for_root_task,
     build_lineage as _build_lineage_tasks_for_root,
     resolve_lineage_root as _resolve_lineage_root_task,
@@ -1197,7 +1196,6 @@ def cmd_show(args: argparse.Namespace) -> int:
     lineage_tasks = _build_lineage_tasks_for_root(store, root_task)
     if not any(t.id == task.id for t in lineage_tasks if t.id is not None):
         lineage_tasks.append(task)
-        lineage_tasks = sorted(lineage_tasks, key=_task_time_for_lineage)
     lineage_str = _format_lineage(lineage_tasks, c["task_id"])
     if lineage_str:
         console.print(f"[{c['label']}]Lineage:[/{c['label']}] {lineage_str}")

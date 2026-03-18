@@ -135,6 +135,24 @@ class TestGetLineage:
         assert impl.id in ids
         assert improve.id in ids
 
+    def test_lineage_orders_root_before_pending_descendants(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root feature", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        store.update(root)
+
+        child = store.add("Child feature", task_type="implement", based_on=root.id)
+        grandchild = store.add("Grandchild feature", task_type="implement", based_on=child.id)
+
+        client = make_client(tmp_path)
+        lineage = client.get_lineage(root.id)
+        lineage_ids = [task.id for task in lineage]
+
+        assert lineage_ids.index(root.id) < lineage_ids.index(child.id) < lineage_ids.index(grandchild.id)
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_lineage_root
