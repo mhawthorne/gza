@@ -972,8 +972,17 @@ def cmd_log(args: argparse.Namespace) -> int:
             console.print(f"[cyan]Branch:[/cyan] {rich_escape(task.branch)}", soft_wrap=True)
     elif worker:
         console.print(f"[cyan]Worker:[/cyan] {rich_escape(worker.worker_id)}", soft_wrap=True)
-        _w_status = "running" if is_running else "completed"
-        _w_color = "yellow" if is_running else "green"
+        _w_status = worker.status if worker.status else "unknown"
+        if is_running and _w_status != "running":
+            # Prefer live process state when worker metadata is stale.
+            _w_status = "running"
+        _w_color = {
+            "running": "yellow",
+            "in_progress": "yellow",
+            "completed": "green",
+            "failed": "red",
+            "stale": "yellow",
+        }.get(_w_status, "white")
         console.print(f"[cyan]Status:[/cyan] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
         console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
         if using_startup_log:

@@ -832,6 +832,87 @@ class TestLogCommand:
         assert "Using startup log (main task log not available)." in result.stdout
         assert "Docker daemon is not running" in result.stdout
 
+    def test_log_by_worker_shows_failed_status_for_startup_failure_without_task(self, tmp_path: Path):
+        """Worker-only view should show failed status when worker metadata is failed."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        SqliteTaskStore(db_path)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-worker-only-failed",
+            pid=12345,
+            task_id=None,
+            task_slug="startup-failed-worker-only",
+            started_at="2026-01-08T00:00:00Z",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            startup_log_file=".gza/workers/w-test-worker-only-failed-startup.log",
+        )
+        registry.register(worker)
+
+        startup_log = tmp_path / ".gza" / "workers" / "w-test-worker-only-failed-startup.log"
+        startup_log.write_text(json.dumps({"type": "result", "result": "startup-log-result"}))
+
+        result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Status: failed" in result.stdout
+        assert "Status: completed" not in result.stdout
+        assert "startup-log-result" in result.stdout
+
+    def test_log_by_worker_prefers_main_log_over_startup_log(self, tmp_path: Path):
+        """Worker log resolution should prefer main task log when both exist."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with both main and startup logs")
+        task.status = "failed"
+        task.log_file = ".gza/logs/test-main.log"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-main-wins",
+            pid=12345,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-01-08T00:00:00Z",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            startup_log_file=".gza/workers/w-test-main-wins-startup.log",
+        )
+        registry.register(worker)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test-main.log").write_text(json.dumps({"type": "result", "result": "main-log-output"}))
+
+        startup_log = tmp_path / ".gza" / "workers" / "w-test-main-wins-startup.log"
+        startup_log.write_text("startup-log-output")
+
+        result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "main-log-output" in result.stdout
+        assert "startup-log-output" not in result.stdout
+        assert "Using startup log (main task log not available)." not in result.stdout
+
     def test_log_by_task_id_startup_failure(self, tmp_path: Path):
         """Log command shows startup error when log contains non-JSON content."""
         from gza.db import SqliteTaskStore

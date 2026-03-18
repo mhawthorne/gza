@@ -1345,6 +1345,47 @@ class TestPsCommand:
 
         registry.remove("w-test-startup-ps")
 
+    def test_print_ps_output_poll_adopts_first_seen_startup_failure(self, tmp_path: Path, capsys):
+        """Poll path keeps startup-failed workers visible on first observation."""
+        import argparse
+        from gza.cli import _print_ps_output
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-startup-poll",
+                pid=99999,
+                task_id=None,
+                task_slug="startup-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                startup_log_file=".gza/workers/w-test-startup-poll-startup.log",
+            )
+        )
+
+        args = argparse.Namespace(quiet=False, json=True)
+        seen_tasks: dict[str, dict] = {}
+        _print_ps_output(args, registry, store, seen_tasks=seen_tasks)
+
+        captured = capsys.readouterr()
+        assert '"worker_id": "w-test-startup-poll"' in captured.out
+        assert '"status": "failed"' in captured.out
+        assert '"startup_failure": true' in captured.out
+        assert "w-test-startup-poll" in seen_tasks
+
+        registry.remove("w-test-startup-poll")
+
     def test_ps_handles_missing_started_timestamp(self, tmp_path: Path):
         """PS should gracefully handle invalid/missing start timestamps."""
         import json

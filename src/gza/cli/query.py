@@ -637,10 +637,15 @@ def _print_ps_output(
         live_keys = set()
         for row in live_rows:
             key = row["task_id"] if row["task_id"] is not None else row["worker_id"]
-            # Only adopt a row into seen_tasks if it's currently active OR
-            # we're already tracking it (status transition). Don't adopt old
-            # completed tasks from the registry that we never saw running.
-            if key in seen_tasks or row["status"] in ("running", "in_progress"):
+            # Only adopt a row into seen_tasks if it's currently active, if we
+            # already track it (status transition), or if it is a startup
+            # failure. This preserves first-seen startup failures in poll mode
+            # while still avoiding unrelated completed history.
+            if (
+                key in seen_tasks
+                or row["status"] in ("running", "in_progress")
+                or row.get("startup_failure", False)
+            ):
                 seen_tasks[key] = row
             live_keys.add(key)
 
