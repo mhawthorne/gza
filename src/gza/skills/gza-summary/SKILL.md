@@ -35,18 +35,18 @@ uv run gza next
 
 Review the combined output and identify actionable items:
 
-**From `gza history`:**
+**From `uv run gza history`:**
 - Note any recently failed tasks — these may need to be retried or their errors investigated
 - Note recently completed tasks that produced branches (candidates for merging or PR creation)
 - Note completed plan/explore tasks whose output hasn't been acted on yet
 
-**From `gza unmerged`:**
+**From `uv run gza unmerged`:**
 - Each branch listed here represents completed work that hasn't been merged to main
 - Identify which branches are ready to merge (no conflicts expected) vs which need review first
 - Check if any unmerged branches have associated PRs or reviews pending
 
-**From `gza next`:**
-- Identify the next pending task(s) — the most immediate work to run with `gza work`
+**From `uv run gza next`:**
+- Identify the next pending task(s) — the most immediate work to run with `uv run gza work`
 - Note any tasks that are blocked by dependencies or require prerequisite steps (e.g., terraform apply, file uploads)
 - Look for tasks that are grouped together and may benefit from being run in sequence
 
@@ -63,7 +63,7 @@ Based on the analysis, provide a prioritized list of specific, actionable sugges
 - "Investigate task #25 failure: check the log with `uv run gza log 25 --task`"
 
 **For pending tasks:**
-- "Run `gza work` to start the next pending task: #31 (implement CSV export)"
+- "Run `uv run gza work` to start the next pending task: #31 (implement CSV export)"
 - "Task #28 depends on #27 which is still in_progress — wait before running"
 
 **For infrastructure/ops tasks:**
@@ -104,4 +104,4 @@ Keep the summary concise — focus on what requires human attention or decision-
 - **Be specific** in suggestions: name the task ID, branch name, or command to run
 - **Prioritize** unmerged work and failed tasks over pending tasks (existing work first)
 - **Respect dependencies**: don't suggest running a task that depends on an incomplete task
-- If all sections are empty (no history, no unmerged, no pending), report that the queue is clean and suggest adding new tasks with `gza add`
+- If all sections are empty (no history, no unmerged, no pending), report that the queue is clean and suggest adding new tasks with `uv run gza add`

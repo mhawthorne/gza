@@ -50,6 +50,23 @@ ENTRYPOINT ["entrypoint.sh"]
 CMD ["{cli_command}"]
 """
 
+GZA_SHIM_SETUP_COMMAND = """\
+mkdir -p /tmp/gza-shims
+cat > /tmp/gza-shims/gza <<'EOF'
+#!/bin/sh
+if [ -x /workspace/bin/gza ]; then
+    exec /workspace/bin/gza "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --directory /workspace gza "$@"
+fi
+echo "Error: gza command unavailable in container. Use 'uv run gza ...' from /workspace." >&2
+exit 127
+EOF
+chmod +x /tmp/gza-shims/gza
+export PATH="/tmp/gza-shims:/workspace/bin:$PATH"
+"""
+
 
 @dataclass
 class DockerConfig:
@@ -255,9 +272,12 @@ def build_docker_cmd(
         if os.getenv(env_var):
             cmd.extend(["-e", env_var])
 
-    # Pass setup command if configured
-    if docker_setup_command:
-        cmd.extend(["-e", f"GZA_DOCKER_SETUP_COMMAND={docker_setup_command}"])
+    # Always install a `gza` shim so bare `gza ...` works inside task containers.
+    setup_commands = [GZA_SHIM_SETUP_COMMAND.strip()]
+    if docker_setup_command.strip():
+        setup_commands.append(docker_setup_command.strip())
+    combined_setup_command = "\n".join(setup_commands)
+    cmd.extend(["-e", f"GZA_DOCKER_SETUP_COMMAND={combined_setup_command}"])
 
     cmd.append(docker_config.image_name)
     return cmd

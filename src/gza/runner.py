@@ -473,7 +473,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
             if omitted_count
             else ""
         )
-        + ". Use `gza show <id>` to inspect prior review findings or improve task prompts."
+        + ". Use `uv run gza show <id>` to inspect prior review findings or improve task prompts."
         " Use `cat <report_file>` to read full review reports."
     )
 

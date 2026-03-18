@@ -532,7 +532,7 @@ class TestReviewContextFromChain:
         assert "later improve" not in context
 
     def test_review_context_includes_tool_hints_when_prior_cycles_exist(self, tmp_path: Path):
-        """Review context includes gza show / cat hints when prior review/improve cycles exist."""
+        """Review context includes uv run gza show / cat hints when prior review/improve cycles exist."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -557,7 +557,7 @@ class TestReviewContextFromChain:
         current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
-        assert "gza show <id>" in context
+        assert "uv run gza show <id>" in context
         assert "cat <report_file>" in context
         assert "1 prior review/improve cycle" in context
 
@@ -621,7 +621,7 @@ class TestReviewContextFromChain:
         first_review = store.add(prompt="Review first", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(first_review, store, tmp_path, git=None)
 
-        assert "gza show <id>" not in context
+        assert "uv run gza show <id>" not in context
         assert "prior review/improve cycle" not in context
         assert "Lineage:" not in context
 
