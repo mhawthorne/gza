@@ -389,6 +389,30 @@ class TestPromptBuilderPrDescription:
         assert "## Summary" in result
         assert "## Changes" in result
 
+    def test_pr_description_includes_issue_linking_instructions(self):
+        """Test that PR description prompt includes issue-linking guidance."""
+        result = PromptBuilder().pr_description_prompt(
+            task_prompt="Implement enhancement for issue #23",
+            commit_log="abc123 Implement enhancement",
+            diff_stat="src/feature.py | 20 +",
+        )
+
+        assert "Closes #<issue number>" in result
+        assert "Closes #N" in result
+        assert "exactly one final line" in result
+        assert "Do not guess or infer issue numbers." in result
+
+    def test_pr_description_disambiguates_non_issue_number_references(self):
+        """Test that PR description prompt disambiguates task/PR numbers from issues."""
+        result = PromptBuilder().pr_description_prompt(
+            task_prompt="Improve implementation of task #465 based on review #480",
+            commit_log="abc123 Improve implementation",
+            diff_stat="src/feature.py | 20 +",
+        )
+
+        assert "Do not treat task IDs, PR numbers, or generic `#N` references as issues" in result
+        assert "explicitly labeled as `issue #N` or `GitHub issue #N`" in result
+
 
 class TestPromptBuilderImproveTask:
     """Tests for PromptBuilder.improve_task_prompt()."""
