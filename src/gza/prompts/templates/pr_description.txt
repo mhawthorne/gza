@@ -9,10 +9,10 @@ Commits on branch:
 Files changed:
 {diff_stat}
 
-If the task prompt includes an explicit GitHub issue reference (for example: `#23`, `issue #23`, or `GitHub issue #23`), include exactly one final line at the end of the PR body:
+If the task prompt includes an explicit GitHub issue reference (for example: `issue #23` or `GitHub issue #23`), include exactly one final line at the end of the PR body:
 Closes #<issue number>
 
-Only include this line when the task prompt clearly references a GitHub issue. Do not guess or infer issue numbers.
+Only include this line when the task prompt clearly references a GitHub issue. Do not treat task IDs, PR numbers, or generic `#N` references as issues unless they are explicitly labeled as `issue #N` or `GitHub issue #N`. Do not guess or infer issue numbers.
 
 Format your response EXACTLY like this (no markdown code fences):
 TITLE: <concise PR title, max 72 chars>
