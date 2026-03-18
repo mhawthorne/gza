@@ -1193,7 +1193,9 @@ def _cmd_advance_unimplemented(
     print()
 
     if not create:
-        print("Run 'gza advance' to create and start implement tasks.")
+        print("Run 'gza advance' to create and start implement tasks for completed plan tasks.")
+        if "explore" in task_types:
+            print("Run 'gza advance --unimplemented --create' to create implement tasks for completed explore tasks.")
         return 0
 
     # Create queued implement tasks

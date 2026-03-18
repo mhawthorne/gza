@@ -3662,6 +3662,33 @@ class TestAdvanceUnimplementedCommand:
         assert result.returncode == 0
         assert "No completed plan/explore tasks without implementation tasks." in result.stdout
 
+    def test_advance_unimplemented_guidance_distinguishes_plan_vs_explore(self, tmp_path: Path):
+        """advance --unimplemented guidance is accurate for explores in list mode."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Plan E", task_type="plan")
+        explore = store.add("Explore E", task_type="explore")
+        plan.status = "completed"
+        explore.status = "completed"
+        now = datetime.now(timezone.utc)
+        plan.completed_at = now
+        explore.completed_at = now
+        store.update(plan)
+        store.update(explore)
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Run 'gza advance' to create and start implement tasks for completed plan tasks." in result.stdout
+        assert "Run 'gza advance --unimplemented --create' to create implement tasks for completed explore tasks." in result.stdout
+        assert "Run 'gza advance' to create and start implement tasks." not in result.stdout
+
     def test_advance_unimplemented_create_queues_implement_tasks(self, tmp_path: Path):
         """advance --unimplemented --create creates implement tasks for each listed task."""
         from gza.db import SqliteTaskStore

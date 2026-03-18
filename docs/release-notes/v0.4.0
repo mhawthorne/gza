@@ -31,6 +31,8 @@ This release brings significant orchestration improvements, expanded skill ecosy
 
 ### New Flags & Options
 - `--batch B`: Spawn B parallel workers in `gza advance`
+- `--unimplemented`: List completed `plan` and `explore` tasks that do not yet have an `implement` task
+- `--plans`: Deprecated alias for `--unimplemented` with plan-only scope
 - `--poll N`: Refresh `gza ps` output every N seconds
 - `--model`, `--provider`: Set LLM provider for commands (add, review, improve)
 - `--resolve`: Auto-resolve conflicts in `gza merge` and `gza rebase`
