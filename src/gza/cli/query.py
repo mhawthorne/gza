@@ -628,8 +628,8 @@ def _print_ps_output(
     live results so that completed/failed tasks remain visible.
     """
     import datetime
-    # In poll mode, include completed workers so we capture status transitions.
-    include_completed_for_query = seen_tasks is not None
+    # Include completed workers so startup failures and poll transitions remain visible.
+    include_completed_for_query = True
     live_rows, _ = _build_ps_rows(registry, store, include_completed=include_completed_for_query)
 
     # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
@@ -658,10 +658,14 @@ def _print_ps_output(
     else:
         rows = live_rows
 
-    # Outside poll mode, filter out completed/failed tasks.
+    # Outside poll mode, filter out completed/failed tasks except startup failures.
     # In poll mode, completed tasks remain visible via seen_tasks.
     if seen_tasks is None:
-        rows = [r for r in rows if r["status"] not in ("completed", "failed")]
+        rows = [
+            r
+            for r in rows
+            if r["status"] not in ("completed", "failed") or r.get("startup_failure", False)
+        ]
 
     if poll_interval is not None:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -689,6 +693,7 @@ def _print_ps_output(
         "in_progress": "green",
         "completed": "cyan",
         "failed": "red",
+        "failed(startup)": "red",
         "stale": "yellow",
         "unknown": "yellow",
     }
@@ -703,6 +708,8 @@ def _print_ps_output(
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
         status = row['status']
+        if status == "failed" and row.get("startup_failure"):
+            status = "failed(startup)"
         sc = STATUS_COLORS.get(status, "white")
 
         # Escape Rich markup in task display (may contain brackets from truncation)
@@ -842,6 +849,16 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
     return (status_group, has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
 
 
+def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | None) -> bool:
+    """Return True when worker failed before main task logging initialized."""
+    if worker is None or worker.status != "failed":
+        return False
+    if not worker.startup_log_file:
+        return False
+    has_main_log = bool((task and task.log_file) or worker.log_file)
+    return not has_main_log
+
+
 def _prefer_worker(existing: WorkerMetadata, candidate: WorkerMetadata) -> bool:
     """Return True when candidate worker should replace existing worker."""
     priority = {"running": 3, "stale": 2, "failed": 1, "completed": 0}
@@ -926,6 +943,9 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         flags.append("stale")
     if is_orphaned:
         flags.append("orphaned")
+    startup_failure = _worker_failed_during_startup(worker, task)
+    if startup_failure:
+        flags.append("startup-failure")
 
     return {
         "worker_id": worker_id,
@@ -942,6 +962,8 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "duration": duration,
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,
+        "startup_failure": startup_failure,
+        "startup_log_file": worker.startup_log_file if worker else None,
         "sort_timestamp": started.isoformat() if started else "",
     }
 
@@ -1196,6 +1218,16 @@ def cmd_show(args: argparse.Namespace) -> int:
             pid_part = f", PID {latest_worker.pid}" if latest_worker.pid else ""
             worker_label = f"{run_mode} ({latest_worker.worker_id}){pid_part}"
             console.print(f"[{c['label']}]Run Context:[/{c['label']}] [{c['value']}]{worker_label}[/{c['value']}]")
+            if _worker_failed_during_startup(latest_worker, task):
+                console.print(
+                    f"[{c['label']}]Worker Failure:[/{c['label']}] "
+                    f"[{c['status_failed']}]failed during startup (before main log setup)[/{c['status_failed']}]"
+                )
+                if latest_worker.startup_log_file:
+                    console.print(
+                        f"[{c['label']}]Startup Log:[/{c['label']}] "
+                        f"[{c['value']}]{latest_worker.startup_log_file}[/{c['value']}]"
+                    )
 
     if task.status == "failed":
         reason = task.failure_reason or "UNKNOWN"

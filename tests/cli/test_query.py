@@ -743,6 +743,44 @@ class TestShowCommand:
         assert "uv run pytest tests/ -q" in result.stdout
         assert "AssertionError" in result.stdout
 
+    def test_show_indicates_worker_startup_failure(self, tmp_path: Path):
+        """Show surfaces startup failure when worker failed before main log existed."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Task with startup failure")
+        assert task.id is not None
+        task.status = "failed"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-20260318-startup-failure",
+                pid=12345,
+                task_id=task.id,
+                task_slug=task.task_id,
+                started_at="2026-03-18T00:00:00+00:00",
+                status="failed",
+                log_file=None,
+                worktree=None,
+                is_background=True,
+                startup_log_file=".gza/workers/w-20260318-startup-failure-startup.log",
+            )
+        )
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Worker Failure: failed during startup" in result.stdout
+        assert "Startup Log: .gza/workers/w-20260318-startup-failure-startup.log" in result.stdout
+
     def test_show_completed_task_omits_failure_diagnostics(self, tmp_path: Path):
         """Completed task output should not include failed-task diagnostics block."""
         from gza.db import SqliteTaskStore
@@ -1270,6 +1308,42 @@ class TestPsCommand:
         assert "orphaned" in rows[0]["flags"]
 
         registry.remove("w-test-stale-ps")
+
+    def test_ps_marks_startup_failure_for_failed_worker_without_main_log(self, tmp_path: Path):
+        """PS marks startup failures in table and JSON output."""
+        import json
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-startup-ps",
+                pid=99999,
+                task_id=None,
+                task_slug="startup-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                startup_log_file=".gza/workers/w-test-startup-ps-startup.log",
+            )
+        )
+
+        table_result = run_gza("ps", "--project", str(tmp_path))
+        assert table_result.returncode == 0
+        assert "failed(startup)" in table_result.stdout
+
+        json_result = run_gza("ps", "--json", "--project", str(tmp_path))
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["startup_failure"] is True
+        assert rows[0]["startup_log_file"] == ".gza/workers/w-test-startup-ps-startup.log"
+
+        registry.remove("w-test-startup-ps")
 
     def test_ps_handles_missing_started_timestamp(self, tmp_path: Path):
         """PS should gracefully handle invalid/missing start timestamps."""
@@ -2600,4 +2674,3 @@ class TestNextCommandWithDependencies:
         assert result.returncode == 0
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
-

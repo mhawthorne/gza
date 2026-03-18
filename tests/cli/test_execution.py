@@ -1091,6 +1091,61 @@ class TestBackgroundWorkerCommand:
             f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
             f"Full command: {captured_cmd}"
 
+    def test_background_worker_registers_startup_log_file(self, tmp_path: Path):
+        """Background worker captures early stdout/stderr into startup log metadata."""
+        from unittest.mock import patch, MagicMock
+        import argparse
+        import subprocess as sp
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Startup log capture test task")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        captured_kwargs = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        def capture_popen(cmd, **kwargs):
+            nonlocal captured_kwargs
+            captured_kwargs = kwargs
+            return mock_proc
+
+        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 0
+        assert captured_kwargs is not None
+        assert captured_kwargs["stderr"] == sp.STDOUT
+        assert captured_kwargs["stdout"] is not sp.DEVNULL
+        assert hasattr(captured_kwargs["stdout"], "name")
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        worker = workers[0]
+        assert worker.startup_log_file == f".gza/workers/{worker.worker_id}-startup.log"
+        assert worker.log_file is None
+        assert (tmp_path / worker.startup_log_file).exists()
+
 
 class TestImplementCommand:
     """Tests for 'gza implement' command."""

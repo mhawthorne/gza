@@ -28,6 +28,7 @@ def test_worker_metadata_serialization():
         status="running",
         log_file=".gza/logs/20260107-test-task.log",
         worktree="/tmp/gza-worktrees/test/20260107-test-task",
+        startup_log_file=".gza/workers/w-20260107-123456-startup.log",
     )
 
     # Convert to dict and back
@@ -39,6 +40,7 @@ def test_worker_metadata_serialization():
     assert restored.task_id == worker.task_id
     assert restored.task_slug == worker.task_slug
     assert restored.status == worker.status
+    assert restored.startup_log_file == worker.startup_log_file
 
 
 def test_registry_generate_worker_id(temp_workers_dir):

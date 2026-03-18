@@ -793,6 +793,45 @@ class TestLogCommand:
         assert result.returncode == 1
         assert "Worker 'w-nonexistent' not found" in result.stdout
 
+    def test_log_by_worker_falls_back_to_startup_log_when_main_missing(self, tmp_path: Path):
+        """Worker lookup uses startup log when no main task log exists."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task that failed before runner log setup")
+        task.status = "failed"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-startup-failure",
+            pid=12345,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-01-08T00:00:00Z",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            startup_log_file=".gza/workers/w-test-startup-failure-startup.log",
+        )
+        registry.register(worker)
+
+        startup_log = tmp_path / ".gza" / "workers" / "w-test-startup-failure-startup.log"
+        startup_log.write_text("Docker daemon is not running")
+
+        result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Using startup log (main task log not available)." in result.stdout
+        assert "Docker daemon is not running" in result.stdout
+
     def test_log_by_task_id_startup_failure(self, tmp_path: Path):
         """Log command shows startup error when log contains non-JSON content."""
         from gza.db import SqliteTaskStore
@@ -928,4 +967,3 @@ class TestBuildStepTimeline:
         steps = _build_step_timeline(entries)
         assert len(steps) == 1
         assert steps[0]["message_text"] == "[gza:info] Task: #1 slug"
-
