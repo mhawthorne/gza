@@ -4,7 +4,7 @@ This is a review task. Write your review to:
 Your prompt already includes changed files, diffstat, and relevant diff/context excerpts. Base your review on that provided context and avoid using git discovery commands.
 
 Project-specific guidance:
-- Follow repository instructions (for example AGENTS.md, REVIEW.md, project docs, and configured verification commands when available).
+- Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
 - Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
 
 Output format contract (use this exact section order and exact headings):
@@ -19,6 +19,12 @@ Do not rename, omit, or reorder these sections.
 Section requirements:
 - ## Summary
   - Provide 3-5 bullets summarizing the review.
+  - Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form and one short evidence clause each:
+    - Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?
+    - Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?
+    - Did I check for misleading output (contradictory UI/prompt/context signals)?
+    - Did I require targeted regression tests that match each failure mode (not generic "add tests")?
+    - If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?
 - ## Must-Fix
   - If there are no blocking issues, write exactly: None.
   - Otherwise list issues ordered by severity with headings:
@@ -29,7 +35,7 @@ Section requirements:
     - Evidence:
     - Impact:
     - Required fix:
-    - Required tests:
+    - Required tests: (name targeted regression coverage tied to the failure mode; avoid generic test asks)
 - ## Suggestions
   - If there are no non-blocking suggestions, write exactly: None.
   - Otherwise list suggestions with headings:
@@ -52,6 +58,11 @@ Section requirements:
 
 Blocking discipline:
 - Request changes only for concrete, actionable blockers.
+- Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.
+- Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.
+- Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.
+- If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.
+- Push style, cleanup, and non-risky refactors to Suggestions.
 - For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.
 
 Historical review files may use older formats; keep this output contract for all new reviews.

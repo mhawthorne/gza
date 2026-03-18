@@ -1,5 +1,6 @@
 """Tests for the PromptBuilder class in gza.prompts."""
 
+import re
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -8,6 +9,22 @@ import pytest
 from gza.prompts import PromptBuilder
 from gza.config import Config
 from gza.db import SqliteTaskStore
+
+
+REVIEW_CONTRACT_PARITY_CLAUSES = [
+    "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
+    "Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
+    "Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.",
+    "Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.",
+    "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.",
+    "Push style, cleanup, and non-risky refactors to Suggestions.",
+    "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
+]
+
+
+def _assert_contains_all_clauses(text: str, clauses: list[str]) -> None:
+    for clause in clauses:
+        assert clause in text
 
 
 class TestPromptBuilderBuild:
@@ -163,6 +180,15 @@ class TestPromptBuilderBuild:
         assert "Impact:" in result
         assert "Required fix:" in result
         assert "Required tests:" in result
+        assert "repo-rules/learnings pass" in result
+        assert "silent broad-exception fallbacks" in result
+        assert "misleading output" in result
+        assert "targeted regression tests" in result
+        assert "config, CLI, or operator-facing behavior changed" in result
+        assert "Reserve Must-Fix for:" in result
+        checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
+        assert len(checklist_lines) == 5
+        assert "Yes/No - ..." in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
         """Test interactive review skill scaffolding matches canonical Summary requirements."""
@@ -178,6 +204,60 @@ class TestPromptBuilderBuild:
 
         assert "<Provide 3-5 bullets summarizing the review>" in content
         assert "<1-2 sentence overview of the changes>" not in content
+        assert (
+            "<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form"
+            in content
+        )
+        assert (
+            "<- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>"
+            in content
+        )
+        assert (
+            "<- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>"
+            in content
+        )
+        assert (
+            "<- Did I check for misleading output (contradictory UI/prompt/context signals)?>"
+            in content
+        )
+        assert (
+            "<- Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?>"
+            in content
+        )
+        assert (
+            "<- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>"
+            in content
+        )
+        assert (
+            "<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
+            in content
+        )
+        assert (
+            "<Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>"
+            in content
+        )
+        assert (
+            "<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>"
+            in content
+        )
+
+    def test_review_contract_parity_between_template_and_interactive_scaffold(self):
+        """Test canonical blocking-discipline clauses are present in both review entrypoints."""
+        root = Path(__file__).resolve().parents[1]
+        template_content = (
+            root / "src" / "gza" / "prompts" / "templates" / "review.txt"
+        ).read_text()
+        skill_content = (
+            root
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-code-review-interactive"
+            / "SKILL.md"
+        ).read_text()
+
+        _assert_contains_all_clauses(template_content, REVIEW_CONTRACT_PARITY_CLAUSES)
+        _assert_contains_all_clauses(skill_content, REVIEW_CONTRACT_PARITY_CLAUSES)
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
