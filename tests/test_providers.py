@@ -22,6 +22,7 @@ from gza.providers import (
 from gza.providers.base import (
     build_docker_cmd,
     DOCKERFILE_TEMPLATE,
+    GZA_SHIM_SETUP_COMMAND,
     is_docker_running,
     verify_docker_credentials,
     ensure_docker_image,
@@ -327,7 +328,7 @@ class TestBuildDockerCmd:
         assert "OTHER_KEY" not in env_vars_passed
 
     def test_skips_env_vars_when_not_set(self, tmp_path):
-        """Should not pass environment variables when they are not set."""
+        """Should not pass unset provider env vars."""
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",
@@ -341,7 +342,9 @@ class TestBuildDockerCmd:
             # Need to preserve PATH etc for the test to work
             cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
 
-        assert "-e" not in cmd
+        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
+        env_values = [cmd[i + 1] for i in e_indices]
+        assert "UNSET_VAR" not in env_values
 
     def test_mounts_custom_volumes(self, tmp_path):
         """Should mount custom docker volumes."""
@@ -462,10 +465,13 @@ class TestBuildDockerCmd:
 
         e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
         env_values = [cmd[i + 1] for i in e_indices]
-        assert "GZA_DOCKER_SETUP_COMMAND=uv sync --project /workspace" in env_values
+        setup_value = next(v for v in env_values if v.startswith("GZA_DOCKER_SETUP_COMMAND="))
+        setup_cmd = setup_value.split("=", 1)[1]
+        assert "uv sync --project /workspace" in setup_cmd
+        assert "mkdir -p /tmp/gza-shims" in setup_cmd
 
     def test_no_setup_command_env_var_when_empty(self, tmp_path):
-        """Should not pass GZA_DOCKER_SETUP_COMMAND when docker_setup_command is empty."""
+        """Should still pass default shim setup when docker_setup_command is empty."""
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",
@@ -481,7 +487,11 @@ class TestBuildDockerCmd:
             docker_setup_command="",
         )
 
-        assert "GZA_DOCKER_SETUP_COMMAND" not in " ".join(cmd)
+        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
+        env_values = [cmd[i + 1] for i in e_indices]
+        setup_value = next(v for v in env_values if v.startswith("GZA_DOCKER_SETUP_COMMAND="))
+        setup_cmd = setup_value.split("=", 1)[1]
+        assert setup_cmd == GZA_SHIM_SETUP_COMMAND.strip()
 
     def test_setup_command_placed_before_image_name(self, tmp_path):
         """GZA_DOCKER_SETUP_COMMAND should be added before image name."""
@@ -507,6 +517,33 @@ class TestBuildDockerCmd:
             if cmd[i + 1].startswith("GZA_DOCKER_SETUP_COMMAND=")
         )
         assert setup_cmd_idx < image_idx
+
+    def test_default_setup_command_installs_gza_shim(self, tmp_path):
+        """Default setup command should install and expose a container gza shim."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_setup_command="",
+        )
+
+        setup_value = next(
+            cmd[i + 1]
+            for i, token in enumerate(cmd)
+            if token == "-e" and cmd[i + 1].startswith("GZA_DOCKER_SETUP_COMMAND=")
+        )
+        setup_cmd = setup_value.split("=", 1)[1]
+        assert "cat > /tmp/gza-shims/gza <<'EOF'" in setup_cmd
+        assert 'exec uv run --directory /workspace gza "$@"' in setup_cmd
+        assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
 
 class TestDockerfileTemplate:

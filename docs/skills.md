@@ -24,7 +24,7 @@ Skills are installed to `.claude/skills/` in your project directory and become a
 
 **Create a well-formed gza task with appropriate type, group, and prompt.**
 
-Use `/gza-task-add` when you want to add a task to the gza queue during a Claude Code session. The skill reads your project's AGENTS.md conventions, asks clarifying questions, constructs a well-scoped prompt, and runs `gza add` with the right flags.
+Use `/gza-task-add` when you want to add a task to the gza queue during a Claude Code session. The skill reads your project's AGENTS.md conventions, asks clarifying questions, constructs a well-scoped prompt, and runs `uv run gza add` with the right flags.
 
 **Key behaviors:**
 - Asks about task type (`explore`, `plan`, `implement`, `review`, `improve`)
@@ -43,7 +43,7 @@ uv run gza add --type implement --review "add JWT authentication to src/api/rout
 
 ## gza-task-draft
 
-**Guide user through deliberate task creation with clarification and refinement before running gza add.**
+**Guide user through deliberate task creation with clarification and refinement before running `uv run gza add`.**
 
 Use `/gza-task-draft` when the task idea needs more thinking before committing. Unlike `gza-task-add`, this skill explicitly surfaces risks, ambiguities, and alternative approaches before finalizing the task.
 
@@ -101,10 +101,10 @@ Use `/gza-task-debug` when a task has failed and you need to understand why befo
 Use `/gza-summary` for a quick status overview: what completed recently, what's unmerged, and what's pending. Returns a prioritized list of suggested next actions.
 
 **Key behaviors:**
-- Runs `gza history`, `gza unmerged`, and `gza next` to collect current state
+- Runs `uv run gza history`, `uv run gza unmerged`, and `uv run gza next` to collect current state
 - Highlights failed tasks, unmerged branches, and blocked pending tasks
 - For plan/explore/review tasks, includes the report file path so you can open it directly
-- Suggests specific commands to run (e.g., `gza work`, `git merge`, `uv run gza log 25 --task`)
+- Suggests specific commands to run (e.g., `uv run gza work`, `git merge`, `uv run gza log 25 --task`)
 
 **Output sections:**
 

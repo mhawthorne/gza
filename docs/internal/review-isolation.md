@@ -24,6 +24,6 @@ The worktree is a git checkout of the implementation branch. It contains:
 
 ## If Claude tries to query gza directly
 
-If Claude runs `gza` commands or reads `.gza/gza.db` during the review, it will find an empty database. This is unnecessary - all relevant context is already in the prompt.
+If Claude runs `gza` commands or reads `.gza/gza.db` during the review, it will find an empty database. This is unnecessary - all relevant context is already in the prompt. In task containers, prefer `uv run gza ...` in guidance snippets because `gza` may rely on a project-local shim.
 
 If a review complains about "database is empty" or "cannot find task record," the reviewer is going beyond the provided prompt context. The prompt should contain everything needed.

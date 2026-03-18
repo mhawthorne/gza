@@ -8,7 +8,7 @@ public: true
 
 # Draft Gza Task
 
-Guide the user through a deliberate task creation process: clarify scope, surface risks, draft a prompt, get approval, then run `gza add`.
+Guide the user through a deliberate task creation process: clarify scope, surface risks, draft a prompt, get approval, then run `uv run gza add`.
 
 ## Step 1: Read conventions
 
@@ -47,7 +47,7 @@ Present the draft prompt and concerns clearly to the user.
 
 ## Step 4: Propose flags
 
-Based on the discussion, suggest the full `gza add` command:
+Based on the discussion, suggest the full `uv run gza add` command:
 
 ```
 uv run gza add [FLAGS] "prompt"
@@ -66,14 +66,14 @@ Flags to consider:
 Use AskUserQuestion to let the user review the draft:
 
 Options:
-- **Approve** — run gza add as proposed
+- **Approve** — run `uv run gza add` as proposed
 - **Refine prompt** — let user provide corrections (ask what to change, then revise and re-present)
 - **Adjust flags** — type, group, or dependencies need changing (ask what, revise, re-present)
 - **Split into multiple tasks** — break into smaller tasks (draft each separately)
 
 Repeat Steps 3–5 if refinement is needed.
 
-## Step 6: Run gza add
+## Step 6: Run uv run gza add
 
 Once approved, run the command. Show the created task ID and confirm type/group if set.
 

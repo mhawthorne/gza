@@ -30,7 +30,7 @@ Ask the user what they want to accomplish. Use AskUserQuestion to gather:
    - `plan` - Planning and design work that produces a specification
    - `implement` - Code implementation based on clear requirements
    - `review` - Code review or quality assessment
-   - `improve` - Address review feedback on an implementation (use `gza improve <impl-id>`)
+   - `improve` - Address review feedback on an implementation (use `uv run gza improve <impl-id>`)
 
 3. **Additional context** (optional):
    - Should this be grouped with related tasks? (--group NAME)
@@ -48,7 +48,7 @@ Create a clear, specific prompt that:
 - For `implement` tasks: Specifies what to build and acceptance criteria
 - For `review` tasks: Identifies what to review and what to look for
 
-### Step 4: Run gza add
+### Step 4: Run uv run gza add
 
 Execute the command with appropriate flags:
 
