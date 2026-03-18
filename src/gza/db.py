@@ -26,7 +26,7 @@ __all__ = [
 
 
 # Known failure reason categories
-KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "UNKNOWN"}
+KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "TIMEOUT", "WORKER_DIED", "UNKNOWN"}
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
@@ -93,6 +93,7 @@ class Task:
     output_tokens: int | None = None  # Total output tokens
     created_at: datetime | None = None
     started_at: datetime | None = None
+    running_pid: int | None = None
     completed_at: datetime | None = None
     # New fields for task import/chaining
     group: str | None = None  # Group name for related tasks
@@ -186,8 +187,11 @@ ALTER TABLE tasks ADD COLUMN provider_is_explicit INTEGER DEFAULT 0;
 # Migration from v21 to v22
 MIGRATION_V21_TO_V22 = "UPDATE tasks SET task_type='internal' WHERE task_type='learn';"
 
+# Migration from v22 to v23
+MIGRATION_V22_TO_V23 = "ALTER TABLE tasks ADD COLUMN running_pid INTEGER;"
+
 # Schema version for migrations
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -214,6 +218,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     cost_usd REAL,
     created_at TEXT NOT NULL,
     started_at TEXT,
+    running_pid INTEGER,
     completed_at TEXT,
     -- New fields for task import/chaining (v2)
     "group" TEXT,
@@ -601,6 +606,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (20, MIGRATION_V19_TO_V20),
     (21, MIGRATION_V20_TO_V21),
     (22, MIGRATION_V21_TO_V22),
+    (23, MIGRATION_V22_TO_V23),
 ]
 
 
@@ -674,6 +680,7 @@ class SqliteTaskStore:
             output_tokens=row["output_tokens"] if "output_tokens" in row.keys() else None,
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            running_pid=row["running_pid"] if "running_pid" in row.keys() else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
             group=row["group"],
             depends_on=row["depends_on"],
@@ -819,6 +826,7 @@ class SqliteTaskStore:
                     input_tokens = ?,
                     output_tokens = ?,
                     started_at = ?,
+                    running_pid = ?,
                     completed_at = ?,
                     "group" = ?,
                     depends_on = ?,
@@ -863,6 +871,7 @@ class SqliteTaskStore:
                     task.input_tokens,
                     task.output_tokens,
                     task.started_at.isoformat() if task.started_at else None,
+                    task.running_pid,
                     task.completed_at.isoformat() if task.completed_at else None,
                     task.group,
                     task.depends_on,
@@ -928,61 +937,28 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
-    def claim_next_pending_task(self) -> Task | None:
-        """Atomically claim the next pending task by marking it in_progress.
-
-        This is used by background workers to ensure only one worker
-        picks up a given task, even in concurrent scenarios.
-
-        Returns:
-            The claimed task, or None if no tasks are available
-        """
+    def try_mark_in_progress(self, task_id: int, pid: int) -> Task | None:
+        """Compare-and-swap pending -> in_progress for a specific task."""
+        started_at = datetime.now(timezone.utc)
         with self._connect() as conn:
-            # Use a transaction to atomically claim the task
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                # Find next pending task
-                cur = conn.execute(
-                    """
-                    WITH RECURSIVE successful_ancestors(id) AS (
-                        SELECT id FROM tasks WHERE status = 'completed'
-                        UNION ALL
-                        SELECT t2.based_on FROM tasks t2
-                        JOIN successful_ancestors sa ON t2.id = sa.id
-                        WHERE t2.based_on IS NOT NULL
-                    )
-                    SELECT t.* FROM tasks t
-                    WHERE t.status = 'pending'
-                    AND (
-                        t.depends_on IS NULL
-                        OR t.depends_on IN (SELECT id FROM successful_ancestors)
-                    )
-                    ORDER BY t.created_at ASC
-                    LIMIT 1
-                    """
-                )
-                row = cur.fetchone()
-
-                if not row:
-                    conn.rollback()
-                    return None
-
-                task = self._row_to_task(row)
-
-                # Mark as in_progress with timestamp
-                conn.execute(
-                    "UPDATE tasks SET status = 'in_progress', started_at = ? WHERE id = ?",
-                    (datetime.now(timezone.utc).isoformat(), task.id)
-                )
-
-                conn.commit()
-                task.status = "in_progress"
-                task.started_at = datetime.now(timezone.utc)
-                return task
-
-            except Exception:
-                conn.rollback()
-                raise
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'in_progress',
+                    started_at = ?,
+                    completed_at = NULL,
+                    failure_reason = NULL,
+                    running_pid = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (started_at.isoformat(), pid, task_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            task = self.get(task_id)
+            if task is None:
+                return None
+            return task
 
     def get_pending(self, limit: int | None = None) -> list[Task]:
         """Get all pending tasks."""
@@ -1939,6 +1915,7 @@ class SqliteTaskStore:
         """Mark a task as in progress."""
         task.status = "in_progress"
         task.started_at = datetime.now(timezone.utc)
+        task.running_pid = os.getpid()
         self.update(task)
 
     def mark_completed(
@@ -1957,6 +1934,7 @@ class SqliteTaskStore:
         """Mark a task as completed."""
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
+        task.running_pid = None
         task.has_commits = has_commits
         if has_commits:
             task.merge_status = "unmerged"
@@ -2014,6 +1992,7 @@ class SqliteTaskStore:
         """Mark a task as failed."""
         task.status = "failed"
         task.completed_at = datetime.now(timezone.utc)
+        task.running_pid = None
         task.has_commits = has_commits
         if log_file:
             task.log_file = log_file

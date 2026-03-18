@@ -1109,19 +1109,58 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                 error_message(f"Error: Task #{task_id} has no session ID (cannot resume)")
                 console.print("Use 'gza retry' to start fresh instead")
                 return 1
-            # Mark task as in_progress
-            store.mark_in_progress(task)
+            if task.status == "pending":
+                assert task.id is not None
+                claimed = store.try_mark_in_progress(task.id, os.getpid())
+                if claimed is None:
+                    refreshed = store.get(task.id)
+                    status = refreshed.status if refreshed else "unknown"
+                    error_message(f"Error: Task #{task_id} is no longer pending (status: {status})")
+                    return 1
+                task = claimed
+            else:
+                task.status = "in_progress"
+                task.started_at = datetime.now(timezone.utc)
+                task.completed_at = None
+                task.failure_reason = None
+                task.running_pid = os.getpid()
+                store.update(task)
         else:
             # Check if task is blocked by dependencies
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
                 error_message(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
                 return 1
+            if task.status == "in_progress":
+                task.running_pid = os.getpid()
+                store.update(task)
+            elif task.status != "pending":
+                error_message(f"Error: Task #{task_id} is no longer pending (status: {task.status})")
+                return 0
+            else:
+                assert task.id is not None
+                claimed = store.try_mark_in_progress(task.id, os.getpid())
+                if claimed is None:
+                    refreshed = store.get(task.id)
+                    status = refreshed.status if refreshed else "unknown"
+                    error_message(f"Error: Task #{task_id} is no longer pending (status: {status})")
+                    return 0
+                task = claimed
     else:
         if resume:
             error_message("Error: Cannot resume without specifying a task ID")
             return 1
-        task = store.get_next_pending()
+        task = None
+        while True:
+            candidate = store.get_next_pending()
+            if candidate is None:
+                break
+            assert candidate.id is not None
+            claimed = store.try_mark_in_progress(candidate.id, os.getpid())
+            if claimed is None:
+                continue
+            task = claimed
+            break
 
     if not task:
         console.print("No pending tasks found")
@@ -1187,54 +1226,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
 
     task_header(task.prompt, task.task_id or "", task.task_type)
 
-    # Register a foreground worker so `gza ps` can see this task is running.
-    # Background workers are already registered by _spawn_background_worker(),
-    # so we only register if no worker exists yet for this task.
-    fg_worker_id = _maybe_register_foreground_worker(config, task)
-
-    try:
-        return _run_inner(task, task_config, config, store, provider, git, resume=resume, open_after=open_after)
-    finally:
-        if fg_worker_id:
-            _cleanup_foreground_worker(config, fg_worker_id)
-
-
-def _maybe_register_foreground_worker(config: Config, task: "Task") -> str | None:
-    """Register a foreground worker entry if no worker already exists for this task.
-
-    Returns the worker_id if registered, None if a worker already existed.
-    """
-    from .workers import WorkerRegistry, WorkerMetadata
-
-    registry = WorkerRegistry(config.workers_path)
-
-    # Check if a background worker is already registered for this task
-    for w in registry.list_all(include_completed=False):
-        if w.task_id == task.id and w.status == "running":
-            return None
-
-    worker_id = registry.generate_worker_id()
-    worker = WorkerMetadata(
-        worker_id=worker_id,
-        pid=os.getpid(),
-        task_id=task.id,
-        task_slug=task.task_id,
-        started_at=datetime.now(timezone.utc).isoformat(),
-        status="running",
-        log_file=None,
-        worktree=None,
-        is_background=False,
-    )
-    registry.register(worker)
-    return worker_id
-
-
-def _cleanup_foreground_worker(config: Config, worker_id: str) -> None:
-    """Remove the foreground worker entry after task completes."""
-    from .workers import WorkerRegistry
-
-    registry = WorkerRegistry(config.workers_path)
-    registry.remove(worker_id)
+    return _run_inner(task, task_config, config, store, provider, git, resume=resume, open_after=open_after)
 
 
 def _resolve_code_task_branch_name(
@@ -1437,7 +1429,8 @@ def _complete_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            failure_reason = extract_failure_reason(log_file)
+            detected = extract_failure_reason(log_file)
+            failure_reason = detected if detected != "UNKNOWN" else "TIMEOUT"
             write_log_entry(
                 log_file,
                 {
@@ -1622,12 +1615,7 @@ def _run_inner(
     # Persist branch early so it's available if the process is killed before completion
     task.branch = branch_name
 
-    # Mark task in progress (unless resuming, in which case already set)
-    # branch is set above so it gets persisted with this call
-    if not resume:
-        store.mark_in_progress(task)
-    else:
-        store.update(task)
+    store.update(task)
 
     # Setup logging - use task_id for naming (logs stay in main project)
     config.log_path.mkdir(parents=True, exist_ok=True)
@@ -1738,7 +1726,8 @@ def _run_inner(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            failure_reason = extract_failure_reason(log_file)
+            detected = extract_failure_reason(log_file)
+            failure_reason = detected if detected != "UNKNOWN" else "TIMEOUT"
             write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
             write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
@@ -1808,9 +1797,6 @@ def _run_non_code_task(
     """
     if resume and task.session_id:
         console.print(f"    Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
-
-    # Mark task in progress
-    store.mark_in_progress(task)
 
     # Setup logging
     config.log_path.mkdir(parents=True, exist_ok=True)

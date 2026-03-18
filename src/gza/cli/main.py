@@ -12,7 +12,9 @@ from ._common import (
     _add_skills_install_args,
     add_common_args,
     _add_query_filter_args,
+    reconcile_in_progress_tasks,
 )
+from ..config import Config
 from .config_cmds import (
     cmd_clean,
     cmd_cleanup,
@@ -1219,6 +1221,12 @@ def main() -> int:
             return 1
 
     try:
+        if args.command != "init":
+            try:
+                cfg = Config.load(args.project_dir)
+                reconcile_in_progress_tasks(cfg)
+            except Exception:
+                pass
         if args.command == "work":
             return cmd_run(args)
         elif args.command == "next":

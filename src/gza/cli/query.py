@@ -719,14 +719,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
-    # Auto-clean zombie workers: "running" workers whose DB task already finished.
-    # These accumulate when PIDs get reused by other processes.
-    # Don't remove stale workers here — they indicate orphaned tasks worth showing.
-    for w in registry.list_all(include_completed=True):
-        if w.status == "running" and w.task_id is not None:
-            task = store.get(w.task_id)
-            if task and task.status in ("completed", "failed"):
-                registry.remove(w.worker_id)
+    # Worker registry is now a thin process index; no ps-specific cleanup.
     poll_interval: int | None = getattr(args, "poll", None)
     show_all: bool = getattr(args, "all", False)
 
@@ -842,11 +835,12 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
 
 def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | None) -> bool:
     """Return True when worker failed before main task logging initialized."""
-    if worker is None or worker.status != "failed":
+    if worker is None:
         return False
-    if not worker.startup_log_file:
+    has_startup_hint = bool(worker.startup_log_file) or bool(task and task.task_id)
+    if worker.status != "failed" or not has_startup_hint:
         return False
-    has_main_log = bool((task and task.log_file) or worker.log_file)
+    has_main_log = bool(task and task.log_file)
     return not has_main_log
 
 
@@ -889,21 +883,18 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         # may have already completed/failed by the time the worker is gone.
         status = task.status if task and task.status else "in_progress"
     elif source == "worker" and worker is not None:
-        status = worker.status
+        status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
     elif worker is not None and task is not None:
         # Both worker and task exist. Prefer DB terminal status over a
         # stale worker status — the DB is the source of truth for completion.
         if task.status in ("completed", "failed"):
             status = task.status
-        elif worker.status in ("completed", "failed", "stale"):
-            status = worker.status
+        elif worker and not (task and task.running_pid):
+            status = "stale"
         else:
             status = "running"
     elif worker is not None:
-        if worker.status in ("completed", "failed", "stale"):
-            status = worker.status
-        else:
-            status = "running"
+        status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
 
     is_stale = worker is not None and worker.status == "stale"
     is_orphaned = (
@@ -926,8 +917,11 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         task_display = task.task_id
     elif task:
         task_display = truncate(task.prompt, 25)
-    elif worker and worker.task_slug:
-        task_display = worker.task_slug
+    elif worker:
+        if worker.task_slug:
+            task_display = worker.task_slug
+        else:
+            task_display = f"task #{worker.task_id}" if worker.task_id is not None else ""
 
     flags = []
     if is_stale:
@@ -954,7 +948,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,
         "startup_failure": startup_failure,
-        "startup_log_file": worker.startup_log_file if worker else None,
+        "startup_log_file": (f".gza/workers/{task.task_id}.startup.log" if task and task.task_id else (worker.startup_log_file if worker else None)),
         "sort_timestamp": started.isoformat() if started else "",
     }
 
@@ -1014,7 +1008,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if hasattr(args, 'all') and args.all:
         # Stop all running workers
         workers = registry.list_all(include_completed=False)
-        running_workers = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
+        running_workers = [w for w in workers if registry.is_running(w.worker_id)]
 
         if not running_workers:
             print("No running workers to stop")
@@ -1035,10 +1029,6 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print(f"Error: Worker {args.worker_id} not found")
         return 1
     worker = maybe_worker
-
-    if worker.status != "running":
-        print(f"Worker {args.worker_id} is not running (status: {worker.status})")
-        return 1
 
     if not registry.is_running(args.worker_id):
         print(f"Worker {args.worker_id} is not running (process not found)")

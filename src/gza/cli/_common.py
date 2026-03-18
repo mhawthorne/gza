@@ -28,6 +28,31 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+def reconcile_in_progress_tasks(config: Config) -> None:
+    """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
+    try:
+        store = get_store(config)
+        now = datetime.now(timezone.utc)
+        timeout_seconds = max(0, int(config.timeout_minutes) * 60)
+        for task in store.get_in_progress():
+            if task.running_pid is None:
+                # Keep legacy/manual resumable rows untouched.
+                if task.started_at is not None and task.session_id is None:
+                    store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+                continue
+            try:
+                os.kill(task.running_pid, 0)
+            except OSError:
+                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+                continue
+            if task.started_at and timeout_seconds > 0:
+                if (now - task.started_at).total_seconds() > timeout_seconds:
+                    store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="TIMEOUT")
+    except Exception:
+        # Reconciliation is intentionally best-effort.
+        return
+
+
 # Shared color palette for history and stats output (readable on dark and light terminals)
 TASK_COLORS: dict[str, str] = {
     "task_id": "#aaaaaa",   # light gray for task ID and date
@@ -44,11 +69,13 @@ TASK_COLORS: dict[str, str] = {
     "value": "white",       # white for values
 }
 
-def _startup_log_paths(config: Config, worker_id: str) -> tuple[Path, str]:
-    """Return absolute and project-relative startup log paths for a worker."""
-    startup_log_path = config.workers_path / f"{worker_id}-startup.log"
+def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
+    """Return deterministic startup log path for a task."""
+    if not task.task_id:
+        return None
+    startup_log_path = config.workers_path / f"{task.task_id}.startup.log"
     startup_log_path.parent.mkdir(parents=True, exist_ok=True)
-    return startup_log_path, str(startup_log_path.relative_to(config.project_dir))
+    return startup_log_path
 
 
 def _spawn_detached_worker_process(
@@ -56,8 +83,9 @@ def _spawn_detached_worker_process(
     config: Config,
     worker_id: str,
 ) -> tuple[subprocess.Popen, str]:
-    """Spawn detached worker process and redirect early startup output to a file."""
-    startup_log_path, startup_log_rel = _startup_log_paths(config, worker_id)
+    """Spawn detached worker process and capture early output."""
+    startup_log_path = config.workers_path / f"{worker_id}-startup.log"
+    startup_log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(startup_log_path, "ab") as startup_log:
         proc = subprocess.Popen(
             cmd,
@@ -67,7 +95,7 @@ def _spawn_detached_worker_process(
             start_new_session=True,
             cwd=config.project_dir,
         )
-    return proc, startup_log_rel
+    return proc, str(startup_log_path.relative_to(config.project_dir))
 
 
 def _run_foreground(
@@ -92,13 +120,8 @@ def _run_foreground(
 
     worker = WorkerMetadata(
         worker_id=worker_id,
-        pid=os.getpid(),
         task_id=task_id,
-        task_slug=None,
-        started_at=datetime.now(timezone.utc).isoformat(),
-        status="running",
-        log_file=None,
-        worktree=None,
+        pid=os.getpid(),
         is_background=False,
     )
     registry.register(worker)
@@ -158,8 +181,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
             return 1
     else:
-        # Atomically claim next task
-        task = store.claim_next_pending_task()
+        # Select a candidate for UX; actual claim happens in the child runner.
+        task = store.get_next_pending()
         if not task:
             print("No pending tasks found")
             return 0
@@ -194,13 +217,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
-            pid=proc.pid,
             task_id=task.id,
-            task_slug=None,  # Will be set when runner starts
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,  # Will be set when runner starts
-            worktree=None,  # Will be set when runner starts
+            pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
@@ -234,11 +252,13 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             worker_id = w.worker_id
             break
 
+    store = get_store(config)
+
     # Set up signal handlers for graceful shutdown
     def signal_handler(signum, frame):
         print("\nReceived shutdown signal, cleaning up...")
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=1, status="failed")
+            registry.mark_completed(worker_id, exit_code=1)
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, signal_handler)
@@ -246,7 +266,21 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
     # Run the task normally
     exit_code = 1
+    startup_log_path: Path | None = None
+    startup_task: DbTask | None = None
+    explicit_task_id = args.task_ids[0] if hasattr(args, "task_ids") and args.task_ids else None
+    if explicit_task_id is None and worker_id:
+        meta = registry.get(worker_id)
+        if meta and meta.task_id is not None:
+            explicit_task_id = meta.task_id
+    if explicit_task_id is not None:
+        startup_task = store.get(explicit_task_id)
+        if startup_task:
+            startup_log_path = startup_log_path_for_task(config, startup_task)
+
     try:
+        if startup_log_path:
+            startup_log_path.write_text(f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\\n")
         resume = hasattr(args, 'resume') and args.resume
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
@@ -256,15 +290,24 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
         # Update worker status on completion
         if worker_id:
-            status = "completed" if exit_code == 0 else "failed"
-            registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+            registry.mark_completed(worker_id, exit_code=exit_code)
 
         return exit_code
 
     except Exception as e:
         print(f"Worker error: {e}")
+        in_progress = [t for t in store.get_in_progress() if t.running_pid == os.getpid()]
+        if not in_progress and startup_task and startup_task.id is not None:
+            refreshed = store.get(startup_task.id)
+            if refreshed and refreshed.status == "in_progress":
+                in_progress = [refreshed]
+        for task in in_progress:
+            store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+        if startup_log_path:
+            with open(startup_log_path, "a") as f:
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\\n")
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=1, status="failed")
+            registry.mark_completed(worker_id, exit_code=1)
         return 1
 
 
@@ -316,13 +359,8 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
-            pid=proc.pid,
             task_id=task.id,
-            task_slug=None,  # Will be set when runner starts
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,  # Will be set when runner starts
-            worktree=None,  # Will be set when runner starts
+            pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
@@ -386,13 +424,8 @@ def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) ->
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
-            pid=proc.pid,
             task_id=args.task_id,
-            task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,
-            worktree=None,
+            pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)

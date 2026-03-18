@@ -697,14 +697,20 @@ def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
     return deduped
 
 
-def _worker_startup_log_path(config: Config, worker: WorkerMetadata) -> Path | None:
-    """Resolve a worker startup log path when available."""
-    if not worker.startup_log_file:
-        return None
-    startup_path = Path(worker.startup_log_file)
-    if not startup_path.is_absolute():
-        startup_path = config.project_dir / startup_path
-    return startup_path
+def _task_startup_log_path(config: Config, task: DbTask | None, worker: WorkerMetadata | None = None) -> Path | None:
+    """Resolve deterministic startup log path from task slug, with legacy fallback."""
+    if task and task.task_id:
+        deterministic = config.workers_path / f"{task.task_id}.startup.log"
+        if deterministic.exists():
+            return deterministic
+    if worker and worker.startup_log_file:
+        startup_path = Path(worker.startup_log_file)
+        if not startup_path.is_absolute():
+            startup_path = config.project_dir / startup_path
+        return startup_path
+    if task and task.task_id:
+        return config.workers_path / f"{task.task_id}.startup.log"
+    return None
 
 
 def _resolve_worker_log_path(
@@ -728,7 +734,7 @@ def _resolve_worker_log_path(
         if candidate.exists():
             return candidate, False
 
-    startup_log_path = _worker_startup_log_path(config, worker)
+    startup_log_path = _task_startup_log_path(config, task, worker)
     if startup_log_path and startup_log_path.exists():
         return startup_log_path, True
 
