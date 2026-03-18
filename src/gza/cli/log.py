@@ -732,9 +732,11 @@ def _resolve_worker_log_path(
     if startup_log_path and startup_log_path.exists():
         return startup_log_path, True
 
+    # Prefer returning a main log candidate (even if missing) over a non-existent
+    # startup log, so error messages reference the expected main log path.
     if main_candidates:
         return main_candidates[0], False
-    return startup_log_path, startup_log_path is not None
+    return None, False
 
 
 def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMetadata | None:

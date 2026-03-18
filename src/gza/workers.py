@@ -267,28 +267,20 @@ class WorkerRegistry:
         worker = self.get(worker_id)
         startup_log_path = None
         if worker and worker.startup_log_file:
-            raw_startup_log_path = Path(worker.startup_log_file)
-            if raw_startup_log_path.is_absolute():
-                startup_log_path = raw_startup_log_path
-            else:
-                project_dir = self.workers_dir.parent.parent
-                candidates = [
-                    project_dir / raw_startup_log_path,
-                    self.workers_dir / raw_startup_log_path,
-                    self.workers_dir / raw_startup_log_path.name,
-                ]
-                startup_log_path = next((p for p in candidates if p.exists()), candidates[0])
+            # Resolve startup log to a path under workers_dir only.
+            # Startup logs are always created as <workers_dir>/<worker_id>-startup.log,
+            # so we resolve by filename to avoid depending on directory hierarchy.
+            candidate = self.workers_dir / Path(worker.startup_log_file).name
 
-            # Safety: only delete startup logs within the workers directory
-            # to prevent path traversal attacks via malformed metadata.
-            if startup_log_path is not None:
-                try:
-                    resolved = startup_log_path.resolve()
-                    allowed_root = self.workers_dir.resolve()
-                    if not resolved.is_relative_to(allowed_root):
-                        startup_log_path = None
-                except (OSError, ValueError):
-                    startup_log_path = None
+            # Safety: only delete if the resolved path is within workers_dir
+            # to prevent path traversal via malformed metadata.
+            try:
+                resolved = candidate.resolve()
+                allowed_root = self.workers_dir.resolve()
+                if resolved.is_relative_to(allowed_root):
+                    startup_log_path = resolved
+            except (OSError, ValueError):
+                pass
 
         metadata_path = self._metadata_path(worker_id)
         if metadata_path.exists():

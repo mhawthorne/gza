@@ -630,8 +630,7 @@ def _print_ps_output(
     """
     import datetime
     # Include completed workers so startup failures and poll transitions remain visible.
-    include_completed_for_query = True
-    live_rows, _ = _build_ps_rows(registry, store, include_completed=include_completed_for_query)
+    live_rows, _ = _build_ps_rows(registry, store, include_completed=True)
 
     # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
     if seen_tasks is not None:
@@ -707,10 +706,10 @@ def _print_ps_output(
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
-        f"{'STATUS':<12} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+        f"{'STATUS':<16} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
     console.print(f"[bold]{header}[/bold]", soft_wrap=True)
-    console.print("[bold]" + "─" * 94 + "[/bold]", soft_wrap=True)
+    console.print("[bold]" + "─" * 98 + "[/bold]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
@@ -724,7 +723,7 @@ def _print_ps_output(
 
         console.print(
             f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
-            f"[{sc}]{status:<12}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
+            f"[{sc}]{status:<16}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
             f"[#ff99cc]{task_display}[/#ff99cc]",
             soft_wrap=True,
         )
