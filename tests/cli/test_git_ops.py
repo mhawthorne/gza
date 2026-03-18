@@ -3601,11 +3601,11 @@ class TestAdvanceMergeSquashThreshold:
         with pytest.raises(ConfigError):
             Config.load(tmp_path)
 
-class TestAdvancePlansCommand:
-    """Tests for 'gza advance --plans' command."""
+class TestAdvanceUnimplementedCommand:
+    """Tests for 'gza advance --unimplemented' command."""
 
-    def test_advance_plans_lists_completed_plans_without_impl(self, tmp_path: Path):
-        """advance --plans lists completed plans with no implement task."""
+    def test_advance_unimplemented_lists_completed_plan_and_explore_without_impl(self, tmp_path: Path):
+        """advance --unimplemented lists completed plans/explores with no implement task."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -3613,21 +3613,28 @@ class TestAdvancePlansCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        # Add a completed plan task
         plan = store.add("Design the authentication system", task_type="plan")
+        explore = store.add("Explore auth provider options", task_type="explore")
         plan.status = "completed"
+        explore.status = "completed"
         from datetime import datetime, timezone
-        plan.completed_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        plan.completed_at = now
+        explore.completed_at = now
         store.update(plan)
+        store.update(explore)
 
-        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert str(plan.id) in result.stdout
+        assert str(explore.id) in result.stdout
+        assert "[plan]" in result.stdout
+        assert "[explore]" in result.stdout
         assert "gza implement" in result.stdout
 
-    def test_advance_plans_excludes_plans_with_impl(self, tmp_path: Path):
-        """advance --plans excludes plans that already have an implement task."""
+    def test_advance_unimplemented_excludes_tasks_with_impl(self, tmp_path: Path):
+        """advance --unimplemented excludes tasks that already have an implement task."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -3638,22 +3645,25 @@ class TestAdvancePlansCommand:
         from datetime import datetime, timezone
 
         plan = store.add("A plan", task_type="plan")
+        explore = store.add("An explore", task_type="explore")
         plan.status = "completed"
-        plan.completed_at = datetime.now(timezone.utc)
+        explore.status = "completed"
+        now = datetime.now(timezone.utc)
+        plan.completed_at = now
+        explore.completed_at = now
         store.update(plan)
+        store.update(explore)
 
-        impl = store.add("Implement plan", task_type="implement", based_on=plan.id)
-        impl.status = "completed"
-        impl.completed_at = datetime.now(timezone.utc)
-        store.update(impl)
+        store.add("Implement plan", task_type="implement", based_on=plan.id)
+        store.add("Implement explore", task_type="implement", based_on=explore.id)
 
-        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "No completed plans without implementation" in result.stdout
+        assert "No completed plan/explore tasks without implementation tasks." in result.stdout
 
-    def test_advance_plans_create_queues_implement_tasks(self, tmp_path: Path):
-        """advance --plans --create creates implement tasks for each listed plan."""
+    def test_advance_unimplemented_create_queues_implement_tasks(self, tmp_path: Path):
+        """advance --unimplemented --create creates implement tasks for each listed task."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -3663,31 +3673,32 @@ class TestAdvancePlansCommand:
 
         from datetime import datetime, timezone
 
-        plan1 = store.add("Plan A", task_type="plan")
-        plan1.status = "completed"
-        plan1.completed_at = datetime.now(timezone.utc)
-        store.update(plan1)
+        plan = store.add("Plan A", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(timezone.utc)
+        store.update(plan)
 
-        plan2 = store.add("Plan B", task_type="plan")
-        plan2.status = "completed"
-        plan2.completed_at = datetime.now(timezone.utc)
-        store.update(plan2)
+        explore = store.add("Explore B", task_type="explore")
+        explore.status = "completed"
+        explore.completed_at = datetime.now(timezone.utc)
+        store.update(explore)
 
-        result = run_gza("advance", "--plans", "--create", "--project", str(tmp_path))
+        result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created" in result.stdout
 
-        # Verify impl tasks were created with based_on pointing to plans
         all_tasks = store.get_all()
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 2
-        based_on_ids = {t.based_on for t in impl_tasks}
-        assert plan1.id in based_on_ids
-        assert plan2.id in based_on_ids
+        by_based_on = {t.based_on: t for t in impl_tasks}
+        assert plan.id in by_based_on
+        assert explore.id in by_based_on
+        assert by_based_on[plan.id].prompt.startswith(f"Implement plan from task #{plan.id}")
+        assert by_based_on[explore.id].prompt.startswith(f"Implement findings from task #{explore.id}")
 
-    def test_advance_plans_dry_run_no_create(self, tmp_path: Path):
-        """advance --plans --create --dry-run shows preview but creates nothing."""
+    def test_advance_unimplemented_dry_run_no_create(self, tmp_path: Path):
+        """advance --unimplemented --create --dry-run shows preview but creates nothing."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -3702,7 +3713,7 @@ class TestAdvancePlansCommand:
         plan.completed_at = datetime.now(timezone.utc)
         store.update(plan)
 
-        result = run_gza("advance", "--plans", "--create", "--dry-run", "--project", str(tmp_path))
+        result = run_gza("advance", "--unimplemented", "--create", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "dry-run" in result.stdout.lower() or "Would create" in result.stdout
@@ -3711,12 +3722,8 @@ class TestAdvancePlansCommand:
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 0
 
-    def test_advance_plans_targeted_query_ignores_non_plan_tasks(self, tmp_path: Path):
-        """advance --plans correctly filters plans even with many non-plan tasks present.
-
-        This exercises get_impl_based_on_ids (the targeted query path) to ensure
-        the plan-exclusion filter is based only on implement tasks, not all tasks.
-        """
+    def test_advance_unimplemented_targeted_query_ignores_non_source_tasks(self, tmp_path: Path):
+        """advance --unimplemented filters by implement based_on regardless of task noise."""
         from gza.db import SqliteTaskStore
         from datetime import datetime, timezone
 
@@ -3730,28 +3737,51 @@ class TestAdvancePlansCommand:
         plan_with_impl.completed_at = datetime.now(timezone.utc)
         store.update(plan_with_impl)
 
-        plan_without_impl = store.add("Plan without impl", task_type="plan")
-        plan_without_impl.status = "completed"
-        plan_without_impl.completed_at = datetime.now(timezone.utc)
-        store.update(plan_without_impl)
+        explore_without_impl = store.add("Explore without impl", task_type="explore")
+        explore_without_impl.status = "completed"
+        explore_without_impl.completed_at = datetime.now(timezone.utc)
+        store.update(explore_without_impl)
 
-        assert plan_with_impl.id is not None and plan_without_impl.id is not None
+        assert plan_with_impl.id is not None and explore_without_impl.id is not None
 
-        # Implement task based on plan_with_impl
         store.add("Impl 1", task_type="implement", based_on=plan_with_impl.id)
 
-        # Many non-plan tasks that should NOT affect the exclusion logic
         for i in range(20):
-            t = store.add(f"Task {i}", task_type="implement")
-            t.based_on = plan_with_impl.id  # review/task based_on should be ignored
+            t = store.add(f"Task {i}", task_type="review")
+            t.based_on = plan_with_impl.id
             store.update(t)
 
-        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        # Only plan_without_impl should appear (plan_with_impl is excluded)
-        assert "Plan without impl" in result.stdout
+        assert "Explore without impl" in result.stdout
         assert "Plan with impl" not in result.stdout
+
+    def test_advance_plans_alias_keeps_plan_only_behavior(self, tmp_path: Path):
+        """legacy --plans remains supported and only targets plan tasks."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Plan D", task_type="plan")
+        explore = store.add("Explore D", task_type="explore")
+        plan.status = "completed"
+        explore.status = "completed"
+        now = datetime.now(timezone.utc)
+        plan.completed_at = datetime.now(timezone.utc)
+        explore.completed_at = now
+        store.update(plan)
+        store.update(explore)
+
+        result = run_gza("advance", "--plans", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "deprecated" in result.stderr.lower()
+        assert str(plan.id) in result.stdout
+        assert str(explore.id) not in result.stdout
 
 
 class TestAdvanceAutoPlans:
