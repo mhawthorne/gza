@@ -163,6 +163,12 @@ class TestPromptBuilderBuild:
         assert "Impact:" in result
         assert "Required fix:" in result
         assert "Required tests:" in result
+        assert "repo-rules/learnings pass" in result
+        assert "silent broad-exception fallbacks" in result
+        assert "misleading output" in result
+        assert "targeted regression tests" in result
+        assert "config, CLI, or operator-facing behavior changed" in result
+        assert "Reserve Must-Fix for:" in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
         """Test interactive review skill scaffolding matches canonical Summary requirements."""
