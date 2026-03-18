@@ -1224,9 +1224,13 @@ def main() -> int:
         if args.command != "init":
             try:
                 cfg = Config.load(args.project_dir)
-                reconcile_in_progress_tasks(cfg)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"Warning: Skipping in-progress reconciliation: {exc}", file=sys.stderr)
+            else:
+                try:
+                    reconcile_in_progress_tasks(cfg)
+                except Exception as exc:
+                    print(f"Warning: In-progress reconciliation failed: {exc}", file=sys.stderr)
         if args.command == "work":
             return cmd_run(args)
         elif args.command == "next":

@@ -1,9 +1,11 @@
 """Tests for task query and display CLI commands."""
 
 
+import argparse
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -2945,3 +2947,40 @@ class TestNextCommandWithDependencies:
         assert result.returncode == 0
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
+
+
+class TestStopCommandSafety:
+    """Safety tests for stopping workers."""
+
+    def test_stop_refuses_non_running_worker_even_if_pid_is_live(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """A non-running worker record should never be signaled."""
+        from gza.cli.query import cmd_stop
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-safety",
+                task_id=None,
+                pid=os.getpid(),
+                status="completed",
+            )
+        )
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            worker_id="w-stop-safety",
+            all=False,
+            force=False,
+        )
+        with patch("gza.cli.query.WorkerRegistry.stop") as mock_stop:
+            rc = cmd_stop(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Refusing to stop worker w-stop-safety" in captured.out
+        mock_stop.assert_not_called()

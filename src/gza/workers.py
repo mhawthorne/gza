@@ -34,10 +34,29 @@ class WorkerMetadata:
     def from_dict(data: dict) -> "WorkerMetadata":
         """Create from dictionary, ignoring unknown legacy keys."""
         raw_pid = data.get("pid")
+        if raw_pid is None:
+            raise ValueError("Worker metadata is missing required 'pid'")
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Worker metadata has invalid pid: {raw_pid!r}") from exc
+        if pid <= 0:
+            raise ValueError(f"Worker metadata has non-positive pid: {pid}")
+
+        raw_task_id = data.get("task_id")
+        task_id: int | None
+        if raw_task_id is None:
+            task_id = None
+        else:
+            try:
+                task_id = int(raw_task_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Worker metadata has invalid task_id: {raw_task_id!r}") from exc
+
         return WorkerMetadata(
             worker_id=str(data.get("worker_id", "")),
-            task_id=data.get("task_id"),
-            pid=int(raw_pid) if raw_pid is not None else 0,
+            task_id=task_id,
+            pid=pid,
             task_slug=data.get("task_slug"),
             started_at=data.get("started_at"),
             status=data.get("status", "running"),
@@ -83,6 +102,8 @@ class WorkerRegistry:
         return worker_id
 
     def register(self, worker: WorkerMetadata) -> None:
+        if worker.pid <= 0:
+            raise ValueError(f"Cannot register worker with non-positive pid: {worker.pid}")
         if worker.started_at is None:
             worker.started_at = datetime.now(timezone.utc).isoformat()
         metadata_path = self._metadata_path(worker.worker_id)
@@ -96,16 +117,19 @@ class WorkerRegistry:
         metadata_path = self._metadata_path(worker_id)
         if not metadata_path.exists():
             return None
-        data = json.loads(metadata_path.read_text())
-        return WorkerMetadata.from_dict(data)
+        try:
+            data = json.loads(metadata_path.read_text())
+            return WorkerMetadata.from_dict(data)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            return None
 
     def list_all(self, include_completed: bool = False) -> list[WorkerMetadata]:
         workers: list[WorkerMetadata] = []
         for metadata_path in self.workers_dir.glob("w-*.json"):
-            data = json.loads(metadata_path.read_text())
             try:
+                data = json.loads(metadata_path.read_text())
                 worker = WorkerMetadata.from_dict(data)
-            except Exception:
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
                 continue
             if not include_completed and worker.status in ("completed", "failed"):
                 continue
@@ -115,7 +139,7 @@ class WorkerRegistry:
 
     def is_running(self, worker_id: str) -> bool:
         worker = self.get(worker_id)
-        if not worker:
+        if not worker or worker.pid <= 0:
             return False
         try:
             os.kill(worker.pid, 0)
@@ -136,7 +160,7 @@ class WorkerRegistry:
 
     def stop(self, worker_id: str, force: bool = False) -> bool:
         worker = self.get(worker_id)
-        if not worker:
+        if not worker or worker.pid <= 0:
             return False
         try:
             sig = signal.SIGKILL if force else signal.SIGTERM

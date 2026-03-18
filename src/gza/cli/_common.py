@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -32,25 +33,41 @@ def reconcile_in_progress_tasks(config: Config) -> None:
     """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
     try:
         store = get_store(config)
-        now = datetime.now(timezone.utc)
-        timeout_seconds = max(0, int(config.timeout_minutes) * 60)
-        for task in store.get_in_progress():
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        print(f"Warning: Skipping task reconciliation due to setup error: {exc}", file=sys.stderr)
+        return
+    except Exception as exc:
+        print(f"Warning: Skipping task reconciliation due to unexpected error: {exc}", file=sys.stderr)
+        return
+
+    now = datetime.now(timezone.utc)
+    timeout_seconds = max(0, int(config.timeout_minutes) * 60)
+    for task in store.get_in_progress():
+        task_label = f"#{task.id}" if task.id is not None else "<unknown>"
+        try:
             if task.running_pid is None:
                 # Keep legacy/manual resumable rows untouched.
                 if task.started_at is not None and task.session_id is None:
                     store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
                 continue
+
+            if task.running_pid <= 0:
+                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+                continue
+
             try:
                 os.kill(task.running_pid, 0)
             except OSError:
                 store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
                 continue
+
             if task.started_at and timeout_seconds > 0:
                 if (now - task.started_at).total_seconds() > timeout_seconds:
                     store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="TIMEOUT")
-    except Exception:
-        # Reconciliation is intentionally best-effort.
-        return
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
 
 
 # Shared color palette for history and stats output (readable on dark and light terminals)
@@ -165,29 +182,31 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     # Get task to run (either specific or next pending)
     store = get_store(config)
-    if task_id:
-        task = store.get(task_id)
+    explicit_task_id = task_id
+    selected_task: DbTask | None = None
+
+    if explicit_task_id is not None:
+        task = store.get(explicit_task_id)
         if not task:
-            print(f"Error: Task #{task_id} not found")
+            print(f"Error: Task #{explicit_task_id} not found")
             return 1
 
         if task.status != "pending":
-            print(f"Error: Task #{task_id} is not pending (status: {task.status})")
+            print(f"Error: Task #{explicit_task_id} is not pending (status: {task.status})")
             return 1
 
         # Check if task is blocked
         is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
         if is_blocked:
-            print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            print(f"Error: Task #{explicit_task_id} is blocked by task #{blocking_id} ({blocking_status})")
             return 1
+        selected_task = task
     else:
         # Select a candidate for UX; actual claim happens in the child runner.
-        task = store.get_next_pending()
-        if not task:
+        selected_task = store.get_next_pending()
+        if not selected_task:
             print("No pending tasks found")
             return 0
-        assert task.id is not None
-        task_id = task.id
 
     # Build command for worker subprocess
     cmd = [
@@ -196,8 +215,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         "--worker-mode",
     ]
 
-    if task_id:
-        cmd.append(str(task_id))
+    if explicit_task_id is not None:
+        cmd.append(str(explicit_task_id))
 
     if args.no_docker:
         cmd.append("--no-docker")
@@ -217,16 +236,17 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
-            task_id=task.id,
+            task_id=explicit_task_id,
             pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
 
+        assert selected_task is not None
         print(f"Started worker {worker_id} (PID {proc.pid})")
-        print(f"  Task: #{task.id}")
-        if task.prompt:
-            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
+        print(f"  Task: #{selected_task.id}")
+        if selected_task.prompt:
+            prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
             print(f"  Prompt: {prompt_display}")
         print()
         print(f"Use 'gza ps' to view running workers")

@@ -2,6 +2,8 @@
 
 
 import subprocess
+import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -84,3 +86,23 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "--unimplemented" in result.stdout
         assert "--plans" not in result.stdout
+
+class TestReconciliationWarnings:
+    """Tests for reconciliation failure visibility during CLI dispatch."""
+
+    def test_main_warns_and_continues_when_reconciliation_raises(self, tmp_path, capsys: pytest.CaptureFixture[str]):
+        """Dispatch should continue even if reconciliation fails unexpectedly."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "next", "--project", str(tmp_path)]),
+            patch("gza.cli.main.reconcile_in_progress_tasks", side_effect=RuntimeError("boom")),
+            patch("gza.cli.main.cmd_next", return_value=0),
+        ):
+            rc = main()
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Warning: In-progress reconciliation failed: boom" in captured.err

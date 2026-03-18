@@ -941,6 +941,25 @@ class TestWorkCommandMultiTask:
         assert result.returncode != 0
         assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
 
+    def test_work_worker_mode_rejects_completed_task(self, tmp_path: Path):
+        """Worker-mode explicit execution should return non-zero for non-pending tasks."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Completed task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("work", "--worker-mode", str(task.id), "--no-docker", "--project", str(tmp_path))
+        assert result.returncode != 0
+        assert f"Task #{task.id}" in (result.stdout + result.stderr)
+
     def test_work_warns_about_orphaned_tasks_before_starting(self, tmp_path: Path):
         """Work command warns about orphaned in-progress tasks before starting new work."""
         from gza.db import SqliteTaskStore
@@ -1031,6 +1050,56 @@ class TestBackgroundWorkerCommand:
         assert captured_cmd[project_idx - 1] == "--project", \
             f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
             f"Full command: {captured_cmd}"
+
+    def test_background_worker_without_explicit_task_does_not_pass_task_id(self, tmp_path: Path):
+        """No-id background work should not pass a selected task ID to child runner."""
+        from unittest.mock import patch, MagicMock
+        from gza.db import SqliteTaskStore
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        from gza.workers import WorkerRegistry
+        import argparse
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        store.add("Pending candidate")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        captured_cmd = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        def capture_popen(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+            rc = _spawn_background_worker(args, config)
+
+        assert rc == 0
+        assert captured_cmd is not None
+        worker_mode_idx = captured_cmd.index("--worker-mode")
+        assert worker_mode_idx + 1 < len(captured_cmd)
+        assert captured_cmd[worker_mode_idx + 1].startswith("--"), f"Unexpected explicit task id in command: {captured_cmd}"
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].task_id is None
 
     def test_background_resume_worker_command_uses_project_flag(self, tmp_path: Path):
         """Background resume worker subprocess must pass project dir with --project flag.
@@ -1145,6 +1214,36 @@ class TestBackgroundWorkerCommand:
         assert worker.startup_log_file == f".gza/workers/{worker.worker_id}-startup.log"
         assert worker.log_file is None
         assert (tmp_path / worker.startup_log_file).exists()
+
+
+class TestReconciliation:
+    """Tests for in-progress reconciliation behavior."""
+
+    def test_reconciliation_warns_on_task_failure_and_continues(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Per-task reconciliation failures should be visible, not silent."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Stuck in-progress task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = -1
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        with patch.object(SqliteTaskStore, "mark_failed", side_effect=RuntimeError("db-write-boom")):
+            reconcile_in_progress_tasks(config)
+
+        captured = capsys.readouterr()
+        assert "Warning: Unexpected reconciliation error for task" in captured.err
+        assert "db-write-boom" in captured.err
 
 
 class TestImplementCommand:

@@ -999,6 +999,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     """Stop a running worker."""
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
 
     # Validate arguments
     if not hasattr(args, 'worker_id') or (not args.worker_id and not (hasattr(args, 'all') and args.all)):
@@ -1008,7 +1009,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if hasattr(args, 'all') and args.all:
         # Stop all running workers
         workers = registry.list_all(include_completed=False)
-        running_workers = [w for w in workers if registry.is_running(w.worker_id)]
+        running_workers = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
 
         if not running_workers:
             print("No running workers to stop")
@@ -1029,6 +1030,28 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print(f"Error: Worker {args.worker_id} not found")
         return 1
     worker = maybe_worker
+
+    if worker.status != "running":
+        print(
+            f"Refusing to stop worker {args.worker_id}: "
+            f"status is '{worker.status}', not 'running'."
+        )
+        print("Run 'gza cleanup' to remove stale worker records.")
+        return 1
+
+    if worker.task_id is not None:
+        task = store.get(worker.task_id)
+        if (
+            task is not None
+            and task.status == "in_progress"
+            and task.running_pid is not None
+            and task.running_pid != worker.pid
+        ):
+            print(
+                f"Refusing to stop worker {args.worker_id}: PID ownership mismatch "
+                f"(worker PID {worker.pid}, task running_pid {task.running_pid})."
+            )
+            return 1
 
     if not registry.is_running(args.worker_id):
         print(f"Worker {args.worker_id} is not running (process not found)")

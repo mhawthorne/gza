@@ -1136,7 +1136,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                 store.update(task)
             elif task.status != "pending":
                 error_message(f"Error: Task #{task_id} is no longer pending (status: {task.status})")
-                return 0
+                return 1
             else:
                 assert task.id is not None
                 claimed = store.try_mark_in_progress(task.id, os.getpid())
@@ -1144,7 +1144,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
                     refreshed = store.get(task.id)
                     status = refreshed.status if refreshed else "unknown"
                     error_message(f"Error: Task #{task_id} is no longer pending (status: {status})")
-                    return 0
+                    return 1
                 task = claimed
     else:
         if resume:
