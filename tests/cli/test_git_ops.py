@@ -4168,6 +4168,41 @@ class TestPrCommand:
         assert title == "Impl auth and metrics"
         assert "## Task Prompt" in body
 
+    def test_generate_pr_content_marks_internal_task_failed_on_runner_exception(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Runner exceptions should not leave PR internal tasks in pending/in_progress."""
+        from gza.cli.git_ops import _generate_pr_content
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        source_task = store.add("Add auth and metrics", task_type="implement")
+        source_task.task_id = "20260318-impl-auth-and-metrics"
+        store.update(source_task)
+
+        with patch(
+            "gza.cli.git_ops.runner_mod.run",
+            side_effect=RuntimeError("runner exploded"),
+        ):
+            title, body = _generate_pr_content(
+                source_task,
+                commit_log="abc123 Add auth",
+                diff_stat="1 file changed",
+                config=Config.load(tmp_path),
+                store=store,
+            )
+
+        assert title == "Impl auth and metrics"
+        assert "## Task Prompt" in body
+
+        internal_tasks = [task for task in store.get_all() if task.task_type == "internal"]
+        assert len(internal_tasks) == 1
+        assert internal_tasks[0].status == "failed"
+        assert internal_tasks[0].failure_reason == "UNKNOWN"
+
+        captured = capsys.readouterr()
+        assert f"internal task #{internal_tasks[0].id} failed" in captured.err
+
 
 class TestRefreshCommand:
     """Tests for 'gza refresh' command."""

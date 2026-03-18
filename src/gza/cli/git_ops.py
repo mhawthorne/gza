@@ -748,17 +748,30 @@ def _generate_pr_content(
 
     if internal_task.id is None:
         return _fallback_pr_content(task, commit_log)
+    internal_task_id = internal_task.id
+
+    def _mark_internal_task_failed_if_nonterminal() -> None:
+        refreshed = store.get(internal_task_id)
+        if refreshed is None:
+            return
+        if refreshed.status in {"pending", "in_progress"}:
+            store.mark_failed(refreshed, failure_reason="UNKNOWN")
 
     try:
-        exit_code = runner_mod.run(config, task_id=internal_task.id)
+        exit_code = runner_mod.run(config, task_id=internal_task_id)
     except Exception as exc:
-        print(f"Warning: PR description internal task failed: {exc}", file=sys.stderr)
+        _mark_internal_task_failed_if_nonterminal()
+        print(
+            f"Warning: PR description internal task #{internal_task_id} failed: {exc}",
+            file=sys.stderr,
+        )
         return _fallback_pr_content(task, commit_log)
 
-    completed_task = store.get(internal_task.id)
+    completed_task = store.get(internal_task_id)
     if exit_code != 0 or completed_task is None or completed_task.status != "completed":
+        _mark_internal_task_failed_if_nonterminal()
         print(
-            f"Warning: PR description internal task #{internal_task.id} did not complete successfully",
+            f"Warning: PR description internal task #{internal_task_id} did not complete successfully",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log)
@@ -766,7 +779,7 @@ def _generate_pr_content(
     response = (completed_task.output_content or "").strip()
     if not response:
         print(
-            f"Warning: PR description internal task #{internal_task.id} produced no output",
+            f"Warning: PR description internal task #{internal_task_id} produced no output",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log)
@@ -775,7 +788,7 @@ def _generate_pr_content(
     has_body = any(line.strip() == "BODY:" for line in response.splitlines())
     if not (has_title and has_body):
         print(
-            f"Warning: PR description internal task #{internal_task.id} produced malformed output",
+            f"Warning: PR description internal task #{internal_task_id} produced malformed output",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log)
