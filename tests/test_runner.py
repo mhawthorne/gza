@@ -2176,9 +2176,217 @@ class TestResumeVerificationPrompt:
         assert "verify by checking the actual code/files" in prompt.lower()
         assert "update the todo list to reflect what is actually complete" in prompt.lower()
         assert "continue from where you left off" in prompt.lower()
+        assert f"Current task DB id: #{review_task.id}" in prompt
+        assert f"Current task slug: {review_task.task_id}" in prompt
+        assert f".gza/reviews/{review_task.task_id}.md" in prompt
 
         # Verify resume_session_id was passed
         assert resume_session_id == "test-session-456"
+
+    def test_resume_review_new_task_id_reasserts_current_report_contract(self, tmp_path: Path):
+        """Resume prompts must bind to the new review task ID/report path, not the failed ancestor."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature X", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.task_id = "20260212-implement-feature-x"
+        impl_task.branch = "gza/20260212-implement-feature-x"
+        store.update(impl_task)
+
+        failed_review = store.add(
+            prompt="Review feature X",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        failed_review.task_id = "20260212-review-feature-x"
+        failed_review.session_id = "resume-session-abc"
+        store.mark_failed(failed_review, log_file="logs/failed.log", stats=None)
+
+        resumed_review = store.add(
+            prompt=failed_review.prompt,
+            task_type="review",
+            depends_on=impl_task.id,
+            based_on=failed_review.id,
+        )
+        resumed_review.task_id = "20260213-review-feature-x-2"
+        resumed_review.session_id = failed_review.session_id
+        store.update(resumed_review)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = _work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{resumed_review.task_id}.md").write_text("# Review\n\nVerdict: APPROVED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.get_diff_numstat.return_value = ""
+        mock_git.get_diff.return_value = ""
+        mock_git.get_diff_stat.return_value = ""
+
+        with patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(
+                resumed_review, config, store, mock_provider, mock_git, resume=True
+            )
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert f"Current task DB id: #{resumed_review.id}" in prompt
+        assert f"Current task slug: {resumed_review.task_id}" in prompt
+        assert f".gza/reviews/{resumed_review.task_id}.md" in prompt
+        assert f".gza/reviews/{failed_review.task_id}.md" not in prompt
+
+
+class TestNonCodeReportArtifactContract:
+    """Regression tests for non-code report artifact contract enforcement."""
+
+    def test_resume_review_fails_when_stale_filename_written(self, tmp_path: Path):
+        """Resumed review should fail when provider writes only the old review filename."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature X", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.task_id = "20260212-implement-feature-x"
+        impl_task.branch = "gza/20260212-implement-feature-x"
+        store.update(impl_task)
+
+        prior_review = store.add(
+            prompt="Review feature X",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.task_id = "20260212-review-feature-x"
+        prior_review.session_id = "resume-session-stale"
+        store.mark_failed(prior_review, log_file="logs/prior.log", stats=None)
+
+        resumed_review = store.add(
+            prompt=prior_review.prompt,
+            task_type="review",
+            depends_on=impl_task.id,
+            based_on=prior_review.id,
+        )
+        resumed_review.task_id = "20260213-review-feature-x-2"
+        resumed_review.session_id = prior_review.session_id
+        store.update(resumed_review)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        def provider_run(_config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            review_dir = work_dir / ".gza" / "reviews"
+            review_dir.mkdir(parents=True, exist_ok=True)
+            (review_dir / f"{prior_review.task_id}.md").write_text("# Review\n\nVerdict: APPROVED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=3.0,
+                num_turns_reported=2,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console"):
+            exit_code = _run_non_code_task(
+                resumed_review, config, store, mock_provider, mock_git, resume=True
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(resumed_review.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
+        assert refreshed.report_file is None
+        assert refreshed.output_content is None
+        expected_host_report = tmp_path / ".gza" / "reviews" / f"{resumed_review.task_id}.md"
+        assert not expected_host_report.exists()
+
+    def test_non_code_success_without_expected_report_marks_failed_and_skips_copy_back(self, tmp_path: Path):
+        """Provider success without expected report must not mark completion or copy host artifact."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan feature Y", task_type="plan")
+        plan_task.task_id = "20260213-plan-feature-y"
+        store.update(plan_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=1.5,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            session_id="session-plan",
+            error_type=None,
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(plan_task, config, store, mock_provider, mock_git, resume=False)
+
+        assert exit_code == 0
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
+        assert refreshed.report_file is None
+        assert refreshed.output_content is None
+        host_report = tmp_path / ".gza" / "plans" / f"{plan_task.task_id}.md"
+        assert not host_report.exists()
 
     def test_normal_run_does_not_include_verification_prompt(self, tmp_path: Path):
         """Test that normal (non-resume) runs use the standard prompt without verification."""

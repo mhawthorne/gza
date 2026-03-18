@@ -133,13 +133,36 @@ class PromptBuilder:
 
         return base_prompt
 
-    def resume_prompt(self) -> str:
+    def resume_prompt(
+        self,
+        *,
+        task_id: int | None = None,
+        task_slug: str | None = None,
+        report_path: Path | None = None,
+    ) -> str:
         """Build the resume verification prompt.
 
         Used when resuming an interrupted task to prompt the agent to verify
         its todo list against the actual state of the codebase.
+
+        For non-code tasks, callers can pass task/report metadata to reassert
+        the current output artifact contract.
         """
-        return _load_template("resume.txt")
+        prompt = _load_template("resume.txt")
+
+        if report_path is None:
+            return prompt
+
+        prompt += (
+            "\n\nResume output contract (current run):\n"
+            f"- Current task DB id: #{task_id if task_id is not None else '?'}\n"
+            f"- Current task slug: {task_slug or '(unset)'}\n"
+            f"- Required report path for this run: {report_path}\n"
+            "- Write output to this exact report path before finishing.\n"
+            "- Do not keep writing a prior task's filename from an earlier session.\n"
+            "- If you wrote to an old report filename earlier, move/copy the final content to the required report path."
+        )
+        return prompt
 
     def pr_description_prompt(
         self, task_prompt: str, commit_log: str, diff_stat: str
