@@ -951,7 +951,7 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--type",
         type=str,
-        choices=["explore", "plan", "implement", "review", "improve", "learn"],
+        choices=["explore", "plan", "implement", "review", "improve", "internal"],
         help="Filter tasks by task_type",
     )
     parser.add_argument(

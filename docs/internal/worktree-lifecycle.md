@@ -13,7 +13,7 @@ Each task type creates a worktree at `config.worktree_path / task.task_id`.
 
 Reviews also use `same_branch=True`. They check out the implementation branch in a new worktree directory. The implementation task's worktree directory is removed as a side effect.
 
-### Non-code tasks (explore, review, learn)
+### Non-code tasks (explore, plan, review, internal)
 
 These create worktrees in `/tmp` (for Docker compatibility) based on the default branch. See `_run_non_code_task` in `runner.py`.
 

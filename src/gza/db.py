@@ -76,7 +76,7 @@ class Task:
     id: int | None  # None for unsaved tasks
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
-    task_type: str = "implement"  # explore, plan, implement, review, improve
+    task_type: str = "implement"  # explore, plan, implement, review, improve, internal
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
     log_file: str | None = None
@@ -183,8 +183,11 @@ MIGRATION_V20_TO_V21 = """
 ALTER TABLE tasks ADD COLUMN provider_is_explicit INTEGER DEFAULT 0;
 """
 
+# Migration from v21 to v22
+MIGRATION_V21_TO_V22 = "UPDATE tasks SET task_type='internal' WHERE task_type='learn';"
+
 # Schema version for migrations
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -597,6 +600,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (19, MIGRATION_V18_TO_V19),
     (20, MIGRATION_V19_TO_V20),
     (21, MIGRATION_V20_TO_V21),
+    (22, MIGRATION_V21_TO_V22),
 ]
 
 
@@ -1011,7 +1015,7 @@ class SqliteTaskStore:
             limit: Maximum number of tasks to return (None for all)
             status: Filter by specific status (e.g., 'completed', 'failed', 'unmerged')
                    If None, returns all completed/failed/unmerged tasks
-            task_type: Filter by specific task_type (e.g., 'task', 'explore', 'plan', 'implement', 'review', 'improve')
+            task_type: Filter by specific task_type (e.g., 'explore', 'plan', 'implement', 'review', 'improve', 'internal')
                       If None, returns all task types
             since: If specified, only return tasks where completed_at >= since
                    (falls back to created_at when completed_at is NULL)
@@ -1144,13 +1148,13 @@ class SqliteTaskStore:
         return depth
 
     def get_recent_completed(self, limit: int = 15) -> list[Task]:
-        """Get recent completed tasks, most recent first. Excludes internal learn tasks."""
+        """Get recent completed tasks, most recent first. Excludes internal tasks."""
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
                 WHERE status = 'completed'
-                  AND task_type != 'learn'
+                  AND task_type != 'internal'
                 ORDER BY completed_at DESC, id DESC
                 LIMIT ?
                 """,

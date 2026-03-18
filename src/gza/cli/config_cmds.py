@@ -398,7 +398,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     effective_sources = _project_effective_source_map(effective, config.source_map)
 
     if args.json:
-        task_types = ["explore", "plan", "implement", "review", "improve", "learn"]
+        task_types = ["explore", "plan", "implement", "review", "improve", "internal"]
         model_resolution = {}
         for task_type in task_types:
             provider = config.get_provider_for_task(task_type)
@@ -450,7 +450,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print()
     print("Model Resolution by Task Type")
     print("=" * 50)
-    task_types = ["explore", "plan", "implement", "review", "improve", "learn"]
+    task_types = ["explore", "plan", "implement", "review", "improve", "internal"]
     model_rows = []
     for task_type in task_types:
         provider = config.get_provider_for_task(task_type)

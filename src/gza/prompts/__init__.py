@@ -64,8 +64,10 @@ class PromptBuilder:
                     f"{spec_content}"
                 )
 
-        # Mention learnings file if it exists and task doesn't opt out
-        if not task.skip_learnings:
+        # Mention learnings file if it exists and task doesn't opt out.
+        # Internal tasks are gza-owned orchestration tasks and should not
+        # implicitly inherit learnings context.
+        if task.task_type != "internal" and not task.skip_learnings:
             learnings_path = config.project_dir / ".gza" / "learnings.md"
             if learnings_path.exists():
                 base_prompt += (
@@ -123,9 +125,9 @@ class PromptBuilder:
                     f"\n\nBefore finishing, run the following verification command"
                     f" and fix any errors: `{config.verify_command}`"
                 )
-        elif task.task_type == "learn":
+        elif task.task_type in ("internal", "learn"):
             if report_path:
-                base_prompt += "\n\n" + _load_template("learn.txt").format(
+                base_prompt += "\n\n" + _load_template("internal.txt").format(
                     report_path=report_path
                 )
         else:

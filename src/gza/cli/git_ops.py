@@ -24,6 +24,7 @@ from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
 from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task
+from .. import runner as runner_mod
 
 from gza.query import (
     get_base_task_slug as _get_base_task_slug,
@@ -719,8 +720,10 @@ def _generate_pr_content(
     task: DbTask,
     commit_log: str,
     diff_stat: str,
+    config: Config,
+    store: SqliteTaskStore,
 ) -> tuple[str, str]:
-    """Generate PR title and body using Claude.
+    """Generate PR title and body using an internal task.
 
     Args:
         task: The task to create a PR for
@@ -730,32 +733,55 @@ def _generate_pr_content(
     Returns:
         Tuple of (title, body)
     """
-    import subprocess
-
-    # Build a prompt for Claude
+    # Build prompt using the strict PR description contract template.
     prompt = PromptBuilder().pr_description_prompt(
         task_prompt=task.prompt,
         commit_log=commit_log,
         diff_stat=diff_stat,
     )
 
-    try:
-        result = subprocess.run(
-            ["claude", "--print"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return _parse_pr_response(result.stdout.strip(), task)
-        elif result.returncode != 0 and result.stderr:
-            print(f"Warning: claude failed: {result.stderr.strip()}", file=sys.stderr)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    internal_task = store.add(
+        prompt=prompt,
+        task_type="internal",
+        skip_learnings=True,
+    )
 
-    # Fallback: generate simple title/body from task
-    return _fallback_pr_content(task, commit_log)
+    if internal_task.id is None:
+        return _fallback_pr_content(task, commit_log)
+
+    try:
+        exit_code = runner_mod.run(config, task_id=internal_task.id)
+    except Exception as exc:
+        print(f"Warning: PR description internal task failed: {exc}", file=sys.stderr)
+        return _fallback_pr_content(task, commit_log)
+
+    completed_task = store.get(internal_task.id)
+    if exit_code != 0 or completed_task is None or completed_task.status != "completed":
+        print(
+            f"Warning: PR description internal task #{internal_task.id} did not complete successfully",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    response = (completed_task.output_content or "").strip()
+    if not response:
+        print(
+            f"Warning: PR description internal task #{internal_task.id} produced no output",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    has_title = any(line.startswith("TITLE:") for line in response.splitlines())
+    has_body = any(line.strip() == "BODY:" for line in response.splitlines())
+    if not (has_title and has_body):
+        print(
+            f"Warning: PR description internal task #{internal_task.id} produced malformed output",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    return _parse_pr_response(response, task)
+
 
 
 def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
@@ -876,7 +902,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         body = f"## Summary\n{truncate(task.prompt, MAX_PR_BODY_LENGTH)}"
     else:
         print("Generating PR description...")
-        title, body = _generate_pr_content(task, commit_log, diff_stat)
+        title, body = _generate_pr_content(task, commit_log, diff_stat, config, store)
 
     # Create the PR
     try:

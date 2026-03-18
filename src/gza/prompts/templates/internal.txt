@@ -1,0 +1,7 @@
+Write your output to:
+  {report_path}
+
+Output requirements:
+- Return only the final output content needed for this internal workflow.
+- Do not wrap your output in markdown code fences.
+- Keep the response concise and structured when possible.
