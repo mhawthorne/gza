@@ -49,3 +49,9 @@ git log v0.3.0..v0.4.0 --pretty=format:"- %s" --no-merges
 # Move an existing tag to current commit:
 git tag -f v0.4.0
 ```
+
+## Packaging versioning note
+
+`pyproject.toml` uses Hatch's VCS version source (`[tool.hatch.version] source = "vcs"`) for
+distribution metadata. We intentionally do not configure a Hatch VCS build hook that writes
+`src/gza/_version.py`, so editable installs work when the gza source tree is mounted read-only.

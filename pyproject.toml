@@ -56,9 +56,6 @@ include = ["src/gza/skills/**/*", "src/gza/prompts/templates/**/*", "src/gza/gza
 source = "vcs"
 fallback-version = "0.1.0.dev0"
 
-[tool.hatch.build.hooks.vcs]
-version-file = "src/gza/_version.py"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-n auto --dist loadscope"
