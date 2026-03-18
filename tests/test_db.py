@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gza.db import SqliteTaskStore, StepRef, Task
+from gza.db import SCHEMA_VERSION, SqliteTaskStore, StepRef, Task
 
 
 class TestTaskChaining:
@@ -407,7 +407,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved (with NULL output_content)
         task = store.get(1)
@@ -517,7 +517,7 @@ class TestTaskResume:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved (with NULL session_id)
         task = store.get(1)
@@ -702,7 +702,7 @@ class TestNumTurnsFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify old task migrated: num_turns_reported populated from num_turns
         task = store.get(1)
@@ -887,7 +887,7 @@ class TestTokenCountFields:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved with NULL token counts
         task = store.get(1)
@@ -1258,7 +1258,7 @@ class TestMergeStatus:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved with NULL merge_status
         task = store.get(1)
@@ -1723,7 +1723,7 @@ class TestFailureReasonTracking:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
         failed_task = store.get(1)
@@ -1894,7 +1894,7 @@ class TestDiffStats:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify existing task has NULL diff stats
         task = store.get(1)
@@ -1974,7 +1974,7 @@ class TestReviewClearedAt:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         # Verify existing task can be retrieved with NULL review_cleared_at
         task = store.get(1)
@@ -2503,7 +2503,7 @@ class TestStepColumnsMigration:
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
         conn.close()
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         migrated = store.get(1)
         assert migrated is not None
@@ -2534,7 +2534,7 @@ class TestRunStepPersistence:
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version FROM schema_version")
         version = cur.fetchone()[0]
-        assert version == 20
+        assert version == SCHEMA_VERSION
 
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('run_steps', 'run_substeps')"
@@ -2817,7 +2817,7 @@ class TestRunStepPersistence:
         value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 1").fetchone()[0]
         conn.close()
 
-        assert version == 20
+        assert version == SCHEMA_VERSION
         assert value == 1
 
     def test_set_log_schema_version_updates_task(self, tmp_path: Path):
@@ -2915,7 +2915,7 @@ class TestCycleOrchestratorSchema:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 20
+        assert version == SCHEMA_VERSION
         assert "task_cycles" in tables
         assert "task_cycle_iterations" in tables
         assert "idx_task_cycles_impl_id" in indexes
@@ -2990,7 +2990,7 @@ class TestCycleOrchestratorSchema:
         indexes = {row[1] for row in conn.execute("SELECT * FROM sqlite_master WHERE type='index'")}
         conn.close()
 
-        assert version == 20
+        assert version == SCHEMA_VERSION
         assert "idx_tasks_type_based_on" in indexes
         assert "uq_task_cycle_iterations_cycle_iter" in indexes
 

@@ -396,8 +396,32 @@ class TestRetryCommand:
         assert new_task.task_type_hint == "feature"
         assert new_task.model == "gpt-5.3-codex"
         assert new_task.provider == "codex"
+        assert new_task.provider_is_explicit is True
         assert new_task.based_on == 1
         assert new_task.status == "pending"
+
+    def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
+        """Retry should not preserve provider that came from resolved default state."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with stale resolved provider")
+        task.status = "failed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.provider = "claude"
+        task.provider_is_explicit = False
+        store.update(task)
+
+        result = run_gza("retry", "1", "--queue", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_task = store.get(2)
+        assert retry_task is not None
+        assert retry_task.provider is None
+        assert retry_task.provider_is_explicit is False
 
     def test_retry_with_background_flag(self, tmp_path: Path):
         """Retry command with --background spawns a worker for the new task."""
@@ -3119,6 +3143,7 @@ class TestAddCommandWithModelAndProvider:
         task = next((t for t in tasks if t.prompt == "Test task with provider"), None)
         assert task is not None
         assert task.provider == "gemini"
+        assert task.provider_is_explicit is True
 
     def test_add_with_both_model_and_provider(self, tmp_path: Path):
         """Add command with both --model and --provider flags works."""
@@ -3144,6 +3169,7 @@ class TestAddCommandWithModelAndProvider:
         assert task is not None
         assert task.model == "claude-opus-4"
         assert task.provider == "claude"
+        assert task.provider_is_explicit is True
 
 
 class TestAddCommandWithNoLearnings:
@@ -3234,6 +3260,7 @@ class TestEditCommandWithModelAndProvider:
         task = store.get(task.id)
         assert task is not None
         assert task.provider == "gemini"
+        assert task.provider_is_explicit is True
 
 
 class TestEditCommandWithNoLearnings:
@@ -3356,6 +3383,32 @@ class TestGetEffectiveConfigForTask:
             id=1,
             prompt="Test task",
             provider="codex",
+            provider_is_explicit=True,
+        )
+
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert provider == "codex"
+        assert model == "o4-mini"
+
+    def test_non_explicit_task_provider_falls_back_to_config_provider(self, tmp_path: Path):
+        """Persisted resolved provider should not override current configured provider."""
+        from gza.config import Config, ProviderConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.provider = "codex"
+        config.providers = {
+            "claude": ProviderConfig(model="claude-default"),
+            "codex": ProviderConfig(model="o4-mini"),
+        }
+
+        task = Task(
+            id=1,
+            prompt="Task created before provider switch",
+            provider="claude",
+            provider_is_explicit=False,
         )
 
         model, provider, _ = get_effective_config_for_task(task, config)

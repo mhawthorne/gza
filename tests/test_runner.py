@@ -2308,6 +2308,7 @@ class TestPersistResolvedConfig:
         assert updated_task is not None
         assert updated_task.model == "claude-sonnet-4-6"
         assert updated_task.provider == "claude"
+        assert updated_task.provider_is_explicit is False
 
 
 class TestWIPFunctionality:

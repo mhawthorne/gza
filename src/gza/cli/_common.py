@@ -596,7 +596,8 @@ def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "dim") -> 
 def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
     """Create a new resume task pointing to the original failed task.
 
-    Copies prompt, task_type, group, session_id, branch, model, provider, etc.
+    Copies prompt, task_type, group, session_id, branch, model, etc.
+    Preserves provider only when the original task had an explicit override.
     Sets based_on to original_task.id to track resume lineage.
     """
     assert original_task.id is not None
@@ -611,7 +612,8 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
         task_type_hint=original_task.task_type_hint,
         based_on=original_task.id,  # Track resume lineage (points to failed task)
         model=original_task.model,
-        provider=original_task.provider,
+        provider=original_task.provider if original_task.provider_is_explicit else None,
+        provider_is_explicit=original_task.provider_is_explicit,
     )
     # Copy session_id and branch from original task so the resumed run
     # continues the Claude Code session and uses the same branch.
