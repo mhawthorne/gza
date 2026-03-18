@@ -389,6 +389,18 @@ class TestPromptBuilderPrDescription:
         assert "## Summary" in result
         assert "## Changes" in result
 
+    def test_pr_description_includes_issue_linking_instructions(self):
+        """Test that PR description prompt includes issue-linking guidance."""
+        result = PromptBuilder().pr_description_prompt(
+            task_prompt="Implement enhancement for issue #23",
+            commit_log="abc123 Implement enhancement",
+            diff_stat="src/feature.py | 20 +",
+        )
+
+        assert "Closes #<issue number>" in result
+        assert "Closes #N" in result
+        assert "Do not guess or infer issue numbers." in result
+
 
 class TestPromptBuilderImproveTask:
     """Tests for PromptBuilder.improve_task_prompt()."""
