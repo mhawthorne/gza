@@ -1,16 +1,30 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
+trap 'echo "Error on line $LINENO" >&2' ERR
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: git-worktree-create <worktree-dir>" >&2
     exit 1
 fi
 
-worktree_dir="$1"
-branch="$(basename "$worktree_dir")"
-main_checkout="$(git worktree list --porcelain | head -1 | sed 's/^worktree //')"
+case "$1" in
+    /*) ;;
+    *) echo "Error: worktree-dir must be an absolute path" >&2; exit 1 ;;
+esac
 
+worktree_dir="$1"
+echo "worktree_dir:$worktree_dir"
+
+branch="$(basename "$worktree_dir")"
+echo "branch:$branch"
+
+#git worktree list --porcelain | head -1 | sed 's/^worktree //'
+
+main_checkout="$(git worktree list --porcelain | head -1 | sed 's/^worktree //')"
+echo "main_checkout:$main_checkout"
+
+echo "adding worktree"
 git worktree add -b "$branch" "$worktree_dir"
 
 (
