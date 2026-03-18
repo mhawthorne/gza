@@ -11,6 +11,22 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 
 
+REVIEW_CONTRACT_PARITY_CLAUSES = [
+    "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
+    "Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
+    "Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.",
+    "Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.",
+    "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.",
+    "Push style, cleanup, and non-risky refactors to Suggestions.",
+    "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
+]
+
+
+def _assert_contains_all_clauses(text: str, clauses: list[str]) -> None:
+    for clause in clauses:
+        assert clause in text
+
+
 class TestPromptBuilderBuild:
     """Tests for PromptBuilder.build()."""
 
@@ -221,9 +237,27 @@ class TestPromptBuilderBuild:
             in content
         )
         assert (
-            "<Treat misleading output as Must-Fix when it can cause incorrect operator or agent decisions.>"
+            "<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>"
             in content
         )
+
+    def test_review_contract_parity_between_template_and_interactive_scaffold(self):
+        """Test canonical blocking-discipline clauses are present in both review entrypoints."""
+        root = Path(__file__).resolve().parents[1]
+        template_content = (
+            root / "src" / "gza" / "prompts" / "templates" / "review.txt"
+        ).read_text()
+        skill_content = (
+            root
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-code-review-interactive"
+            / "SKILL.md"
+        ).read_text()
+
+        _assert_contains_all_clauses(template_content, REVIEW_CONTRACT_PARITY_CLAUSES)
+        _assert_contains_all_clauses(skill_content, REVIEW_CONTRACT_PARITY_CLAUSES)
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""

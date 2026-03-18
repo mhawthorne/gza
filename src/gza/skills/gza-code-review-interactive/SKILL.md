@@ -42,12 +42,15 @@ You are reviewing a pull request. Your job is to read the project review guideli
 
 **Step 1**: Read `REVIEW.md` from the project root for review guidelines and criteria.
 
-**Step 2**: Get the diff to review:
+**Step 2**: Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
+Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
+
+**Step 3**: Get the diff to review:
 ```bash
 git diff main...HEAD
 ```
 
-**Step 3**: Write a structured review with these sections:
+**Step 4**: Write a structured review with these sections:
 
 ```markdown
 ## Summary
@@ -66,8 +69,10 @@ git diff main...HEAD
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
 <Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
 <Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
-<Treat misleading output as Must-Fix when it can cause incorrect operator or agent decisions.>
+<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
+<Push style, cleanup, and non-risky refactors to Suggestions.>
+<For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 
 ## Suggestions
 
@@ -99,7 +104,7 @@ If no PR number is provided, just output the review directly.
 
 Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent.
 
-### Step 4: Report back
+### Step 5: Report back
 
 After the subagent completes:
 - Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
