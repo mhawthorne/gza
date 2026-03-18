@@ -49,6 +49,7 @@ This release brings significant orchestration improvements, expanded skill ecosy
 - **Startup failure visibility in `gza ps`**: Default `gza ps` now surfaces `failed(startup)` rows, with earliest diagnostics available in `.gza/workers/*-startup.log`
 - **Orchestration logging**: Task lifecycle events logged to log files for debugging
 - **Orphaned task detection**: Identify and resurface tasks without active workers
+- **Canonical lineage tree semantics**: Lineage output and API/docs now describe branch-rendered tree behavior and deterministic pre-order flattening (not chronological chain ordering)
 
 ### Learning & Context
 - **LLM-powered learnings summarization**: Automatic pattern extraction and summarization from completed tasks with Phase 3 implementation

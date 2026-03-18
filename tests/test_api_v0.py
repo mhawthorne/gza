@@ -63,6 +63,14 @@ class TestGzaClientConstruction:
 
 
 class TestGetLineage:
+    def test_get_lineage_docstring_describes_tree_preorder_not_chronological(self):
+        from gza.api.v0 import GzaClient
+
+        doc = GzaClient.get_lineage.__doc__ or ""
+
+        assert "pre-order" in doc
+        assert "chronological" not in doc
+
     def test_unknown_task_raises_key_error(self, tmp_path: Path):
         setup_config(tmp_path)
         make_store(tmp_path)  # ensure db is created

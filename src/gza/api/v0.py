@@ -81,15 +81,16 @@ class GzaClient:
     def get_lineage(self, task_id: int) -> list[Task]:
         """Return all tasks in the lineage tree containing task_id as a flat list.
 
-        The chain is sorted chronologically and deduplicated. It starts from
-        the root implementation task and includes all linked reviews and
-        improve tasks.
+        The result is deduplicated and returned in deterministic pre-order
+        traversal from the canonical lineage tree. It starts from the
+        resolved lineage root and includes linked descendants.
 
         Parameters
         ----------
         task_id:
-            The numeric database ID of any task in the chain (implement,
-            review, or improve). The root is resolved automatically.
+            The numeric database ID of any task in the lineage tree
+            (implement, review, or improve). The root is resolved
+            automatically.
 
         Returns
         -------

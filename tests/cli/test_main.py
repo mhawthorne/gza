@@ -61,3 +61,14 @@ class TestHelpOutput:
             # Verify commands are in alphabetical order
             sorted_commands = sorted(commands)
             assert commands == sorted_commands, f"Commands not in alphabetical order. Got: {commands}, Expected: {sorted_commands}"
+
+    def test_history_lineage_depth_help_mentions_root_deduplicated_trees(self, tmp_path):
+        """history --help should describe tree/root lineage semantics."""
+        setup_config(tmp_path)
+
+        result = run_gza("history", "--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Render root-deduplicated lineage trees up to N levels" in result.stdout
+        assert "from each resolved root" in result.stdout
+        assert "Expand lineage N levels for each matching task" not in result.stdout

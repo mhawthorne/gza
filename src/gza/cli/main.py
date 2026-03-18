@@ -145,8 +145,8 @@ def main() -> int:
         default=0,
         metavar="N",
         help=(
-            "Expand lineage N levels for each matching task, showing ancestors "
-            "(via based_on) and descendants"
+            "Render root-deduplicated lineage trees up to N levels from each "
+            "resolved root"
         ),
     )
 
