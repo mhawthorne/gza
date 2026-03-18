@@ -746,6 +746,36 @@ def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMet
     return workers[-1]
 
 
+def _resolve_task_log_path(
+    config: Config,
+    registry: WorkerRegistry,
+    task: DbTask,
+    attempts: list[DbTask],
+) -> tuple[Path | None, bool]:
+    """Resolve log path for task/slug lookups with worker startup fallback."""
+    main_candidates: list[Path] = []
+    main_candidates.extend(_task_log_candidates(config, task))
+    for attempt in attempts:
+        if attempt.id == task.id:
+            continue
+        main_candidates.extend(_task_log_candidates(config, attempt))
+
+    for candidate in main_candidates:
+        if candidate.exists():
+            return candidate, False
+
+    if task.id is not None:
+        latest_worker = _latest_worker_for_task(registry, task.id)
+        if latest_worker is not None:
+            worker_log_path, using_startup_log = _resolve_worker_log_path(config, latest_worker, task)
+            if worker_log_path is not None:
+                return worker_log_path, using_startup_log
+
+    if main_candidates:
+        return main_candidates[0], False
+    return None, False
+
+
 def _running_worker_id_for_task(registry: WorkerRegistry, task_id: int) -> str | None:
     """Return a running worker ID for a task when available."""
     workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
@@ -843,19 +873,7 @@ def cmd_log(args: argparse.Namespace) -> int:
                 "(latest same-type retry/resume in based_on chain)"
             )
 
-        candidate_paths: list[Path] = []
-        candidate_paths.extend(_task_log_candidates(config, task))
-        for attempt in attempts:
-            if attempt.id == task.id:
-                continue
-            candidate_paths.extend(_task_log_candidates(config, attempt))
-
-        for candidate in candidate_paths:
-            if candidate.exists():
-                log_path = candidate
-                break
-        if log_path is None and candidate_paths:
-            log_path = candidate_paths[0]
+        log_path, using_startup_log = _resolve_task_log_path(config, registry, task, attempts)
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
@@ -880,19 +898,7 @@ def cmd_log(args: argparse.Namespace) -> int:
                 "(latest same-type retry/resume in based_on chain)"
             )
 
-        slug_candidate_paths: list[Path] = []
-        slug_candidate_paths.extend(_task_log_candidates(config, task))
-        for attempt in attempts:
-            if attempt.id == task.id:
-                continue
-            slug_candidate_paths.extend(_task_log_candidates(config, attempt))
-
-        for candidate in slug_candidate_paths:
-            if candidate.exists():
-                log_path = candidate
-                break
-        if log_path is None and slug_candidate_paths:
-            log_path = slug_candidate_paths[0]
+        log_path, using_startup_log = _resolve_task_log_path(config, registry, task, attempts)
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)

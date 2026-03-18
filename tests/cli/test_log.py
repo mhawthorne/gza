@@ -913,6 +913,145 @@ class TestLogCommand:
         assert "startup-log-output" not in result.stdout
         assert "Using startup log (main task log not available)." not in result.stdout
 
+    @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
+    def test_log_task_lookup_falls_back_to_startup_log_when_main_missing(self, tmp_path: Path, query_mode: str):
+        """Task lookup should use latest worker startup log when task log is missing."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task lookup startup fallback")
+        assert task.id is not None
+        task.task_id = "20260318-task-startup-fallback"
+        task.status = "failed"
+        task.log_file = ".gza/logs/missing-main.log"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-task-startup-fallback",
+            pid=12345,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-03-18T00:00:00Z",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            startup_log_file=".gza/workers/w-test-task-startup-fallback-startup.log",
+        )
+        registry.register(worker)
+
+        startup_log = tmp_path / ".gza" / "workers" / "w-test-task-startup-fallback-startup.log"
+        startup_log.write_text("startup-output-from-worker")
+
+        if query_mode == "task_id":
+            result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        else:
+            result = run_gza("log", "--slug", task.task_id, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Using startup log (main task log not available)." in result.stdout
+        assert "startup-output-from-worker" in result.stdout
+
+    @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
+    def test_log_task_lookup_prefers_main_log_over_startup_log(self, tmp_path: Path, query_mode: str):
+        """Task lookup should prefer task log when both task and startup logs are present."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task lookup main log precedence")
+        assert task.id is not None
+        task.task_id = "20260318-task-main-precedence"
+        task.status = "failed"
+        task.log_file = ".gza/logs/task-main.log"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-task-main-precedence",
+            pid=12345,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-03-18T00:00:00Z",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            startup_log_file=".gza/workers/w-test-task-main-precedence-startup.log",
+        )
+        registry.register(worker)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "task-main.log").write_text(json.dumps({"type": "result", "result": "task-main-output"}))
+
+        startup_log = tmp_path / ".gza" / "workers" / "w-test-task-main-precedence-startup.log"
+        startup_log.write_text("startup-output-should-not-be-used")
+
+        if query_mode == "task_id":
+            result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        else:
+            result = run_gza("log", "--slug", task.task_id, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "task-main-output" in result.stdout
+        assert "startup-output-should-not-be-used" not in result.stdout
+        assert "Using startup log (main task log not available)." not in result.stdout
+
+    @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
+    def test_log_task_lookup_reports_clear_error_when_no_task_or_startup_log(self, tmp_path: Path, query_mode: str):
+        """Task lookup should return a clear missing-log error when no logs exist."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task lookup with no available logs")
+        assert task.id is not None
+        task.task_id = "20260318-task-no-logs"
+        task.status = "failed"
+        task.log_file = ".gza/logs/task-missing.log"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-task-no-logs",
+            pid=12345,
+            task_id=task.id,
+            task_slug=task.task_id,
+            started_at="2026-03-18T00:00:00Z",
+            status="failed",
+            log_file=None,
+            worktree=None,
+            startup_log_file=".gza/workers/w-test-task-no-logs-startup.log",
+        )
+        registry.register(worker)
+
+        if query_mode == "task_id":
+            result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        else:
+            result = run_gza("log", "--slug", task.task_id, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: Log file not found at" in result.stdout
+
     def test_log_by_task_id_startup_failure(self, tmp_path: Path):
         """Log command shows startup error when log contains non-JSON content."""
         from gza.db import SqliteTaskStore
