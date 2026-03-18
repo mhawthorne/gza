@@ -573,27 +573,32 @@ def _create_improve_task(
     )
 
 
-from ..query import (
-    get_task_slug as _get_task_slug,
-    get_reviews_for_root as _get_reviews_for_root_task,
-    task_time_for_lineage as _task_time_for_lineage,
-    get_improves_for_root as _get_improves_for_root_task,
-    build_lineage as _build_lineage_tasks_for_root,
-    resolve_lineage_root as _resolve_lineage_root_task,
-)
+from ..query import TaskLineageNode as _TaskLineageNode
 
 
-def _format_lineage(lineage_tasks: list[DbTask], task_id_color: str = "dim") -> str:
-    """Format lineage tasks as a linear #id[type] chain."""
-    lineage_parts: list[str] = []
-    for lineage_task in lineage_tasks:
-        if lineage_task.id is None:
-            continue
-        lineage_parts.append(
-            f"[{task_id_color}]#{lineage_task.id}[/{task_id_color}]"
-            f"[dim]\\[{lineage_task.task_type}][/dim]"
+def _format_lineage(lineage_tree: _TaskLineageNode, task_id_color: str = "dim") -> str:
+    """Format a lineage tree as a multi-line branch rendering."""
+
+    def _node_label(task: DbTask) -> str:
+        if task.id is None:
+            return f"[dim]\\[{task.task_type}][/dim]"
+        return (
+            f"[{task_id_color}]#{task.id}[/{task_id_color}]"
+            f"[dim]\\[{task.task_type}][/dim]"
         )
-    return " -> ".join(lineage_parts)
+
+    lines: list[str] = [_node_label(lineage_tree.task)]
+
+    def _walk(node: _TaskLineageNode, prefix: str) -> None:
+        for index, child in enumerate(node.children):
+            is_last = index == (len(node.children) - 1)
+            branch = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{branch}{_node_label(child.task)}")
+            next_prefix = f"{prefix}{'    ' if is_last else '│   '}"
+            _walk(child, next_prefix)
+
+    _walk(lineage_tree, "")
+    return "\n".join(lines)
 
 
 def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:

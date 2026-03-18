@@ -1082,6 +1082,22 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_lineage_children(self, task_id: int) -> list[Task]:
+        """Return direct lineage children linked by based_on or depends_on.
+
+        This is the canonical query used by lineage tree construction.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE based_on = ? OR depends_on = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id, task_id),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_resumable_failed_tasks(self) -> list[Task]:
         """Return failed tasks that can be auto-resumed.
 
@@ -1712,7 +1728,11 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_improve_tasks_by_root(self, root_task_id: int) -> list[Task]:
-        """Get all improve tasks whose based_on points to root_task_id."""
+        """Get all improve tasks whose based_on points to root_task_id.
+
+        This remains for review/improve workflow logic; lineage display should
+        use get_lineage_children() via gza.query.build_lineage_tree().
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -1725,7 +1745,11 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_impl_tasks_by_depends_on_or_based_on(self, task_id: int) -> list[Task]:
-        """Get implement tasks that depend on or are based on a given task."""
+        """Get implement tasks that depend on or are based on a given task.
+
+        Kept for implementation-focused callers that only need implement tasks.
+        Lineage display should use get_lineage_children().
+        """
         with self._connect() as conn:
             cur = conn.execute(
                 """

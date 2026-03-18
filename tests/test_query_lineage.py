@@ -7,6 +7,7 @@ import pytest
 
 from gza.query import (
     build_lineage,
+    build_lineage_tree,
     get_base_task_slug,
     get_improves_for_root,
     get_reviews_for_root,
@@ -178,9 +179,7 @@ class TestBuildLineage:
     def test_single_root_task(self):
         store = MagicMock()
         root = _make_task(id=1, created_at=datetime(2026, 1, 1))
-        store.get_reviews_for_task.return_value = []
-        store.get_improve_tasks_by_root.return_value = []
-        store.get_impl_tasks_by_depends_on_or_based_on.return_value = []
+        store.get_lineage_children.return_value = []
         result = build_lineage(store, root)
         assert result == [root]
 
@@ -196,10 +195,12 @@ class TestBuildLineage:
         review = _make_task(id=2, task_type="review", created_at=datetime(2026, 1, 2))
         improve = _make_task(id=3, task_type="improve", created_at=datetime(2026, 1, 3))
 
-        store.get_reviews_for_task.return_value = [review]
-        store.get_improve_tasks_by_root.return_value = [improve]
-        store.get_impl_tasks_by_depends_on_or_based_on.return_value = []
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [review, improve]
+            return []
 
+        store.get_lineage_children.side_effect = lineage_children
         result = build_lineage(store, root)
         assert len(result) == 3
         assert result[0] == root
@@ -211,9 +212,9 @@ class TestBuildLineage:
         root = _make_task(id=1, created_at=datetime(2026, 1, 1))
         shared = _make_task(id=2, task_type="review", created_at=datetime(2026, 1, 2))
 
-        store.get_reviews_for_task.return_value = [shared]
-        store.get_improve_tasks_by_root.return_value = []
-        store.get_impl_tasks_by_depends_on_or_based_on.return_value = []
+        store.get_lineage_children.side_effect = (
+            lambda task_id: [shared, shared] if task_id == 1 else []
+        )
 
         result = build_lineage(store, root)
         ids = [t.id for t in result]
@@ -225,21 +226,52 @@ class TestBuildLineage:
         child = _make_task(id=2, created_at=datetime(2026, 1, 2))
         grandchild = _make_task(id=3, created_at=datetime(2026, 1, 3))
 
-        store.get_reviews_for_task.side_effect = lambda task_id: []
-        store.get_improve_tasks_by_root.side_effect = lambda task_id: []
-
-        def get_downstream(task_id):
+        def lineage_children(task_id):
             if task_id == 1:
                 return [child]
             if task_id == 2:
                 return [grandchild]
             return []
 
-        store.get_impl_tasks_by_depends_on_or_based_on.side_effect = get_downstream
+        store.get_lineage_children.side_effect = lineage_children
 
         result = build_lineage(store, root)
         assert len(result) == 3
         assert [t.id for t in result] == [1, 2, 3]
+
+    def test_prefers_review_branch_when_child_has_two_parents(self):
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        review = _make_task(
+            id=2,
+            task_type="review",
+            depends_on=1,
+            created_at=datetime(2026, 1, 2),
+        )
+        improve = _make_task(
+            id=3,
+            task_type="improve",
+            based_on=1,
+            depends_on=2,
+            created_at=datetime(2026, 1, 3),
+        )
+        sibling_impl = _make_task(
+            id=4,
+            task_type="implement",
+            depends_on=1,
+            created_at=datetime(2026, 1, 4),
+        )
+
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [sibling_impl, improve, review]
+            if task_id == 2:
+                return [improve]
+            return []
+
+        store.get_lineage_children.side_effect = lineage_children
+        result = build_lineage(store, root)
+        assert [t.id for t in result] == [1, 2, 3, 4]
 
     def test_orders_by_dependency_depth_not_completion_time(self):
         store = MagicMock()
@@ -256,14 +288,27 @@ class TestBuildLineage:
             status="pending",
         )
 
-        store.get_reviews_for_task.return_value = []
-        store.get_improve_tasks_by_root.return_value = []
-        store.get_impl_tasks_by_depends_on_or_based_on.side_effect = (
+        store.get_lineage_children.side_effect = (
             lambda task_id: [child] if task_id == 1 else []
         )
 
         result = build_lineage(store, root)
         assert [t.id for t in result] == [1, 2]
+
+    def test_tree_node_relationship_labels(self):
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        review = _make_task(id=2, task_type="review", depends_on=1, created_at=datetime(2026, 1, 2))
+        impl = _make_task(id=3, task_type="implement", based_on=1, created_at=datetime(2026, 1, 3))
+
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [impl, review]
+            return []
+
+        store.get_lineage_children.side_effect = lineage_children
+        tree = build_lineage_tree(store, root)
+        assert [child.relationship for child in tree.children] == ["review", "implement-based"]
 
 
 # ---------------------------------------------------------------------------
@@ -339,3 +384,15 @@ class TestResolveLineageRoot:
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, child)
         assert result == parent
+
+    def test_implement_depends_on_resolves_upstream_root(self):
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement")
+        dependent = _make_task(id=2, task_type="implement", depends_on=1)
+
+        def mock_get(task_id):
+            return {1: root, 2: dependent}.get(task_id)
+
+        store.get.side_effect = mock_get
+        result = resolve_lineage_root(store, dependent)
+        assert result == root

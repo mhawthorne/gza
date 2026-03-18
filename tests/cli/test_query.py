@@ -314,7 +314,7 @@ class TestHistoryCommand:
         assert "Old task" not in result.stdout
 
     def test_history_lineage_depth(self, tmp_path: Path):
-        """--lineage-depth shows ancestor/descendant relationship lines."""
+        """--lineage-depth shows a branch-rendered tree."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -335,9 +335,9 @@ class TestHistoryCommand:
         result = run_gza("history", "--lineage-depth", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        # Child should appear with ancestor relationship label
+        assert "Parent task" in result.stdout
         assert "Child task" in result.stdout
-        assert "ancestor" in result.stdout
+        assert "└──" in result.stdout or "├──" in result.stdout
 
     def test_history_lineage_depth_two(self, tmp_path: Path):
         """--lineage-depth 2 renders all three levels of a grandparent→parent→child chain."""

@@ -31,12 +31,12 @@ class HistoryFilter:
 
 @dataclass
 class TaskLineageNode:
-    """A task with optional lineage context. Designed for promotion to gza.api.v0."""
+    """A lineage tree node rooted at a task."""
 
     task: Task
     depth: int = 0
-    ancestors: list[TaskLineageNode] = field(default_factory=list)
-    descendants: list[TaskLineageNode] = field(default_factory=list)
+    relationship: str = "root"
+    children: list[TaskLineageNode] = field(default_factory=list)
 
 
 def is_lineage_complete(task: Task) -> bool:
@@ -109,57 +109,46 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
 
 
 def get_task_lineage(store: SqliteTaskStore, task_id: int, depth: int) -> TaskLineageNode:
-    """Return a TaskLineageNode with ancestors/descendants populated up to depth."""
+    """Return lineage tree rooted at the resolved lineage root for task_id."""
     task = store.get(task_id)
     if task is None:
         raise KeyError(f"Task {task_id} not found")
-    return _build_node(store, task, current_depth=0, max_depth=depth)
+    root = resolve_lineage_root(store, task)
+    return build_lineage_tree(store, root, max_depth=depth)
 
 
 def query_history_with_lineage(
     store: SqliteTaskStore, f: HistoryFilter
 ) -> list[TaskLineageNode]:
-    """Return filtered history with lineage expanded to f.lineage_depth levels."""
+    """Return filtered history with lineage trees expanded to f.lineage_depth."""
     tasks = query_history(store, f)
-    return [_build_node(store, t, 0, f.lineage_depth) for t in tasks]
+    root_nodes: list[TaskLineageNode] = []
+    seen_root_ids: set[int] = set()
+
+    for task in tasks:
+        root = resolve_lineage_root(store, task)
+        if root.id is not None and root.id in seen_root_ids:
+            continue
+        if root.id is not None:
+            seen_root_ids.add(root.id)
+        root_nodes.append(build_lineage_tree(store, root, max_depth=f.lineage_depth))
+
+    return root_nodes
 
 
-# --- Internal helpers ---
-
-
-def _build_node(
-    store: SqliteTaskStore, task: Task, current_depth: int, max_depth: int
-) -> TaskLineageNode:
-    """Recursively build a TaskLineageNode up to max_depth levels."""
-    node = TaskLineageNode(task=task, depth=current_depth)
-    if current_depth >= max_depth:
-        return node
-
-    # Ancestors: follow based_on chain upward
-    if task.based_on is not None:
-        parent = store.get(task.based_on)
-        if parent is not None:
-            node.ancestors.append(
-                _build_node(store, parent, current_depth + 1, max_depth)
-            )
-
-    # Descendants: tasks that have based_on = task.id
-    if task.id is not None:
-        children = store.get_based_on_children(task.id)
-        for child in children:
-            node.descendants.append(
-                _build_node(store, child, current_depth + 1, max_depth)
-            )
-
-    return node
-
-
-# --- Lineage helpers (formerly _query.py) ---
+# --- Lineage helpers ---
 
 
 def task_time_for_lineage(task: Task) -> datetime:
     """Return best-effort timestamp for lineage ordering."""
     return task.completed_at or task.created_at or datetime.min
+
+
+def _normalize_lineage_time(value: datetime) -> datetime:
+    """Normalize aware/naive datetimes for stable lineage comparisons."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def get_task_slug(task: Task) -> str | None:
@@ -196,104 +185,156 @@ def get_reviews_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
 
 
 def get_improves_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Get improve tasks related to the root implementation task.
-
-    Uses a targeted query instead of get_all() to avoid a full table scan.
-    """
+    """Get improve tasks directly based on the given root task."""
     if root_task.id is None:
         return []
     return store.get_improve_tasks_by_root(root_task.id)
 
 
-def _get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[Task]:
-    """Get implement tasks that depend on or are based on a given task."""
-    return store.get_impl_tasks_by_depends_on_or_based_on(task_id)
+def _classify_child_relationship(parent: Task, child: Task) -> str:
+    """Return a child relationship label for lineage tree rendering/debugging."""
+    parent_id = parent.id
+    if parent_id is None:
+        return "child"
+
+    if child.task_type == "review" and child.depends_on == parent_id:
+        return "review"
+    if child.task_type == "improve" and child.depends_on == parent_id:
+        return "improve-from-review"
+    if child.task_type == "improve" and child.based_on == parent_id:
+        return "improve"
+    if child.task_type == "implement" and child.depends_on == parent_id:
+        return "implement-depends"
+    if child.task_type == "implement" and child.based_on == parent_id:
+        return "implement-based"
+    if child.depends_on == parent_id and child.based_on == parent_id:
+        return "depends-and-based"
+    if child.depends_on == parent_id:
+        return "depends"
+    if child.based_on == parent_id:
+        return "based"
+    return child.task_type
+
+
+def _lineage_child_sort_key(parent: Task, child: Task) -> tuple[int, datetime, int]:
+    """Sort children to keep lineage rendering deterministic and readable."""
+    relation = _classify_child_relationship(parent, child)
+    relation_rank = {
+        "review": 0,
+        "improve-from-review": 1,
+        "implement-depends": 2,
+        "implement-based": 3,
+        "improve": 4,
+        "depends-and-based": 5,
+        "depends": 6,
+        "based": 7,
+    }.get(relation, 8)
+
+    child_time = _normalize_lineage_time(task_time_for_lineage(child))
+    child_id = child.id if child.id is not None else 10**9
+    return (relation_rank, child_time, child_id)
+
+
+def build_lineage_tree(
+    store: SqliteTaskStore,
+    root_task: Task,
+    *,
+    max_depth: int | None = None,
+) -> TaskLineageNode:
+    """Build a canonical lineage tree by walking both depends_on and based_on edges."""
+
+    root = TaskLineageNode(task=root_task, depth=0, relationship="root")
+    if root_task.id is None:
+        return root
+
+    attached_ids: set[int] = {root_task.id}
+
+    def _populate(node: TaskLineageNode) -> None:
+        if max_depth is not None and node.depth >= max_depth:
+            return
+        parent_id = node.task.id
+        if parent_id is None:
+            return
+
+        children = store.get_lineage_children(parent_id)
+        children.sort(key=lambda child: _lineage_child_sort_key(node.task, child))
+
+        for child in children:
+            if child.id is None:
+                continue
+            if child.id in attached_ids:
+                # A task may reference a parent by both depends_on and based_on.
+                # Attach once to avoid duplicated branches.
+                continue
+            attached_ids.add(child.id)
+            child_node = TaskLineageNode(
+                task=child,
+                depth=node.depth + 1,
+                relationship=_classify_child_relationship(node.task, child),
+            )
+            node.children.append(child_node)
+            _populate(child_node)
+
+    _populate(root)
+    return root
+
+
+def flatten_lineage_tree(node: TaskLineageNode) -> list[Task]:
+    """Flatten lineage tree to a deterministic pre-order traversal."""
+    items: list[Task] = [node.task]
+    for child in node.children:
+        items.extend(flatten_lineage_tree(child))
+    return items
 
 
 def build_lineage(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Build deduplicated lineage tasks for a root task, including dependency chains.
+    """Return lineage as a flattened list from the canonical tree builder."""
+    if root_task.id is None:
+        return []
+    return flatten_lineage_tree(build_lineage_tree(store, root_task, max_depth=None))
 
-    Ordering is causal dependency order:
-    1) root first
-    2) descendants by increasing dependency depth
-    3) ties within the same depth by creation time, then task ID
-    """
-    seen_ids: set[int] = set()
-    all_tasks: list[Task] = []
-    task_depths: dict[int, int] = {}
 
-    def _collect(task: Task, depth: int) -> None:
-        if task.id is None:
-            return
-        existing_depth = task_depths.get(task.id)
-        if existing_depth is not None and existing_depth <= depth:
-            return
-        task_depths[task.id] = depth
-
-        if task.id not in seen_ids:
-            seen_ids.add(task.id)
-            all_tasks.append(task)
-
-        for review in get_reviews_for_root(store, task):
-            if review.id is not None and review.id not in seen_ids:
-                seen_ids.add(review.id)
-                all_tasks.append(review)
-            if review.id is not None:
-                existing_review_depth = task_depths.get(review.id)
-                if existing_review_depth is None or (depth + 1) < existing_review_depth:
-                    task_depths[review.id] = depth + 1
-
-        for improve in get_improves_for_root(store, task):
-            if improve.id is not None and improve.id not in seen_ids:
-                seen_ids.add(improve.id)
-                all_tasks.append(improve)
-            if improve.id is not None:
-                existing_improve_depth = task_depths.get(improve.id)
-                if existing_improve_depth is None or (depth + 1) < existing_improve_depth:
-                    task_depths[improve.id] = depth + 1
-
-        if task.id is not None:
-            for downstream in _get_downstream_impls(store, task.id):
-                _collect(downstream, depth + 1)
-
-    _collect(root_task, depth=0)
-
-    def _lineage_order_key(task: Task) -> tuple[int, datetime, int]:
-        if task.id is None:
-            return (10**9, datetime.max, 10**9)
-        return (
-            task_depths.get(task.id, 10**9),
-            task.created_at or datetime.min,
-            task.id,
-        )
-
-    return sorted(all_tasks, key=_lineage_order_key)
+def _get_parent_ids(task: Task) -> list[int]:
+    parent_ids: list[int] = []
+    if task.based_on is not None:
+        parent_ids.append(task.based_on)
+    if task.depends_on is not None:
+        parent_ids.append(task.depends_on)
+    return parent_ids
 
 
 def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
-    """Resolve the root task for lineage display, walking up through dependency links."""
-    # For review tasks, navigate to the implementation they review
-    if task.task_type == "review" and task.depends_on:
-        depends = store.get(task.depends_on)
-        if depends is not None:
-            task = depends
+    """Resolve the root task for lineage display across based_on + depends_on chains."""
+    if task.id is None:
+        return task
 
-    # For improve tasks, navigate to the implementation they improve
-    if task.task_type == "improve" and task.based_on:
-        based = store.get(task.based_on)
-        if based is not None:
-            task = based
+    graph_nodes: dict[int, Task] = {task.id: task}
+    to_visit = _get_parent_ids(task)
 
-    # Walk the based_on chain upward to find the topmost ancestor (e.g. a plan)
-    current = task
-    seen: set[int] = set()
-    if current.id is not None:
-        seen.add(current.id)
-    while current.based_on:
-        next_task = store.get(current.based_on)
-        if next_task is None or next_task.id is None or next_task.id in seen:
-            break
-        seen.add(next_task.id)
-        current = next_task
+    while to_visit:
+        parent_id = to_visit.pop(0)
+        if parent_id in graph_nodes:
+            continue
+        parent = store.get(parent_id)
+        if parent is None or parent.id is None:
+            continue
+        graph_nodes[parent.id] = parent
+        to_visit.extend(_get_parent_ids(parent))
 
-    return current
+    if len(graph_nodes) == 1:
+        return task
+
+    node_ids = set(graph_nodes.keys())
+    root_candidates = [
+        candidate
+        for candidate in graph_nodes.values()
+        if not any(parent_id in node_ids for parent_id in _get_parent_ids(candidate))
+    ]
+    candidates = root_candidates or list(graph_nodes.values())
+
+    def _root_order_key(candidate: Task) -> tuple[datetime, int]:
+        ts = _normalize_lineage_time(task_time_for_lineage(candidate))
+        candidate_id = candidate.id if candidate.id is not None else 10**9
+        return (ts, candidate_id)
+
+    return sorted(candidates, key=_root_order_key)[0]

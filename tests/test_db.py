@@ -3376,6 +3376,26 @@ class TestGetBasedOnChildren:
         assert ids == [c1.id, c2.id, c3.id]
 
 
+class TestGetLineageChildren:
+    """Tests for SqliteTaskStore.get_lineage_children()."""
+
+    def test_returns_children_from_both_relationship_columns(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        root = store.add("root", task_type="implement")
+        based_child = store.add("based child", task_type="implement", based_on=root.id)
+        depends_child = store.add("depends child", task_type="review", depends_on=root.id)
+
+        children = store.get_lineage_children(root.id)
+        child_ids = {child.id for child in children}
+        assert based_child.id in child_ids
+        assert depends_child.id in child_ids
+
+    def test_returns_empty_when_no_lineage_children(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("standalone")
+        assert store.get_lineage_children(task.id) == []
+
+
 class TestMigrationV19ToV20:
     """Tests for database migration v19 → v20 (task → implement default type)."""
 

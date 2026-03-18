@@ -79,22 +79,23 @@ class GzaClient:
     # ------------------------------------------------------------------ #
 
     def get_lineage(self, task_id: int) -> list[Task]:
-        """Return all tasks in the lineage chain containing task_id.
+        """Return all tasks in the lineage tree containing task_id as a flat list.
 
-        The chain is sorted chronologically and deduplicated. It starts from
-        the root implementation task and includes all linked reviews and
-        improve tasks.
+        The result is deduplicated and returned in deterministic pre-order
+        traversal from the canonical lineage tree. It starts from the
+        resolved lineage root and includes linked descendants.
 
         Parameters
         ----------
         task_id:
-            The numeric database ID of any task in the chain (implement,
-            review, or improve). The root is resolved automatically.
+            The numeric database ID of any task in the lineage tree
+            (implement, review, or improve). The root is resolved
+            automatically.
 
         Returns
         -------
         list[Task]
-            Sorted, deduplicated list of tasks forming the lineage chain.
+            Pre-order flattened list of tasks from the canonical lineage tree.
             Returns a single-element list if the task has no related tasks.
 
         Raises
@@ -106,7 +107,8 @@ class GzaClient:
         if task is None:
             raise KeyError(f"Task {task_id} not found")
         root = _query.resolve_lineage_root(self._store, task)
-        return _query.build_lineage(self._store, root)
+        tree = _query.build_lineage_tree(self._store, root)
+        return _query.flatten_lineage_tree(tree)
 
     def get_lineage_root(self, task_id: int) -> Task:
         """Resolve the root implementation task for any task in a chain.

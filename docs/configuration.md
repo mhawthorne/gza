@@ -652,7 +652,7 @@ gza unmerged [options]
 
 For each unmerged implementation, output includes:
 - Branch diff/commit summary.
-- A `lineage:` chain showing related task IDs and types (implementation, review, improve).
+- A `lineage:` branch-rendered tree showing related task IDs and types (implementation, review, improve).
 - A `review:` freshness classification:
   - `no review` when no completed review exists.
   - `reviewed` when the latest completed review still reflects current code.
@@ -684,7 +684,7 @@ gza history [options]
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
 | `--incomplete` | Show only unresolved tasks (failed or unmerged) |
-| `--lineage-depth N` | Expand lineage N levels for each task |
+| `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 
 ### checkout
 
