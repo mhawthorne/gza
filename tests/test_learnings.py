@@ -184,33 +184,33 @@ def test_llm_path_fallback_on_runner_exception(tmp_path: Path):
     assert "Regex pattern found" in content
 
 
-def test_learn_task_kept_after_success(tmp_path: Path):
-    """The learn task should remain in the store after successful summarization."""
+def test_internal_task_kept_after_success(tmp_path: Path):
+    """The internal task should remain in the store after successful summarization."""
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
     task = store.add("Task", task_type="implement")
     store.mark_completed(task, output_content="- Some pattern\n", has_commits=False)
 
-    captured_learn_task_id: list = []
+    captured_internal_task_id: list = []
 
     def mock_run(cfg, task_id=None, **kwargs):
-        captured_learn_task_id.append(task_id)
-        learn_task = store.get(task_id)
-        learn_task.status = "completed"
-        learn_task.output_content = "- LLM learning\n"
-        store.update(learn_task)
+        captured_internal_task_id.append(task_id)
+        internal_task = store.get(task_id)
+        internal_task.status = "completed"
+        internal_task.output_content = "- LLM learning\n"
+        store.update(internal_task)
         return 0
 
     with patch("gza.runner.run", side_effect=mock_run):
         regenerate_learnings(store, config, window=10)
 
-    assert len(captured_learn_task_id) == 1
-    assert store.get(captured_learn_task_id[0]) is not None
+    assert len(captured_internal_task_id) == 1
+    assert store.get(captured_internal_task_id[0]) is not None
 
 
-def test_learn_task_has_skip_learnings_flag(tmp_path: Path):
-    """The learn task must have skip_learnings=True to prevent recursion."""
+def test_internal_task_has_skip_learnings_flag(tmp_path: Path):
+    """The internal task must have skip_learnings=True to prevent recursion."""
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
@@ -218,57 +218,57 @@ def test_learn_task_has_skip_learnings_flag(tmp_path: Path):
     store.mark_completed(task, output_content="- Some pattern\n", has_commits=False)
 
     def mock_run(cfg, task_id=None, **kwargs):
-        learn_task = store.get(task_id)
-        assert learn_task.task_type == "learn"
-        assert learn_task.skip_learnings is True
-        learn_task.status = "completed"
-        learn_task.output_content = "- LLM learning\n"
-        store.update(learn_task)
+        internal_task = store.get(task_id)
+        assert internal_task.task_type == "internal"
+        assert internal_task.skip_learnings is True
+        internal_task.status = "completed"
+        internal_task.output_content = "- LLM learning\n"
+        store.update(internal_task)
         return 0
 
     with patch("gza.runner.run", side_effect=mock_run):
         regenerate_learnings(store, config, window=10)
 
 
-def test_learn_task_kept_after_failure(tmp_path: Path):
-    """The learn task should remain in the store even when the runner fails."""
+def test_internal_task_kept_after_failure(tmp_path: Path):
+    """The internal task should remain in the store even when the runner fails."""
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
     task = store.add("Task", task_type="implement")
     store.mark_completed(task, output_content="- Pattern\n", has_commits=False)
 
-    captured_learn_task_id: list = []
+    captured_internal_task_id: list = []
 
     def mock_run_fail(cfg, task_id=None, **kwargs):
-        captured_learn_task_id.append(task_id)
+        captured_internal_task_id.append(task_id)
         return 1  # failure
 
     with patch("gza.runner.run", side_effect=mock_run_fail):
         regenerate_learnings(store, config, window=10)
 
-    assert len(captured_learn_task_id) == 1
-    assert store.get(captured_learn_task_id[0]) is not None
+    assert len(captured_internal_task_id) == 1
+    assert store.get(captured_internal_task_id[0]) is not None
 
 
-def test_learn_task_not_in_get_recent_completed(tmp_path: Path):
-    """Completed learn tasks must not appear in get_recent_completed() to avoid polluting the summarization window."""
+def test_internal_task_not_in_get_recent_completed(tmp_path: Path):
+    """Completed internal tasks must not appear in get_recent_completed() to avoid polluting summarization windows."""
     store = _new_store(tmp_path)
 
     impl_task = store.add("Normal task", task_type="implement")
     store.mark_completed(impl_task, output_content="- Pattern from work\n", has_commits=False)
 
-    learn_task = store.add("Learn prompt", task_type="learn", skip_learnings=True)
-    store.mark_completed(learn_task, output_content="- Meta learning\n", has_commits=False)
+    internal_task = store.add("Learn prompt", task_type="internal", skip_learnings=True)
+    store.mark_completed(internal_task, output_content="- Meta learning\n", has_commits=False)
 
     recent = store.get_recent_completed(limit=10)
     task_types = [t.task_type for t in recent]
-    assert "learn" not in task_types
+    assert "internal" not in task_types
     assert "implement" in task_types
 
 
 def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
-    """Completing a learn task (skip_learnings=True) must not trigger maybe_auto_regenerate_learnings."""
+    """Completing an internal task (skip_learnings=True) must not trigger maybe_auto_regenerate_learnings."""
     from unittest.mock import Mock
     from gza.runner import _run_non_code_task
     from gza.providers.base import RunResult
@@ -282,9 +282,9 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     config.worktree_path.mkdir(parents=True, exist_ok=True)
     config.use_docker = False
 
-    learn_task = store.add("Learn prompt", task_type="learn", skip_learnings=True)
-    learn_task.task_id = "20260101-learn-prompt"
-    store.update(learn_task)
+    internal_task = store.add("Learn prompt", task_type="internal", skip_learnings=True)
+    internal_task.task_id = "20260101-learn-prompt"
+    store.update(internal_task)
 
     mock_provider = Mock()
     mock_provider.name = "MockProvider"
@@ -301,12 +301,12 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     mock_git.default_branch.return_value = "main"
     mock_git._run.return_value = Mock(returncode=0)
 
-    report_dir = tmp_path / "worktrees" / f"{learn_task.task_id}-learn" / ".gza" / "reports"
+    report_dir = tmp_path / "worktrees" / f"{internal_task.task_id}-internal" / ".gza" / "internal"
     report_dir.mkdir(parents=True, exist_ok=True)
-    (report_dir / f"{learn_task.task_id}.md").write_text("# Learn report\n")
+    (report_dir / f"{internal_task.task_id}.md").write_text("# Internal report\n")
 
     with patch("gza.runner.console"), \
          patch("gza.runner.maybe_auto_regenerate_learnings") as mock_auto:
-        _run_non_code_task(learn_task, config, store, mock_provider, mock_git)
+        _run_non_code_task(internal_task, config, store, mock_provider, mock_git)
 
     mock_auto.assert_not_called()

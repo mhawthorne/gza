@@ -190,7 +190,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `implement`, `review`, `improve`
+Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `internal`
 
 Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
 
@@ -678,7 +678,7 @@ gza history [options]
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 10) |
 | `--all` | Show all tasks (no limit) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `learn` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `internal` |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
@@ -929,6 +929,7 @@ Gza supports several task types, each with distinct behavior:
 | `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
+| `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
 
 **Typical workflow:**
 

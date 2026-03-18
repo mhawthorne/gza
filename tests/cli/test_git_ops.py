@@ -4100,6 +4100,109 @@ class TestPrCommand:
         # Should NOT say "merged into" since the branch was not actually merged
         assert "merged into" not in result.stdout
 
+    def test_generate_pr_content_uses_internal_task_output(self, tmp_path: Path):
+        """PR content generation uses an internal task and parses output_content."""
+        from gza.cli.git_ops import _generate_pr_content
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        source_task = store.add("Add auth and metrics", task_type="implement")
+        source_task.task_id = "20260318-impl-auth-and-metrics"
+        store.update(source_task)
+
+        def _mock_run(_config, task_id=None, **_kwargs):
+            internal_task = store.get(task_id)
+            assert internal_task is not None
+            assert internal_task.task_type == "internal"
+            assert internal_task.skip_learnings is True
+            internal_task.status = "completed"
+            internal_task.output_content = (
+                "TITLE: Add auth and metrics\n\n"
+                "BODY:\n"
+                "## Summary\nAdds auth and metrics.\n\n"
+                "## Changes\n- Added auth\n- Added metrics\n"
+            )
+            store.update(internal_task)
+            return 0
+
+        with patch("gza.cli.git_ops.runner_mod.run", side_effect=_mock_run):
+            title, body = _generate_pr_content(
+                source_task,
+                commit_log="abc123 Add auth",
+                diff_stat="1 file changed",
+                config=Config.load(tmp_path),
+                store=store,
+            )
+
+        assert title == "Add auth and metrics"
+        assert "## Summary" in body
+        assert "Added auth" in body
+
+    def test_generate_pr_content_falls_back_on_malformed_output(self, tmp_path: Path):
+        """Malformed internal-task output falls back to deterministic PR content."""
+        from gza.cli.git_ops import _generate_pr_content
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        source_task = store.add("Add auth and metrics", task_type="implement")
+        source_task.task_id = "20260318-impl-auth-and-metrics"
+        store.update(source_task)
+
+        def _mock_run(_config, task_id=None, **_kwargs):
+            internal_task = store.get(task_id)
+            assert internal_task is not None
+            internal_task.status = "completed"
+            internal_task.output_content = "unexpected format without markers"
+            store.update(internal_task)
+            return 0
+
+        with patch("gza.cli.git_ops.runner_mod.run", side_effect=_mock_run):
+            title, body = _generate_pr_content(
+                source_task,
+                commit_log="abc123 Add auth",
+                diff_stat="1 file changed",
+                config=Config.load(tmp_path),
+                store=store,
+            )
+
+        assert title == "Impl auth and metrics"
+        assert "## Task Prompt" in body
+
+    def test_generate_pr_content_marks_internal_task_failed_on_runner_exception(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Runner exceptions should not leave PR internal tasks in pending/in_progress."""
+        from gza.cli.git_ops import _generate_pr_content
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        source_task = store.add("Add auth and metrics", task_type="implement")
+        source_task.task_id = "20260318-impl-auth-and-metrics"
+        store.update(source_task)
+
+        with patch(
+            "gza.cli.git_ops.runner_mod.run",
+            side_effect=RuntimeError("runner exploded"),
+        ):
+            title, body = _generate_pr_content(
+                source_task,
+                commit_log="abc123 Add auth",
+                diff_stat="1 file changed",
+                config=Config.load(tmp_path),
+                store=store,
+            )
+
+        assert title == "Impl auth and metrics"
+        assert "## Task Prompt" in body
+
+        internal_tasks = [task for task in store.get_all() if task.task_type == "internal"]
+        assert len(internal_tasks) == 1
+        assert internal_tasks[0].status == "failed"
+        assert internal_tasks[0].failure_reason == "UNKNOWN"
+
+        captured = capsys.readouterr()
+        assert f"internal task #{internal_tasks[0].id} failed" in captured.err
+
 
 class TestRefreshCommand:
     """Tests for 'gza refresh' command."""

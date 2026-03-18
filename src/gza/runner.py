@@ -141,6 +141,7 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
 PLAN_DIR = f".{APP_NAME}/plans"
 REVIEW_DIR = f".{APP_NAME}/reviews"
+INTERNAL_DIR = f".{APP_NAME}/internal"
 SUMMARY_DIR = f".{APP_NAME}/summaries"
 WIP_DIR = f".{APP_NAME}/wip"
 BACKUP_DIR = f".{APP_NAME}/backups"
@@ -1576,8 +1577,9 @@ def _run_inner(
     open_after: bool = False,
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
-    # For explore, plan, review, and learn tasks, run in project dir without creating a branch
-    if task.task_type in ("explore", "plan", "review", "learn"):
+    # For explore, plan, review, and internal tasks, run without creating a branch.
+    # Keep temporary "learn" compatibility for pre-migration rows.
+    if task.task_type in ("explore", "plan", "review", "internal", "learn"):
         return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
 
     # Code tasks (implement/improve) require git
@@ -1793,7 +1795,7 @@ def _run_non_code_task(
     resume: bool = False,
     open_after: bool = False,
 ) -> int:
-    """Run a non-code task (explore, plan, review) in a worktree (no branch creation).
+    """Run a non-code task (explore, plan, review, internal) in a worktree (no branch creation).
 
     Args:
         task: Task to run
@@ -1831,6 +1833,9 @@ def _run_non_code_task(
     elif task.task_type == "review":
         report_dir = config.project_dir / REVIEW_DIR
         task_type_display = "Review"
+    elif task.task_type in ("internal", "learn"):
+        report_dir = config.project_dir / INTERNAL_DIR
+        task_type_display = "Internal"
     else:
         report_dir = config.project_dir / DEFAULT_REPORT_DIR
         task_type_display = "Report"
@@ -1904,8 +1909,9 @@ def _run_non_code_task(
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
 
-        # Copy learnings file into worktree so the agent can read it
-        _copy_learnings_to_worktree(config, worktree_path)
+        # Internal orchestration tasks do not implicitly consume learnings context.
+        if task.task_type not in ("internal", "learn"):
+            _copy_learnings_to_worktree(config, worktree_path)
 
         hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
 
@@ -2060,7 +2066,7 @@ def _run_non_code_task(
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = None
-        if not task.skip_learnings:
+        if task.task_type not in ("internal", "learn") and not task.skip_learnings:
             auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
         # For review tasks, post to PR if applicable

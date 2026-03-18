@@ -151,9 +151,9 @@ def _run_learnings_task(
     config: "Config",
     recent_tasks: list[Task],
 ) -> list[str] | None:
-    """Run a learn task to summarize learnings from recent task outputs.
+    """Run an internal task to summarize learnings from recent task outputs.
 
-    Creates a ``learn`` task and runs it via the standard runner (same as
+    Creates an ``internal`` task and runs it via the standard runner (same as
     explore/plan/review tasks — worktree, provider, status transitions).
     The task is kept in the DB for observability.
 
@@ -164,7 +164,7 @@ def _run_learnings_task(
     prompt = _build_summarization_prompt(recent_tasks)
     learn_task = store.add(
         prompt=prompt,
-        task_type="learn",
+        task_type="internal",
         skip_learnings=True,
     )
 

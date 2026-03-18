@@ -3493,3 +3493,83 @@ class TestMigrationV19ToV20:
         row = conn2.execute("SELECT version FROM schema_version").fetchone()
         conn2.close()
         assert row[0] == SCHEMA_VERSION
+
+
+class TestMigrationV21ToV22:
+    """Tests for database migration v21 → v22 (learn → internal)."""
+
+    def test_migration_converts_learn_task_type_to_internal(self, tmp_path: Path):
+        """Migration v21->v22 updates existing rows with task_type='learn' to 'internal'."""
+        import sqlite3
+        from gza.db import SCHEMA_VERSION
+
+        db_path = tmp_path / "test.db"
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (21)")
+        conn.execute("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                task_id TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on INTEGER,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on INTEGER,
+                spec TEXT,
+                create_review INTEGER NOT NULL DEFAULT 0,
+                same_branch INTEGER NOT NULL DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                provider_is_explicit INTEGER NOT NULL DEFAULT 0,
+                merge_status TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER NOT NULL DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                log_schema_version INTEGER NOT NULL DEFAULT 1,
+                cycle_id INTEGER,
+                cycle_iteration_index INTEGER,
+                cycle_role TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
+            ("Learn prompt", "learn", "2024-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        store = SqliteTaskStore(db_path)
+        tasks = store.get_all()
+
+        assert len(tasks) == 1
+        assert tasks[0].task_type == "internal"
+
+        conn2 = sqlite3.connect(db_path)
+        row = conn2.execute("SELECT version FROM schema_version").fetchone()
+        conn2.close()
+        assert row[0] == SCHEMA_VERSION

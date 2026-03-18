@@ -2068,8 +2068,8 @@ class TestPsCommand:
         store = SqliteTaskStore(db_path)
 
         # Create 2 in_progress tasks
-        task1 = store.add("Learn task 1", task_type="learn")
-        task2 = store.add("Learn task 2", task_type="learn")
+        task1 = store.add("Internal task 1", task_type="internal")
+        task2 = store.add("Internal task 2", task_type="internal")
         store.mark_in_progress(task1)
         store.mark_in_progress(task2)
 

@@ -30,7 +30,7 @@ Options for `init`:
 Options for `history`:
 - `--last N` / `-n N` - Show last N tasks (default: 10)
 - `--all` - Show all tasks (no limit)
-- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, learn)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, internal)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
@@ -41,7 +41,7 @@ Options for `history`:
 Options for `stats`:
 - `--last N` / `-n N` - Show last N tasks (default: 5)
 - `--all` - Show all tasks (no limit)
-- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, learn)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, internal)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
@@ -105,14 +105,14 @@ Gza is configured via `gza.yaml` in the project root. Key fields:
 After each completed task (on interval), gza can automatically update `.gza/learnings.md` by running an LLM to consolidate patterns from recent completed tasks.
 
 **How it works**:
-1. A `learn` task is created in the DB with `skip_learnings=True` (to prevent recursion) and run via the standard runner — same as explore/plan/review tasks (worktree, provider, status transitions).
+1. An `internal` task is created in the DB with `skip_learnings=True` (to prevent recursion) and run via the standard runner — same as explore/plan/review tasks (worktree, provider, status transitions).
 2. The LLM produces bullet-point learnings from recent task outputs; these replace/merge into `.gza/learnings.md`.
 3. On any failure (non-zero exit, exception), gza falls back to the existing regex-based extraction.
-4. The `learn` task is kept in the DB for observability (visible via `gza history --type learn`).
+4. The `internal` task is kept in the DB for observability (visible via `gza history --type internal`).
 
 **Architecture note**: Always use the provider system (via `runner.run()` or `get_provider()`) for LLM calls — never hardcode provider-specific CLI commands. This keeps gza provider-agnostic across Claude, Codex, and Gemini.
 
-**`skip_learnings` field** (on `db.Task`): When `True`, the task's completion will not trigger `maybe_auto_regenerate_learnings`. This is set automatically on `learn` tasks to prevent infinite recursion. It can also be set manually on any task type to suppress learnings updates.
+**`skip_learnings` field** (on `db.Task`): When `True`, the task's completion will not trigger `maybe_auto_regenerate_learnings`. This is set automatically on `internal` learnings tasks to prevent infinite recursion. It can also be set manually on any task type to suppress learnings updates.
 
 ### verify_command
 
@@ -120,7 +120,7 @@ The `verify_command` field ensures agents always run project-specific verificati
 
 > Before finishing, run the following verification command and fix any errors: `<verify_command>`
 
-This is NOT added to `explore`, `plan`, `review`, or `learn` tasks since those don't produce code changes.
+This is NOT added to `explore`, `plan`, `review`, or `internal` tasks since those don't produce code changes.
 
 Example `gza.yaml`:
 ```yaml
