@@ -1,5 +1,6 @@
 """Tests for the PromptBuilder class in gza.prompts."""
 
+import re
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -169,6 +170,9 @@ class TestPromptBuilderBuild:
         assert "targeted regression tests" in result
         assert "config, CLI, or operator-facing behavior changed" in result
         assert "Reserve Must-Fix for:" in result
+        checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
+        assert len(checklist_lines) == 5
+        assert "Yes/No - ..." in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
         """Test interactive review skill scaffolding matches canonical Summary requirements."""
@@ -184,6 +188,42 @@ class TestPromptBuilderBuild:
 
         assert "<Provide 3-5 bullets summarizing the review>" in content
         assert "<1-2 sentence overview of the changes>" not in content
+        assert (
+            "<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form"
+            in content
+        )
+        assert (
+            "<- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>"
+            in content
+        )
+        assert (
+            "<- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>"
+            in content
+        )
+        assert (
+            "<- Did I check for misleading output (contradictory UI/prompt/context signals)?>"
+            in content
+        )
+        assert (
+            "<- Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?>"
+            in content
+        )
+        assert (
+            "<- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>"
+            in content
+        )
+        assert (
+            "<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
+            in content
+        )
+        assert (
+            "<Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>"
+            in content
+        )
+        assert (
+            "<Treat misleading output as Must-Fix when it can cause incorrect operator or agent decisions.>"
+            in content
+        )
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""

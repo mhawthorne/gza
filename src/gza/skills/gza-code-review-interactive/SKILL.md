@@ -53,11 +53,21 @@ git diff main...HEAD
 ## Summary
 
 <Provide 3-5 bullets summarizing the review>
+<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form and one short evidence clause each:>
+<- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>
+<- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>
+<- Did I check for misleading output (contradictory UI/prompt/context signals)?>
+<- Did I require targeted regression tests that match each failure mode (not generic "add tests")?>
+<- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>
 
 ## Must-Fix
 
 <Use ### M1, ### M2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
+<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
+<Treat misleading output as Must-Fix when it can cause incorrect operator or agent decisions.>
+<If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
 
 ## Suggestions
 
@@ -73,6 +83,8 @@ git diff main...HEAD
 <Brief justification>
 Verdict: APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION
 ```
+
+Do not rename, omit, or reorder these sections.
 
 If a PR number is provided, post the review as a PR comment:
 ```bash
