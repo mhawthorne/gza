@@ -743,6 +743,44 @@ class TestShowCommand:
         assert "uv run pytest tests/ -q" in result.stdout
         assert "AssertionError" in result.stdout
 
+    def test_show_indicates_worker_startup_failure(self, tmp_path: Path):
+        """Show surfaces startup failure when worker failed before main log existed."""
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Task with startup failure")
+        assert task.id is not None
+        task.status = "failed"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-20260318-startup-failure",
+                pid=12345,
+                task_id=task.id,
+                task_slug=task.task_id,
+                started_at="2026-03-18T00:00:00+00:00",
+                status="failed",
+                log_file=None,
+                worktree=None,
+                is_background=True,
+                startup_log_file=".gza/workers/w-20260318-startup-failure-startup.log",
+            )
+        )
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Worker Failure: failed during startup" in result.stdout
+        assert "Startup Log: .gza/workers/w-20260318-startup-failure-startup.log" in result.stdout
+
     def test_show_completed_task_omits_failure_diagnostics(self, tmp_path: Path):
         """Completed task output should not include failed-task diagnostics block."""
         from gza.db import SqliteTaskStore
@@ -1270,6 +1308,260 @@ class TestPsCommand:
         assert "orphaned" in rows[0]["flags"]
 
         registry.remove("w-test-stale-ps")
+
+    def test_ps_marks_startup_failure_for_failed_worker_without_main_log(self, tmp_path: Path):
+        """PS marks startup failures in table and JSON output."""
+        import json
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-startup-ps",
+                pid=99999,
+                task_id=None,
+                task_slug="startup-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                startup_log_file=".gza/workers/w-test-startup-ps-startup.log",
+            )
+        )
+
+        table_result = run_gza("ps", "--project", str(tmp_path))
+        assert table_result.returncode == 0
+        assert "failed(startup)" in table_result.stdout
+
+        json_result = run_gza("ps", "--json", "--project", str(tmp_path))
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["startup_failure"] is True
+        assert rows[0]["startup_log_file"] == ".gza/workers/w-test-startup-ps-startup.log"
+
+        registry.remove("w-test-startup-ps")
+
+    def test_ps_default_includes_startup_failure_but_filters_other_terminal_rows(self, tmp_path: Path):
+        """Default ps keeps startup failures visible while filtering other terminal rows."""
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-running",
+                pid=99998,
+                task_id=None,
+                task_slug="running-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-startup-failed",
+                pid=99997,
+                task_id=None,
+                task_slug="startup-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                startup_log_file=".gza/workers/w-test-ps-startup-failed-startup.log",
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-failed",
+                pid=99996,
+                task_id=None,
+                task_slug="ordinary-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-completed",
+                pid=99995,
+                task_id=None,
+                task_slug="completed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                exit_code=0,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        result = run_gza("ps", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "running-worker" in result.stdout
+        assert "failed(startup)" in result.stdout
+        assert "ordinary-failed-worker" not in result.stdout
+        assert "completed-worker" not in result.stdout
+
+        registry.remove("w-test-ps-running")
+        registry.remove("w-test-ps-startup-failed")
+        registry.remove("w-test-ps-failed")
+        registry.remove("w-test-ps-completed")
+
+    def test_ps_all_flag_includes_completed_and_failed_rows(self, tmp_path: Path):
+        """ps --all includes ordinary completed/failed rows that default ps filters out."""
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-all-running",
+                pid=99998,
+                task_id=None,
+                task_slug="running-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-all-failed",
+                pid=99996,
+                task_id=None,
+                task_slug="ordinary-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-all-completed",
+                pid=99995,
+                task_id=None,
+                task_slug="completed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                exit_code=0,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        # Default ps: filters out ordinary completed/failed
+        result = run_gza("ps", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "running-worker" in result.stdout
+        assert "ordinary-failed-worker" not in result.stdout
+        assert "completed-worker" not in result.stdout
+
+        # ps --all: includes everything
+        result_all = run_gza("ps", "--all", "--project", str(tmp_path))
+        assert result_all.returncode == 0
+        assert "running-worker" in result_all.stdout
+        assert "ordinary-failed-worker" in result_all.stdout
+        assert "completed-worker" in result_all.stdout
+
+        # status --all (alias) also works
+        result_status = run_gza("status", "--all", "--project", str(tmp_path))
+        assert result_status.returncode == 0
+        assert "completed-worker" in result_status.stdout
+
+        registry.remove("w-all-running")
+        registry.remove("w-all-failed")
+        registry.remove("w-all-completed")
+
+    def test_ps_all_json_includes_terminal_rows(self, tmp_path: Path):
+        """ps --all --json includes completed/failed workers in JSON output."""
+        import json as json_lib
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-json-completed",
+                pid=99994,
+                task_id=None,
+                task_slug="json-completed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                exit_code=0,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        assert result.returncode == 0
+        data = json_lib.loads(result.stdout)
+        slugs = [r["task"] for r in data]
+        assert any("json-completed-worker" in s for s in slugs)
+
+        registry.remove("w-json-completed")
+
+    def test_print_ps_output_poll_adopts_first_seen_startup_failure(self, tmp_path: Path, capsys):
+        """Poll path keeps startup-failed workers visible on first observation."""
+        import argparse
+        from gza.cli import _print_ps_output
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-startup-poll",
+                pid=99999,
+                task_id=None,
+                task_slug="startup-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                startup_log_file=".gza/workers/w-test-startup-poll-startup.log",
+            )
+        )
+
+        args = argparse.Namespace(quiet=False, json=True)
+        seen_tasks: dict[str, dict] = {}
+        _print_ps_output(args, registry, store, seen_tasks=seen_tasks)
+
+        captured = capsys.readouterr()
+        assert '"worker_id": "w-test-startup-poll"' in captured.out
+        assert '"status": "failed"' in captured.out
+        assert '"startup_failure": true' in captured.out
+        assert "w-test-startup-poll" in seen_tasks
+
+        registry.remove("w-test-startup-poll")
 
     def test_ps_handles_missing_started_timestamp(self, tmp_path: Path):
         """PS should gracefully handle invalid/missing start timestamps."""
@@ -2600,4 +2892,3 @@ class TestNextCommandWithDependencies:
         assert result.returncode == 0
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
-

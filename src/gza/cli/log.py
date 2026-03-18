@@ -697,6 +697,48 @@ def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
     return deduped
 
 
+def _worker_startup_log_path(config: Config, worker: WorkerMetadata) -> Path | None:
+    """Resolve a worker startup log path when available."""
+    if not worker.startup_log_file:
+        return None
+    startup_path = Path(worker.startup_log_file)
+    if not startup_path.is_absolute():
+        startup_path = config.project_dir / startup_path
+    return startup_path
+
+
+def _resolve_worker_log_path(
+    config: Config,
+    worker: WorkerMetadata,
+    task: DbTask | None,
+) -> tuple[Path | None, bool]:
+    """Resolve log path for worker lookups, preferring main task logs then startup logs."""
+    main_candidates: list[Path] = []
+
+    if worker.log_file:
+        worker_log = Path(worker.log_file)
+        if not worker_log.is_absolute():
+            worker_log = config.project_dir / worker_log
+        main_candidates.append(worker_log)
+
+    if task is not None:
+        main_candidates.extend(_task_log_candidates(config, task))
+
+    for candidate in main_candidates:
+        if candidate.exists():
+            return candidate, False
+
+    startup_log_path = _worker_startup_log_path(config, worker)
+    if startup_log_path and startup_log_path.exists():
+        return startup_log_path, True
+
+    # Prefer returning a main log candidate (even if missing) over a non-existent
+    # startup log, so error messages reference the expected main log path.
+    if main_candidates:
+        return main_candidates[0], False
+    return None, False
+
+
 def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMetadata | None:
     """Return most recent worker metadata for a task."""
     workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
@@ -704,6 +746,36 @@ def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMet
         return None
     workers.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
     return workers[-1]
+
+
+def _resolve_task_log_path(
+    config: Config,
+    registry: WorkerRegistry,
+    task: DbTask,
+    attempts: list[DbTask],
+) -> tuple[Path | None, bool]:
+    """Resolve log path for task/slug lookups with worker startup fallback."""
+    main_candidates: list[Path] = []
+    main_candidates.extend(_task_log_candidates(config, task))
+    for attempt in attempts:
+        if attempt.id == task.id:
+            continue
+        main_candidates.extend(_task_log_candidates(config, attempt))
+
+    for candidate in main_candidates:
+        if candidate.exists():
+            return candidate, False
+
+    if task.id is not None:
+        latest_worker = _latest_worker_for_task(registry, task.id)
+        if latest_worker is not None:
+            worker_log_path, using_startup_log = _resolve_worker_log_path(config, latest_worker, task)
+            if worker_log_path is not None:
+                return worker_log_path, using_startup_log
+
+    if main_candidates:
+        return main_candidates[0], False
+    return None, False
 
 
 def _running_worker_id_for_task(registry: WorkerRegistry, task_id: int) -> str | None:
@@ -766,6 +838,7 @@ def cmd_log(args: argparse.Namespace) -> int:
     resolution_note = None
     worker = None
     log_path = None
+    using_startup_log = False
     is_running = False
     worker_id_for_follow: str | None = None
 
@@ -778,10 +851,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         is_running = registry.is_running(query)
         if worker.task_id:
             task = store.get(worker.task_id)
-        if task and task.log_file:
-            log_path = config.project_dir / task.log_file
-        elif task and task.task_id:
-            log_path = config.log_path / f"{task.task_id}.log"
+        log_path, using_startup_log = _resolve_worker_log_path(config, worker, task)
         worker_id_for_follow = worker.worker_id
 
     elif args.slug:
@@ -805,19 +875,7 @@ def cmd_log(args: argparse.Namespace) -> int:
                 "(latest same-type retry/resume in based_on chain)"
             )
 
-        candidate_paths: list[Path] = []
-        candidate_paths.extend(_task_log_candidates(config, task))
-        for attempt in attempts:
-            if attempt.id == task.id:
-                continue
-            candidate_paths.extend(_task_log_candidates(config, attempt))
-
-        for candidate in candidate_paths:
-            if candidate.exists():
-                log_path = candidate
-                break
-        if log_path is None and candidate_paths:
-            log_path = candidate_paths[0]
+        log_path, using_startup_log = _resolve_task_log_path(config, registry, task, attempts)
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
@@ -842,19 +900,7 @@ def cmd_log(args: argparse.Namespace) -> int:
                 "(latest same-type retry/resume in based_on chain)"
             )
 
-        slug_candidate_paths: list[Path] = []
-        slug_candidate_paths.extend(_task_log_candidates(config, task))
-        for attempt in attempts:
-            if attempt.id == task.id:
-                continue
-            slug_candidate_paths.extend(_task_log_candidates(config, attempt))
-
-        for candidate in slug_candidate_paths:
-            if candidate.exists():
-                log_path = candidate
-                break
-        if log_path is None and slug_candidate_paths:
-            log_path = slug_candidate_paths[0]
+        log_path, using_startup_log = _resolve_task_log_path(config, registry, task, attempts)
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
@@ -865,9 +911,11 @@ def cmd_log(args: argparse.Namespace) -> int:
         return 1
 
     if not log_path.exists():
-        if is_running:
+        if is_running and not using_startup_log:
             print(f"Log file not yet created: {log_path}")
             print("Worker is still starting up...")
+        elif using_startup_log:
+            print(f"Error: Startup log not found at {log_path}")
         else:
             print(f"Error: Log file not found at {log_path}")
         return 1
@@ -898,6 +946,9 @@ def cmd_log(args: argparse.Namespace) -> int:
         if log_data is None and not entries:
             # If we have content but couldn't parse any JSON, it's likely a startup error
             if content:
+                if using_startup_log:
+                    console.print(f"[cyan]Startup log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+                    console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
                 console.print("[red]Task failed during startup (no Claude session):[/red]", soft_wrap=True)
                 # Display the raw error message, indented for clarity
                 for line in content.split('\n'):
@@ -923,14 +974,27 @@ def cmd_log(args: argparse.Namespace) -> int:
         if resolution_note:
             console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
         console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+        if using_startup_log:
+            console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
         if task.branch:
             console.print(f"[cyan]Branch:[/cyan] {rich_escape(task.branch)}", soft_wrap=True)
     elif worker:
         console.print(f"[cyan]Worker:[/cyan] {rich_escape(worker.worker_id)}", soft_wrap=True)
-        _w_status = "running" if is_running else "completed"
-        _w_color = "yellow" if is_running else "green"
+        _w_status = worker.status if worker.status else "unknown"
+        if is_running and _w_status != "running":
+            # Prefer live process state when worker metadata is stale.
+            _w_status = "running"
+        _w_color = {
+            "running": "yellow",
+            "in_progress": "yellow",
+            "completed": "green",
+            "failed": "red",
+            "stale": "yellow",
+        }.get(_w_status, "white")
         console.print(f"[cyan]Status:[/cyan] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
         console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+        if using_startup_log:
+            console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
     console.print(_sep, soft_wrap=True)
     console.print()
 

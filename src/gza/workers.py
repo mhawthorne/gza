@@ -19,6 +19,7 @@ class WorkerMetadata:
     status: str  # running, completed, failed
     log_file: str | None
     worktree: str | None
+    startup_log_file: str | None = None
     is_background: bool = True  # True for background workers, False for foreground
     exit_code: int | None = None
     completed_at: str | None = None
@@ -263,6 +264,24 @@ class WorkerRegistry:
         Args:
             worker_id: Worker ID to remove
         """
+        worker = self.get(worker_id)
+        startup_log_path = None
+        if worker and worker.startup_log_file:
+            # Resolve startup log to a path under workers_dir only.
+            # Startup logs are always created as <workers_dir>/<worker_id>-startup.log,
+            # so we resolve by filename to avoid depending on directory hierarchy.
+            candidate = self.workers_dir / Path(worker.startup_log_file).name
+
+            # Safety: only delete if the resolved path is within workers_dir
+            # to prevent path traversal via malformed metadata.
+            try:
+                resolved = candidate.resolve()
+                allowed_root = self.workers_dir.resolve()
+                if resolved.is_relative_to(allowed_root):
+                    startup_log_path = resolved
+            except (OSError, ValueError):
+                pass
+
         metadata_path = self._metadata_path(worker_id)
         if metadata_path.exists():
             metadata_path.unlink()
@@ -270,3 +289,6 @@ class WorkerRegistry:
         pid_path = self._pid_path(worker_id)
         if pid_path.exists():
             pid_path.unlink()
+
+        if startup_log_path and startup_log_path.exists():
+            startup_log_path.unlink()

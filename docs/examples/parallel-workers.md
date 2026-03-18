@@ -27,14 +27,13 @@ Each worker atomically claims a pending task—no conflicts or duplicate work.
 
 ```bash
 $ gza ps
-WORKER ID          PID    STATUS   TASK                              DURATION
-w-20260108-160001  51234  running  20260108-add-user-avatar-uploa…   1m 23s
-w-20260108-160002  51235  running  20260108-implement-email-notif…   1m 22s
-w-20260108-160003  51236  running  20260108-add-dark-mode-toggle-…   1m 21s
-w-20260108-160004  51237  running  20260108-create-api-rate-limit…   1m 20s
+TASK ID    TYPE       STATUS         STARTED                  STEPS   DURATION   TASK
+#101       implement  running        2026-01-08 16:00:01 UTC  12      1m 23s     20260108-add-user-avatar-upload
+#102       implement  running        2026-01-08 16:00:02 UTC  11      1m 22s     20260108-implement-email-notifications
+#103       implement  failed(startup) 2026-01-08 16:00:03 UTC -       8s         20260108-add-dark-mode-toggle
 ```
 
-Include completed workers:
+Default output includes running tasks and startup failures. Include all completed/failed rows:
 
 ```bash
 $ gza ps --all
@@ -75,7 +74,8 @@ Background workers:
 
 - Spawn as detached processes (survive terminal close)
 - Atomically claim pending tasks (no conflicts with concurrent workers)
-- Write logs to `.gza/logs/<task_id>.log`
+- Write task logs to `.gza/logs/<task_id>.log`
+- Capture startup output in `.gza/workers/<worker_id>-startup.log` until task logging is available
 - Update status in `.gza/workers/<worker_id>.json`
 - Clean up automatically on completion
 

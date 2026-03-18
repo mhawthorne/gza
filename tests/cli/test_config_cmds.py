@@ -491,7 +491,7 @@ class TestCleanupCommand:
         assert new_log.exists()
 
     def test_cleanup_workers(self, tmp_path: Path):
-        """Cleanup command cleans up stale worker metadata."""
+        """Cleanup command cleans stale worker metadata and startup logs."""
         from gza.config import Config
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -510,13 +510,17 @@ class TestCleanupCommand:
             status="running",
             log_file=None,
             worktree=None,
+            startup_log_file=f".gza/workers/{worker_id}-startup.log",
             is_background=True,
         )
         registry.register(worker_meta)
+        startup_log_file = config.workers_path / f"{worker_id}-startup.log"
+        startup_log_file.write_text("startup output")
 
         # Verify worker file exists
         worker_file = config.workers_path / f"{worker_id}.json"
         assert worker_file.exists()
+        assert startup_log_file.exists()
 
         result = run_gza("cleanup", "--workers", "--project", str(tmp_path))
 
@@ -524,6 +528,7 @@ class TestCleanupCommand:
         assert "worker files cleaned" in result.stdout.lower()
         # Worker metadata should be cleaned up
         assert not worker_file.exists()
+        assert not startup_log_file.exists()
 
     def test_cleanup_keep_unmerged_logs(self, tmp_path: Path):
         """Cleanup command with --keep-unmerged keeps logs for unmerged tasks."""
@@ -1735,4 +1740,3 @@ class TestLearningsCommand:
         learnings_path = tmp_path / ".gza" / "learnings.md"
         assert learnings_path.exists()
         assert "Use dedicated fixtures for tests" in learnings_path.read_text()
-

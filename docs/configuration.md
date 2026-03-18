@@ -396,6 +396,7 @@ gza log <identifier> [options]
 | `--raw` | Show raw JSON lines |
 
 By default, the identifier is treated as a task ID (numeric).
+If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
 
 ### stats
 
@@ -478,7 +479,7 @@ gza clean --purge --days 60
 
 The clean command archives files from:
 - `.gza/logs/` - Task execution logs
-- `.gza/workers/` - Worker metadata files
+- `.gza/workers/` - Worker metadata and startup logs
 
 Files are moved to `.gza/archive/` based on their modification time. Use `--purge` to permanently delete archived files.
 
@@ -506,7 +507,7 @@ gza group <group>
 
 ### status
 
-List running workers (alias for `ps`).
+List active workers and startup failures (alias for `ps`).
 
 ```bash
 gza status
@@ -514,7 +515,7 @@ gza status
 
 ### ps
 
-Show running workers.
+Show active workers and startup failures.
 
 ```bash
 gza ps [options]
@@ -522,7 +523,7 @@ gza ps [options]
 
 | Option | Description |
 |--------|-------------|
-| `--all`, `-a` | Include completed/failed workers |
+| `--all`, `-a` | Include all completed/failed workers (not just startup failures) |
 | `--quiet`, `-q` | Only show worker IDs |
 | `--json` | Output as JSON |
 
@@ -735,7 +736,7 @@ uv run gza skills-install --target codex gza-rebase --project /path/to/project
 
 ### cleanup
 
-Clean up stale worktrees, old logs, and worker metadata.
+Clean up stale worktrees, old logs, and worker artifacts.
 
 ```bash
 gza cleanup [options]
@@ -745,7 +746,7 @@ gza cleanup [options]
 |--------|-------------|
 | `--worktrees` | Only clean up stale worktrees |
 | `--logs` | Only clean up old log files |
-| `--workers` | Only clean up stale worker metadata |
+| `--workers` | Only clean up stale worker metadata and startup logs |
 | `--days N` | Remove items older than N days (default: 30) |
 | `--keep-unmerged` | Keep logs for tasks that are still unmerged |
 | `--dry-run` | Show what would be cleaned without doing it |
@@ -1009,7 +1010,7 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `.gza/` | Local state directory (add to `.gitignore`) |
 | `.gza/gza.db` | SQLite task database |
 | `.gza/logs/` | Task execution logs |
-| `.gza/workers/` | Worker metadata |
+| `.gza/workers/` | Worker metadata and startup logs |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |
 | `etc/Dockerfile.codex` | Generated Docker image for Codex |
 | `etc/Dockerfile.gemini` | Generated Docker image for Gemini |

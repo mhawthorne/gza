@@ -621,6 +621,7 @@ def _print_ps_output(
     store: "SqliteTaskStore",
     poll_interval: int | None = None,
     seen_tasks: "dict | None" = None,
+    show_all: bool = False,
 ) -> None:
     """Print ps output once. Used by cmd_ps directly and in poll loop.
 
@@ -628,19 +629,23 @@ def _print_ps_output(
     live results so that completed/failed tasks remain visible.
     """
     import datetime
-    # In poll mode, include completed workers so we capture status transitions.
-    include_completed_for_query = seen_tasks is not None
-    live_rows, _ = _build_ps_rows(registry, store, include_completed=include_completed_for_query)
+    # Include completed workers so startup failures and poll transitions remain visible.
+    live_rows, _ = _build_ps_rows(registry, store, include_completed=True)
 
     # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
     if seen_tasks is not None:
         live_keys = set()
         for row in live_rows:
             key = row["task_id"] if row["task_id"] is not None else row["worker_id"]
-            # Only adopt a row into seen_tasks if it's currently active OR
-            # we're already tracking it (status transition). Don't adopt old
-            # completed tasks from the registry that we never saw running.
-            if key in seen_tasks or row["status"] in ("running", "in_progress"):
+            # Only adopt a row into seen_tasks if it's currently active, if we
+            # already track it (status transition), or if it is a startup
+            # failure. This preserves first-seen startup failures in poll mode
+            # while still avoiding unrelated completed history.
+            if (
+                key in seen_tasks
+                or row["status"] in ("running", "in_progress")
+                or row.get("startup_failure", False)
+            ):
                 seen_tasks[key] = row
             live_keys.add(key)
 
@@ -658,10 +663,15 @@ def _print_ps_output(
     else:
         rows = live_rows
 
-    # Outside poll mode, filter out completed/failed tasks.
+    # Outside poll mode, filter out completed/failed tasks except startup failures.
     # In poll mode, completed tasks remain visible via seen_tasks.
-    if seen_tasks is None:
-        rows = [r for r in rows if r["status"] not in ("completed", "failed")]
+    # With --all, show everything including ordinary completed/failed rows.
+    if seen_tasks is None and not show_all:
+        rows = [
+            r
+            for r in rows
+            if r["status"] not in ("completed", "failed") or r.get("startup_failure", False)
+        ]
 
     if poll_interval is not None:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -689,20 +699,23 @@ def _print_ps_output(
         "in_progress": "green",
         "completed": "cyan",
         "failed": "red",
+        "failed(startup)": "red",
         "stale": "yellow",
         "unknown": "yellow",
     }
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
-        f"{'STATUS':<12} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+        f"{'STATUS':<16} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
     console.print(f"[bold]{header}[/bold]", soft_wrap=True)
-    console.print("[bold]" + "─" * 94 + "[/bold]", soft_wrap=True)
+    console.print("[bold]" + "─" * 98 + "[/bold]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
         status = row['status']
+        if status == "failed" and row.get("startup_failure"):
+            status = "failed(startup)"
         sc = STATUS_COLORS.get(status, "white")
 
         # Escape Rich markup in task display (may contain brackets from truncation)
@@ -710,7 +723,7 @@ def _print_ps_output(
 
         console.print(
             f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
-            f"[{sc}]{status:<12}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
+            f"[{sc}]{status:<16}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
             f"[#ff99cc]{task_display}[/#ff99cc]",
             soft_wrap=True,
         )
@@ -731,6 +744,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
             if task and task.status in ("completed", "failed"):
                 registry.remove(w.worker_id)
     poll_interval: int | None = getattr(args, "poll", None)
+    show_all: bool = getattr(args, "all", False)
 
     if poll_interval is not None:
         if poll_interval < 1:
@@ -743,12 +757,12 @@ def cmd_ps(args: argparse.Namespace) -> int:
             while True:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")  # clear screen, move cursor to top
-                _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks)
+                _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks, show_all=show_all)
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
             return 0
     else:
-        _print_ps_output(args, registry, store)
+        _print_ps_output(args, registry, store, show_all=show_all)
 
     return 0
 
@@ -842,6 +856,16 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
     return (status_group, has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
 
 
+def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | None) -> bool:
+    """Return True when worker failed before main task logging initialized."""
+    if worker is None or worker.status != "failed":
+        return False
+    if not worker.startup_log_file:
+        return False
+    has_main_log = bool((task and task.log_file) or worker.log_file)
+    return not has_main_log
+
+
 def _prefer_worker(existing: WorkerMetadata, candidate: WorkerMetadata) -> bool:
     """Return True when candidate worker should replace existing worker."""
     priority = {"running": 3, "stale": 2, "failed": 1, "completed": 0}
@@ -926,6 +950,9 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         flags.append("stale")
     if is_orphaned:
         flags.append("orphaned")
+    startup_failure = _worker_failed_during_startup(worker, task)
+    if startup_failure:
+        flags.append("startup-failure")
 
     return {
         "worker_id": worker_id,
@@ -942,6 +969,8 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "duration": duration,
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,
+        "startup_failure": startup_failure,
+        "startup_log_file": worker.startup_log_file if worker else None,
         "sort_timestamp": started.isoformat() if started else "",
     }
 
@@ -1196,6 +1225,16 @@ def cmd_show(args: argparse.Namespace) -> int:
             pid_part = f", PID {latest_worker.pid}" if latest_worker.pid else ""
             worker_label = f"{run_mode} ({latest_worker.worker_id}){pid_part}"
             console.print(f"[{c['label']}]Run Context:[/{c['label']}] [{c['value']}]{worker_label}[/{c['value']}]")
+            if _worker_failed_during_startup(latest_worker, task):
+                console.print(
+                    f"[{c['label']}]Worker Failure:[/{c['label']}] "
+                    f"[{c['status_failed']}]failed during startup (before main log setup)[/{c['status_failed']}]"
+                )
+                if latest_worker.startup_log_file:
+                    console.print(
+                        f"[{c['label']}]Startup Log:[/{c['label']}] "
+                        f"[{c['value']}]{latest_worker.startup_log_file}[/{c['value']}]"
+                    )
 
     if task.status == "failed":
         reason = task.failure_reason or "UNKNOWN"

@@ -44,6 +44,31 @@ TASK_COLORS: dict[str, str] = {
     "value": "white",       # white for values
 }
 
+def _startup_log_paths(config: Config, worker_id: str) -> tuple[Path, str]:
+    """Return absolute and project-relative startup log paths for a worker."""
+    startup_log_path = config.workers_path / f"{worker_id}-startup.log"
+    startup_log_path.parent.mkdir(parents=True, exist_ok=True)
+    return startup_log_path, str(startup_log_path.relative_to(config.project_dir))
+
+
+def _spawn_detached_worker_process(
+    cmd: list[str],
+    config: Config,
+    worker_id: str,
+) -> tuple[subprocess.Popen, str]:
+    """Spawn detached worker process and redirect early startup output to a file."""
+    startup_log_path, startup_log_rel = _startup_log_paths(config, worker_id)
+    with open(startup_log_path, "ab") as startup_log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=startup_log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+    return proc, startup_log_rel
+
 
 def _run_foreground(
     config: Config,
@@ -162,18 +187,9 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     # Spawn detached process
     try:
-        # Use nohup to detach from terminal
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=config.project_dir,
-        )
-
         # Generate worker ID
         worker_id = registry.generate_worker_id()
+        proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
 
         # Register worker
         worker = WorkerMetadata(
@@ -185,6 +201,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             status="running",
             log_file=None,  # Will be set when runner starts
             worktree=None,  # Will be set when runner starts
+            startup_log_file=startup_log_rel,
         )
         registry.register(worker)
 
@@ -292,17 +309,9 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
 
     # Spawn detached process
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=config.project_dir,
-        )
-
         # Generate worker ID
         worker_id = registry.generate_worker_id()
+        proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
 
         # Register worker
         worker = WorkerMetadata(
@@ -314,6 +323,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
             status="running",
             log_file=None,  # Will be set when runner starts
             worktree=None,  # Will be set when runner starts
+            startup_log_file=startup_log_rel,
         )
         registry.register(worker)
 
@@ -369,17 +379,9 @@ def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) ->
 
     # Spawn detached process
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=config.project_dir,
-        )
-
         # Generate worker ID
         worker_id = registry.generate_worker_id()
+        proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
 
         # Register worker
         worker = WorkerMetadata(
@@ -391,6 +393,7 @@ def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) ->
             status="running",
             log_file=None,
             worktree=None,
+            startup_log_file=startup_log_rel,
         )
         registry.register(worker)
 

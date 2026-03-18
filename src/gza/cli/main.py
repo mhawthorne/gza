@@ -1103,7 +1103,12 @@ def main() -> int:
     for ps_cmd in ("ps", "status"):
         ps_parser = subparsers.add_parser(
             ps_cmd,
-            help="List running workers" if ps_cmd == "ps" else "List running workers (alias for ps)",
+            help="List active workers and startup failures" if ps_cmd == "ps" else "List active workers and startup failures (alias for ps)",
+        )
+        ps_parser.add_argument(
+            "--all", "-a",
+            action="store_true",
+            help="Include all completed/failed workers (not just startup failures)",
         )
         ps_parser.add_argument(
             "--quiet", "-q",
