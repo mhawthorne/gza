@@ -279,6 +279,17 @@ class WorkerRegistry:
                 ]
                 startup_log_path = next((p for p in candidates if p.exists()), candidates[0])
 
+            # Safety: only delete startup logs within the workers directory
+            # to prevent path traversal attacks via malformed metadata.
+            if startup_log_path is not None:
+                try:
+                    resolved = startup_log_path.resolve()
+                    allowed_root = self.workers_dir.resolve()
+                    if not resolved.is_relative_to(allowed_root):
+                        startup_log_path = None
+                except (OSError, ValueError):
+                    startup_log_path = None
+
         metadata_path = self._metadata_path(worker_id)
         if metadata_path.exists():
             metadata_path.unlink()

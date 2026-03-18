@@ -621,6 +621,7 @@ def _print_ps_output(
     store: "SqliteTaskStore",
     poll_interval: int | None = None,
     seen_tasks: "dict | None" = None,
+    show_all: bool = False,
 ) -> None:
     """Print ps output once. Used by cmd_ps directly and in poll loop.
 
@@ -665,7 +666,8 @@ def _print_ps_output(
 
     # Outside poll mode, filter out completed/failed tasks except startup failures.
     # In poll mode, completed tasks remain visible via seen_tasks.
-    if seen_tasks is None:
+    # With --all, show everything including ordinary completed/failed rows.
+    if seen_tasks is None and not show_all:
         rows = [
             r
             for r in rows
@@ -743,6 +745,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
             if task and task.status in ("completed", "failed"):
                 registry.remove(w.worker_id)
     poll_interval: int | None = getattr(args, "poll", None)
+    show_all: bool = getattr(args, "all", False)
 
     if poll_interval is not None:
         if poll_interval < 1:
@@ -755,12 +758,12 @@ def cmd_ps(args: argparse.Namespace) -> int:
             while True:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")  # clear screen, move cursor to top
-                _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks)
+                _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks, show_all=show_all)
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
             return 0
     else:
-        _print_ps_output(args, registry, store)
+        _print_ps_output(args, registry, store, show_all=show_all)
 
     return 0
 

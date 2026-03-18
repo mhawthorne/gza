@@ -1418,6 +1418,110 @@ class TestPsCommand:
         registry.remove("w-test-ps-failed")
         registry.remove("w-test-ps-completed")
 
+    def test_ps_all_flag_includes_completed_and_failed_rows(self, tmp_path: Path):
+        """ps --all includes ordinary completed/failed rows that default ps filters out."""
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-all-running",
+                pid=99998,
+                task_id=None,
+                task_slug="running-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-all-failed",
+                pid=99996,
+                task_id=None,
+                task_slug="ordinary-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-all-completed",
+                pid=99995,
+                task_id=None,
+                task_slug="completed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                exit_code=0,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        # Default ps: filters out ordinary completed/failed
+        result = run_gza("ps", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "running-worker" in result.stdout
+        assert "ordinary-failed-worker" not in result.stdout
+        assert "completed-worker" not in result.stdout
+
+        # ps --all: includes everything
+        result_all = run_gza("ps", "--all", "--project", str(tmp_path))
+        assert result_all.returncode == 0
+        assert "running-worker" in result_all.stdout
+        assert "ordinary-failed-worker" in result_all.stdout
+        assert "completed-worker" in result_all.stdout
+
+        # status --all (alias) also works
+        result_status = run_gza("status", "--all", "--project", str(tmp_path))
+        assert result_status.returncode == 0
+        assert "completed-worker" in result_status.stdout
+
+        registry.remove("w-all-running")
+        registry.remove("w-all-failed")
+        registry.remove("w-all-completed")
+
+    def test_ps_all_json_includes_terminal_rows(self, tmp_path: Path):
+        """ps --all --json includes completed/failed workers in JSON output."""
+        import json as json_lib
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-json-completed",
+                pid=99994,
+                task_id=None,
+                task_slug="json-completed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                exit_code=0,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        assert result.returncode == 0
+        data = json_lib.loads(result.stdout)
+        slugs = [r["task"] for r in data]
+        assert any("json-completed-worker" in s for s in slugs)
+
+        registry.remove("w-json-completed")
+
     def test_print_ps_output_poll_adopts_first_seen_startup_failure(self, tmp_path: Path, capsys):
         """Poll path keeps startup-failed workers visible on first observation."""
         import argparse
