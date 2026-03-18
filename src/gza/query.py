@@ -211,32 +211,63 @@ def _get_downstream_impls(store: SqliteTaskStore, task_id: int) -> list[Task]:
 
 
 def build_lineage(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Build deduplicated lineage tasks for a root task, including dependency chains."""
+    """Build deduplicated lineage tasks for a root task, including dependency chains.
+
+    Ordering is causal dependency order:
+    1) root first
+    2) descendants by increasing dependency depth
+    3) ties within the same depth by creation time, then task ID
+    """
     seen_ids: set[int] = set()
     all_tasks: list[Task] = []
+    task_depths: dict[int, int] = {}
 
-    def _collect(task: Task) -> None:
-        if task.id is None or task.id in seen_ids:
+    def _collect(task: Task, depth: int) -> None:
+        if task.id is None:
             return
-        seen_ids.add(task.id)
-        all_tasks.append(task)
+        existing_depth = task_depths.get(task.id)
+        if existing_depth is not None and existing_depth <= depth:
+            return
+        task_depths[task.id] = depth
+
+        if task.id not in seen_ids:
+            seen_ids.add(task.id)
+            all_tasks.append(task)
 
         for review in get_reviews_for_root(store, task):
             if review.id is not None and review.id not in seen_ids:
                 seen_ids.add(review.id)
                 all_tasks.append(review)
+            if review.id is not None:
+                existing_review_depth = task_depths.get(review.id)
+                if existing_review_depth is None or (depth + 1) < existing_review_depth:
+                    task_depths[review.id] = depth + 1
 
         for improve in get_improves_for_root(store, task):
             if improve.id is not None and improve.id not in seen_ids:
                 seen_ids.add(improve.id)
                 all_tasks.append(improve)
+            if improve.id is not None:
+                existing_improve_depth = task_depths.get(improve.id)
+                if existing_improve_depth is None or (depth + 1) < existing_improve_depth:
+                    task_depths[improve.id] = depth + 1
 
         if task.id is not None:
             for downstream in _get_downstream_impls(store, task.id):
-                _collect(downstream)
+                _collect(downstream, depth + 1)
 
-    _collect(root_task)
-    return sorted(all_tasks, key=task_time_for_lineage)
+    _collect(root_task, depth=0)
+
+    def _lineage_order_key(task: Task) -> tuple[int, datetime, int]:
+        if task.id is None:
+            return (10**9, datetime.max, 10**9)
+        return (
+            task_depths.get(task.id, 10**9),
+            task.created_at or datetime.min,
+            task.id,
+        )
+
+    return sorted(all_tasks, key=_lineage_order_key)
 
 
 def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:

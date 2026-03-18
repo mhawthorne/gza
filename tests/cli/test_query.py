@@ -371,6 +371,33 @@ class TestHistoryCommand:
         assert "Parent task" in result.stdout
         assert "Child task" in result.stdout
 
+    def test_history_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
+        """Lineage rendering keeps ancestor-first order even when descendants are pending."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        root = store.add("Root completed task", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        store.update(root)
+
+        child = store.add("Child pending task", task_type="implement", based_on=root.id)
+        grandchild = store.add("Grandchild pending task", task_type="implement", based_on=child.id)
+        assert child.id is not None
+        assert grandchild.id is not None
+
+        result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        root_idx = result.stdout.index("Root completed task")
+        child_idx = result.stdout.index("Child pending task")
+        grandchild_idx = result.stdout.index("Grandchild pending task")
+        assert root_idx < child_idx < grandchild_idx
+
     def test_history_incomplete_with_lookback(self, tmp_path: Path):
         """--incomplete combined with --days applies both filters."""
         from gza.db import SqliteTaskStore
@@ -870,6 +897,32 @@ class TestShowCommand:
         assert f"#{plan.id}" in result.stdout
         assert f"#{impl1.id}" in result.stdout
         assert f"#{impl2.id}" in result.stdout
+
+    def test_show_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
+        """Show lineage keeps root first even when downstream tasks are still pending."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        root = store.add("Root task", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        store.update(root)
+
+        child = store.add("Child task", task_type="implement", based_on=root.id)
+        grandchild = store.add("Grandchild task", task_type="implement", based_on=child.id)
+
+        result = run_gza("show", str(root.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        root_idx = result.stdout.index(f"#{root.id}")
+        child_idx = result.stdout.index(f"#{child.id}")
+        grandchild_idx = result.stdout.index(f"#{grandchild.id}")
+        assert root_idx < child_idx < grandchild_idx
 
     def test_show_depended_on_by_field(self, tmp_path: Path):
         """Show displays 'Depended on by' listing tasks that reference the displayed task."""
