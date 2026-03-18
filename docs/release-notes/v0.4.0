@@ -46,6 +46,7 @@ This release brings significant orchestration improvements, expanded skill ecosy
 - **Colorized terminal output**: Rich formatting for `gza next`, `gza show`, `gza history`, and logs with colored status indicators
 - **Live step count updates**: Real-time step progress in `gza ps` polling
 - **Improved `gza ps` display**: Better task visibility, worker tracking, and filtering
+- **Startup failure visibility in `gza ps`**: Default `gza ps` now surfaces `failed(startup)` rows, with earliest diagnostics available in `.gza/workers/*-startup.log`
 - **Orchestration logging**: Task lifecycle events logged to log files for debugging
 - **Orphaned task detection**: Identify and resurface tasks without active workers
 

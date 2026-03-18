@@ -284,6 +284,30 @@ def test_registry_remove(temp_workers_dir):
     assert not metadata_file.exists()
 
 
+def test_registry_remove_deletes_startup_log_artifact(temp_workers_dir):
+    """Removing a worker also deletes its startup log file."""
+    registry = WorkerRegistry(temp_workers_dir)
+    startup_log = temp_workers_dir / "w-test-remove-startup-startup.log"
+    startup_log.write_text("startup output")
+
+    worker = WorkerMetadata(
+        worker_id="w-test-remove-startup",
+        pid=12349,
+        task_id=5,
+        task_slug="20260107-remove-startup",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status="failed",
+        log_file=None,
+        worktree=None,
+        startup_log_file=".gza/workers/w-test-remove-startup-startup.log",
+    )
+    registry.register(worker)
+
+    registry.remove("w-test-remove-startup")
+
+    assert not startup_log.exists()
+
+
 def test_registry_cleanup_stale(temp_workers_dir):
     """Test cleaning up stale workers."""
     registry = WorkerRegistry(temp_workers_dir)

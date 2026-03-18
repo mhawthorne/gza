@@ -264,6 +264,21 @@ class WorkerRegistry:
         Args:
             worker_id: Worker ID to remove
         """
+        worker = self.get(worker_id)
+        startup_log_path = None
+        if worker and worker.startup_log_file:
+            raw_startup_log_path = Path(worker.startup_log_file)
+            if raw_startup_log_path.is_absolute():
+                startup_log_path = raw_startup_log_path
+            else:
+                project_dir = self.workers_dir.parent.parent
+                candidates = [
+                    project_dir / raw_startup_log_path,
+                    self.workers_dir / raw_startup_log_path,
+                    self.workers_dir / raw_startup_log_path.name,
+                ]
+                startup_log_path = next((p for p in candidates if p.exists()), candidates[0])
+
         metadata_path = self._metadata_path(worker_id)
         if metadata_path.exists():
             metadata_path.unlink()
@@ -271,3 +286,6 @@ class WorkerRegistry:
         pid_path = self._pid_path(worker_id)
         if pid_path.exists():
             pid_path.unlink()
+
+        if startup_log_path and startup_log_path.exists():
+            startup_log_path.unlink()

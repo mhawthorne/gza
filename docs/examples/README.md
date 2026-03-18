@@ -42,7 +42,7 @@ Practical examples showing common workflows with Gza.
 | Advance (execute) | `gza advance --auto --batch 3` |
 | Review/improve cycle | `gza iterate <impl_id>` |
 | View pending | `gza next` |
-| View running workers | `gza ps` |
+| View active/startup-failed workers | `gza ps` |
 | Tail worker logs | `gza log -w <worker_id> -f` |
 | View task log | `gza log <task_id>` |
 | Stop a worker | `gza stop <worker_id>` |

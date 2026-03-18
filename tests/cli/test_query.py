@@ -1345,6 +1345,79 @@ class TestPsCommand:
 
         registry.remove("w-test-startup-ps")
 
+    def test_ps_default_includes_startup_failure_but_filters_other_terminal_rows(self, tmp_path: Path):
+        """Default ps keeps startup failures visible while filtering other terminal rows."""
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-running",
+                pid=99998,
+                task_id=None,
+                task_slug="running-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-startup-failed",
+                pid=99997,
+                task_id=None,
+                task_slug="startup-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                startup_log_file=".gza/workers/w-test-ps-startup-failed-startup.log",
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-failed",
+                pid=99996,
+                task_id=None,
+                task_slug="ordinary-failed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-completed",
+                pid=99995,
+                task_id=None,
+                task_slug="completed-worker",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                exit_code=0,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        result = run_gza("ps", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "running-worker" in result.stdout
+        assert "failed(startup)" in result.stdout
+        assert "ordinary-failed-worker" not in result.stdout
+        assert "completed-worker" not in result.stdout
+
+        registry.remove("w-test-ps-running")
+        registry.remove("w-test-ps-startup-failed")
+        registry.remove("w-test-ps-failed")
+        registry.remove("w-test-ps-completed")
+
     def test_print_ps_output_poll_adopts_first_seen_startup_failure(self, tmp_path: Path, capsys):
         """Poll path keeps startup-failed workers visible on first observation."""
         import argparse
