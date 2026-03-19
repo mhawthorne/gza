@@ -3,7 +3,7 @@ name: gza-code-review-interactive
 description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
 allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
 version: 2.0.0
-public: false
+public: true
 ---
 
 # Interactive Code Review
