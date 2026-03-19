@@ -97,9 +97,9 @@ class TestReconciliationWarnings:
         setup_config(tmp_path)
 
         with (
-            patch.object(sys, "argv", ["gza", "next", "--project", str(tmp_path)]),
+            patch.object(sys, "argv", ["gza", "ps", "--project", str(tmp_path)]),
             patch("gza.cli.main.reconcile_in_progress_tasks", side_effect=RuntimeError("boom")),
-            patch("gza.cli.main.cmd_next", return_value=0),
+            patch("gza.cli.main.cmd_ps", return_value=0),
         ):
             rc = main()
 

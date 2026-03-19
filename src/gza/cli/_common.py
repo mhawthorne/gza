@@ -46,8 +46,8 @@ def reconcile_in_progress_tasks(config: Config) -> None:
         task_label = f"#{task.id}" if task.id is not None else "<unknown>"
         try:
             if task.running_pid is None:
-                # Keep legacy/manual resumable rows untouched.
-                if task.started_at is not None and task.session_id is None:
+                # No PID tracked — mark as orphaned if the task was actually started.
+                if task.started_at is not None:
                     store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
                 continue
 

@@ -1439,8 +1439,7 @@ def _complete_code_task(
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
             ])
-            detected = extract_failure_reason(log_file)
-            failure_reason = detected if detected != "UNKNOWN" else "TIMEOUT"
+            failure_reason = extract_failure_reason(log_file)
             write_log_entry(
                 log_file,
                 {

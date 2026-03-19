@@ -1220,8 +1220,14 @@ def main() -> int:
             print(f"Error: {args.project_dir} is not a directory")
             return 1
 
+    # Commands where reconciling orphaned in-progress tasks is useful.
+    _RECONCILE_COMMANDS = {
+        "work", "ps", "status", "stop", "advance", "retry",
+        "mark-completed", "set-status",
+    }
+
     try:
-        if args.command != "init":
+        if args.command in _RECONCILE_COMMANDS:
             try:
                 cfg = Config.load(args.project_dir)
             except Exception as exc:
