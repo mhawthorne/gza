@@ -39,6 +39,7 @@ from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
     get_improves_for_root as _get_improves_for_root_task,
     build_lineage_tree as _build_lineage_tree_for_root,
+    filter_lineage_tree as _filter_lineage_tree,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 
@@ -369,8 +370,14 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         reviews = _get_reviews_for_root_task(store, root_task)
         improve_tasks = _get_improves_for_root_task(store, root_task)
         lineage_tree = _build_lineage_tree_for_root(store, root_task)
+        filtered_lineage_tree = _filter_lineage_tree(lineage_tree, {"review", "improve"})
         c = UNMERGED_COLORS  # shorthand
-        lineage_str = _format_lineage(lineage_tree, c["task_id"])
+        lineage_str = _format_lineage(
+            filtered_lineage_tree,
+            c["task_id"],
+            annotate=True,
+            review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
+        )
 
         # Classify review freshness/status for this implementation.
         latest_review = next((r for r in reviews if r.completed_at is not None), None)

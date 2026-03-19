@@ -8,7 +8,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..config import Config
 from ..console import (
@@ -576,15 +576,80 @@ def _create_improve_task(
 from ..query import TaskLineageNode as _TaskLineageNode
 
 
-def _format_lineage(lineage_tree: _TaskLineageNode, task_id_color: str = "dim") -> str:
+def _format_lineage(
+    lineage_tree: _TaskLineageNode,
+    task_id_color: str = "dim",
+    *,
+    annotate: bool = False,
+    review_verdict_resolver: Callable[[DbTask], str | None] | None = None,
+) -> str:
     """Format a lineage tree as a multi-line branch rendering."""
+
+    def _normalize_time(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def _lineage_time(task: DbTask) -> datetime:
+        return task.completed_at or task.created_at or datetime.min
+
+    latest_review_task_id: int | None = None
+    if annotate:
+        review_tasks: list[DbTask] = []
+
+        def _collect_reviews(node: _TaskLineageNode) -> None:
+            if node.task.task_type == "review":
+                review_tasks.append(node.task)
+            for child_node in node.children:
+                _collect_reviews(child_node)
+
+        _collect_reviews(lineage_tree)
+        if review_tasks:
+            latest_review = max(
+                review_tasks,
+                key=lambda task: (
+                    _normalize_time(_lineage_time(task)),
+                    task.id if task.id is not None else -1,
+                ),
+            )
+            latest_review_task_id = latest_review.id
+
+    def _annotation(task: DbTask) -> str:
+        if not annotate:
+            return ""
+
+        completed_label = (
+            task.completed_at.strftime("%Y-%m-%d %H:%M")
+            if task.completed_at
+            else "n/a"
+        )
+        status_label = task.status or "unknown"
+        verdict_label = "-"
+
+        if task.task_type == "review":
+            verdict = (
+                review_verdict_resolver(task)
+                if review_verdict_resolver is not None
+                else parse_review_verdict(task.output_content)
+            )
+            verdict_map = {
+                "APPROVED": "approved",
+                "CHANGES_REQUESTED": "changes_requested",
+                "NEEDS_DISCUSSION": "needs_discussion",
+            }
+            verdict_label = verdict_map.get(verdict, "unknown") if verdict else "unknown"
+            if latest_review_task_id is not None and task.id == latest_review_task_id:
+                verdict_label = f"{verdict_label} \u2190 latest"
+
+        return f" [dim]({completed_label} | {status_label} | {verdict_label})[/dim]"
 
     def _node_label(task: DbTask) -> str:
         if task.id is None:
-            return f"[dim]\\[{task.task_type}][/dim]"
+            return f"[dim]\\[{task.task_type}][/dim]{_annotation(task)}"
         return (
             f"[{task_id_color}]#{task.id}[/{task_id_color}]"
             f"[dim]\\[{task.task_type}][/dim]"
+            f"{_annotation(task)}"
         )
 
     lines: list[str] = [_node_label(lineage_tree.task)]

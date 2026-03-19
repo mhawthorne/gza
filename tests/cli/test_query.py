@@ -2595,6 +2595,71 @@ class TestUnmergedReviewStatus:
         assert "[improve]" in result.stdout
         assert "review stale" in result.stdout
 
+    def test_unmerged_lineage_filters_downstream_implement_and_shows_annotations(self, tmp_path: Path):
+        """Unmerged lineage omits downstream implement nodes and annotates each rendered node."""
+        store, impl, git = setup_unmerged_env(tmp_path)
+
+        review = store.add("Review", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=timezone.utc)
+        review.depends_on = impl.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        improve = store.add("Improve", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=timezone.utc)
+        improve.based_on = impl.id
+        improve.depends_on = review.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        downstream_impl = store.add("Downstream implement noise", task_type="implement")
+        downstream_impl.status = "completed"
+        downstream_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=timezone.utc)
+        downstream_impl.based_on = impl.id
+        downstream_impl.branch = "feature/test"
+        downstream_impl.same_branch = True
+        store.update(downstream_impl)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "lineage:" in result.stdout
+        assert f"#{impl.id}" in result.stdout
+        assert f"#{review.id}" in result.stdout
+        assert f"#{improve.id}" in result.stdout
+        assert f"#{downstream_impl.id}" not in result.stdout
+        assert "| completed |" in result.stdout
+        assert "changes_requested" in result.stdout
+        assert "← latest" in result.stdout
+
+    def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
+        """The most recent review node is annotated with the latest marker."""
+        store, impl, git = setup_unmerged_env(tmp_path)
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=timezone.utc)
+        older_review.depends_on = impl.id
+        older_review.output_content = "Verdict: APPROVED"
+        store.update(older_review)
+
+        latest_review = store.add("Latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=timezone.utc)
+        latest_review.depends_on = impl.id
+        latest_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        older_idx = result.stdout.index(f"#{older_review.id}")
+        latest_idx = result.stdout.index(f"#{latest_review.id}")
+        marker_idx = result.stdout.index("← latest")
+        assert marker_idx > latest_idx
+        assert not (older_idx < marker_idx < latest_idx)
+
 
 class TestUnmergedAllFlag:
     """Tests for 'gza unmerged --all' flag."""
