@@ -1303,6 +1303,42 @@ class TestRebaseHelpers:
         assert internal_task.status == "failed"
         assert internal_task.failure_reason == "UNKNOWN"
 
+    def test_invoke_provider_resolve_marks_internal_task_failed_on_nonzero_exit(self, tmp_path):
+        """Non-zero provider exits should fail resolve even without an exception."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="codex")
+        store = SqliteTaskStore(config.db_path)
+        task = SimpleNamespace(
+            id=45,
+            task_type="implement",
+            provider=None,
+            provider_is_explicit=False,
+            model=None,
+        )
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=1)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config)
+
+        assert result is False
+        internal_tasks = store.get_history(limit=None, task_type="internal")
+        assert len(internal_tasks) == 1
+        internal_task = internal_tasks[0]
+        assert internal_task.status == "failed"
+        assert internal_task.failure_reason == "UNKNOWN"
+        assert internal_task.output_content is None
+
     def test_ensure_skill_returns_true_when_skill_already_present(self, tmp_path):
         """ensure_skill returns True immediately when the skill file already exists."""
         from gza.cli import ensure_skill

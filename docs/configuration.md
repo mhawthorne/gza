@@ -670,6 +670,8 @@ gza groups
 
 List recent completed or failed tasks.
 
+By default, `gza history` excludes `internal` tasks. Use `--type internal` to view internal task history.
+
 ```bash
 gza history [options]
 ```

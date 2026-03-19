@@ -418,10 +418,14 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
     store.mark_in_progress(internal_task)
 
     try:
-        provider.run(resolve_config, "/gza-rebase --auto --continue", log_file, config.project_dir)
+        run_result = provider.run(resolve_config, "/gza-rebase --auto --continue", log_file, config.project_dir)
     except Exception:
         store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
         raise
+
+    if run_result.exit_code != 0:
+        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
+        return False
 
     # Check if rebase completed (no longer in rebase state)
     rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
