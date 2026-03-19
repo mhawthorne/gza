@@ -3332,6 +3332,43 @@ class TestGetHistorySinceParam:
         assert len(results) == 3
 
 
+class TestGetHistoryInternalFiltering:
+    """Tests for default internal-task filtering in get_history()."""
+
+    def test_excludes_internal_tasks_by_default(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+
+        impl = store.add("Implement task", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = now
+        store.update(impl)
+
+        internal = store.add("Internal task", task_type="internal")
+        internal.status = "completed"
+        internal.completed_at = now
+        store.update(internal)
+
+        results = store.get_history(limit=None)
+        prompts = [t.prompt for t in results]
+        assert "Implement task" in prompts
+        assert "Internal task" not in prompts
+
+    def test_includes_internal_tasks_when_task_type_requested(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+
+        internal = store.add("Internal task", task_type="internal")
+        internal.status = "completed"
+        internal.completed_at = now
+        store.update(internal)
+
+        results = store.get_history(limit=None, task_type="internal")
+        assert len(results) == 1
+        assert results[0].task_type == "internal"
+        assert results[0].prompt == "Internal task"
+
+
 class TestGetBasedOnChildren:
     """Tests for SqliteTaskStore.get_based_on_children()."""
 

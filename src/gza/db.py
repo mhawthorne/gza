@@ -1036,6 +1036,8 @@ class SqliteTaskStore:
             if task_type:
                 where_clauses.append("task_type = ?")
                 params.append(task_type)
+            else:
+                where_clauses.append("task_type != 'internal'")
 
             if since is not None:
                 since_str = since.isoformat()

@@ -1197,6 +1197,77 @@ class TestRebaseHelpers:
             resolve_config = mock_get_provider.call_args.args[0]
             assert resolve_config.provider == "codex"
 
+    def test_invoke_provider_resolve_creates_internal_task_record(self, tmp_path):
+        """Auto-resolve should persist an internal task so history/auditing can find it."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="codex")
+        store = SqliteTaskStore(config.db_path)
+        task = SimpleNamespace(
+            id=42,
+            task_type="implement",
+            provider=None,
+            provider_is_explicit=False,
+            model=None,
+        )
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config)
+
+        assert result is True
+        internal_tasks = store.get_history(limit=None, task_type="internal")
+        assert len(internal_tasks) == 1
+        internal_task = internal_tasks[0]
+        assert internal_task.status == "completed"
+        assert internal_task.skip_learnings is True
+        assert internal_task.output_content is not None
+        assert "/gza-rebase --auto --continue" in internal_task.output_content
+
+    def test_invoke_provider_resolve_marks_internal_task_failed_on_exception(self, tmp_path):
+        """Provider exceptions should mark the tracking internal task as failed."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="codex")
+        store = SqliteTaskStore(config.db_path)
+        task = SimpleNamespace(
+            id=43,
+            task_type="implement",
+            provider=None,
+            provider_is_explicit=False,
+            model=None,
+        )
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.side_effect = RuntimeError("provider failure")
+            mock_get_provider.return_value = mock_provider
+
+            with pytest.raises(RuntimeError, match="provider failure"):
+                invoke_provider_resolve(task, "feature", "main", config)
+
+        internal_tasks = store.get_history(limit=None, task_type="internal")
+        assert len(internal_tasks) == 1
+        internal_task = internal_tasks[0]
+        assert internal_task.status == "failed"
+        assert internal_task.failure_reason == "UNKNOWN"
+
     def test_ensure_skill_returns_true_when_skill_already_present(self, tmp_path):
         """ensure_skill returns True immediately when the skill file already exists."""
         from gza.cli import ensure_skill
