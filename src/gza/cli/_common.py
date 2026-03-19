@@ -87,7 +87,14 @@ def prune_terminal_dead_workers(config: Config) -> None:
             if worker.task_id is None:
                 continue
             task = store.get(worker.task_id)
-            if task is None or task.status not in terminal_statuses:
+            if task is None:
+                print(
+                    f"Warning: Worker {worker.worker_id} references task {task_label} not found in DB; "
+                    f"possible registry/DB desynchronization",
+                    file=sys.stderr,
+                )
+                continue
+            if task.status not in terminal_statuses:
                 continue
             if registry.is_running(worker.worker_id):
                 continue
