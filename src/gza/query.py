@@ -279,6 +279,51 @@ def build_lineage_tree(
     return root
 
 
+def filter_lineage_tree(
+    tree: TaskLineageNode,
+    allowed_types: set[str] | list[str] | tuple[str, ...],
+) -> TaskLineageNode:
+    """Return a lineage tree with disallowed descendants pruned.
+
+    The root node is always preserved so callers can keep a stable lineage anchor.
+    Any disallowed descendants are removed, and their allowed descendants are
+    re-parented to the nearest retained ancestor.
+    """
+    allowed = set(allowed_types)
+
+    def _filter_children(node: TaskLineageNode) -> list[TaskLineageNode]:
+        filtered: list[TaskLineageNode] = []
+        for child in node.children:
+            kept_grandchildren = _filter_children(child)
+            if child.task.task_type in allowed:
+                filtered.append(
+                    TaskLineageNode(
+                        task=child.task,
+                        depth=0,
+                        relationship=child.relationship,
+                        children=kept_grandchildren,
+                    )
+                )
+            else:
+                filtered.extend(kept_grandchildren)
+        return filtered
+
+    filtered_root = TaskLineageNode(
+        task=tree.task,
+        depth=0,
+        relationship=tree.relationship,
+        children=_filter_children(tree),
+    )
+
+    def _assign_depths(node: TaskLineageNode, depth: int) -> None:
+        node.depth = depth
+        for child in node.children:
+            _assign_depths(child, depth + 1)
+
+    _assign_depths(filtered_root, 0)
+    return filtered_root
+
+
 def flatten_lineage_tree(node: TaskLineageNode) -> list[Task]:
     """Flatten lineage tree to a deterministic pre-order traversal."""
     items: list[Task] = [node.task]

@@ -8,6 +8,7 @@ import pytest
 from gza.query import (
     build_lineage,
     build_lineage_tree,
+    filter_lineage_tree,
     get_base_task_slug,
     get_improves_for_root,
     get_reviews_for_root,
@@ -309,6 +310,46 @@ class TestBuildLineage:
         store.get_lineage_children.side_effect = lineage_children
         tree = build_lineage_tree(store, root)
         assert [child.relationship for child in tree.children] == ["review", "implement-based"]
+
+
+# ---------------------------------------------------------------------------
+# filter_lineage_tree
+# ---------------------------------------------------------------------------
+
+
+class TestFilterLineageTree:
+    def test_prunes_disallowed_children_and_reparents_allowed_descendants(self):
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        downstream_impl = _make_task(id=2, task_type="implement", based_on=1, created_at=datetime(2026, 1, 2))
+        review = _make_task(id=3, task_type="review", depends_on=2, created_at=datetime(2026, 1, 3))
+        improve = _make_task(
+            id=4,
+            task_type="improve",
+            based_on=1,
+            depends_on=3,
+            created_at=datetime(2026, 1, 4),
+        )
+
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [downstream_impl]
+            if task_id == 2:
+                return [review]
+            if task_id == 3:
+                return [improve]
+            return []
+
+        store.get_lineage_children.side_effect = lineage_children
+
+        tree = build_lineage_tree(store, root)
+        filtered = filter_lineage_tree(tree, {"review", "improve"})
+
+        assert filtered.task.id == 1
+        assert [child.task.id for child in filtered.children] == [3]
+        assert [child.task.id for child in filtered.children[0].children] == [4]
+        assert filtered.children[0].depth == 1
+        assert filtered.children[0].children[0].depth == 2
 
 
 # ---------------------------------------------------------------------------
