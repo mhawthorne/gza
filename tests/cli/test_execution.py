@@ -1,13 +1,16 @@
 """Tests for task execution and lifecycle CLI commands."""
 
 
+import argparse
+import os
+import signal as signal_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from gza.cli import _run_foreground
+from gza.cli import _run_as_worker, _run_foreground
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.workers import WorkerRegistry
@@ -3163,6 +3166,115 @@ class TestRunForeground:
         assert mock_mark.call_count == 1
         assert mock_mark.call_args.kwargs.get("status") == "failed"
         assert mock_mark.call_args.kwargs.get("exit_code") == 130
+
+
+class TestRunAsWorker:
+    """Tests for _run_as_worker() helper."""
+
+    def _register_current_worker(self, config: Config, task_id: int, worker_id: str) -> WorkerRegistry:
+        from gza.workers import WorkerMetadata
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id=worker_id,
+                task_id=task_id,
+                pid=os.getpid(),
+                status="running",
+                startup_log_file=f"{worker_id}-startup.log",
+            )
+        )
+        return registry
+
+    def test_run_as_worker_nonzero_exit_marks_failed(self, tmp_path: Path):
+        """Worker metadata status is failed when run() returns non-zero."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker non-zero")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-nonzero")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", return_value=7):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 7
+        worker = registry.get("w-worker-nonzero")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 7
+
+    def test_run_as_worker_exception_marks_failed_and_ps_shows_startup_failure(self, tmp_path: Path):
+        """Exception cleanup keeps worker/task failed and startup failure visible in ps rows."""
+        from gza.cli.query import _build_ps_rows
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker exception")
+        assert task.id is not None
+        store.mark_in_progress(task)
+
+        registry = self._register_current_worker(config, task.id, "w-worker-exception")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", side_effect=RuntimeError("boom")):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 1
+        worker = registry.get("w-worker-exception")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=True)
+        row = next(r for r in rows if r["worker_id"] == "w-worker-exception")
+        assert row["status"] == "failed"
+        assert row["startup_failure"] is True
+
+    def test_run_as_worker_signal_handler_marks_failed(self, tmp_path: Path):
+        """Signal handler cleanup marks worker as failed before exiting."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker signal")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-signal")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        installed_handlers: dict[int, object] = {}
+
+        def capture_signal(signum, handler):
+            installed_handlers[signum] = handler
+            return None
+
+        def run_then_signal(*_args, **_kwargs):
+            handler = installed_handlers.get(signal_mod.SIGTERM)
+            assert callable(handler)
+            handler(signal_mod.SIGTERM, None)
+            return 0
+
+        with patch("gza.cli.signal.signal", side_effect=capture_signal):
+            with patch("gza.cli.run", side_effect=run_then_signal):
+                with pytest.raises(SystemExit) as exc:
+                    _run_as_worker(args, config)
+
+        assert exc.value.code == 1
+        worker = registry.get("w-worker-signal")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
 
 class TestForceCompleteRemoval:
     """Tests for removed force-complete command."""

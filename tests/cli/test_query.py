@@ -2984,3 +2984,98 @@ class TestStopCommandSafety:
         assert rc == 1
         assert "Refusing to stop worker w-stop-safety" in captured.out
         mock_stop.assert_not_called()
+
+    def test_stop_all_skips_worker_with_pid_ownership_mismatch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """stop --all must skip workers whose task running_pid points to another process."""
+        from gza.cli.query import cmd_stop
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        task = store.add("Mismatch task")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.running_pid = os.getpid() + 12345
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-all-mismatch",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+
+        args = argparse.Namespace(project_dir=tmp_path, worker_id=None, all=True, force=False)
+        with patch("gza.cli.query.WorkerRegistry.stop") as mock_stop:
+            rc = cmd_stop(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
+        mock_stop.assert_not_called()
+
+    def test_stop_all_only_signals_ownership_valid_workers(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """stop --all should signal only workers whose PID ownership matches task.running_pid."""
+        from gza.cli.query import cmd_stop
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+
+        valid_task = store.add("Valid task")
+        assert valid_task.id is not None
+        valid_task.status = "in_progress"
+        valid_task.running_pid = os.getpid()
+        store.update(valid_task)
+
+        mismatch_task = store.add("Mismatch task")
+        assert mismatch_task.id is not None
+        mismatch_task.status = "in_progress"
+        mismatch_task.running_pid = os.getpid() + 54321
+        store.update(mismatch_task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-all-valid",
+                task_id=valid_task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-all-mismatch",
+                task_id=mismatch_task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+
+        args = argparse.Namespace(project_dir=tmp_path, worker_id=None, all=True, force=False)
+        with patch("gza.cli.query.WorkerRegistry.stop", return_value=True) as mock_stop:
+            rc = cmd_stop(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Stopping worker w-stop-all-valid" in captured.out
+        assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
+        called_workers = [call.args[0] for call in mock_stop.call_args_list]
+        assert called_workers == ["w-stop-all-valid"]

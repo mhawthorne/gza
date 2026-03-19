@@ -278,7 +278,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     def signal_handler(signum, frame):
         print("\nReceived shutdown signal, cleaning up...")
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=1)
+            registry.mark_completed(worker_id, exit_code=1, status="failed")
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, signal_handler)
@@ -310,7 +310,8 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
         # Update worker status on completion
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=exit_code)
+            status = "completed" if exit_code == 0 else "failed"
+            registry.mark_completed(worker_id, exit_code=exit_code, status=status)
 
         return exit_code
 
@@ -327,7 +328,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             with open(startup_log_path, "a") as f:
                 f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\\n")
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=1)
+            registry.mark_completed(worker_id, exit_code=1, status="failed")
         return 1
 
 

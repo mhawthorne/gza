@@ -995,6 +995,19 @@ def _format_started(started: datetime | None) -> str:
     return started_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _has_pid_ownership_mismatch(worker: WorkerMetadata, store: SqliteTaskStore) -> bool:
+    """Return True when task runtime ownership disagrees with worker metadata PID."""
+    if worker.task_id is None:
+        return False
+    task = store.get(worker.task_id)
+    return (
+        task is not None
+        and task.status == "in_progress"
+        and task.running_pid is not None
+        and task.running_pid != worker.pid
+    )
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Stop a running worker."""
     config = Config.load(args.project_dir)
@@ -1016,6 +1029,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
             return 0
 
         for worker in running_workers:
+            if _has_pid_ownership_mismatch(worker, store):
+                task = store.get(worker.task_id) if worker.task_id is not None else None
+                running_pid = task.running_pid if task is not None else None
+                print(
+                    f"Skipping worker {worker.worker_id}: PID ownership mismatch "
+                    f"(worker PID {worker.pid}, task running_pid {running_pid})."
+                )
+                continue
             print(f"Stopping worker {worker.worker_id} (PID {worker.pid})...")
             if registry.stop(worker.worker_id, force=args.force if hasattr(args, 'force') else False):
                 print(f"  ✓ Sent stop signal")
@@ -1039,19 +1060,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print("Run 'gza cleanup' to remove stale worker records.")
         return 1
 
-    if worker.task_id is not None:
-        task = store.get(worker.task_id)
-        if (
-            task is not None
-            and task.status == "in_progress"
-            and task.running_pid is not None
-            and task.running_pid != worker.pid
-        ):
-            print(
-                f"Refusing to stop worker {args.worker_id}: PID ownership mismatch "
-                f"(worker PID {worker.pid}, task running_pid {task.running_pid})."
-            )
-            return 1
+    if _has_pid_ownership_mismatch(worker, store):
+        task = store.get(worker.task_id) if worker.task_id is not None else None
+        running_pid = task.running_pid if task is not None else None
+        print(
+            f"Refusing to stop worker {args.worker_id}: PID ownership mismatch "
+            f"(worker PID {worker.pid}, task running_pid {running_pid})."
+        )
+        return 1
 
     if not registry.is_running(args.worker_id):
         print(f"Worker {args.worker_id} is not running (process not found)")
