@@ -1146,58 +1146,73 @@ def _determine_advance_action(
     }
 
 
-def _cmd_advance_plans(
+def _unimplemented_implement_prompt(task: DbTask) -> str:
+    """Build the default implement prompt for a completed upstream task."""
+    assert task.id is not None
+    slug = _get_base_task_slug(task)
+    if task.task_type == "plan":
+        return f"Implement plan from task #{task.id}: {slug}" if slug else f"Implement plan from task #{task.id}"
+    return f"Implement findings from task #{task.id}: {slug}" if slug else f"Implement findings from task #{task.id}"
+
+
+def _cmd_advance_unimplemented(
     config: "Config",
     store: SqliteTaskStore,
     dry_run: bool = False,
     create: bool = False,
+    task_types: tuple[str, ...] = ("plan", "explore"),
 ) -> int:
-    """List completed plans that have no implementation task.
+    """List completed task types that have no implementation task.
 
-    With --create, creates queued implement tasks for each such plan.
+    With --create, creates queued implement tasks for each such task.
     """
-    all_completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
+    all_completed: list[DbTask] = []
+    for task_type in task_types:
+        all_completed.extend(store.get_history(limit=None, status="completed", task_type=task_type))
 
-    # Find plans that have no implement task pointing at them (via based_on).
+    # Find tasks that have no implement task pointing at them (via based_on).
     # Use a targeted query instead of a full table scan to avoid loading every
     # task (including output_content blobs) into memory.
     impl_based_on_ids: set[int] = store.get_impl_based_on_ids()
 
-    pending_plans = [p for p in all_completed_plans if p.id not in impl_based_on_ids]
+    pending_tasks = [task for task in all_completed if task.id not in impl_based_on_ids]
 
-    if not pending_plans:
-        print("No completed plans without implementation tasks.")
+    if not pending_tasks:
+        task_label = "/".join(task_types)
+        print(f"No completed {task_label} tasks without implementation tasks.")
         return 0
 
-    print(f"Completed plans without implementation ({len(pending_plans)}):")
+    task_label = "/".join(task_types)
+    print(f"Completed {task_label} tasks without implementation ({len(pending_tasks)}):")
     print()
-    for plan in pending_plans:
-        assert plan.id is not None
-        prompt_display = truncate(plan.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        print(f"  #{plan.id}  {prompt_display}")
-        print(f"       → gza implement {plan.id}")
+    for task in pending_tasks:
+        assert task.id is not None
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        print(f"  #{task.id}  [{task.task_type}] {prompt_display}")
+        print(f"       → gza implement {task.id}")
     print()
 
     if not create:
-        print("Run 'gza advance' or 'gza advance --type plan' to create and start implement tasks.")
+        print("Run 'gza advance' to create and start implement tasks for completed plan tasks.")
+        if "explore" in task_types:
+            print("Run 'gza advance --unimplemented --create' to create implement tasks for completed explore tasks.")
         return 0
 
     # Create queued implement tasks
     created_count = 0
-    for plan in pending_plans:
-        assert plan.id is not None
+    for task in pending_tasks:
+        assert task.id is not None
         if dry_run:
-            print(f"[dry-run] Would create implement task for plan #{plan.id}")
+            print(f"[dry-run] Would create implement task for {task.task_type} #{task.id}")
             continue
-        slug = _get_base_task_slug(plan)
-        prompt_text = f"Implement plan from task #{plan.id}: {slug}" if slug else f"Implement plan from task #{plan.id}"
+        prompt_text = _unimplemented_implement_prompt(task)
         impl_task = store.add(
             prompt=prompt_text,
             task_type="implement",
-            based_on=plan.id,
-            group=plan.group,
+            based_on=task.id,
+            group=task.group,
         )
-        print(f"✓ Created implement task #{impl_task.id} for plan #{plan.id}")
+        print(f"✓ Created implement task #{impl_task.id} for {task.task_type} #{task.id}")
         created_count += 1
 
     if not dry_run:
@@ -1235,6 +1250,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     batch_limit: int | None = getattr(args, 'batch', None)
     task_id: int | None = getattr(args, 'task_id', None)
     plans_mode: bool = getattr(args, 'plans', False)
+    unimplemented_mode: bool = getattr(args, 'unimplemented', False)
     create_mode: bool = getattr(args, 'create', False)
     no_resume_failed: bool = getattr(args, 'no_resume_failed', False)
     max_resume_attempts_override: int | None = getattr(args, 'max_resume_attempts', None)
@@ -1262,9 +1278,19 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print("Error: --batch must be a positive integer", file=sys.stderr)
         return 1
 
-    # --plans mode: list completed plans without implementations
-    if plans_mode:
-        return _cmd_advance_plans(config, store, dry_run=dry_run, create=create_mode)
+    # --unimplemented mode: list completed plans/explores without implementations
+    # Legacy --plans is supported as an alias scoped to plans only.
+    if unimplemented_mode or plans_mode:
+        unimplemented_types: tuple[str, ...] = ("plan",) if plans_mode and not unimplemented_mode else ("plan", "explore")
+        if plans_mode:
+            print("Warning: --plans is deprecated. Use --unimplemented instead.", file=sys.stderr)
+        return _cmd_advance_unimplemented(
+            config,
+            store,
+            dry_run=dry_run,
+            create=create_mode,
+            task_types=unimplemented_types,
+        )
 
     # Pre-compute the set of plan IDs that already have implement children
     # to avoid repeated DB queries in _determine_advance_action.
@@ -1642,8 +1668,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         elif action_type == 'create_implement':
             # Create an implement task for a completed plan and spawn a worker
-            slug = _get_base_task_slug(task)
-            prompt_text = f"Implement plan from task #{task.id}: {slug}" if slug else f"Implement plan from task #{task.id}"
+            prompt_text = _unimplemented_implement_prompt(task)
             impl_task = store.add(
                 prompt=prompt_text,
                 task_type="implement",

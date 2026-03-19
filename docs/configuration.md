@@ -844,8 +844,8 @@ gza advance [task_id] [options]
 | `--dry-run` | Preview actions without executing them |
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
-| `--plans` | List completed plans with no implementation task yet |
-| `--create` | With `--plans`: create queued implement tasks for listed plans |
+| `--unimplemented` | List completed plans/explores with no implementation task yet |
+| `--create` | With `--unimplemented`: create queued implement tasks for listed tasks |
 | `--auto`, `-y` | Skip confirmation and execute immediately |
 | `--batch B` | Stop after spawning B background workers |
 | `--no-resume-failed` | Skip auto-resume of failed tasks |

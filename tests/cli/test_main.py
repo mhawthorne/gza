@@ -72,3 +72,15 @@ class TestHelpOutput:
         assert "Render root-deduplicated lineage trees up to N levels" in result.stdout
         assert "from each resolved root" in result.stdout
         assert "Expand lineage N levels for each matching task" not in result.stdout
+
+    def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
+        """advance --help should show --unimplemented and keep --plans hidden."""
+        result = subprocess.run(
+            ["uv", "run", "gza", "advance", "--help"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "--unimplemented" in result.stdout
+        assert "--plans" not in result.stdout

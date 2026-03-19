@@ -196,14 +196,19 @@ def main() -> int:
         help="Run workers directly instead of in Docker",
     )
     advance_parser.add_argument(
+        "--unimplemented",
+        action="store_true",
+        help="List completed plans/explores with no implementation task yet",
+    )
+    advance_parser.add_argument(
         "--plans",
         action="store_true",
-        help="List completed plans that have no implementation task yet",
+        help=argparse.SUPPRESS,
     )
     advance_parser.add_argument(
         "--create",
         action="store_true",
-        help="With --plans: create queued implement tasks for all listed plans",
+        help="With --unimplemented: create queued implement tasks for listed tasks",
     )
     advance_parser.add_argument(
         "--auto",
