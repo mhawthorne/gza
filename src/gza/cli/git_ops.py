@@ -403,12 +403,48 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
     log_file = log_dir / f"resolve-{timestamp}.log"
 
     provider = get_provider(resolve_config)
-    provider.run(resolve_config, "/gza-rebase --auto --continue", log_file, config.project_dir)
+    store = get_store(config)
+    task_id_label = getattr(task, "id", None)
+    task_ref = f"#{task_id_label}" if task_id_label is not None else "<unknown>"
+    internal_prompt = (
+        f"Resolve rebase conflicts for task {task_ref} branch '{branch}' onto '{target}' "
+        "using /gza-rebase --auto --continue."
+    )
+    internal_task = store.add(
+        prompt=internal_prompt,
+        task_type="internal",
+        skip_learnings=True,
+    )
+    store.mark_in_progress(internal_task)
+
+    try:
+        run_result = provider.run(resolve_config, "/gza-rebase --auto --continue", log_file, config.project_dir)
+    except Exception:
+        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
+        raise
+
+    if run_result.exit_code != 0:
+        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
+        return False
 
     # Check if rebase completed (no longer in rebase state)
     rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
+    output_content = (
+        "Resolved rebase conflicts with /gza-rebase --auto --continue."
+        if not rebase_in_progress
+        else "Rebase still in progress after /gza-rebase --auto --continue."
+    )
+    if rebase_in_progress:
+        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
+        return False
 
-    return not rebase_in_progress
+    store.mark_completed(
+        internal_task,
+        log_file=str(log_file),
+        output_content=output_content,
+        has_commits=False,
+    )
+    return True
 
 
 def cmd_rebase(args: argparse.Namespace) -> int:

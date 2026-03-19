@@ -446,6 +446,48 @@ class TestGetHistory:
         assert pending.id not in ids
         assert completed.id in ids
 
+    def test_default_excludes_internal_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        internal = store.add("Internal task", task_type="internal")
+        internal.status = "completed"
+        internal.completed_at = datetime.now(timezone.utc)
+        store.update(internal)
+
+        completed = store.add("Completed task", task_type="implement")
+        completed.status = "completed"
+        completed.completed_at = datetime.now(timezone.utc)
+        store.update(completed)
+
+        client = make_client(tmp_path)
+        result = client.get_history(limit=None)
+        prompts = {task.prompt for task in result}
+
+        assert "Completed task" in prompts
+        assert "Internal task" not in prompts
+
+    def test_explicit_internal_type_includes_internal_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        internal = store.add("Internal task", task_type="internal")
+        internal.status = "completed"
+        internal.completed_at = datetime.now(timezone.utc)
+        store.update(internal)
+
+        completed = store.add("Completed task", task_type="implement")
+        completed.status = "completed"
+        completed.completed_at = datetime.now(timezone.utc)
+        store.update(completed)
+
+        client = make_client(tmp_path)
+        result = client.get_history(limit=None, task_type="internal")
+        prompts = {task.prompt for task in result}
+
+        assert "Internal task" in prompts
+        assert "Completed task" not in prompts
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_recent_completed

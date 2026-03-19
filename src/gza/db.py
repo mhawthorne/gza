@@ -1000,7 +1000,8 @@ class SqliteTaskStore:
             status: Filter by specific status (e.g., 'completed', 'failed', 'unmerged')
                    If None, returns all completed/failed/unmerged tasks
             task_type: Filter by specific task_type (e.g., 'explore', 'plan', 'implement', 'review', 'improve', 'internal')
-                      If None, returns all task types
+                      If None, returns all non-internal task types
+                      (use task_type='internal' to include internal tasks)
             since: If specified, only return tasks where completed_at >= since
                    (falls back to created_at when completed_at is NULL)
             until: If specified, only return tasks where completed_at <= until
@@ -1020,6 +1021,8 @@ class SqliteTaskStore:
             if task_type:
                 where_clauses.append("task_type = ?")
                 params.append(task_type)
+            else:
+                where_clauses.append("task_type != 'internal'")
 
             if since is not None:
                 since_str = since.isoformat()

@@ -174,6 +174,32 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert "No completed or failed tasks with type 'review'" in result.stdout
 
+    def test_history_excludes_internal_tasks_by_default(self, tmp_path: Path):
+        """Default history output omits internal tasks."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Implement task", "status": "completed", "task_type": "implement"},
+            {"prompt": "Internal task", "status": "completed", "task_type": "internal"},
+        ])
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement task" in result.stdout
+        assert "Internal task" not in result.stdout
+
+    def test_history_internal_type_includes_internal_tasks(self, tmp_path: Path):
+        """Explicit --type internal includes internal tasks."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Implement task", "status": "completed", "task_type": "implement"},
+            {"prompt": "Internal task", "status": "completed", "task_type": "internal"},
+        ])
+
+        result = run_gza("history", "--type", "internal", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Internal task" in result.stdout
+        assert "Implement task" not in result.stdout
+
     def test_history_shows_task_type_labels(self, tmp_path: Path):
         """History command displays task type labels for all task types."""
         setup_db_with_tasks(tmp_path, [

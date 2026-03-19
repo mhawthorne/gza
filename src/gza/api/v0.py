@@ -186,8 +186,10 @@ class GzaClient:
             Filter by status: 'completed', 'failed', or 'unmerged'.
             None returns all three.
         task_type:
-            Filter by type: 'task', 'explore', 'plan', 'implement',
-            'review', or 'improve'. None returns all types.
+            Filter by type: 'explore', 'plan', 'implement',
+            'review', 'improve', or 'internal'. None returns all
+            non-internal types. Use ``task_type="internal"`` to include
+            internal tasks.
 
         Returns
         -------
