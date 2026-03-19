@@ -262,6 +262,14 @@ def build_lineage_tree(
         for child in children:
             if child.id is None:
                 continue
+            # If a task references another already-attached node via depends_on,
+            # defer attachment so it is picked up under that dependency parent.
+            if (
+                child.depends_on is not None
+                and child.depends_on != parent_id
+                and child.depends_on in attached_ids
+            ):
+                continue
             if child.id in attached_ids:
                 # A task may reference a parent by both depends_on and based_on.
                 # Attach once to avoid duplicated branches.
