@@ -12,6 +12,13 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 
 ## Process
 
+### Modes
+
+- Default mode: run the full flow (Steps 1-6).
+- `--continue` mode: assume a rebase conflict is already in progress, skip Steps 1-3, and start directly at Step 4.
+  - In this mode, do not check for a clean working tree; the tree is expected to be dirty because of conflict markers.
+  - If no rebase is in progress, stop and report that `git rebase --continue` cannot proceed.
+
 ### Step 1: Pre-flight checks
 
 1. Check for uncommitted changes - if any exist, stop and ask the user to commit or stash them

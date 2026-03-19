@@ -403,7 +403,7 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
     log_file = log_dir / f"resolve-{timestamp}.log"
 
     provider = get_provider(resolve_config)
-    provider.run(resolve_config, "/gza-rebase --auto", log_file, config.project_dir)
+    provider.run(resolve_config, "/gza-rebase --auto --continue", log_file, config.project_dir)
 
     # Check if rebase completed (no longer in rebase state)
     rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
