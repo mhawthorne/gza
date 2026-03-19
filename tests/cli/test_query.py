@@ -1225,6 +1225,131 @@ class TestPsCommand:
 
         registry.remove("w-test-both")
 
+    def test_ps_no_id_background_claim_reconciles_single_active_row(self, tmp_path: Path):
+        """No-id background claim should reconcile into one active non-orphaned task row."""
+        import os
+
+        from gza.cli.query import _build_ps_rows
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("No-id claimed task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.task_id = "20260319-claim-no-id"
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-id-claim",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=False)
+        assert len(rows) == 1
+        assert rows[0]["source"] == "both"
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["status"] == "running"
+        assert rows[0]["is_orphaned"] is False
+
+    def test_no_orphan_warning_for_healthy_no_id_background_claim(self, tmp_path: Path):
+        """Healthy claimed no-id background runs should not be classified as orphaned."""
+        import os
+
+        from gza.cli.query import _get_orphaned_tasks
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Healthy running task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.task_id = "20260319-healthy-no-id"
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-id-healthy",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        orphaned = _get_orphaned_tasks(registry, store)
+        assert orphaned == []
+
+    def test_ps_task_label_maps_to_claimed_task_for_no_id_background_claim(self, tmp_path: Path):
+        """No-id claimed worker rows should render the claimed task label, not a worker placeholder."""
+        import os
+
+        from gza.cli.query import _build_ps_rows
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Claimed label task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.task_id = "20260319-claimed-label"
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-id-label",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=False)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["task"] == task.task_id
+        assert rows[0]["task"] != ""
+        assert not rows[0]["task"].startswith("task #")
+
     def test_ps_includes_db_only_in_progress_and_flags_orphaned(self, tmp_path: Path):
         """PS includes in-progress DB rows even when no worker exists."""
         import json

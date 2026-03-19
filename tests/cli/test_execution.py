@@ -3171,7 +3171,7 @@ class TestRunForeground:
 class TestRunAsWorker:
     """Tests for _run_as_worker() helper."""
 
-    def _register_current_worker(self, config: Config, task_id: int, worker_id: str) -> WorkerRegistry:
+    def _register_current_worker(self, config: Config, task_id: int | None, worker_id: str) -> WorkerRegistry:
         from gza.workers import WorkerMetadata
 
         config.workers_path.mkdir(parents=True, exist_ok=True)
@@ -3275,6 +3275,41 @@ class TestRunAsWorker:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.exit_code == 1
+
+    def test_run_as_worker_backfills_task_id_after_no_id_claim(self, tmp_path: Path):
+        """No-id worker mode updates worker metadata with the claimed DB task ID."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("No-id background claim")
+        assert task.id is not None
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        store.update(task)
+
+        registry = self._register_current_worker(config, task_id=None, worker_id="w-worker-claim")
+        args = argparse.Namespace(task_ids=[], resume=False)
+
+        def fake_run(_config, task_id=None, resume=False, open_after=False, on_task_claimed=None):
+            assert task_id is None
+            assert resume is False
+            claimed = store.get(task.id)
+            assert claimed is not None
+            if on_task_claimed is not None:
+                on_task_claimed(claimed)
+            return 0
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", side_effect=fake_run):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 0
+        worker = registry.get("w-worker-claim")
+        assert worker is not None
+        assert worker.status == "completed"
+        assert worker.task_id == task.id
 
 class TestForceCompleteRemoval:
     """Tests for removed force-complete command."""

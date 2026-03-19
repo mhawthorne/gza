@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from .config import (
     APP_NAME,
@@ -1074,7 +1075,13 @@ def _restore_worktree_git_metadata(worktree_path: Path, backup_path: Path | None
     backup_path.rename(git_path)
 
 
-def run(config: Config, task_id: int | None = None, resume: bool = False, open_after: bool = False) -> int:
+def run(
+    config: Config,
+    task_id: int | None = None,
+    resume: bool = False,
+    open_after: bool = False,
+    on_task_claimed: Callable[[Task], None] | None = None,
+) -> int:
     """Run Gza on the next pending task or a specific task.
 
     Uses git worktrees to isolate task execution from the main working directory.
@@ -1085,6 +1092,7 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
         task_id: Optional specific task ID to run. If None, runs next pending task.
         resume: If True, resume from previous session using stored session_id.
         open_after: If True, open the report file in $EDITOR after completion (for review tasks).
+        on_task_claimed: Optional callback invoked after task ownership is established.
     """
     load_dotenv(config.project_dir)
 
@@ -1165,6 +1173,8 @@ def run(config: Config, task_id: int | None = None, resume: bool = False, open_a
     if not task:
         console.print("No pending tasks found")
         return 0
+    if on_task_claimed is not None:
+        on_task_claimed(task)
 
     # Get effective model and provider for this task
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)

@@ -288,6 +288,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     exit_code = 1
     startup_log_path: Path | None = None
     startup_task: DbTask | None = None
+    startup_header_written = False
     explicit_task_id = args.task_ids[0] if hasattr(args, "task_ids") and args.task_ids else None
     if explicit_task_id is None and worker_id:
         meta = registry.get(worker_id)
@@ -298,15 +299,44 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         if startup_task:
             startup_log_path = startup_log_path_for_task(config, startup_task)
 
+    def _on_task_claimed(claimed_task: DbTask) -> None:
+        nonlocal startup_task
+        nonlocal startup_log_path
+        nonlocal startup_header_written
+
+        startup_task = claimed_task
+        if startup_log_path is None:
+            startup_log_path = startup_log_path_for_task(config, claimed_task)
+
+        if worker_id and claimed_task.id is not None:
+            meta = registry.get(worker_id)
+            if meta and meta.task_id != claimed_task.id:
+                meta.task_id = claimed_task.id
+                registry.update(meta)
+
+        if startup_log_path and not startup_header_written:
+            startup_log_path.write_text(
+                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\\n"
+            )
+            startup_header_written = True
+
     try:
         if startup_log_path:
-            startup_log_path.write_text(f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\\n")
+            startup_log_path.write_text(
+                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\\n"
+            )
+            startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
-            exit_code = run(config, task_id=args.task_ids[0], resume=resume)
+            exit_code = run(
+                config,
+                task_id=args.task_ids[0],
+                resume=resume,
+                on_task_claimed=_on_task_claimed,
+            )
         else:
-            exit_code = run(config, resume=resume)
+            exit_code = run(config, resume=resume, on_task_claimed=_on_task_claimed)
 
         # Update worker status on completion
         if worker_id:
