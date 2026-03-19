@@ -61,9 +61,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
                 continue
 
-            if task.started_at and timeout_seconds > 0:
-                if (now - task.started_at).total_seconds() > timeout_seconds:
-                    store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="TIMEOUT")
+            # PID is alive — leave timeout handling to the runner process.
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
         except Exception as exc:
@@ -316,14 +314,14 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
         if startup_log_path and not startup_header_written:
             startup_log_path.write_text(
-                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\\n"
+                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
             )
             startup_header_written = True
 
     try:
         if startup_log_path:
             startup_log_path.write_text(
-                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\\n"
+                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
             )
             startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
@@ -356,7 +354,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
         if startup_log_path:
             with open(startup_log_path, "a") as f:
-                f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\\n")
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\n")
         if worker_id:
             registry.mark_completed(worker_id, exit_code=1, status="failed")
         return 1

@@ -653,7 +653,7 @@ class SqliteTaskStore:
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -938,27 +938,35 @@ class SqliteTaskStore:
             return self._row_to_task(row) if row else None
 
     def try_mark_in_progress(self, task_id: int, pid: int) -> Task | None:
-        """Compare-and-swap pending -> in_progress for a specific task."""
+        """Compare-and-swap pending -> in_progress for a specific task.
+
+        Returns the updated Task on success, or None if the task was already
+        claimed (CAS loss) or the database was busy.
+        """
         started_at = datetime.now(timezone.utc)
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'in_progress',
-                    started_at = ?,
-                    completed_at = NULL,
-                    failure_reason = NULL,
-                    running_pid = ?
-                WHERE id = ? AND status = 'pending'
-                """,
-                (started_at.isoformat(), pid, task_id),
-            )
-            if cur.rowcount == 0:
-                return None
-            task = self.get(task_id)
-            if task is None:
-                return None
-            return task
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'in_progress',
+                        started_at = ?,
+                        completed_at = NULL,
+                        failure_reason = NULL,
+                        running_pid = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (started_at.isoformat(), pid, task_id),
+                )
+                if cur.rowcount == 0:
+                    return None
+                task = self.get(task_id)
+                if task is None:
+                    return None
+                return task
+        except sqlite3.OperationalError:
+            # Database busy after timeout — treat as CAS loss.
+            return None
 
     def get_pending(self, limit: int | None = None) -> list[Task]:
         """Get all pending tasks."""
