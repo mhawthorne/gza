@@ -12,7 +12,9 @@ from ._common import (
     _add_skills_install_args,
     add_common_args,
     _add_query_filter_args,
+    reconcile_in_progress_tasks,
 )
+from ..config import Config
 from .config_cmds import (
     cmd_clean,
     cmd_cleanup,
@@ -1218,7 +1220,23 @@ def main() -> int:
             print(f"Error: {args.project_dir} is not a directory")
             return 1
 
+    # Commands where reconciling orphaned in-progress tasks is useful.
+    _RECONCILE_COMMANDS = {
+        "work", "ps", "status", "stop", "advance", "retry",
+        "mark-completed", "set-status",
+    }
+
     try:
+        if args.command in _RECONCILE_COMMANDS:
+            try:
+                cfg = Config.load(args.project_dir)
+            except Exception as exc:
+                print(f"Warning: Skipping in-progress reconciliation: {exc}", file=sys.stderr)
+            else:
+                try:
+                    reconcile_in_progress_tasks(cfg)
+                except Exception as exc:
+                    print(f"Warning: In-progress reconciliation failed: {exc}", file=sys.stderr)
         if args.command == "work":
             return cmd_run(args)
         elif args.command == "next":

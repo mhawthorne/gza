@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -28,6 +29,45 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+def reconcile_in_progress_tasks(config: Config) -> None:
+    """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
+    try:
+        store = get_store(config)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        print(f"Warning: Skipping task reconciliation due to setup error: {exc}", file=sys.stderr)
+        return
+    except Exception as exc:
+        print(f"Warning: Skipping task reconciliation due to unexpected error: {exc}", file=sys.stderr)
+        return
+
+    now = datetime.now(timezone.utc)
+    timeout_seconds = max(0, int(config.timeout_minutes) * 60)
+    for task in store.get_in_progress():
+        task_label = f"#{task.id}" if task.id is not None else "<unknown>"
+        try:
+            if task.running_pid is None:
+                # No PID tracked — mark as orphaned if the task was actually started.
+                if task.started_at is not None:
+                    store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+                continue
+
+            if task.running_pid <= 0:
+                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+                continue
+
+            try:
+                os.kill(task.running_pid, 0)
+            except OSError:
+                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+                continue
+
+            # PID is alive — leave timeout handling to the runner process.
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
+
+
 # Shared color palette for history and stats output (readable on dark and light terminals)
 TASK_COLORS: dict[str, str] = {
     "task_id": "#aaaaaa",   # light gray for task ID and date
@@ -44,11 +84,13 @@ TASK_COLORS: dict[str, str] = {
     "value": "white",       # white for values
 }
 
-def _startup_log_paths(config: Config, worker_id: str) -> tuple[Path, str]:
-    """Return absolute and project-relative startup log paths for a worker."""
-    startup_log_path = config.workers_path / f"{worker_id}-startup.log"
+def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
+    """Return deterministic startup log path for a task."""
+    if not task.task_id:
+        return None
+    startup_log_path = config.workers_path / f"{task.task_id}.startup.log"
     startup_log_path.parent.mkdir(parents=True, exist_ok=True)
-    return startup_log_path, str(startup_log_path.relative_to(config.project_dir))
+    return startup_log_path
 
 
 def _spawn_detached_worker_process(
@@ -56,8 +98,9 @@ def _spawn_detached_worker_process(
     config: Config,
     worker_id: str,
 ) -> tuple[subprocess.Popen, str]:
-    """Spawn detached worker process and redirect early startup output to a file."""
-    startup_log_path, startup_log_rel = _startup_log_paths(config, worker_id)
+    """Spawn detached worker process and capture early output."""
+    startup_log_path = config.workers_path / f"{worker_id}-startup.log"
+    startup_log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(startup_log_path, "ab") as startup_log:
         proc = subprocess.Popen(
             cmd,
@@ -67,7 +110,7 @@ def _spawn_detached_worker_process(
             start_new_session=True,
             cwd=config.project_dir,
         )
-    return proc, startup_log_rel
+    return proc, str(startup_log_path.relative_to(config.project_dir))
 
 
 def _run_foreground(
@@ -92,13 +135,8 @@ def _run_foreground(
 
     worker = WorkerMetadata(
         worker_id=worker_id,
-        pid=os.getpid(),
         task_id=task_id,
-        task_slug=None,
-        started_at=datetime.now(timezone.utc).isoformat(),
-        status="running",
-        log_file=None,
-        worktree=None,
+        pid=os.getpid(),
         is_background=False,
     )
     registry.register(worker)
@@ -142,29 +180,31 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     # Get task to run (either specific or next pending)
     store = get_store(config)
-    if task_id:
-        task = store.get(task_id)
+    explicit_task_id = task_id
+    selected_task: DbTask | None = None
+
+    if explicit_task_id is not None:
+        task = store.get(explicit_task_id)
         if not task:
-            print(f"Error: Task #{task_id} not found")
+            print(f"Error: Task #{explicit_task_id} not found")
             return 1
 
         if task.status != "pending":
-            print(f"Error: Task #{task_id} is not pending (status: {task.status})")
+            print(f"Error: Task #{explicit_task_id} is not pending (status: {task.status})")
             return 1
 
         # Check if task is blocked
         is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
         if is_blocked:
-            print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            print(f"Error: Task #{explicit_task_id} is blocked by task #{blocking_id} ({blocking_status})")
             return 1
+        selected_task = task
     else:
-        # Atomically claim next task
-        task = store.claim_next_pending_task()
-        if not task:
+        # Select a candidate for UX; actual claim happens in the child runner.
+        selected_task = store.get_next_pending()
+        if not selected_task:
             print("No pending tasks found")
             return 0
-        assert task.id is not None
-        task_id = task.id
 
     # Build command for worker subprocess
     cmd = [
@@ -173,8 +213,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         "--worker-mode",
     ]
 
-    if task_id:
-        cmd.append(str(task_id))
+    if explicit_task_id is not None:
+        cmd.append(str(explicit_task_id))
 
     if args.no_docker:
         cmd.append("--no-docker")
@@ -194,21 +234,17 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
+            task_id=explicit_task_id,
             pid=proc.pid,
-            task_id=task.id,
-            task_slug=None,  # Will be set when runner starts
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,  # Will be set when runner starts
-            worktree=None,  # Will be set when runner starts
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
 
+        assert selected_task is not None
         print(f"Started worker {worker_id} (PID {proc.pid})")
-        print(f"  Task: #{task.id}")
-        if task.prompt:
-            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
+        print(f"  Task: #{selected_task.id}")
+        if selected_task.prompt:
+            prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
             print(f"  Prompt: {prompt_display}")
         print()
         print(f"Use 'gza ps' to view running workers")
@@ -234,6 +270,8 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             worker_id = w.worker_id
             break
 
+    store = get_store(config)
+
     # Set up signal handlers for graceful shutdown
     def signal_handler(signum, frame):
         print("\nReceived shutdown signal, cleaning up...")
@@ -246,13 +284,57 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
     # Run the task normally
     exit_code = 1
+    startup_log_path: Path | None = None
+    startup_task: DbTask | None = None
+    startup_header_written = False
+    explicit_task_id = args.task_ids[0] if hasattr(args, "task_ids") and args.task_ids else None
+    if explicit_task_id is None and worker_id:
+        meta = registry.get(worker_id)
+        if meta and meta.task_id is not None:
+            explicit_task_id = meta.task_id
+    if explicit_task_id is not None:
+        startup_task = store.get(explicit_task_id)
+        if startup_task:
+            startup_log_path = startup_log_path_for_task(config, startup_task)
+
+    def _on_task_claimed(claimed_task: DbTask) -> None:
+        nonlocal startup_task
+        nonlocal startup_log_path
+        nonlocal startup_header_written
+
+        startup_task = claimed_task
+        if startup_log_path is None:
+            startup_log_path = startup_log_path_for_task(config, claimed_task)
+
+        if worker_id and claimed_task.id is not None:
+            meta = registry.get(worker_id)
+            if meta and meta.task_id != claimed_task.id:
+                meta.task_id = claimed_task.id
+                registry.update(meta)
+
+        if startup_log_path and not startup_header_written:
+            startup_log_path.write_text(
+                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
+            )
+            startup_header_written = True
+
     try:
+        if startup_log_path:
+            startup_log_path.write_text(
+                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
+            )
+            startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
-            exit_code = run(config, task_id=args.task_ids[0], resume=resume)
+            exit_code = run(
+                config,
+                task_id=args.task_ids[0],
+                resume=resume,
+                on_task_claimed=_on_task_claimed,
+            )
         else:
-            exit_code = run(config, resume=resume)
+            exit_code = run(config, resume=resume, on_task_claimed=_on_task_claimed)
 
         # Update worker status on completion
         if worker_id:
@@ -263,6 +345,16 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
     except Exception as e:
         print(f"Worker error: {e}")
+        in_progress = [t for t in store.get_in_progress() if t.running_pid == os.getpid()]
+        if not in_progress and startup_task and startup_task.id is not None:
+            refreshed = store.get(startup_task.id)
+            if refreshed and refreshed.status == "in_progress":
+                in_progress = [refreshed]
+        for task in in_progress:
+            store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+        if startup_log_path:
+            with open(startup_log_path, "a") as f:
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\n")
         if worker_id:
             registry.mark_completed(worker_id, exit_code=1, status="failed")
         return 1
@@ -316,13 +408,8 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
-            pid=proc.pid,
             task_id=task.id,
-            task_slug=None,  # Will be set when runner starts
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,  # Will be set when runner starts
-            worktree=None,  # Will be set when runner starts
+            pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
@@ -386,13 +473,8 @@ def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) ->
         # Register worker
         worker = WorkerMetadata(
             worker_id=worker_id,
-            pid=proc.pid,
             task_id=args.task_id,
-            task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            status="running",
-            log_file=None,
-            worktree=None,
+            pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)

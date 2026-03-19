@@ -1,13 +1,16 @@
 """Tests for task execution and lifecycle CLI commands."""
 
 
+import argparse
+import os
+import signal as signal_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from gza.cli import _run_foreground
+from gza.cli import _run_as_worker, _run_foreground
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.workers import WorkerRegistry
@@ -941,6 +944,25 @@ class TestWorkCommandMultiTask:
         assert result.returncode != 0
         assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
 
+    def test_work_worker_mode_rejects_completed_task(self, tmp_path: Path):
+        """Worker-mode explicit execution should return non-zero for non-pending tasks."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Completed task")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        result = run_gza("work", "--worker-mode", str(task.id), "--no-docker", "--project", str(tmp_path))
+        assert result.returncode != 0
+        assert f"Task #{task.id}" in (result.stdout + result.stderr)
+
     def test_work_warns_about_orphaned_tasks_before_starting(self, tmp_path: Path):
         """Work command warns about orphaned in-progress tasks before starting new work."""
         from gza.db import SqliteTaskStore
@@ -1031,6 +1053,56 @@ class TestBackgroundWorkerCommand:
         assert captured_cmd[project_idx - 1] == "--project", \
             f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
             f"Full command: {captured_cmd}"
+
+    def test_background_worker_without_explicit_task_does_not_pass_task_id(self, tmp_path: Path):
+        """No-id background work should not pass a selected task ID to child runner."""
+        from unittest.mock import patch, MagicMock
+        from gza.db import SqliteTaskStore
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        from gza.workers import WorkerRegistry
+        import argparse
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        store.add("Pending candidate")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        captured_cmd = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        def capture_popen(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+            rc = _spawn_background_worker(args, config)
+
+        assert rc == 0
+        assert captured_cmd is not None
+        worker_mode_idx = captured_cmd.index("--worker-mode")
+        assert worker_mode_idx + 1 < len(captured_cmd)
+        assert captured_cmd[worker_mode_idx + 1].startswith("--"), f"Unexpected explicit task id in command: {captured_cmd}"
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].task_id is None
 
     def test_background_resume_worker_command_uses_project_flag(self, tmp_path: Path):
         """Background resume worker subprocess must pass project dir with --project flag.
@@ -1145,6 +1217,36 @@ class TestBackgroundWorkerCommand:
         assert worker.startup_log_file == f".gza/workers/{worker.worker_id}-startup.log"
         assert worker.log_file is None
         assert (tmp_path / worker.startup_log_file).exists()
+
+
+class TestReconciliation:
+    """Tests for in-progress reconciliation behavior."""
+
+    def test_reconciliation_warns_on_task_failure_and_continues(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Per-task reconciliation failures should be visible, not silent."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Stuck in-progress task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = -1
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        with patch.object(SqliteTaskStore, "mark_failed", side_effect=RuntimeError("db-write-boom")):
+            reconcile_in_progress_tasks(config)
+
+        captured = capsys.readouterr()
+        assert "Warning: Unexpected reconciliation error for task" in captured.err
+        assert "db-write-boom" in captured.err
 
 
 class TestImplementCommand:
@@ -3064,6 +3166,150 @@ class TestRunForeground:
         assert mock_mark.call_count == 1
         assert mock_mark.call_args.kwargs.get("status") == "failed"
         assert mock_mark.call_args.kwargs.get("exit_code") == 130
+
+
+class TestRunAsWorker:
+    """Tests for _run_as_worker() helper."""
+
+    def _register_current_worker(self, config: Config, task_id: int | None, worker_id: str) -> WorkerRegistry:
+        from gza.workers import WorkerMetadata
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id=worker_id,
+                task_id=task_id,
+                pid=os.getpid(),
+                status="running",
+                startup_log_file=f"{worker_id}-startup.log",
+            )
+        )
+        return registry
+
+    def test_run_as_worker_nonzero_exit_marks_failed(self, tmp_path: Path):
+        """Worker metadata status is failed when run() returns non-zero."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker non-zero")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-nonzero")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", return_value=7):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 7
+        worker = registry.get("w-worker-nonzero")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 7
+
+    def test_run_as_worker_exception_marks_failed_and_ps_shows_startup_failure(self, tmp_path: Path):
+        """Exception cleanup keeps worker/task failed and startup failure visible in ps rows."""
+        from gza.cli.query import _build_ps_rows
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker exception")
+        assert task.id is not None
+        store.mark_in_progress(task)
+
+        registry = self._register_current_worker(config, task.id, "w-worker-exception")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", side_effect=RuntimeError("boom")):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 1
+        worker = registry.get("w-worker-exception")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=True)
+        row = next(r for r in rows if r["worker_id"] == "w-worker-exception")
+        assert row["status"] == "failed"
+        assert row["startup_failure"] is True
+
+    def test_run_as_worker_signal_handler_marks_failed(self, tmp_path: Path):
+        """Signal handler cleanup marks worker as failed before exiting."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker signal")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-signal")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        installed_handlers: dict[int, object] = {}
+
+        def capture_signal(signum, handler):
+            installed_handlers[signum] = handler
+            return None
+
+        def run_then_signal(*_args, **_kwargs):
+            handler = installed_handlers.get(signal_mod.SIGTERM)
+            assert callable(handler)
+            handler(signal_mod.SIGTERM, None)
+            return 0
+
+        with patch("gza.cli.signal.signal", side_effect=capture_signal):
+            with patch("gza.cli.run", side_effect=run_then_signal):
+                with pytest.raises(SystemExit) as exc:
+                    _run_as_worker(args, config)
+
+        assert exc.value.code == 1
+        worker = registry.get("w-worker-signal")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
+
+    def test_run_as_worker_backfills_task_id_after_no_id_claim(self, tmp_path: Path):
+        """No-id worker mode updates worker metadata with the claimed DB task ID."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("No-id background claim")
+        assert task.id is not None
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        store.update(task)
+
+        registry = self._register_current_worker(config, task_id=None, worker_id="w-worker-claim")
+        args = argparse.Namespace(task_ids=[], resume=False)
+
+        def fake_run(_config, task_id=None, resume=False, open_after=False, on_task_claimed=None):
+            assert task_id is None
+            assert resume is False
+            claimed = store.get(task.id)
+            assert claimed is not None
+            if on_task_claimed is not None:
+                on_task_claimed(claimed)
+            return 0
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", side_effect=fake_run):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 0
+        worker = registry.get("w-worker-claim")
+        assert worker is not None
+        assert worker.status == "completed"
+        assert worker.task_id == task.id
 
 class TestForceCompleteRemoval:
     """Tests for removed force-complete command."""

@@ -2995,6 +2995,94 @@ class TestNoChangesWithExistingCommits:
         assert refreshed.status == "failed", f"Expected 'failed', got '{refreshed.status}'"
 
 
+class TestTaskClaimSafety:
+    """Regression tests for explicit status handling and CAS contention."""
+
+    def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
+        return config
+
+    def test_explicit_non_pending_task_returns_non_zero(self, tmp_path: Path):
+        """Running an explicit completed task should fail with a non-zero exit code."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Done task", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+        with patch("gza.runner.load_dotenv"), patch("gza.runner.backup_database"):
+            result = run(config, task_id=task.id, resume=False)
+
+        assert result == 1
+
+    def test_next_pending_claim_retries_after_cas_loss(self, tmp_path: Path):
+        """No-id run should keep scanning and claim another pending task after CAS loss."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        first = store.add(prompt="First pending", task_type="implement")
+        second = store.add(prompt="Second pending", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+
+        original_try_mark = SqliteTaskStore.try_mark_in_progress
+        lost_first_race = {"value": False}
+
+        def _try_mark_with_one_forced_loss(self, task_id: int, pid: int):
+            if task_id == first.id and not lost_first_race["value"]:
+                lost_first_race["value"] = True
+                stolen = self.get(first.id)
+                assert stolen is not None
+                stolen.status = "in_progress"
+                stolen.running_pid = 424242
+                self.update(stolen)
+                return None
+            return original_try_mark(self, task_id, pid)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch.object(SqliteTaskStore, "try_mark_in_progress", new=_try_mark_with_one_forced_loss),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = False
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, resume=False)
+
+        assert result == 1
+        assert lost_first_race["value"] is True
+        first_refreshed = store.get(first.id)
+        second_refreshed = store.get(second.id)
+        assert first_refreshed is not None
+        assert second_refreshed is not None
+        assert first_refreshed.status == "in_progress"
+        assert second_refreshed.status == "in_progress"
+        assert second_refreshed.running_pid == os.getpid()
+
+
 class TestSameBranchLineageWalk:
     """Tests for same_branch resolution walking the based_on lineage chain."""
 

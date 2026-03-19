@@ -4,6 +4,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -185,6 +186,38 @@ def test_registry_list_filter_completed(temp_workers_dir):
     # With include_completed
     workers = registry.list_all(include_completed=True)
     assert len(workers) == 2
+
+
+def test_registry_list_all_ignores_entries_without_pid(temp_workers_dir):
+    """Malformed metadata without pid should be ignored."""
+    registry = WorkerRegistry(temp_workers_dir)
+    (temp_workers_dir / "w-bad-missing-pid.json").write_text('{"worker_id": "w-bad-missing-pid", "task_id": 1}')
+
+    workers = registry.list_all(include_completed=True)
+    assert workers == []
+
+
+def test_registry_list_all_ignores_entries_with_zero_pid(temp_workers_dir):
+    """Non-positive pid metadata should be ignored."""
+    registry = WorkerRegistry(temp_workers_dir)
+    (temp_workers_dir / "w-bad-zero-pid.json").write_text('{"worker_id": "w-bad-zero-pid", "task_id": 1, "pid": 0}')
+
+    workers = registry.list_all(include_completed=True)
+    assert workers == []
+
+
+def test_registry_stop_does_not_signal_for_non_numeric_pid(temp_workers_dir):
+    """Malformed non-numeric pid should not trigger os.kill."""
+    registry = WorkerRegistry(temp_workers_dir)
+    (temp_workers_dir / "w-bad-nonnumeric-pid.json").write_text(
+        '{"worker_id": "w-bad-nonnumeric-pid", "task_id": 1, "pid": "not-a-number"}'
+    )
+
+    with patch("gza.workers.os.kill") as mock_kill:
+        assert registry.stop("w-bad-nonnumeric-pid") is False
+        assert registry.is_running("w-bad-nonnumeric-pid") is False
+
+    mock_kill.assert_not_called()
 
 
 def test_registry_is_running(temp_workers_dir):

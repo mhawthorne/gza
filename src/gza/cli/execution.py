@@ -103,14 +103,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Register foreground worker
     worker = WorkerMetadata(
         worker_id=worker_id,
-        pid=os.getpid(),
         task_id=task_id_for_registration,
-        task_slug=None,
-        started_at=datetime.now(timezone.utc).isoformat(),
-        status="running",
-        log_file=None,
-        worktree=None,
-        is_background=False,
+        pid=os.getpid(),
     )
     registry.register(worker)
 
@@ -1134,6 +1128,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
             print("Use 'gza cancel' to stop it first, or wait for it to finish")
             return 1
         print(f"Note: Task #{args.task_id} appears orphaned (in_progress but no live worker), resuming...")
+    elif task.status == "failed" and task.failure_reason == "WORKER_DIED":
+        print(f"Note: Task #{args.task_id} appears orphaned (worker died), resuming...")
 
     if not task.session_id:
         print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")

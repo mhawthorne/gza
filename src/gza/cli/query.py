@@ -726,14 +726,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
-    # Auto-clean zombie workers: "running" workers whose DB task already finished.
-    # These accumulate when PIDs get reused by other processes.
-    # Don't remove stale workers here — they indicate orphaned tasks worth showing.
-    for w in registry.list_all(include_completed=True):
-        if w.status == "running" and w.task_id is not None:
-            task = store.get(w.task_id)
-            if task and task.status in ("completed", "failed"):
-                registry.remove(w.worker_id)
+    # Worker registry is now a thin process index; no ps-specific cleanup.
     poll_interval: int | None = getattr(args, "poll", None)
     show_all: bool = getattr(args, "all", False)
 
@@ -849,11 +842,12 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
 
 def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | None) -> bool:
     """Return True when worker failed before main task logging initialized."""
-    if worker is None or worker.status != "failed":
+    if worker is None:
         return False
-    if not worker.startup_log_file:
+    has_startup_hint = bool(worker.startup_log_file) or bool(task and task.task_id)
+    if worker.status != "failed" or not has_startup_hint:
         return False
-    has_main_log = bool((task and task.log_file) or worker.log_file)
+    has_main_log = bool(task and task.log_file)
     return not has_main_log
 
 
@@ -896,21 +890,18 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         # may have already completed/failed by the time the worker is gone.
         status = task.status if task and task.status else "in_progress"
     elif source == "worker" and worker is not None:
-        status = worker.status
+        status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
     elif worker is not None and task is not None:
         # Both worker and task exist. Prefer DB terminal status over a
         # stale worker status — the DB is the source of truth for completion.
         if task.status in ("completed", "failed"):
             status = task.status
-        elif worker.status in ("completed", "failed", "stale"):
-            status = worker.status
+        elif worker and not (task and task.running_pid):
+            status = "stale"
         else:
             status = "running"
     elif worker is not None:
-        if worker.status in ("completed", "failed", "stale"):
-            status = worker.status
-        else:
-            status = "running"
+        status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
 
     is_stale = worker is not None and worker.status == "stale"
     is_orphaned = (
@@ -933,8 +924,11 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         task_display = task.task_id
     elif task:
         task_display = truncate(task.prompt, 25)
-    elif worker and worker.task_slug:
-        task_display = worker.task_slug
+    elif worker:
+        if worker.task_slug:
+            task_display = worker.task_slug
+        else:
+            task_display = f"task #{worker.task_id}" if worker.task_id is not None else ""
 
     flags = []
     if is_stale:
@@ -961,7 +955,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,
         "startup_failure": startup_failure,
-        "startup_log_file": worker.startup_log_file if worker else None,
+        "startup_log_file": (f".gza/workers/{task.task_id}.startup.log" if task and task.task_id else (worker.startup_log_file if worker else None)),
         "sort_timestamp": started.isoformat() if started else "",
     }
 
@@ -1008,10 +1002,24 @@ def _format_started(started: datetime | None) -> str:
     return started_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _has_pid_ownership_mismatch(worker: WorkerMetadata, store: SqliteTaskStore) -> bool:
+    """Return True when task runtime ownership disagrees with worker metadata PID."""
+    if worker.task_id is None:
+        return False
+    task = store.get(worker.task_id)
+    return (
+        task is not None
+        and task.status == "in_progress"
+        and task.running_pid is not None
+        and task.running_pid != worker.pid
+    )
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Stop a running worker."""
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
 
     # Validate arguments
     if not hasattr(args, 'worker_id') or (not args.worker_id and not (hasattr(args, 'all') and args.all)):
@@ -1028,6 +1036,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
             return 0
 
         for worker in running_workers:
+            if _has_pid_ownership_mismatch(worker, store):
+                task = store.get(worker.task_id) if worker.task_id is not None else None
+                running_pid = task.running_pid if task is not None else None
+                print(
+                    f"Skipping worker {worker.worker_id}: PID ownership mismatch "
+                    f"(worker PID {worker.pid}, task running_pid {running_pid})."
+                )
+                continue
             print(f"Stopping worker {worker.worker_id} (PID {worker.pid})...")
             if registry.stop(worker.worker_id, force=args.force if hasattr(args, 'force') else False):
                 print(f"  ✓ Sent stop signal")
@@ -1044,7 +1060,20 @@ def cmd_stop(args: argparse.Namespace) -> int:
     worker = maybe_worker
 
     if worker.status != "running":
-        print(f"Worker {args.worker_id} is not running (status: {worker.status})")
+        print(
+            f"Refusing to stop worker {args.worker_id}: "
+            f"status is '{worker.status}', not 'running'."
+        )
+        print("Run 'gza cleanup' to remove stale worker records.")
+        return 1
+
+    if _has_pid_ownership_mismatch(worker, store):
+        task = store.get(worker.task_id) if worker.task_id is not None else None
+        running_pid = task.running_pid if task is not None else None
+        print(
+            f"Refusing to stop worker {args.worker_id}: PID ownership mismatch "
+            f"(worker PID {worker.pid}, task running_pid {running_pid})."
+        )
         return 1
 
     if not registry.is_running(args.worker_id):

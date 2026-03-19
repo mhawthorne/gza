@@ -1,9 +1,11 @@
 """Tests for task query and display CLI commands."""
 
 
+import argparse
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1222,6 +1224,131 @@ class TestPsCommand:
         assert rows[0]["started_at"] is not None
 
         registry.remove("w-test-both")
+
+    def test_ps_no_id_background_claim_reconciles_single_active_row(self, tmp_path: Path):
+        """No-id background claim should reconcile into one active non-orphaned task row."""
+        import os
+
+        from gza.cli.query import _build_ps_rows
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("No-id claimed task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.task_id = "20260319-claim-no-id"
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-id-claim",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=False)
+        assert len(rows) == 1
+        assert rows[0]["source"] == "both"
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["status"] == "running"
+        assert rows[0]["is_orphaned"] is False
+
+    def test_no_orphan_warning_for_healthy_no_id_background_claim(self, tmp_path: Path):
+        """Healthy claimed no-id background runs should not be classified as orphaned."""
+        import os
+
+        from gza.cli.query import _get_orphaned_tasks
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Healthy running task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.task_id = "20260319-healthy-no-id"
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-id-healthy",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        orphaned = _get_orphaned_tasks(registry, store)
+        assert orphaned == []
+
+    def test_ps_task_label_maps_to_claimed_task_for_no_id_background_claim(self, tmp_path: Path):
+        """No-id claimed worker rows should render the claimed task label, not a worker placeholder."""
+        import os
+
+        from gza.cli.query import _build_ps_rows
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+        task = store.add("Claimed label task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.task_id = "20260319-claimed-label"
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-no-id-label",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=False)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["task"] == task.task_id
+        assert rows[0]["task"] != ""
+        assert not rows[0]["task"].startswith("task #")
 
     def test_ps_includes_db_only_in_progress_and_flags_orphaned(self, tmp_path: Path):
         """PS includes in-progress DB rows even when no worker exists."""
@@ -3010,3 +3137,135 @@ class TestNextCommandWithDependencies:
         assert result.returncode == 0
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
+
+
+class TestStopCommandSafety:
+    """Safety tests for stopping workers."""
+
+    def test_stop_refuses_non_running_worker_even_if_pid_is_live(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """A non-running worker record should never be signaled."""
+        from gza.cli.query import cmd_stop
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-safety",
+                task_id=None,
+                pid=os.getpid(),
+                status="completed",
+            )
+        )
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            worker_id="w-stop-safety",
+            all=False,
+            force=False,
+        )
+        with patch("gza.cli.query.WorkerRegistry.stop") as mock_stop:
+            rc = cmd_stop(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Refusing to stop worker w-stop-safety" in captured.out
+        mock_stop.assert_not_called()
+
+    def test_stop_all_skips_worker_with_pid_ownership_mismatch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """stop --all must skip workers whose task running_pid points to another process."""
+        from gza.cli.query import cmd_stop
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        task = store.add("Mismatch task")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.running_pid = os.getpid() + 12345
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-all-mismatch",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+
+        args = argparse.Namespace(project_dir=tmp_path, worker_id=None, all=True, force=False)
+        with patch("gza.cli.query.WorkerRegistry.stop") as mock_stop:
+            rc = cmd_stop(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
+        mock_stop.assert_not_called()
+
+    def test_stop_all_only_signals_ownership_valid_workers(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """stop --all should signal only workers whose PID ownership matches task.running_pid."""
+        from gza.cli.query import cmd_stop
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+
+        valid_task = store.add("Valid task")
+        assert valid_task.id is not None
+        valid_task.status = "in_progress"
+        valid_task.running_pid = os.getpid()
+        store.update(valid_task)
+
+        mismatch_task = store.add("Mismatch task")
+        assert mismatch_task.id is not None
+        mismatch_task.status = "in_progress"
+        mismatch_task.running_pid = os.getpid() + 54321
+        store.update(mismatch_task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-all-valid",
+                task_id=valid_task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stop-all-mismatch",
+                task_id=mismatch_task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+
+        args = argparse.Namespace(project_dir=tmp_path, worker_id=None, all=True, force=False)
+        with patch("gza.cli.query.WorkerRegistry.stop", return_value=True) as mock_stop:
+            rc = cmd_stop(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Stopping worker w-stop-all-valid" in captured.out
+        assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
+        called_workers = [call.args[0] for call in mock_stop.call_args_list]
+        assert called_workers == ["w-stop-all-valid"]
