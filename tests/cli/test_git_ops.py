@@ -1123,7 +1123,7 @@ class TestRebaseHelpers:
             assert resolve_config.provider == "codex"
             assert resolve_config.use_docker is False
             mock_provider.run.assert_called_once()
-            assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
+            assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto --continue"
 
     def test_invoke_provider_resolve_uses_effective_gemini_provider(self, tmp_path):
         """Auto-resolve supports gemini provider selection from effective config."""
@@ -1149,7 +1149,7 @@ class TestRebaseHelpers:
             resolve_config = mock_get_provider.call_args.args[0]
             assert resolve_config.provider == "gemini"
             mock_provider.run.assert_called_once()
-            assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
+            assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto --continue"
 
     def test_invoke_provider_resolve_fails_fast_when_skill_missing(self, tmp_path, capsys, monkeypatch):
         """Auto-resolve fails before provider run when runtime skill is missing and auto-install fails."""
