@@ -311,6 +311,36 @@ class TestBuildLineage:
         tree = build_lineage_tree(store, root)
         assert [child.relationship for child in tree.children] == ["review", "implement-based"]
 
+    def test_tree_defers_cross_parent_improve_to_review_parent(self):
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        review = _make_task(
+            id=2,
+            task_type="review",
+            depends_on=1,
+            created_at=datetime(2026, 1, 2),
+        )
+        improve = _make_task(
+            id=3,
+            task_type="improve",
+            based_on=1,
+            depends_on=2,
+            created_at=datetime(2026, 1, 3),
+        )
+
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [review, improve]
+            if task_id == 2:
+                return [improve]
+            return []
+
+        store.get_lineage_children.side_effect = lineage_children
+
+        tree = build_lineage_tree(store, root)
+        assert [child.task.id for child in tree.children] == [2]
+        assert [child.task.id for child in tree.children[0].children] == [3]
+
 
 # ---------------------------------------------------------------------------
 # filter_lineage_tree
