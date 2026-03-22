@@ -120,7 +120,7 @@ Type: implement
 Duration: 89.2s (1:29)
 Cost: $0.15
 Prompt: "Fix database migration script"
-Log shows: ImportError on line 45 - missing 'alembic' module
+Log shows: verify_command failed — mypy found 3 type errors in src/gza/db.py
 ```
 
 **Pending task with dependency:**

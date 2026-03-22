@@ -272,6 +272,47 @@ class TestBuildDockerCmd:
         assert "--rm" in cmd
         assert cmd[-1] == "test-image"
 
+    def test_mounts_git_dir_for_worktree(self, tmp_path):
+        """Should mount host .git dir when work_dir is a git worktree."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        # Simulate a git worktree: .git is a file pointing to a gitdir
+        fake_git_dir = tmp_path / "repo" / ".git" / "worktrees" / "my-task"
+        fake_git_dir.mkdir(parents=True)
+        main_git_dir = tmp_path / "repo" / ".git"
+
+        worktree_dir = tmp_path / "worktree"
+        worktree_dir.mkdir()
+        (worktree_dir / ".git").write_text(f"gitdir: {fake_git_dir}\n")
+
+        cmd = build_docker_cmd(docker_config, worktree_dir, timeout_minutes=10)
+        assert f"{main_git_dir}:{main_git_dir}" in " ".join(cmd)
+
+    def test_no_git_mount_for_regular_repo(self, tmp_path):
+        """Should not add extra mount when .git is a directory (regular repo)."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        # .git is a directory, not a worktree
+        (tmp_path / ".git").mkdir()
+
+        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
+        # Only the workspace mount and config mount should have -v
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        mount_args = [cmd[i + 1] for i in v_indices]
+        assert all("/workspace" in m or ".testconfig" in m for m in mount_args)
+
     def test_mounts_workspace(self, tmp_path):
         """Should mount workspace directory."""
         docker_config = DockerConfig(
