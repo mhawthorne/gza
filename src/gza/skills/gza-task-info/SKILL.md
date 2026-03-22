@@ -35,7 +35,9 @@ This will show:
 
 ### Step 3: Check branch status (if task has a branch)
 
-If the task has a branch field set, gather git information:
+If the task has a branch field set, gather git information.
+
+First, determine the base branch by running `git rev-parse --abbrev-ref @{upstream} 2>/dev/null | sed 's|.*/||'`. If that fails (no upstream set), fall back to `main`. Store this as `BASE_BRANCH`.
 
 1. **Check if branch exists:**
    ```bash
@@ -47,9 +49,9 @@ If the task has a branch field set, gather git information:
    git log <branch-name> --oneline -10
    ```
 
-3. **Check if branch is merged to main:**
+3. **Check if branch is merged to base branch:**
    ```bash
-   git branch --merged main | grep <branch-name> || echo "Not merged to main"
+   git branch --merged $BASE_BRANCH | grep <branch-name> || echo "Not merged to $BASE_BRANCH"
    ```
 
 4. **Check for uncommitted changes (if on this branch):**
@@ -57,9 +59,9 @@ If the task has a branch field set, gather git information:
    git diff <branch-name> --stat
    ```
 
-5. **Show branch comparison with main:**
+5. **Show branch comparison with base branch:**
    ```bash
-   git log main..<branch-name> --oneline
+   git log $BASE_BRANCH..<branch-name> --oneline
    ```
 
 ### Step 4: Show log file (if exists)
@@ -107,7 +109,7 @@ Create a clear, concise summary of the task state. Examples:
 ```
 Task #18: completed
 Type: implement
-Branch: 20260115-add-authentication (3 commits, not yet merged to main)
+Branch: 20260115-add-authentication (3 commits, not yet merged)
 Duration: 245.3s (4:05)
 Cost: $0.42
 Prompt: "Add JWT authentication to API endpoints"
@@ -120,7 +122,7 @@ Type: implement
 Duration: 89.2s (1:29)
 Cost: $0.15
 Prompt: "Fix database migration script"
-Log shows: ImportError on line 45 - missing 'alembic' module
+Log shows: verify_command failed — mypy found 3 type errors in src/gza/db.py
 ```
 
 **Pending task with dependency:**

@@ -41,7 +41,7 @@ Review the combined output and identify actionable items:
 - Note completed plan/explore tasks whose output hasn't been acted on yet
 
 **From `uv run gza unmerged`:**
-- Each branch listed here represents completed work that hasn't been merged to main
+- Each branch listed here represents completed work that hasn't been merged to the base branch
 - Identify which branches are ready to merge (no conflicts expected) vs which need review first
 - Check if any unmerged branches have associated PRs or reviews pending
 

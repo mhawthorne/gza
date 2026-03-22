@@ -1020,61 +1020,6 @@ def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
     shutil.copy2(src, dst_dir / "learnings.md")
 
 
-def _hide_invalid_worktree_git_metadata_for_docker(task: Task, config: Config, worktree_path: Path) -> Path | None:
-    """Temporarily hide invalid worktree .git metadata for Docker review runs.
-
-    Worktree .git files can reference host-only absolute gitdir paths that do not
-    exist inside the container. Hiding the file prevents provider-side git probes
-    from failing with path-mismatch errors.
-
-    Returns:
-        Backup path of the hidden .git file if one was moved, otherwise None.
-    """
-    if not config.use_docker or task.task_type != "review":
-        return None
-
-    git_file = worktree_path / ".git"
-    if not git_file.is_file():
-        return None
-
-    try:
-        first_line = git_file.read_text().splitlines()[0].strip()
-    except (OSError, IndexError):
-        return None
-
-    if not first_line.startswith("gitdir:"):
-        return None
-
-    gitdir_path = Path(first_line.split(":", 1)[1].strip())
-    if gitdir_path.exists():
-        return None
-
-    backup_path = worktree_path / ".git.gza-host-worktree"
-    if backup_path.exists():
-        if backup_path.is_dir():
-            shutil.rmtree(backup_path)
-        else:
-            backup_path.unlink()
-
-    git_file.rename(backup_path)
-    return backup_path
-
-
-def _restore_worktree_git_metadata(worktree_path: Path, backup_path: Path | None) -> None:
-    """Restore original worktree .git metadata after provider execution."""
-    if not backup_path or not backup_path.exists():
-        return
-
-    git_path = worktree_path / ".git"
-    if git_path.exists():
-        if git_path.is_dir():
-            shutil.rmtree(git_path)
-        else:
-            git_path.unlink()
-
-    backup_path.rename(git_path)
-
-
 def run(
     config: Config,
     task_id: int | None = None,
@@ -1908,8 +1853,6 @@ def _run_non_code_task(
         if task.task_type not in ("internal", "learn"):
             _copy_learnings_to_worktree(config, worktree_path)
 
-        hidden_git_backup = _hide_invalid_worktree_git_metadata_for_docker(task, config, worktree_path)
-
         def _on_session_id_non_code(session_id: str) -> None:
             """Persist session_id as soon as it is first seen during streaming."""
             if task.session_id == session_id:
@@ -1922,6 +1865,15 @@ def _run_non_code_task(
             task.num_steps_computed = count
             store.update(task)
 
+        # When running in Docker, the worktree .git file contains a host-specific
+        # gitdir path that is invalid inside the container.  Hide it before the
+        # provider run and restore it afterwards so the host worktree stays valid.
+        host_git_file = worktree_path / ".git"
+        hidden_git_file = worktree_path / ".git.gza-host-worktree"
+        hide_git = config.use_docker and host_git_file.is_file()
+        if hide_git:
+            host_git_file.rename(hidden_git_file)
+
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code, on_step_count=_on_step_count_non_code)
         except KeyboardInterrupt:
@@ -1929,8 +1881,8 @@ def _run_non_code_task(
             console.print("\nInterrupted")
             return 130
         finally:
-            _restore_worktree_git_metadata(worktree_path, hidden_git_backup)
-
+            if hide_git and hidden_git_file.exists():
+                hidden_git_file.rename(host_git_file)
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None

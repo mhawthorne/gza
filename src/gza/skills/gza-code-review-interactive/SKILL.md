@@ -21,9 +21,10 @@ Review committed changes on the current feature branch and output a structured r
 
 1. Check current branch: `git branch --show-current`
    - If on `main` or `master`, stop and tell the user to switch to a feature branch
-2. Check for uncommitted changes: `git status --porcelain`
+2. Determine the base branch by running `git rev-parse --abbrev-ref @{upstream} 2>/dev/null | sed 's|.*/||'`. If that fails (no upstream set), fall back to `main`. Store this as `BASE_BRANCH`.
+3. Check for uncommitted changes: `git status --porcelain`
    - If there are uncommitted changes, warn the user but proceed with reviewing committed changes
-3. Check if branch has commits ahead of main: `git log main..HEAD --oneline`
+4. Check if branch has commits ahead of base: `git log $BASE_BRANCH..HEAD --oneline`
    - If no commits ahead, stop and tell the user there's nothing to review
 
 ### Step 2: Find PR (only if --pr flag is set)
@@ -47,7 +48,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 
 **Step 3**: Get the diff to review:
 ```bash
-git diff main...HEAD
+git diff $BASE_BRANCH...HEAD
 ```
 
 **Step 4**: Write a structured review with these sections:

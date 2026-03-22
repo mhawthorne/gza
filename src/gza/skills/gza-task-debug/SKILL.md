@@ -100,10 +100,12 @@ If `report_file` is set, read it for the agent's own summary of what happened.
 
 ### Step 7: Check the git diff
 
+Determine the base branch by running `git rev-parse --abbrev-ref @{upstream} 2>/dev/null | sed 's|.*/||'`. If that fails (no upstream set), fall back to `main`. Store this as `BASE_BRANCH`.
+
 If the task has a `branch` with commits:
 
 ```bash
-git diff main...<branch> --stat
+git diff $BASE_BRANCH...<branch> --stat
 ```
 
 This shows:
@@ -118,7 +120,7 @@ Calculate the **turns-per-file-changed** ratio:
 
 Also check what was actually committed:
 ```bash
-git log main...<branch> --oneline
+git log $BASE_BRANCH...<branch> --oneline
 ```
 
 ### Step 8: Synthesize the diagnosis

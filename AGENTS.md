@@ -8,7 +8,7 @@ A coding AI agent runner for Claude Code.
 
 ## Usage
 
-To run gza commands, use either `bin/gza` or `uv run gza`:
+**IMPORTANT**: Always use `uv run gza` to run gza commands. Do NOT use `gza` directly or `python -m gza` - these will fail.
 
 ```
 gza init [--project DIR]              # Generate new gza.yaml with defaults
@@ -147,7 +147,13 @@ Gza tasks run inside a Docker container. The container:
 
 **Do NOT use** `python -m pytest` or `pip install` directly - always use `uv run`.
 
-**Do NOT use the `sqlite3` CLI** — it may not be installed. To query the database programmatically, use `uv run python -c 'from gza.db import ...'`.
+**Do NOT use the `sqlite3` CLI** — it may not be installed. To query the database programmatically:
+```python
+from pathlib import Path
+from gza.db import SqliteTaskStore, Task
+store = SqliteTaskStore(Path('.gza/gza.db'))
+task = store.get(42)  # or store.get_all(), store.get_pending(), store.get_by_task_id('slug')
+```
 
 **Do NOT modify files outside `/workspace/gza/`** unless explicitly instructed. Other directories under `/workspace/` are sibling projects.
 
@@ -181,6 +187,7 @@ Signs you're violating this:
 - **Do NOT create setup/how-to docs in project root**. If you must document something for developers (e.g., release process, setup instructions), place it in `docs/internal/` - never in the project root.
 - **Do NOT create one-off utility scripts** in the project root (e.g., `check_syntax.py`, `validate_*.py`, `verify_*.py`). Use existing tools like `uv run pytest` or `uv run python -m py_compile <file>` instead.
 - **Use offset/limit when reading large files** - When reading files that might be large (>1000 lines), use the `offset` and `limit` parameters on the Read tool. If you get a file-too-large error, retry with `limit=500` and navigate using `offset`.
+- **Use Explore subagents for multi-file research** - When you need to understand code across 3+ files before making changes (e.g., tracing a feature, reviewing an implementation, understanding call sites), delegate the exploration to an Agent tool with `subagent_type: Explore` rather than sequentially reading files yourself. This runs in parallel and keeps your main context clean. Especially useful for review tasks and pre-implementation research.
 
 ## Creating Tasks from Conversations
 

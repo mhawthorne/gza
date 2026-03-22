@@ -18,7 +18,9 @@ Run `uv run gza config` and extract the `verify_command` value. If it is empty o
 
 ### Step 2: Get changed files
 
-Run `git diff --name-only main...HEAD` to get the list of files changed on the current branch compared to `main`. Store this list — it will be used to scope fixes (but NOT to filter which errors to report).
+Determine the base branch by running `git rev-parse --abbrev-ref @{upstream} 2>/dev/null | sed 's|.*/||'`. If that fails (no upstream set), fall back to `main`. Store this as `BASE_BRANCH`.
+
+Run `git diff --name-only $BASE_BRANCH...HEAD` to get the list of files changed on the current branch compared to the base branch. Store this list — it will be used to scope fixes (but NOT to filter which errors to report).
 
 ### Step 3: Run verify_command and fix errors (max 3 iterations)
 
@@ -53,7 +55,7 @@ If no files were modified, report that no fixes were needed.
 ## Important notes
 
 - **Run the full verify_command** — do not skip tests or filter output. All failures matter.
-- **Only fix files on the changed-files list** — do not touch files that are not in the `git diff --name-only main...HEAD` output.
+- **Only fix files on the changed-files list** — do not touch files that are not in the `git diff --name-only $BASE_BRANCH...HEAD` output.
 - **Maximum 3 fix iterations** — do not loop indefinitely. If errors remain after 3 rounds, report them to the user.
 - **One commit at the end** — accumulate all fixes before committing. Do not commit after each fix.
 - **Do not run `git push`** — leave pushing to the user.

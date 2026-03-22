@@ -141,7 +141,7 @@ for logfile in log_files:
                         file_too_large += 1
 
                     # Specific error categories
-                    if 'not a git repository' in content and 'worktrees' in content:
+                    if 'not a git repository' in content:
                         worktree_git_errors += 1
                     if 'sqlite3: command not found' in content:
                         sqlite_not_found += 1
@@ -199,10 +199,10 @@ if bare_commands:
     for cmd, count in bare_commands.most_common(15):
         print(f'  {count}x: {cmd}')
 
-# Section 3: Worktree/git errors
+# Section 3: Git errors
 if worktree_git_errors or git_errors:
-    print(f'\n## Git Errors in Worktrees — {worktree_git_errors} total')
-    print('Git commands failing because worktree was cleaned up or git dir is stale.')
+    print(f'\n## Git Errors — {worktree_git_errors} "not a git repository" + {sum(git_errors.values())} failed git commands')
+    print('Includes stale worktrees, missing repos, and other git failures.')
     for cmd, count in git_errors.most_common(10):
         print(f'  {count}x: {cmd}')
 

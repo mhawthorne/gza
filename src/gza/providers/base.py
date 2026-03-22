@@ -258,6 +258,24 @@ def build_docker_cmd(
         "-w", "/workspace",
     ]
 
+    # If work_dir is a git worktree, mount the host .git directory so git
+    # commands work inside the container.  Worktree .git files reference an
+    # absolute host path (e.g. /Users/.../project/.git/worktrees/<name>) that
+    # doesn't exist in the container.  Mounting the main .git dir at the same
+    # host path makes the reference resolve transparently.
+    git_file = work_dir / ".git"
+    if git_file.is_file():
+        try:
+            first_line = git_file.read_text().splitlines()[0].strip()
+            if first_line.startswith("gitdir:"):
+                gitdir = Path(first_line.split(":", 1)[1].strip())
+                # gitdir is .git/worktrees/<name>; main .git is two levels up
+                main_git_dir = gitdir.parent.parent
+                if main_git_dir.is_dir():
+                    cmd.extend(["-v", f"{main_git_dir}:{main_git_dir}"])
+        except (OSError, IndexError):
+            pass  # Non-fatal — git just won't work inside the container
+
     # Mount config directory if specified (for OAuth credentials)
     for arg in _get_config_dir_volume_args(docker_config):
         cmd.insert(-2, arg)
