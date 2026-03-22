@@ -85,6 +85,11 @@ def prune_terminal_dead_workers(config: Config) -> None:
         task_label = f"#{worker.task_id}" if worker.task_id is not None else "<unknown>"
         try:
             if worker.task_id is None:
+                print(
+                    f"Warning: Worker {worker.worker_id} has no associated task_id; "
+                    f"skipping prune (possible incomplete registration)",
+                    file=sys.stderr,
+                )
                 continue
             task = store.get(worker.task_id)
             if task is None:

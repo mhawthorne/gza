@@ -1253,6 +1253,7 @@ class TestPsCommand:
 
     def test_ps_prunes_dead_worker_for_terminal_task(self, tmp_path: Path):
         """ps/status should prune stale worker entries once their task is terminal."""
+        import subprocess
         from gza.db import SqliteTaskStore
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -1266,13 +1267,17 @@ class TestPsCommand:
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
 
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        dead_pid = proc.pid
+
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_dir)
         registry.register(
             WorkerMetadata(
                 worker_id="w-prune-on-ps",
-                pid=999997,
+                pid=dead_pid,
                 task_id=task.id,
                 task_slug=None,
                 started_at=datetime.now(timezone.utc).isoformat(),
