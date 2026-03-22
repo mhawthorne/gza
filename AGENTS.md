@@ -147,6 +147,8 @@ Gza tasks run inside a Docker container. The container:
 
 **Do NOT use** `python -m pytest` or `pip install` directly - always use `uv run`.
 
+**Do NOT use the `sqlite3` CLI** — it may not be installed. To query the database programmatically, use `uv run python -c 'from gza.db import ...'`.
+
 **Do NOT modify files outside `/workspace/gza/`** unless explicitly instructed. Other directories under `/workspace/` are sibling projects.
 
 ## Renaming/Refactoring Tips
@@ -170,13 +172,15 @@ Signs you're violating this:
 ## Important Guidelines
 
 - **Always run gza commands from your starting directory** - Do not `cd` to other directories before running gza commands unless explicitly instructed. Gza uses the current directory to find `gza.yaml`, `.gza/`, and the task database. Running from the wrong directory will target the wrong project or fail.
-- **Do NOT run git commands** - Gza handles all git operations (branching, committing, pushing) automatically after your task completes. Just make the code changes and let gza commit them.
+- **Do NOT run git commands** - Gza handles all git operations (branching, committing, pushing) automatically after your task completes. Just make the code changes and let gza commit them. If git fails with "not a git repository" (e.g., in a cleaned-up worktree), do not attempt `git init` or `--git-dir` workarounds — report the issue and stop.
 - **Run /gza-test-and-fix before completing any task** - You MUST invoke the `/gza-test-and-fix` skill before declaring a task complete. This runs mypy and pytest, automatically fixes any failures in files changed on the current branch, and commits the fixes. Do not mark a task as done until `/gza-test-and-fix` passes cleanly.
+- **Test retry circuit breaker** - If the same test fails 3 times with the same error, stop and report the issue instead of continuing to retry. Looping on unfixable tests wastes turns and budget.
 - **Do NOT delete git branches** unless explicitly asked to. Branches should be preserved for history and reference.
 - **Do NOT create summary or documentation files** (e.g., `IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, `*_SETUP.md`). Just make the code changes and commit them. If summaries are needed, they will be handled separately.
 - **Do NOT create README files** unless explicitly requested.
 - **Do NOT create setup/how-to docs in project root**. If you must document something for developers (e.g., release process, setup instructions), place it in `docs/internal/` - never in the project root.
 - **Do NOT create one-off utility scripts** in the project root (e.g., `check_syntax.py`, `validate_*.py`, `verify_*.py`). Use existing tools like `uv run pytest` or `uv run python -m py_compile <file>` instead.
+- **Use offset/limit when reading large files** - When reading files that might be large (>1000 lines), use the `offset` and `limit` parameters on the Read tool. If you get a file-too-large error, retry with `limit=500` and navigate using `offset`.
 
 ## Creating Tasks from Conversations
 
