@@ -1251,6 +1251,47 @@ class TestPsCommand:
 
         registry.remove("w-test-both")
 
+    def test_ps_prunes_dead_worker_for_terminal_task(self, tmp_path: Path):
+        """ps/status should prune stale worker entries once their task is terminal."""
+        import subprocess
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Terminal task with dead worker")
+        task.status = "failed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        dead_pid = proc.pid
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-prune-on-ps",
+                pid=dead_pid,
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "No running workers or in-progress tasks" in result.stdout
+        assert registry.get("w-prune-on-ps") is None
+
     def test_ps_no_id_background_claim_reconciles_single_active_row(self, tmp_path: Path):
         """No-id background claim should reconcile into one active non-orphaned task row."""
         import os

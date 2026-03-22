@@ -1248,6 +1248,114 @@ class TestReconciliation:
         assert "Warning: Unexpected reconciliation error for task" in captured.err
         assert "db-write-boom" in captured.err
 
+    def test_prune_terminal_dead_workers_removes_completed_task_worker(self, tmp_path: Path):
+        """Terminal task workers with dead PIDs should be pruned from the registry."""
+        import os
+        import subprocess
+        from gza.cli._common import prune_terminal_dead_workers
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Completed task with stale worker metadata")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        # Use a PID known to be dead: start a process, wait for it to exit, then use its PID.
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        dead_pid = proc.pid
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-prune-terminal",
+                task_id=task.id,
+                pid=dead_pid,
+                status="running",
+            )
+        )
+        assert registry.get("w-prune-terminal") is not None
+
+        prune_terminal_dead_workers(config)
+
+        assert registry.get("w-prune-terminal") is None
+
+    def test_prune_terminal_dead_workers_keeps_in_progress_task_worker(self, tmp_path: Path):
+        """Non-terminal task workers should not be pruned by terminal cleanup."""
+        import os
+        from gza.cli._common import prune_terminal_dead_workers
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("In-progress task should keep worker entry")
+        store.mark_in_progress(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-keep-in-progress",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+
+        prune_terminal_dead_workers(config)
+
+        assert registry.get("w-keep-in-progress") is not None
+
+    def test_prune_terminal_dead_workers_keeps_live_worker_for_terminal_task(self, tmp_path: Path):
+        """Live worker PID for a terminal task must NOT be pruned (is_running guard)."""
+        import os
+        from gza.cli._common import prune_terminal_dead_workers
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Terminal task with live worker still flushing")
+        task.status = "failed"
+        from datetime import datetime, timezone
+        task.completed_at = datetime.now(timezone.utc)
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        # Use the current process PID — guaranteed alive for the duration of this test.
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-live-terminal",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+        assert registry.get("w-live-terminal") is not None
+
+        prune_terminal_dead_workers(config)
+
+        # Entry must be retained because the PID is still alive.
+        assert registry.get("w-live-terminal") is not None
+
 
 class TestImplementCommand:
     """Tests for 'gza implement' command."""

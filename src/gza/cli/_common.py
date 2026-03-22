@@ -68,6 +68,55 @@ def reconcile_in_progress_tasks(config: Config) -> None:
             print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
 
 
+def prune_terminal_dead_workers(config: Config) -> None:
+    """Remove worker registry entries for terminal tasks when the worker PID is dead."""
+    try:
+        store = get_store(config)
+        registry = WorkerRegistry(config.workers_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        print(f"Warning: Skipping worker prune due to setup error: {exc}", file=sys.stderr)
+        return
+    except Exception as exc:
+        print(f"Warning: Skipping worker prune due to unexpected error: {exc}", file=sys.stderr)
+        return
+
+    terminal_statuses = {"completed", "failed", "dropped", "unmerged"}
+    for worker in registry.list_all(include_completed=True):
+        task_label = f"#{worker.task_id}" if worker.task_id is not None else "<unknown>"
+        try:
+            if worker.task_id is None:
+                print(
+                    f"Warning: Worker {worker.worker_id} has no associated task_id; "
+                    f"skipping prune (possible incomplete registration)",
+                    file=sys.stderr,
+                )
+                continue
+            task = store.get(worker.task_id)
+            if task is None:
+                print(
+                    f"Warning: Worker {worker.worker_id} references task {task_label} not found in DB; "
+                    f"possible registry/DB desynchronization",
+                    file=sys.stderr,
+                )
+                continue
+            if task.status not in terminal_statuses:
+                continue
+            if registry.is_running(worker.worker_id):
+                continue
+            registry.remove(worker.worker_id)
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(
+                f"Warning: Failed to prune worker {worker.worker_id} for task {task_label}: {exc}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: Unexpected worker prune error for worker {worker.worker_id} "
+                f"(task {task_label}): {exc}",
+                file=sys.stderr,
+            )
+
+
 # Shared color palette for history and stats output (readable on dark and light terminals)
 TASK_COLORS: dict[str, str] = {
     "task_id": "#aaaaaa",   # light gray for task ID and date

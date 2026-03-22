@@ -12,6 +12,7 @@ from ._common import (
     _add_skills_install_args,
     add_common_args,
     _add_query_filter_args,
+    prune_terminal_dead_workers,
     reconcile_in_progress_tasks,
 )
 from ..config import Config
@@ -1237,6 +1238,11 @@ def main() -> int:
                     reconcile_in_progress_tasks(cfg)
                 except Exception as exc:
                     print(f"Warning: In-progress reconciliation failed: {exc}", file=sys.stderr)
+                if args.command in {"ps", "status"}:
+                    try:
+                        prune_terminal_dead_workers(cfg)
+                    except Exception as exc:
+                        print(f"Warning: Worker prune failed: {exc}", file=sys.stderr)
         if args.command == "work":
             return cmd_run(args)
         elif args.command == "next":
