@@ -1865,12 +1865,24 @@ def _run_non_code_task(
             task.num_steps_computed = count
             store.update(task)
 
+        # When running in Docker, the worktree .git file contains a host-specific
+        # gitdir path that is invalid inside the container.  Hide it before the
+        # provider run and restore it afterwards so the host worktree stays valid.
+        host_git_file = worktree_path / ".git"
+        hidden_git_file = worktree_path / ".git.gza-host-worktree"
+        hide_git = config.use_docker and host_git_file.is_file()
+        if hide_git:
+            host_git_file.rename(hidden_git_file)
+
         try:
             result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code, on_step_count=_on_step_count_non_code)
         except KeyboardInterrupt:
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason="INTERRUPTED")
             console.print("\nInterrupted")
             return 130
+        finally:
+            if hide_git and hidden_git_file.exists():
+                hidden_git_file.rename(host_git_file)
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None
