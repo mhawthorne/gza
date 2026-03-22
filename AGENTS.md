@@ -8,7 +8,7 @@ A coding AI agent runner for Claude Code.
 
 ## Usage
 
-To run gza commands, use either `bin/gza` or `uv run gza`:
+**IMPORTANT**: Always use `uv run gza` to run gza commands. Do NOT use `gza` directly or `python -m gza` - these will fail.
 
 ```
 gza init [--project DIR]              # Generate new gza.yaml with defaults
