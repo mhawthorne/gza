@@ -16,6 +16,7 @@ gza work [--project DIR]              # Run the next pending task
 gza next [--project DIR]              # List upcoming pending tasks
 gza history [--project DIR]           # List recent completed/failed tasks
 gza stats [--project DIR]             # Show cost and usage statistics
+gza lineage <task-id> [--project DIR] # Show full ancestor/descendant tree for a task
 gza validate [--project DIR]          # Validate gza.yaml configuration
 gza skills-install [SKILLS...]        # Install gza Claude Code skills to project
 ```
@@ -47,6 +48,10 @@ Options for `stats`:
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
+
+Options for `lineage`:
+- `<task-id>` - ID of any task in the lineage (the root is resolved automatically)
+- Displays the full ancestor/descendant tree with status, relationship labels, cost/token stats, and marks the target task with `→`
 
 ## Installing Claude Code Skills
 

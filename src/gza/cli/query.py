@@ -41,7 +41,31 @@ from ..query import (
     build_lineage_tree as _build_lineage_tree_for_root,
     filter_lineage_tree as _filter_lineage_tree,
     resolve_lineage_root as _resolve_lineage_root_task,
+    TaskLineageNode,
 )
+
+
+_LINEAGE_STATUS_COLORS: dict[str, str] = {
+    "completed": "green",
+    "failed": "red",
+    "pending": "yellow",
+    "in_progress": "cyan",
+    "unmerged": "yellow",
+    "dropped": "red",
+}
+
+_LINEAGE_REL_LABELS: dict[str, str] = {
+    "review": "review",
+    "improve-from-review": "improve",
+    "improve": "improve",
+    "implement-depends": "implement",
+    "implement-based": "implement",
+    "depends-and-based": "retry",
+    "depends": "depends",
+    "based": "retry",
+    # Relationships not in this map (e.g. "plan", "explore", "task", "internal")
+    # silently produce no label — this is intentional for unusual/unknown relationships.
+}
 
 
 def cmd_next(args: argparse.Namespace) -> int:
@@ -1151,6 +1175,71 @@ def cmd_delete(args: argparse.Namespace) -> int:
     else:
         print(f"Error: Failed to delete task")
         return 1
+
+
+def cmd_lineage(args: argparse.Namespace) -> int:
+    """Show the full lineage tree for a given task."""
+    from rich.tree import Tree as RichTree
+
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task_id: int = args.task_id
+    task = store.get(task_id)
+    if task is None:
+        console.print(f"[red]Error: Task #{task_id} not found[/red]")
+        return 1
+
+    root = _resolve_lineage_root_task(store, task)
+    lineage_tree = _build_lineage_tree_for_root(store, root, max_depth=None)
+
+    def _status_text(t: DbTask) -> str:
+        if t.status == "failed":
+            if t.failure_reason and t.failure_reason != "UNKNOWN":
+                return f"failed ({t.failure_reason})"
+            return "failed"
+        return t.status or "unknown"
+
+    def _node_label(node: TaskLineageNode) -> str:
+        t = node.task
+        is_target = t.id == task_id
+
+        status = _status_text(t)
+        type_str = t.task_type or "implement"
+        first_line = t.prompt.split("\n")[0].strip()
+        prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
+
+        rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
+        rel_part = f" [dim]{rich_escape(f'[{rel}]')}[/dim]" if rel else ""
+
+        stats = format_stats(t)
+        stats_part = f" [cyan]({stats})[/cyan]" if stats else ""
+
+        status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
+
+        label = (
+            f"[dim]#{t.id}[/dim]"
+            f" [magenta]{rich_escape(type_str)}[/magenta]"
+            f" [{status_color}]{rich_escape(status)}[/{status_color}]"
+            f"{rel_part}"
+            f"  [#ff99cc]'{rich_escape(prompt_short)}'[/#ff99cc]"
+            f"{stats_part}"
+        )
+
+        if is_target:
+            label = f"[bold]→ {label}[/bold]"
+
+        return label
+
+    def _populate(node: TaskLineageNode, rich_parent: RichTree) -> None:
+        for child in node.children:
+            child_branch = rich_parent.add(_node_label(child))
+            _populate(child, child_branch)
+
+    rich_tree = RichTree(_node_label(lineage_tree))
+    _populate(lineage_tree, rich_tree)
+    console.print(rich_tree)
+    return 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:

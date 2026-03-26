@@ -55,6 +55,7 @@ from .query import (
     cmd_delete,
     cmd_groups,
     cmd_history,
+    cmd_lineage,
     cmd_next,
     cmd_ps,
     cmd_show,
@@ -1038,6 +1039,17 @@ def main() -> int:
     )
     add_common_args(review_parser)
 
+    # lineage command
+    lineage_parser = subparsers.add_parser(
+        "lineage", help="Show the full lineage tree for a given task"
+    )
+    lineage_parser.add_argument(
+        "task_id",
+        type=int,
+        help="Task ID to show lineage for",
+    )
+    add_common_args(lineage_parser)
+
     # show command
     show_parser = subparsers.add_parser("show", help="Show details of a specific task")
     show_parser.add_argument(
@@ -1297,6 +1309,8 @@ def main() -> int:
             return cmd_review(args)
         elif args.command == "resume":
             return cmd_resume(args)
+        elif args.command == "lineage":
+            return cmd_lineage(args)
         elif args.command == "show":
             return cmd_show(args)
         elif args.command == "sync-report":
