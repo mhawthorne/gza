@@ -1884,8 +1884,8 @@ class TestAdvanceCommand:
         assert updated_task is not None
         assert updated_task.merge_status == "merged"
 
-    def test_advance_skips_task_with_conflicts(self, tmp_path: Path):
-        """advance skips a task whose branch has merge conflicts."""
+    def test_advance_spawns_rebase_worker_on_conflicts(self, tmp_path: Path):
+        """advance spawns a background rebase --resolve worker when conflicts are detected."""
         from gza.db import SqliteTaskStore
         from gza.git import Git
         setup_config(tmp_path)
@@ -1918,9 +1918,10 @@ class TestAdvanceCommand:
 
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "needs" in result.stdout.lower() and "rebase" in result.stdout.lower()
+        assert "rebase" in result.stdout.lower()
+        assert "started rebase worker" in result.stdout.lower()
 
-        # Task should still be unmerged
+        # Task should still be unmerged (rebase worker runs in background)
         updated_task = store.get(task.id)
         assert updated_task is not None
         assert updated_task.merge_status == "unmerged"

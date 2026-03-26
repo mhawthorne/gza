@@ -525,6 +525,7 @@ def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) ->
             task_id=args.task_id,
             pid=proc.pid,
             startup_log_file=startup_log_rel,
+            worker_type="rebase",
         )
         registry.register(worker)
 
@@ -1145,14 +1146,9 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         help="Show last N tasks",
     )
     parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Show all tasks (no limit)",
-    )
-    parser.add_argument(
         "--type",
         type=str,
-        choices=["explore", "plan", "implement", "review", "improve", "internal"],
+        choices=["explore", "plan", "implement", "review", "improve", "rebase", "internal"],
         help="Filter tasks by task_type",
     )
     parser.add_argument(

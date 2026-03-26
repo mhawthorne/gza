@@ -30,7 +30,6 @@ Options for `init`:
 
 Options for `history`:
 - `--last N` / `-n N` - Show last N tasks (default: 5)
-- `--all` - Show all tasks (no limit)
 - `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, internal)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date

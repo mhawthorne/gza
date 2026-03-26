@@ -183,7 +183,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     lineage_depth = getattr(args, 'lineage_depth', 0)
 
     f = HistoryFilter(
-        limit=None if args.all else args.last,
+        limit=args.last,
         status=status,
         task_type=task_type,
         incomplete=incomplete,
@@ -938,11 +938,15 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
     elif source == "worker" and worker is not None:
         status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
     elif worker is not None and task is not None:
-        # Both worker and task exist. Prefer DB terminal status over a
-        # stale worker status — the DB is the source of truth for completion.
-        if task.status in ("completed", "failed"):
+        # Both worker and task exist.
+        # For auxiliary workers (worker_type set, e.g. rebase), the linked task
+        # may already be terminal — prefer worker's live status over DB status.
+        # For regular task workers, prefer DB terminal status as source of truth.
+        if worker.worker_type and worker.status == "running":
+            status = "running"
+        elif task.status in ("completed", "failed"):
             status = task.status
-        elif worker and not (task and task.running_pid):
+        elif not (task and task.running_pid):
             status = "stale"
         else:
             status = "running"
@@ -962,7 +966,13 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
     worker_id = worker.worker_id if worker else "-"
     pid = str(worker.pid) if worker else "-"
-    task_type_display = task.task_type if task else "-"
+    # Worker type (e.g. "rebase") takes precedence over task type for display
+    if worker and worker.worker_type:
+        task_type_display = worker.worker_type
+    elif task:
+        task_type_display = task.task_type
+    else:
+        task_type_display = "-"
 
     task_id = task.id if task and task.id is not None else worker.task_id if worker else None
     task_display = ""

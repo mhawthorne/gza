@@ -1363,78 +1363,89 @@ def _complete_code_task(
     worktree_summary_path: Path,
     summary_path: Path,
     summary_dir: Path,
+    *,
+    skip_commit: bool = False,
 ) -> int:
-    """Handle successful code-task completion (staging, commit, completion state, output)."""
-    # Compute which files changed during the provider run (selective staging)
-    post_run_status = worktree_git.status_porcelain()
-    new_changes = post_run_status - pre_run_status
-    has_uncommitted = bool(new_changes)
+    """Handle successful code-task completion (staging, commit, completion state, output).
 
-    if not has_uncommitted:
-        # Check if branch already has commits from a previous run
-        default_branch = worktree_git.default_branch()
-        commits_ahead = worktree_git.count_commits_ahead(branch_name, default_branch)
-        if commits_ahead == 0:
-            # No uncommitted changes and no commits on branch - real failure
-            # Note: No need to save WIP here since there are no changes
-            error_message("No changes made")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
-            failure_reason = extract_failure_reason(log_file)
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "outcome",
-                    "message": "Outcome: failed (no changes made)",
-                    "exit_code": exit_code,
-                    "failure_reason": failure_reason,
-                },
-            )
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "stats",
-                    "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
-                    "duration_seconds": stats.duration_seconds,
-                    "cost_usd": stats.cost_usd,
-                    "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
-                },
-            )
-            store.mark_failed(
-                task,
-                log_file=str(log_file.relative_to(config.project_dir)),
-                stats=stats,
-                branch=branch_name,
-                failure_reason=failure_reason,
-            )
-            return 0
-        # else: branch has commits from a previous run - treat as success without committing
+    Args:
+        skip_commit: If True, skip staging/committing changes. Used for rebase
+            tasks where the agent handles all git operations (rebase + force push)
+            and no new commits should be created by the runner.
+    """
+    if skip_commit:
+        has_uncommitted = False
+    else:
+        # Compute which files changed during the provider run (selective staging)
+        post_run_status = worktree_git.status_porcelain()
+        new_changes = post_run_status - pre_run_status
+        has_uncommitted = bool(new_changes)
 
-    if has_uncommitted:
-        # Squash any WIP commits before creating final commit
-        _squash_wip_commits(worktree_git, task)
+        if not has_uncommitted:
+            # Check if branch already has commits from a previous run
+            default_branch = worktree_git.default_branch()
+            commits_ahead = worktree_git.count_commits_ahead(branch_name, default_branch)
+            if commits_ahead == 0:
+                # No uncommitted changes and no commits on branch - real failure
+                # Note: No need to save WIP here since there are no changes
+                error_message("No changes made")
+                stats_line(stats, has_commits=False)
+                console.print(f"Task ID: {task.id}")
+                next_steps([
+                    (f"gza retry {task.id}", "retry from scratch"),
+                    (f"gza resume {task.id}", "resume from where it left off"),
+                ])
+                failure_reason = extract_failure_reason(log_file)
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "outcome",
+                        "message": "Outcome: failed (no changes made)",
+                        "exit_code": exit_code,
+                        "failure_reason": failure_reason,
+                    },
+                )
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "stats",
+                        "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+                        "duration_seconds": stats.duration_seconds,
+                        "cost_usd": stats.cost_usd,
+                        "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+                    },
+                )
+                store.mark_failed(
+                    task,
+                    log_file=str(log_file.relative_to(config.project_dir)),
+                    stats=stats,
+                    branch=branch_name,
+                    failure_reason=failure_reason,
+                )
+                return 0
+            # else: branch has commits from a previous run - treat as success without committing
 
-        # Stage only files that changed during the provider run
-        files_to_stage = [filepath for _, filepath in new_changes]
-        for f in files_to_stage:
-            worktree_git.add(f)
+        if has_uncommitted:
+            # Squash any WIP commits before creating final commit
+            _squash_wip_commits(worktree_git, task)
 
-        # Build commit message with trailer for improve tasks
-        commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
+            # Stage only files that changed during the provider run
+            files_to_stage = [filepath for _, filepath in new_changes]
+            for f in files_to_stage:
+                worktree_git.add(f)
 
-        # Add review trailer for improve tasks
-        if task.task_type == "improve" and task.depends_on:
-            review_task = store.get(task.depends_on)
-            if review_task and review_task.task_type == "review":
-                commit_message += f"\nGza-Review: #{review_task.id}"
+            # Build commit message with trailer for improve tasks
+            commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
 
-        worktree_git.commit(commit_message)
+            # Add review trailer for improve tasks
+            if task.task_type == "improve" and task.depends_on:
+                review_task = store.get(task.depends_on)
+                if review_task and review_task.task_type == "review":
+                    commit_message += f"\nGza-Review: #{review_task.id}"
+
+            worktree_git.commit(commit_message)
 
     # Copy summary file from worktree to main project directory
     output_content = None
@@ -1715,6 +1726,7 @@ def _run_inner(
             worktree_summary_path,
             summary_path,
             summary_dir,
+            skip_commit=task.task_type == "rebase",
         )
 
     except GitError as e:
