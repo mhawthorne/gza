@@ -228,6 +228,22 @@ class ClaudeProvider(Provider):
             return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
         return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
 
+    @staticmethod
+    def _build_claude_args(config: Config, resume_session_id: str | None = None) -> list[str]:
+        """Build the claude CLI arguments shared across docker and direct modes."""
+        args = ["-p", "-", "--output-format", "stream-json", "--verbose"]
+
+        if resume_session_id:
+            args.extend(["--resume", resume_session_id])
+
+        if config.model:
+            args.extend(["--model", config.model])
+
+        args.extend(config.claude.args)
+        args.extend(["--max-turns", str(config.max_steps)])
+
+        return args
+
     def _run_docker(
         self,
         config: Config,
@@ -248,13 +264,8 @@ class ClaudeProvider(Provider):
             return RunResult(exit_code=1)
 
         cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
-        cmd.extend(["claude", "-p", "-", "--output-format", "stream-json", "--verbose"])
-
-        if resume_session_id:
-            cmd.extend(["--resume", resume_session_id])
-
-        cmd.extend(config.claude.args)
-        cmd.extend(["--max-turns", str(config.max_steps)])
+        cmd.append("claude")
+        cmd.extend(self._build_claude_args(config, resume_session_id))
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
@@ -274,17 +285,8 @@ class ClaudeProvider(Provider):
         on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
-        cmd = [
-            "timeout", f"{config.timeout_minutes}m",
-            "claude", "-p", "-",
-            "--output-format", "stream-json", "--verbose",
-        ]
-
-        if resume_session_id:
-            cmd.extend(["--resume", resume_session_id])
-
-        cmd.extend(config.claude.args)
-        cmd.extend(["--max-turns", str(config.max_steps)])
+        cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
+        cmd.extend(self._build_claude_args(config, resume_session_id))
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
