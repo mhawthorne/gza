@@ -18,6 +18,10 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 - `--continue` mode: assume a rebase conflict is already in progress, skip Steps 1-3, and start directly at Step 4.
   - In this mode, do not check for a clean working tree; the tree is expected to be dirty because of conflict markers.
   - If no rebase is in progress, stop and report that `git rebase --continue` cannot proceed.
+- `--auto` mode: unattended rebase for background workers. Same as default mode but:
+  - Do NOT use AskUserQuestion — resolve all conflicts autonomously using best judgment.
+  - After successful rebase, run `git push --force-with-lease` automatically.
+  - If a conflict is truly ambiguous and cannot be resolved confidently, abort the rebase and report failure.
 
 ### Step 1: Pre-flight checks
 
@@ -70,7 +74,7 @@ Show:
 
 ## Important notes
 
-- **Never force-push automatically** - always let the user do this manually
-- **Always ask before resolving ambiguous conflicts** - if the intent isn't clear, ask
+- **Never force-push automatically** (unless in `--auto` mode) - always let the user do this manually
+- **Always ask before resolving ambiguous conflicts** (unless in `--auto` mode) - if the intent isn't clear, ask
 - **Preserve both changes when possible** - most conflicts in this project are additive (both sides adding new code)
 - **Check Python syntax after each resolution** - catch errors early

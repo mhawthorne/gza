@@ -1926,6 +1926,94 @@ class TestAdvanceCommand:
         assert updated_task is not None
         assert updated_task.merge_status == "unmerged"
 
+    def test_advance_skips_task_with_in_progress_rebase_child(self, tmp_path: Path):
+        """advance skips a task when a rebase child is already in progress."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a branch that conflicts with main
+        branch = "feat/conflicting2"
+        git._run("checkout", "-b", branch)
+        (tmp_path / "README.md").write_text("feature version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Conflict commit")
+        git._run("checkout", "main")
+        (tmp_path / "README.md").write_text("main version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Main change")
+
+        task = store.add("Conflicting feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        # Create an in-progress rebase child
+        rebase_child = store.add(
+            "Rebase branch",
+            task_type="rebase",
+            based_on=task.id,
+            same_branch=True,
+        )
+        rebase_child.status = "in_progress"
+        store.update(rebase_child)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'skip'
+        assert f"rebase #{rebase_child.id} already in progress" in action['description']
+
+    def test_advance_needs_discussion_for_failed_rebase_child(self, tmp_path: Path):
+        """advance returns needs_discussion when a rebase child has failed."""
+        from gza.db import SqliteTaskStore
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create a branch that conflicts with main
+        branch = "feat/conflicting3"
+        git._run("checkout", "-b", branch)
+        (tmp_path / "README.md").write_text("feature version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Conflict commit")
+        git._run("checkout", "main")
+        (tmp_path / "README.md").write_text("main version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Main change")
+
+        task = store.add("Conflicting feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        # Create a failed rebase child
+        rebase_child = store.add(
+            "Rebase branch",
+            task_type="rebase",
+            based_on=task.id,
+            same_branch=True,
+        )
+        rebase_child.status = "failed"
+        store.update(rebase_child)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'needs_discussion'
+        assert f"rebase #{rebase_child.id} failed" in action['description']
+
     def test_advance_merges_non_implement_task_without_review(self, tmp_path: Path):
         """advance merges a non-implement task (e.g. explore) directly, skipping review creation."""
         import argparse

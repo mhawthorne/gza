@@ -30,7 +30,7 @@ Options for `init`:
 
 Options for `history`:
 - `--last N` / `-n N` - Show last N tasks (default: 5)
-- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, internal)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, rebase, internal)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
@@ -43,7 +43,7 @@ Options for `history`:
 Options for `stats`:
 - `--last N` / `-n N` - Show last N tasks (default: 5)
 - `--all` - Show all tasks (no limit)
-- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, internal)
+- `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, rebase, internal)
 - `--days N` - Show only tasks from the last N days
 - `--start-date YYYY-MM-DD` - Show only tasks on or after this date
 - `--end-date YYYY-MM-DD` - Show only tasks on or before this date
@@ -180,6 +180,9 @@ Signs you're violating this:
 - Copy-pasting code between functions
 - Adding "if task_type == X" checks in multiple places for the same behavior
 - Post-completion hooks that only run from some entry points
+- A background/automated version of a command that uses a different mechanism than the foreground/manual version
+
+**Multiple entry points, same mechanism**: Many operations (rebase, review, improve, work) can be triggered from multiple entry points: direct CLI invocation, `--background` flag, `gza advance`, Docker, etc. All entry points for the same operation must use the same underlying mechanism. For example, `gza rebase --background` must create a rebase task and run it through the standard runner — the same path `gza advance` uses when it detects conflicts. Do not create a separate "background rebase" implementation that bypasses the runner.
 
 ## Important Guidelines
 

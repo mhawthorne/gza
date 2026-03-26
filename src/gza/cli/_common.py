@@ -479,67 +479,27 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         return 1
 
 
-def _spawn_background_rebase_worker(args: argparse.Namespace, config: Config) -> int:
-    """Spawn a background worker to perform a rebase.
+def _create_rebase_task(
+    store: SqliteTaskStore,
+    parent_task_id: int,
+    branch: str,
+    target_branch: str,
+) -> DbTask:
+    """Create a rebase task for resolving merge conflicts.
 
-    Args:
-        args: Command-line arguments (task_id, onto, remote, force, resolve)
-        config: Configuration object
-
-    Returns:
-        0 on success, 1 on error
+    Used by both ``gza rebase --background`` and ``gza advance`` so that
+    rebases always go through the standard runner.
     """
-    registry = WorkerRegistry(config.workers_path)
-
-    # Build command: gza rebase <task_id> [options] (without --background)
-    cmd = [
-        sys.executable, "-m", "gza",
-        "rebase",
-        str(args.task_id),
-    ]
-
-    if getattr(args, 'onto', None):
-        cmd.extend(["--onto", args.onto])
-
-    if getattr(args, 'remote', False):
-        cmd.append("--remote")
-
-    if getattr(args, 'force', False):
-        cmd.append("--force")
-
-    if getattr(args, 'resolve', False):
-        cmd.append("--resolve")
-
-    # Add project directory
-    cmd.extend(["--project", str(config.project_dir.absolute())])
-
-    # Spawn detached process
-    try:
-        # Generate worker ID
-        worker_id = registry.generate_worker_id()
-        proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
-
-        # Register worker
-        worker = WorkerMetadata(
-            worker_id=worker_id,
-            task_id=args.task_id,
-            pid=proc.pid,
-            startup_log_file=startup_log_rel,
-            worker_type="rebase",
-        )
-        registry.register(worker)
-
-        print(f"Started worker {worker_id} (PID {proc.pid})")
-        print(f"  Rebasing task: #{args.task_id}")
-        print()
-        print(f"Use 'gza ps' to view running workers")
-        print(f"Use 'gza log -w {worker_id} -f' to follow output")
-
-        return 0
-
-    except Exception as e:
-        print(f"Error spawning background worker: {e}")
-        return 1
+    return store.add(
+        prompt=(
+            f"Rebase branch '{branch}' onto '{target_branch}' and resolve "
+            f"any conflicts. Use /gza-rebase --auto to perform the rebase."
+        ),
+        task_type="rebase",
+        based_on=parent_task_id,
+        same_branch=True,
+        skip_learnings=True,
+    )
 
 
 def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:

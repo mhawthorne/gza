@@ -38,8 +38,8 @@ from ._common import (
     get_store,
     get_review_verdict,
     _create_resume_task,
+    _create_rebase_task,
     _spawn_background_worker,
-    _spawn_background_rebase_worker,
     _spawn_background_resume_worker,
 )
 
@@ -451,9 +451,23 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
 
-    # Handle background mode - spawn worker to perform the rebase
+    # Handle background mode - create a rebase task and run through the standard runner
     if getattr(args, 'background', False):
-        return _spawn_background_rebase_worker(args, config)
+        store = get_store(config)
+        task = store.get(args.task_id)
+        if not task:
+            print(f"Error: Task #{args.task_id} not found")
+            return 1
+        if not task.branch:
+            print(f"Error: Task #{args.task_id} has no branch")
+            return 1
+        git = Git(config.project_dir)
+        target = getattr(args, 'onto', None) or git.default_branch()
+        if getattr(args, 'remote', False):
+            target = f"origin/{target}"
+        rebase_task = _create_rebase_task(store, args.task_id, task.branch, target)
+        worker_args = argparse.Namespace(no_docker=False, max_turns=None)
+        return _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
 
     store = get_store(config)
     git = Git(config.project_dir)
@@ -1744,14 +1758,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 error_count += 1
 
         elif action_type == 'needs_rebase':
-            # Create a rebase task and run it through the normal runner
-            rebase_task = store.add(
-                prompt=f"Rebase branch '{task.branch}' onto '{default_branch}' and resolve any conflicts. Use /gza-rebase --auto to perform the rebase. Force push the branch after successful rebase.",
-                task_type='rebase',
-                based_on=task.id,
-                same_branch=True,
-                skip_learnings=True,
-            )
+            assert task.id is not None
+            rebase_task = _create_rebase_task(store, task.id, task.branch, default_branch)
             assert rebase_task.id is not None
             console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")
 
