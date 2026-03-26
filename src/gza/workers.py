@@ -25,7 +25,6 @@ class WorkerMetadata:
     is_background: bool = True
     exit_code: int | None = None
     completed_at: str | None = None
-    worker_type: str | None = None  # "task" (default), "rebase", etc.
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -67,7 +66,6 @@ class WorkerMetadata:
             is_background=bool(data.get("is_background", True)),
             exit_code=data.get("exit_code"),
             completed_at=data.get("completed_at"),
-            worker_type=data.get("worker_type"),
         )
 
 

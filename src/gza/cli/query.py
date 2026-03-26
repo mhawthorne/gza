@@ -939,12 +939,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
     elif worker is not None and task is not None:
         # Both worker and task exist.
-        # For auxiliary workers (worker_type set, e.g. rebase), the linked task
-        # may already be terminal — prefer worker's live status over DB status.
-        # For regular task workers, prefer DB terminal status as source of truth.
-        if worker.worker_type and worker.status == "running":
-            status = "running"
-        elif task.status in ("completed", "failed"):
+        if task.status in ("completed", "failed"):
             status = task.status
         elif not (task and task.running_pid):
             status = "stale"
@@ -966,10 +961,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
     worker_id = worker.worker_id if worker else "-"
     pid = str(worker.pid) if worker else "-"
-    # Worker type (e.g. "rebase") takes precedence over task type for display
-    if worker and worker.worker_type:
-        task_type_display = worker.worker_type
-    elif task:
+    if task:
         task_type_display = task.task_type
     else:
         task_type_display = "-"

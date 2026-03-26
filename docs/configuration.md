@@ -190,7 +190,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `internal`
+Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal`
 
 Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
 
@@ -686,7 +686,7 @@ gza history [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal` |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
