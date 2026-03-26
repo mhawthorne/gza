@@ -14,7 +14,7 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 
 ### Modes
 
-- Default mode: run the full flow (Steps 1-6).
+- Default mode: run the full flow (Steps 1-7).
 - `--continue` mode: assume a rebase conflict is already in progress, skip Steps 1-3, and start directly at Step 4.
   - In this mode, do not check for a clean working tree; the tree is expected to be dirty because of conflict markers.
   - If no rebase is in progress, stop and report that `git rebase --continue` cannot proceed.
@@ -25,7 +25,9 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 
 ### Step 1: Pre-flight checks
 
-1. Check for uncommitted changes - if any exist, stop and ask the user to commit or stash them
+1. Check for uncommitted changes (`git status --porcelain`)
+   - In default mode: if any exist, stop and ask the user to commit or stash them
+   - In `--auto` mode: if any exist, run `git stash` to save them. They will be restored after the rebase completes.
 2. Show the current branch name
 
 ### Step 2: Choose rebase target
@@ -65,7 +67,11 @@ After all conflicts are resolved:
 2. If more conflicts appear (from subsequent commits), repeat Step 4
 3. Continue until rebase completes
 
-### Step 6: Final summary
+### Step 6: Restore stashed changes
+
+If changes were stashed in Step 1, run `git stash pop` to restore them.
+
+### Step 7: Final summary
 
 Show:
 - "Rebase completed successfully!"

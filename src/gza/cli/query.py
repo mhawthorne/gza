@@ -743,10 +743,10 @@ def _print_ps_output(
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
-        f"{'STATUS':<16} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+        f"{'STATUS':<16} {'PID':<8} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
     console.print(f"[bold]{header}[/bold]", soft_wrap=True)
-    console.print("[bold]" + "─" * 98 + "[/bold]", soft_wrap=True)
+    console.print("[bold]" + "─" * 106 + "[/bold]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
@@ -760,7 +760,7 @@ def _print_ps_output(
 
         console.print(
             f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
-            f"[{sc}]{status:<16}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
+            f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
             f"[#ff99cc]{task_display}[/#ff99cc]",
             soft_wrap=True,
         )

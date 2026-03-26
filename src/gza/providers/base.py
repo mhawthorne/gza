@@ -290,6 +290,27 @@ def build_docker_cmd(
         if os.getenv(env_var):
             cmd.extend(["-e", env_var])
 
+    # Pass git identity into the container so git commit/rebase works.
+    # Read from host git config; GIT_* env vars override if already set.
+    for env_var, git_key in [
+        ("GIT_AUTHOR_NAME", "user.name"),
+        ("GIT_AUTHOR_EMAIL", "user.email"),
+        ("GIT_COMMITTER_NAME", "user.name"),
+        ("GIT_COMMITTER_EMAIL", "user.email"),
+    ]:
+        if os.getenv(env_var):
+            cmd.extend(["-e", env_var])
+        else:
+            try:
+                result = subprocess.run(
+                    ["git", "config", git_key],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    cmd.extend(["-e", f"{env_var}={result.stdout.strip()}"])
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
     # Always install a `gza` shim so bare `gza ...` works inside task containers.
     setup_commands = [GZA_SHIM_SETUP_COMMAND.strip()]
     if docker_setup_command.strip():
