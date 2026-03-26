@@ -611,9 +611,8 @@ class TestHistoryCommand:
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "failed (UNKNOWN)" in result.stdout
+        assert result.stdout.count("failed (UNKNOWN)") >= 2  # explicit UNKNOWN and None both map to UNKNOWN
         assert "failed (MAX_STEPS)" in result.stdout
-        assert "failed (UNKNOWN)" in result.stdout  # no-reason also shows UNKNOWN
 
     def test_history_shows_parent_task_id(self, tmp_path: Path):
         """History shows parent task ID when based_on or depends_on is set."""
@@ -640,8 +639,8 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert f"← #{parent.id}" in result.stdout
 
-    def test_history_reconciles_in_progress_tasks(self, tmp_path: Path):
-        """History command reconciles orphaned in_progress tasks to failed (WORKER_DIED)."""
+    def test_history_shows_both_based_on_and_depends_on(self, tmp_path: Path):
+        """History shows both based_on and depends_on when a task has both set."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -649,15 +648,52 @@ class TestHistoryCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
 
-        # Create a task and mark it in_progress with no actual worker
-        orphaned = store.add("Orphaned in_progress task")
-        store.mark_in_progress(orphaned)
+        plan = store.add("Plan task")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(timezone.utc)
+        store.update(plan)
+
+        blocker = store.add("Blocker task")
+        blocker.status = "completed"
+        blocker.completed_at = datetime.now(timezone.utc)
+        store.update(blocker)
+
+        assert plan.id is not None
+        assert blocker.id is not None
+
+        child = store.add("Child task", based_on=plan.id, depends_on=blocker.id)
+        child.status = "completed"
+        child.completed_at = datetime.now(timezone.utc)
+        store.update(child)
 
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        # After reconciliation, orphaned task should appear as failed or in the output
-        assert "Orphaned in_progress task" in result.stdout
+        assert f"← #{plan.id} (dep #{blocker.id})" in result.stdout
+
+    def test_history_reconciles_in_progress_tasks(self, tmp_path: Path):
+        """History command reconciles orphaned in_progress tasks to failed (WORKER_DIED)."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a task and mark it in_progress with a non-existent PID so reconciliation triggers
+        orphaned = store.add("Orphaned in_progress task")
+        orphaned.status = "in_progress"
+        orphaned.started_at = datetime.now(timezone.utc)
+        orphaned.running_pid = 999999999  # non-existent PID
+        store.update(orphaned)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Reconciliation must have run: task should be shown as failed with WORKER_DIED reason
+        assert "failed" in result.stdout
+        assert "WORKER_DIED" in result.stdout
 
 
 class TestNextCommand:

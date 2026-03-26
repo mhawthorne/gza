@@ -189,8 +189,14 @@ def cmd_history(args: argparse.Namespace) -> int:
         )
         type_label = f" \\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
-        parent_id = task.based_on or task.depends_on
-        parent_label = f" ← #{parent_id}" if parent_id else ""
+        if task.based_on and task.depends_on:
+            parent_label = f" ← #{task.based_on} (dep #{task.depends_on})"
+        elif task.based_on:
+            parent_label = f" ← #{task.based_on}"
+        elif task.depends_on:
+            parent_label = f" ← #{task.depends_on}"
+        else:
+            parent_label = ""
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         console.print(
             f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
