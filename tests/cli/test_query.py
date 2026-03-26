@@ -3336,3 +3336,171 @@ class TestStopCommandSafety:
         assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
         called_workers = [call.args[0] for call in mock_stop.call_args_list]
         assert called_workers == ["w-stop-all-valid"]
+
+
+class TestLineageCommand:
+    """Tests for 'gza lineage <task-id>' command."""
+
+    def test_lineage_single_root_task(self, tmp_path: Path):
+        """Lineage command shows a single root task with no children."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "Design auth system", "status": "completed", "task_type": "plan"},
+        ])
+
+        result = run_gza("lineage", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Design auth system" in result.stdout
+        assert "plan" in result.stdout
+        assert "completed" in result.stdout
+
+    def test_lineage_task_not_found(self, tmp_path: Path):
+        """Lineage command returns error for missing task ID."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("lineage", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout.lower() or "not found" in result.stderr.lower()
+
+    def test_lineage_highlights_target_task(self, tmp_path: Path):
+        """Lineage command highlights the requested task with an arrow marker."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        root = store.add("Design auth system", task_type="plan")
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+
+        child = store.add("Implement auth per plan", task_type="implement", based_on=root.id)
+        child.status = "completed"
+        child.completed_at = now
+        store.update(child)
+
+        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Arrow marker for the target task
+        assert "→" in result.stdout
+        # Both tasks shown
+        assert "Design auth system" in result.stdout
+        assert "Implement auth per plan" in result.stdout
+
+    def test_lineage_shows_failed_task_with_reason(self, tmp_path: Path):
+        """Lineage command shows failure_reason for failed tasks."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "failed"
+        task.failure_reason = "MAX_STEPS"
+        task.completed_at = now
+        store.update(task)
+
+        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "MAX_STEPS" in result.stdout
+        assert "Implement feature" in result.stdout
+
+    def test_lineage_full_tree(self, tmp_path: Path):
+        """Lineage command renders a multi-level tree with parent and children."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        root = store.add("Design auth system", task_type="plan")
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+
+        impl = store.add("Implement auth per plan", task_type="implement", based_on=root.id)
+        impl.status = "completed"
+        impl.completed_at = now
+        store.update(impl)
+
+        review = store.add("Review implementation", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = now
+        store.update(review)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Design auth system" in result.stdout
+        assert "Implement auth per plan" in result.stdout
+        assert "Review implementation" in result.stdout
+
+    def test_lineage_shows_stats_when_available(self, tmp_path: Path):
+        """Lineage command shows duration and cost when available."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = now
+        task.duration_seconds = 120.0  # 2 minutes
+        task.cost_usd = 0.1234
+        store.update(task)
+
+        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "2m" in result.stdout
+        assert "0.1234" in result.stdout
+
+    def test_lineage_child_shows_relationship_label(self, tmp_path: Path):
+        """Lineage command shows relationship type on child edges."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = now
+        store.update(impl)
+
+        review = store.add("Review feature impl", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = now
+        store.update(review)
+
+        result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "review" in result.stdout
+        assert "Review feature impl" in result.stdout
