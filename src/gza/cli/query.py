@@ -171,23 +171,41 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     c = TASK_COLORS
 
+    # Fixed width for status labels to ensure alignment
+    STATUS_WIDTH = 9  # "completed" is the longest at 9 chars
+
     def _render_task_line(task: DbTask, indent: str = "") -> None:
         """Render a single task entry."""
         if task.merge_status == "unmerged":
-            status_icon = f"[{c['unmerged']}]unmerged[/{c['unmerged']}]"
+            status_label = "unmerged"
+            status_color = c['unmerged']
         elif task.status == "completed":
-            status_icon = f"[{c['success']}]completed[/{c['success']}]"
+            status_label = "completed"
+            status_color = c['success']
         elif task.status == "dropped":
-            status_icon = f"[{c['failure']}]dropped[/{c['failure']}]"
+            status_label = "dropped"
+            status_color = c['failure']
         else:
-            reason = task.failure_reason or "UNKNOWN"
-            status_icon = f"[{c['failure']}]failed ({reason})[/{c['failure']}]"
+            status_label = "failed"
+            status_color = c['failure']
+        status_padded = f"{status_label:<{STATUS_WIDTH}}"
+        status_icon = f"[{status_color}]{status_padded}[/{status_color}]"
         date_str = (
             f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]"
             if task.completed_at
             else ""
         )
-        type_label = f" \\[{task.task_type}]"
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        console.print(
+            f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
+            f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
+        )
+        # Failed reason on its own line
+        if task.status == "failed":
+            reason = task.failure_reason or "UNKNOWN"
+            console.print(f"{indent}    [{c['failure']}]reason: {reason}[/{c['failure']}]")
+        # Type + deps on a separate line
+        type_label = f"\\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
         if task.based_on and task.depends_on:
             parent_label = f" ← #{task.based_on} (dep #{task.depends_on})"
@@ -197,11 +215,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             parent_label = f" ← #{task.depends_on}"
         else:
             parent_label = ""
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-        console.print(
-            f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
-            f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}{parent_label}"
-        )
+        console.print(f"{indent}    {type_label}{merge_label}{parent_label}")
         if task.branch:
             console.print(f"{indent}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
         if task.report_file:
@@ -283,19 +297,21 @@ def _print_history_empty_message(
 
 def _render_orphaned_task(task: "DbTask", c: dict) -> None:
     """Render a single orphaned task entry for gza history."""
-    status_icon = f"[{c['orphaned']}]⚠ orphaned[/{c['orphaned']}]"
+    status_padded = f"{'orphaned':<9}"
+    status_icon = f"[{c['orphaned']}]⚠ {status_padded}[/{c['orphaned']}]"
     date_str = ""
     if task.started_at:
         date_str = (
             f"[{c['task_id']}](started {task.started_at.strftime('%Y-%m-%d %H:%M')})"
             f"[/{c['task_id']}]"
         )
-    type_label = f" \\[{task.task_type}]"
     prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
     console.print(
         f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
-        f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}"
+        f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
     )
+    type_label = f"\\[{task.task_type}]"
+    console.print(f"    {type_label}")
     if task.branch:
         console.print(f"    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
     console.print(f"    [{c['task_id']}]Run 'gza work {task.id}' to resume[/{c['task_id']}]")

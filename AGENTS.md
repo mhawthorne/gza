@@ -28,7 +28,7 @@ Options for `init`:
 - `--force` - Overwrite existing gza.yaml file
 
 Options for `history`:
-- `--last N` / `-n N` - Show last N tasks (default: 10)
+- `--last N` / `-n N` - Show last N tasks (default: 5)
 - `--all` - Show all tasks (no limit)
 - `--type TYPE` - Filter by task type (explore, plan, implement, review, improve, internal)
 - `--days N` - Show only tasks from the last N days

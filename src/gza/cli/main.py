@@ -126,7 +126,7 @@ def main() -> int:
     history_parser = subparsers.add_parser("history", help="List recent completed/failed tasks")
     add_common_args(history_parser)
     _add_query_filter_args(history_parser)
-    history_parser.set_defaults(last=10)
+    history_parser.set_defaults(last=5)
     history_parser.add_argument(
         "--status",
         type=str,

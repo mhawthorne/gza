@@ -210,8 +210,11 @@ class TestHistoryCommand:
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Implement task [implement]" in result.stdout
-        assert "Plan task [plan]" in result.stdout
+        # Type labels are now on a separate line
+        assert "Implement task" in result.stdout
+        assert "[implement]" in result.stdout
+        assert "Plan task" in result.stdout
+        assert "[plan]" in result.stdout
 
     def test_history_shows_orphaned_tasks_at_top(self, tmp_path: Path):
         """History command includes orphaned in-progress tasks at the top."""
@@ -611,8 +614,9 @@ class TestHistoryCommand:
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert result.stdout.count("failed (UNKNOWN)") >= 2  # explicit UNKNOWN and None both map to UNKNOWN
-        assert "failed (MAX_STEPS)" in result.stdout
+        # Failure reason is now on a separate line
+        assert result.stdout.count("reason: UNKNOWN") >= 2  # explicit UNKNOWN and None both map to UNKNOWN
+        assert "reason: MAX_STEPS" in result.stdout
 
     def test_history_shows_parent_task_id(self, tmp_path: Path):
         """History shows parent task ID when based_on or depends_on is set."""
