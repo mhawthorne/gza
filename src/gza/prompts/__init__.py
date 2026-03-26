@@ -125,6 +125,10 @@ class PromptBuilder:
                     f"\n\nBefore finishing, run the following verification command"
                     f" and fix any errors: `{config.verify_command}`"
                 )
+        elif task.task_type == "rebase":
+            # Rebase tasks get no extra instructions — the task prompt already
+            # contains the rebase command. No verify_command, no summary file.
+            pass
         elif task.task_type in ("internal", "learn"):
             if report_path:
                 base_prompt += "\n\n" + _load_template("internal.txt").format(

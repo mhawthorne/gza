@@ -76,7 +76,7 @@ class Task:
     id: int | None  # None for unsaved tasks
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
-    task_type: str = "implement"  # explore, plan, implement, review, improve, internal
+    task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
     task_id: str | None = None  # YYYYMMDD-slug format
     branch: str | None = None
     log_file: str | None = None
@@ -1012,7 +1012,13 @@ class SqliteTaskStore:
             where_clauses = []
             params = []
 
-            if status:
+            if status == "unmerged":
+                # Unmerged tasks: either merge_status='unmerged' (current) or
+                # legacy status='unmerged' (old data)
+                where_clauses.append(
+                    "(merge_status = 'unmerged' OR status = 'unmerged')"
+                )
+            elif status:
                 where_clauses.append("status = ?")
                 params.append(status)
             else:

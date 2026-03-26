@@ -38,8 +38,8 @@ from ._common import (
     get_store,
     get_review_verdict,
     _create_resume_task,
+    _create_rebase_task,
     _spawn_background_worker,
-    _spawn_background_rebase_worker,
     _spawn_background_resume_worker,
 )
 
@@ -451,9 +451,23 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
 
-    # Handle background mode - spawn worker to perform the rebase
+    # Handle background mode - create a rebase task and run through the standard runner
     if getattr(args, 'background', False):
-        return _spawn_background_rebase_worker(args, config)
+        store = get_store(config)
+        task = store.get(args.task_id)
+        if not task:
+            print(f"Error: Task #{args.task_id} not found")
+            return 1
+        if not task.branch:
+            print(f"Error: Task #{args.task_id} has no branch")
+            return 1
+        git = Git(config.project_dir)
+        target = getattr(args, 'onto', None) or git.default_branch()
+        if getattr(args, 'remote', False):
+            target = f"origin/{target}"
+        rebase_task = _create_rebase_task(store, args.task_id, task.branch, target)
+        worker_args = argparse.Namespace(no_docker=False, max_turns=None)
+        return _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
 
     store = get_store(config)
     git = Git(config.project_dir)
@@ -1033,9 +1047,25 @@ def _determine_advance_action(
 
     # Check for merge conflicts against the default branch (the merge target)
     if not git.can_merge(task.branch, default_branch):
+        # Check if a rebase is already in progress or has failed
+        assert task.id is not None
+        rebase_children = store.get_lineage_children(task.id)
+        for child in rebase_children:
+            if child.task_type != "rebase":
+                continue
+            if child.status == "in_progress" or child.status == "pending":
+                return {
+                    'type': 'skip',
+                    'description': f'SKIP: rebase #{child.id} already in progress',
+                }
+            if child.status == "failed":
+                return {
+                    'type': 'needs_discussion',
+                    'description': f'SKIP: rebase #{child.id} failed, needs manual resolution',
+                }
         return {
             'type': 'needs_rebase',
-            'description': 'SKIP: needs manual rebase (conflicts detected)',
+            'description': 'rebase --resolve (conflicts detected)',
         }
 
     # Check review state
@@ -1536,7 +1566,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     error_count = 0
     workers_started = 0
     # Track tasks skipped for actionable reasons (needs human attention)
-    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'})
+    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'})
     attention_tasks: list[tuple[DbTask, dict]] = []
 
     for task, action in plan:
@@ -1544,7 +1574,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         action_type = action['type']
 
-        if action_type in ('needs_rebase', 'wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
+        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
             console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
@@ -1554,7 +1584,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
-        if action_type in ('run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
+        if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
             if batch_limit is not None and workers_started >= batch_limit:
                 console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
                 console.print(f"      [yellow]— batch limit reached ({workers_started}/{batch_limit}), skipping[/yellow]")
@@ -1725,6 +1755,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 success_count += 1
             else:
                 console.print(f"      [red]✗ Failed to start implement worker[/red]")
+                error_count += 1
+
+        elif action_type == 'needs_rebase':
+            assert task.id is not None
+            rebase_task = _create_rebase_task(store, task.id, task.branch, default_branch)
+            assert rebase_task.id is not None
+            console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")
+
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+            )
+            rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+            workers_started += 1
+            if rc == 0:
+                console.print(f"      [green]✓ Started rebase worker[/green]")
+                success_count += 1
+            else:
+                console.print(f"      [red]✗ Failed to start rebase worker[/red]")
                 error_count += 1
 
         print()

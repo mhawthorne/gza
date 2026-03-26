@@ -412,6 +412,11 @@ def main() -> int:
     stats_parser = subparsers.add_parser("stats", help="Show cost and usage statistics")
     add_common_args(stats_parser)
     _add_query_filter_args(stats_parser)
+    stats_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all tasks (no limit)",
+    )
     stats_parser.set_defaults(last=5)
     stats_parser.add_argument(
         "--cycles",

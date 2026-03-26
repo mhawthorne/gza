@@ -3369,6 +3369,48 @@ class TestGetHistoryInternalFiltering:
         assert results[0].prompt == "Internal task"
 
 
+class TestGetHistoryUnmergedStatus:
+    """Tests for get_history(status='unmerged') matching both current and legacy data."""
+
+    def test_unmerged_status_matches_merge_status_and_legacy_status(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+
+        # Task with current merge_status='unmerged'
+        t1 = store.add("Current unmerged", task_type="implement")
+        t1.status = "completed"
+        t1.completed_at = now
+        t1.merge_status = "unmerged"
+        t1.has_commits = True
+        store.update(t1)
+
+        # Simulate legacy task with status='unmerged' (no merge_status field)
+        with store._connect() as conn:
+            conn.execute(
+                "INSERT INTO tasks (prompt, task_type, status, created_at) VALUES (?, ?, ?, ?)",
+                ("Legacy unmerged", "implement", "unmerged", now.isoformat()),
+            )
+            legacy_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        results = store.get_history(limit=None, status="unmerged")
+        result_ids = {t.id for t in results}
+        assert t1.id in result_ids, "Should match task with merge_status='unmerged'"
+        assert legacy_id in result_ids, "Should match legacy task with status='unmerged'"
+
+    def test_unmerged_status_excludes_merged_tasks(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+
+        merged = store.add("Merged task", task_type="implement")
+        merged.status = "completed"
+        merged.completed_at = now
+        merged.merge_status = "merged"
+        store.update(merged)
+
+        results = store.get_history(limit=None, status="unmerged")
+        assert all(t.id != merged.id for t in results)
+
+
 class TestGetBasedOnChildren:
     """Tests for SqliteTaskStore.get_based_on_children()."""
 

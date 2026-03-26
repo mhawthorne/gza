@@ -183,7 +183,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     lineage_depth = getattr(args, 'lineage_depth', 0)
 
     f = HistoryFilter(
-        limit=None if args.all else args.last,
+        limit=args.last,
         status=status,
         task_type=task_type,
         incomplete=incomplete,
@@ -938,11 +938,10 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
     elif source == "worker" and worker is not None:
         status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
     elif worker is not None and task is not None:
-        # Both worker and task exist. Prefer DB terminal status over a
-        # stale worker status — the DB is the source of truth for completion.
+        # Both worker and task exist.
         if task.status in ("completed", "failed"):
             status = task.status
-        elif worker and not (task and task.running_pid):
+        elif not (task and task.running_pid):
             status = "stale"
         else:
             status = "running"
@@ -962,7 +961,10 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
     worker_id = worker.worker_id if worker else "-"
     pid = str(worker.pid) if worker else "-"
-    task_type_display = task.task_type if task else "-"
+    if task:
+        task_type_display = task.task_type
+    else:
+        task_type_display = "-"
 
     task_id = task.id if task and task.id is not None else worker.task_id if worker else None
     task_display = ""
