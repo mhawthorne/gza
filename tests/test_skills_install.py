@@ -69,7 +69,7 @@ class TestSkillsInstallClaudeTarget:
 
         assert result.returncode == 0
         skills_dir = tmp_path / ".claude" / "skills"
-        assert (skills_dir / "gza-spec-review" / "SKILL.md").exists()
+        assert (skills_dir / "gza-docs-review" / "SKILL.md").exists()
 
     def test_dev_skills_excluded_by_default(self, tmp_path: Path):
         """Non-public skills are not installed without --dev."""
@@ -78,7 +78,8 @@ class TestSkillsInstallClaudeTarget:
 
         assert result.returncode == 0
         skills_dir = tmp_path / ".claude" / "skills"
-        assert not (skills_dir / "gza-spec-review").exists()
+        # gza-spec-review is now public, so the dev-only check uses a different skill
+        assert not (skills_dir / "gza-docs-review").exists()
 
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
