@@ -44,6 +44,27 @@ from ..query import (
 )
 
 
+_LINEAGE_STATUS_COLORS: dict[str, str] = {
+    "completed": "green",
+    "failed": "red",
+    "pending": "yellow",
+    "in_progress": "cyan",
+    "unmerged": "yellow",
+    "dropped": "red",
+}
+
+_LINEAGE_REL_LABELS: dict[str, str] = {
+    "review": "review",
+    "improve-from-review": "improve",
+    "improve": "improve",
+    "implement-depends": "implement",
+    "implement-based": "implement",
+    "depends-and-based": "retry",
+    "depends": "depends",
+    "based": "retry",
+}
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
@@ -1136,7 +1157,6 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     from rich.tree import Tree as RichTree
 
     from ..query import TaskLineageNode
-    from ._common import format_stats
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -1149,26 +1169,6 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
     root = _resolve_lineage_root_task(store, task)
     lineage_tree = _build_lineage_tree_for_root(store, root, max_depth=None)
-
-    _STATUS_COLORS: dict[str, str] = {
-        "completed": "green",
-        "failed": "red",
-        "pending": "yellow",
-        "in_progress": "cyan",
-        "unmerged": "yellow",
-        "dropped": "red",
-    }
-
-    _REL_LABELS: dict[str, str] = {
-        "review": "review",
-        "improve-from-review": "improve",
-        "improve": "improve",
-        "implement-depends": "implement",
-        "implement-based": "implement",
-        "depends-and-based": "retry",
-        "depends": "depends",
-        "based": "retry",
-    }
 
     def _status_text(t: DbTask) -> str:
         if t.status == "failed":
@@ -1186,13 +1186,13 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         first_line = t.prompt.split("\n")[0].strip()
         prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
 
-        rel = _REL_LABELS.get(node.relationship, "")
+        rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
         rel_part = f" [dim][{rel}][/dim]" if rel else ""
 
         stats = format_stats(t)
         stats_part = f" [cyan]({stats})[/cyan]" if stats else ""
 
-        status_color = _STATUS_COLORS.get(t.status or "", "white")
+        status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
 
         label = (
             f"[dim]#{t.id}[/dim]"
