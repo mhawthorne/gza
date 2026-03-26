@@ -1586,8 +1586,8 @@ class TestMergeStatusTracking:
         assert "[merged]" in result.stdout
         assert "Merged feature task" in result.stdout
 
-    def test_cmd_history_shows_lightning_for_unmerged(self, tmp_path: Path):
-        """gza history shows lightning icon for tasks with merge_status='unmerged'."""
+    def test_cmd_history_shows_unmerged_label_for_unmerged(self, tmp_path: Path):
+        """gza history shows 'unmerged' text label for tasks with merge_status='unmerged'."""
         from gza.db import SqliteTaskStore
         from datetime import datetime, timezone
 
@@ -1605,7 +1605,7 @@ class TestMergeStatusTracking:
 
         result = run_gza("history", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "\u26a1" in result.stdout
+        assert "unmerged" in result.stdout
         assert "Unmerged feature" in result.stdout
         assert "[merged]" not in result.stdout
 
@@ -1627,7 +1627,7 @@ class TestMergeStatusTracking:
         result = run_gza("history", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "[merged]" not in result.stdout
-        assert "\u2713" in result.stdout
+        assert "completed" in result.stdout
 
     def test_cmd_show_displays_merge_status(self, tmp_path: Path):
         """gza show displays Merge Status when merge_status is set."""

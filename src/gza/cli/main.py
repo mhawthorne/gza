@@ -1224,7 +1224,7 @@ def main() -> int:
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
         "work", "ps", "status", "stop", "advance", "retry",
-        "mark-completed", "set-status",
+        "mark-completed", "set-status", "history",
     }
 
     try:

@@ -174,16 +174,14 @@ def cmd_history(args: argparse.Namespace) -> int:
     def _render_task_line(task: DbTask, indent: str = "") -> None:
         """Render a single task entry."""
         if task.merge_status == "unmerged":
-            status_icon = f"[{c['unmerged']}]⚡[/{c['unmerged']}]"
+            status_icon = f"[{c['unmerged']}]unmerged[/{c['unmerged']}]"
         elif task.status == "completed":
-            status_icon = f"[{c['success']}]✓[/{c['success']}]"
+            status_icon = f"[{c['success']}]completed[/{c['success']}]"
         elif task.status == "dropped":
-            status_icon = f"[{c['failure']}]⊘ dropped[/{c['failure']}]"
+            status_icon = f"[{c['failure']}]dropped[/{c['failure']}]"
         else:
-            if task.failure_reason and task.failure_reason != "UNKNOWN":
-                status_icon = f"[{c['failure']}]✗ failed ({task.failure_reason})[/{c['failure']}]"
-            else:
-                status_icon = f"[{c['failure']}]✗[/{c['failure']}]"
+            reason = task.failure_reason or "UNKNOWN"
+            status_icon = f"[{c['failure']}]failed ({reason})[/{c['failure']}]"
         date_str = (
             f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]"
             if task.completed_at
@@ -191,10 +189,18 @@ def cmd_history(args: argparse.Namespace) -> int:
         )
         type_label = f" \\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
+        if task.based_on and task.depends_on:
+            parent_label = f" ← #{task.based_on} (dep #{task.depends_on})"
+        elif task.based_on:
+            parent_label = f" ← #{task.based_on}"
+        elif task.depends_on:
+            parent_label = f" ← #{task.depends_on}"
+        else:
+            parent_label = ""
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
         console.print(
             f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
-            f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}"
+            f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]{type_label}{merge_label}{parent_label}"
         )
         if task.branch:
             console.print(f"{indent}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")

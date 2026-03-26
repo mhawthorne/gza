@@ -38,6 +38,8 @@ Options for `history`:
 - `--incomplete` - Show only unresolved tasks (failed or unmerged)
 - `--lineage-depth N` - Expand lineage N levels for each task
 
+**Note**: `gza history` also reconciles any orphaned `in_progress` tasks (tasks whose worker process is no longer alive) to `failed (WORKER_DIED)` before listing. This is a side effect that may change task statuses in the database. If you use `gza history` in monitoring scripts that require a read-only view, be aware that orphaned task statuses will be updated on each invocation.
+
 Options for `stats`:
 - `--last N` / `-n N` - Show last N tasks (default: 5)
 - `--all` - Show all tasks (no limit)

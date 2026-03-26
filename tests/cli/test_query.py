@@ -551,6 +551,150 @@ class TestHistoryCommand:
         assert "Old task" in result.stdout
         assert "Recent task" not in result.stdout
 
+    def test_history_shows_text_status_labels(self, tmp_path: Path):
+        """History command shows text labels instead of icons for status."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        completed = store.add("Completed task")
+        completed.status = "completed"
+        completed.completed_at = datetime.now(timezone.utc)
+        store.update(completed)
+
+        failed = store.add("Failed task")
+        failed.status = "failed"
+        failed.completed_at = datetime.now(timezone.utc)
+        store.update(failed)
+
+        dropped = store.add("Dropped task")
+        dropped.status = "dropped"
+        dropped.completed_at = datetime.now(timezone.utc)
+        store.update(dropped)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "completed" in result.stdout
+        assert "failed" in result.stdout
+        assert "dropped" in result.stdout
+
+    def test_history_shows_failure_reason_including_unknown(self, tmp_path: Path):
+        """History shows failure_reason for all failed tasks, including UNKNOWN."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        failed_unknown = store.add("Failed unknown reason")
+        failed_unknown.status = "failed"
+        failed_unknown.failure_reason = "UNKNOWN"
+        failed_unknown.completed_at = datetime.now(timezone.utc)
+        store.update(failed_unknown)
+
+        failed_known = store.add("Failed known reason")
+        failed_known.status = "failed"
+        failed_known.failure_reason = "MAX_STEPS"
+        failed_known.completed_at = datetime.now(timezone.utc)
+        store.update(failed_known)
+
+        failed_none = store.add("Failed no reason")
+        failed_none.status = "failed"
+        failed_none.completed_at = datetime.now(timezone.utc)
+        store.update(failed_none)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.count("failed (UNKNOWN)") >= 2  # explicit UNKNOWN and None both map to UNKNOWN
+        assert "failed (MAX_STEPS)" in result.stdout
+
+    def test_history_shows_parent_task_id(self, tmp_path: Path):
+        """History shows parent task ID when based_on or depends_on is set."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add("Parent task")
+        parent.status = "completed"
+        parent.completed_at = datetime.now(timezone.utc)
+        store.update(parent)
+        assert parent.id is not None
+
+        child = store.add("Child task", based_on=parent.id)
+        child.status = "completed"
+        child.completed_at = datetime.now(timezone.utc)
+        store.update(child)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"← #{parent.id}" in result.stdout
+
+    def test_history_shows_both_based_on_and_depends_on(self, tmp_path: Path):
+        """History shows both based_on and depends_on when a task has both set."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add("Plan task")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(timezone.utc)
+        store.update(plan)
+
+        blocker = store.add("Blocker task")
+        blocker.status = "completed"
+        blocker.completed_at = datetime.now(timezone.utc)
+        store.update(blocker)
+
+        assert plan.id is not None
+        assert blocker.id is not None
+
+        child = store.add("Child task", based_on=plan.id, depends_on=blocker.id)
+        child.status = "completed"
+        child.completed_at = datetime.now(timezone.utc)
+        store.update(child)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"← #{plan.id} (dep #{blocker.id})" in result.stdout
+
+    def test_history_reconciles_in_progress_tasks(self, tmp_path: Path):
+        """History command reconciles orphaned in_progress tasks to failed (WORKER_DIED)."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create a task and mark it in_progress with a non-existent PID so reconciliation triggers
+        orphaned = store.add("Orphaned in_progress task")
+        orphaned.status = "in_progress"
+        orphaned.started_at = datetime.now(timezone.utc)
+        orphaned.running_pid = 999999999  # non-existent PID
+        store.update(orphaned)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        # Reconciliation must have run: task should be shown as failed with WORKER_DIED reason
+        assert "failed" in result.stdout
+        assert "WORKER_DIED" in result.stdout
+
 
 class TestNextCommand:
     """Tests for 'gza next' command."""
