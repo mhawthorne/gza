@@ -3502,5 +3502,35 @@ class TestLineageCommand:
         result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "review" in result.stdout
+        assert "[review]" in result.stdout
         assert "Review feature impl" in result.stdout
+
+    def test_lineage_rel_label_brackets_are_rendered_literally(self, tmp_path: Path):
+        """Relationship labels render as [rel] text, not as Rich markup tags."""
+        from gza.db import SqliteTaskStore
+        from datetime import datetime, timezone
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        now = datetime.now(timezone.utc)
+
+        root = store.add("Root task", task_type="implement")
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+
+        # task_type="task" with depends_on → _classify_child_relationship returns "depends"
+        # → _LINEAGE_REL_LABELS maps to "depends" → rendered as [depends]
+        child = store.add("Dependent task", task_type="task", depends_on=root.id)
+        child.status = "pending"
+        store.update(child)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+
+        # returncode == 0 catches MarkupError crashes
+        assert result.returncode == 0
+        # "[depends]" in stdout catches silent text loss of the relationship label
+        assert "[depends]" in result.stdout

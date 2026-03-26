@@ -41,6 +41,7 @@ from ..query import (
     build_lineage_tree as _build_lineage_tree_for_root,
     filter_lineage_tree as _filter_lineage_tree,
     resolve_lineage_root as _resolve_lineage_root_task,
+    TaskLineageNode,
 )
 
 
@@ -62,6 +63,8 @@ _LINEAGE_REL_LABELS: dict[str, str] = {
     "depends-and-based": "retry",
     "depends": "depends",
     "based": "retry",
+    # Relationships not in this map (e.g. "plan", "explore", "task", "internal")
+    # silently produce no label — this is intentional for unusual/unknown relationships.
 }
 
 
@@ -1156,8 +1159,6 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     """Show the full lineage tree for a given task."""
     from rich.tree import Tree as RichTree
 
-    from ..query import TaskLineageNode
-
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -1187,7 +1188,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
 
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        rel_part = f" [dim][{rel}][/dim]" if rel else ""
+        rel_part = f" [dim]{rich_escape(f'[{rel}]')}[/dim]" if rel else ""
 
         stats = format_stats(t)
         stats_part = f" [cyan]({stats})[/cyan]" if stats else ""
