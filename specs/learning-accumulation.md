@@ -18,14 +18,15 @@ This spec describes a system for accumulating and reusing knowledge across task 
 
 ## Design
 
-### Core Concept: Time-Windowed Learnings
+### Core Concept: Incrementally Updated Learnings
 
-Generate a `.gza/learnings.md` file from recent completed tasks. This file contains extracted patterns, decisions, and conventions that inform future tasks.
+Maintain a `.gza/learnings.md` file that accumulates project knowledge over time. Rather than regenerating from scratch each cycle, the LLM receives the current learnings alongside recent task outputs and produces an updated version — adding new patterns, revising stale ones, and preserving stable knowledge that hasn't been contradicted.
 
 **Key properties:**
-- **Bounded size**: Only reflects last N completed tasks (default: 15)
-- **Auto-regenerated**: Updates periodically to stay fresh
-- **Manually editable**: Users can curate/prune entries
+- **Incremental**: New task outputs refine existing learnings rather than replacing them
+- **Stable knowledge persists**: Learnings about untouched areas of the codebase are retained, not discarded
+- **Auto-updated**: Runs periodically after every N completed tasks (default: 5)
+- **Manually editable**: Users can curate/prune entries — manual edits are preserved as input to the next update
 - **Auto-injected**: Included in all task prompts as context
 
 ### Learnings File Structure
@@ -69,14 +70,14 @@ Last updated: 2026-02-19 (from 15 recent tasks)
 2. **On-demand**: Via `gza learnings update` command
 3. **Manual**: User directly edits `.gza/learnings.md`
 
-**Extraction approach — LLM summarization as a real task via Provider.run():**
+**Extraction approach — LLM summarization as an internal task:**
 
-The `learn` task type is a first-class non-code task (like `plan`, `explore`, `review`) that runs through the standard runner infrastructure. This gives us:
+Learnings regeneration creates an `internal` task and runs it through the standard runner infrastructure. This gives us:
 
 - **DB tracking** — cost, duration, tokens, success/failure per learnings run
 - **Log files** — full execution logs for debugging prompt quality
 - **Retry** — failed learnings tasks can be resumed via existing mechanisms
-- **Observability** — `gza history --type learn` and `gza stats --type learn`
+- **Observability** — `gza history --type internal` and `gza stats --type internal`
 - **Provider-agnostic** — works with Claude, Codex, Gemini via existing provider system
 
 Model selection uses the existing `task_types` config:
@@ -84,7 +85,7 @@ Model selection uses the existing `task_types` config:
 ```yaml
 # gza.yaml — configure model for learnings extraction
 task_types:
-  learn:
+  internal:
     model: claude-haiku-4-5-20251001  # cheap model recommended
 ```
 
@@ -93,42 +94,50 @@ If unconfigured, falls back to the project's default model.
 **Task creation and execution:**
 
 When learnings regeneration triggers (every N completed tasks or on-demand), the system:
-1. Creates a `learn` task in the DB with a summarization prompt
-2. Runs it through the standard non-code task runner (`_run_non_code_task`)
+1. Creates an `internal` task in the DB with a summarization prompt
+2. Spawns a **background subprocess** to run it via the standard runner — the CLI returns immediately
 3. The task's `output_content` contains the LLM's learnings output
 4. Parses bullet points from the output and writes `.gza/learnings.md`
 
 ```python
 def _run_learnings_task(store: SqliteTaskStore, config: Config, recent_tasks: list[Task]) -> list[str] | None:
-    """Create and run a learn task, return extracted learnings or None."""
+    """Create an internal task and spawn it in the background."""
     prompt = _build_summarization_prompt(recent_tasks)
-    task = store.add(prompt, task_type="learn", skip_learnings=True)  # avoid circular injection
+    task = store.add(prompt, task_type="internal", skip_learnings=True)
 
-    # Run through standard runner infrastructure
-    exit_code = run_non_code_task(task, config, store)
-
-    if exit_code != 0:
-        return None  # triggers regex fallback
-
-    # Re-fetch task to get output_content populated by runner
-    task = store.get(task.id)
-    if task and task.output_content:
-        return _parse_bullet_list(task.output_content)
-    return None
+    # Spawn background subprocess using worker-mode entry point.
+    # The CLI returns immediately; the learnings task runs asynchronously.
+    _spawn_background_worker(config, task.id)
+    return None  # Learnings will be written when the background task completes
 ```
 
-**Key detail**: Learn tasks set `skip_learnings=True` to avoid circular injection (learnings prompt shouldn't include learnings context).
+**Non-blocking execution**: The learnings task must never block the foreground CLI command. It spawns as a detached background subprocess using the same worker-mode entry point as `gza work`. The internal task is visible via `gza ps` and `gza history --type internal` while running.
+
+**Key detail**: Internal learnings tasks set `skip_learnings=True` to avoid circular injection (learnings prompt shouldn't include learnings context).
 
 **Summarization prompt:**
 
-```
-You are analyzing completed tasks from a software project to extract
-reusable learnings for future agents working on this codebase.
+The prompt provides both the existing learnings and recent task outputs, asking the LLM to produce an updated version:
 
-Below are the {N} most recently completed tasks.
+```
+You are maintaining a knowledge base for a software project. Your job is to
+update the project's learnings based on recent completed tasks.
+
+## Current Learnings
+{contents of .gza/learnings.md, or "No existing learnings." if empty}
+
+## Recent Completed Tasks (last {N})
 {for each: type, prompt, truncated output_content (~1500 chars)}
 
-Distill 5-15 key learnings. Focus on:
+## Instructions
+
+Update the learnings based on the recent tasks above:
+- ADD new patterns, conventions, or pitfalls discovered in recent tasks
+- REVISE any existing learnings that are now outdated or wrong based on recent work
+- KEEP existing learnings that are still valid, even if not mentioned in recent tasks
+- REMOVE learnings only if recent tasks clearly contradict them
+
+Focus on:
 - Codebase conventions (naming, structure, idioms)
 - Architecture decisions and rationale
 - Testing patterns (frameworks, fixtures, assertions)
@@ -138,32 +147,42 @@ Distill 5-15 key learnings. Focus on:
 Do NOT include:
 - Task-specific details that don't generalize
 - Generic software engineering advice
+- Vague platitudes ("write clean code", "test thoroughly")
+- Repetitive or near-duplicate entries
 
-Format: one per line, starting with "- ". Max 25 words each.
+Output format: a flat bullet list, one learning per line, starting with "- ".
+No headers, no numbering, no sub-lists. Max 25 words per learning.
+Each learning should be concrete and actionable — a new developer should
+be able to follow it without additional context.
 ```
 
-**Fallback — regex extraction:**
+**Output parsing:**
 
-If the learn task fails (provider error, timeout, bad output), the system falls back to regex-based extraction from task `output_content`. This ensures learnings still work offline or when credentials are unavailable.
+When the LLM task succeeds, parse its `output_content` by extracting lines matching `^\s*[-*]\s+(.+)$` (bullet items). Only keep items between 8-160 characters. Do NOT attempt to extract learnings from markdown headers — headers are discarded.
 
-**Aggregation logic:**
+**Fallback — bullet extraction from task outputs:**
+
+If the internal learnings task fails (provider error, timeout, bad output), the system falls back to extracting bullet items from recent task `output_content` fields. Only lines matching bullet syntax (`- ` or `* `) are extracted — markdown headers are discarded entirely. Existing learnings are preserved and new bullet extractions are appended (deduplicated). This ensures learnings still work offline or when credentials are unavailable, though quality will be lower.
+
+**Update logic:**
 
 ```python
-def regenerate_learnings(store: SqliteTaskStore, config: Config, window: int = 15):
-    """Regenerate learnings.md from recent completed tasks."""
+def regenerate_learnings(store: SqliteTaskStore, config: Config, window: int = 25):
+    """Update learnings.md incrementally from recent completed tasks."""
     recent_tasks = store.get_recent_completed(limit=window)
-
-    # Try LLM summarization via learn task
-    learnings = _run_learnings_task(store, config, recent_tasks)
-
-    # Fall back to regex extraction if learn task failed
-    if learnings is None:
-        learnings = _extract_learnings_regex(recent_tasks)
-
-    learnings = _dedupe(learnings)
-    content = _format_learnings_markdown(learnings, len(recent_tasks))
-
     learnings_path = config.project_dir / ".gza" / "learnings.md"
+    existing_learnings = learnings_path.read_text() if learnings_path.exists() else ""
+
+    # Try LLM incremental update
+    learnings = _run_learnings_task(store, config, recent_tasks, existing_learnings)
+
+    # Fall back to bullet extraction if LLM failed
+    if learnings is None:
+        existing_bullets = _extract_existing_file_learnings(learnings_path)
+        new_bullets = _extract_bullets_from_tasks(recent_tasks)
+        learnings = _dedupe(existing_bullets + new_bullets)
+
+    content = _format_learnings_markdown(learnings, len(recent_tasks))
     learnings_path.write_text(content)
 ```
 
@@ -213,7 +232,7 @@ Model selection uses the existing `task_types` config — no new config section 
 ```yaml
 # gza.yaml
 task_types:
-  learn:
+  internal:
     model: claude-haiku-4-5-20251001  # cheap model for learnings extraction
 ```
 
@@ -223,15 +242,25 @@ Or with provider-scoped config:
 providers:
   claude:
     task_types:
-      learn:
+      internal:
         model: claude-haiku-4-5-20251001
 ```
 
-The `learn` task type is not user-facing — it only controls model resolution for the learnings LLM call. If unconfigured, the project's default model is used.
+The `internal` task type is not user-facing — it only controls model resolution for the learnings LLM call. If unconfigured, the project's default model is used.
 
-Auto-regeneration parameters are constants in `learnings.py`:
-- `DEFAULT_LEARNINGS_WINDOW = 15` — number of recent tasks to generate from
-- `AUTO_LEARNINGS_INTERVAL = 5` — regenerate every N completed tasks
+### Learnings Parameters
+
+Configurable via `gza.yaml`:
+
+```yaml
+# gza.yaml
+learnings_window: 25        # Number of recent tasks to include in update prompt (default: 25)
+learnings_interval: 5       # Auto-update every N completed tasks (default: 5, 0 to disable)
+```
+
+These should be included (commented out) in the default `gza.yaml` template generated by `gza init`, and documented in `docs/configuration.md`.
+
+The `--window` flag on `gza learnings update` overrides `learnings_window` for that invocation.
 
 ---
 
@@ -295,40 +324,47 @@ CREATE TABLE IF NOT EXISTS learnings_metadata (
 
 ---
 
-## Implementation Phases
+## Implementation Status
 
-### Phase 1: Manual Learnings ✅ COMPLETE
+### What exists today
 
-1. ✅ `learnings.md` injection in `build_prompt()` (`prompts/__init__.py`)
-2. ✅ `skip_learnings` field on Task model, `--no-learnings` CLI flag
-3. ✅ `gza learnings update` and `gza learnings show` commands
+The following infrastructure is in place but producing poor results:
 
-### Phase 2: Regex Extraction + Auto-Regeneration ✅ COMPLETE (but low quality)
+- [x] `.gza/learnings.md` injected into task prompts via `build_prompt()` (`prompts/__init__.py`)
+- [x] `skip_learnings` field on Task model, `--no-learnings` CLI flag
+- [x] `gza learnings update` and `gza learnings show` commands
+- [x] `regenerate_learnings()` with LLM path + regex fallback
+- [x] `_run_learnings_task()` creates `internal` task and runs via provider
+- [x] Auto-regeneration every 5 completed tasks (`maybe_auto_regenerate_learnings`)
+- [x] Delta tracking (added/removed/retained counts) + history log (`.gza/learnings_history.jsonl`)
+- [x] Deduplication (case-insensitive stable dedupe)
+- [x] Internal tasks tracked in DB, set `skip_learnings=True` to avoid circular injection
 
-1. ✅ `regenerate_learnings()` with regex-based bullet/header extraction
-2. ✅ Auto-regeneration every 5 completed tasks (`maybe_auto_regenerate_learnings`)
-3. ✅ Delta tracking (added/removed/retained counts) + history log (`.gza/learnings_history.jsonl`)
-4. ✅ Deduplication (case-insensitive stable dedupe)
+### What's broken
 
-**Problem**: Regex extraction produces low-quality output. Markdown headers become meaningless "Prefer following documented X conventions" entries. Actual codebase knowledge is lost.
+1. **Garbage output** — `_extract_learnings_from_output()` has a header extraction path (`_HEADER_RE`) that converts markdown headers into meaningless "Prefer following documented X conventions" strings. This fires on both LLM output and regex fallback output.
+2. **Full replacement, not incremental** — `regenerate_learnings()` overwrites learnings from scratch each time. Stable knowledge about untouched parts of the codebase is lost.
+3. **Blocking execution** — `maybe_auto_regenerate_learnings()` runs the LLM task synchronously inline after task completion, blocking the CLI for minutes every 5th task.
+4. **Weak prompt** — `_build_summarization_prompt()` lacks "Do NOT include" guidance, output format constraints, and doesn't pass existing learnings as context. The LLM returns unstructured markdown that gets mangled by the header regex.
+5. **Not configurable** — window size and interval are hardcoded constants, not in gza.yaml or docs.
+6. **Fallback destroys existing learnings** — when LLM fails, regex fallback replaces the file entirely instead of preserving existing content.
 
-### Phase 3: LLM Summarization as Real Task 🔜 NEXT
+### Work items 🔜
 
-**Goal**: Replace regex extraction with LLM-powered summarization running as a proper `learn` task through the standard runner infrastructure.
+All items below address the broken state above. They should be implemented together — fixing the prompt without fixing the incremental approach (or vice versa) won't produce good results.
 
-1. Add `learn` as a recognized task type in the runner's non-code task path
-2. Add `_run_learnings_task()` to `learnings.py` — creates a `learn` task, runs it via provider, parses output
-3. Modify `regenerate_learnings()` to try learn task first, fall back to regex
-4. Learn tasks tracked in DB — cost, duration, tokens, success/failure all visible via `gza history`/`gza stats`
-5. Failed learn tasks can be retried via existing resume mechanisms
-6. Model configured via `task_types.learn.model` (existing config infrastructure)
-7. Learn tasks set `skip_learnings=True` to avoid circular learnings injection
+1. **Delete header extraction** — remove the `_HEADER_RE` path from `_extract_learnings_from_output()`. Only keep bullet extraction (`_BULLET_RE`).
+2. **Switch to incremental update** — rewrite `_build_summarization_prompt()` to include existing learnings alongside recent tasks, asking the LLM to ADD/REVISE/KEEP/REMOVE rather than regenerate from scratch. See prompt template in Generation Strategy section above.
+3. **Improve summarization prompt** — add "Do NOT include" guidance, specify flat bullet format (no headers, no numbering), max 25 words per learning, require concrete/actionable items.
+4. **Make learnings task non-blocking** — spawn as detached background subprocess instead of running synchronously inline. Use the same worker-mode entry point as `gza work`. CLI returns immediately after spawning. The background process writes `.gza/learnings.md` on completion.
+5. **Make window/interval configurable** — add `learnings_window` (default: 25) and `learnings_interval` (default: 5) to gza.yaml schema. Change `DEFAULT_LEARNINGS_WINDOW` from 15 to 25. Add to default template and docs/configuration.md.
+6. **Fix fallback to preserve existing learnings** — when LLM fails, append new bullet extractions to existing learnings (deduplicated) instead of replacing them.
 
-**Validation**: Run `gza learnings update`, compare output quality vs regex. Check `gza history --type learn` shows the task.
+**Validation**: Run `gza learnings update`, verify output is a flat bullet list of concrete learnings with no "Prefer following documented" garbage. Verify existing learnings are preserved/updated, not replaced. Check `gza history --type internal` shows the task. Verify `gza work` returns immediately when learnings regeneration triggers.
 
-### Phase 4: Refinements
+### Future enhancements
 
-**Future enhancements** (not required for initial release):
+Not required for the fixes above:
 
 - **Semantic search**: Only inject relevant learnings (requires embeddings)
 - **Multiple scopes**: Per-group learnings in addition to global
@@ -337,73 +373,32 @@ CREATE TABLE IF NOT EXISTS learnings_metadata (
 
 ---
 
-## Open Questions
+## Resolved Questions
 
 ### 1. Categorization Strategy
-
-How to organize learnings into sections?
-
-**Option A**: LLM categorizes into predefined categories
-```python
-CATEGORIES = ["Testing", "Code Style", "Architecture", "Git Workflow", "Common Pitfalls"]
-```
-
-**Option B**: LLM generates categories dynamically based on content
-
-**Option C**: No categorization, just flat list
-
-**Recommendation**: Start with Option C (flat list), add categorization in Phase 4 if file gets large.
+**Decision**: Flat list (Option C). No headers or categories. If the file gets large, revisit in Phase 4.
 
 ### 2. Deduplication
+**Decision**: Simple string matching (Option B) as a safety net. With incremental updates, the LLM is also instructed to avoid near-duplicates, so string dedupe is a backstop rather than the primary mechanism.
 
-How to avoid duplicate learnings?
-
-**Option A**: LLM-based similarity detection
-- Compare new learning to existing ones
-- Skip if semantically similar (>80% similarity)
-
-**Option B**: Simple string matching
-- Lowercase + normalize whitespace
-- Skip exact duplicates only
-
-**Option C**: No deduplication, rely on time-window to naturally prune
-
-**Recommendation**: Start with Option B (exact duplicates only), add Option A if accumulation becomes noisy.
-
-### 3. Regeneration Frequency
-
-What's the right balance?
-
-- **Too frequent** (every task): Expensive, learnings churn too fast
-- **Too infrequent** (every 50 tasks): Stale learnings, doesn't adapt to recent changes
-
-**Recommendation**: Default `regenerate_every: 5`, make configurable. Users can tune based on their workflow.
+### 3. Update Frequency
+**Decision**: Every 5 completed tasks (`learnings_interval: 5`), configurable via gza.yaml. Set to 0 to disable auto-updates.
 
 ### 4. Cost Management
-
-Learning extraction uses a single LLM call per regeneration (consolidation approach, not per-task).
-
-**Estimated cost** (using Haiku at ~$0.001/call): ~$0.001 per regeneration
-
-For 100 tasks with `regenerate_every: 5` = 20 regenerations = ~$0.02 total
-
-**Mitigation**: Use cheapest model via `task_types.learn.model`, single consolidation call instead of per-task extraction, regex fallback when LLM is unavailable.
+Single LLM call per update. Input is larger now (existing learnings + recent tasks) but still bounded. Use cheapest model via `task_types.internal.model`.
 
 ### 5. Learning Quality
+**Decision**: Incremental updates address the main quality issue — learnings accumulate over time rather than being regenerated from a small window. The improved prompt with explicit "Do NOT include" guidance and format constraints addresses the garbage output problem.
 
-How to ensure extracted learnings are high-quality?
+## Open Questions
 
-**Problems**:
-- LLM may extract trivial patterns ("use print statements for debugging")
-- May extract task-specific details that don't generalize
-- May miss important implicit patterns
+### 1. Learnings Growth
+With incremental updates, learnings will grow over time since stable knowledge is preserved. Need to decide:
+- Should there be a hard cap on number of learnings? (e.g., max 50 items)
+- Should the LLM be instructed to consolidate/merge related learnings to keep the list compact?
+- At what size does the learnings file become too large for prompt injection?
 
-**Mitigations**:
-- Refine extraction prompt with examples of good vs bad learnings
-- Manual review workflow: `gza learnings review` shows proposed additions before saving
-- User can always manually edit `.gza/learnings.md`
-
-**Recommendation**: Start with simple extraction, iterate on prompt quality based on real usage.
+**Current recommendation**: No hard cap initially. Let the LLM's "REMOVE learnings only if contradicted" instruction naturally keep things reasonable. Monitor file size in practice.
 
 ---
 
@@ -605,13 +600,13 @@ gza learnings update --dry-run
 - [x] Add auto-regeneration on interval (learnings.py, runner.py)
 - [x] Add tests (tests/test_learnings.py)
 
-### Phase 3 (LLM Summarization as Real Task)
-- [ ] Add `learn` as recognized non-code task type in runner
-- [ ] Add `_run_learnings_task()` to learnings.py — creates task, runs via provider, parses output
-- [ ] Build summarization prompt with task metadata + truncated output_content
-- [ ] Modify `regenerate_learnings()` to try learn task first, fall back to regex
-- [ ] Set `skip_learnings=True` on learn tasks to avoid circular injection
-- [ ] Learn tasks tracked in DB — visible via `gza history --type learn` and `gza stats --type learn`
-- [ ] Add retry logic for failed learn tasks
-- [ ] Add tests for LLM path + fallback (tests/test_learnings.py)
-- [ ] Update AGENTS.md with `task_types.learn` documentation
+### Phase 3 (Quality Fixes + Non-Blocking Execution)
+- [x] `_run_learnings_task()` creates `internal` task, runs via provider, parses output
+- [x] Summarization prompt with task metadata + truncated output_content
+- [x] `regenerate_learnings()` tries LLM first, falls back to bullet extraction
+- [x] `skip_learnings=True` on internal tasks to avoid circular injection
+- [x] Internal tasks tracked in DB — visible via `gza history --type internal`
+- [ ] Delete header extraction (`_HEADER_RE` path) from `_extract_learnings_from_output()` — only keep bullet extraction
+- [ ] Improve summarization prompt — flat bullets, no headers, max 25 words, concrete/actionable, "Do NOT include" guidance
+- [ ] Make learnings task non-blocking — spawn as detached background subprocess instead of synchronous inline execution
+- [ ] Add tests for non-blocking behavior + improved extraction (tests/test_learnings.py)
