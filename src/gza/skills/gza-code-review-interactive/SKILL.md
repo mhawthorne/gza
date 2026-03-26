@@ -1,6 +1,6 @@
 ---
 name: gza-code-review-interactive
-description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
+description: Review changes (branch diff, uncommitted changes, or recent commits on main) and output a structured review. Optionally post to PR with --pr flag.
 allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
 version: 2.0.0
 public: true
@@ -8,7 +8,7 @@ public: true
 
 # Interactive Code Review
 
-Review committed changes on the current feature branch and output a structured review.
+Review changes and output a structured review. Works on feature branches, uncommitted changes, or recent commits on main.
 
 ## Arguments
 
@@ -17,15 +17,21 @@ Review committed changes on the current feature branch and output a structured r
 
 ## Process
 
-### Step 1: Verify branch state
+### Step 1: Determine what to review
 
 1. Check current branch: `git branch --show-current`
-   - If on `main` or `master`, stop and tell the user to switch to a feature branch
 2. Determine the base branch by running `git rev-parse --abbrev-ref @{upstream} 2>/dev/null | sed 's|.*/||'`. If that fails (no upstream set), fall back to `main`. Store this as `BASE_BRANCH`.
 3. Check for uncommitted changes: `git status --porcelain`
-   - If there are uncommitted changes, warn the user but proceed with reviewing committed changes
 4. Check if branch has commits ahead of base: `git log $BASE_BRANCH..HEAD --oneline`
-   - If no commits ahead, stop and tell the user there's nothing to review
+
+Determine the review mode based on the results:
+
+- **Feature branch with commits ahead**: Use `git diff $BASE_BRANCH...HEAD` as the diff. If there are also uncommitted changes, warn the user that uncommitted changes are excluded.
+- **On main/master with uncommitted changes**: Use `git diff HEAD` as the diff (covers both staged and unstaged). Tell the user you're reviewing uncommitted changes.
+- **On main/master with no uncommitted changes**: Use `git diff HEAD~1` as the diff to review the most recent commit. Tell the user you're reviewing the last commit.
+- **No commits and no uncommitted changes**: Stop and tell the user there's nothing to review.
+
+Store the chosen diff command as `DIFF_CMD`.
 
 ### Step 2: Find PR (only if --pr flag is set)
 
@@ -46,9 +52,9 @@ You are reviewing a pull request. Your job is to read the project review guideli
 **Step 2**: Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
 Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
 
-**Step 3**: Get the diff to review:
+**Step 3**: Get the diff to review using the provided diff command:
 ```bash
-git diff $BASE_BRANCH...HEAD
+$DIFF_CMD
 ```
 
 **Step 4**: Write a structured review with these sections:
@@ -103,7 +109,7 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent.
+Pass the diff command (`DIFF_CMD`) and the PR number (if `--pr` was used and a PR was found) to the subagent.
 
 ### Step 5: Report back
 
