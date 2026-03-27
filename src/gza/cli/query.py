@@ -1271,14 +1271,12 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
         report_dir = None
 
     if report_dir and task.task_id:
-        report_dir.mkdir(parents=True, exist_ok=True)
         report_path = report_dir / f"{task.task_id}.md"
 
     # Determine summary path for code tasks
     summary_path: Path | None = None
     if task.task_type in ("task", "implement", "improve") and task.task_id:
         summary_dir = project_dir / SUMMARY_DIR
-        summary_dir.mkdir(parents=True, exist_ok=True)
         summary_path = summary_dir / f"{task.task_id}.md"
 
     git = Git(project_dir)

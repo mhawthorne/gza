@@ -1084,9 +1084,24 @@ def _determine_advance_action(
         latest_review = reviews[0]
 
         # If a rebase completed after the latest review, force a new review
+        # (unless one is already pending/in_progress)
         if completed_rebases and latest_review.completed_at is not None:
             latest_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
             if latest_rebase.completed_at is not None and latest_rebase.completed_at > latest_review.completed_at:
+                active_review = next(
+                    (r for r in reviews if r.status in ('pending', 'in_progress')),
+                    None,
+                )
+                if active_review:
+                    if active_review.status == 'pending':
+                        return {
+                            'type': 'run_review',
+                            'description': f'Run pending review #{active_review.id} (post-rebase)',
+                        }
+                    return {
+                        'type': 'wait_review',
+                        'description': f'SKIP: review #{active_review.id} in progress (post-rebase)',
+                    }
                 return {
                     'type': 'create_review',
                     'description': 'Create review (code changed by rebase since last review)',
@@ -1777,6 +1792,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         elif action_type == 'needs_rebase':
             assert task.id is not None
+            assert task.branch is not None
             rebase_task = _create_rebase_task(store, task.id, task.branch, default_branch)
             assert rebase_task.id is not None
             console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")

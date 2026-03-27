@@ -3290,6 +3290,56 @@ class TestAdvanceCommand:
         assert action['type'] == 'create_review'
         assert 'rebase' in action['description'].lower()
 
+    def test_advance_rebase_after_review_idempotent(self, tmp_path: Path):
+        """advance does not create duplicate reviews after a rebase — reuses pending review."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+
+        # Completed review, then completed rebase after it
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = t0
+        review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
+        store.update(review_task)
+
+        rebase_task = store.add(
+            f"Rebase #{task.id}",
+            task_type="rebase",
+            based_on=task.id,
+        )
+        rebase_task.status = "completed"
+        rebase_task.completed_at = t1
+        store.update(rebase_task)
+
+        # First call should want to create a review
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'create_review'
+
+        # Simulate the review being created (pending)
+        new_review = store.add(
+            f"Review #{task.id} (post-rebase)",
+            task_type="review",
+            depends_on=task.id,
+        )
+
+        # Second call should run the pending review, not create another
+        action2 = _determine_advance_action(config, store, git, task, "main")
+        assert action2['type'] == 'run_review'
+        assert str(new_review.id) in action2['description']
+
     def test_advance_rebase_before_review_does_not_force_new_review(self, tmp_path: Path):
         """advance does NOT force new review when rebase completed before the latest review."""
         setup_config(tmp_path)

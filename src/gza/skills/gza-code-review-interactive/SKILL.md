@@ -53,6 +53,8 @@ Keep this review stack-agnostic. If project verification instructions are missin
 git diff main...HEAD
 ```
 
+**Step 3.5**: When you need to verify behavior that isn't visible in the diff (e.g., whether a CLI command exists, how a called function works, what a referenced method does), use the Read, Grep, or Glob tools to check the current codebase. Do not guess or assume — verify.
+
 **Step 4**: Write a structured review with these sections:
 
 ```markdown
