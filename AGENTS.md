@@ -312,7 +312,7 @@ Gza skills are Claude Code skills that agents can invoke during task execution. 
 
 ### Where Skills Live
 
-Skills are authored as `SKILL.md` files in the package source:
+The source of truth for all `/gza-*` skills is:
 
 ```
 src/gza/skills/<skill-name>/SKILL.md
@@ -320,17 +320,19 @@ src/gza/skills/<skill-name>/SKILL.md
 
 For example: `src/gza/skills/gza-task-add/SKILL.md`
 
+**Always edit skills in `src/gza/skills/`, never in `.claude/skills/`.** The `.claude/skills/` copies are installed artifacts — they get overwritten by `gza skills-install`.
+
 When gza is installed, the `skills/` directory is included as package data. There is **no registry to update** — adding a new directory under `src/gza/skills/` with a `SKILL.md` file is sufficient for it to be discovered automatically.
 
 ### Installing Skills into a Project
 
-Skills are installed to `.claude/skills/` in the target project via:
+After creating or editing skills in `src/gza/skills/`, install them into the project with:
 
 ```bash
 gza skills-install
 ```
 
-This copies skills from the installed gza package into the project's `.claude/skills/` directory, where Claude Code picks them up.
+This copies skills from the installed gza package into the project's `.claude/skills/` directory, where Claude Code picks them up. Use `--force` to overwrite existing skills.
 
 ### SKILL.md Frontmatter Fields
 

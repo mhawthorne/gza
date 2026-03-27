@@ -3261,6 +3261,9 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+
         # Create a completed APPROVED review (completed first)
         review_task = store.add(
             f"Review #{task.id}",
@@ -3268,19 +3271,18 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = t0
         review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
         store.update(review_task)
 
         # Create a completed rebase (completed AFTER the review)
-        time.sleep(0.01)
         rebase_task = store.add(
             f"Rebase #{task.id}",
             task_type="rebase",
             based_on=task.id,
         )
         rebase_task.status = "completed"
-        rebase_task.completed_at = datetime.now(timezone.utc)
+        rebase_task.completed_at = t1
         store.update(rebase_task)
 
         config = Config.load(tmp_path)
@@ -3298,6 +3300,9 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+
         # Create a completed rebase (completed first)
         rebase_task = store.add(
             f"Rebase #{task.id}",
@@ -3305,18 +3310,17 @@ class TestAdvanceCommand:
             based_on=task.id,
         )
         rebase_task.status = "completed"
-        rebase_task.completed_at = datetime.now(timezone.utc)
+        rebase_task.completed_at = t0
         store.update(rebase_task)
 
         # Create a completed APPROVED review (completed AFTER the rebase)
-        time.sleep(0.01)
         review_task = store.add(
             f"Review #{task.id}",
             task_type="review",
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = t1
         review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
         store.update(review_task)
 
@@ -3361,6 +3365,10 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+        t2 = datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc)
+
         # Old rebase (before review)
         old_rebase = store.add(
             f"Old rebase #{task.id}",
@@ -3368,30 +3376,28 @@ class TestAdvanceCommand:
             based_on=task.id,
         )
         old_rebase.status = "completed"
-        old_rebase.completed_at = datetime.now(timezone.utc)
+        old_rebase.completed_at = t0
         store.update(old_rebase)
 
         # Review (after old rebase)
-        time.sleep(0.01)
         review_task = store.add(
             f"Review #{task.id}",
             task_type="review",
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = t1
         review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
         store.update(review_task)
 
         # New rebase (after review) — this is the one that should invalidate
-        time.sleep(0.01)
         new_rebase = store.add(
             f"New rebase #{task.id}",
             task_type="rebase",
             based_on=task.id,
         )
         new_rebase.status = "completed"
-        new_rebase.completed_at = datetime.now(timezone.utc)
+        new_rebase.completed_at = t2
         store.update(new_rebase)
 
         config = Config.load(tmp_path)

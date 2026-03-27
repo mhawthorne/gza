@@ -1244,6 +1244,60 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore") -> int:
+    """Build and print the full prompt for a task as JSON.
+
+    Uses the same build_prompt() path as background execution, so the output
+    is identical to what a background worker would receive.
+    """
+    import json
+    from pathlib import Path
+    from ..git import Git
+    from ..runner import build_prompt, SUMMARY_DIR, DEFAULT_REPORT_DIR, PLAN_DIR, REVIEW_DIR, INTERNAL_DIR
+
+    project_dir = config.project_dir
+
+    # Determine report path based on task type (same logic as runner.py)
+    report_path: Path | None = None
+    if task.task_type == "explore":
+        report_dir = project_dir / DEFAULT_REPORT_DIR
+    elif task.task_type == "plan":
+        report_dir = project_dir / PLAN_DIR
+    elif task.task_type == "review":
+        report_dir = project_dir / REVIEW_DIR
+    elif task.task_type in ("internal", "learn"):
+        report_dir = project_dir / INTERNAL_DIR
+    else:
+        report_dir = None
+
+    if report_dir and task.task_id:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"{task.task_id}.md"
+
+    # Determine summary path for code tasks
+    summary_path: Path | None = None
+    if task.task_type in ("task", "implement", "improve") and task.task_id:
+        summary_dir = project_dir / SUMMARY_DIR
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = summary_dir / f"{task.task_id}.md"
+
+    git = Git(project_dir)
+    prompt = build_prompt(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
+
+    output = {
+        "task_id": task.id,
+        "task_type": task.task_type,
+        "task_slug": task.task_id,
+        "branch": task.branch,
+        "prompt": prompt,
+        "report_path": str(report_path) if report_path else None,
+        "summary_path": str(summary_path) if summary_path else None,
+        "verify_command": config.verify_command,
+    }
+    print(json.dumps(output, indent=2))
+    return 0
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
     from .log import _latest_worker_for_task
@@ -1256,6 +1310,10 @@ def cmd_show(args: argparse.Namespace) -> int:
     if not task:
         console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
         return 1
+
+    # --prompt: emit the fully built prompt as JSON and exit
+    if getattr(args, "prompt", False):
+        return _show_built_prompt(task, config, store)
 
     SHOW_COLORS = {
         "heading": "bold cyan",

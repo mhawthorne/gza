@@ -2,7 +2,7 @@
 name: gza-task-run
 description: Run a gza task inline in the current conversation, using the same prompt that background execution would use
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), AskUserQuestion
-version: 1.1.0
+version: 2.0.0
 public: true
 ---
 
@@ -22,73 +22,29 @@ uv run gza next
 
 ### Step 2: Build the task prompt
 
-Run the following Python script to build the exact prompt that background execution would use. This calls the same `build_prompt()` function used by `gza run`:
+Use `gza show --prompt` to build the exact prompt that background execution would use:
 
 ```bash
-uv run python -c "
-import json, sys
-from pathlib import Path
-from gza.config import Config
-from gza.db import SqliteTaskStore
-from gza.runner import build_prompt, SUMMARY_DIR, DEFAULT_REPORT_DIR, PLAN_DIR, REVIEW_DIR, INTERNAL_DIR
-from gza.git import Git
-
-config = Config.load()
-store = SqliteTaskStore(config.db_path)
-task = store.get(<TASK_ID>)
-if not task:
-    print('ERROR: Task not found', file=sys.stderr)
-    sys.exit(1)
-if task.status not in ('pending', 'failed'):
-    print(f'ERROR: Task is {task.status}, expected pending or failed', file=sys.stderr)
-    sys.exit(1)
-
-# Determine output paths based on task type (same logic as runner.py)
-project_dir = config.project_dir
-if task.task_type in ('explore',):
-    report_dir = project_dir / DEFAULT_REPORT_DIR
-elif task.task_type == 'plan':
-    report_dir = project_dir / PLAN_DIR
-elif task.task_type == 'review':
-    report_dir = project_dir / REVIEW_DIR
-elif task.task_type in ('internal', 'learn'):
-    report_dir = project_dir / INTERNAL_DIR
-else:
-    report_dir = None
-
-report_path = None
-if report_dir and task.task_id:
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / f'{task.task_id}.md'
-
-summary_path = None
-if task.task_type in ('task', 'implement', 'improve') and task.task_id:
-    summary_dir = project_dir / SUMMARY_DIR
-    summary_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = summary_dir / f'{task.task_id}.md'
-
-git = Git(project_dir)
-prompt = build_prompt(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
-
-# Output as JSON so we can parse it cleanly
-print(json.dumps({
-    'task_id': task.id,
-    'task_type': task.task_type,
-    'task_slug': task.task_id,
-    'branch': task.branch,
-    'prompt': prompt,
-    'report_path': str(report_path) if report_path else None,
-    'summary_path': str(summary_path) if summary_path else None,
-    'verify_command': config.verify_command,
-}))
-"
+uv run gza show --prompt <TASK_ID>
 ```
 
-Replace `<TASK_ID>` with the actual numeric task ID.
+This outputs JSON with: `task_id`, `task_type`, `task_slug`, `branch`, `prompt`, `report_path`, `summary_path`, `verify_command`.
+
+If you need to edit the task prompt before running, use `gza edit`:
+
+```bash
+uv run gza edit <TASK_ID> --prompt "updated prompt text"
+```
+
+Then re-run `gza show --prompt` to get the updated built prompt.
 
 ### Step 3: Mark task as in-progress
 
-Use `store.mark_in_progress()` to properly set status, started_at, and running_pid:
+```bash
+uv run gza set-status <TASK_ID> in_progress
+```
+
+If `set-status` is not available, use:
 
 ```bash
 uv run python -c "
@@ -130,46 +86,35 @@ git commit -m "<descriptive message>"
 
 ### Step 6: Mark task as completed
 
-Use `store.mark_completed()` to properly set status, merge_status, running_pid, and all other fields:
+```bash
+uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>
+```
+
+If the task produced a report file, persist the output:
 
 ```bash
 uv run python -c "
-import os
-from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 config = Config.load()
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
-
-# Read output content if report or summary exists
-output_content = None
-report_file = None
-report_path = '<REPORT_OR_SUMMARY_PATH>'
-if report_path != 'None':
-    p = Path(report_path)
-    if p.exists():
-        output_content = p.read_text()
-        report_file = str(p.relative_to(config.project_dir))
-
-store.mark_completed(
-    task,
-    branch='<BRANCH_NAME>',
-    has_commits=True,
-    report_file=report_file,
-    output_content=output_content,
-)
-print('Task marked as completed')
+from pathlib import Path
+report = Path('<REPORT_OR_SUMMARY_PATH>')
+if report.exists():
+    task.report_file = str(report.relative_to(config.project_dir))
+    task.output_content = report.read_text()
+    store.update(task)
+    print('Report persisted')
 "
 ```
 
-Replace `<REPORT_OR_SUMMARY_PATH>` with the report_path (for explore/plan/review) or summary_path (for task/implement/improve) from Step 2's output, or `None` if neither applies.
-
 ## Important notes
 
-- **Same prompt as background**: The prompt is built using the exact same `build_prompt()` function that `gza run` uses. This ensures identical instructions, context injection, and type-specific templates.
+- **Same prompt as background**: `gza show --prompt` calls the same `build_prompt()` function that `gza run` uses. Identical instructions, context injection, and type-specific templates.
 - **No worktree**: Unlike background execution, this runs directly on the current working tree. Changes are made in-place.
 - **Branch management**: Create a new branch for the task work, just like background execution would.
-- **Proper status tracking**: Uses `store.mark_in_progress()` and `store.mark_completed()` to ensure correct `merge_status`, `running_pid`, etc. — tasks completed inline appear in `gza unmerged` and work with `gza advance`.
+- **Editing prompts**: Use `gza edit <id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
+- **Proper status tracking**: Uses `mark-completed` to ensure correct `merge_status` so tasks appear in `gza unmerged` and work with `gza advance`.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.

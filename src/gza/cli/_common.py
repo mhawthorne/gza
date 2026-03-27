@@ -38,7 +38,7 @@ def _branch_has_commits(config: Config, branch: str | None) -> bool:
     if not branch:
         return False
     try:
-        from ..git import Git
+        from ..git import Git  # lazy import to avoid circular: _common → git → config → _common
         git = Git(config.project_dir)
         default_branch = git.default_branch()
         count = git.count_commits_ahead(branch, default_branch)
