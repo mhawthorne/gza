@@ -1045,11 +1045,13 @@ def _determine_advance_action(
             'description': 'SKIP: task has no branch (no commits)',
         }
 
+    # Fetch lineage children once (used for rebase conflict checks and post-rebase review invalidation)
+    assert task.id is not None
+    rebase_children = store.get_lineage_children(task.id)
+
     # Check for merge conflicts against the default branch (the merge target)
     if not git.can_merge(task.branch, default_branch):
         # Check if a rebase is already in progress or has failed
-        assert task.id is not None
-        rebase_children = store.get_lineage_children(task.id)
         for child in rebase_children:
             if child.task_type != "rebase":
                 continue
@@ -1070,8 +1072,6 @@ def _determine_advance_action(
 
     # Check if a rebase completed after the latest review — if so, the review
     # is stale and we need a fresh one before merging.
-    assert task.id is not None
-    rebase_children = store.get_lineage_children(task.id)
     completed_rebases = [
         c for c in rebase_children
         if c.task_type == "rebase" and c.status == "completed" and c.completed_at is not None

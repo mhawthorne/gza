@@ -1493,6 +1493,10 @@ def _complete_code_task(
     if task.task_type == "improve" and task.based_on:
         store.clear_review_state(task.based_on)
 
+    # Invalidate review state after rebase completes, since conflict resolution
+    # may have introduced changes not covered by prior reviews.
+    if task.task_type == "rebase" and task.based_on:
+        store.invalidate_review_state(task.based_on)
 
     console.print("")
     success_message("Done")

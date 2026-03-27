@@ -1999,6 +1999,34 @@ class TestReviewClearedAt:
         # Should not raise any exception
         store.clear_review_state(99999)
 
+    def test_invalidate_review_state_clears_review_cleared_at(self, tmp_path: Path):
+        """invalidate_review_state sets review_cleared_at to NULL."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Task to invalidate", task_type="implement")
+        assert task.id is not None
+
+        # First set review_cleared_at
+        store.clear_review_state(task.id)
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.review_cleared_at is not None
+
+        # Now invalidate it
+        store.invalidate_review_state(task.id)
+        invalidated = store.get(task.id)
+        assert invalidated is not None
+        assert invalidated.review_cleared_at is None
+
+    def test_invalidate_review_state_on_nonexistent_task_is_graceful(self, tmp_path: Path):
+        """invalidate_review_state does not raise when task_id does not exist."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        # Should not raise any exception
+        store.invalidate_review_state(99999)
+
 
 class TestConvenienceFunctions:
     """Tests for module-level convenience functions get_task, get_task_log_path,

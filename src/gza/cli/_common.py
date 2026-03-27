@@ -43,7 +43,7 @@ def _branch_has_commits(config: Config, branch: str | None) -> bool:
         default_branch = git.default_branch()
         count = git.count_commits_ahead(branch, default_branch)
         return count > 0
-    except Exception:
+    except (subprocess.CalledProcessError, OSError, ValueError):
         return False
 
 

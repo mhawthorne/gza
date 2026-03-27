@@ -3251,6 +3251,153 @@ class TestAdvanceCommand:
         action = _determine_advance_action(config, store, git, task, "main")
         assert action['type'] == 'improve'
 
+    def test_advance_rebase_after_review_forces_new_review(self, tmp_path: Path):
+        """advance creates a new review when rebase completed after latest review."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a completed APPROVED review (completed first)
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
+        store.update(review_task)
+
+        # Create a completed rebase (completed AFTER the review)
+        time.sleep(0.01)
+        rebase_task = store.add(
+            f"Rebase #{task.id}",
+            task_type="rebase",
+            based_on=task.id,
+        )
+        rebase_task.status = "completed"
+        rebase_task.completed_at = datetime.now(timezone.utc)
+        store.update(rebase_task)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'create_review'
+        assert 'rebase' in action['description'].lower()
+
+    def test_advance_rebase_before_review_does_not_force_new_review(self, tmp_path: Path):
+        """advance does NOT force new review when rebase completed before the latest review."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a completed rebase (completed first)
+        rebase_task = store.add(
+            f"Rebase #{task.id}",
+            task_type="rebase",
+            based_on=task.id,
+        )
+        rebase_task.status = "completed"
+        rebase_task.completed_at = datetime.now(timezone.utc)
+        store.update(rebase_task)
+
+        # Create a completed APPROVED review (completed AFTER the rebase)
+        time.sleep(0.01)
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
+        store.update(review_task)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        # Should proceed to merge, not force a new review
+        assert action['type'] != 'create_review'
+
+    def test_advance_no_rebases_no_effect_on_review(self, tmp_path: Path):
+        """advance with no rebase tasks does not affect review flow."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Create a completed APPROVED review (no rebase at all)
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
+        store.update(review_task)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        # Should merge, not create another review
+        assert action['type'] == 'merge'
+
+    def test_advance_multiple_rebases_only_latest_matters(self, tmp_path: Path):
+        """advance checks only the latest rebase against the latest review."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        # Old rebase (before review)
+        old_rebase = store.add(
+            f"Old rebase #{task.id}",
+            task_type="rebase",
+            based_on=task.id,
+        )
+        old_rebase.status = "completed"
+        old_rebase.completed_at = datetime.now(timezone.utc)
+        store.update(old_rebase)
+
+        # Review (after old rebase)
+        time.sleep(0.01)
+        review_task = store.add(
+            f"Review #{task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
+        store.update(review_task)
+
+        # New rebase (after review) — this is the one that should invalidate
+        time.sleep(0.01)
+        new_rebase = store.add(
+            f"New rebase #{task.id}",
+            task_type="rebase",
+            based_on=task.id,
+        )
+        new_rebase.status = "completed"
+        new_rebase.completed_at = datetime.now(timezone.utc)
+        store.update(new_rebase)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'create_review'
+
     def test_advance_needs_attention_summary_printed(self, tmp_path: Path):
         """advance prints Needs attention section for actionable skips."""
         (tmp_path / "gza.yaml").write_text(

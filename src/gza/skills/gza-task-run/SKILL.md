@@ -2,7 +2,7 @@
 name: gza-task-run
 description: Run a gza task inline in the current conversation, using the same prompt that background execution would use
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), AskUserQuestion
-version: 1.0.0
+version: 1.1.0
 public: true
 ---
 
@@ -88,17 +88,16 @@ Replace `<TASK_ID>` with the actual numeric task ID.
 
 ### Step 3: Mark task as in-progress
 
+Use `store.mark_in_progress()` to properly set status, started_at, and running_pid:
+
 ```bash
 uv run python -c "
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from datetime import datetime, timezone
 config = Config.load()
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
-task.status = 'in_progress'
-task.started_at = datetime.now(timezone.utc)
-store.update(task)
+store.mark_in_progress(task)
 print('Task marked as in_progress')
 "
 ```
@@ -131,48 +130,46 @@ git commit -m "<descriptive message>"
 
 ### Step 6: Mark task as completed
 
+Use `store.mark_completed()` to properly set status, merge_status, running_pid, and all other fields:
+
 ```bash
 uv run python -c "
+import os
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from datetime import datetime, timezone
 config = Config.load()
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
-task.status = 'completed'
-task.completed_at = datetime.now(timezone.utc)
-task.has_commits = True
-task.branch = '<BRANCH_NAME>'
-store.update(task)
+
+# Read output content if report or summary exists
+output_content = None
+report_file = None
+report_path = '<REPORT_OR_SUMMARY_PATH>'
+if report_path != 'None':
+    p = Path(report_path)
+    if p.exists():
+        output_content = p.read_text()
+        report_file = str(p.relative_to(config.project_dir))
+
+store.mark_completed(
+    task,
+    branch='<BRANCH_NAME>',
+    has_commits=True,
+    report_file=report_file,
+    output_content=output_content,
+)
 print('Task marked as completed')
 "
 ```
 
-If the task produced a report file, also persist it:
-
-```bash
-uv run python -c "
-from gza.config import Config
-from gza.db import SqliteTaskStore
-config = Config.load()
-store = SqliteTaskStore(config.db_path)
-task = store.get(<TASK_ID>)
-task.report_file = '<REPORT_PATH_RELATIVE>'
-from pathlib import Path
-report = Path('<REPORT_PATH_ABSOLUTE>')
-if report.exists():
-    task.output_content = report.read_text()
-store.update(task)
-print('Report persisted')
-"
-```
+Replace `<REPORT_OR_SUMMARY_PATH>` with the report_path (for explore/plan/review) or summary_path (for task/implement/improve) from Step 2's output, or `None` if neither applies.
 
 ## Important notes
 
 - **Same prompt as background**: The prompt is built using the exact same `build_prompt()` function that `gza run` uses. This ensures identical instructions, context injection, and type-specific templates.
 - **No worktree**: Unlike background execution, this runs directly on the current working tree. Changes are made in-place.
 - **Branch management**: Create a new branch for the task work, just like background execution would.
-- **Task status tracking**: The task is properly marked as in_progress then completed in the database, so `gza status`, `gza history`, etc. reflect the work.
+- **Proper status tracking**: Uses `store.mark_in_progress()` and `store.mark_completed()` to ensure correct `merge_status`, `running_pid`, etc. — tasks completed inline appear in `gza unmerged` and work with `gza advance`.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.
