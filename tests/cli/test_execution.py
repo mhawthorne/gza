@@ -1248,6 +1248,90 @@ class TestReconciliation:
         assert "Warning: Unexpected reconciliation error for task" in captured.err
         assert "db-write-boom" in captured.err
 
+    def test_reconciliation_detects_commits_on_worker_died(self, tmp_path: Path):
+        """WORKER_DIED reconciliation sets has_commits=True when branch has commits."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Set up a git repo with a branch that has commits
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create a branch with a commit
+        git._run("checkout", "-b", "task-branch")
+        (tmp_path / "work.py").write_text("print('hello')")
+        git._run("add", "work.py")
+        git._run("commit", "-m", "Task work")
+        git._run("checkout", "main")
+
+        # Create task that looks like worker died (dead PID, has branch)
+        task = store.add("Task with commits")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = -1  # guaranteed dead PID
+        task.branch = "task-branch"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.has_commits is True
+
+    def test_reconciliation_no_commits_on_worker_died(self, tmp_path: Path):
+        """WORKER_DIED reconciliation sets has_commits=False when branch has no commits."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Set up a git repo — no extra branch
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        # Create task with no branch (worker died before branch creation)
+        task = store.add("Task without branch")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = -1
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.has_commits is not True
+
     def test_prune_terminal_dead_workers_removes_completed_task_worker(self, tmp_path: Path):
         """Terminal task workers with dead PIDs should be pruned from the registry."""
         import os

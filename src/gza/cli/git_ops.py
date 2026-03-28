@@ -1045,11 +1045,13 @@ def _determine_advance_action(
             'description': 'SKIP: task has no branch (no commits)',
         }
 
+    # Fetch lineage children once (used for rebase conflict checks and post-rebase review invalidation)
+    assert task.id is not None
+    rebase_children = store.get_lineage_children(task.id)
+
     # Check for merge conflicts against the default branch (the merge target)
     if not git.can_merge(task.branch, default_branch):
         # Check if a rebase is already in progress or has failed
-        assert task.id is not None
-        rebase_children = store.get_lineage_children(task.id)
         for child in rebase_children:
             if child.task_type != "rebase":
                 continue
@@ -1068,11 +1070,42 @@ def _determine_advance_action(
             'description': 'rebase --resolve (conflicts detected)',
         }
 
+    # Check if a rebase completed after the latest review — if so, the review
+    # is stale and we need a fresh one before merging.
+    completed_rebases = [
+        c for c in rebase_children
+        if c.task_type == "rebase" and c.status == "completed" and c.completed_at is not None
+    ]
+
     # Check review state
     reviews = _get_reviews_for_root_task(store, task)
 
     if reviews:
         latest_review = reviews[0]
+
+        # If a rebase completed after the latest review, force a new review
+        # (unless one is already pending/in_progress)
+        if completed_rebases and latest_review.completed_at is not None:
+            latest_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
+            if latest_rebase.completed_at is not None and latest_rebase.completed_at > latest_review.completed_at:
+                active_review = next(
+                    (r for r in reviews if r.status in ('pending', 'in_progress')),
+                    None,
+                )
+                if active_review:
+                    if active_review.status == 'pending':
+                        return {
+                            'type': 'run_review',
+                            'description': f'Run pending review #{active_review.id} (post-rebase)',
+                        }
+                    return {
+                        'type': 'wait_review',
+                        'description': f'SKIP: review #{active_review.id} in progress (post-rebase)',
+                    }
+                return {
+                    'type': 'create_review',
+                    'description': 'Create review (code changed by rebase since last review)',
+                }
 
         # Determine if the review has been cleared by a subsequent improve task
         review_cleared = (
@@ -1759,6 +1792,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         elif action_type == 'needs_rebase':
             assert task.id is not None
+            if not task.branch:
+                console.print(f"      [red]✗ Cannot rebase: task #{task.id} has no branch[/red]")
+                error_count += 1
+                continue
             rebase_task = _create_rebase_task(store, task.id, task.branch, default_branch)
             assert rebase_task.id is not None
             console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")

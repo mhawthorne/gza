@@ -13,6 +13,7 @@ from gza.git import Git
 from gza.providers import RunResult, ClaudeProvider
 from gza.runner import (
     build_prompt,
+    get_task_output_paths,
     SUMMARY_DIR,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     WIP_DIR,
@@ -39,6 +40,51 @@ from gza.runner import (
     run,
     write_log_entry,
 )
+
+
+class TestGetTaskOutputPaths:
+    """Tests for get_task_output_paths function."""
+
+    def _make_task(self, store, task_type):
+        """Create a task with a task_id slug set."""
+        task = store.add(prompt=f"Test {task_type}", task_type=task_type)
+        task.task_id = f"20260101-test-{task_type}"
+        store.update(task)
+        return task
+
+    def test_code_task_types_return_summary_path(self, tmp_path: Path):
+        """Code task types (task, implement, improve, rebase) return a summary_path."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        for task_type in ("task", "implement", "improve", "rebase"):
+            task = self._make_task(store, task_type)
+            report_path, summary_path = get_task_output_paths(task, tmp_path)
+            assert summary_path is not None, f"{task_type} should have summary_path"
+            assert report_path is None, f"{task_type} should not have report_path"
+            assert "summaries" in str(summary_path)
+
+    def test_non_code_task_types_return_report_path(self, tmp_path: Path):
+        """Non-code task types (explore, plan, review, internal) return a report_path."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        for task_type in ("explore", "plan", "review", "internal", "learn"):
+            task = self._make_task(store, task_type)
+            report_path, summary_path = get_task_output_paths(task, tmp_path)
+            assert report_path is not None, f"{task_type} should have report_path"
+            assert summary_path is None, f"{task_type} should not have summary_path"
+
+    def test_no_task_id_returns_none(self, tmp_path: Path):
+        """Tasks without a task_id return (None, None)."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="No slug", task_type="implement")
+        # task_id is None by default (slug not yet generated)
+        assert task.task_id is None
+        report_path, summary_path = get_task_output_paths(task, tmp_path)
+        assert report_path is None
+        assert summary_path is None
 
 
 class TestBuildPrompt:

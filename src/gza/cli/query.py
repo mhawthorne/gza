@@ -743,10 +743,10 @@ def _print_ps_output(
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
-        f"{'STATUS':<16} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+        f"{'STATUS':<16} {'PID':<8} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
     console.print(f"[bold]{header}[/bold]", soft_wrap=True)
-    console.print("[bold]" + "─" * 98 + "[/bold]", soft_wrap=True)
+    console.print("[bold]" + "─" * 106 + "[/bold]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
@@ -760,7 +760,7 @@ def _print_ps_output(
 
         console.print(
             f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
-            f"[{sc}]{status:<16}[/{sc}] {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
+            f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
             f"[#ff99cc]{task_display}[/#ff99cc]",
             soft_wrap=True,
         )
@@ -1244,6 +1244,35 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore") -> int:
+    """Build and print the full prompt for a task as JSON.
+
+    Uses the same build_prompt() path as background execution, so the output
+    is identical to what a background worker would receive.
+    """
+    import json
+    from ..git import Git
+    from ..runner import build_prompt, get_task_output_paths
+
+    report_path, summary_path = get_task_output_paths(task, config.project_dir)
+
+    git = Git(config.project_dir)
+    prompt = build_prompt(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
+
+    output = {
+        "task_id": task.id,
+        "task_type": task.task_type,
+        "task_slug": task.task_id,
+        "branch": task.branch,
+        "prompt": prompt,
+        "report_path": str(report_path) if report_path else None,
+        "summary_path": str(summary_path) if summary_path else None,
+        "verify_command": config.verify_command,
+    }
+    print(json.dumps(output, indent=2))
+    return 0
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
     from .log import _latest_worker_for_task
@@ -1256,6 +1285,10 @@ def cmd_show(args: argparse.Namespace) -> int:
     if not task:
         console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
         return 1
+
+    # --prompt: emit the fully built prompt as JSON and exit
+    if getattr(args, "prompt", False):
+        return _show_built_prompt(task, config, store)
 
     SHOW_COLORS = {
         "heading": "bold cyan",

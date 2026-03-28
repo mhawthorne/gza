@@ -1068,6 +1068,12 @@ def main() -> int:
         default=False,
         help="Show full output without truncation",
     )
+    show_parser.add_argument(
+        "--prompt",
+        action="store_true",
+        default=False,
+        help="Output the fully built prompt (with templates, context, verify_command) as JSON",
+    )
     add_common_args(show_parser)
 
     # sync-report command

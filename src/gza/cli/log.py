@@ -452,8 +452,12 @@ class _LiveLogPrinter:
             todos = tool_input.get("todos", [])
             self._fmt.print_tool_event(tool_name, f"{len(todos)} todos")
             for todo in todos:
-                status = todo.get("status", "pending")
-                todo_content = todo.get("content", "")
+                if isinstance(todo, dict):
+                    status = todo.get("status", "pending")
+                    todo_content = todo.get("content", "")
+                else:
+                    status = "pending"
+                    todo_content = str(todo)
                 self._fmt.print_todo(status, self._trunc(todo_content, 60))
         else:
             file_path = tool_input.get("file_path") or tool_input.get("path")

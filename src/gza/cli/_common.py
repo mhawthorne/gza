@@ -29,6 +29,25 @@ def get_store(config: Config) -> SqliteTaskStore:
     return SqliteTaskStore(config.db_path)
 
 
+def _branch_has_commits(config: Config, branch: str | None) -> bool:
+    """Check if a branch has commits beyond the default branch.
+
+    Used during reconciliation to detect whether a WORKER_DIED task
+    actually produced work before the process vanished.
+    """
+    if not branch:
+        return False
+    try:
+        from ..git import Git  # lazy import to avoid circular: _common → git → config → _common
+        git = Git(config.project_dir)
+        default_branch = git.default_branch()
+        count = git.count_commits_ahead(branch, default_branch)
+        return count > 0
+    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+        print(f"Warning: Could not check commits on branch '{branch}': {exc}", file=sys.stderr)
+        return False
+
+
 def reconcile_in_progress_tasks(config: Config) -> None:
     """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
     try:
@@ -45,20 +64,24 @@ def reconcile_in_progress_tasks(config: Config) -> None:
     for task in store.get_in_progress():
         task_label = f"#{task.id}" if task.id is not None else "<unknown>"
         try:
+            is_dead = False
             if task.running_pid is None:
                 # No PID tracked — mark as orphaned if the task was actually started.
                 if task.started_at is not None:
-                    store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
-                continue
+                    is_dead = True
+                else:
+                    continue
+            elif task.running_pid <= 0:
+                is_dead = True
+            else:
+                try:
+                    os.kill(task.running_pid, 0)
+                except OSError:
+                    is_dead = True
 
-            if task.running_pid <= 0:
-                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
-                continue
-
-            try:
-                os.kill(task.running_pid, 0)
-            except OSError:
-                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+            if is_dead:
+                has_commits = _branch_has_commits(config, task.branch)
+                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED", has_commits=has_commits)
                 continue
 
             # PID is alive — leave timeout handling to the runner process.
@@ -400,7 +423,8 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             if refreshed and refreshed.status == "in_progress":
                 in_progress = [refreshed]
         for task in in_progress:
-            store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED")
+            has_commits = _branch_has_commits(config, task.branch)
+            store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED", has_commits=has_commits)
         if startup_log_path:
             with open(startup_log_path, "a") as f:
                 f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\n")

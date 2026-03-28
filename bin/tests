@@ -1,5 +1,6 @@
 #!/bin/sh
+set -ex
 
-uv run mypy src/gza/ && \
-uv run pytest tests/ -xv && \
+uv run mypy src/gza/
+uv run pytest tests/ -xv
 uv run pytest tests_integration
