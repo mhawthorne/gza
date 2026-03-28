@@ -44,20 +44,6 @@ Then re-run `gza show --prompt` to get the updated built prompt.
 uv run gza set-status <TASK_ID> in_progress
 ```
 
-If `set-status` is not available, use:
-
-```bash
-uv run python -c "
-from gza.config import Config
-from gza.db import SqliteTaskStore
-config = Config.load()
-store = SqliteTaskStore(config.db_path)
-task = store.get(<TASK_ID>)
-store.mark_in_progress(task)
-print('Task marked as in_progress')
-"
-```
-
 ### Step 4: Create a branch and execute the task
 
 Create a branch for the task if one doesn't already exist:
@@ -90,20 +76,20 @@ git commit -m "<descriptive message>"
 uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>
 ```
 
-If the task produced a report file, persist the output:
+If the task produced a report or summary file (shown in `report_path` or `summary_path` from Step 2), persist it:
 
 ```bash
 uv run python -c "
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 config = Config.load()
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
-from pathlib import Path
-report = Path('<REPORT_OR_SUMMARY_PATH>')
-if report.exists():
-    task.report_file = str(report.relative_to(config.project_dir))
-    task.output_content = report.read_text()
+p = Path('<REPORT_OR_SUMMARY_PATH>')
+if p.exists():
+    task.report_file = str(p.relative_to(config.project_dir))
+    task.output_content = p.read_text()
     store.update(task)
     print('Report persisted')
 "

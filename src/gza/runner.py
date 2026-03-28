@@ -147,6 +147,39 @@ SUMMARY_DIR = f".{APP_NAME}/summaries"
 WIP_DIR = f".{APP_NAME}/wip"
 BACKUP_DIR = f".{APP_NAME}/backups"
 
+
+def get_task_output_paths(
+    task: Task, project_dir: Path
+) -> tuple[Path | None, Path | None]:
+    """Determine report_path and summary_path for a task based on its type.
+
+    This is the single source of truth for where task outputs go.
+    Used by the runner and by ``gza show --prompt``.
+
+    Returns:
+        (report_path, summary_path) — one or both may be None.
+    """
+    report_path: Path | None = None
+    summary_path: Path | None = None
+
+    if not task.task_id:
+        return None, None
+
+    if task.task_type in ("task", "implement", "improve"):
+        summary_path = project_dir / SUMMARY_DIR / f"{task.task_id}.md"
+    elif task.task_type == "explore":
+        report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.task_id}.md"
+    elif task.task_type == "plan":
+        report_path = project_dir / PLAN_DIR / f"{task.task_id}.md"
+    elif task.task_type == "review":
+        report_path = project_dir / REVIEW_DIR / f"{task.task_id}.md"
+    elif task.task_type in ("internal", "learn"):
+        report_path = project_dir / INTERNAL_DIR / f"{task.task_id}.md"
+    else:
+        report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.task_id}.md"
+
+    return report_path, summary_path
+
 # Diff size thresholds for tiered diff strategy in review prompts
 DIFF_SMALL_THRESHOLD = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
 DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
@@ -1600,10 +1633,10 @@ def _run_inner(
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
 
     # Setup summary directory and path for task/implement types
-    summary_dir = config.project_dir / SUMMARY_DIR
+    _, summary_path = get_task_output_paths(task, config.project_dir)
+    assert summary_path is not None, f"Code task type '{task.task_type}' must have a summary path"
+    summary_dir = summary_path.parent
     summary_dir.mkdir(parents=True, exist_ok=True)
-    summary_filename = f"{task.task_id}.md"
-    summary_path = summary_dir / summary_filename
     summary_file_relative = str(summary_path.relative_to(config.project_dir))
 
     # Create summary directory structure in worktree
@@ -1781,25 +1814,18 @@ def _run_non_code_task(
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
 
     # Setup report file based on task type
-    if task.task_type == "explore":
-        report_dir = config.project_dir / DEFAULT_REPORT_DIR
-        task_type_display = "Exploration"
-    elif task.task_type == "plan":
-        report_dir = config.project_dir / PLAN_DIR
-        task_type_display = "Plan"
-    elif task.task_type == "review":
-        report_dir = config.project_dir / REVIEW_DIR
-        task_type_display = "Review"
-    elif task.task_type in ("internal", "learn"):
-        report_dir = config.project_dir / INTERNAL_DIR
-        task_type_display = "Internal"
-    else:
-        report_dir = config.project_dir / DEFAULT_REPORT_DIR
-        task_type_display = "Report"
+    report_path, _ = get_task_output_paths(task, config.project_dir)
+    assert report_path is not None, f"Non-code task type '{task.task_type}' must have a report path"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_filename = f"{task.task_id}.md"
-    report_path = report_dir / report_filename
+    task_type_display_map = {
+        "explore": "Exploration",
+        "plan": "Plan",
+        "review": "Review",
+        "internal": "Internal",
+        "learn": "Internal",
+    }
+    task_type_display = task_type_display_map.get(task.task_type, "Report")
     report_file_relative = str(report_path.relative_to(config.project_dir))
 
     # Create worktree in /tmp for Docker compatibility on macOS

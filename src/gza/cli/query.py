@@ -1251,35 +1251,12 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
     is identical to what a background worker would receive.
     """
     import json
-    from pathlib import Path
     from ..git import Git
-    from ..runner import build_prompt, SUMMARY_DIR, DEFAULT_REPORT_DIR, PLAN_DIR, REVIEW_DIR, INTERNAL_DIR
+    from ..runner import build_prompt, get_task_output_paths
 
-    project_dir = config.project_dir
+    report_path, summary_path = get_task_output_paths(task, config.project_dir)
 
-    # Determine report path based on task type (same logic as runner.py)
-    report_path: Path | None = None
-    if task.task_type == "explore":
-        report_dir = project_dir / DEFAULT_REPORT_DIR
-    elif task.task_type == "plan":
-        report_dir = project_dir / PLAN_DIR
-    elif task.task_type == "review":
-        report_dir = project_dir / REVIEW_DIR
-    elif task.task_type in ("internal", "learn"):
-        report_dir = project_dir / INTERNAL_DIR
-    else:
-        report_dir = None
-
-    if report_dir and task.task_id:
-        report_path = report_dir / f"{task.task_id}.md"
-
-    # Determine summary path for code tasks
-    summary_path: Path | None = None
-    if task.task_type in ("task", "implement", "improve") and task.task_id:
-        summary_dir = project_dir / SUMMARY_DIR
-        summary_path = summary_dir / f"{task.task_id}.md"
-
-    git = Git(project_dir)
+    git = Git(config.project_dir)
     prompt = build_prompt(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
 
     output = {

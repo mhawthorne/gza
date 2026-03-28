@@ -1792,7 +1792,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         elif action_type == 'needs_rebase':
             assert task.id is not None
-            assert task.branch is not None
+            if not task.branch:
+                console.print(f"      [red]✗ Cannot rebase: task #{task.id} has no branch[/red]")
+                error_count += 1
+                continue
             rebase_task = _create_rebase_task(store, task.id, task.branch, default_branch)
             assert rebase_task.id is not None
             console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")
