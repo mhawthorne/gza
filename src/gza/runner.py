@@ -165,7 +165,7 @@ def get_task_output_paths(
     if not task.task_id:
         return None, None
 
-    if task.task_type in ("task", "implement", "improve"):
+    if task.task_type in ("task", "implement", "improve", "rebase"):
         summary_path = project_dir / SUMMARY_DIR / f"{task.task_id}.md"
     elif task.task_type == "explore":
         report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.task_id}.md"
