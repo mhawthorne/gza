@@ -180,6 +180,7 @@ def get_task_output_paths(
 
     return report_path, summary_path
 
+
 # Diff size thresholds for tiered diff strategy in review prompts
 DIFF_SMALL_THRESHOLD = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
 DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
