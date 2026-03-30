@@ -1819,7 +1819,7 @@ class TestTmuxConfigValidation:
 
         self._write_config(tmp_path, "")
         config = Config.load(tmp_path)
-        assert config.tmux.enabled is True
+        assert config.tmux.enabled is False
         assert config.tmux.auto_accept_timeout == 10.0
         assert config.tmux.max_idle_timeout == 300.0
         assert config.tmux.detach_grace == 5.0

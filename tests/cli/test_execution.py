@@ -457,7 +457,8 @@ class TestRetryCommand:
         new_task = store.get(2)
         assert new_task is not None
         assert new_task.prompt == "Failed task to retry"
-        assert new_task.status == "pending"
+        # Background worker may claim the task before we check, so accept both
+        assert new_task.status in ("pending", "in_progress")
         assert new_task.based_on == 1
 
     def test_retry_runs_by_default(self, tmp_path: Path):

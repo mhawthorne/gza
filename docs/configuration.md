@@ -33,10 +33,9 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
 | `model` | String | *(empty)* | Legacy global model fallback (compatible) |
 | `task_types` | Dict | `{}` | Legacy global per-task fallback (compatible) |
-| `claude` | Dict | *(see below)* | Claude-specific configuration section |
-| `claude.fetch_auth_token_from_keychain` | Boolean | `false` | Fetch OAuth token from macOS Keychain for Docker (macOS only) |
-| `claude.args` | List | `["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]` | Arguments passed to Claude Code CLI |
+| `claude` | Dict | *(see below)* | Claude-specific configuration (see [Claude Configuration](#claude-configuration)) |
 | `claude_args` | List | *(deprecated)* | Use `claude.args` instead |
+| `tmux` | Dict | *(see below)* | Tmux session configuration (see [Tmux Sessions](tmux.md)) |
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
@@ -153,6 +152,42 @@ docker_volumes:
 - Tilde (`~`) in source paths is automatically expanded to your home directory
 - The workspace is always mounted at `/workspace` automatically
 - Config validation warns about common syntax errors but doesn't block invalid formats
+
+### Claude Configuration
+
+Nested under the `claude:` key in `gza.yaml`:
+
+```yaml
+claude:
+  fetch_auth_token_from_keychain: false
+  args: ["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `fetch_auth_token_from_keychain` | Boolean | `false` | Fetch OAuth token from macOS Keychain for Docker (macOS only) |
+| `args` | List | `["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]` | Arguments passed to Claude Code CLI |
+
+### Tmux Sessions
+
+Background tasks run inside tmux sessions so you can attach to observe or take interactive control. See [Tmux Sessions](tmux.md) for full details on attach/detach workflow, provider behavior, and safety timeouts.
+
+```yaml
+tmux:
+  enabled: true
+  auto_accept_timeout: 10
+  max_idle_timeout: 300
+  detach_grace: 5
+  terminal_size: [200, 50]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | Boolean | `false` | Run background tasks inside tmux sessions. Requires tmux to be installed |
+| `auto_accept_timeout` | Float | `10.0` | Seconds of quiescence before auto-accepting a tool prompt |
+| `max_idle_timeout` | Float | `300.0` | Seconds of total inactivity before assuming stuck and killing the session |
+| `detach_grace` | Float | `5.0` | Seconds to wait after a human detaches before resuming auto-accept |
+| `terminal_size` | List | `[200, 50]` | Terminal dimensions `[cols, rows]` |
 
 ### Provider-Scoped Configuration
 
@@ -512,6 +547,18 @@ List active workers and startup failures (alias for `ps`).
 ```bash
 gza status
 ```
+
+### attach
+
+Attach to a running task's tmux session. See [Tmux Sessions](tmux.md) for details.
+
+```bash
+gza attach <worker_id_or_task_id>
+```
+
+| Option | Description |
+|--------|-------------|
+| `worker_id_or_task_id` | Worker ID (from `gza ps`) or numeric task ID |
 
 ### ps
 

@@ -238,7 +238,7 @@ class ClaudeConfig:
 @dataclass
 class TmuxConfig:
     """Configuration for running tasks inside tmux sessions."""
-    enabled: bool = True
+    enabled: bool = False
     auto_accept_timeout: float = 10.0   # seconds of quiescence before auto-accept
     max_idle_timeout: float = 300.0     # seconds before assuming stuck (5 min)
     detach_grace: float = 5.0           # seconds after detach before auto-accept resumes
@@ -962,7 +962,7 @@ class Config:
             )
 
         tmux_config = TmuxConfig(
-            enabled=tmux_data.get("enabled", True),
+            enabled=tmux_data.get("enabled", False),
             auto_accept_timeout=auto_accept_timeout,
             max_idle_timeout=max_idle_timeout,
             detach_grace=detach_grace,

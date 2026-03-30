@@ -175,3 +175,51 @@ Use `/gza-plan-review` to evaluate a completed plan task before creating an impl
 **Review documentation for accuracy, completeness, and missing information that users may need.**
 
 Use `/gza-docs-review` to audit documentation before a release or after adding new features. Verifies docs against CLI `--help` output, checks for missing commands, and reviews specs for accuracy. Writes findings to `reviews/<timestamp>-docs-review.md`.
+
+---
+
+## Authoring Skills
+
+### Where Skills Live
+
+The source of truth for all `/gza-*` skills is:
+
+```
+src/gza/skills/<skill-name>/SKILL.md
+```
+
+**Always edit skills in `src/gza/skills/`, never in `.claude/skills/`.** The `.claude/skills/` copies are installed artifacts that get overwritten by `gza skills-install`.
+
+New skills are auto-discovered — adding a directory under `src/gza/skills/` with a `SKILL.md` file is sufficient. No registry to update.
+
+### SKILL.md Frontmatter
+
+```yaml
+---
+name: gza-task-add
+description: Create a well-formed gza task with appropriate type, group, and prompt
+allowed-tools: Read, Bash(uv run gza add:*), AskUserQuestion
+version: 1.0.0
+public: true
+---
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Skill identifier, must match the directory name |
+| `description` | Yes | Short description shown in skill listings |
+| `allowed-tools` | Yes | Comma-separated list of tools the skill may use |
+| `version` | Yes | Semantic version string |
+| `public` | No | `true` to expose via `skills-install`. Defaults to `false` |
+
+### Public vs Private
+
+- **`public: true`** — included when running `gza skills-install`
+- **`public: false` (or omitted)** — internal/developer-only, not installed by default
+
+### Adding a New Skill
+
+1. Create `src/gza/skills/<your-skill-name>/SKILL.md`
+2. Add required frontmatter and skill instructions
+3. Set `public: true` if user-facing
+4. Run `gza skills-install` to install into the project
