@@ -236,6 +236,17 @@ class ClaudeConfig:
 
 
 @dataclass
+class TmuxConfig:
+    """Configuration for running tasks inside tmux sessions."""
+    enabled: bool = True
+    auto_accept_timeout: float = 10.0   # seconds of quiescence before auto-accept
+    max_idle_timeout: float = 300.0     # seconds before assuming stuck (5 min)
+    detach_grace: float = 5.0           # seconds after detach before auto-accept resumes
+    terminal_size: list[int] = field(default_factory=lambda: [200, 50])  # [cols, rows]
+    session_name: str | None = None     # set at runtime by the work command
+
+
+@dataclass
 class BranchStrategy:
     """Configuration for branch naming strategy."""
     pattern: str
@@ -305,6 +316,7 @@ class Config:
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+    tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -501,6 +513,7 @@ class Config:
             "merge_squash_threshold",
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
+            "tmux",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -909,6 +922,53 @@ class Config:
         if review_context_file_limit < 1:
             raise ConfigError("review_context_file_limit must be a positive integer")
 
+        # Parse tmux configuration
+        tmux_data = data.get("tmux") or {}
+        if not isinstance(tmux_data, dict):
+            raise ConfigError("'tmux' must be a dictionary")
+
+        try:
+            auto_accept_timeout = float(tmux_data.get("auto_accept_timeout", 10.0))
+        except (TypeError, ValueError):
+            raise ConfigError("tmux.auto_accept_timeout must be a positive number")
+        if auto_accept_timeout <= 0:
+            raise ConfigError("tmux.auto_accept_timeout must be a positive number")
+
+        try:
+            max_idle_timeout = float(tmux_data.get("max_idle_timeout", 300.0))
+        except (TypeError, ValueError):
+            raise ConfigError("tmux.max_idle_timeout must be a positive number")
+        if max_idle_timeout <= 0:
+            raise ConfigError("tmux.max_idle_timeout must be a positive number")
+
+        try:
+            detach_grace = float(tmux_data.get("detach_grace", 5.0))
+        except (TypeError, ValueError):
+            raise ConfigError("tmux.detach_grace must be a positive number")
+        if detach_grace <= 0:
+            raise ConfigError(
+                "tmux.detach_grace must be a positive number "
+                "(seconds to wait after human detaches before auto-accept resumes)"
+            )
+
+        terminal_size = tmux_data.get("terminal_size", [200, 50])
+        if (
+            not isinstance(terminal_size, list)
+            or len(terminal_size) != 2
+            or not all(isinstance(v, int) and v > 0 for v in terminal_size)
+        ):
+            raise ConfigError(
+                "tmux.terminal_size must be a list of two positive integers [cols, rows]"
+            )
+
+        tmux_config = TmuxConfig(
+            enabled=tmux_data.get("enabled", True),
+            auto_accept_timeout=auto_accept_timeout,
+            max_idle_timeout=max_idle_timeout,
+            detach_grace=detach_grace,
+            terminal_size=terminal_size,
+        )
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -943,6 +1003,7 @@ class Config:
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
+            tmux=tmux_config,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
@@ -996,6 +1057,7 @@ class Config:
             "merge_squash_threshold",
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
+            "tmux",
         }
 
         for key in data.keys():

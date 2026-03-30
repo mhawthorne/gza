@@ -1865,7 +1865,7 @@ def _run_non_code_task(
             git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
 
         # Create report directory structure in worktree
-        worktree_report_dir = worktree_path / report_dir.relative_to(config.project_dir)
+        worktree_report_dir = worktree_path / report_path.parent.relative_to(config.project_dir)
         worktree_report_dir.mkdir(parents=True, exist_ok=True)
         worktree_report_path = worktree_path / report_path.relative_to(config.project_dir)
 
@@ -2037,7 +2037,7 @@ def _run_non_code_task(
 
         console.print(f"Report written to: {report_file_relative}")
         # Ensure target directory exists
-        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         # Copy report content from worktree to project dir
         report_path.write_text(worktree_report_path.read_text())
 

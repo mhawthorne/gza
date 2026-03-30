@@ -1740,3 +1740,102 @@ class TestLearningsCommand:
         learnings_path = tmp_path / ".gza" / "learnings.md"
         assert learnings_path.exists()
         assert "Use dedicated fixtures for tests" in learnings_path.read_text()
+
+
+class TestTmuxConfigValidation:
+    """Tests for tmux config section parsing and validation."""
+
+    def _write_config(self, tmp_path: Path, extra: str) -> None:
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(f"project_name: test\n{extra}")
+
+    def test_config_tmux_invalid_auto_accept_timeout_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError for a non-numeric auto_accept_timeout."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  auto_accept_timeout: bad\n")
+        with pytest.raises(ConfigError, match="auto_accept_timeout"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_invalid_max_idle_timeout_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError for a non-numeric max_idle_timeout."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  max_idle_timeout: bad\n")
+        with pytest.raises(ConfigError, match="max_idle_timeout"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_invalid_detach_grace_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError for a non-numeric detach_grace."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  detach_grace: bad\n")
+        with pytest.raises(ConfigError, match="detach_grace"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_negative_auto_accept_timeout_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError for negative auto_accept_timeout."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  auto_accept_timeout: -1\n")
+        with pytest.raises(ConfigError, match="auto_accept_timeout"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_negative_max_idle_timeout_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError for negative max_idle_timeout."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  max_idle_timeout: -1\n")
+        with pytest.raises(ConfigError, match="max_idle_timeout"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_zero_timeout_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError for zero-valued timeout fields."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  auto_accept_timeout: 0\n")
+        with pytest.raises(ConfigError, match="auto_accept_timeout"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_invalid_terminal_size_string_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError when terminal_size is a string."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  terminal_size: '200x50'\n")
+        with pytest.raises(ConfigError, match="terminal_size"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_invalid_terminal_size_one_element_raises(self, tmp_path: Path):
+        """Config.load raises ConfigError when terminal_size has only one element."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "tmux:\n  terminal_size: [200]\n")
+        with pytest.raises(ConfigError, match="terminal_size"):
+            Config.load(tmp_path)
+
+    def test_config_tmux_valid_defaults_load(self, tmp_path: Path):
+        """Config.load succeeds and returns TmuxConfig defaults when no tmux key present."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.tmux.enabled is True
+        assert config.tmux.auto_accept_timeout == 10.0
+        assert config.tmux.max_idle_timeout == 300.0
+        assert config.tmux.detach_grace == 5.0
+        assert config.tmux.terminal_size == [200, 50]
+
+    def test_config_tmux_custom_values_load(self, tmp_path: Path):
+        """Config.load stores custom tmux values correctly."""
+        from gza.config import Config
+
+        self._write_config(
+            tmp_path,
+            "tmux:\n  enabled: false\n  auto_accept_timeout: 20\n  max_idle_timeout: 600\n  detach_grace: 10\n  terminal_size: [160, 40]\n",
+        )
+        config = Config.load(tmp_path)
+        assert config.tmux.enabled is False
+        assert config.tmux.auto_accept_timeout == 20.0
+        assert config.tmux.max_idle_timeout == 600.0
+        assert config.tmux.detach_grace == 10.0
+        assert config.tmux.terminal_size == [160, 40]

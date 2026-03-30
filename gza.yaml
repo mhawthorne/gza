@@ -8,6 +8,8 @@ branch_strategy: date_slug
 
 max_steps: 100
 
+merge_squash_threshold: 1
+
 provider: claude
 model: claude-sonnet-4-6
 
