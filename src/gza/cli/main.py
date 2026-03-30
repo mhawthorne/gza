@@ -52,6 +52,7 @@ from .git_ops import (
 )
 from .log import cmd_log
 from .query import (
+    cmd_attach,
     cmd_delete,
     cmd_groups,
     cmd_history,
@@ -113,6 +114,19 @@ def main() -> int:
         metavar="N",
         help="Override max_turns setting from gza.yaml for this run",
     )
+    work_parser.add_argument(
+        "--tmux-session",
+        metavar="NAME",
+        help=argparse.SUPPRESS,  # Internal flag: tmux session name when running inside tmux
+    )
+
+    # attach command
+    attach_parser = subparsers.add_parser("attach", help="Attach to a running task's tmux session")
+    attach_parser.add_argument(
+        "worker_id",
+        help="Worker ID (e.g. w-20260301-1) or task ID (numeric) to attach to",
+    )
+    add_common_args(attach_parser)
 
     # next command
     next_parser = subparsers.add_parser("next", help="List upcoming pending tasks")
@@ -1266,7 +1280,9 @@ def main() -> int:
                         prune_terminal_dead_workers(cfg)
                     except Exception as exc:
                         print(f"Warning: Worker prune failed: {exc}", file=sys.stderr)
-        if args.command == "work":
+        if args.command == "attach":
+            return cmd_attach(args)
+        elif args.command == "work":
             return cmd_run(args)
         elif args.command == "next":
             return cmd_next(args)

@@ -1950,6 +1950,7 @@ class TestRunStepPersistenceIntegration:
         config.model = ""
         config.chat_text_display_length = 80
         config.claude = Mock(args=[])
+        config.tmux = Mock(session_name=None)
 
         mock_git = Mock()
         mock_git.default_branch.return_value = "main"
@@ -2032,6 +2033,7 @@ class TestRunStepPersistenceIntegration:
         config.model = ""
         config.chat_text_display_length = 80
         config.claude = Mock(args=[])
+        config.tmux = Mock(session_name=None)
 
         mock_git = Mock()
         mock_git.default_branch.return_value = "main"

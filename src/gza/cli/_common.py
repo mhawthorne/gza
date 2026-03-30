@@ -3,10 +3,12 @@
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import signal
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +23,7 @@ from ..prompts import PromptBuilder
 from ..review_verdict import parse_review_verdict
 from ..review_tasks import DuplicateReviewError, create_review_task
 from ..runner import run
+from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
 
@@ -278,49 +281,123 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print("No pending tasks found")
             return 0
 
-    # Build command for worker subprocess
-    cmd = [
+    assert selected_task is not None
+
+    # Build inner command for the worker subprocess
+    inner_cmd = [
         sys.executable, "-m", "gza",
         "work",
         "--worker-mode",
     ]
 
     if explicit_task_id is not None:
-        cmd.append(str(explicit_task_id))
+        inner_cmd.append(str(explicit_task_id))
 
     if args.no_docker:
-        cmd.append("--no-docker")
+        inner_cmd.append("--no-docker")
 
     if hasattr(args, 'max_turns') and args.max_turns is not None:
-        cmd.extend(["--max-turns", str(args.max_turns)])
+        inner_cmd.extend(["--max-turns", str(args.max_turns)])
 
     # Add project directory
-    cmd.extend(["--project", str(config.project_dir.absolute())])
+    inner_cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    use_tmux = config.tmux.enabled
+    if use_tmux:
+        # Verify tmux binary is present; fall back to bare subprocess if not available
+        if shutil.which("tmux") is None:
+            print(
+                "Warning: tmux not found; falling back to non-tmux execution. "
+                "Install tmux to enable interactive task attachment.",
+                file=sys.stderr,
+            )
+            use_tmux = False
+
+    tmux_session: str | None = None
+
+    if use_tmux:
+        # Use explicit task ID for session name when available; fall back to worker-based name
+        # (worker_id is generated below, so we use a placeholder key derived from the task)
+        session_task_id = explicit_task_id if explicit_task_id is not None else selected_task.id
+        tmux_session = f"gza-{session_task_id}"
+        inner_cmd.extend(["--tmux-session", tmux_session])
 
     # Spawn detached process
     try:
-        # Generate worker ID
         worker_id = registry.generate_worker_id()
-        proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
+
+        startup_log_rel: str | None = None
+        if use_tmux:
+            assert tmux_session is not None
+            cols, rows = config.tmux.terminal_size
+
+            # Write the task prompt to a temporary file so the proxy can deliver
+            # it to Claude via the PTY (simulating typing), avoiding shell argument
+            # size limits and matching the spec's stdin-based delivery design.
+            prompt_file_path: str | None = None
+            if selected_task.prompt:
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        suffix="-gza-prompt.txt",
+                        delete=False,
+                    ) as tf:
+                        tf.write(selected_task.prompt)
+                        prompt_file_path = tf.name
+                except OSError as e:
+                    print(f"Warning: Failed to write prompt to temp file: {e}", file=sys.stderr)
+
+            proxy_cmd = [
+                sys.executable, "-m", "gza.tmux_proxy",
+                "--session", tmux_session,
+                "--auto-accept-timeout", str(config.tmux.auto_accept_timeout),
+                "--max-idle-timeout", str(config.tmux.max_idle_timeout),
+                "--detach-grace", str(config.tmux.detach_grace),
+            ]
+            if prompt_file_path:
+                proxy_cmd.extend(["--prompt-file", prompt_file_path])
+            proxy_cmd.extend(["--", *inner_cmd])
+            # Kill any existing session with this name to avoid "session already exists" error
+            subprocess.run(
+                ["tmux", "kill-session", "-t", tmux_session],
+                stderr=subprocess.DEVNULL,
+            )
+            tmux_cmd = [
+                "tmux", "new-session", "-d",
+                "-s", tmux_session,
+                "-x", str(cols), "-y", str(rows),
+                "--", *proxy_cmd,
+            ]
+            subprocess.run(tmux_cmd, check=True)
+
+            # Get PID of the proxy process from tmux
+            pid = get_tmux_session_pid(tmux_session) or 0
+        else:
+            proc, _startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
+            pid = proc.pid
+            startup_log_rel = _startup_log_rel
 
         # Register worker
-        worker = WorkerMetadata(
+        worker_metadata = WorkerMetadata(
             worker_id=worker_id,
-            task_id=explicit_task_id,
-            pid=proc.pid,
+            task_id=explicit_task_id,  # None when no explicit task; child runner claims the task
+            pid=pid,
             startup_log_file=startup_log_rel,
+            tmux_session=tmux_session,
         )
-        registry.register(worker)
+        registry.register(worker_metadata)
 
-        assert selected_task is not None
-        print(f"Started worker {worker_id} (PID {proc.pid})")
+        print(f"Started worker {worker_id} (PID {pid})")
         print(f"  Task: #{selected_task.id}")
         if selected_task.prompt:
             prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
             print(f"  Prompt: {prompt_display}")
         print()
         print(f"Use 'gza ps' to view running workers")
-        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+        if use_tmux:
+            print(f"Use 'gza attach {worker_id}' to attach to the session")
+        else:
+            print(f"Use 'gza log -w {worker_id} -f' to follow output")
 
         return 0
 
@@ -389,6 +466,11 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
                 f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
             )
             startup_header_written = True
+
+    # Propagate tmux session name to config so the provider can dispatch to
+    # interactive mode when running inside a tmux session.
+    if hasattr(args, "tmux_session") and args.tmux_session:
+        config.tmux.session_name = args.tmux_session
 
     try:
         if startup_log_path:

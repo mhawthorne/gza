@@ -1,9 +1,11 @@
 """CLI commands for querying and displaying task state.
 
-Covers: next, history, unmerged, groups, status, ps, stop, delete, show.
+Covers: next, history, unmerged, groups, status, ps, stop, delete, show, attach.
 """
 
 import argparse
+import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -1485,3 +1487,77 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
 
     return 0
+
+
+# Providers where the human can interact (type messages, approve/deny tools)
+_INTERACTIVE_PROVIDERS = {"claude"}
+# Providers that run headless — attach is observe-only
+_OBSERVE_ONLY_PROVIDERS = {"codex", "gemini"}
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Attach to a running task's tmux session."""
+    config = Config.load(args.project_dir)
+    registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
+
+    target = args.worker_id
+
+    # Try as worker ID first, then as numeric task ID
+    worker = registry.get(target)
+    if worker is None:
+        try:
+            task_id_int = int(target)
+        except ValueError:
+            task_id_int = None
+
+        if task_id_int is not None:
+            for w in registry.list_all(include_completed=False):
+                if w.task_id == task_id_int:
+                    worker = w
+                    break
+
+    if worker is None or worker.status != "running":
+        print(f"No running worker found for: {target}")
+        return 1
+
+    if worker.task_id is None:
+        print(f"Worker {worker.worker_id} has no associated task ID")
+        return 1
+
+    session_name = worker.tmux_session or f"gza-{worker.task_id}"
+
+    # Verify the tmux session exists
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", session_name],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        print(f"No tmux session found: {session_name}")
+        print("This task may have been started without tmux support.")
+        return 1
+
+    # Determine provider to decide attach mode
+    task = store.get(worker.task_id)
+    provider_name = "claude"
+    if task is not None:
+        provider_name = (task.provider or config.provider or "claude").lower()
+
+    if provider_name in _OBSERVE_ONLY_PROVIDERS:
+        print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
+        print(
+            f"Note: {provider_name.title()} runs in headless mode. You can observe"
+        )
+        print("output but cannot interact. Use Ctrl-B D to detach.")
+        print(
+            f"To intervene, stop this task (gza stop {worker.task_id}) and re-run with Claude."
+        )
+        print()
+        os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])
+    else:
+        print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
+        print("You have full interactive control. Ctrl-B D to detach.")
+        print()
+        os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
+
+    return 0  # unreachable after execvp but satisfies the return type

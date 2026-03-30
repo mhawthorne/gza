@@ -285,6 +285,11 @@ class ClaudeProvider(Provider):
         on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
+        # When running inside a tmux session, use interactive mode so the proxy
+        # can auto-accept tool prompts and users can attach.
+        if getattr(config.tmux, "session_name", None):
+            return self._run_direct_tmux(config, prompt, log_file, work_dir)
+
         cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
         cmd.extend(self._build_claude_args(config, resume_session_id))
 
@@ -294,6 +299,67 @@ class ClaudeProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
         )
+
+    def _run_direct_tmux(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+    ) -> RunResult:
+        """Run Claude in interactive mode for tmux sessions.
+
+        The initial task prompt is delivered by the TmuxProxy via the PTY master
+        fd (simulating typing), so Claude does not receive it as a positional
+        argument.  Raw terminal output is captured to ``log_file`` via
+        ``tmux pipe-pane``; structured proxy events go to a separate
+        ``*-proxy.log`` file so existing log parsers see clean output.
+        """
+        import json as _json
+        import shlex as _shlex
+
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Proxy structured events (JSONL) go to a separate file so they do not
+        # mix with the raw terminal output captured in the main log file.
+        proxy_log_file = log_file.parent / f"{log_file.stem}-proxy.log"
+
+        with open(proxy_log_file, "a") as f:
+            f.write(_json.dumps({
+                "type": "gza",
+                "subtype": "tmux_start",
+                "message": "Started in tmux interactive mode",
+                "session": config.tmux.session_name,
+            }) + "\n")
+
+        # Capture raw terminal output from the tmux pane to the main log file.
+        # This mirrors the output that humans see when they attach, and is what
+        # ``gza log -f`` reads in tmux mode.
+        if config.tmux.session_name:
+            subprocess.run(
+                [
+                    "tmux", "pipe-pane", "-t", config.tmux.session_name,
+                    f"cat >> {_shlex.quote(str(log_file))}",
+                ],
+                check=False,
+            )
+
+        # Run Claude in interactive mode — the proxy delivers the prompt via the
+        # PTY so we do not pass it as a positional argument here.
+        cmd = ["claude", "--max-turns", str(config.max_steps)]
+        cmd.extend(config.claude.args)
+
+        # Run with inherited stdin/stdout/stderr (connected to the PTY via the proxy)
+        result = subprocess.run(cmd, cwd=work_dir)
+
+        with open(proxy_log_file, "a") as f:
+            f.write(_json.dumps({
+                "type": "gza",
+                "subtype": "tmux_end",
+                "exit_code": result.returncode,
+            }) + "\n")
+
+        return RunResult(exit_code=result.returncode)
 
     def _run_with_output_parsing(
         self,

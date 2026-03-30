@@ -870,6 +870,7 @@ class TestWorkCommandMultiTask:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         config = Config.load(tmp_path)
+        config.tmux.enabled = False  # Test bare Popen path, not tmux
         args = argparse.Namespace(no_docker=True, max_turns=None)
 
         with patch("gza.cli.subprocess.Popen") as mock_popen:
@@ -1017,6 +1018,7 @@ class TestBackgroundWorkerCommand:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         config = Config.load(tmp_path)
+        config.tmux.enabled = False  # Test bare Popen path, not tmux
 
         # Create args namespace matching what argparse produces
         args = argparse.Namespace(
@@ -1072,6 +1074,7 @@ class TestBackgroundWorkerCommand:
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
         config = Config.load(tmp_path)
+        config.tmux.enabled = False  # Test bare Popen path, not tmux
 
         args = argparse.Namespace(
             no_docker=True,
@@ -1183,6 +1186,7 @@ class TestBackgroundWorkerCommand:
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
         config = Config.load(tmp_path)
+        config.tmux.enabled = False  # Test bare Popen path, not tmux
 
         args = argparse.Namespace(
             no_docker=True,

@@ -108,6 +108,30 @@ Gza is configured via `gza.yaml` in the project root. Key fields:
 | `max_review_cycles` | int | `3` | Maximum number of review/improve cycles before `gza advance` stops and flags a task for human intervention. Overridable per-run with `--max-review-cycles N`. |
 | `merge_squash_threshold` | int | `0` | When > 0, `gza advance` squash-merges branches with this many commits or more. `0` disables auto-squash (default). `1` = always squash. Overridable per-run with `--squash-threshold N`. |
 
+### Tmux Configuration
+
+Tasks can run inside tmux sessions so you can attach interactively with `gza attach`. Configure under the `tmux:` key in `gza.yaml`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tmux.enabled` | bool | `true` | Run tasks inside tmux sessions. Set `false` to disable tmux (e.g. in CI or environments where tmux is unavailable). |
+| `tmux.auto_accept_timeout` | float | `10.0` | Seconds of quiescence (no new output) before the proxy auto-sends Enter to accept a tool prompt. Must be > 0. |
+| `tmux.max_idle_timeout` | float | `300.0` | Seconds of quiescence before the proxy assumes the session is stuck, sends Ctrl-C + EOF, and exits. Must be > 0. |
+| `tmux.detach_grace` | float | `5.0` | Seconds to wait after a human detaches before auto-accept resumes. Gives users time to reattach after an accidental detach. Must be > 0. |
+| `tmux.terminal_size` | list[int] | `[200, 50]` | Terminal dimensions `[cols, rows]` for the tmux session. Both values must be positive integers. |
+
+Example:
+```yaml
+tmux:
+  enabled: true
+  auto_accept_timeout: 10
+  max_idle_timeout: 300
+  detach_grace: 5
+  terminal_size: [200, 50]
+```
+
+Use `gza attach <worker-id>` or `gza attach <task-id>` to connect to a running task's tmux session.
+
 ### LLM-Powered Learnings Summarization
 
 After each completed task (on interval), gza can automatically update `.gza/learnings.md` by running an LLM to consolidate patterns from recent completed tasks.
