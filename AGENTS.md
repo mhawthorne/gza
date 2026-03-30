@@ -76,6 +76,7 @@ Available skills:
 - `gza-task-info`: Gather comprehensive info about specific gza tasks including status, branch, commits, and logs
 - `gza-task-debug`: Diagnose why a gza task failed — analyzes logs, detects loops, checks diffs, compares baselines, and suggests fixes
 - `gza-task-run`: Run a gza task inline in the current conversation, using the same prompt as background execution
+- `gza-task-improve`: Address review comments for a task inline — reads the most recent review, fixes must-fix items, runs verify, and commits
 - `gza-rebase`: Rebase current branch on main, with interactive conflict resolution
 
 The skills are installed to `.claude/skills/` in your project directory.
