@@ -418,40 +418,14 @@ class CodexProvider(Provider):
                         if isinstance(counters, dict):
                             counters.setdefault(legacy_turn_id, 0)
 
-                    # Calculate runtime
-                    elapsed_seconds = int(time.time() - data["start_time"])
-                    total_tokens = data.get("input_tokens", 0) + data.get("output_tokens", 0)
-
-                    # Calculate estimated cost
-                    cost = calculate_cost(
-                        data.get("input_tokens", 0),
-                        data.get("output_tokens", 0),
-                        model,
-                    )
-
-                    # Log timestamp to log file at start of each step
-                    if log_handle:
-                        from datetime import datetime
-                        timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                        log_handle.write(f"--- Step {data['turn_count']} at {timestamp_str} ---\n")
-                        log_handle.flush()
-
-                    formatter.print_step_header(
-                        data["turn_count"],
-                        total_tokens,
-                        cost,
-                        elapsed_seconds,
-                        blank_line_before=data["turn_count"] > 1,
-                    )
+                    # Step headers are now printed when agent_message items
+                    # arrive, so each model response is a logical step (like claude).
 
                 elif event_type == "item.completed":
                     item = event.get("item", {})
                     item_type = item.get("type")
                     data["item_count"] = data.get("item_count", 0) + 1
                     data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
-                    turn_count = data.get("turn_count", 0)
-                    item_idx = data.get("item_count_in_turn", 0)
-                    item_prefix = f"[S{turn_count}.{item_idx}] " if turn_count > 0 else ""
 
                     if item_type == "command_execution":
                         command = item.get("command", "")
@@ -530,37 +504,54 @@ class CodexProvider(Provider):
                             )
                         # Truncate to 80 chars
                         command = truncate_text(command, 80)
-                        formatter.print_tool_event("Bash", command, prefix=f"  {item_prefix}")
+                        formatter.print_tool_event("Bash", command, prefix="  ")
 
                     elif item_type == "agent_message":
                         data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
                         raw_text = item.get("text", "")
                         data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(raw_text)
+
+                        # Treat each agent_message as a new logical step
+                        # (like claude does with each unique msg_id)
+                        data["computed_step_count"] = data.get("computed_step_count", 0) + 1
+                        step_num = data["computed_step_count"]
+
+                        elapsed_seconds = int(time.time() - data.get("start_time", time.time()))
+                        total_tokens = data.get("input_tokens", 0) + data.get("output_tokens", 0)
+                        cost = calculate_cost(
+                            data.get("input_tokens", 0),
+                            data.get("output_tokens", 0),
+                            model,
+                        )
+
+                        if log_handle:
+                            from datetime import datetime
+                            timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                            log_handle.write(f"--- Step {step_num} at {timestamp_str} ---\n")
+                            log_handle.flush()
+
+                        formatter.print_step_header(
+                            step_num,
+                            total_tokens,
+                            cost,
+                            elapsed_seconds,
+                            blank_line_before=step_num > 1,
+                        )
+
                         legacy_turn_id = _current_turn_id(data)
-                        current_step = data.get("_current_step_event")
-                        if (
-                            current_step is not None
-                            and current_step.get("legacy_turn_id") == legacy_turn_id
-                            and not current_step.get("message_text")
-                        ):
-                            current_step["message_text"] = raw_text.strip() or None
-                            current_step["summary"] = None
-                            if current_step.get("legacy_event_id") is None:
-                                current_step["legacy_event_id"] = _allocate_legacy_event_id(data, legacy_turn_id)
-                        else:
-                            _start_step(
-                                data,
-                                raw_text.strip() or None,
-                                legacy_turn_id,
-                                legacy_event_id=_allocate_legacy_event_id(data, legacy_turn_id),
-                            )
-                            _maybe_mark_max_steps_exceeded(data)
-                        text = item.get("text", "").strip()
+                        _start_step(
+                            data,
+                            raw_text.strip() or None,
+                            legacy_turn_id,
+                            legacy_event_id=_allocate_legacy_event_id(data, legacy_turn_id),
+                        )
+                        _maybe_mark_max_steps_exceeded(data)
+
+                        text = raw_text.strip()
                         if text:
-                            # Truncate to first line and 80 chars
                             first_line = text.split("\n")[0]
                             formatter.print_agent_message(
-                                truncate_text(first_line, 80), prefix=f"  {item_prefix}"
+                                truncate_text(first_line, 80), prefix="  "
                             )
 
                     elif item_type == "reasoning":

@@ -2300,6 +2300,7 @@ class TestCodexStepTimestampLogging:
 
         json_lines = [
             json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "hello"}}) + "\n",
         ]
 
         with patch("gza.providers.base.subprocess.Popen") as mock_popen:
@@ -2329,6 +2330,7 @@ class TestCodexStepTimestampLogging:
 
         json_lines = [
             json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "hello"}}) + "\n",
         ]
 
         with patch("gza.providers.base.subprocess.Popen") as mock_popen:
@@ -3229,8 +3231,8 @@ class TestCodexOutputParsing:
         assert result.num_turns_computed == 2
         assert result.num_steps_computed == 2
 
-    def test_logs_item_prefix_with_step_and_item_index(self, tmp_path, capsys):
-        """Should include step/item index prefix for item.completed output."""
+    def test_logs_tool_call_under_agent_message_step(self, tmp_path, capsys):
+        """Tool calls should appear under the preceding agent_message step."""
         import json
         from gza.providers.codex import CodexProvider
 
@@ -3239,6 +3241,10 @@ class TestCodexOutputParsing:
 
         json_lines = [
             json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Let me check"},
+            }) + "\n",
             json.dumps({
                 "type": "item.completed",
                 "item": {"type": "command_execution", "command": "ls -la"},
@@ -3259,8 +3265,10 @@ class TestCodexOutputParsing:
             )
 
         captured = capsys.readouterr()
-        assert "[S1.1]" in captured.out
+        assert "Step 1" in captured.out
         assert "→ Bash ls -la" in captured.out
+        # No [S1.1] prefix — tool calls are substeps of the logical step
+        assert "[S" not in captured.out
 
     def test_does_not_print_startup_non_json_line_twice(self, tmp_path, capsys):
         """Startup line should be shown once, not duplicated by parser fallback."""
@@ -3354,13 +3362,18 @@ class TestCodexOutputParsing:
             )
 
         run_steps = result._accumulated_data["run_step_events"]
-        assert len(run_steps) == 2
+        # Each agent_message creates a logical step; tool calls before a
+        # message get their own "Pre-message tool activity" step.
+        assert len(run_steps) == 3
         assert run_steps[0]["message_text"] == "first"
         assert run_steps[0]["substeps"] == []
-        assert run_steps[1]["message_text"] == "second"
-        assert run_steps[1]["legacy_turn_id"] == "T2"
+        # Pre-message tool activity step
+        assert run_steps[1]["summary"] == "Pre-message tool activity"
         assert len(run_steps[1]["substeps"]) == 1
         assert run_steps[1]["substeps"][0]["payload"]["command"] == "echo before"
+        # Second agent message step
+        assert run_steps[2]["message_text"] == "second"
+        assert run_steps[2]["legacy_turn_id"] == "T2"
 
     def test_maps_command_execution_to_tool_call_and_output(self, tmp_path):
         """Codex command_execution should emit lifecycle substeps and deterministic legacy IDs."""
@@ -3401,11 +3414,11 @@ class TestCodexOutputParsing:
             )
 
         run_steps = result._accumulated_data["run_step_events"]
-        assert len(run_steps) == 1
-        assert run_steps[0]["message_text"] == "done"
-        assert run_steps[0]["legacy_event_id"] == "T1.1"
+        # Pre-message tool activity step + agent_message step
+        assert len(run_steps) == 2
+        assert run_steps[0]["summary"] == "Pre-message tool activity"
         assert [s["type"] for s in run_steps[0]["substeps"]] == ["tool_call", "tool_output"]
-        assert [s["legacy_event_id"] for s in run_steps[0]["substeps"]] == ["T1.2", "T1.3"]
+        assert run_steps[1]["message_text"] == "done"
 
     def test_uses_shared_formatter_for_turn_tool_message_and_error(self, tmp_path):
         """Codex parser should route key output lines through shared formatter."""
@@ -4162,3 +4175,607 @@ class TestOnStepCountCallback:
             )
 
         assert counts == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Full-conversation simulation tests
+# ---------------------------------------------------------------------------
+# These tests feed a realistic multi-step event stream through each provider's
+# parser and verify step boundaries, substep structure, display output, and
+# step counts match expectations.
+
+
+class TestClaudeFullConversationSimulation:
+    """Simulate a realistic multi-step Claude conversation end-to-end."""
+
+    def _build_json_lines(self):
+        """3-step conversation: text → tool+text → multi-tool+text → result."""
+        return [
+            # Step 1: plain text response
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_001",
+                    "usage": {"input_tokens": 200, "output_tokens": 40,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                    "content": [
+                        {"type": "text", "text": "I'll examine the project structure first."},
+                    ],
+                },
+            }) + "\n",
+            # Step 2: tool call + result + text
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_002",
+                    "usage": {"input_tokens": 350, "output_tokens": 80,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 100},
+                    "content": [
+                        {"type": "tool_use", "id": "call_glob", "name": "Glob",
+                         "input": {"pattern": "**/*.py"}},
+                        {"type": "tool_result", "tool_use_id": "call_glob",
+                         "content": "src/main.py\nsrc/utils.py\ntests/test_main.py", "is_error": False},
+                        {"type": "text", "text": "Found 3 Python files. Let me read the main module."},
+                    ],
+                },
+            }) + "\n",
+            # Step 3: multiple tools, a retry, error, then success
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_003",
+                    "usage": {"input_tokens": 500, "output_tokens": 120,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 50},
+                    "content": [
+                        {"type": "tool_use", "id": "call_read", "name": "Read",
+                         "input": {"file_path": "/project/src/main.py"}},
+                        {"type": "tool_result", "tool_use_id": "call_read",
+                         "content": "def main(): pass", "is_error": False},
+                        {"type": "tool_use", "id": "call_bash1", "name": "Bash",
+                         "input": {"command": "python -m pytest tests/ -v"}},
+                        {"type": "tool_result", "tool_use_id": "call_bash1",
+                         "content": "Permission denied", "is_error": True},
+                        {"type": "tool_retry", "id": "call_bash2",
+                         "retry_of_call_id": "call_bash1"},
+                        {"type": "tool_use", "id": "call_bash2", "name": "Bash",
+                         "input": {"command": "python -m pytest tests/ -v"}},
+                        {"type": "tool_result", "tool_use_id": "call_bash2",
+                         "content": "3 passed", "is_error": False},
+                        {"type": "text", "text": "All tests pass after retry."},
+                    ],
+                },
+            }) + "\n",
+            # Final result
+            json.dumps({
+                "type": "result", "subtype": "success",
+                "num_turns": 3, "total_cost_usd": 0.05,
+                "session_id": "ses_test123",
+            }) + "\n",
+        ]
+
+    def test_step_count_and_boundaries(self, tmp_path):
+        """Each unique msg_id should create exactly one step."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+        assert len(steps) == 3
+        assert result.num_steps_computed == 3
+        assert result.num_turns_reported == 3
+
+    def test_substep_types_per_step(self, tmp_path):
+        """Verify substep types match expected tool lifecycle per step."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+
+        # Step 1: text only → no substeps
+        assert steps[0]["substeps"] == []
+        assert steps[0]["message_text"] == "I'll examine the project structure first."
+
+        # Step 2: tool_call + tool_output
+        assert [s["type"] for s in steps[1]["substeps"]] == ["tool_call", "tool_output"]
+        assert steps[1]["message_text"] == "Found 3 Python files. Let me read the main module."
+
+        # Step 3: read + result, bash + error, retry + bash + result
+        assert [s["type"] for s in steps[2]["substeps"]] == [
+            "tool_call", "tool_output",      # Read
+            "tool_call", "tool_error",        # Bash (failed)
+            "tool_retry", "tool_call", "tool_output",  # Bash retry (success)
+        ]
+        assert steps[2]["message_text"] == "All tests pass after retry."
+
+    def test_display_output_has_step_headers(self, tmp_path, capsys):
+        """Live output should contain Step 1/2/3 headers."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Step 1" in out
+        assert "Step 2" in out
+        assert "Step 3" in out
+        assert "→ Glob" in out
+        assert "→ Read" in out
+        assert "→ Bash" in out
+
+    def test_step_count_callback(self, tmp_path):
+        """on_step_count should fire for each new step."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_step_count=counts.append,
+            )
+
+        assert counts == [1, 2, 3]
+
+    def test_log_file_has_step_timestamps(self, tmp_path):
+        """Log file should contain step timestamp markers."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        matches = re.findall(pattern, log_content)
+        assert len(matches) == 3
+
+
+class TestCodexFullConversationSimulation:
+    """Simulate a realistic multi-step Codex conversation end-to-end."""
+
+    def _build_json_lines(self):
+        """3-step conversation across 2 API turns."""
+        return [
+            # API turn 1
+            json.dumps({"type": "thread.started", "thread_id": "thread_abc"}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            # Step 1: agent thinks, then runs a tool
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message",
+                "text": "I'll examine the project structure first.",
+            }}) + "\n",
+            json.dumps({"type": "item.completed", "item": {
+                "id": "cmd_1",
+                "type": "command_execution",
+                "command": "find . -name '*.py' -type f",
+                "aggregated_output": "./main.py\n./utils.py\n./tests/test_main.py",
+                "exit_code": 0,
+            }}) + "\n",
+            # Step 2: agent responds with findings, runs another tool
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message",
+                "text": "Found 3 Python files. Let me read the main module.",
+            }}) + "\n",
+            json.dumps({"type": "item.completed", "item": {
+                "id": "cmd_2",
+                "type": "command_execution",
+                "command": "cat main.py",
+                "aggregated_output": "def main(): pass",
+                "exit_code": 0,
+            }}) + "\n",
+            json.dumps({"type": "turn.completed", "usage": {
+                "input_tokens": 500, "output_tokens": 120, "cached_input_tokens": 50,
+            }}) + "\n",
+            # API turn 2
+            json.dumps({"type": "turn.started"}) + "\n",
+            # Step 3: agent runs tests and reports
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message",
+                "text": "Now I'll run the test suite.",
+            }}) + "\n",
+            json.dumps({"type": "item.completed", "item": {
+                "id": "cmd_3",
+                "type": "command_execution",
+                "command": "python -m pytest tests/ -v",
+                "aggregated_output": "3 passed",
+                "exit_code": 0,
+            }}) + "\n",
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message",
+                "text": "All 3 tests pass. The codebase looks healthy.",
+            }}) + "\n",
+            json.dumps({"type": "turn.completed", "usage": {
+                "input_tokens": 800, "output_tokens": 200, "cached_input_tokens": 100,
+            }}) + "\n",
+        ]
+
+    def test_step_count_and_boundaries(self, tmp_path):
+        """Each agent_message should create a separate logical step."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+        # 4 agent_messages = 4 logical steps
+        assert len(steps) == 4
+        assert steps[0]["message_text"] == "I'll examine the project structure first."
+        assert steps[1]["message_text"] == "Found 3 Python files. Let me read the main module."
+        assert steps[2]["message_text"] == "Now I'll run the test suite."
+        assert steps[3]["message_text"] == "All 3 tests pass. The codebase looks healthy."
+
+    def test_substep_types_per_step(self, tmp_path):
+        """Tool calls should attach as substeps to the preceding agent_message step."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+
+        # Step 1: agent_message + find command
+        assert [s["type"] for s in steps[0]["substeps"]] == ["tool_call", "tool_output"]
+        assert steps[0]["substeps"][0]["payload"]["command"] == "find . -name '*.py' -type f"
+
+        # Step 2: agent_message + cat command
+        assert [s["type"] for s in steps[1]["substeps"]] == ["tool_call", "tool_output"]
+        assert steps[1]["substeps"][0]["payload"]["command"] == "cat main.py"
+
+        # Step 3: agent_message + pytest command
+        assert [s["type"] for s in steps[2]["substeps"]] == ["tool_call", "tool_output"]
+        assert steps[2]["substeps"][0]["payload"]["command"] == "python -m pytest tests/ -v"
+
+        # Step 4: final agent_message, no tools
+        assert steps[3]["substeps"] == []
+
+    def test_display_output_has_step_headers(self, tmp_path, capsys):
+        """Live output should contain per-step headers, not per-turn."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Step 1" in out
+        assert "Step 2" in out
+        assert "Step 3" in out
+        assert "Step 4" in out
+        # No old-style [S1.x] prefixes
+        assert "[S" not in out
+        # Tool calls present
+        assert "→ Bash" in out
+
+    def test_step_count_callback(self, tmp_path):
+        """on_step_count should fire for each logical step."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+                on_step_count=counts.append,
+            )
+
+        # 4 agent_messages = 4 step_count callbacks
+        assert len(counts) == 4
+
+    def test_log_file_has_step_timestamps(self, tmp_path):
+        """Log file should contain step timestamp markers for each agent_message."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        log_content = log_file.read_text()
+        pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        matches = re.findall(pattern, log_content)
+        assert len(matches) == 4
+
+    def test_session_id_captured(self, tmp_path):
+        """thread_id should be captured as session ID."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.session_id == "thread_abc"
+
+
+class TestGeminiFullConversationSimulation:
+    """Simulate a realistic multi-step Gemini conversation end-to-end."""
+
+    def _build_json_lines(self):
+        """3-step conversation: text+tool → text+tool → text+tool(retry) → text → result."""
+        return [
+            # Step 1: assistant message + tool call
+            json.dumps({"type": "message", "role": "assistant",
+                         "content": "I'll find all Python files first."}) + "\n",
+            json.dumps({"type": "tool_use", "id": "call_1", "tool_name": "Bash",
+                         "tool_input": {"command": "find . -name '*.py'"}}) + "\n",
+            json.dumps({"type": "tool_output", "call_id": "call_1",
+                         "output": "./main.py\n./utils.py\n./tests/test_main.py"}) + "\n",
+            # Step 2: user turn resets, then assistant + tool
+            json.dumps({"type": "message", "role": "user",
+                         "content": "Now read main.py"}) + "\n",
+            json.dumps({"type": "message", "role": "assistant",
+                         "content": "Let me read main.py for you."}) + "\n",
+            json.dumps({"type": "tool_use", "id": "call_2", "tool_name": "Read",
+                         "tool_input": {"file_path": "/project/main.py"}}) + "\n",
+            json.dumps({"type": "tool_output", "call_id": "call_2",
+                         "output": "def main(): pass"}) + "\n",
+            # Step 3: user turn resets, assistant + tool + error + retry
+            json.dumps({"type": "message", "role": "user",
+                         "content": "Run the tests"}) + "\n",
+            json.dumps({"type": "message", "role": "assistant",
+                         "content": "Running the test suite now."}) + "\n",
+            json.dumps({"type": "tool_use", "id": "call_3", "tool_name": "Bash",
+                         "tool_input": {"command": "pytest tests/ -v"}}) + "\n",
+            json.dumps({"type": "tool_error", "call_id": "call_3",
+                         "error": "Permission denied"}) + "\n",
+            json.dumps({"type": "tool_retry", "call_id": "call_4",
+                         "retry_of_call_id": "call_3"}) + "\n",
+            json.dumps({"type": "tool_use", "id": "call_4", "tool_name": "Bash",
+                         "tool_input": {"command": "python -m pytest tests/ -v"}}) + "\n",
+            json.dumps({"type": "tool_output", "call_id": "call_4",
+                         "output": "3 passed"}) + "\n",
+            # Step 4: final summary (no tools)
+            json.dumps({"type": "message", "role": "assistant",
+                         "content": "All 3 tests pass after retry."}) + "\n",
+            # Result
+            json.dumps({"type": "result", "stats": {
+                "input_tokens": 800, "output_tokens": 200,
+            }}) + "\n",
+        ]
+
+    def test_step_count_and_boundaries(self, tmp_path):
+        """Each assistant message should create a separate step."""
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+        assert len(steps) == 4
+        assert steps[0]["message_text"] == "I'll find all Python files first."
+        assert steps[1]["message_text"] == "Let me read main.py for you."
+        assert steps[2]["message_text"] == "Running the test suite now."
+        assert steps[3]["message_text"] == "All 3 tests pass after retry."
+
+    def test_substep_types_per_step(self, tmp_path):
+        """Tool calls should attach as substeps to the correct step."""
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+
+        # Step 1: find command
+        assert [s["type"] for s in steps[0]["substeps"]] == ["tool_call", "tool_output"]
+
+        # Step 2: read command
+        assert [s["type"] for s in steps[1]["substeps"]] == ["tool_call", "tool_output"]
+
+        # Step 3: bash error + retry + success
+        assert [s["type"] for s in steps[2]["substeps"]] == [
+            "tool_call", "tool_error", "tool_retry", "tool_call", "tool_output",
+        ]
+
+        # Step 4: final text, no tools
+        assert steps[3]["substeps"] == []
+
+    def test_display_output_has_step_headers(self, tmp_path, capsys):
+        """Live output should contain Step 1-4 headers."""
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        out = capsys.readouterr().out
+        assert "Step 1" in out
+        assert "Step 2" in out
+        assert "Step 3" in out
+        assert "Step 4" in out
+        assert "→ Bash" in out
+        assert "→ Read" in out
+
+    def test_step_count_callback(self, tmp_path):
+        """on_step_count should fire for each new step."""
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+        counts: list[int] = []
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+                on_step_count=counts.append,
+            )
+
+        assert len(counts) == 4
+
+    def test_log_file_has_step_timestamps(self, tmp_path):
+        """Log file should contain step timestamp markers."""
+        provider = GeminiProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(self._build_json_lines())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["gemini", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+                model="gemini-2.5-flash",
+            )
+
+        log_content = log_file.read_text()
+        pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        matches = re.findall(pattern, log_content)
+        assert len(matches) == 4

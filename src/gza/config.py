@@ -102,6 +102,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "fetch_auth_token_from_keychain": None,
         "args": None,
     },
+    "tmux": {
+        "enabled": None,
+    },
     "chat_text_display_length": None,
     "verify_command": None,
     "max_resume_attempts": None,
