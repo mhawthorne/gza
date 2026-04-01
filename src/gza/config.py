@@ -104,6 +104,10 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     },
     "tmux": {
         "enabled": None,
+        "auto_accept_timeout": None,
+        "max_idle_timeout": None,
+        "detach_grace": None,
+        "terminal_size": None,
     },
     "chat_text_display_length": None,
     "verify_command": None,

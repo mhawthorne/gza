@@ -1292,6 +1292,24 @@ def cmd_show(args: argparse.Namespace) -> int:
     if getattr(args, "prompt", False):
         return _show_built_prompt(task, config, store)
 
+    # --path: print only the report file path and exit
+    if getattr(args, "path", False):
+        if task.report_file:
+            report_path = config.project_dir / task.report_file
+            print(report_path)
+            return 0
+        console.print(f"[red]Error: Task #{args.task_id} has no report file[/red]")
+        return 1
+
+    # --output: print only the raw output content and exit
+    if getattr(args, "output", False):
+        output = _get_task_output(task, config.project_dir)
+        if output:
+            print(output)
+            return 0
+        console.print(f"[red]Error: Task #{args.task_id} has no output content[/red]")
+        return 1
+
     SHOW_COLORS = {
         "heading": "bold cyan",
         "section": "dim",
