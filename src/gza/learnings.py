@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .config import DEFAULT_LEARNINGS_INTERVAL, DEFAULT_LEARNINGS_WINDOW
 from .console import console
 from .db import SqliteTaskStore, Task
 
@@ -18,8 +19,7 @@ if TYPE_CHECKING:
     from .config import Config
 
 
-DEFAULT_LEARNINGS_WINDOW = 25
-AUTO_LEARNINGS_INTERVAL = 5
+AUTO_LEARNINGS_INTERVAL = DEFAULT_LEARNINGS_INTERVAL
 LEARNINGS_HISTORY_FILE = "learnings_history.jsonl"
 
 
@@ -58,14 +58,6 @@ def _extract_learnings_from_output(output: str) -> list[str]:
 
     return learnings
 
-
-def _fallback_learning(task: Task) -> str:
-    """Generate a fallback learning from task prompt when no bullets exist."""
-    first_line = task.prompt.splitlines()[0].strip()
-    first_line = _normalize_learning(first_line)
-    if len(first_line) > 120:
-        first_line = first_line[:117].rstrip() + "..."
-    return f"Reuse patterns from: {first_line}"
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -328,11 +320,9 @@ def maybe_auto_regenerate_learnings(
 ) -> LearningsResult | None:
     """Regenerate learnings on periodic completed-task intervals."""
     if interval is None:
-        val = getattr(config, "learnings_interval", AUTO_LEARNINGS_INTERVAL)
-        interval = int(val) if isinstance(val, int) else AUTO_LEARNINGS_INTERVAL
+        interval = config.learnings_interval
     if window is None:
-        val = getattr(config, "learnings_window", DEFAULT_LEARNINGS_WINDOW)
-        window = int(val) if isinstance(val, int) else DEFAULT_LEARNINGS_WINDOW
+        window = config.learnings_window
     if interval <= 0:
         return None
 

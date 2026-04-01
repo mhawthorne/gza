@@ -525,6 +525,7 @@ class Config:
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
             "tmux",
+            "learnings_window", "learnings_interval",
         }
         for key in data.keys():
             if key not in valid_fields:

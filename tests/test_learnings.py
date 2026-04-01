@@ -479,3 +479,17 @@ def test_maybe_auto_regenerate_uses_config_interval_and_window(tmp_path: Path):
 
     mock_spawn.assert_called_once_with(config, 20)
     assert result is None
+
+
+def test_learnings_config_fields_no_unknown_warning(tmp_path: Path, capsys):
+    """learnings_window and learnings_interval must not produce unknown-field warnings."""
+    config_file = tmp_path / "gza.yaml"
+    config_file.write_text(
+        "project_name: test\nlearnings_window: 30\nlearnings_interval: 10\n"
+    )
+    config = Config.load(tmp_path)
+    captured = capsys.readouterr()
+    assert "learnings_window" not in captured.err
+    assert "learnings_interval" not in captured.err
+    assert config.learnings_window == 30
+    assert config.learnings_interval == 10
