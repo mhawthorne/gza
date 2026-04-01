@@ -1326,7 +1326,7 @@ def _cmd_advance_unimplemented(
 
 # Maps advance action types to their execution priority (lower = runs first).
 # 'merge' actions are fast and synchronous; running them first ensures freshly
-# merged code is on the default branch before any review/improve workers are
+# merged code is on the current branch before any review/improve workers are
 # spawned, reducing rebase conflicts for those workers.
 _ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
 
