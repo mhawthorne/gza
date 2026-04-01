@@ -188,6 +188,7 @@ DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
 REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 4
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
+COMMIT_SUBJECT_MAX_CHARS = 72
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
@@ -422,6 +423,37 @@ def _compact_output_summary(content: str, max_chars: int = REVIEW_IMPROVE_SUMMAR
     if len(compact) > max_chars:
         return compact[: max_chars - 3].rstrip() + "..."
     return compact
+
+
+def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
+    """Truncate text on word boundaries, adding ellipsis when shortened."""
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_chars:
+        return compact
+
+    cutoff = max_chars - 3
+    if cutoff <= 0:
+        return "." * max_chars
+
+    candidate = compact[:cutoff].rstrip()
+    split = candidate.rfind(" ")
+    if split > 0:
+        candidate = candidate[:split].rstrip()
+    if not candidate:
+        candidate = compact[:cutoff].rstrip()
+    return f"{candidate}..."
+
+
+def _build_code_task_commit_subject(task_prompt: str, worktree_summary_path: Path) -> str:
+    """Build commit subject from worktree summary, with prompt fallback."""
+    if worktree_summary_path.exists():
+        summary_content = worktree_summary_path.read_text().strip()
+        if summary_content:
+            compact_summary = _compact_output_summary(summary_content, max_chars=COMMIT_SUBJECT_MAX_CHARS)
+            if compact_summary:
+                return compact_summary
+
+    return _truncate_to_word_boundary(task_prompt, max_chars=COMMIT_SUBJECT_MAX_CHARS)
 
 
 def _is_improve_in_impl_chain(improve_task: Task, impl_task: Task, tasks_by_id: dict[int, Task]) -> bool:
@@ -1478,13 +1510,14 @@ def _complete_code_task(
                 if review_task and review_task.task_type == "review":
                     review_task_id = review_task.id
 
+            commit_subject = _build_code_task_commit_subject(task.prompt, worktree_summary_path)
+
             commit_message = build_task_commit_message(
-                task.prompt,
+                commit_subject,
                 task_id=task.id,
                 task_slug=task.task_id,
                 review_task_id=review_task_id,
             )
-
             worktree_git.commit(commit_message)
 
     # Copy summary file from worktree to main project directory
