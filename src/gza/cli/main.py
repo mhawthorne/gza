@@ -1088,6 +1088,18 @@ def main() -> int:
         default=False,
         help="Output the fully built prompt (with templates, context, verify_command) as JSON",
     )
+    show_parser.add_argument(
+        "--output",
+        action="store_true",
+        default=False,
+        help="Print only the raw output/report content (no metadata), suitable for piping",
+    )
+    show_parser.add_argument(
+        "--path",
+        action="store_true",
+        default=False,
+        help="Print only the report file path",
+    )
     add_common_args(show_parser)
 
     # sync-report command

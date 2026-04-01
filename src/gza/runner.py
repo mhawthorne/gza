@@ -17,6 +17,7 @@ from .config import (
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
     DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
 )
+from .commit_messages import build_task_commit_message
 from .console import console, task_header, stats_line, success_message, error_message, info_line, next_steps
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
@@ -1462,6 +1463,7 @@ def _complete_code_task(
             # else: branch has commits from a previous run - treat as success without committing
 
         if has_uncommitted:
+            assert task.id is not None, "Task ID must be set before committing"
             # Squash any WIP commits before creating final commit
             _squash_wip_commits(worktree_git, task)
 
@@ -1470,14 +1472,18 @@ def _complete_code_task(
             for f in files_to_stage:
                 worktree_git.add(f)
 
-            # Build commit message with trailer for improve tasks
-            commit_message = f"Gza: {task.prompt[:50]}\n\nTask ID: {task.task_id}"
-
-            # Add review trailer for improve tasks
+            review_task_id = None
             if task.task_type == "improve" and task.depends_on:
                 review_task = store.get(task.depends_on)
                 if review_task and review_task.task_type == "review":
-                    commit_message += f"\nGza-Review: #{review_task.id}"
+                    review_task_id = review_task.id
+
+            commit_message = build_task_commit_message(
+                task.prompt,
+                task_id=task.id,
+                task_slug=task.task_id,
+                review_task_id=review_task_id,
+            )
 
             worktree_git.commit(commit_message)
 

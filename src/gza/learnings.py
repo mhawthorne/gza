@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -189,6 +190,37 @@ def _run_learnings_task(
     return learnings if learnings else None
 
 
+def _spawn_background_learnings_update(config: "Config", window: int) -> bool:
+    """Start detached `gza learnings update` process.
+
+    Returns True when spawning succeeds. Returns False if process creation
+    fails; caller should run foreground fallback.
+    """
+    startup_log_path = config.workers_path / "learnings-update.startup.log"
+    startup_log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "uv",
+        "run",
+        "gza",
+        "learnings",
+        "update",
+        "--window",
+        str(window),
+        "--project",
+        str(config.project_dir.absolute()),
+    ]
+    with startup_log_path.open("ab") as startup_log:
+        subprocess.Popen(
+            cmd,
+            stdout=startup_log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+    return True
+
+
 def _append_history_entry(config: "Config", entry: dict) -> None:
     """Append a JSONL history record for learnings regeneration.
 
@@ -283,4 +315,16 @@ def maybe_auto_regenerate_learnings(
     if completed_count <= 0 or completed_count % interval != 0:
         return None
 
-    return regenerate_learnings(store, config, window=window)
+    recent_tasks = store.get_recent_completed(limit=window)
+    if not recent_tasks:
+        return None
+
+    try:
+        _spawn_background_learnings_update(config, window)
+    except Exception as exc:
+        console.print(
+            "[yellow]LLM learnings background spawn failed: "
+            f"{exc}; running foreground regeneration fallback.[/yellow]"
+        )
+        return regenerate_learnings(store, config, window=window)
+    return None
