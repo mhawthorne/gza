@@ -501,6 +501,14 @@ class Git:
         """
         self._run("merge", "--abort")
 
+    def reset_hard_head(self) -> None:
+        """Reset tracked files to HEAD, discarding local tracked changes.
+
+        Used as a fallback cleanup path when merge abort is unavailable
+        (for example, failed squash merges without MERGE_HEAD).
+        """
+        self._run("reset", "--hard", "HEAD")
+
     def rebase(self, branch: str) -> None:
         """Rebase the current branch onto another branch.
 

@@ -7,18 +7,15 @@ from dataclasses import dataclass
 from rich.console import Console
 from rich.markup import escape as rich_escape
 
+from ..colors import WorkOutputColors
+
 
 @dataclass(frozen=True)
-class OutputStyles:
-    """Color and style definitions for provider stream output."""
+class OutputStyles(WorkOutputColors):
+    """Color and style definitions for provider stream output.
 
-    step_header: str = "blue"
-    assistant_text: str = "green"
-    tool_use: str = "magenta"
-    error: str = "bold red"
-    todo_pending: str = "white"
-    todo_in_progress: str = "yellow"
-    todo_completed: str = "green"
+    Inherits all color fields from :class:`gza.colors.WorkOutputColors`.
+    """
 
 
 def format_runtime(seconds: int) -> str:

@@ -2,9 +2,9 @@
 
 ## How `gza advance` handles merge conflicts
 
-When `gza advance` encounters a completed task whose branch has merge conflicts with the default branch, it follows this flow (see `_determine_advance_action` in `git_ops.py`):
+When `gza advance` encounters a completed task whose branch has merge conflicts with the currently checked-out branch (the advance target branch), it follows this flow (see `_determine_advance_action` in `git_ops.py`):
 
-1. **Detect conflicts**: `git.can_merge(task.branch, default_branch)` returns `False`
+1. **Detect conflicts**: `git.can_merge(task.branch, target_branch)` returns `False`, where `target_branch` is determined at runtime via `git.current_branch()`
 2. **Check for existing rebase children**: Query `store.get_lineage_children(task.id)` for any child tasks with `task_type="rebase"`
 3. **Decide action based on rebase child status**:
    - `pending` or `in_progress` → skip (rebase already running, avoid duplicates)

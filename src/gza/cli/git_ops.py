@@ -32,6 +32,7 @@ from gza.query import (
     get_reviews_for_root as _get_reviews_for_root_task,
     get_improves_for_root as _get_improves_for_root_task,
 )
+from ..colors import pink_prompt
 
 from ._common import (
     DuplicateReviewError,
@@ -1010,7 +1011,7 @@ def _determine_advance_action(
     store: SqliteTaskStore,
     git: Git,
     task: DbTask,
-    default_branch: str,
+    target_branch: str,
     impl_based_on_ids: set[int] | None = None,
 ) -> dict:
     """Determine the next action needed to advance a task.
@@ -1055,8 +1056,8 @@ def _determine_advance_action(
     assert task.id is not None
     rebase_children = store.get_lineage_children(task.id)
 
-    # Check for merge conflicts against the default branch (the merge target)
-    if not git.can_merge(task.branch, default_branch):
+    # Check for merge conflicts against the current advance target branch.
+    if not git.can_merge(task.branch, target_branch):
         # Check if a rebase is already in progress or has failed
         for child in rebase_children:
             if child.task_type != "rebase":
@@ -1327,7 +1328,7 @@ def _cmd_advance_unimplemented(
 
 # Maps advance action types to their execution priority (lower = runs first).
 # 'merge' actions are fast and synchronous; running them first ensures freshly
-# merged code is on the default branch before any review/improve workers are
+# merged code is on the current branch before any review/improve workers are
 # spawned, reducing rebase conflicts for those workers.
 _ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
 
@@ -1466,15 +1467,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if max_tasks is not None:
         tasks = tasks[:max_tasks]
 
-    # Use the default branch as the merge target for all operations.
-    # advance is a batch command and operators may not be on main, so we
-    # always merge into the canonical default branch (main/master).
-    default_branch = git.default_branch()
+    # Use the currently checked-out branch as the target for conflict checks,
+    # merge execution, and rebase task creation.
+    target_branch = git.current_branch()
 
     # Analyze each completed task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
-        action = _determine_advance_action(config, store, git, task, default_branch, impl_based_on_ids=impl_based_on_ids)
+        action = _determine_advance_action(config, store, git, task, target_branch, impl_based_on_ids=impl_based_on_ids)
         plan.append((task, action))
 
     # Analyze each resumable failed task
@@ -1514,7 +1514,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
                 for task, action in plan:
                     prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-                    console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                    console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -1524,7 +1524,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if plan:
                 for task, action in plan:
                     prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-                    console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                    console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -1533,10 +1533,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"Would advance {len(plan)} task(s):\n")
         for task, action in plan:
             prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-            console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+            console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
             description = action['description']
             if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
-                commit_count = git.count_commits_ahead(task.branch, default_branch)
+                commit_count = git.count_commits_ahead(task.branch, target_branch)
                 if commit_count >= config.merge_squash_threshold:
                     description = f"{description} (auto-squash, {commit_count} commits)"
             _color = _advance_action_color(action['type'])
@@ -1554,7 +1554,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     for pt in pending_tasks:
                         flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
                         prompt_display = truncate(flat_prompt, prompt_width)
-                        console.print(f"  [cyan]#{pt.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                        console.print(f"  [cyan]#{pt.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
                         console.print(f"      [cyan]→ Start new worker[/cyan]")
                         print()
                 else:
@@ -1567,7 +1567,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"Will advance {len(actionable_plan)} task(s):\n")
         for task, action in plan:
             prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-            console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+            console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
             print()
@@ -1585,7 +1585,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 for pt in new_pending_tasks:
                     flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
                     prompt_display = truncate(flat_prompt, prompt_width)
-                    console.print(f"  [cyan]#{pt.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                    console.print(f"  [cyan]#{pt.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
                     console.print(f"      [cyan]→ Start new worker[/cyan]")
                     print()
 
@@ -1614,7 +1614,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         action_type = action['type']
 
         if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
-            console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+            console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
             skip_count += 1
@@ -1625,13 +1625,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Worker-spawning actions: check batch limit before proceeding
         if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
             if batch_limit is not None and workers_started >= batch_limit:
-                console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+                console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
                 console.print(f"      [yellow]— batch limit reached ({workers_started}/{batch_limit}), skipping[/yellow]")
                 print()
                 skip_count += 1
                 continue
 
-        console.print(f"  [cyan]#{task.id}[/cyan] [#ff99cc]{prompt_display}[/#ff99cc]")
+        console.print(f"  [cyan]#{task.id}[/cyan] [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
@@ -1639,7 +1639,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # Determine whether to auto-squash based on commit count and threshold
             should_squash = False
             if config.merge_squash_threshold > 0 and task.branch:
-                commit_count = git.count_commits_ahead(task.branch, default_branch)
+                commit_count = git.count_commits_ahead(task.branch, target_branch)
                 if commit_count >= config.merge_squash_threshold:
                     should_squash = True
             # Build a minimal args namespace for _merge_single_task
@@ -1651,13 +1651,52 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 remote=False,
                 resolve=False,
             )
-            rc = _merge_single_task(task.id, config, store, git, merge_args, default_branch)
+            rc = _merge_single_task(task.id, config, store, git, merge_args, target_branch)
             if rc == 0:
                 console.print(f"      [green]✓ Merged[/green]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Merge failed[/red]")
-                error_count += 1
+                task_branch = task.branch
+                conflict_detected = (
+                    task_branch is not None and not git.can_merge(task_branch, target_branch)
+                )
+                if conflict_detected:
+                    console.print(f"      [yellow]! Merge had conflicts against '{target_branch}'[/yellow]")
+                    try:
+                        # _merge_single_task already attempts merge --abort.
+                        # For failed squash merges, MERGE_HEAD may be absent, so
+                        # force cleanup as a final fallback.
+                        git.reset_hard_head()
+                        console.print("      [green]✓ Restored clean git state[/green]")
+                    except GitError as cleanup_error:
+                        console.print(
+                            f"      [red]✗ Cleanup failed after merge conflict: {cleanup_error}. "
+                            f"Manual intervention required.[/red]"
+                        )
+                        error_count += 1
+                        continue
+                    assert task_branch is not None  # guaranteed by conflict_detected guard
+                    rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
+                    assert rebase_task.id is not None
+                    console.print(
+                        f"      [green]✓ Created rebase task #{rebase_task.id} "
+                        f"(target: {target_branch})[/green]"
+                    )
+                    worker_args = argparse.Namespace(
+                        no_docker=getattr(args, 'no_docker', False),
+                        max_turns=None,
+                    )
+                    rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+                    workers_started += 1
+                    if rebase_rc == 0:
+                        console.print(f"      [green]✓ Started rebase worker[/green]")
+                        success_count += 1
+                    else:
+                        console.print(f"      [red]✗ Failed to start rebase worker[/red]")
+                        error_count += 1
+                else:
+                    console.print(f"      [red]✗ Merge failed[/red]")
+                    error_count += 1
 
         elif action_type == 'create_review':
             try:
@@ -1802,7 +1841,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 console.print(f"      [red]✗ Cannot rebase: task #{task.id} has no branch[/red]")
                 error_count += 1
                 continue
-            rebase_task = _create_rebase_task(store, task.id, task.branch, default_branch)
+            rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
             assert rebase_task.id is not None
             console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")
 
@@ -1858,7 +1897,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if desc.startswith('SKIP: '):
                 desc = desc[len('SKIP: '):]
             _color = _advance_action_color(aaction['type'])
-            console.print(f"  [cyan]#{atask.id}[/cyan]  [#ff99cc]{prompt_display}[/#ff99cc]")
+            console.print(f"  [cyan]#{atask.id}[/cyan]  [{pink_prompt}]{prompt_display}[/{pink_prompt}]")
             console.print(f"       [{_color}]→ {desc}[/{_color}]")
 
     return 0 if error_count == 0 else 1
