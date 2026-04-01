@@ -188,6 +188,7 @@ DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
 REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 4
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
+COMMIT_SUBJECT_MAX_CHARS = 72
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
@@ -422,6 +423,59 @@ def _compact_output_summary(content: str, max_chars: int = REVIEW_IMPROVE_SUMMAR
     if len(compact) > max_chars:
         return compact[: max_chars - 3].rstrip() + "..."
     return compact
+
+
+def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
+    """Truncate text on word boundaries, adding ellipsis when shortened."""
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_chars:
+        return compact
+
+    cutoff = max_chars - 3
+    if cutoff <= 0:
+        return "." * max_chars
+
+    candidate = compact[:cutoff].rstrip()
+    split = candidate.rfind(" ")
+    if split > 0:
+        candidate = candidate[:split].rstrip()
+    if not candidate:
+        candidate = compact[:cutoff].rstrip()
+    return f"{candidate}..."
+
+
+def _default_code_task_commit_subject(task_slug: str | None, task_db_id: int | None) -> str:
+    """Build deterministic fallback commit subject for code tasks."""
+    if task_slug and task_slug.strip():
+        return f"gza task {task_slug.strip()}"
+    if task_db_id is not None:
+        return f"Task #{task_db_id}"
+    return "gza task"
+
+
+def _build_code_task_commit_subject(task_prompt: str, worktree_summary_path: Path, fallback_subject: str | None = None) -> str:
+    """Build commit subject from worktree summary, with prompt fallback."""
+    fallback = (fallback_subject or "").strip() or "gza task"
+    if worktree_summary_path.exists():
+        try:
+            summary_content = worktree_summary_path.read_text().strip()
+        except (OSError, UnicodeError):
+            logger.warning(
+                "Failed to read summary file for commit subject at %s; falling back",
+                worktree_summary_path,
+                exc_info=True,
+            )
+        else:
+            if summary_content:
+                compact_summary = _compact_output_summary(summary_content)
+                summary_subject = _truncate_to_word_boundary(compact_summary, max_chars=COMMIT_SUBJECT_MAX_CHARS)
+                if summary_subject:
+                    return summary_subject
+
+    prompt_subject = _truncate_to_word_boundary(task_prompt, max_chars=COMMIT_SUBJECT_MAX_CHARS)
+    if prompt_subject:
+        return prompt_subject
+    return fallback
 
 
 def _is_improve_in_impl_chain(improve_task: Task, impl_task: Task, tasks_by_id: dict[int, Task]) -> bool:
@@ -1478,23 +1532,37 @@ def _complete_code_task(
                 if review_task and review_task.task_type == "review":
                     review_task_id = review_task.id
 
-            commit_message = build_task_commit_message(
+            commit_subject = _build_code_task_commit_subject(
                 task.prompt,
+                worktree_summary_path,
+                fallback_subject=_default_code_task_commit_subject(task.task_id, task.id),
+            )
+
+            commit_message = build_task_commit_message(
+                commit_subject,
                 task_id=task.id,
                 task_slug=task.task_id,
                 review_task_id=review_task_id,
             )
-
             worktree_git.commit(commit_message)
 
     # Copy summary file from worktree to main project directory
     output_content = None
     if worktree_summary_path.exists():
-        # Ensure target directory exists
-        summary_dir.mkdir(parents=True, exist_ok=True)
-        # Copy summary content from worktree to project dir
-        summary_path.write_text(worktree_summary_path.read_text())
-        output_content = summary_path.read_text()
+        try:
+            summary_content = worktree_summary_path.read_text()
+        except (OSError, UnicodeError):
+            logger.warning(
+                "Failed to read summary file for task completion output at %s; continuing without output_content",
+                worktree_summary_path,
+                exc_info=True,
+            )
+        else:
+            # Ensure target directory exists
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            # Copy summary content from worktree to project dir
+            summary_path.write_text(summary_content)
+            output_content = summary_content
 
     # Compute diff stats vs. default branch before marking completed
     default_branch = worktree_git.default_branch()

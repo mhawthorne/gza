@@ -19,6 +19,7 @@ from gza.runner import (
     WIP_DIR,
     BACKUP_DIR,
     _build_context_from_chain,
+    _build_code_task_commit_subject,
     _build_review_improve_lineage_context,
     _copy_learnings_to_worktree,
     _extract_review_verdict,
@@ -3753,6 +3754,282 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "completed"
         assert summary_path.exists()
+
+    def test_complete_code_task_uses_summary_for_commit_subject(self, tmp_path: Path):
+        """Commit subject should come from worktree summary when present."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Improve implementation based on review", task_type="improve")
+        task.task_id = "20260401-improve-commit-subject"
+        store.mark_in_progress(task)
+
+        review_task = store.add(prompt="Review implementation", task_type="review")
+        task.depends_on = review_task.id
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.task_id}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text(
+            "- Use task summary for commit subject\n"
+            "- Include task metadata trailers\n"
+        )
+
+        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        commit_message = worktree_git.commit.call_args.args[0]
+        assert commit_message.startswith("Use task summary for commit subject Include task metadata trailers")
+        assert f"\n\nTask #{task.id}\nSlug: {task.task_id}\n" in commit_message
+        assert f"Gza-Review: #{review_task.id}" in commit_message
+
+    def test_build_code_task_commit_subject_falls_back_to_word_boundary_prompt(self, tmp_path: Path):
+        """Without summary file, fallback should use word-boundary truncation of task prompt."""
+        prompt = (
+            "Improve implementation based on review by tightening commit message "
+            "subject generation for summary-driven workflows"
+        )
+        worktree_summary_path = tmp_path / "missing-summary.md"
+
+        subject = _build_code_task_commit_subject(prompt, worktree_summary_path)
+
+        assert subject == "Improve implementation based on review by tightening commit message..."
+
+    def test_build_code_task_commit_subject_uses_default_when_prompt_and_summary_empty(self, tmp_path: Path):
+        """Whitespace-only prompts should still produce a non-empty deterministic subject."""
+        subject = _build_code_task_commit_subject("   \n\t", tmp_path / "missing-summary.md")
+        assert subject == "gza task"
+
+    def test_complete_code_task_uses_slug_fallback_subject_when_prompt_blank(self, tmp_path: Path):
+        """Completion should commit with slug-based subject when prompt and summary are empty."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="   \n\t", task_type="implement")
+        task.task_id = "20260401-blank-prompt-fallback"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.task_id}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+
+        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        commit_message = worktree_git.commit.call_args.args[0]
+        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+
+    @pytest.mark.parametrize(
+        ("summary_error", "expected_warning"),
+        [
+            (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "Failed to read summary file for commit subject"),
+            (OSError("simulated read error"), "Failed to read summary file for commit subject"),
+        ],
+    )
+    def test_complete_code_task_commits_when_summary_subject_read_fails_then_copy_succeeds(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        summary_error: Exception,
+        expected_warning: str,
+    ):
+        """Completion should continue and commit when summary read fails for subject generation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="   \n\t", task_type="implement")
+        task.task_id = "20260401-summary-read-error-fallback"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.task_id}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("placeholder summary")
+
+        original_read_text = Path.read_text
+        summary_read_calls = {"count": 0}
+
+        def _flaky_read_text(self: Path, *args, **kwargs):
+            if self == worktree_summary_path:
+                summary_read_calls["count"] += 1
+                if summary_read_calls["count"] == 1:
+                    raise summary_error
+                return "Copied summary content"
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch.object(Path, "read_text", autospec=True, side_effect=_flaky_read_text),
+            caplog.at_level("WARNING"),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        commit_message = worktree_git.commit.call_args.args[0]
+        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+        assert expected_warning in caplog.text
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.output_content == "Copied summary content"
+
+    @pytest.mark.parametrize(
+        "summary_error",
+        [
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+            OSError("simulated persistent read error"),
+        ],
+    )
+    def test_complete_code_task_commits_when_summary_read_persistently_fails(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        summary_error: Exception,
+    ):
+        """Persistent summary read failures should not crash completion after commit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="   \n\t", task_type="implement")
+        task.task_id = "20260401-summary-read-persistent-failure"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.task_id}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("placeholder summary")
+
+        original_read_text = Path.read_text
+
+        def _always_failing_read_text(self: Path, *args, **kwargs):
+            if self == worktree_summary_path:
+                raise summary_error
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch.object(Path, "read_text", autospec=True, side_effect=_always_failing_read_text),
+            caplog.at_level("WARNING"),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        commit_message = worktree_git.commit.call_args.args[0]
+        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+        assert "Failed to read summary file for commit subject" in caplog.text
+        assert "Failed to read summary file for task completion output" in caplog.text
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.output_content is None
 
 
 class TestWriteLogEntry:
