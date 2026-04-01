@@ -1314,6 +1314,7 @@ class TestRebaseHelpers:
 
         with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops.load_dotenv"), \
              patch("pathlib.Path.exists", side_effect=[True, False]):
             mock_provider = Mock()
             mock_provider.run.return_value = RunResult(exit_code=0)
