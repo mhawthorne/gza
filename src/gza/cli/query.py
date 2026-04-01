@@ -45,16 +45,7 @@ from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
     TaskLineageNode,
 )
-
-
-_LINEAGE_STATUS_COLORS: dict[str, str] = {
-    "completed": "green",
-    "failed": "red",
-    "pending": "yellow",
-    "in_progress": "cyan",
-    "unmerged": "yellow",
-    "dropped": "red",
-}
+from ..colors import LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS, PS_STATUS_COLORS, SHOW_COLORS_DICT, UNMERGED_COLORS_DICT
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
     "review": "review",
@@ -374,17 +365,8 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         console.print("No unmerged tasks")
         return 0
 
-    # Configurable colors for unmerged output
-    UNMERGED_COLORS = {
-        "task_id": "dim",          # dim for task ID and date (adapts to terminal background)
-        "prompt": "#ff99cc",       # pink for prompt text (works on dark and light)
-        "stats": "cyan",           # cyan for stats (visible on dark and light)
-        "branch": "cyan",          # cyan for branch name (visible on dark and light)
-        "review_approved": "green",
-        "review_changes": "yellow",
-        "review_discussion": "cyan",
-        "review_none": "dim yellow",
-    }
+    # Colors for unmerged output — defined in gza.colors.
+    UNMERGED_COLORS = UNMERGED_COLORS_DICT
 
     # Group tasks by branch
     branch_groups: dict[str, list] = {}
@@ -738,16 +720,8 @@ def _print_ps_output(
         print(json_lib.dumps(rows, indent=2))
         return
 
-    # Color scheme for ps output
-    STATUS_COLORS = {
-        "running": "green",
-        "in_progress": "green",
-        "completed": "cyan",
-        "failed": "red",
-        "failed(startup)": "red",
-        "stale": "yellow",
-        "unknown": "yellow",
-    }
+    # Color scheme for ps output — defined in gza.colors.
+    STATUS_COLORS = PS_STATUS_COLORS
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
@@ -1316,21 +1290,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task #{args.task_id} has no output content[/red]")
         return 1
 
-    SHOW_COLORS = {
-        "heading": "bold cyan",
-        "section": "dim",
-        "label": "dim",
-        "value": "bold",           # bold adapts to terminal background (was "white")
-        "task_id": "dim",          # dim adapts to terminal background (was "#cccccc")
-        "prompt": "#ff99cc",       # pink works on dark and light backgrounds
-        "branch": "cyan",          # cyan visible on dark and light (was "#6699ff")
-        "stats": "cyan",           # cyan visible on dark and light (was "#6699ff")
-        "status_pending": "yellow",
-        "status_running": "cyan",
-        "status_completed": "green",
-        "status_failed": "red",
-        "status_default": "bold",  # bold adapts to terminal background (was "white")
-    }
+    # Colors for show output — defined in gza.colors.
+    SHOW_COLORS = SHOW_COLORS_DICT
     c = SHOW_COLORS
 
     status_color_map = {
