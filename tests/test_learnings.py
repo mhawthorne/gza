@@ -87,8 +87,7 @@ def test_auto_regenerate_only_on_interval(tmp_path: Path):
     mock_popen.assert_called_once()
     args, kwargs = mock_popen.call_args
     cmd = args[0]
-    assert cmd[1:4] == ["-m", "gza", "learnings"]
-    assert "update" in cmd
+    assert cmd[:5] == ["uv", "run", "gza", "learnings", "update"]
     assert "--window" in cmd
     assert "--project" in cmd
     assert kwargs["start_new_session"] is True

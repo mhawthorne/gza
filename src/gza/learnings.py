@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -200,8 +199,8 @@ def _spawn_background_learnings_update(config: "Config", window: int) -> bool:
     startup_log_path = config.workers_path / "learnings-update.startup.log"
     startup_log_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        sys.executable,
-        "-m",
+        "uv",
+        "run",
         "gza",
         "learnings",
         "update",

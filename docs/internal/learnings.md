@@ -8,6 +8,8 @@ After each completed task (on interval), gza can automatically update `.gza/lear
 2. The LLM produces bullet-point learnings from recent task outputs; these replace/merge into `.gza/learnings.md`.
 3. On any failure (non-zero exit, exception), gza falls back to the existing regex-based extraction.
 4. The `internal` task is kept in the DB for observability (visible via `gza history --type internal`).
+5. Auto-regeneration background spawn uses the canonical CLI entrypoint (`uv run gza ...`) to ensure the same environment resolution as normal project commands.
+6. Pending `internal` tasks are not selected by default queue pickup (`get_next_pending()`), so they do not run via generic `gza work` pending selection.
 
 ## Architecture Notes
 
