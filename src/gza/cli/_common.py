@@ -313,6 +313,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     # Spawn detached process
     try:
         worker_id = registry.generate_worker_id()
+        inner_cmd.extend(["--worker-id", worker_id])
 
         startup_log_rel: str | None = None
         if use_tmux:
@@ -399,13 +400,16 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     registry = WorkerRegistry(config.workers_path)
     worker_id = None
 
-    # Find our worker entry by PID
-    my_pid = os.getpid()
-    workers = registry.list_all(include_completed=False)
-    for w in workers:
-        if w.pid == my_pid:
-            worker_id = w.worker_id
-            break
+    # Use explicit worker ID if passed by parent, otherwise fall back to PID matching
+    if hasattr(args, 'worker_id') and args.worker_id:
+        worker_id = args.worker_id
+    else:
+        my_pid = os.getpid()
+        workers = registry.list_all(include_completed=False)
+        for w in workers:
+            if w.pid == my_pid:
+                worker_id = w.worker_id
+                break
 
     store = get_store(config)
 
@@ -546,6 +550,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
     try:
         # Generate worker ID
         worker_id = registry.generate_worker_id()
+        cmd.extend(["--worker-id", worker_id])
         proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
 
         # Register worker
