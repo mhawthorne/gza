@@ -146,6 +146,7 @@ def prune_terminal_dead_workers(config: Config) -> None:
 # Shared color palette for history and stats output — defined in gza.colors.
 from gza.colors import TASK_COLORS_DICT as TASK_COLORS
 
+
 def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
     """Return deterministic startup log path for a task."""
     if not task.task_id:

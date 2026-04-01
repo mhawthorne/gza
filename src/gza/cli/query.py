@@ -36,6 +36,7 @@ from ._common import (
     _parse_iso,
     get_review_verdict,
 )
+from ..colors import NEXT_COLORS_DICT
 
 from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
@@ -92,13 +93,7 @@ def cmd_next(args: argparse.Namespace) -> int:
             runnable.append(task)
 
     # Colors consistent with cmd_history
-    c = {
-        "task_id": "dim",
-        "prompt": "#ff99cc",
-        "type": "magenta",
-        "blocked": "yellow",
-        "index": "dim",
-    }
+    c = NEXT_COLORS_DICT
 
     # Terminal-width-aware column widths
     terminal_width = get_terminal_width()

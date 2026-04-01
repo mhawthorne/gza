@@ -1,8 +1,9 @@
 """Centralized color definitions for all gza CLI output.
 
 This module provides a single source of truth for all colors used in gza's
-terminal output. Colors are chosen for readability on both dark and light
-terminal backgrounds.
+terminal output, covering: task history/stats, task status, work output,
+log display, next/pending lists, and review verdicts. Colors are chosen for
+readability on both dark and light terminal backgrounds.
 
 ## Terminal Compatibility Notes
 - ``#ff99cc`` (pink_prompt): Chosen specifically for prompt text — readable on
@@ -117,16 +118,6 @@ class WorkOutputColors:
 
 
 @dataclass(frozen=True)
-class ReviewColors:
-    """Colors for PR review state display (``gza unmerged``)."""
-
-    approved: str = green_success     # green for approved
-    changes_requested: str = yellow_warning  # yellow for changes requested
-    discussion: str = cyan_header     # cyan for discussion/comment
-    none: str = dim_yellow_note       # dim yellow when no review
-
-
-@dataclass(frozen=True)
 class ShowColors:
     """Colors for the ``gza show`` command task detail view."""
 
@@ -159,6 +150,17 @@ class UnmergedColors:
     review_none: str = dim_yellow_note        # dim yellow for no review
 
 
+@dataclass(frozen=True)
+class NextColors:
+    """Colors for the ``gza next`` command pending-task list."""
+
+    task_id: str = dim_secondary     # dim for task ID
+    prompt: str = pink_prompt        # pink for prompt text
+    type: str = magenta_tool         # magenta for task type
+    blocked: str = yellow_warning    # yellow for blocked indicator
+    index: str = dim_secondary       # dim for row index
+
+
 # ---------------------------------------------------------------------------
 # Module-level singleton instances (typed, attribute-style access)
 # ---------------------------------------------------------------------------
@@ -166,19 +168,22 @@ class UnmergedColors:
 TASK_COLORS = TaskColors()
 STATUS_COLORS = StatusColors()
 WORK_OUTPUT_COLORS = WorkOutputColors()
-REVIEW_COLORS = ReviewColors()
 SHOW_COLORS = ShowColors()
 UNMERGED_COLORS = UnmergedColors()
+NEXT_COLORS = NextColors()
 
 # ---------------------------------------------------------------------------
 # Dict variants (drop-in replacements for the old inline dictionaries)
 # ---------------------------------------------------------------------------
 
+# These module-level dict calls execute at import time (intentionally eager —
+# the module is small and the dicts are always needed).
 TASK_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_COLORS)
 STATUS_COLORS_DICT: dict[str, str] = dataclasses.asdict(STATUS_COLORS)
 WORK_OUTPUT_COLORS_DICT: dict[str, str] = dataclasses.asdict(WORK_OUTPUT_COLORS)
 SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
+NEXT_COLORS_DICT: dict[str, str] = dataclasses.asdict(NEXT_COLORS)
 
 # Lineage-status dict (subset of StatusColors, keyed by status string)
 LINEAGE_STATUS_COLORS: dict[str, str] = {
@@ -199,4 +204,33 @@ PS_STATUS_COLORS: dict[str, str] = {
     "failed(startup)": STATUS_COLORS.failed,
     "stale": STATUS_COLORS.stale,
     "unknown": STATUS_COLORS.unknown,
+}
+
+# Log-command task-status colors (keyed by task.status string).
+# Note: 'unmerged' maps to green (treated as successfully merged for display
+# purposes) and 'in_progress' maps to yellow — both differ from STATUS_COLORS
+# which uses yellow/cyan respectively for those states.
+LOG_TASK_STATUS_COLORS: dict[str, str] = {
+    "completed": green_success,
+    "unmerged": green_success,
+    "failed": red_error,
+    "dropped": red_error,
+    "in_progress": yellow_warning,
+}
+
+# Log-command worker-status colors (keyed by worker.status string).
+LOG_WORKER_STATUS_COLORS: dict[str, str] = {
+    "running": yellow_warning,
+    "in_progress": yellow_warning,
+    "completed": green_success,
+    "failed": red_error,
+    "stale": yellow_warning,
+}
+
+# Review-verdict colors for the runner's post-task verdict display.
+# Keys are uppercase verdict strings as returned by parse_review_verdict().
+REVIEW_VERDICT_COLORS: dict[str, str] = {
+    "APPROVED": green_success,
+    "CHANGES_REQUESTED": yellow_warning,
+    "NEEDS_DISCUSSION": blue_step,
 }
