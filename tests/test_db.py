@@ -82,6 +82,16 @@ class TestTaskChaining:
         # Could be task2 or task3 depending on order
         assert next_task.id in (task2.id, task3.id)
 
+    def test_get_next_pending_skips_internal_tasks(self, tmp_path: Path):
+        """Internal tasks should not be selected by default pending-task pickup."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        internal = store.add("Internal task", task_type="internal", skip_learnings=True)
+        assert internal.status == "pending"
+
+        assert store.get_next_pending() is None
+
     def test_get_in_progress_returns_only_in_progress_tasks(self, tmp_path: Path):
         """Test get_in_progress returns only in-progress tasks."""
         db_path = tmp_path / "test.db"

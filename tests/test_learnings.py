@@ -1,6 +1,7 @@
 """Tests for learnings generation."""
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -59,7 +60,7 @@ def test_regenerate_learnings_dedupes_items(tmp_path: Path):
 
 
 def test_auto_regenerate_only_on_interval(tmp_path: Path):
-    """Auto-regeneration should run only when completed count hits interval."""
+    """Auto-regeneration should spawn background worker only on interval."""
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
@@ -67,14 +68,29 @@ def test_auto_regenerate_only_on_interval(tmp_path: Path):
         task = store.add(f"Task {i}", task_type="implement")
         store.mark_completed(task, output_content=f"- Learn {i}\n", has_commits=False)
 
-    assert maybe_auto_regenerate_learnings(store, config, interval=5, window=10) is None
+    with patch("gza.learnings.subprocess.Popen") as mock_popen:
+        assert maybe_auto_regenerate_learnings(store, config, interval=5, window=10) is None
+    mock_popen.assert_not_called()
 
     fifth = store.add("Task 5", task_type="implement")
     store.mark_completed(fifth, output_content="- Learn 5\n", has_commits=False)
 
-    result = maybe_auto_regenerate_learnings(store, config, interval=5, window=10)
-    assert result is not None
-    assert (tmp_path / ".gza" / "learnings.md").exists()
+    with patch("gza.learnings.subprocess.Popen") as mock_popen:
+        result = maybe_auto_regenerate_learnings(store, config, interval=5, window=10)
+
+    assert result is None
+    mock_popen.assert_called_once()
+    args, kwargs = mock_popen.call_args
+    cmd = args[0]
+    assert cmd[1:4] == ["-m", "gza", "work"]
+    assert "--worker-mode" in cmd
+    assert "--project" in cmd
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] == subprocess.DEVNULL
+
+    pending_internal_tasks = [t for t in store.get_pending() if t.task_type == "internal"]
+    assert len(pending_internal_tasks) == 1
+    assert pending_internal_tasks[0].skip_learnings is True
 
 
 def test_regenerate_learnings_reports_delta_counts(tmp_path: Path):

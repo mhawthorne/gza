@@ -926,6 +926,7 @@ class SqliteTaskStore:
                 )
                 SELECT t.* FROM tasks t
                 WHERE t.status = 'pending'
+                AND t.task_type != 'internal'
                 AND (
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)

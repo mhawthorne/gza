@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -150,6 +152,8 @@ def _run_learnings_task(
     store: SqliteTaskStore,
     config: "Config",
     recent_tasks: list[Task],
+    *,
+    background: bool = False,
 ) -> list[str] | None:
     """Run an internal task to summarize learnings from recent task outputs.
 
@@ -170,6 +174,37 @@ def _run_learnings_task(
 
     learn_task_id = learn_task.id
     if learn_task_id is None:
+        return None
+
+    if background:
+        startup_log_path = config.workers_path / f"learnings-{learn_task_id}-startup.log"
+        startup_log_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            sys.executable,
+            "-m",
+            "gza",
+            "work",
+            "--worker-mode",
+            str(learn_task_id),
+            "--project",
+            str(config.project_dir.absolute()),
+        ]
+        try:
+            with startup_log_path.open("ab") as startup_log:
+                subprocess.Popen(
+                    cmd,
+                    stdout=startup_log,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    cwd=config.project_dir,
+                )
+        except Exception as exc:
+            console.print(
+                "[yellow]LLM learnings background spawn failed: "
+                f"{exc}; falling back to regex extraction.[/yellow]"
+            )
+            return None
         return None
 
     try:
@@ -283,4 +318,7 @@ def maybe_auto_regenerate_learnings(
     if completed_count <= 0 or completed_count % interval != 0:
         return None
 
-    return regenerate_learnings(store, config, window=window)
+    recent_tasks = store.get_recent_completed(limit=window)
+    if recent_tasks:
+        _run_learnings_task(store, config, recent_tasks, background=True)
+    return None
