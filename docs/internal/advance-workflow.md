@@ -63,11 +63,13 @@ For each task, `_determine_advance_action()` returns an action. The decision tre
 
 ### 3. Merge conflicts
 
+Conflict detection uses the currently checked-out branch as the merge target (`target_branch = git.current_branch()`).
+
 | Condition | Action |
 |-----------|--------|
-| Branch cannot merge AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
-| Branch cannot merge AND rebase child is `failed` | `needs_discussion` — manual intervention required |
-| Branch cannot merge AND no active rebase child | `needs_rebase` — create rebase task |
+| Branch cannot merge into current branch AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
+| Branch cannot merge into current branch AND rebase child is `failed` | `needs_discussion` — manual intervention required |
+| Branch cannot merge into current branch AND no active rebase child | `needs_rebase` — create rebase task |
 
 ### 4. Post-rebase review invalidation
 
@@ -156,7 +158,7 @@ These actions create background workers and count toward the batch limit.
 
 ## Execution Order
 
-1. **Merges execute first** (priority 0) before worker spawns (priority 1). This ensures fresh code lands on the default branch before review/improve workers start, reducing rebase conflicts.
+1. **Merges execute first** (priority 0) before worker spawns (priority 1). This ensures fresh code lands on the current branch before review/improve workers start, reducing rebase conflicts.
 2. Within the same priority, tasks are processed in DB order.
 
 ## Batch Limits

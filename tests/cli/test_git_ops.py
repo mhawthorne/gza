@@ -1954,6 +1954,218 @@ class TestAdvanceCommand:
         assert updated_task is not None
         assert updated_task.merge_status == "unmerged"
 
+    def test_advance_targets_current_branch_for_conflict_check_and_rebase(self, tmp_path: Path):
+        """advance uses the current branch (not default) for conflict detection and rebase target."""
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        # Create an integration branch and diverge it from main.
+        git._run("checkout", "-b", "agent-sessions")
+        (tmp_path / "README.md").write_text("agent branch version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Agent branch change")
+
+        # Create feature from main so it can merge into main cleanly.
+        git._run("checkout", "main")
+        git._run("checkout", "-b", "feat/target-mismatch")
+        (tmp_path / "README.md").write_text("feature branch version")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Feature change")
+
+        # Return to agent-sessions so advance target is non-default.
+        git._run("checkout", "agent-sessions")
+
+        task = store.add("Conflicting on agent-sessions only", task_type="explore")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = "feat/target-mismatch"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+        )
+
+        with patch("gza.cli._spawn_background_worker", return_value=0):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
+        assert len(rebases) == 1
+        assert "onto 'agent-sessions'" in rebases[0].prompt
+        assert store.get(task.id).merge_status == "unmerged"
+
+    def test_advance_passes_current_branch_as_merge_target(self, tmp_path: Path):
+        """advance passes current branch to _merge_single_task for merge actions."""
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        git._run("checkout", "-b", "agent-sessions")
+        git._run("checkout", "main")
+        task = store.add("Explore merge target branch", task_type="explore")
+        branch = f"feat/task-{task.id}"
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Add feature for task {task.id}")
+        git._run("checkout", "main")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        git._run("checkout", "agent-sessions")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+        )
+
+        captured_targets: list[str] = []
+
+        def fake_merge(task_id, config, store, git, merge_args, target_branch):
+            captured_targets.append(target_branch)
+            return 0
+
+        with patch("gza.cli._merge_single_task", side_effect=fake_merge):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        assert captured_targets == ["agent-sessions"]
+
+    def test_advance_merge_conflict_fallback_creates_rebase_and_cleans_state(self, tmp_path: Path):
+        """A merge conflict during execution resets git state and falls back to rebase task creation."""
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = store.add("Explore fallback behavior", task_type="explore")
+        branch = f"feat/task-{task.id}"
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature one")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Commit 1 for task {task.id}")
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature two")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Commit 2 for task {task.id}")
+        git._run("checkout", "main")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+        )
+
+        with patch("gza.cli._determine_advance_action", return_value={"type": "merge", "description": "Merge"}):
+            with patch("gza.cli._merge_single_task", return_value=1):
+                with patch("gza.git.Git.can_merge", return_value=False):
+                    with patch("gza.git.Git.reset_hard_head") as mock_reset:
+                        with patch("gza.cli._spawn_background_worker", return_value=0):
+                            rc = cmd_advance(args)
+
+        assert rc == 0
+        assert mock_reset.called
+        rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
+        assert len(rebases) == 1
+        assert "onto 'main'" in rebases[0].prompt
+
+    def test_advance_merge_conflict_fallback_reset_failure_is_hard_error(self, tmp_path: Path):
+        """When reset_hard_head fails, advance increments error_count and skips rebase task creation."""
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from gza.git import GitError
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = store.add("Explore fallback reset failure", task_type="explore")
+        branch = f"feat/task-{task.id}"
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Commit for task {task.id}")
+        git._run("checkout", "main")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+        )
+
+        output_lines: list[str] = []
+
+        def capture_print(msg: str = "", **kwargs: object) -> None:
+            output_lines.append(str(msg))
+
+        with patch("gza.cli._determine_advance_action", return_value={"type": "merge", "description": "Merge"}):
+            with patch("gza.cli._merge_single_task", return_value=1):
+                with patch("gza.git.Git.can_merge", return_value=False):
+                    with patch("gza.git.Git.reset_hard_head", side_effect=GitError("reset failed")):
+                        with patch("gza.cli._spawn_background_worker", return_value=0) as mock_spawn:
+                            from rich.console import Console
+                            with patch("gza.cli.git_ops.console") as mock_console:
+                                mock_console.print.side_effect = capture_print
+                                rc = cmd_advance(args)
+
+        # No rebase task should be created
+        rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
+        assert len(rebases) == 0
+        # No background worker spawned for rebase
+        mock_spawn.assert_not_called()
+        # Output should contain a red error message about failed cleanup
+        combined = "\n".join(output_lines)
+        assert "Cleanup failed" in combined or "Manual intervention" in combined
+
     def test_advance_skips_task_with_in_progress_rebase_child(self, tmp_path: Path):
         """advance skips a task when a rebase child is already in progress."""
         from gza.db import SqliteTaskStore
