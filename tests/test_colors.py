@@ -34,6 +34,7 @@ def test_import_dict_variants() -> None:
         LOG_TASK_STATUS_COLORS,
         LOG_WORKER_STATUS_COLORS,
         REVIEW_VERDICT_COLORS,
+        CYCLE_STATUS_COLORS,
     )
 
 
@@ -144,6 +145,13 @@ def test_review_verdict_colors_keys() -> None:
     assert set(REVIEW_VERDICT_COLORS.keys()) == expected_keys
 
 
+def test_cycle_status_colors_keys() -> None:
+    from gza.colors import CYCLE_STATUS_COLORS
+
+    expected_keys = {"active", "approved", "maxed_out", "blocked"}
+    assert set(CYCLE_STATUS_COLORS.keys()) == expected_keys
+
+
 # ---------------------------------------------------------------------------
 # Specific value regression tests (guard against silent color drift)
 # ---------------------------------------------------------------------------
@@ -210,11 +218,15 @@ def test_output_styles_instantiation() -> None:
 
 
 def test_no_hex_colors_outside_colors_module() -> None:
-    """Assert no #rrggbb hex color literals appear outside gza/colors.py."""
-    import ast
+    """Assert no #rrggbb hex color literals appear outside gza/colors.py.
+
+    Matches hex colors in any context: standalone strings (``"#ff99cc"``),
+    Rich markup tags (``[#ff99cc]``, ``[/#ff99cc]``), and f-string interpolations.
+    """
     from pathlib import Path
 
-    hex_pattern = re.compile(r'"#[0-9a-fA-F]{6}"')
+    # Match any bare #rrggbb sequence — covers both quoted strings and Rich markup tags.
+    hex_pattern = re.compile(r'#[0-9a-fA-F]{6}')
     src_root = Path(__file__).parent.parent / "src" / "gza"
 
     violations: list[str] = []

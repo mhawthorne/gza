@@ -46,7 +46,14 @@ from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
     TaskLineageNode,
 )
-from ..colors import LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS, PS_STATUS_COLORS, SHOW_COLORS_DICT, UNMERGED_COLORS_DICT
+from ..colors import (
+    LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS,
+    PS_STATUS_COLORS,
+    SHOW_COLORS_DICT,
+    UNMERGED_COLORS_DICT,
+    pink_prompt,
+    CYCLE_STATUS_COLORS,
+)
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
     "review": "review",
@@ -738,7 +745,7 @@ def _print_ps_output(
         console.print(
             f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
             f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
-            f"[#ff99cc]{task_display}[/#ff99cc]",
+            f"[{pink_prompt}]{task_display}[/{pink_prompt}]",
             soft_wrap=True,
         )
 
@@ -836,7 +843,7 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
         type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        console.print(f"   [cyan](#{task.id})[/cyan] {type_label}[#ff99cc]{prompt_display}[/#ff99cc]")
+        console.print(f"   [cyan](#{task.id})[/cyan] {type_label}[{pink_prompt}]{prompt_display}[/{pink_prompt}]")
     console.print("   Run [cyan]gza work <id>[/cyan] to resume, or [cyan]gza mark-completed --force <id>[/cyan] to clear.")
 
 
@@ -1201,7 +1208,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
             f" [magenta]{rich_escape(type_str)}[/magenta]"
             f" [{status_color}]{rich_escape(status)}[/{status_color}]"
             f"{rel_part}"
-            f"  [#ff99cc]'{rich_escape(prompt_short)}'[/#ff99cc]"
+            f"  [{pink_prompt}]'{rich_escape(prompt_short)}'[/{pink_prompt}]"
             f"{stats_part}"
         )
 
@@ -1427,13 +1434,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         cycles = store.get_cycles_for_impl(task.id)
         if cycles:
             latest_cycle = cycles[0]
-            cycle_color_map = {
-                "active": c["status_running"],
-                "approved": c["status_completed"],
-                "maxed_out": "yellow",
-                "blocked": "red",
-            }
-            cycle_color = cycle_color_map.get(latest_cycle.status, c["value"])
+            cycle_color = CYCLE_STATUS_COLORS.get(latest_cycle.status, c["value"])
             console.print(
                 f"[{c['label']}]Latest Cycle:[/{c['label']}] "
                 f"[{cycle_color}]#{latest_cycle.id} {latest_cycle.status}[/{cycle_color}]"

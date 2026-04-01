@@ -234,3 +234,12 @@ REVIEW_VERDICT_COLORS: dict[str, str] = {
     "CHANGES_REQUESTED": yellow_warning,
     "NEEDS_DISCUSSION": blue_step,
 }
+
+# Cycle-status colors for the ``gza show`` cycle state display.
+# Keys are cycle status strings as stored in the database.
+CYCLE_STATUS_COLORS: dict[str, str] = {
+    "active": cyan_header,
+    "approved": green_success,
+    "maxed_out": yellow_warning,
+    "blocked": red_error,
+}
