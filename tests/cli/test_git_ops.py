@@ -212,6 +212,7 @@ class TestMergeCommand:
         # Create a task with a descriptive prompt
         task_prompt = "Implement user authentication with JWT tokens"
         task = store.add(task_prompt)
+        task.task_id = "20260401-impl-auth-jwt"
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         task.branch = "feature/auth"
@@ -234,7 +235,7 @@ class TestMergeCommand:
 
         # Verify the commit message contains task information
         assert f"Task #{task.id}" in commit_message, "Commit message should include task ID"
-        assert task_prompt in commit_message, "Commit message should include task prompt"
+        assert f"Slug: {task.task_id}" in commit_message, "Commit message should include task slug"
         assert "Squash merge" in commit_message, "Commit message should indicate squash merge"
 
     def test_branch_shows_as_merged_after_squash(self, tmp_path: Path):

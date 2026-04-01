@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import Config
+from ..commit_messages import build_task_commit_message
 from ..console import (
     console,
     get_terminal_width,
@@ -181,9 +182,13 @@ def _merge_single_task(
             # For squash merge, create a commit message from the task
             commit_message = None
             if args.squash:
-                # Get a concise summary of the task
-                task_summary = truncate(task.prompt, MAX_PR_TITLE_LENGTH)
-                commit_message = f"Squash merge: {task_summary}\n\nTask #{task.id}: {task.prompt}"
+                assert task.id is not None, "Task ID must be set before squash merge commit"
+                commit_message = build_task_commit_message(
+                    task.prompt,
+                    task_id=task.id,
+                    task_slug=task.task_id,
+                    subject_prefix="Squash merge: ",
+                )
 
             git.merge(task.branch, squash=args.squash, commit_message=commit_message)
 
