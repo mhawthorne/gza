@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.learnings import regenerate_learnings, maybe_auto_regenerate_learnings
+from gza.learnings import LearningsResult, regenerate_learnings, maybe_auto_regenerate_learnings
 
 
 def _new_store(tmp_path: Path) -> SqliteTaskStore:
@@ -60,37 +60,95 @@ def test_regenerate_learnings_dedupes_items(tmp_path: Path):
 
 
 def test_auto_regenerate_only_on_interval(tmp_path: Path):
-    """Auto-regeneration should spawn background worker only on interval."""
+    """Auto-regeneration should spawn background update only on interval."""
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
     for i in range(4):
         task = store.add(f"Task {i}", task_type="implement")
-        store.mark_completed(task, output_content=f"- Learn {i}\n", has_commits=False)
+        store.mark_completed(task, output_content=f"- Learn pattern {i}\n", has_commits=False)
 
     with patch("gza.learnings.subprocess.Popen") as mock_popen:
         assert maybe_auto_regenerate_learnings(store, config, interval=5, window=10) is None
     mock_popen.assert_not_called()
 
     fifth = store.add("Task 5", task_type="implement")
-    store.mark_completed(fifth, output_content="- Learn 5\n", has_commits=False)
+    store.mark_completed(fifth, output_content="- Learn pattern 5\n", has_commits=False)
 
-    with patch("gza.learnings.subprocess.Popen") as mock_popen:
+    def _run_background_inline(*args, **kwargs):
+        with patch("gza.runner.run", return_value=1):
+            regenerate_learnings(store, config, window=10)
+        return MagicMock(pid=99999)
+
+    with patch("gza.learnings.subprocess.Popen", side_effect=_run_background_inline) as mock_popen:
         result = maybe_auto_regenerate_learnings(store, config, interval=5, window=10)
 
     assert result is None
     mock_popen.assert_called_once()
     args, kwargs = mock_popen.call_args
     cmd = args[0]
-    assert cmd[1:4] == ["-m", "gza", "work"]
-    assert "--worker-mode" in cmd
+    assert cmd[1:4] == ["-m", "gza", "learnings"]
+    assert "update" in cmd
+    assert "--window" in cmd
     assert "--project" in cmd
     assert kwargs["start_new_session"] is True
     assert kwargs["stdin"] == subprocess.DEVNULL
 
-    pending_internal_tasks = [t for t in store.get_pending() if t.task_type == "internal"]
-    assert len(pending_internal_tasks) == 1
-    assert pending_internal_tasks[0].skip_learnings is True
+    learnings_file = tmp_path / ".gza" / "learnings.md"
+    assert learnings_file.exists()
+    assert "Learn pattern 5" in learnings_file.read_text()
+
+
+def test_auto_regenerate_async_falls_back_to_regex_when_llm_fails(tmp_path: Path):
+    """Async path should still write learnings via regex fallback when LLM fails."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    for i in range(5):
+        task = store.add(f"Task {i}", task_type="implement")
+        store.mark_completed(task, output_content=f"- Regex fallback {i}\n", has_commits=False)
+
+    def _run_background_inline(*args, **kwargs):
+        with patch("gza.runner.run", side_effect=RuntimeError("provider failure")):
+            regenerate_learnings(store, config, window=10)
+        return MagicMock(pid=99998)
+
+    with patch("gza.learnings.subprocess.Popen", side_effect=_run_background_inline):
+        result = maybe_auto_regenerate_learnings(store, config, interval=5, window=10)
+
+    assert result is None
+    content = (tmp_path / ".gza" / "learnings.md").read_text()
+    assert "Regex fallback 0" in content
+
+
+def test_auto_regenerate_spawn_failure_runs_foreground_fallback(tmp_path: Path):
+    """Spawn failure should run foreground fallback and avoid stranded internal pending tasks."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    for i in range(5):
+        task = store.add(f"Task {i}", task_type="implement")
+        store.mark_completed(task, output_content=f"- Learn {i}\n", has_commits=False)
+
+    fallback_result = LearningsResult(
+        path=tmp_path / ".gza" / "learnings.md",
+        tasks_used=5,
+        learnings_count=5,
+        added_count=5,
+        removed_count=0,
+        retained_count=0,
+        churn_percent=500.0,
+    )
+
+    with patch("gza.learnings.subprocess.Popen", side_effect=OSError("spawn exploded")), \
+         patch("gza.learnings.regenerate_learnings", return_value=fallback_result) as mock_regen, \
+         patch("gza.learnings.console.print") as mock_print:
+        result = maybe_auto_regenerate_learnings(store, config, interval=5, window=10)
+
+    assert result == fallback_result
+    mock_regen.assert_called_once_with(store, config, window=10)
+    assert any("foreground regeneration fallback" in str(call.args[0]) for call in mock_print.call_args_list)
+    assert [t for t in store.get_pending() if t.task_type == "internal"] == []
 
 
 def test_regenerate_learnings_reports_delta_counts(tmp_path: Path):

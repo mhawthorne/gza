@@ -152,8 +152,6 @@ def _run_learnings_task(
     store: SqliteTaskStore,
     config: "Config",
     recent_tasks: list[Task],
-    *,
-    background: bool = False,
 ) -> list[str] | None:
     """Run an internal task to summarize learnings from recent task outputs.
 
@@ -176,37 +174,6 @@ def _run_learnings_task(
     if learn_task_id is None:
         return None
 
-    if background:
-        startup_log_path = config.workers_path / f"learnings-{learn_task_id}-startup.log"
-        startup_log_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            sys.executable,
-            "-m",
-            "gza",
-            "work",
-            "--worker-mode",
-            str(learn_task_id),
-            "--project",
-            str(config.project_dir.absolute()),
-        ]
-        try:
-            with startup_log_path.open("ab") as startup_log:
-                subprocess.Popen(
-                    cmd,
-                    stdout=startup_log,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                    cwd=config.project_dir,
-                )
-        except Exception as exc:
-            console.print(
-                "[yellow]LLM learnings background spawn failed: "
-                f"{exc}; falling back to regex extraction.[/yellow]"
-            )
-            return None
-        return None
-
     try:
         exit_code = _runner_mod.run(config, task_id=learn_task_id)
     except Exception as exc:
@@ -222,6 +189,37 @@ def _run_learnings_task(
 
     learnings = _extract_learnings_from_output(refreshed.output_content)
     return learnings if learnings else None
+
+
+def _spawn_background_learnings_update(config: "Config", window: int) -> bool:
+    """Start detached `gza learnings update` process.
+
+    Returns True when spawning succeeds. Returns False if process creation
+    fails; caller should run foreground fallback.
+    """
+    startup_log_path = config.workers_path / "learnings-update.startup.log"
+    startup_log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        "-m",
+        "gza",
+        "learnings",
+        "update",
+        "--window",
+        str(window),
+        "--project",
+        str(config.project_dir.absolute()),
+    ]
+    with startup_log_path.open("ab") as startup_log:
+        subprocess.Popen(
+            cmd,
+            stdout=startup_log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=config.project_dir,
+        )
+    return True
 
 
 def _append_history_entry(config: "Config", entry: dict) -> None:
@@ -319,6 +317,15 @@ def maybe_auto_regenerate_learnings(
         return None
 
     recent_tasks = store.get_recent_completed(limit=window)
-    if recent_tasks:
-        _run_learnings_task(store, config, recent_tasks, background=True)
+    if not recent_tasks:
+        return None
+
+    try:
+        _spawn_background_learnings_update(config, window)
+    except Exception as exc:
+        console.print(
+            "[yellow]LLM learnings background spawn failed: "
+            f"{exc}; running foreground regeneration fallback.[/yellow]"
+        )
+        return regenerate_learnings(store, config, window=window)
     return None
