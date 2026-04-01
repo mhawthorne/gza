@@ -1314,6 +1314,7 @@ class TestRebaseHelpers:
 
         with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops.load_dotenv") as mock_load_dotenv, \
              patch("pathlib.Path.exists", side_effect=[True, False]):
             mock_provider = Mock()
             mock_provider.run.return_value = RunResult(exit_code=0)
@@ -1322,6 +1323,7 @@ class TestRebaseHelpers:
             result = invoke_provider_resolve(task, "feature", "main", config)
 
         assert result is False
+        mock_load_dotenv.assert_called_once_with(tmp_path)
         internal_tasks = store.get_history(limit=None, task_type="internal")
         assert len(internal_tasks) == 1
         internal_task = internal_tasks[0]
@@ -1349,6 +1351,7 @@ class TestRebaseHelpers:
 
         with patch("gza.cli.ensure_skill", return_value=True), \
              patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops.load_dotenv"), \
              patch("pathlib.Path.exists", return_value=False):
             mock_provider = Mock()
             mock_provider.run.return_value = RunResult(exit_code=1)
