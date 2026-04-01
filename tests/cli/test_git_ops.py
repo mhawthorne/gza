@@ -1122,7 +1122,7 @@ class TestRebaseHelpers:
             assert mock_get_provider.call_count == 1
             resolve_config = mock_get_provider.call_args.args[0]
             assert resolve_config.provider == "codex"
-            assert resolve_config.use_docker is False
+            assert resolve_config.use_docker is config.use_docker
             mock_provider.run.assert_called_once()
             assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto --continue"
 
@@ -1197,6 +1197,30 @@ class TestRebaseHelpers:
             assert mock_get_provider.call_count == 1
             resolve_config = mock_get_provider.call_args.args[0]
             assert resolve_config.provider == "codex"
+
+    def test_invoke_provider_resolve_honors_use_docker_override(self, tmp_path):
+        """Auto-resolve should respect config.use_docker when launching provider."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="codex", use_docker=False)
+        task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("pathlib.Path.exists", return_value=False):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config)
+
+        assert result is True
+        resolve_config = mock_get_provider.call_args.args[0]
+        assert resolve_config.use_docker is False
 
     def test_invoke_provider_resolve_creates_internal_task_record(self, tmp_path):
         """Auto-resolve should persist an internal task so history/auditing can find it."""

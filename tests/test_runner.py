@@ -3755,6 +3755,54 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.status == "completed"
         assert summary_path.exists()
 
+    def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
+        """Rebase completion should force-push from the host runner."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        rebase_task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        rebase_task.task_id = "20260401-rebase-push"
+        store.mark_in_progress(rebase_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{rebase_task.task_id}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+
+        with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            rc = _complete_code_task(
+                rebase_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feat/parent",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "missing-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{rebase_task.task_id}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+                skip_commit=True,
+            )
+
+        assert rc == 0
+        worktree_git.push_force_with_lease.assert_called_once_with("feat/parent")
+        refreshed = store.get(rebase_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+
     def test_complete_code_task_uses_summary_for_commit_subject(self, tmp_path: Path):
         """Commit subject should come from worktree summary when present."""
         db_path = tmp_path / "test.db"

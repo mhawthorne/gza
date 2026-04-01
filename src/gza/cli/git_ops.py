@@ -375,8 +375,6 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
     from dataclasses import replace
     from ..providers import get_provider
 
-    # Always run directly (not in Docker) since we need access to the
-    # host's git rebase state on the local filesystem
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
     runtime = _resolve_runtime_skill_dir(config.project_dir, effective_provider)
@@ -395,7 +393,6 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
 
     resolve_config = replace(
         config,
-        use_docker=False,
         provider=effective_provider,
         model=effective_model or "",
         max_steps=effective_max_steps,
@@ -433,7 +430,10 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
         return False
 
     # Check if rebase completed (no longer in rebase state)
-    rebase_in_progress = Path(".git/rebase-merge").exists() or Path(".git/rebase-apply").exists()
+    rebase_in_progress = (
+        (config.project_dir / ".git" / "rebase-merge").exists()
+        or (config.project_dir / ".git" / "rebase-apply").exists()
+    )
     output_content = (
         "Resolved rebase conflicts with /gza-rebase --auto --continue."
         if not rebase_in_progress
