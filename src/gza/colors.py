@@ -44,9 +44,14 @@ from dataclasses import dataclass
 # dark and light backgrounds (pure white vanishes on light; pure black on dark).
 pink_prompt: str = "#ff99cc"
 
+blue_neon: str = "#00ffff"
+pink_neon: str = "#ffaaff"
+
 # Soft gray used for secondary/metadata text (task IDs, dates, labels).
 # Visible on dark terminals without the harsh contrast of white on light ones.
 gray_secondary: str = "#aaaaaa"
+
+gray_light1: str = "#eeeeee"
 
 # Standard ANSI colors — adapt reasonably to most terminal themes.
 blue_step: str = "blue"
@@ -154,11 +159,11 @@ class UnmergedColors:
 class NextColors:
     """Colors for the ``gza next`` command pending-task list."""
 
-    task_id: str = dim_secondary     # dim for task ID
-    prompt: str = pink_prompt        # pink for prompt text
-    type: str = magenta_tool         # magenta for task type
+    task_id: str = blue_neon
+    prompt: str = pink_neon
+    type: str = gray_light1
     blocked: str = yellow_warning    # yellow for blocked indicator
-    index: str = dim_secondary       # dim for row index
+    index: str = gray_light1
 
 
 # ---------------------------------------------------------------------------
