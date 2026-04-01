@@ -3880,7 +3880,7 @@ class TestExtractedRunInnerHelpers:
             (OSError("simulated read error"), "Failed to read summary file for commit subject"),
         ],
     )
-    def test_complete_code_task_commits_when_summary_read_fails(
+    def test_complete_code_task_commits_when_summary_subject_read_fails_then_copy_succeeds(
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
@@ -3949,6 +3949,87 @@ class TestExtractedRunInnerHelpers:
         commit_message = worktree_git.commit.call_args.args[0]
         assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
         assert expected_warning in caplog.text
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.output_content == "Copied summary content"
+
+    @pytest.mark.parametrize(
+        "summary_error",
+        [
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+            OSError("simulated persistent read error"),
+        ],
+    )
+    def test_complete_code_task_commits_when_summary_read_persistently_fails(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        summary_error: Exception,
+    ):
+        """Persistent summary read failures should not crash completion after commit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="   \n\t", task_type="implement")
+        task.task_id = "20260401-summary-read-persistent-failure"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.task_id}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("placeholder summary")
+
+        original_read_text = Path.read_text
+
+        def _always_failing_read_text(self: Path, *args, **kwargs):
+            if self == worktree_summary_path:
+                raise summary_error
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch.object(Path, "read_text", autospec=True, side_effect=_always_failing_read_text),
+            caplog.at_level("WARNING"),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        commit_message = worktree_git.commit.call_args.args[0]
+        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+        assert "Failed to read summary file for commit subject" in caplog.text
+        assert "Failed to read summary file for task completion output" in caplog.text
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.output_content is None
 
 
 class TestWriteLogEntry:

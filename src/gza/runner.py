@@ -1549,11 +1549,20 @@ def _complete_code_task(
     # Copy summary file from worktree to main project directory
     output_content = None
     if worktree_summary_path.exists():
-        # Ensure target directory exists
-        summary_dir.mkdir(parents=True, exist_ok=True)
-        # Copy summary content from worktree to project dir
-        summary_path.write_text(worktree_summary_path.read_text())
-        output_content = summary_path.read_text()
+        try:
+            summary_content = worktree_summary_path.read_text()
+        except (OSError, UnicodeError):
+            logger.warning(
+                "Failed to read summary file for task completion output at %s; continuing without output_content",
+                worktree_summary_path,
+                exc_info=True,
+            )
+        else:
+            # Ensure target directory exists
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            # Copy summary content from worktree to project dir
+            summary_path.write_text(summary_content)
+            output_content = summary_content
 
     # Compute diff stats vs. default branch before marking completed
     default_branch = worktree_git.default_branch()
