@@ -1667,29 +1667,31 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         git.reset_hard_head()
                         console.print("      [green]✓ Restored clean git state[/green]")
                     except GitError as cleanup_error:
-                        console.print(f"      [yellow]Warning: cleanup fallback failed: {cleanup_error}[/yellow]")
-                    if not task_branch:
-                        console.print(f"      [red]✗ Cannot rebase: task #{task.id} has no branch[/red]")
-                        error_count += 1
-                    else:
-                        rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
-                        assert rebase_task.id is not None
                         console.print(
-                            f"      [green]✓ Created rebase task #{rebase_task.id} "
-                            f"(target: {target_branch})[/green]"
+                            f"      [red]✗ Cleanup failed after merge conflict: {cleanup_error}. "
+                            f"Manual intervention required.[/red]"
                         )
-                        worker_args = argparse.Namespace(
-                            no_docker=getattr(args, 'no_docker', False),
-                            max_turns=None,
-                        )
-                        rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
-                        workers_started += 1
-                        if rebase_rc == 0:
-                            console.print(f"      [green]✓ Started rebase worker[/green]")
-                            success_count += 1
-                        else:
-                            console.print(f"      [red]✗ Failed to start rebase worker[/red]")
-                            error_count += 1
+                        error_count += 1
+                        continue
+                    assert task_branch is not None  # guaranteed by conflict_detected guard
+                    rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
+                    assert rebase_task.id is not None
+                    console.print(
+                        f"      [green]✓ Created rebase task #{rebase_task.id} "
+                        f"(target: {target_branch})[/green]"
+                    )
+                    worker_args = argparse.Namespace(
+                        no_docker=getattr(args, 'no_docker', False),
+                        max_turns=None,
+                    )
+                    rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+                    workers_started += 1
+                    if rebase_rc == 0:
+                        console.print(f"      [green]✓ Started rebase worker[/green]")
+                        success_count += 1
+                    else:
+                        console.print(f"      [red]✗ Failed to start rebase worker[/red]")
+                        error_count += 1
                 else:
                     console.print(f"      [red]✗ Merge failed[/red]")
                     error_count += 1

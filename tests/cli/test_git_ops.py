@@ -2080,6 +2080,65 @@ class TestAdvanceCommand:
         assert len(rebases) == 1
         assert "onto 'main'" in rebases[0].prompt
 
+    def test_advance_merge_conflict_fallback_reset_failure_is_hard_error(self, tmp_path: Path):
+        """When reset_hard_head fails, advance increments error_count and skips rebase task creation."""
+        from gza.db import SqliteTaskStore
+        from gza.cli import cmd_advance
+        from gza.git import GitError
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = store.add("Explore fallback reset failure", task_type="explore")
+        branch = f"feat/task-{task.id}"
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Commit for task {task.id}")
+        git._run("checkout", "main")
+        task.status = "completed"
+        task.completed_at = datetime.now(timezone.utc)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+        )
+
+        output_lines: list[str] = []
+
+        def capture_print(msg: str = "", **kwargs: object) -> None:
+            output_lines.append(str(msg))
+
+        with patch("gza.cli._determine_advance_action", return_value={"type": "merge", "description": "Merge"}):
+            with patch("gza.cli._merge_single_task", return_value=1):
+                with patch("gza.git.Git.can_merge", return_value=False):
+                    with patch("gza.git.Git.reset_hard_head", side_effect=GitError("reset failed")):
+                        with patch("gza.cli._spawn_background_worker", return_value=0) as mock_spawn:
+                            from rich.console import Console
+                            with patch("gza.cli.git_ops.console") as mock_console:
+                                mock_console.print.side_effect = capture_print
+                                rc = cmd_advance(args)
+
+        # No rebase task should be created
+        rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
+        assert len(rebases) == 0
+        # No background worker spawned for rebase
+        mock_spawn.assert_not_called()
+        # Output should contain a red error message about failed cleanup
+        combined = "\n".join(output_lines)
+        assert "Cleanup failed" in combined or "Manual intervention" in combined
+
     def test_advance_skips_task_with_in_progress_rebase_child(self, tmp_path: Path):
         """advance skips a task when a rebase child is already in progress."""
         from gza.db import SqliteTaskStore
