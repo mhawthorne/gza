@@ -20,7 +20,6 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
   - If no rebase is in progress, stop and report that `git rebase --continue` cannot proceed.
 - `--auto` mode: unattended rebase for background workers. Same as default mode but:
   - Do NOT use AskUserQuestion — resolve all conflicts autonomously using best judgment.
-  - After successful rebase, run `git push --force-with-lease` automatically.
   - If a conflict is truly ambiguous and cannot be resolved confidently, abort the rebase and report failure.
 
 ### Step 1: Pre-flight checks
@@ -76,11 +75,11 @@ If changes were stashed in Step 1, run `git stash pop` to restore them.
 Show:
 - "Rebase completed successfully!"
 - Number of conflicts resolved
-- The command to push: `git push --force-with-lease`
+- If not in `--auto` mode, remind the user to push with `git push --force-with-lease`
 
 ## Important notes
 
-- **Never force-push automatically** (unless in `--auto` mode) - always let the user do this manually
+- **Never force-push automatically** - always let the caller/user do this manually
 - **Always ask before resolving ambiguous conflicts** (unless in `--auto` mode) - if the intent isn't clear, ask
 - **Preserve both changes when possible** - most conflicts in this project are additive (both sides adding new code)
 - **Check Python syntax after each resolution** - catch errors early

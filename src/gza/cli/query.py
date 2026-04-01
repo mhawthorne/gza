@@ -184,8 +184,14 @@ def cmd_history(args: argparse.Namespace) -> int:
     end_date = getattr(args, 'end_date', None)
     lineage_depth = getattr(args, 'lineage_depth', 0)
 
+    # If a date-based filter is active and --last/-n wasn't explicitly provided,
+    # don't cap results with the default limit.
+    has_date_filter = days is not None or start_date is not None or end_date is not None
+    explicit_last = '--last' in sys.argv or '-n' in sys.argv
+    limit = args.last if (explicit_last or not has_date_filter) else None
+
     f = HistoryFilter(
-        limit=args.last,
+        limit=limit,
         status=status,
         task_type=task_type,
         incomplete=incomplete,

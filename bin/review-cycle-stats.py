@@ -251,8 +251,9 @@ def main() -> int:
     for root_id, review_dates in root_reviews.items():
         if root_id not in seen_roots:
             continue
+        # Group by when the first review happened, not when the impl was created
         earliest = min(review_dates)
-        wk = week_label(tasks[root_id]["created_at"])
+        wk = week_label(earliest)
         week_data[wk]["reviews"] += len(review_dates)
         week_data[wk]["reviewed_cycles"].append(len(review_dates))
 
@@ -303,10 +304,12 @@ def main() -> int:
     # Distribution (reviewed tasks only)
     if all_reviewed_cycles:
         dist = Counter(all_reviewed_cycles)
+        total = len(all_reviewed_cycles)
         print(f"\nCycle distribution (reviewed tasks only):")
         for count in sorted(dist.keys()):
+            pct = dist[count] / total * 100
             bar = "#" * dist[count]
-            print(f"  {count} cycles: {dist[count]:>3} impls  {bar}")
+            print(f"  {count} cycles: {dist[count]:>3} ({pct:4.0f}%)  {bar}")
 
     # Per-model review cycle stats
     # For each root impl, determine the predominant review model
@@ -337,6 +340,7 @@ def main() -> int:
     if args.issues and review_content:
         print(f"\nParsing issue counts from {len(review_content)} review(s)...")
         model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        unparsed: list[int] = []
         for ri in ri_tasks:
             if ri["task_type"] != "review":
                 continue
@@ -345,9 +349,12 @@ def main() -> int:
                 continue
             must_fix, sugg = count_review_issues(content)
             if must_fix == 0 and sugg == 0:
-                print(f"  warning: could not parse issues from review #{ri['id']} ({ri['model'] or 'unknown'})", file=sys.stderr)
+                unparsed.append(ri["id"])
             model = ri["model"] or "unknown"
             model_issues[model].append((must_fix, sugg))
+        if unparsed:
+            ids = ", ".join(f"#{i}" for i in unparsed)
+            print(f"\nwarning: could not parse issues from {len(unparsed)} review(s): {ids}", file=sys.stderr)
 
         if model_issues:
             print(f"\nIssue counts per review (parsed from markdown)")

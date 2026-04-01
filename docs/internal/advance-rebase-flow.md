@@ -26,7 +26,8 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
 - Resolve the branch via `_resolve_code_task_branch_name` (follows `based_on` chain to find parent's branch)
 - Set up a worktree on that branch
 - Run the provider (Claude) which invokes `/gza-rebase --auto`
-- On completion, `skip_commit=True` is set (rebase tasks don't need to auto-commit)
+- On completion, `skip_commit=True` is set (rebase tasks don't need runner commits)
+- After completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
 
 ## Docker considerations
 

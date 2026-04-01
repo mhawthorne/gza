@@ -1459,7 +1459,7 @@ def _complete_code_task(
 
     Args:
         skip_commit: If True, skip staging/committing changes. Used for rebase
-            tasks where the agent handles all git operations (rebase + force push)
+            tasks where the agent handles rebases directly
             and no new commits should be created by the runner.
     """
     if skip_commit:
@@ -1605,6 +1605,11 @@ def _complete_code_task(
     # may have introduced changes not covered by prior reviews.
     if task.task_type == "rebase" and task.based_on:
         store.invalidate_review_state(task.based_on)
+
+    # Rebase tasks run provider-side conflict resolution in the worktree.
+    # Force-push from the host runner so SSH/auth follows host environment.
+    if task.task_type == "rebase":
+        worktree_git.push_force_with_lease(branch_name)
 
     console.print("")
     success_message("Done")

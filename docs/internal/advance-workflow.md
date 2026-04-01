@@ -177,11 +177,11 @@ When advance detects merge conflicts:
    - Stashes any uncommitted changes
    - Fetches and rebases onto the target branch
    - Resolves conflicts autonomously
-   - Force-pushes the rebased branch
    - Restores stashed changes
-5. On completion: advance sees no more conflicts on next run
-6. If a completed rebase is newer than the latest review → advance creates a fresh review before merging
-7. If the rebase task fails → advance reports `needs_discussion` (no automatic retry)
+5. On completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
+6. Advance sees no more conflicts on next run
+7. If a completed rebase is newer than the latest review → advance creates a fresh review before merging
+8. If the rebase task fails → advance reports `needs_discussion` (no automatic retry)
 
 ### Docker considerations
 
