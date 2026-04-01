@@ -9,6 +9,13 @@ from pathlib import Path
 
 from rich.markup import escape as rich_escape
 
+from ..colors import (
+    blue_step,
+    dim_secondary,
+    pink_prompt,
+    LOG_TASK_STATUS_COLORS,
+    LOG_WORKER_STATUS_COLORS,
+)
 from ..config import Config
 from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
@@ -302,7 +309,7 @@ class _LiveLogPrinter:
                 else:
                     console.print(
                         f"| Step {self._step_count} |",
-                        style="blue",
+                        style=blue_step,
                     )
 
             raw_content = message.get("content", [])
@@ -336,7 +343,7 @@ class _LiveLogPrinter:
                         if is_error:
                             self._fmt.print_error(result)
                         else:
-                            console.print(rich_escape(result), style="dim", soft_wrap=True)
+                            console.print(rich_escape(result), style=dim_secondary, soft_wrap=True)
 
         elif entry_type == "gza":
             subtype = entry.get("subtype", "")
@@ -368,7 +375,7 @@ class _LiveLogPrinter:
             else:
                 console.print(
                     f"| Step {self._step_count} |",
-                    style="blue",
+                    style=blue_step,
                 )
 
         elif entry_type == "item.completed":
@@ -393,7 +400,7 @@ class _LiveLogPrinter:
                     if is_error:
                         self._fmt.print_error(output)
                     else:
-                        console.print(rich_escape(output), style="dim", soft_wrap=True)
+                        console.print(rich_escape(output), style=dim_secondary, soft_wrap=True)
 
         elif entry_type == "result":
             is_error = entry.get("is_error", False)
@@ -976,9 +983,9 @@ def cmd_log(args: argparse.Namespace) -> int:
     console.print(_sep, soft_wrap=True)
     if task:
         prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
-        console.print(f"[#ff99cc]Task: {rich_escape(prompt_display)}[/#ff99cc]", soft_wrap=True)
+        console.print(f"[{pink_prompt}]Task: {rich_escape(prompt_display)}[/{pink_prompt}]", soft_wrap=True)
         console.print(f"[cyan]ID:[/cyan] {task.id} | [cyan]Slug:[/cyan] {rich_escape(task.task_id or '')}", soft_wrap=True)
-        _status_color = {"completed": "green", "unmerged": "green", "failed": "red", "dropped": "red", "in_progress": "yellow"}.get(task.status, "")
+        _status_color = LOG_TASK_STATUS_COLORS.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
         console.print(f"[cyan]Status:[/cyan] {_status_val}", soft_wrap=True)
         if resolution_note:
@@ -994,13 +1001,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         if is_running and _w_status != "running":
             # Prefer live process state when worker metadata is stale.
             _w_status = "running"
-        _w_color = {
-            "running": "yellow",
-            "in_progress": "yellow",
-            "completed": "green",
-            "failed": "red",
-            "stale": "yellow",
-        }.get(_w_status, "white")
+        _w_color = LOG_WORKER_STATUS_COLORS.get(_w_status, "white")
         console.print(f"[cyan]Status:[/cyan] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
         console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
         if using_startup_log:

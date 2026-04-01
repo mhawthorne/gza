@@ -25,6 +25,7 @@ from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
+from .colors import REVIEW_VERDICT_COLORS
 from .review_verdict import parse_review_verdict
 from .review_tasks import DuplicateReviewError, create_review_task
 
@@ -2153,11 +2154,7 @@ def _run_non_code_task(
         if task.task_type == "review":
             verdict = _extract_review_verdict(output_content)
             if verdict:
-                verdict_color = {
-                    "APPROVED": "green",
-                    "CHANGES_REQUESTED": "yellow",
-                    "NEEDS_DISCUSSION": "blue",
-                }.get(verdict, "white")
+                verdict_color = REVIEW_VERDICT_COLORS.get(verdict, "white")
                 console.print(f"Verdict: [{verdict_color}]{verdict}[/{verdict_color}]")
         console.print("")
 
