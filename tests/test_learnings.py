@@ -7,7 +7,13 @@ from unittest.mock import patch, MagicMock
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.learnings import LearningsResult, regenerate_learnings, maybe_auto_regenerate_learnings
+from gza.learnings import (
+    LearningsResult,
+    _build_summarization_prompt,
+    _extract_learnings_from_output,
+    regenerate_learnings,
+    maybe_auto_regenerate_learnings,
+)
 
 
 def _new_store(tmp_path: Path) -> SqliteTaskStore:
@@ -151,14 +157,18 @@ def test_auto_regenerate_spawn_failure_runs_foreground_fallback(tmp_path: Path):
 
 
 def test_regenerate_learnings_reports_delta_counts(tmp_path: Path):
-    """Delta metrics should reflect previous vs regenerated learnings."""
+    """Delta metrics should reflect previous vs regenerated learnings.
+
+    With the fallback path (LLM fails), existing learnings are preserved and new
+    bullets appended (deduplicated), so nothing is removed.
+    """
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
     learnings_path = tmp_path / ".gza" / "learnings.md"
     learnings_path.parent.mkdir(parents=True, exist_ok=True)
     learnings_path.write_text(
-        "# Project Learnings\n\n## Recent Patterns\n- Keep old pattern\n- Remove this\n"
+        "# Project Learnings\n\n## Recent Patterns\n- Keep old pattern\n- Existing stable\n"
     )
 
     task = store.add("Task", task_type="implement")
@@ -169,10 +179,11 @@ def test_regenerate_learnings_reports_delta_counts(tmp_path: Path):
     )
 
     result = regenerate_learnings(store, config, window=10)
-    assert result.retained_count == 1
-    assert result.added_count == 1
-    assert result.removed_count == 1
-    assert result.churn_percent == 100.0
+    # Fallback preserves existing + appends new: ["Keep old pattern", "Existing stable", "Add new pattern"]
+    assert result.retained_count == 2  # both existing items kept
+    assert result.added_count == 1     # "Add new pattern" is new
+    assert result.removed_count == 0   # nothing removed in fallback
+    assert result.churn_percent == 50.0
 
 
 def test_regenerate_learnings_writes_history_log(tmp_path: Path):
@@ -383,3 +394,88 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
         _run_non_code_task(internal_task, config, store, mock_provider, mock_git)
 
     mock_auto.assert_not_called()
+
+
+def test_extract_learnings_ignores_headers(tmp_path: Path):
+    """Header lines must not produce 'Prefer following documented X' garbage."""
+    output = (
+        "# Summary\n"
+        "## Testing Patterns\n"
+        "### Recent Changes\n"
+        "- Use pytest fixtures for database setup\n"
+        "- Run uv run pytest before finishing\n"
+    )
+    results = _extract_learnings_from_output(output)
+    assert all("Prefer following documented" not in item for item in results)
+    assert "Use pytest fixtures for database setup" in results
+    assert "Run uv run pytest before finishing" in results
+    assert len(results) == 2
+
+
+def test_build_summarization_prompt_includes_existing_learnings():
+    """Prompt must include existing learnings for incremental update."""
+    from gza.db import Task
+    existing = "- Always use uv run pytest\n- Never commit secrets"
+    tasks: list[Task] = []
+    prompt = _build_summarization_prompt(tasks, existing_learnings=existing)
+    assert "Always use uv run pytest" in prompt
+    assert "Never commit secrets" in prompt
+    assert "ADD new patterns" in prompt
+    assert "KEEP existing learnings" in prompt
+    assert "Do NOT include" in prompt
+    assert "No headers, no numbering" in prompt
+
+
+def test_build_summarization_prompt_no_existing_learnings():
+    """Prompt must say 'No existing learnings.' when file is empty."""
+    from gza.db import Task
+    tasks: list[Task] = []
+    prompt = _build_summarization_prompt(tasks)
+    assert "No existing learnings." in prompt
+
+
+def test_fallback_preserves_existing_learnings_when_llm_fails(tmp_path: Path):
+    """When LLM fails, fallback must append new bullets to existing learnings (not replace)."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    learnings_path = tmp_path / ".gza" / "learnings.md"
+    learnings_path.parent.mkdir(parents=True, exist_ok=True)
+    learnings_path.write_text(
+        "# Project Learnings\n\n## Recent Patterns\n- Existing stable learning\n"
+    )
+
+    task = store.add("Task one", task_type="implement")
+    store.mark_completed(task, output_content="- New learning from task\n", has_commits=False)
+
+    with patch("gza.runner.run", return_value=1):
+        result = regenerate_learnings(store, config, window=10)
+
+    content = result.path.read_text()
+    assert "Existing stable learning" in content
+    assert "New learning from task" in content
+
+
+def test_config_learnings_fields_default():
+    """Config must have learnings_window=25 and learnings_interval=5 by default."""
+    config = Config(project_dir=Path("/tmp"), project_name="test")
+    assert config.learnings_window == 25
+    assert config.learnings_interval == 5
+
+
+def test_maybe_auto_regenerate_uses_config_interval_and_window(tmp_path: Path):
+    """maybe_auto_regenerate_learnings should read interval/window from config."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+    config.learnings_interval = 3
+    config.learnings_window = 20
+
+    for i in range(3):
+        task = store.add(f"Task {i}", task_type="implement")
+        store.mark_completed(task, output_content=f"- Pattern {i}\n", has_commits=False)
+
+    with patch("gza.learnings._spawn_background_learnings_update") as mock_spawn:
+        result = maybe_auto_regenerate_learnings(store, config)
+
+    mock_spawn.assert_called_once_with(config, 20)
+    assert result is None

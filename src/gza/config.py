@@ -59,6 +59,8 @@ DEFAULT_CLEANUP_DAYS = 30
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
+DEFAULT_LEARNINGS_WINDOW = 25
+DEFAULT_LEARNINGS_INTERVAL = 5
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -323,6 +325,8 @@ class Config:
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+    learnings_window: int = DEFAULT_LEARNINGS_WINDOW
+    learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
     tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
@@ -929,6 +933,20 @@ class Config:
         if review_context_file_limit < 1:
             raise ConfigError("review_context_file_limit must be a positive integer")
 
+        try:
+            learnings_window = int(data.get("learnings_window", DEFAULT_LEARNINGS_WINDOW))
+        except (TypeError, ValueError):
+            raise ConfigError("learnings_window must be a positive integer")
+        if learnings_window < 1:
+            raise ConfigError("learnings_window must be a positive integer")
+
+        try:
+            learnings_interval = int(data.get("learnings_interval", DEFAULT_LEARNINGS_INTERVAL))
+        except (TypeError, ValueError):
+            raise ConfigError("learnings_interval must be a non-negative integer")
+        if learnings_interval < 0:
+            raise ConfigError("learnings_interval must be a non-negative integer")
+
         # Parse tmux configuration
         tmux_data = data.get("tmux") or {}
         if not isinstance(tmux_data, dict):
@@ -1010,6 +1028,8 @@ class Config:
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
+            learnings_window=learnings_window,
+            learnings_interval=learnings_interval,
             tmux=tmux_config,
             source_map=source_map,
             local_override_path=local_override_path,
