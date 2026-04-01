@@ -24,7 +24,7 @@ from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
 from ..prompts import PromptBuilder
-from ..runner import get_effective_config_for_task
+from ..runner import get_effective_config_for_task, load_dotenv
 from .. import runner as runner_mod
 
 from gza.query import (
@@ -404,6 +404,7 @@ def invoke_provider_resolve(task: DbTask, branch: str, target: str, config: Conf
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_file = log_dir / f"resolve-{timestamp}.log"
 
+    load_dotenv(config.project_dir)
     provider = get_provider(resolve_config)
     store = get_store(config)
     task_id_label = getattr(task, "id", None)
