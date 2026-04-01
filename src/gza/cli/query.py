@@ -47,11 +47,12 @@ from ..query import (
     TaskLineageNode,
 )
 from ..colors import (
+    LINEAGE_COLORS,
     LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS,
     PS_STATUS_COLORS,
     SHOW_COLORS_DICT,
     UNMERGED_COLORS_DICT,
-    pink_prompt,
+    pink,
     CYCLE_STATUS_COLORS,
 )
 
@@ -412,7 +413,6 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         c = UNMERGED_COLORS  # shorthand
         lineage_str = _format_lineage(
             filtered_lineage_tree,
-            c["task_id"],
             annotate=True,
             review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
         )
@@ -505,18 +505,18 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 commit_count = git.count_commits_ahead(branch, default_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
-                branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
+                branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
                 if diff_str:
-                    branch_detail += f", [{c['task_id']}]{diff_str}[/{c['task_id']}]"
+                    branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
             else:
                 revision_range = f"{default_branch}...{branch}"
                 files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
                 commit_count = git.count_commits_ahead(branch, default_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
-                branch_detail = f"[{c['task_id']}]{commit_count} {commits_label}[/{c['task_id']}]"
+                branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
                 if diff_str:
-                    branch_detail += f", [{c['task_id']}]{diff_str}[/{c['task_id']}]"
+                    branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
             console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ({branch_detail})")
             if not git.can_merge(branch, default_branch):
                 console.print("[yellow]⚠️  has conflicts[/yellow]")
@@ -745,7 +745,7 @@ def _print_ps_output(
         console.print(
             f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
             f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
-            f"[{pink_prompt}]{task_display}[/{pink_prompt}]",
+            f"[{pink}]{task_display}[/{pink}]",
             soft_wrap=True,
         )
 
@@ -843,7 +843,7 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
         type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        console.print(f"   [cyan](#{task.id})[/cyan] {type_label}[{pink_prompt}]{prompt_display}[/{pink_prompt}]")
+        console.print(f"   [cyan](#{task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
     console.print("   Run [cyan]gza work <id>[/cyan] to resume, or [cyan]gza mark-completed --force <id>[/cyan] to clear.")
 
 
@@ -1195,25 +1195,26 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         first_line = t.prompt.split("\n")[0].strip()
         prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
 
+        lc = LINEAGE_COLORS
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        rel_part = f" [dim]{rich_escape(f'[{rel}]')}[/dim]" if rel else ""
+        rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel else ""
 
         stats = format_stats(t)
-        stats_part = f" [cyan]({stats})[/cyan]" if stats else ""
+        stats_part = f" [{lc.stats}]({stats})[/{lc.stats}]" if stats else ""
 
         status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
 
         label = (
-            f"[dim]#{t.id}[/dim]"
-            f" [magenta]{rich_escape(type_str)}[/magenta]"
+            f"[{lc.task_id}]#{t.id}[/{lc.task_id}]"
+            f" [{lc.type_label}]{rich_escape(type_str)}[/{lc.type_label}]"
             f" [{status_color}]{rich_escape(status)}[/{status_color}]"
             f"{rel_part}"
-            f"  [{pink_prompt}]'{rich_escape(prompt_short)}'[/{pink_prompt}]"
+            f"  [{lc.prompt}]'{rich_escape(prompt_short)}'[/{lc.prompt}]"
             f"{stats_part}"
         )
 
         if is_target:
-            label = f"[bold]→ {label}[/bold]"
+            label = f"[{lc.target_highlight}]→ {label}[/{lc.target_highlight}]"
 
         return label
 

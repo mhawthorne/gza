@@ -144,7 +144,7 @@ def prune_terminal_dead_workers(config: Config) -> None:
 
 
 # Shared color palette for history and stats output — defined in gza.colors.
-from gza.colors import TASK_COLORS_DICT as TASK_COLORS
+from gza.colors import LINEAGE_COLORS, TASK_COLORS_DICT as TASK_COLORS
 
 
 def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
@@ -769,12 +769,15 @@ from ..query import TaskLineageNode as _TaskLineageNode
 
 def _format_lineage(
     lineage_tree: _TaskLineageNode,
-    task_id_color: str = "dim",
+    task_id_color: str | None = None,
     *,
     annotate: bool = False,
     review_verdict_resolver: Callable[[DbTask], str | None] | None = None,
 ) -> str:
     """Format a lineage tree as a multi-line branch rendering."""
+    lc = LINEAGE_COLORS
+    # Allow callers to override task_id color (e.g. unmerged passes its own)
+    _task_id_color = task_id_color if task_id_color is not None else lc.task_id
 
     def _normalize_time(value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -832,14 +835,14 @@ def _format_lineage(
             if latest_review_task_id is not None and task.id == latest_review_task_id:
                 verdict_label = f"{verdict_label} \u2190 latest"
 
-        return f" [dim]({completed_label} | {status_label} | {verdict_label})[/dim]"
+        return f" [{lc.annotation}]({completed_label} | {status_label} | {verdict_label})[/{lc.annotation}]"
 
     def _node_label(task: DbTask) -> str:
         if task.id is None:
-            return f"[dim]\\[{task.task_type}][/dim]{_annotation(task)}"
+            return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{_annotation(task)}"
         return (
-            f"[{task_id_color}]#{task.id}[/{task_id_color}]"
-            f"[dim]\\[{task.task_type}][/dim]"
+            f"[{_task_id_color}]#{task.id}[/{_task_id_color}]"
+            f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]"
             f"{_annotation(task)}"
         )
 

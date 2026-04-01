@@ -40,10 +40,10 @@ def test_import_dict_variants() -> None:
 
 def test_import_base_palette() -> None:
     from gza.colors import (  # noqa: F401
-        pink_prompt,
+        pink,
         gray_secondary,
         blue_step,
-        cyan_header,
+        cyan,
         green_success,
         yellow_warning,
         red_error,

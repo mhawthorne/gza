@@ -6,7 +6,7 @@ log display, next/pending lists, and review verdicts. Colors are chosen for
 readability on both dark and light terminal backgrounds.
 
 ## Terminal Compatibility Notes
-- ``#ff99cc`` (pink_prompt): Chosen specifically for prompt text — readable on
+- ``#ff99cc`` (pink): Chosen specifically for prompt text — readable on
   both dark (white-on-dark) and light (dark-on-light) terminals where pure
   white or pure black would be invisible.
 - ``#aaaaaa`` (gray_secondary): Soft gray visible on dark backgrounds; avoids
@@ -40,11 +40,13 @@ from dataclasses import dataclass
 # Base palette — logical semantic names mapped to Rich color strings
 # ---------------------------------------------------------------------------
 
-# Pink used for prompt text — chosen for cross-terminal readability on both
-# dark and light backgrounds (pure white vanishes on light; pure black on dark).
-pink_prompt: str = "#ff99cc"
+# Readable on both dark and light backgrounds (pure white vanishes on light;
+# pure black on dark).
+pink: str = "#ff99cc"
 
 blue_neon: str = "#00ffff"
+blue_bright: str = "#00aaff"
+
 pink_neon: str = "#ffaaff"
 
 # Soft gray used for secondary/metadata text (task IDs, dates, labels).
@@ -55,8 +57,11 @@ gray_light1: str = "#eeeeee"
 
 # Standard ANSI colors — adapt reasonably to most terminal themes.
 blue_step: str = "blue"
-cyan_header: str = "cyan"
-green_success: str = "green"
+cyan: str = "cyan"
+
+# green_success: str = "green"
+green_success: str = "#00ff88"
+
 yellow_warning: str = "yellow"
 red_error: str = "red"
 magenta_tool: str = "magenta"
@@ -70,6 +75,9 @@ bold_cyan_heading: str = "bold cyan"
 bold_red_error: str = "bold red"
 dim_yellow_note: str = "dim yellow"
 
+purple: str = "#cc88ff"
+orange: str = "#ffcc44"
+
 
 # ---------------------------------------------------------------------------
 # Per-domain color dataclasses
@@ -81,9 +89,9 @@ class TaskColors:
     """Colors for task history / stats output (``gza history``, ``gza stats``)."""
 
     task_id: str = gray_secondary    # light gray for task ID and date
-    prompt: str = pink_prompt        # pink for prompt text
-    branch: str = cyan_header        # cyan for branch name
-    stats: str = cyan_header         # cyan for stats line
+    prompt: str = pink        # pink for prompt text
+    branch: str = cyan        # cyan for branch name
+    stats: str = cyan         # cyan for stats line
     success: str = green_success     # green for completed (✓)
     failure: str = red_error         # red for failed (✗)
     unmerged: str = yellow_warning   # yellow for unmerged (⚡)
@@ -101,7 +109,7 @@ class StatusColors:
     completed: str = green_success   # green
     failed: str = red_error          # red
     pending: str = yellow_warning    # yellow
-    in_progress: str = cyan_header   # cyan
+    in_progress: str = cyan   # cyan
     unmerged: str = yellow_warning   # yellow
     dropped: str = red_error         # red
     stale: str = yellow_warning      # yellow
@@ -131,11 +139,11 @@ class ShowColors:
     label: str = dim_secondary        # dim for field labels
     value: str = bold_heading         # bold adapts to terminal background
     task_id: str = dim_secondary      # dim adapts to terminal background
-    prompt: str = pink_prompt         # pink works on dark and light backgrounds
-    branch: str = cyan_header         # cyan visible on dark and light
-    stats: str = cyan_header          # cyan visible on dark and light
+    prompt: str = pink         # pink works on dark and light backgrounds
+    branch: str = cyan         # cyan visible on dark and light
+    stats: str = cyan          # cyan visible on dark and light
     status_pending: str = yellow_warning   # yellow for pending
-    status_running: str = cyan_header      # cyan for running/in_progress
+    status_running: str = cyan      # cyan for running/in_progress
     status_completed: str = green_success  # green for completed
     status_failed: str = red_error         # red for failed
     status_default: str = bold_heading     # bold adapts to terminal background
@@ -145,14 +153,31 @@ class ShowColors:
 class UnmergedColors:
     """Colors for the ``gza unmerged`` command task list."""
 
-    task_id: str = dim_secondary     # dim adapts to terminal background
-    prompt: str = pink_prompt        # pink works on dark and light
-    stats: str = cyan_header         # cyan visible on dark and light
-    branch: str = cyan_header        # cyan for branch name
+    task_id: str = blue_neon
+    prompt: str = pink_neon
+    stats: str = purple
+    branch: str = cyan        # cyan for branch name
     review_approved: str = green_success      # green for approved
     review_changes: str = yellow_warning      # yellow for changes requested
-    review_discussion: str = cyan_header      # cyan for discussion
+    review_discussion: str = cyan      # cyan for discussion
     review_none: str = dim_yellow_note        # dim yellow for no review
+
+
+@dataclass(frozen=True)
+class LineageColors:
+    """Colors for lineage tree rendering (``_format_lineage`` and ``gza lineage``)."""
+
+    task_id: str = blue_bright       # blue for task ID in tree nodes
+    task_type: str = orange
+    # annotation: str = dim_secondary  # dim for annotation metadata
+    annotation: str = gray_light1
+    connector: str = dim_secondary   # dim for tree branch connectors (├── └──)
+    # cmd_lineage-specific colors
+    type_label: str = "magenta"      # magenta for task type in gza lineage
+    stats: str = cyan
+    prompt: str = pink        # pink for prompt text
+    relationship: str = dim_secondary  # dim for relationship labels
+    target_highlight: str = bold_heading  # bold for the target task
 
 
 @dataclass(frozen=True)
@@ -175,6 +200,7 @@ STATUS_COLORS = StatusColors()
 WORK_OUTPUT_COLORS = WorkOutputColors()
 SHOW_COLORS = ShowColors()
 UNMERGED_COLORS = UnmergedColors()
+LINEAGE_COLORS = LineageColors()
 NEXT_COLORS = NextColors()
 
 # ---------------------------------------------------------------------------
@@ -188,6 +214,7 @@ STATUS_COLORS_DICT: dict[str, str] = dataclasses.asdict(STATUS_COLORS)
 WORK_OUTPUT_COLORS_DICT: dict[str, str] = dataclasses.asdict(WORK_OUTPUT_COLORS)
 SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
+LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
 NEXT_COLORS_DICT: dict[str, str] = dataclasses.asdict(NEXT_COLORS)
 
 # Lineage-status dict (subset of StatusColors, keyed by status string)
@@ -243,7 +270,7 @@ REVIEW_VERDICT_COLORS: dict[str, str] = {
 # Cycle-status colors for the ``gza show`` cycle state display.
 # Keys are cycle status strings as stored in the database.
 CYCLE_STATUS_COLORS: dict[str, str] = {
-    "active": cyan_header,
+    "active": cyan,
     "approved": green_success,
     "maxed_out": yellow_warning,
     "blocked": red_error,
