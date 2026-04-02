@@ -239,10 +239,14 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
 def load_dotenv(project_dir: Path) -> None:
     """Load .env files from project .gza dir, project root, and home directory.
 
-    Load order (highest priority first — later sources do not override earlier ones):
-    1. <project_dir>/.gza/.env (project-specific, shared across worktrees via symlink)
-    2. <project_dir>/.env (root override for backwards compat)
-    3. ~/.{APP_NAME}/.env (home defaults, lowest priority)
+    Load order (lowest priority first — higher-priority sources are loaded last and
+    use override=True to win over shell environment variables and earlier sources):
+    1. ~/.{APP_NAME}/.env (home defaults, lowest priority; uses setdefault)
+    2. <project_dir>/.env (overrides shell vars and home defaults)
+    3. <project_dir>/.gza/.env (highest priority; overrides project .env and shell vars)
+
+    Shell environment variables are preserved unless overridden by sources loaded
+    with override=True (i.e., project .env and .gza/.env).
     """
     def _load(path: Path, override: bool) -> None:
         if not path.exists():
@@ -261,14 +265,14 @@ def load_dotenv(project_dir: Path) -> None:
                     else:
                         os.environ.setdefault(k, v)
 
+    # Lowest priority: home ~/.{APP_NAME}/.env (does not override shell or project values)
+    _load(Path.home() / f".{APP_NAME}" / ".env", override=False)
+
+    # Mid priority: project root .env (overrides shell and home; backwards compat)
+    _load(project_dir / ".env", override=True)
+
     # Highest priority: project .gza/.env (shared across worktrees via symlink)
     _load(project_dir / f".{APP_NAME}" / ".env", override=True)
-
-    # Mid priority: project root .env (backwards compat; does not override .gza/.env)
-    _load(project_dir / ".env", override=False)
-
-    # Lowest priority: home ~/.{APP_NAME}/.env (does not override project values)
-    _load(Path.home() / f".{APP_NAME}" / ".env", override=False)
 
 
 def slugify(text: str, max_length: int = 50) -> str:

@@ -4481,3 +4481,15 @@ class TestLoadDotenv:
         assert os.environ["HOME_ONLY"] == "home_value"
         monkeypatch.delenv("MY_TEST_KEY")
         monkeypatch.delenv("HOME_ONLY")
+
+    def test_root_env_overrides_shell_env(self, tmp_path: Path, monkeypatch):
+        """Project root .env should override shell environment variables."""
+        from gza.runner import load_dotenv
+
+        home_gza, project_dir = self._setup_dirs(tmp_path, monkeypatch)
+        (project_dir / ".env").write_text("MY_TEST_KEY=from_project\n")
+        monkeypatch.setenv("MY_TEST_KEY", "from_shell")
+
+        load_dotenv(project_dir)
+
+        assert os.environ["MY_TEST_KEY"] == "from_project"
