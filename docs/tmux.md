@@ -44,6 +44,12 @@ When you detach:
 
 The grace period prevents accidental auto-accepts if you briefly disconnect and want to reattach.
 
+### Attaching from inside tmux
+
+If you're already in a tmux session, `gza attach` uses `tmux switch-client` instead of `attach-session`, so you don't need to worry about nested sessions. When the task ends and its session is destroyed, you're automatically switched back to your previous session. You can also Ctrl-B D to detach at any time, which returns you to your original session while the task continues autonomously.
+
+This requires tmux 3.2+ for the automatic switch-back. On older versions, you'll be detached from tmux when the task session ends.
+
 ## Safety Timeouts
 
 The proxy has two layers of protection against hung sessions:

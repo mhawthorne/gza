@@ -360,10 +360,16 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             subprocess.run(tmux_cmd, check=True)
             # Ensure the session is destroyed when the command exits,
             # even if the user has remain-on-exit on globally.
-            subprocess.run(
+            roi_result = subprocess.run(
                 ["tmux", "set-option", "-t", tmux_session, "remain-on-exit", "off"],
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
             )
+            if roi_result.returncode != 0:
+                print(
+                    f"Warning: could not set remain-on-exit off on {tmux_session}. "
+                    "Session may persist after task ends.",
+                    file=sys.stderr,
+                )
 
             # Get PID of the proxy process from tmux
             pid = get_tmux_session_pid(tmux_session) or 0
