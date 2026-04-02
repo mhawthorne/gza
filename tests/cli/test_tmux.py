@@ -239,6 +239,38 @@ class TestSpawnBackgroundWorkerTmux:
         assert "set-option" in set_args
         assert "remain-on-exit" in set_args
 
+    def test_spawn_warns_on_remain_on_exit_failure(self, tmp_path: Path, capsys):
+        """_spawn_background_worker warns when remain-on-exit set-option fails."""
+        from gza.db import SqliteTaskStore
+
+        config = self._make_config(tmp_path, tmux_enabled=True)
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add("test task")
+        store.update(task)
+
+        args = _make_args(tmp_path)
+        mock_pid_result = 9999
+
+        def side_effect_fn(cmd, **kwargs):
+            # Return failure for the set-option remain-on-exit call
+            if cmd[0] == "tmux" and "set-option" in cmd and "remain-on-exit" in cmd:
+                return MagicMock(returncode=1)
+            result = MagicMock(returncode=0)
+            return result
+
+        with patch("gza.cli._common.subprocess.run", side_effect=side_effect_fn) as mock_run, \
+             patch("gza.cli._common.get_tmux_session_pid", return_value=mock_pid_result), \
+             patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
+            mock_get_store.return_value = store
+            from gza.cli._common import _spawn_background_worker
+            result = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert result == 0, "Spawn should still succeed even if set-option fails"
+        captured = capsys.readouterr()
+        assert "remain-on-exit" in captured.err, "Warning about remain-on-exit failure should be printed to stderr"
+
     def test_spawn_background_worker_skips_tmux_when_disabled(self, tmp_path: Path):
         """_spawn_background_worker uses bare Popen when config.tmux.enabled is False."""
         from gza.db import SqliteTaskStore
