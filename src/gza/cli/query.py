@@ -1533,11 +1533,18 @@ def cmd_attach(args: argparse.Namespace) -> int:
         # When task ends and its session is destroyed, switch back to the
         # previous session instead of detaching from tmux entirely.
         # Scoped to the task session (not -g) to avoid mutating global config.
-        subprocess.run(
+        # Requires tmux 3.2+ for session-level detach-on-destroy.
+        result = subprocess.run(
             ["tmux", "set-option", "-t", session_name,
              "detach-on-destroy", "previous"],
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
         )
+        if result.returncode != 0:
+            print(
+                "Warning: could not set detach-on-destroy on task session. "
+                "When the task ends you may be detached from tmux.",
+                file=sys.stderr,
+            )
 
     if provider_name in _OBSERVE_ONLY_PROVIDERS:
         print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")

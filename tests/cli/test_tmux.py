@@ -51,18 +51,17 @@ class TestCmdAttach:
             task.provider = provider
         store.update(task)
 
-    def test_cmd_attach_finds_session_by_worker_id(self, tmp_path: Path):
+    def test_cmd_attach_finds_session_by_worker_id(self, tmp_path: Path, monkeypatch):
         """cmd_attach attaches to tmux session when looked up by worker ID."""
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
+        monkeypatch.delenv("TMUX", raising=False)
 
         args = _make_args(tmp_path, worker_id="w-20260301-1")
 
         tmux_has_session = MagicMock(returncode=0)
 
         with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp, \
-             patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("TMUX", None)
+             patch("gza.cli.query.os.execvp") as mock_execvp:
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
@@ -116,17 +115,16 @@ class TestCmdAttach:
 
         assert result == 1
 
-    def test_cmd_attach_prints_warning_for_observe_only_provider(self, tmp_path: Path, capsys):
+    def test_cmd_attach_prints_warning_for_observe_only_provider(self, tmp_path: Path, capsys, monkeypatch):
         """cmd_attach attaches read-only and prints notice for codex/gemini providers."""
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
+        monkeypatch.delenv("TMUX", raising=False)
 
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
 
         with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp, \
-             patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("TMUX", None)
+             patch("gza.cli.query.os.execvp") as mock_execvp:
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
