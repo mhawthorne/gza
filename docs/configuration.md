@@ -316,17 +316,19 @@ Environment variables can be set in `.env` files:
 | Location | Scope |
 |----------|-------|
 | `~/.gza/.env` | User-level (applies to all projects) |
-| `.env` | Project-level (overrides everything) |
+| `.env` | Project-level (overrides shell and user-level) |
+| `.gza/.env` | Worktree-level (highest priority; shared across worktrees via symlink) |
 
 These files are for **provider credentials only** (API keys, tokens). Gza configuration should go in `gza.yaml` or `gza.local.yaml`, not in `.env` files.
 
 **Credential precedence** (highest to lowest):
 
-1. **Project `.env`** - Overrides all other sources
-2. **Shell environment** - Variables exported in your shell
-3. **`~/.gza/.env`** - Only sets values not already defined
+1. **`.gza/.env`** - Highest priority; overrides all other sources (useful for worktree setups where `.gza/` is symlinked to share credentials)
+2. **Project `.env`** - Overrides shell environment and user-level defaults
+3. **Shell environment** - Variables exported in your shell
+4. **`~/.gza/.env`** - Only sets values not already defined
 
-This means if you have `ANTHROPIC_API_KEY` set in your shell, you don't need `~/.gza/.env` at all. The home `.env` file uses `setdefault` behavior, so it won't override existing environment variables.
+This means if you have `ANTHROPIC_API_KEY` set in your shell, a project `.env` or `.gza/.env` will override it. The home `.env` file uses `setdefault` behavior, so it won't override existing environment variables.
 
 **Format:**
 
@@ -1065,6 +1067,7 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `gza.yaml` | Main configuration file |
 | `gza.local.yaml` | Local machine overrides (gitignored) |
 | `.env` | Project-specific environment variables |
+| `.gza/.env` | Worktree-level credentials (highest priority; shared via symlink) |
 | `.gza/` | Local state directory (add to `.gitignore`) |
 | `.gza/gza.db` | SQLite task database |
 | `.gza/logs/` | Task execution logs |
