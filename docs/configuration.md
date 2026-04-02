@@ -74,6 +74,64 @@ gza config
 gza config --json
 ```
 
+### Themes and Colors
+
+Gza supports color themes that control the appearance of all CLI output.
+
+#### Built-in themes
+
+| Theme | Description |
+|-------|-------------|
+| `default_dark` | Light gray / white palette optimized for dark terminal backgrounds |
+| `selective_neon` | Minimal overrides — bright neon highlights on task IDs and headings |
+| `blue` | Monochromatic blue palette |
+
+Set a theme in `gza.yaml` or `gza.local.yaml`:
+
+```yaml
+theme: default_dark
+```
+
+#### Ad-hoc color overrides
+
+The `colors` key lets you override individual fields on top of (or instead of) a theme. Values are [Rich color strings](https://rich.readthedocs.io/en/stable/appendix/colors.html) — hex (`#ff99cc`), ANSI names (`cyan`), or modifiers (`bold`, `dim`).
+
+```yaml
+theme: blue
+colors:
+  task_id: "#ff0000"
+  prompt: bold green
+```
+
+Overrides apply to every output context that has the named field. For example, setting `task_id` changes it in `gza history`, `gza show`, `gza next`, `gza lineage`, and `gza unmerged` simultaneously.
+
+#### Override priority
+
+From highest to lowest:
+
+1. `colors` in config (ad-hoc per-field overrides)
+2. Theme domain-specific overrides (e.g. the theme's `task` or `show` dict)
+3. Theme base overrides (cross-cutting fields like `task_id`, `prompt`, `stats`)
+4. Dataclass field defaults (hardcoded in `src/gza/colors.py`)
+
+#### Available color fields
+
+**Base fields** (shared across most output contexts): `task_id`, `prompt`, `stats`, `branch`, `label`, `value`, `heading`
+
+**Domain-specific fields** — these only affect their respective command:
+
+| Context | Fields |
+|---------|--------|
+| Task history | `success`, `failure`, `unmerged`, `orphaned`, `lineage`, `header` |
+| Status | `completed`, `failed`, `pending`, `in_progress`, `unmerged`, `dropped`, `stale`, `unknown`, `running` |
+| Work output | `step_header`, `assistant_text`, `tool_use`, `error`, `todo_pending`, `todo_in_progress`, `todo_completed` |
+| Show | `section`, `status_pending`, `status_running`, `status_completed`, `status_failed`, `status_default` |
+| Unmerged | `review_approved`, `review_changes`, `review_discussion`, `review_none` |
+| Lineage | `task_type`, `annotation`, `connector`, `type_label`, `relationship`, `target_highlight` |
+| Next | `type`, `blocked`, `index` |
+
+Some color dicts (`LOG_TASK_STATUS_COLORS`, `LOG_WORKER_STATUS_COLORS`, `REVIEW_VERDICT_COLORS`) are intentionally excluded from theming to preserve semantic meaning (green = pass, red = fail).
+
 ### Branch Naming Strategy
 
 Configure branch naming with the `branch_strategy` option. Three presets are available:

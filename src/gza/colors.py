@@ -39,6 +39,8 @@ Use :func:`set_theme` to activate a named theme or ad-hoc overrides::
     set_theme('blue', {'task_id': '#ff0000'})
 
 Built-in themes: ``'default_dark'``, ``'selective_neon'``, ``'blue'``.
+
+Use :meth:`Theme.uniform` to create a theme that sets every field to a single color.
 """
 
 from __future__ import annotations
@@ -231,6 +233,11 @@ class BaseColors:
 # ---------------------------------------------------------------------------
 
 
+def _all_fields(color: str, cls: type) -> dict[str, str]:
+    """Return a dict mapping every dataclass field name in *cls* to *color*."""
+    return {f.name: color for f in dataclasses.fields(cls)}
+
+
 @dataclass(frozen=True)
 class Theme:
     """A named set of partial color overrides layered on top of per-domain defaults.
@@ -255,78 +262,36 @@ class Theme:
     lineage: dict[str, str] = field(default_factory=dict)
     next_colors: dict[str, str] = field(default_factory=dict)
 
+    @classmethod
+    def uniform(cls, name: str, color: str) -> "Theme":
+        """Create a theme that sets every field in every domain class to *color*."""
+        af = _all_fields  # local alias for brevity
+        return cls(
+            name=name,
+            base=af(color, BaseColors),
+            task=af(color, TaskColors),
+            status=af(color, StatusColors),
+            work_output=af(color, WorkOutputColors),
+            show=af(color, ShowColors),
+            unmerged=af(color, UnmergedColors),
+            lineage=af(color, LineageColors),
+            next_colors=af(color, NextColors),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Built-in themes
 # ---------------------------------------------------------------------------
 
-_THEME_DEFAULT_DARK = Theme(
-    name="default_dark",
-    base={
-        "task_id": gray_light1,
-        "prompt": gray_light1,
-        "stats": gray_light1,
-        "branch": gray_light1,
-        "label": gray_light1,
-        "value": "white",
-        "heading": "white",
-    },
-    task={
-        "success": gray_light1,
-        "failure": gray_light1,
-        "unmerged": gray_light1,
-        "orphaned": gray_light1,
-        "lineage": gray_light1,
-        "header": "white",
-    },
-    status={
-        "completed": gray_light1,
-        "failed": gray_light1,
-        "pending": gray_light1,
-        "in_progress": gray_light1,
-        "unmerged": gray_light1,
-        "dropped": gray_light1,
-        "stale": gray_light1,
-        "unknown": gray_light1,
-        "running": gray_light1,
-    },
-    work_output={
-        "step_header": gray_light1,
-        "assistant_text": gray_light1,
-        "tool_use": gray_light1,
-        "error": "white",
-        "todo_pending": "white",
-        "todo_in_progress": gray_light1,
-        "todo_completed": gray_light1,
-    },
-    show={
-        "heading": "white",
-        "section": gray_light1,
-        "status_pending": gray_light1,
-        "status_running": gray_light1,
-        "status_completed": gray_light1,
-        "status_failed": gray_light1,
-        "status_default": "white",
-    },
-    unmerged={
-        "review_approved": gray_light1,
-        "review_changes": gray_light1,
-        "review_discussion": gray_light1,
-        "review_none": gray_light1,
-    },
-    lineage={
-        "task_type": gray_light1,
-        "annotation": gray_light1,
-        "connector": gray_light1,
-        "type_label": gray_light1,
-        "relationship": gray_light1,
-        "target_highlight": "white",
-    },
-    next_colors={
-        "type": "white",
-        "blocked": gray_light1,
-        "index": gray_light1,
-    },
+_dd = Theme.uniform("default_dark", gray_light1)
+_THEME_DEFAULT_DARK = dataclasses.replace(
+    _dd,
+    base={**_dd.base, "value": "white", "heading": "white"},
+    task={**_dd.task, "header": "white"},
+    work_output={**_dd.work_output, "error": "white", "todo_pending": "white"},
+    show={**_dd.show, "heading": "white", "status_default": "white"},
+    lineage={**_dd.lineage, "target_highlight": "white"},
+    next_colors={**_dd.next_colors, "type": "white"},
 )
 
 _THEME_SELECTIVE_NEON = Theme(

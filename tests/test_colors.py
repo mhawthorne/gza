@@ -458,6 +458,51 @@ class TestAdHocColorOverrides:
         assert c.SHOW_COLORS.prompt == "#123456"
 
 
+class TestThemeUniform:
+    """Theme.uniform() creates a theme with every field set to one color."""
+
+    def test_uniform_sets_all_base_fields(self) -> None:
+        from gza.colors import Theme, BaseColors
+        import dataclasses
+        t = Theme.uniform("test", "#ff00ff")
+        for f in dataclasses.fields(BaseColors):
+            assert t.base[f.name] == "#ff00ff"
+
+    def test_uniform_sets_all_domain_fields(self) -> None:
+        from gza.colors import (
+            Theme, TaskColors, StatusColors, WorkOutputColors,
+            ShowColors, UnmergedColors, LineageColors, NextColors,
+        )
+        import dataclasses
+        t = Theme.uniform("test", "#abcdef")
+        for cls, attr in [
+            (TaskColors, "task"), (StatusColors, "status"),
+            (WorkOutputColors, "work_output"), (ShowColors, "show"),
+            (UnmergedColors, "unmerged"), (LineageColors, "lineage"),
+            (NextColors, "next_colors"),
+        ]:
+            domain_dict = getattr(t, attr)
+            for f in dataclasses.fields(cls):
+                assert domain_dict[f.name] == "#abcdef", f"{attr}.{f.name}"
+
+    def test_uniform_applied_via_set_theme(self) -> None:
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES
+        t = Theme.uniform("_test_uniform", "#ff00ff")
+        BUILT_IN_THEMES["_test_uniform"] = t
+        try:
+            c.set_theme("_test_uniform")
+            assert c.TASK_COLORS.task_id == "#ff00ff"
+            assert c.TASK_COLORS.prompt == "#ff00ff"
+            assert c.STATUS_COLORS.completed == "#ff00ff"
+            assert c.SHOW_COLORS.heading == "#ff00ff"
+            assert c.LINEAGE_COLORS.connector == "#ff00ff"
+            assert c.NEXT_COLORS.index == "#ff00ff"
+        finally:
+            del BUILT_IN_THEMES["_test_uniform"]
+            c.set_theme(None)
+
+
 class TestBuiltInThemeDefaultDark:
     """default_dark theme sets colors to light gray / white."""
 
