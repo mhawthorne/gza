@@ -41,6 +41,8 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
+| `theme` | String | *(none)* | Built-in color theme: `default_dark`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
+| `colors` | Dict | `{}` | Ad-hoc map of `field_name: rich_color_string` applied on top of `theme` (highest priority). Allowed in `gza.local.yaml`. |
 
 ### Local Overrides (gza.local.yaml)
 
