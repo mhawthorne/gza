@@ -4312,22 +4312,26 @@ class TestExceptionHandlerMarkFailed:
 class TestLoadDotenv:
     """Tests for load_dotenv() credential loading from .env files."""
 
-    def _setup_home(self, tmp_path: Path, monkeypatch):
-        """Create a fake ~/.gza/.env directory and patch Path.home()."""
-        gza_dir = tmp_path / ".gza"
-        gza_dir.mkdir()
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-        return gza_dir
+    def _setup_dirs(self, tmp_path: Path, monkeypatch):
+        """Create separate home and project directories; patch Path.home() to home_dir."""
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        home_gza = home_dir / ".gza"
+        home_gza.mkdir()
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home_dir))
+        return home_gza, project_dir
 
     def test_home_env_sets_unset_vars(self, tmp_path: Path, monkeypatch):
         """~/.gza/.env should set variables not already in the environment."""
         from gza.runner import load_dotenv
 
-        gza_dir = self._setup_home(tmp_path, monkeypatch)
-        (gza_dir / ".env").write_text("MY_TEST_KEY=from_home\n")
+        home_gza, project_dir = self._setup_dirs(tmp_path, monkeypatch)
+        (home_gza / ".env").write_text("MY_TEST_KEY=from_home\n")
         monkeypatch.delenv("MY_TEST_KEY", raising=False)
 
-        load_dotenv(tmp_path)
+        load_dotenv(project_dir)
 
         assert os.environ["MY_TEST_KEY"] == "from_home"
         monkeypatch.delenv("MY_TEST_KEY")
@@ -4336,11 +4340,11 @@ class TestLoadDotenv:
         """~/.gza/.env should not override variables already set in the environment."""
         from gza.runner import load_dotenv
 
-        gza_dir = self._setup_home(tmp_path, monkeypatch)
-        (gza_dir / ".env").write_text("MY_TEST_KEY=from_home\n")
+        home_gza, project_dir = self._setup_dirs(tmp_path, monkeypatch)
+        (home_gza / ".env").write_text("MY_TEST_KEY=from_home\n")
         monkeypatch.setenv("MY_TEST_KEY", "from_shell")
 
-        load_dotenv(tmp_path)
+        load_dotenv(project_dir)
 
         assert os.environ["MY_TEST_KEY"] == "from_shell"
 
@@ -4348,11 +4352,8 @@ class TestLoadDotenv:
         """Project .env should override values from ~/.gza/.env."""
         from gza.runner import load_dotenv
 
-        gza_dir = self._setup_home(tmp_path, monkeypatch)
-        (gza_dir / ".env").write_text("MY_TEST_KEY=from_home\n")
-
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
+        home_gza, project_dir = self._setup_dirs(tmp_path, monkeypatch)
+        (home_gza / ".env").write_text("MY_TEST_KEY=from_home\n")
         (project_dir / ".env").write_text("MY_TEST_KEY=from_project\n")
         monkeypatch.delenv("MY_TEST_KEY", raising=False)
 
@@ -4365,8 +4366,8 @@ class TestLoadDotenv:
         """Comments and blank lines in .env files should be ignored."""
         from gza.runner import load_dotenv
 
-        gza_dir = self._setup_home(tmp_path, monkeypatch)
-        (gza_dir / ".env").write_text(
+        home_gza, project_dir = self._setup_dirs(tmp_path, monkeypatch)
+        (home_gza / ".env").write_text(
             "# This is a comment\n"
             "\n"
             "MY_TEST_KEY=valid_value\n"
@@ -4375,7 +4376,7 @@ class TestLoadDotenv:
         monkeypatch.delenv("MY_TEST_KEY", raising=False)
         monkeypatch.delenv("COMMENTED_OUT", raising=False)
 
-        load_dotenv(tmp_path)
+        load_dotenv(project_dir)
 
         assert os.environ["MY_TEST_KEY"] == "valid_value"
         assert "COMMENTED_OUT" not in os.environ
@@ -4385,6 +4386,98 @@ class TestLoadDotenv:
         """load_dotenv should not fail when no .env files exist."""
         from gza.runner import load_dotenv
 
-        self._setup_home(tmp_path, monkeypatch)
+        _, project_dir = self._setup_dirs(tmp_path, monkeypatch)
 
-        load_dotenv(tmp_path)
+        load_dotenv(project_dir)
+
+    def test_gza_env_takes_priority_over_root_env(self, tmp_path: Path, monkeypatch):
+        """<project_dir>/.gza/.env should take priority over <project_dir>/.env."""
+        from gza.runner import load_dotenv
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        gza_subdir = project_dir / ".gza"
+        gza_subdir.mkdir()
+        (gza_subdir / ".env").write_text("MY_TEST_KEY=from_gza_dir\n")
+        (project_dir / ".env").write_text("MY_TEST_KEY=from_root_env\n")
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+        # Home dir has no .env
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+        load_dotenv(project_dir)
+
+        assert os.environ["MY_TEST_KEY"] == "from_gza_dir"
+        monkeypatch.delenv("MY_TEST_KEY")
+
+    def test_gza_env_takes_priority_over_home_env(self, tmp_path: Path, monkeypatch):
+        """<project_dir>/.gza/.env should take priority over ~/.gza/.env."""
+        from gza.runner import load_dotenv
+
+        # Set up home ~/.gza/.env
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        home_gza = home_dir / ".gza"
+        home_gza.mkdir()
+        (home_gza / ".env").write_text("MY_TEST_KEY=from_home\n")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home_dir))
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        gza_subdir = project_dir / ".gza"
+        gza_subdir.mkdir()
+        (gza_subdir / ".env").write_text("MY_TEST_KEY=from_gza_dir\n")
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+
+        load_dotenv(project_dir)
+
+        assert os.environ["MY_TEST_KEY"] == "from_gza_dir"
+        monkeypatch.delenv("MY_TEST_KEY")
+
+    def test_root_env_overrides_home_env_when_no_gza_env(self, tmp_path: Path, monkeypatch):
+        """<project_dir>/.env should still override ~/.gza/.env when .gza/.env is absent."""
+        from gza.runner import load_dotenv
+
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        home_gza = home_dir / ".gza"
+        home_gza.mkdir()
+        (home_gza / ".env").write_text("MY_TEST_KEY=from_home\n")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home_dir))
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / ".env").write_text("MY_TEST_KEY=from_root_env\n")
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+
+        load_dotenv(project_dir)
+
+        assert os.environ["MY_TEST_KEY"] == "from_root_env"
+        monkeypatch.delenv("MY_TEST_KEY")
+
+    def test_home_env_is_lowest_priority(self, tmp_path: Path, monkeypatch):
+        """~/.gza/.env should be lowest priority — not override any project values."""
+        from gza.runner import load_dotenv
+
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        home_gza = home_dir / ".gza"
+        home_gza.mkdir()
+        (home_gza / ".env").write_text("MY_TEST_KEY=from_home\nHOME_ONLY=home_value\n")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home_dir))
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        gza_subdir = project_dir / ".gza"
+        gza_subdir.mkdir()
+        (gza_subdir / ".env").write_text("MY_TEST_KEY=from_gza_dir\n")
+        monkeypatch.delenv("MY_TEST_KEY", raising=False)
+        monkeypatch.delenv("HOME_ONLY", raising=False)
+
+        load_dotenv(project_dir)
+
+        # .gza/.env wins over home
+        assert os.environ["MY_TEST_KEY"] == "from_gza_dir"
+        # home-only vars still get loaded
+        assert os.environ["HOME_ONLY"] == "home_value"
+        monkeypatch.delenv("MY_TEST_KEY")
+        monkeypatch.delenv("HOME_ONLY")
