@@ -105,6 +105,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         worker_id=worker_id,
         task_id=task_id_for_registration,
         pid=os.getpid(),
+        is_background=False,
     )
     registry.register(worker)
 

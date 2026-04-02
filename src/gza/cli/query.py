@@ -1516,7 +1516,11 @@ def cmd_attach(args: argparse.Namespace) -> int:
     )
     if result.returncode != 0:
         print(f"No tmux session found: {session_name}")
-        print("This task may have been started without tmux support.")
+        if not worker.is_background:
+            print("Foreground tasks (gza work without -b) don't use tmux sessions.")
+            print("Use -b to run tasks in the background with tmux attach support.")
+        else:
+            print("This task may have been started without tmux support.")
         return 1
 
     # Determine provider to decide attach mode
