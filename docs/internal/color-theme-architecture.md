@@ -44,16 +44,11 @@ Cross-cutting defaults for fields that appear in multiple domain classes (`task_
 `Theme.uniform(name, color)` creates a theme that sets every field in every domain class to a single color. Uses the `_all_fields(color, cls)` helper. Useful for monochrome themes or as a base for themes with a few exceptions:
 
 ```python
-# All pink, one line:
+# All pink:
 _THEME_PINK = Theme.uniform("pink", pink)
 
-# Mostly gray, with white accents:
-_dd = Theme.uniform("default_dark", gray_light1)
-_THEME_DEFAULT_DARK = dataclasses.replace(
-    _dd,
-    base={**_dd.base, "value": "white", "heading": "white"},
-    ...
-)
+# All light gray:
+_THEME_DEFAULT_DARK = Theme.uniform("default_dark", gray_light1)
 ```
 
 ### Built-in themes

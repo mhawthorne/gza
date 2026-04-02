@@ -10,17 +10,22 @@ from pathlib import Path
 from rich.markup import escape as rich_escape
 
 from ..colors import (
-    blue_step,
-    dim_secondary,
+    blue,
     pink,
     LOG_TASK_STATUS_COLORS,
     LOG_WORKER_STATUS_COLORS,
+    SHOW_COLORS_DICT,
 )
 from ..config import Config
 from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_store, _parse_iso
+
+
+def _lc() -> str:
+    """Return the themed label color for log output."""
+    return SHOW_COLORS_DICT["label"]
 
 
 def _result_step_count(result_entry: dict) -> int | None:
@@ -235,7 +240,7 @@ def _display_step_timeline(entries: list[dict], *, verbose: bool) -> None:
         return
 
     for step in steps:
-        title = f"[cyan]\\[Step {step['step_id']}][/cyan]"
+        title = f"[{_lc()}]\\[Step {step['step_id']}][/{_lc()}]"
         message_text = step.get("message_text")
         summary = step.get("summary")
         if message_text:
@@ -309,7 +314,7 @@ class _LiveLogPrinter:
                 else:
                     console.print(
                         f"| Step {self._step_count} |",
-                        style=blue_step,
+                        style=blue,
                     )
 
             raw_content = message.get("content", [])
@@ -343,16 +348,16 @@ class _LiveLogPrinter:
                         if is_error:
                             self._fmt.print_error(result)
                         else:
-                            console.print(rich_escape(result), style=dim_secondary, soft_wrap=True)
+                            console.print(rich_escape(result), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
 
         elif entry_type == "gza":
             subtype = entry.get("subtype", "")
             message = entry.get("message", "")
             if message:
                 if subtype:
-                    console.print(f"[cyan]\\[gza:{rich_escape(subtype)}][/cyan] {rich_escape(message)}", soft_wrap=True)
+                    console.print(f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
                 else:
-                    console.print(f"[cyan]\\[gza][/cyan] {rich_escape(message)}", soft_wrap=True)
+                    console.print(f"[{_lc()}]\\[gza][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
 
         elif entry_type == "thread.started":
             thread_id = entry.get("thread_id", "")
@@ -375,7 +380,7 @@ class _LiveLogPrinter:
             else:
                 console.print(
                     f"| Step {self._step_count} |",
-                    style=blue_step,
+                    style=blue,
                 )
 
         elif entry_type == "item.completed":
@@ -400,7 +405,7 @@ class _LiveLogPrinter:
                     if is_error:
                         self._fmt.print_error(output)
                     else:
-                        console.print(rich_escape(output), style=dim_secondary, soft_wrap=True)
+                        console.print(rich_escape(output), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
 
         elif entry_type == "result":
             is_error = entry.get("is_error", False)
@@ -485,7 +490,7 @@ def _format_log_entry(entry: dict) -> str | None:
         subtype = entry.get("subtype", "")
         if subtype == "init":
             model = rich_escape(str(entry.get("model", "unknown")))
-            return f"[cyan]\\[system][/cyan] Session initialized (model: {model})"
+            return f"[{_lc()}]\\[system][/{_lc()}] Session initialized (model: {model})"
         return None  # Skip other system messages
 
     elif entry_type == "user":
@@ -586,8 +591,8 @@ def _format_log_entry(entry: dict) -> str | None:
         if not message:
             return None
         if subtype:
-            return f"[cyan]\\[gza:{rich_escape(subtype)}][/cyan] {rich_escape(message)}"
-        return f"[cyan]\\[gza][/cyan] {rich_escape(message)}"
+            return f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}"
+        return f"[{_lc()}]\\[gza][/{_lc()}] {rich_escape(message)}"
 
     return None
 
@@ -964,7 +969,7 @@ def cmd_log(args: argparse.Namespace) -> int:
             # If we have content but couldn't parse any JSON, it's likely a startup error
             if content:
                 if using_startup_log:
-                    console.print(f"[cyan]Startup log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+                    console.print(f"[{_lc()}]Startup log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
                     console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
                 console.print("[red]Task failed during startup (no Claude session):[/red]", soft_wrap=True)
                 # Display the raw error message, indented for clarity
@@ -979,31 +984,31 @@ def cmd_log(args: argparse.Namespace) -> int:
         return 1
 
     # Display header
-    _sep = "[cyan]" + "━" * 70 + "[/cyan]"
+    _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
     console.print(_sep, soft_wrap=True)
     if task:
         prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
         console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
-        console.print(f"[cyan]ID:[/cyan] {task.id} | [cyan]Slug:[/cyan] {rich_escape(task.task_id or '')}", soft_wrap=True)
+        console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.task_id or '')}", soft_wrap=True)
         _status_color = LOG_TASK_STATUS_COLORS.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
-        console.print(f"[cyan]Status:[/cyan] {_status_val}", soft_wrap=True)
+        console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
         if resolution_note:
             console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
-        console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
         if using_startup_log:
             console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
         if task.branch:
-            console.print(f"[cyan]Branch:[/cyan] {rich_escape(task.branch)}", soft_wrap=True)
+            console.print(f"[{_lc()}]Branch:[/{_lc()}] {rich_escape(task.branch)}", soft_wrap=True)
     elif worker:
-        console.print(f"[cyan]Worker:[/cyan] {rich_escape(worker.worker_id)}", soft_wrap=True)
+        console.print(f"[{_lc()}]Worker:[/{_lc()}] {rich_escape(worker.worker_id)}", soft_wrap=True)
         _w_status = worker.status if worker.status else "unknown"
         if is_running and _w_status != "running":
             # Prefer live process state when worker metadata is stale.
             _w_status = "running"
         _w_color = LOG_WORKER_STATUS_COLORS.get(_w_status, "white")
-        console.print(f"[cyan]Status:[/cyan] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
-        console.print(f"[cyan]Log:[/cyan] {rich_escape(str(log_path))}", soft_wrap=True)
+        console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
+        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
         if using_startup_log:
             console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
     console.print(_sep, soft_wrap=True)
@@ -1049,14 +1054,14 @@ def cmd_log(args: argparse.Namespace) -> int:
     if log_data:
         if "duration_ms" in log_data:
             duration_sec = log_data["duration_ms"] / 1000
-            console.print(f"[cyan]Duration:[/cyan] {format_duration(duration_sec, verbose=True)}", soft_wrap=True)
+            console.print(f"[{_lc()}]Duration:[/{_lc()}] {format_duration(duration_sec, verbose=True)}", soft_wrap=True)
         step_count = _result_step_count(log_data)
         if step_count is not None:
-            console.print(f"[cyan]Steps:[/cyan] {step_count}", soft_wrap=True)
+            console.print(f"[{_lc()}]Steps:[/{_lc()}] {step_count}", soft_wrap=True)
             if "num_steps" not in log_data and "num_steps_reported" not in log_data and "num_turns" in log_data:
-                console.print(f"[cyan]Legacy turns:[/cyan] {log_data['num_turns']}", soft_wrap=True)
+                console.print(f"[{_lc()}]Legacy turns:[/{_lc()}] {log_data['num_turns']}", soft_wrap=True)
         if "total_cost_usd" in log_data:
-            console.print(f"[cyan]Cost:[/cyan] ${log_data['total_cost_usd']:.4f}", soft_wrap=True)
+            console.print(f"[{_lc()}]Cost:[/{_lc()}] ${log_data['total_cost_usd']:.4f}", soft_wrap=True)
 
     return 0
 

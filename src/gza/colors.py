@@ -56,10 +56,15 @@ from typing import Any
 
 # Readable on both dark and light backgrounds (pure white vanishes on light;
 # pure black on dark).
+
+white_bright: str = "bright_white"
+white: str = "white"
+
 pink: str = "#ff99cc"
 
 blue_neon: str = "#00ffff"
-blue_bright: str = "#00aaff"
+blue_bright: str = "#00ccff"
+blue: str = "blue"
 
 pink_neon: str = "#ffaaff"
 
@@ -67,22 +72,21 @@ pink_neon: str = "#ffaaff"
 # Visible on dark terminals without the harsh contrast of white on light ones.
 gray_secondary: str = "#aaaaaa"
 
-gray_light1: str = "#eeeeee"
+gray_light1: str = "#f0f0f0"
+gray_light2: str = "#eeeeee"
 
 # Standard ANSI colors — adapt reasonably to most terminal themes.
-blue_step: str = "blue"
 cyan: str = "cyan"
 
 # green_success: str = "green"
 green_success: str = "#00ff88"
 
 yellow_warning: str = "yellow"
-red_error: str = "red"
+red_error: str = "#ff88aa"
 magenta_tool: str = "magenta"
 
 # Semantic modifiers — inherit from the terminal's own foreground color.
 bold_heading: str = "bold"
-dim_secondary: str = "dim"
 
 # Composite styles.
 bold_cyan_heading: str = "bold cyan"
@@ -91,6 +95,9 @@ dim_yellow_note: str = "dim yellow"
 
 purple: str = "#cc88ff"
 orange: str = "#ffcc44"
+
+# Default color for all fields when no theme is applied.
+default_color: str = "bright_white"
 
 
 # ---------------------------------------------------------------------------
@@ -102,107 +109,107 @@ orange: str = "#ffcc44"
 class TaskColors:
     """Colors for task history / stats output (``gza history``, ``gza stats``)."""
 
-    task_id: str = gray_secondary    # light gray for task ID and date
-    prompt: str = pink        # pink for prompt text
-    branch: str = cyan        # cyan for branch name
-    stats: str = cyan         # cyan for stats line
-    success: str = green_success     # green for completed (✓)
-    failure: str = red_error         # red for failed (✗)
-    unmerged: str = yellow_warning   # yellow for unmerged (⚡)
-    orphaned: str = yellow_warning   # yellow for orphaned (⚠)
-    lineage: str = gray_secondary    # light gray for lineage relationship labels
-    header: str = bold_heading       # bold for section headers
-    label: str = gray_secondary      # light gray for labels
-    value: str = "white"             # white for values
+    task_id: str = default_color
+    prompt: str = default_color
+    branch: str = default_color
+    stats: str = default_color
+    success: str = default_color
+    failure: str = default_color
+    unmerged: str = default_color
+    orphaned: str = default_color
+    lineage: str = default_color
+    date: str = default_color
+    file: str = default_color
+    header: str = default_color
+    label: str = default_color
+    value: str = default_color
 
 
 @dataclass(frozen=True)
 class StatusColors:
     """Colors for task/worker status values (``gza ps`` and lineage trees)."""
 
-    completed: str = green_success   # green
-    failed: str = red_error          # red
-    pending: str = yellow_warning    # yellow
-    in_progress: str = cyan   # cyan
-    unmerged: str = yellow_warning   # yellow
-    dropped: str = red_error         # red
-    stale: str = yellow_warning      # yellow
-    unknown: str = yellow_warning    # yellow
-    running: str = green_success     # green
+    completed: str = default_color
+    failed: str = default_color
+    pending: str = default_color
+    in_progress: str = default_color
+    unmerged: str = default_color
+    dropped: str = default_color
+    stale: str = default_color
+    unknown: str = default_color
+    running: str = default_color
 
 
 @dataclass(frozen=True)
 class WorkOutputColors:
     """Colors for live provider stream output (agent work log)."""
 
-    step_header: str = blue_step       # blue for step/turn headers
-    assistant_text: str = green_success  # green for assistant messages
-    tool_use: str = magenta_tool       # magenta for tool-use events
-    error: str = bold_red_error        # bold red for errors
-    todo_pending: str = "white"        # white for pending todo items
-    todo_in_progress: str = yellow_warning  # yellow for in-progress todos
-    todo_completed: str = green_success     # green for completed todos
+    step_header: str = default_color
+    assistant_text: str = default_color
+    tool_use: str = default_color
+    error: str = default_color
+    todo_pending: str = default_color
+    todo_in_progress: str = default_color
+    todo_completed: str = default_color
 
 
 @dataclass(frozen=True)
 class ShowColors:
     """Colors for the ``gza show`` command task detail view."""
 
-    heading: str = bold_cyan_heading  # bold cyan for headings
-    section: str = dim_secondary      # dim for section separators
-    label: str = dim_secondary        # dim for field labels
-    value: str = bold_heading         # bold adapts to terminal background
-    task_id: str = dim_secondary      # dim adapts to terminal background
-    prompt: str = pink         # pink works on dark and light backgrounds
-    branch: str = cyan         # cyan visible on dark and light
-    stats: str = cyan          # cyan visible on dark and light
-    status_pending: str = yellow_warning   # yellow for pending
-    status_running: str = cyan      # cyan for running/in_progress
-    status_completed: str = green_success  # green for completed
-    status_failed: str = red_error         # red for failed
-    status_default: str = bold_heading     # bold adapts to terminal background
+    heading: str = default_color
+    section: str = default_color
+    label: str = default_color
+    value: str = default_color
+    task_id: str = default_color
+    prompt: str = default_color
+    branch: str = default_color
+    stats: str = default_color
+    status_pending: str = default_color
+    status_running: str = default_color
+    status_completed: str = default_color
+    status_failed: str = default_color
+    status_default: str = default_color
 
 
 @dataclass(frozen=True)
 class UnmergedColors:
     """Colors for the ``gza unmerged`` command task list."""
 
-    task_id: str = blue_neon
-    prompt: str = pink_neon
-    stats: str = purple
-    branch: str = cyan        # cyan for branch name
-    review_approved: str = green_success      # green for approved
-    review_changes: str = yellow_warning      # yellow for changes requested
-    review_discussion: str = cyan      # cyan for discussion
-    review_none: str = dim_yellow_note        # dim yellow for no review
+    task_id: str = default_color
+    prompt: str = default_color
+    stats: str = default_color
+    branch: str = default_color
+    review_approved: str = default_color
+    review_changes: str = default_color
+    review_discussion: str = default_color
+    review_none: str = default_color
 
 
 @dataclass(frozen=True)
 class LineageColors:
     """Colors for lineage tree rendering (``_format_lineage`` and ``gza lineage``)."""
 
-    task_id: str = blue_bright       # blue for task ID in tree nodes
-    task_type: str = orange
-    # annotation: str = dim_secondary  # dim for annotation metadata
-    annotation: str = gray_light1
-    connector: str = dim_secondary   # dim for tree branch connectors (├── └──)
-    # cmd_lineage-specific colors
-    type_label: str = "magenta"      # magenta for task type in gza lineage
-    stats: str = cyan
-    prompt: str = pink        # pink for prompt text
-    relationship: str = dim_secondary  # dim for relationship labels
-    target_highlight: str = bold_heading  # bold for the target task
+    task_id: str = default_color
+    task_type: str = default_color
+    annotation: str = default_color
+    connector: str = default_color
+    type_label: str = default_color
+    stats: str = default_color
+    prompt: str = default_color
+    relationship: str = default_color
+    target_highlight: str = default_color
 
 
 @dataclass(frozen=True)
 class NextColors:
     """Colors for the ``gza next`` command pending-task list."""
 
-    task_id: str = blue_neon
-    prompt: str = pink_neon
-    type: str = gray_light1
-    blocked: str = yellow_warning    # yellow for blocked indicator
-    index: str = gray_light1
+    task_id: str = default_color
+    prompt: str = default_color
+    type: str = default_color
+    blocked: str = default_color
+    index: str = default_color
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +226,13 @@ class BaseColors:
     class that has that field, unless a domain-specific override is also set.
     """
 
-    task_id: str = gray_secondary
-    prompt: str = pink
-    stats: str = cyan
-    branch: str = cyan
-    label: str = gray_secondary
-    value: str = "white"
-    heading: str = bold_cyan_heading
+    task_id: str = default_color
+    prompt: str = default_color
+    stats: str = default_color
+    branch: str = default_color
+    label: str = default_color
+    value: str = default_color
+    heading: str = default_color
 
 
 # ---------------------------------------------------------------------------
@@ -283,15 +290,30 @@ class Theme:
 # Built-in themes
 # ---------------------------------------------------------------------------
 
-_dd = Theme.uniform("default_dark", gray_light1)
-_THEME_DEFAULT_DARK = dataclasses.replace(
-    _dd,
-    base={**_dd.base, "value": "white", "heading": "white"},
-    task={**_dd.task, "header": "white"},
-    work_output={**_dd.work_output, "error": "white", "todo_pending": "white"},
-    show={**_dd.show, "heading": "white", "status_default": "white"},
-    lineage={**_dd.lineage, "target_highlight": "white"},
-    next_colors={**_dd.next_colors, "type": "white"},
+_THEME_DEFAULT_DARK = Theme.uniform("default_dark", gray_light1)
+
+_THEME_MINIMAL = Theme(
+    name="minimal",
+    base={
+        "task_id": blue_bright,
+        "prompt": pink_neon,
+        # "file": blue_bright,
+        # "branch": blue_bright,
+    },
+    lineage={
+        "task_id": blue_bright,
+    },
+    task={
+        "success": green_success,
+        "failure": red_error,
+        "running": green_success,
+        "pending": yellow_warning,
+        "dropped": red_error,
+        "stale": yellow_warning,
+        "unknown": red_error,
+        "unmerged": f"{green_success} bold",
+        "orphaned": yellow_warning,
+    }
 )
 
 _THEME_SELECTIVE_NEON = Theme(
@@ -314,7 +336,7 @@ _THEME_BLUE = Theme(
     base={
         "task_id": blue_bright,
         "branch": blue_neon,
-        "stats": blue_step,
+        "stats": blue,
     },
     task={
         "stats": blue_bright,
@@ -326,7 +348,7 @@ _THEME_BLUE = Theme(
 
 #: Registry of all built-in themes, keyed by name.
 BUILT_IN_THEMES: dict[str, Theme] = {
-    t.name: t for t in [_THEME_DEFAULT_DARK, _THEME_SELECTIVE_NEON, _THEME_BLUE]
+    t.name: t for t in [_THEME_DEFAULT_DARK, _THEME_MINIMAL, _THEME_SELECTIVE_NEON, _THEME_BLUE]
 }
 
 # ---------------------------------------------------------------------------
@@ -431,20 +453,18 @@ def set_theme(
                          top of the theme.  The same key applies to *every* domain class
                          that has a field with that name.
 
-    This function replaces the module-level singletons (``TASK_COLORS``,
-    ``TASK_COLORS_DICT``, etc.) in place so that code which has already imported
-    a singleton via ``import gza.colors as c`` and accesses ``c.TASK_COLORS``
-    sees the updated value.  Code that captured the singleton via
-    ``from gza.colors import TASK_COLORS`` at an earlier import will retain the
-    old value.
+    Dict singletons are updated **in place** (clear + update) so that code
+    which captured a reference via ``from gza.colors import TASK_COLORS_DICT``
+    sees the themed values.  Dataclass singletons are replaced (frozen
+    dataclasses cannot be mutated), so code using ``import gza.colors as c``
+    and ``c.TASK_COLORS`` is preferred for those.
     """
     global TASK_COLORS, STATUS_COLORS, WORK_OUTPUT_COLORS, SHOW_COLORS
     global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS
-    global TASK_COLORS_DICT, STATUS_COLORS_DICT, WORK_OUTPUT_COLORS_DICT, SHOW_COLORS_DICT
-    global UNMERGED_COLORS_DICT, LINEAGE_COLORS_DICT, NEXT_COLORS_DICT
-    global LINEAGE_STATUS_COLORS, PS_STATUS_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
+
+    # Frozen dataclass singletons — must replace the module-level name.
     TASK_COLORS = inst["TASK_COLORS"]
     STATUS_COLORS = inst["STATUS_COLORS"]
     WORK_OUTPUT_COLORS = inst["WORK_OUTPUT_COLORS"]
@@ -452,15 +472,16 @@ def set_theme(
     UNMERGED_COLORS = inst["UNMERGED_COLORS"]
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
     NEXT_COLORS = inst["NEXT_COLORS"]
-    TASK_COLORS_DICT = inst["TASK_COLORS_DICT"]
-    STATUS_COLORS_DICT = inst["STATUS_COLORS_DICT"]
-    WORK_OUTPUT_COLORS_DICT = inst["WORK_OUTPUT_COLORS_DICT"]
-    SHOW_COLORS_DICT = inst["SHOW_COLORS_DICT"]
-    UNMERGED_COLORS_DICT = inst["UNMERGED_COLORS_DICT"]
-    LINEAGE_COLORS_DICT = inst["LINEAGE_COLORS_DICT"]
-    NEXT_COLORS_DICT = inst["NEXT_COLORS_DICT"]
-    LINEAGE_STATUS_COLORS = inst["LINEAGE_STATUS_COLORS"]
-    PS_STATUS_COLORS = inst["PS_STATUS_COLORS"]
+
+    # Dict singletons — update in place so ``from`` imports see new values.
+    for name in (
+        "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "WORK_OUTPUT_COLORS_DICT",
+        "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
+        "NEXT_COLORS_DICT", "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS",
+    ):
+        target = globals()[name]
+        target.clear()
+        target.update(inst[name])
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +562,7 @@ LOG_WORKER_STATUS_COLORS: dict[str, str] = {
 REVIEW_VERDICT_COLORS: dict[str, str] = {
     "APPROVED": green_success,
     "CHANGES_REQUESTED": yellow_warning,
-    "NEEDS_DISCUSSION": blue_step,
+    "NEEDS_DISCUSSION": blue,
 }
 
 # Cycle-status colors for the ``gza show`` cycle state display.

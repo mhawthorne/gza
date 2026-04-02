@@ -42,14 +42,12 @@ def test_import_base_palette() -> None:
     from gza.colors import (  # noqa: F401
         pink,
         gray_secondary,
-        blue_step,
         cyan,
         green_success,
         yellow_warning,
         red_error,
         magenta_tool,
         bold_heading,
-        dim_secondary,
         bold_cyan_heading,
         bold_red_error,
         dim_yellow_note,
@@ -69,7 +67,7 @@ def test_task_colors_dict_keys() -> None:
     from gza.colors import TASK_COLORS_DICT
 
     expected_keys = {"task_id", "prompt", "branch", "stats", "success", "failure",
-                     "unmerged", "orphaned", "lineage", "header", "label", "value"}
+                     "unmerged", "orphaned", "lineage", "date", "file", "header", "label", "value"}
     assert set(TASK_COLORS_DICT.keys()) == expected_keys
 
 
@@ -233,15 +231,10 @@ class TestBaseColors:
         assert field_names == {"task_id", "prompt", "stats", "branch", "label", "value", "heading"}
 
     def test_base_colors_defaults(self) -> None:
-        from gza.colors import BaseColors, gray_secondary, pink, cyan, bold_cyan_heading
+        from gza.colors import BaseColors, default_color
         bc = BaseColors()
-        assert bc.task_id == gray_secondary
-        assert bc.prompt == pink
-        assert bc.stats == cyan
-        assert bc.branch == cyan
-        assert bc.label == gray_secondary
-        assert bc.value == "white"
-        assert bc.heading == bold_cyan_heading
+        for f_name in ("task_id", "prompt", "stats", "branch", "label", "value", "heading"):
+            assert getattr(bc, f_name) == default_color
 
 
 class TestBuiltInThemes:
@@ -250,6 +243,7 @@ class TestBuiltInThemes:
     def test_all_themes_present(self) -> None:
         from gza.colors import BUILT_IN_THEMES
         assert "default_dark" in BUILT_IN_THEMES
+        assert "minimal" in BUILT_IN_THEMES
         assert "selective_neon" in BUILT_IN_THEMES
         assert "blue" in BUILT_IN_THEMES
 
@@ -632,15 +626,17 @@ class TestConfigThemeIntegration:
     def teardown_method(self) -> None:
         _reset_theme()
 
-    def test_config_with_no_theme_leaves_defaults(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+    def test_config_with_no_theme_uses_minimal(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
         import gza.colors as c
         from gza.config import Config
-        from gza.colors import TaskColors
+        from gza.colors import gray_secondary
 
         cfg_file = tmp_path / "gza.yaml"
         cfg_file.write_text("project_name: test\n")
         Config.load(tmp_path)
-        assert c.TASK_COLORS == TaskColors()
+        # minimal theme sets task_id to blue_bright via base
+        from gza.colors import blue_bright
+        assert c.TASK_COLORS.task_id == blue_bright
 
     def test_config_with_valid_theme_applies_it(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
         import gza.colors as c

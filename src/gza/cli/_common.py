@@ -144,7 +144,8 @@ def prune_terminal_dead_workers(config: Config) -> None:
 
 
 # Shared color palette for history and stats output — defined in gza.colors.
-from gza.colors import LINEAGE_COLORS, TASK_COLORS_DICT as TASK_COLORS
+import gza.colors as _colors
+from gza.colors import TASK_COLORS_DICT as TASK_COLORS
 
 
 def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
@@ -787,7 +788,7 @@ def _format_lineage(
     review_verdict_resolver: Callable[[DbTask], str | None] | None = None,
 ) -> str:
     """Format a lineage tree as a multi-line branch rendering."""
-    lc = LINEAGE_COLORS
+    lc = _colors.LINEAGE_COLORS
     # Allow callers to override task_id color (e.g. unmerged passes its own)
     _task_id_color = task_id_color if task_id_color is not None else lc.task_id
 

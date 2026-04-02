@@ -41,7 +41,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
-| `theme` | String | *(none)* | Built-in color theme: `default_dark`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
+| `theme` | String | *(none)* | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
 | `colors` | Dict | `{}` | Ad-hoc map of `field_name: rich_color_string` applied on top of `theme` (highest priority). Allowed in `gza.local.yaml`. |
 
 ### Local Overrides (gza.local.yaml)
@@ -83,6 +83,7 @@ Gza supports color themes that control the appearance of all CLI output.
 | Theme | Description |
 |-------|-------------|
 | `default_dark` | Light gray / white palette optimized for dark terminal backgrounds |
+| `minimal` | Extends `default_dark` with selective semantic color — red for errors, green for success, yellow for warnings, dim for secondary info |
 | `selective_neon` | Minimal overrides — bright neon highlights on task IDs and headings |
 | `blue` | Monochromatic blue palette |
 

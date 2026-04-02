@@ -46,8 +46,8 @@ from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
     TaskLineageNode,
 )
+import gza.colors as _colors
 from ..colors import (
-    LINEAGE_COLORS,
     LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS,
     PS_STATUS_COLORS,
     SHOW_COLORS_DICT,
@@ -217,7 +217,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         status_padded = f"{status_label:<{STATUS_WIDTH}}"
         status_icon = f"[{status_color}]{status_padded}[/{status_color}]"
         date_str = (
-            f"[{c['task_id']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]"
+            f"[{c['date']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]"
             if task.completed_at
             else ""
         )
@@ -233,19 +233,20 @@ def cmd_history(args: argparse.Namespace) -> int:
         # Type + deps on a separate line
         type_label = f"\\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
+        tid = c['task_id']
         if task.based_on and task.depends_on:
-            parent_label = f" ← #{task.based_on} (dep #{task.depends_on})"
+            parent_label = f" ← [{tid}]#{task.based_on}[/{tid}] (dep [{tid}]#{task.depends_on}[/{tid}])"
         elif task.based_on:
-            parent_label = f" ← #{task.based_on}"
+            parent_label = f" ← [{tid}]#{task.based_on}[/{tid}]"
         elif task.depends_on:
-            parent_label = f" ← #{task.depends_on}"
+            parent_label = f" ← [{tid}]#{task.depends_on}[/{tid}]"
         else:
             parent_label = ""
         console.print(f"{indent}    {type_label}{merge_label}{parent_label}")
         if task.branch:
             console.print(f"{indent}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
         if task.report_file:
-            console.print(f"{indent}    report: [{c['task_id']}]{task.report_file}[/{c['task_id']}]")
+            console.print(f"{indent}    report: [{c['file']}]{task.report_file}[/{c['file']}]")
         stats_str = format_stats(task)
         if stats_str:
             console.print(f"{indent}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -1195,7 +1196,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         first_line = t.prompt.split("\n")[0].strip()
         prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
 
-        lc = LINEAGE_COLORS
+        lc = _colors.LINEAGE_COLORS
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
         rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel else ""
 
