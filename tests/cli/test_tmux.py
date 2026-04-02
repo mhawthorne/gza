@@ -1,6 +1,7 @@
 """Tests for tmux-related CLI functionality: attach command and tmux spawn logic."""
 
 import argparse
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -59,7 +60,9 @@ class TestCmdAttach:
         tmux_has_session = MagicMock(returncode=0)
 
         with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp:
+             patch("gza.cli.query.os.execvp") as mock_execvp, \
+             patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("TMUX", None)
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
@@ -121,7 +124,9 @@ class TestCmdAttach:
         tmux_has_session = MagicMock(returncode=0)
 
         with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp:
+             patch("gza.cli.query.os.execvp") as mock_execvp, \
+             patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("TMUX", None)
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
@@ -132,6 +137,43 @@ class TestCmdAttach:
 
         captured = capsys.readouterr()
         assert "headless" in captured.out.lower() or "observe" in captured.out.lower()
+
+    def test_cmd_attach_uses_switch_client_inside_tmux(self, tmp_path: Path):
+        """cmd_attach uses switch-client instead of attach-session when already in tmux."""
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
+
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        tmux_has_session = MagicMock(returncode=0)
+
+        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+             patch("gza.cli.query.os.execvp") as mock_execvp, \
+             patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
+            from gza.cli.query import cmd_attach
+            cmd_attach(args)
+
+        mock_execvp.assert_called_once()
+        call_args = mock_execvp.call_args[0]
+        assert call_args[0] == "tmux"
+        assert "switch-client" in call_args[1]
+        assert "gza-1" in call_args[1]
+
+    def test_cmd_attach_observe_only_uses_switch_client_inside_tmux(self, tmp_path: Path):
+        """cmd_attach uses switch-client -r for observe-only providers when inside tmux."""
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
+
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        tmux_has_session = MagicMock(returncode=0)
+
+        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+             patch("gza.cli.query.os.execvp") as mock_execvp, \
+             patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
+            from gza.cli.query import cmd_attach
+            cmd_attach(args)
+
+        mock_execvp.assert_called_once()
+        call_args = mock_execvp.call_args[0]
+        assert "switch-client" in call_args[1]
+        assert "-r" in call_args[1]
 
 
 class TestSpawnBackgroundWorkerTmux:
@@ -169,14 +211,17 @@ class TestSpawnBackgroundWorkerTmux:
             result = _spawn_background_worker(args, config, task_id=task.id)
 
         assert result == 0
-        # Verify tmux kill-session (cleanup) + new-session were called
+        # Verify tmux kill-session + new-session + set-option were called
         tmux_calls = [c for c in mock_run.call_args_list if c[0][0][0] == "tmux"]
-        assert len(tmux_calls) == 2, "Expected kill-session + new-session tmux commands"
+        assert len(tmux_calls) == 3, "Expected kill-session + new-session + set-option tmux commands"
         kill_args = tmux_calls[0][0][0]
         assert "kill-session" in kill_args
         new_args = tmux_calls[1][0][0]
         assert "new-session" in new_args
         assert "-d" in new_args
+        set_args = tmux_calls[2][0][0]
+        assert "set-option" in set_args
+        assert "remain-on-exit" in set_args
 
     def test_spawn_background_worker_skips_tmux_when_disabled(self, tmp_path: Path):
         """_spawn_background_worker uses bare Popen when config.tmux.enabled is False."""
