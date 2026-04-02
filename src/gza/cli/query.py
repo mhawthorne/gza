@@ -1529,6 +1529,16 @@ def cmd_attach(args: argparse.Namespace) -> int:
     # to avoid the "sessions should be nested with care" error.
     inside_tmux = bool(os.environ.get("TMUX"))
 
+    if inside_tmux:
+        # When task ends and its session is destroyed, switch back to the
+        # previous session instead of detaching from tmux entirely.
+        # Scoped to the task session (not -g) to avoid mutating global config.
+        subprocess.run(
+            ["tmux", "set-option", "-t", session_name,
+             "detach-on-destroy", "previous"],
+            stderr=subprocess.DEVNULL,
+        )
+
     if provider_name in _OBSERVE_ONLY_PROVIDERS:
         print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
         print(
@@ -1540,12 +1550,6 @@ def cmd_attach(args: argparse.Namespace) -> int:
         )
         print()
         if inside_tmux:
-            # When task ends and its session is destroyed, switch back to
-            # the previous session instead of detaching from tmux entirely.
-            subprocess.run(
-                ["tmux", "set-option", "-g", "detach-on-destroy", "previous"],
-                stderr=subprocess.DEVNULL,
-            )
             os.execvp("tmux", ["tmux", "switch-client", "-r", "-t", session_name])
         else:
             os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])
@@ -1554,10 +1558,6 @@ def cmd_attach(args: argparse.Namespace) -> int:
         print("You have full interactive control. Ctrl-B D to detach.")
         print()
         if inside_tmux:
-            subprocess.run(
-                ["tmux", "set-option", "-g", "detach-on-destroy", "previous"],
-                stderr=subprocess.DEVNULL,
-            )
             os.execvp("tmux", ["tmux", "switch-client", "-t", session_name])
         else:
             os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])

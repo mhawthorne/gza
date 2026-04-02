@@ -145,7 +145,7 @@ class TestCmdAttach:
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
              patch("gza.cli.query.os.execvp") as mock_execvp, \
              patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
             from gza.cli.query import cmd_attach
@@ -157,6 +157,16 @@ class TestCmdAttach:
         assert "switch-client" in call_args[1]
         assert "gza-1" in call_args[1]
 
+        # Verify detach-on-destroy is set on the task session (not globally)
+        set_option_calls = [
+            c for c in mock_run.call_args_list
+            if "set-option" in c[0][0] and "detach-on-destroy" in c[0][0]
+        ]
+        assert len(set_option_calls) == 1, "detach-on-destroy must be set when inside tmux"
+        set_args = set_option_calls[0][0][0]
+        assert "-t" in set_args, "detach-on-destroy must be session-scoped (-t), not global (-g)"
+        assert "gza-1" in set_args
+
     def test_cmd_attach_observe_only_uses_switch_client_inside_tmux(self, tmp_path: Path):
         """cmd_attach uses switch-client -r for observe-only providers when inside tmux."""
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
@@ -164,7 +174,7 @@ class TestCmdAttach:
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
              patch("gza.cli.query.os.execvp") as mock_execvp, \
              patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
             from gza.cli.query import cmd_attach
@@ -174,6 +184,14 @@ class TestCmdAttach:
         call_args = mock_execvp.call_args[0]
         assert "switch-client" in call_args[1]
         assert "-r" in call_args[1]
+
+        # Verify detach-on-destroy is set on the task session (not globally)
+        set_option_calls = [
+            c for c in mock_run.call_args_list
+            if "set-option" in c[0][0] and "detach-on-destroy" in c[0][0]
+        ]
+        assert len(set_option_calls) == 1
+        assert "-t" in set_option_calls[0][0][0]
 
 
 class TestSpawnBackgroundWorkerTmux:
