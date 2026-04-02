@@ -29,12 +29,24 @@ for the old inline dictionaries)::
 
     from gza.colors import TASK_COLORS_DICT
     color = TASK_COLORS_DICT["prompt"]  # "#ff99cc"
+
+## Theme System
+A theme is a named set of partial color overrides layered on top of defaults.
+Use :func:`set_theme` to activate a named theme or ad-hoc overrides::
+
+    from gza.colors import set_theme
+    set_theme('blue')
+    set_theme('blue', {'task_id': '#ff0000'})
+
+Built-in themes: ``'default_dark'``, ``'selective_neon'``, ``'blue'``.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Base palette — logical semantic names mapped to Rich color strings
@@ -192,23 +204,318 @@ class NextColors:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton instances (typed, attribute-style access)
+# BaseColors — cross-context defaults for fields shared across multiple classes
 # ---------------------------------------------------------------------------
 
-TASK_COLORS = TaskColors()
-STATUS_COLORS = StatusColors()
-WORK_OUTPUT_COLORS = WorkOutputColors()
-SHOW_COLORS = ShowColors()
-UNMERGED_COLORS = UnmergedColors()
-LINEAGE_COLORS = LineageColors()
-NEXT_COLORS = NextColors()
+
+@dataclass(frozen=True)
+class BaseColors:
+    """Default color for each field that appears in multiple domain color classes.
+
+    These values are used by :class:`Theme` to apply cross-cutting overrides —
+    setting ``base.task_id`` in a theme changes ``task_id`` in *every* domain
+    class that has that field, unless a domain-specific override is also set.
+    """
+
+    task_id: str = gray_secondary
+    prompt: str = pink
+    stats: str = cyan
+    branch: str = cyan
+    label: str = gray_secondary
+    value: str = "white"
+    heading: str = bold_cyan_heading
+
+
+# ---------------------------------------------------------------------------
+# Theme model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Theme:
+    """A named set of partial color overrides layered on top of per-domain defaults.
+
+    Resolution priority (highest wins):
+
+    1. Ad-hoc per-field overrides from the config ``colors:`` key (highest).
+    2. Per-domain dicts (``task``, ``show``, etc.) — domain-specific overrides
+       that take precedence over ``base`` for that class.
+    3. ``base`` dict — cross-cutting overrides for :class:`BaseColors` fields;
+       applied to every domain class that has the named field.
+    4. Dataclass field defaults — the hardcoded default values in each class.
+    """
+
+    name: str
+    base: dict[str, str] = field(default_factory=dict)
+    task: dict[str, str] = field(default_factory=dict)
+    status: dict[str, str] = field(default_factory=dict)
+    work_output: dict[str, str] = field(default_factory=dict)
+    show: dict[str, str] = field(default_factory=dict)
+    unmerged: dict[str, str] = field(default_factory=dict)
+    lineage: dict[str, str] = field(default_factory=dict)
+    next_colors: dict[str, str] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Built-in themes
+# ---------------------------------------------------------------------------
+
+_THEME_DEFAULT_DARK = Theme(
+    name="default_dark",
+    base={
+        "task_id": gray_light1,
+        "prompt": gray_light1,
+        "stats": gray_light1,
+        "branch": gray_light1,
+        "label": gray_light1,
+        "value": "white",
+        "heading": "white",
+    },
+    task={
+        "success": gray_light1,
+        "failure": gray_light1,
+        "unmerged": gray_light1,
+        "orphaned": gray_light1,
+        "lineage": gray_light1,
+        "header": "white",
+    },
+    status={
+        "completed": gray_light1,
+        "failed": gray_light1,
+        "pending": gray_light1,
+        "in_progress": gray_light1,
+        "unmerged": gray_light1,
+        "dropped": gray_light1,
+        "stale": gray_light1,
+        "unknown": gray_light1,
+        "running": gray_light1,
+    },
+    work_output={
+        "step_header": gray_light1,
+        "assistant_text": gray_light1,
+        "tool_use": gray_light1,
+        "error": "white",
+        "todo_pending": "white",
+        "todo_in_progress": gray_light1,
+        "todo_completed": gray_light1,
+    },
+    show={
+        "heading": "white",
+        "section": gray_light1,
+        "status_pending": gray_light1,
+        "status_running": gray_light1,
+        "status_completed": gray_light1,
+        "status_failed": gray_light1,
+        "status_default": "white",
+    },
+    unmerged={
+        "review_approved": gray_light1,
+        "review_changes": gray_light1,
+        "review_discussion": gray_light1,
+        "review_none": gray_light1,
+    },
+    lineage={
+        "task_type": gray_light1,
+        "annotation": gray_light1,
+        "connector": gray_light1,
+        "type_label": gray_light1,
+        "relationship": gray_light1,
+        "target_highlight": "white",
+    },
+    next_colors={
+        "type": "white",
+        "blocked": gray_light1,
+        "index": gray_light1,
+    },
+)
+
+_THEME_SELECTIVE_NEON = Theme(
+    name="selective_neon",
+    base={
+        "task_id": blue_neon,
+        "heading": pink_neon,
+    },
+    work_output={
+        "step_header": blue_neon,
+        "error": bold_red_error,
+    },
+    show={
+        "heading": pink_neon,
+    },
+)
+
+_THEME_BLUE = Theme(
+    name="blue",
+    base={
+        "task_id": blue_bright,
+        "branch": blue_neon,
+        "stats": blue_step,
+    },
+    task={
+        "stats": blue_bright,
+    },
+    show={
+        "heading": bold_cyan_heading,
+    },
+)
+
+#: Registry of all built-in themes, keyed by name.
+BUILT_IN_THEMES: dict[str, Theme] = {
+    t.name: t for t in [_THEME_DEFAULT_DARK, _THEME_SELECTIVE_NEON, _THEME_BLUE]
+}
+
+# ---------------------------------------------------------------------------
+# Theme application helpers
+# ---------------------------------------------------------------------------
+
+_BASE_COLOR_FIELDS: frozenset[str] = frozenset(
+    f.name for f in dataclasses.fields(BaseColors)
+)
+
+def _apply_domain_theme(
+    default_instance: Any,
+    domain_overrides: dict[str, str],
+    base_overrides: dict[str, str],
+    color_overrides: dict[str, str],
+) -> Any:
+    """Return a new frozen dataclass instance with theme and config overrides applied.
+
+    Priority (highest to lowest):
+
+    1. ``color_overrides`` — ad-hoc per-field config overrides.
+    2. ``domain_overrides`` — theme's domain-specific overrides.
+    3. ``base_overrides`` — theme's BaseColors overrides (only for shared fields).
+    4. ``default_instance`` field values — hardcoded dataclass defaults.
+    """
+    overrides: dict[str, Any] = {}
+    for f in dataclasses.fields(default_instance):
+        name = f.name
+        if name in color_overrides:
+            overrides[name] = color_overrides[name]
+        elif name in domain_overrides:
+            overrides[name] = domain_overrides[name]
+        elif name in _BASE_COLOR_FIELDS and name in base_overrides:
+            overrides[name] = base_overrides[name]
+    if overrides:
+        return dataclasses.replace(default_instance, **overrides)
+    return default_instance
+
+
+def _build_themed_instances(
+    theme_name: str | None,
+    color_overrides: dict[str, str],
+) -> dict[str, Any]:
+    """Build all themed color singletons and return them in a dict."""
+    theme = BUILT_IN_THEMES.get(theme_name) if theme_name else None
+    base_ov = theme.base if theme is not None else {}
+    _no: dict[str, str] = {}
+
+    task_c = _apply_domain_theme(TaskColors(), theme.task if theme else _no, base_ov, color_overrides)
+    status_c = _apply_domain_theme(StatusColors(), theme.status if theme else _no, base_ov, color_overrides)
+    work_c = _apply_domain_theme(WorkOutputColors(), theme.work_output if theme else _no, base_ov, color_overrides)
+    show_c = _apply_domain_theme(ShowColors(), theme.show if theme else _no, base_ov, color_overrides)
+    unmerged_c = _apply_domain_theme(UnmergedColors(), theme.unmerged if theme else _no, base_ov, color_overrides)
+    lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
+    next_c = _apply_domain_theme(NextColors(), theme.next_colors if theme else _no, base_ov, color_overrides)
+
+    return {
+        "TASK_COLORS": task_c,
+        "STATUS_COLORS": status_c,
+        "WORK_OUTPUT_COLORS": work_c,
+        "SHOW_COLORS": show_c,
+        "UNMERGED_COLORS": unmerged_c,
+        "LINEAGE_COLORS": lineage_c,
+        "NEXT_COLORS": next_c,
+        "TASK_COLORS_DICT": dataclasses.asdict(task_c),
+        "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
+        "WORK_OUTPUT_COLORS_DICT": dataclasses.asdict(work_c),
+        "SHOW_COLORS_DICT": dataclasses.asdict(show_c),
+        "UNMERGED_COLORS_DICT": dataclasses.asdict(unmerged_c),
+        "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
+        "NEXT_COLORS_DICT": dataclasses.asdict(next_c),
+        "LINEAGE_STATUS_COLORS": {
+            "completed": status_c.completed,
+            "failed": status_c.failed,
+            "pending": status_c.pending,
+            "in_progress": status_c.in_progress,
+            "unmerged": status_c.unmerged,
+            "dropped": status_c.dropped,
+        },
+        "PS_STATUS_COLORS": {
+            "running": status_c.running,
+            "in_progress": status_c.in_progress,
+            "completed": status_c.completed,
+            "failed": status_c.failed,
+            "failed(startup)": status_c.failed,
+            "stale": status_c.stale,
+            "unknown": status_c.unknown,
+        },
+    }
+
+
+def set_theme(
+    theme_name: str | None = None,
+    color_overrides: dict[str, str] | None = None,
+) -> None:
+    """Apply a named theme and optional ad-hoc overrides to all module-level singletons.
+
+    Args:
+        theme_name: Name of a built-in theme (``'default_dark'``, ``'selective_neon'``,
+                    ``'blue'``), or ``None`` to use per-class defaults.
+        color_overrides: Optional mapping of field-name → Rich color string applied on
+                         top of the theme.  The same key applies to *every* domain class
+                         that has a field with that name.
+
+    This function replaces the module-level singletons (``TASK_COLORS``,
+    ``TASK_COLORS_DICT``, etc.) in place so that code which has already imported
+    a singleton via ``import gza.colors as c`` and accesses ``c.TASK_COLORS``
+    sees the updated value.  Code that captured the singleton via
+    ``from gza.colors import TASK_COLORS`` at an earlier import will retain the
+    old value.
+    """
+    global TASK_COLORS, STATUS_COLORS, WORK_OUTPUT_COLORS, SHOW_COLORS
+    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS
+    global TASK_COLORS_DICT, STATUS_COLORS_DICT, WORK_OUTPUT_COLORS_DICT, SHOW_COLORS_DICT
+    global UNMERGED_COLORS_DICT, LINEAGE_COLORS_DICT, NEXT_COLORS_DICT
+    global LINEAGE_STATUS_COLORS, PS_STATUS_COLORS
+
+    inst = _build_themed_instances(theme_name, color_overrides or {})
+    TASK_COLORS = inst["TASK_COLORS"]
+    STATUS_COLORS = inst["STATUS_COLORS"]
+    WORK_OUTPUT_COLORS = inst["WORK_OUTPUT_COLORS"]
+    SHOW_COLORS = inst["SHOW_COLORS"]
+    UNMERGED_COLORS = inst["UNMERGED_COLORS"]
+    LINEAGE_COLORS = inst["LINEAGE_COLORS"]
+    NEXT_COLORS = inst["NEXT_COLORS"]
+    TASK_COLORS_DICT = inst["TASK_COLORS_DICT"]
+    STATUS_COLORS_DICT = inst["STATUS_COLORS_DICT"]
+    WORK_OUTPUT_COLORS_DICT = inst["WORK_OUTPUT_COLORS_DICT"]
+    SHOW_COLORS_DICT = inst["SHOW_COLORS_DICT"]
+    UNMERGED_COLORS_DICT = inst["UNMERGED_COLORS_DICT"]
+    LINEAGE_COLORS_DICT = inst["LINEAGE_COLORS_DICT"]
+    NEXT_COLORS_DICT = inst["NEXT_COLORS_DICT"]
+    LINEAGE_STATUS_COLORS = inst["LINEAGE_STATUS_COLORS"]
+    PS_STATUS_COLORS = inst["PS_STATUS_COLORS"]
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton instances (typed, attribute-style access)
+# ---------------------------------------------------------------------------
+# Initialized with per-class defaults. Call set_theme() to apply a theme at
+# runtime (Config.load() does this automatically).
+
+TASK_COLORS: TaskColors = TaskColors()
+STATUS_COLORS: StatusColors = StatusColors()
+WORK_OUTPUT_COLORS: WorkOutputColors = WorkOutputColors()
+SHOW_COLORS: ShowColors = ShowColors()
+UNMERGED_COLORS: UnmergedColors = UnmergedColors()
+LINEAGE_COLORS: LineageColors = LineageColors()
+NEXT_COLORS: NextColors = NextColors()
 
 # ---------------------------------------------------------------------------
 # Dict variants (drop-in replacements for the old inline dictionaries)
 # ---------------------------------------------------------------------------
 
-# These module-level dict calls execute at import time (intentionally eager —
-# the module is small and the dicts are always needed).
 TASK_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_COLORS)
 STATUS_COLORS_DICT: dict[str, str] = dataclasses.asdict(STATUS_COLORS)
 WORK_OUTPUT_COLORS_DICT: dict[str, str] = dataclasses.asdict(WORK_OUTPUT_COLORS)
@@ -242,6 +549,9 @@ PS_STATUS_COLORS: dict[str, str] = {
 # Note: 'unmerged' maps to green (treated as successfully merged for display
 # purposes) and 'in_progress' maps to yellow — both differ from STATUS_COLORS
 # which uses yellow/cyan respectively for those states.
+# Intentionally excluded from set_theme(): these use semantic ANSI colors
+# (green_success, red_error, yellow_warning) that should remain stable across
+# themes to preserve clear pass/fail readability in log output.
 LOG_TASK_STATUS_COLORS: dict[str, str] = {
     "completed": green_success,
     "unmerged": green_success,
@@ -251,6 +561,7 @@ LOG_TASK_STATUS_COLORS: dict[str, str] = {
 }
 
 # Log-command worker-status colors (keyed by worker.status string).
+# Intentionally excluded from set_theme() — same rationale as LOG_TASK_STATUS_COLORS.
 LOG_WORKER_STATUS_COLORS: dict[str, str] = {
     "running": yellow_warning,
     "in_progress": yellow_warning,
@@ -261,6 +572,7 @@ LOG_WORKER_STATUS_COLORS: dict[str, str] = {
 
 # Review-verdict colors for the runner's post-task verdict display.
 # Keys are uppercase verdict strings as returned by parse_review_verdict().
+# Intentionally excluded from set_theme() — same rationale as LOG_TASK_STATUS_COLORS.
 REVIEW_VERDICT_COLORS: dict[str, str] = {
     "APPROVED": green_success,
     "CHANGES_REQUESTED": yellow_warning,
@@ -269,9 +581,11 @@ REVIEW_VERDICT_COLORS: dict[str, str] = {
 
 # Cycle-status colors for the ``gza show`` cycle state display.
 # Keys are cycle status strings as stored in the database.
+# Intentionally excluded from set_theme() — same rationale as LOG_TASK_STATUS_COLORS.
 CYCLE_STATUS_COLORS: dict[str, str] = {
     "active": cyan,
     "approved": green_success,
     "maxed_out": yellow_warning,
     "blocked": red_error,
 }
+

@@ -1,6 +1,7 @@
 """Tests for tmux-related CLI functionality: attach command and tmux spawn logic."""
 
 import argparse
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -50,9 +51,10 @@ class TestCmdAttach:
             task.provider = provider
         store.update(task)
 
-    def test_cmd_attach_finds_session_by_worker_id(self, tmp_path: Path):
+    def test_cmd_attach_finds_session_by_worker_id(self, tmp_path: Path, monkeypatch):
         """cmd_attach attaches to tmux session when looked up by worker ID."""
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
+        monkeypatch.delenv("TMUX", raising=False)
 
         args = _make_args(tmp_path, worker_id="w-20260301-1")
 
@@ -113,9 +115,10 @@ class TestCmdAttach:
 
         assert result == 1
 
-    def test_cmd_attach_prints_warning_for_observe_only_provider(self, tmp_path: Path, capsys):
+    def test_cmd_attach_prints_warning_for_observe_only_provider(self, tmp_path: Path, capsys, monkeypatch):
         """cmd_attach attaches read-only and prints notice for codex/gemini providers."""
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
+        monkeypatch.delenv("TMUX", raising=False)
 
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
@@ -132,6 +135,61 @@ class TestCmdAttach:
 
         captured = capsys.readouterr()
         assert "headless" in captured.out.lower() or "observe" in captured.out.lower()
+
+    def test_cmd_attach_uses_switch_client_inside_tmux(self, tmp_path: Path):
+        """cmd_attach uses switch-client instead of attach-session when already in tmux."""
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
+
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        tmux_has_session = MagicMock(returncode=0)
+
+        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
+             patch("gza.cli.query.os.execvp") as mock_execvp, \
+             patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
+            from gza.cli.query import cmd_attach
+            cmd_attach(args)
+
+        mock_execvp.assert_called_once()
+        call_args = mock_execvp.call_args[0]
+        assert call_args[0] == "tmux"
+        assert "switch-client" in call_args[1]
+        assert "gza-1" in call_args[1]
+
+        # Verify detach-on-destroy is set on the task session (not globally)
+        set_option_calls = [
+            c for c in mock_run.call_args_list
+            if "set-option" in c[0][0] and "detach-on-destroy" in c[0][0]
+        ]
+        assert len(set_option_calls) == 1, "detach-on-destroy must be set when inside tmux"
+        set_args = set_option_calls[0][0][0]
+        assert "-t" in set_args, "detach-on-destroy must be session-scoped (-t), not global (-g)"
+        assert "gza-1" in set_args
+
+    def test_cmd_attach_observe_only_uses_switch_client_inside_tmux(self, tmp_path: Path):
+        """cmd_attach uses switch-client -r for observe-only providers when inside tmux."""
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
+
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        tmux_has_session = MagicMock(returncode=0)
+
+        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
+             patch("gza.cli.query.os.execvp") as mock_execvp, \
+             patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
+            from gza.cli.query import cmd_attach
+            cmd_attach(args)
+
+        mock_execvp.assert_called_once()
+        call_args = mock_execvp.call_args[0]
+        assert "switch-client" in call_args[1]
+        assert "-r" in call_args[1]
+
+        # Verify detach-on-destroy is set on the task session (not globally)
+        set_option_calls = [
+            c for c in mock_run.call_args_list
+            if "set-option" in c[0][0] and "detach-on-destroy" in c[0][0]
+        ]
+        assert len(set_option_calls) == 1
+        assert "-t" in set_option_calls[0][0][0]
 
 
 class TestSpawnBackgroundWorkerTmux:
@@ -169,14 +227,49 @@ class TestSpawnBackgroundWorkerTmux:
             result = _spawn_background_worker(args, config, task_id=task.id)
 
         assert result == 0
-        # Verify tmux kill-session (cleanup) + new-session were called
+        # Verify tmux kill-session + new-session + set-option were called
         tmux_calls = [c for c in mock_run.call_args_list if c[0][0][0] == "tmux"]
-        assert len(tmux_calls) == 2, "Expected kill-session + new-session tmux commands"
+        assert len(tmux_calls) == 3, "Expected kill-session + new-session + set-option tmux commands"
         kill_args = tmux_calls[0][0][0]
         assert "kill-session" in kill_args
         new_args = tmux_calls[1][0][0]
         assert "new-session" in new_args
         assert "-d" in new_args
+        set_args = tmux_calls[2][0][0]
+        assert "set-option" in set_args
+        assert "remain-on-exit" in set_args
+
+    def test_spawn_warns_on_remain_on_exit_failure(self, tmp_path: Path, capsys):
+        """_spawn_background_worker warns when remain-on-exit set-option fails."""
+        from gza.db import SqliteTaskStore
+
+        config = self._make_config(tmp_path, tmux_enabled=True)
+        db_path = tmp_path / ".gza" / "gza.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add("test task")
+        store.update(task)
+
+        args = _make_args(tmp_path)
+        mock_pid_result = 9999
+
+        def side_effect_fn(cmd, **kwargs):
+            # Return failure for the set-option remain-on-exit call
+            if cmd[0] == "tmux" and "set-option" in cmd and "remain-on-exit" in cmd:
+                return MagicMock(returncode=1)
+            result = MagicMock(returncode=0)
+            return result
+
+        with patch("gza.cli._common.subprocess.run", side_effect=side_effect_fn) as mock_run, \
+             patch("gza.cli._common.get_tmux_session_pid", return_value=mock_pid_result), \
+             patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
+            mock_get_store.return_value = store
+            from gza.cli._common import _spawn_background_worker
+            result = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert result == 0, "Spawn should still succeed even if set-option fails"
+        captured = capsys.readouterr()
+        assert "remain-on-exit" in captured.err, "Warning about remain-on-exit failure should be printed to stderr"
 
     def test_spawn_background_worker_skips_tmux_when_disabled(self, tmp_path: Path):
         """_spawn_background_worker uses bare Popen when config.tmux.enabled is False."""

@@ -121,6 +121,10 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
+    "theme": None,
+    "colors": {
+        "*": None,
+    },
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
@@ -328,6 +332,8 @@ class Config:
     learnings_window: int = DEFAULT_LEARNINGS_WINDOW
     learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
     tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
+    theme: str | None = None  # Named color theme ('default_dark', 'selective_neon', 'blue')
+    colors: dict[str, str] = field(default_factory=dict)  # Ad-hoc per-field color overrides
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
     local_overrides_active: bool = False
@@ -526,6 +532,7 @@ class Config:
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
             "tmux",
             "learnings_window", "learnings_interval",
+            "theme", "colors",
         }
         for key in data.keys():
             if key not in valid_fields:
@@ -995,6 +1002,31 @@ class Config:
             terminal_size=terminal_size,
         )
 
+        # Parse theme and ad-hoc color overrides.
+        from .colors import BUILT_IN_THEMES, set_theme as _set_theme  # noqa: PLC0415
+
+        theme_name: str | None = data.get("theme")
+        if theme_name is not None:
+            if not isinstance(theme_name, str):
+                raise ConfigError("'theme' must be a string")
+            if theme_name not in BUILT_IN_THEMES:
+                raise ConfigError(
+                    f"'theme' must be one of: {', '.join(sorted(BUILT_IN_THEMES))}"
+                )
+
+        raw_colors = data.get("colors") or {}
+        if not isinstance(raw_colors, dict):
+            raise ConfigError("'colors' must be a dictionary of field-name: color-value pairs")
+        colors: dict[str, str] = {}
+        for k, v in raw_colors.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ConfigError("'colors' keys and values must both be strings")
+            colors[k] = v
+
+        # Apply theme to module-level color singletons so all subsequent code
+        # sees the correct themed values when accessing gza.colors.*.
+        _set_theme(theme_name, colors)
+
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
@@ -1032,6 +1064,8 @@ class Config:
             learnings_window=learnings_window,
             learnings_interval=learnings_interval,
             tmux=tmux_config,
+            theme=theme_name,
+            colors=colors,
             source_map=source_map,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,

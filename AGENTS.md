@@ -66,6 +66,11 @@ Key modules: `src/gza/db.py` (storage), `src/gza/cli/` (CLI), `src/gza/runner.py
 
 Edit skills in `src/gza/skills/`, never in `.claude/skills/` (installed artifacts). Install with `gza skills-install`. New skill = new directory with `SKILL.md`. See [docs/skills.md](docs/skills.md).
 
+## Config Fields (new/notable)
+
+- `theme` — built-in color theme: `default_dark`, `selective_neon`, or `blue`. See [docs/configuration.md](docs/configuration.md).
+- `colors` — ad-hoc dict of `field_name: rich_color_string` applied on top of `theme`; overrides always win. Allowed in `gza.local.yaml`.
+
 ## Conventions
 
 - Unix line endings (LF) only

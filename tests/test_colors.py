@@ -56,6 +56,10 @@ def test_import_base_palette() -> None:
     )
 
 
+def test_import_theme_types() -> None:
+    from gza.colors import BaseColors, Theme, BUILT_IN_THEMES, set_theme  # noqa: F401
+
+
 # ---------------------------------------------------------------------------
 # Dataclass key-set regression tests
 # ---------------------------------------------------------------------------
@@ -206,3 +210,447 @@ def test_no_hex_colors_outside_colors_module() -> None:
         "Hex color literals found outside gza/colors.py — add them to colors.py instead:\n"
         + "\n".join(violations)
     )
+
+
+# ---------------------------------------------------------------------------
+# Theme system tests
+# ---------------------------------------------------------------------------
+
+
+def _reset_theme() -> None:
+    """Reset colors module to default (no theme) state."""
+    import gza.colors as c
+    c.set_theme(None, None)
+
+
+class TestBaseColors:
+    """BaseColors dataclass has the right fields and defaults."""
+
+    def test_base_colors_has_shared_fields(self) -> None:
+        from gza.colors import BaseColors
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(BaseColors)}
+        assert field_names == {"task_id", "prompt", "stats", "branch", "label", "value", "heading"}
+
+    def test_base_colors_defaults(self) -> None:
+        from gza.colors import BaseColors, gray_secondary, pink, cyan, bold_cyan_heading
+        bc = BaseColors()
+        assert bc.task_id == gray_secondary
+        assert bc.prompt == pink
+        assert bc.stats == cyan
+        assert bc.branch == cyan
+        assert bc.label == gray_secondary
+        assert bc.value == "white"
+        assert bc.heading == bold_cyan_heading
+
+
+class TestBuiltInThemes:
+    """BUILT_IN_THEMES contains all three required themes."""
+
+    def test_all_themes_present(self) -> None:
+        from gza.colors import BUILT_IN_THEMES
+        assert "default_dark" in BUILT_IN_THEMES
+        assert "selective_neon" in BUILT_IN_THEMES
+        assert "blue" in BUILT_IN_THEMES
+
+    def test_theme_names_match_keys(self) -> None:
+        from gza.colors import BUILT_IN_THEMES
+        for key, theme in BUILT_IN_THEMES.items():
+            assert theme.name == key
+
+
+class TestSetTheme:
+    """set_theme() correctly applies themes and resets to defaults."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_default_theme_uses_dataclass_defaults(self) -> None:
+        from gza.colors import TaskColors, ShowColors
+        import gza.colors as c
+        c.set_theme(None)
+        assert c.TASK_COLORS == TaskColors()
+        assert c.SHOW_COLORS == ShowColors()
+
+    def test_set_theme_none_restores_defaults(self) -> None:
+        import gza.colors as c
+        from gza.colors import TaskColors
+        c.set_theme("blue")
+        c.set_theme(None)
+        assert c.TASK_COLORS == TaskColors()
+
+    def test_dict_variants_stay_in_sync(self) -> None:
+        import gza.colors as c
+        import dataclasses
+        c.set_theme("blue")
+        assert c.TASK_COLORS_DICT == dataclasses.asdict(c.TASK_COLORS)
+        assert c.STATUS_COLORS_DICT == dataclasses.asdict(c.STATUS_COLORS)
+        assert c.SHOW_COLORS_DICT == dataclasses.asdict(c.SHOW_COLORS)
+
+    def test_lineage_status_colors_stays_in_sync(self) -> None:
+        import gza.colors as c
+        c.set_theme("default_dark")
+        assert c.LINEAGE_STATUS_COLORS["completed"] == c.STATUS_COLORS.completed
+        assert c.LINEAGE_STATUS_COLORS["failed"] == c.STATUS_COLORS.failed
+
+    def test_ps_status_colors_stays_in_sync(self) -> None:
+        import gza.colors as c
+        c.set_theme("default_dark")
+        assert c.PS_STATUS_COLORS["completed"] == c.STATUS_COLORS.completed
+        assert c.PS_STATUS_COLORS["failed"] == c.STATUS_COLORS.failed
+
+
+class TestBaseColorsPropagation:
+    """Theme base overrides propagate to all domain classes with the same field."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_base_task_id_applies_to_all_classes(self) -> None:
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES
+
+        # Apply a custom theme with only a base override for task_id
+        custom_theme = Theme(name="_test_base_propagate", base={"task_id": "#ff0000"})
+        # Temporarily register and use it
+        BUILT_IN_THEMES["_test_base_propagate"] = custom_theme
+        try:
+            c.set_theme("_test_base_propagate")
+            # All domain classes with task_id should have been overridden
+            assert c.TASK_COLORS.task_id == "#ff0000"
+            assert c.SHOW_COLORS.task_id == "#ff0000"
+            assert c.UNMERGED_COLORS.task_id == "#ff0000"
+            assert c.LINEAGE_COLORS.task_id == "#ff0000"
+            assert c.NEXT_COLORS.task_id == "#ff0000"
+        finally:
+            del BUILT_IN_THEMES["_test_base_propagate"]
+
+    def test_base_prompt_applies_to_all_classes(self) -> None:
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES
+
+        custom_theme = Theme(name="_test_base_prompt", base={"prompt": "#00ff00"})
+        BUILT_IN_THEMES["_test_base_prompt"] = custom_theme
+        try:
+            c.set_theme("_test_base_prompt")
+            assert c.TASK_COLORS.prompt == "#00ff00"
+            assert c.SHOW_COLORS.prompt == "#00ff00"
+            assert c.UNMERGED_COLORS.prompt == "#00ff00"
+            assert c.LINEAGE_COLORS.prompt == "#00ff00"
+            assert c.NEXT_COLORS.prompt == "#00ff00"
+        finally:
+            del BUILT_IN_THEMES["_test_base_prompt"]
+
+    def test_base_non_shared_fields_ignored(self) -> None:
+        """Fields not in BaseColors are not affected by base overrides."""
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES, StatusColors
+
+        custom_theme = Theme(name="_test_base_ignore", base={"task_id": "#ff0000"})
+        BUILT_IN_THEMES["_test_base_ignore"] = custom_theme
+        try:
+            c.set_theme("_test_base_ignore")
+            # StatusColors has no task_id, so it's unaffected by the base override
+            assert c.STATUS_COLORS == StatusColors()
+        finally:
+            del BUILT_IN_THEMES["_test_base_ignore"]
+
+
+class TestDomainOverridePrecedence:
+    """Domain-specific theme overrides take precedence over base overrides."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_domain_overrides_base(self) -> None:
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES
+
+        custom_theme = Theme(
+            name="_test_domain_prio",
+            base={"task_id": "#aaaaaa"},
+            task={"task_id": "#ff0000"},  # domain-specific overrides base
+        )
+        BUILT_IN_THEMES["_test_domain_prio"] = custom_theme
+        try:
+            c.set_theme("_test_domain_prio")
+            # TaskColors gets domain-specific value
+            assert c.TASK_COLORS.task_id == "#ff0000"
+            # ShowColors gets base value (no domain override)
+            assert c.SHOW_COLORS.task_id == "#aaaaaa"
+        finally:
+            del BUILT_IN_THEMES["_test_domain_prio"]
+
+    def test_domain_override_does_not_affect_other_classes(self) -> None:
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES
+
+        custom_theme = Theme(
+            name="_test_domain_isolated",
+            task={"task_id": "#112233"},
+        )
+        BUILT_IN_THEMES["_test_domain_isolated"] = custom_theme
+        try:
+            c.set_theme("_test_domain_isolated")
+            assert c.TASK_COLORS.task_id == "#112233"
+            # Other classes not overridden — use their own defaults
+            from gza.colors import ShowColors, UnmergedColors
+            assert c.SHOW_COLORS.task_id == ShowColors().task_id
+            assert c.UNMERGED_COLORS.task_id == UnmergedColors().task_id
+        finally:
+            del BUILT_IN_THEMES["_test_domain_isolated"]
+
+
+class TestAdHocColorOverrides:
+    """Ad-hoc color_overrides layer on top of a theme (highest priority)."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_override_applies_to_all_classes_with_field(self) -> None:
+        import gza.colors as c
+        c.set_theme(None, {"task_id": "#ffffff"})
+        assert c.TASK_COLORS.task_id == "#ffffff"
+        assert c.SHOW_COLORS.task_id == "#ffffff"
+        assert c.UNMERGED_COLORS.task_id == "#ffffff"
+
+    def test_override_beats_theme_domain(self) -> None:
+        import gza.colors as c
+        from gza.colors import Theme, BUILT_IN_THEMES
+
+        custom_theme = Theme(
+            name="_test_override_prio",
+            base={"task_id": "#aaaaaa"},
+            task={"task_id": "#bbbbbb"},
+        )
+        BUILT_IN_THEMES["_test_override_prio"] = custom_theme
+        try:
+            c.set_theme("_test_override_prio", {"task_id": "#cccccc"})
+            assert c.TASK_COLORS.task_id == "#cccccc"  # override beats domain
+            assert c.SHOW_COLORS.task_id == "#cccccc"  # override beats base
+        finally:
+            del BUILT_IN_THEMES["_test_override_prio"]
+
+    def test_override_only_affects_named_fields(self) -> None:
+        import gza.colors as c
+        from gza.colors import TaskColors
+        c.set_theme(None, {"task_id": "#ffffff"})
+        # Unrelated fields retain their defaults
+        assert c.TASK_COLORS.prompt == TaskColors().prompt
+        assert c.TASK_COLORS.branch == TaskColors().branch
+
+    def test_override_with_no_theme(self) -> None:
+        import gza.colors as c
+        c.set_theme(None, {"prompt": "#123456"})
+        assert c.TASK_COLORS.prompt == "#123456"
+        assert c.SHOW_COLORS.prompt == "#123456"
+
+
+class TestBuiltInThemeDefaultDark:
+    """default_dark theme sets colors to light gray / white."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_task_id_becomes_light_gray(self) -> None:
+        import gza.colors as c
+        from gza.colors import gray_light1
+        c.set_theme("default_dark")
+        assert c.TASK_COLORS.task_id == gray_light1
+
+    def test_prompt_becomes_light_gray(self) -> None:
+        import gza.colors as c
+        from gza.colors import gray_light1
+        c.set_theme("default_dark")
+        assert c.TASK_COLORS.prompt == gray_light1
+        assert c.SHOW_COLORS.prompt == gray_light1
+
+    def test_unoverridden_fields_still_present(self) -> None:
+        """set_theme does not add unexpected fields."""
+        import gza.colors as c
+        import dataclasses
+        from gza.colors import TaskColors
+        c.set_theme("default_dark")
+        themed_keys = {f.name for f in dataclasses.fields(c.TASK_COLORS)}
+        default_keys = {f.name for f in dataclasses.fields(TaskColors())}
+        assert themed_keys == default_keys
+
+
+class TestBuiltInThemeSelectiveNeon:
+    """selective_neon theme changes only a few fields to bright neon colors."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_task_id_becomes_neon_blue(self) -> None:
+        import gza.colors as c
+        from gza.colors import blue_neon
+        c.set_theme("selective_neon")
+        assert c.TASK_COLORS.task_id == blue_neon
+        assert c.SHOW_COLORS.task_id == blue_neon
+
+    def test_non_overridden_fields_keep_defaults(self) -> None:
+        import gza.colors as c
+        from gza.colors import TaskColors
+        c.set_theme("selective_neon")
+        # stats and branch are not touched by selective_neon
+        assert c.TASK_COLORS.stats == TaskColors().stats
+        assert c.TASK_COLORS.branch == TaskColors().branch
+        assert c.TASK_COLORS.success == TaskColors().success
+
+
+class TestBuiltInThemeBlue:
+    """blue theme applies 3–4 shades of blue to a handful of fields."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_task_id_is_blue(self) -> None:
+        import gza.colors as c
+        from gza.colors import blue_bright
+        c.set_theme("blue")
+        assert c.TASK_COLORS.task_id == blue_bright
+
+    def test_branch_is_blue(self) -> None:
+        import gza.colors as c
+        from gza.colors import blue_neon
+        c.set_theme("blue")
+        assert c.TASK_COLORS.branch == blue_neon
+
+    def test_non_overridden_fields_keep_defaults(self) -> None:
+        import gza.colors as c
+        from gza.colors import TaskColors
+        c.set_theme("blue")
+        assert c.TASK_COLORS.success == TaskColors().success
+        assert c.TASK_COLORS.failure == TaskColors().failure
+        assert c.TASK_COLORS.prompt == TaskColors().prompt
+
+
+class TestNoModuleLevelConfigRead:
+    """Importing gza.colors must not read gza.yaml from CWD."""
+
+    def test_import_does_not_read_cwd_gza_yaml(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        """Module-level _load_theme_from_config side-effect must not exist."""
+        import os
+        import importlib
+        import sys
+
+        # Write a gza.yaml with theme: blue in tmp_path
+        gza_yaml = tmp_path / "gza.yaml"
+        gza_yaml.write_text("project_name: test\ntheme: blue\n")
+
+        orig_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            # Force a fresh import by removing cached module
+            sys.modules.pop("gza.colors", None)
+            import gza.colors as c
+            importlib.reload(c)
+            # Default colors must be intact — blue theme NOT auto-applied
+            from gza.colors import TaskColors
+            assert c.TASK_COLORS == TaskColors(), (
+                "gza.colors auto-applied theme from CWD gza.yaml — "
+                "module-level config read must be removed"
+            )
+        finally:
+            os.chdir(orig_dir)
+            sys.modules.pop("gza.colors", None)
+
+
+class TestConfigThemeIntegration:
+    """Config.load() parses theme and colors, and calls set_theme()."""
+
+    def setup_method(self) -> None:
+        _reset_theme()
+
+    def teardown_method(self) -> None:
+        _reset_theme()
+
+    def test_config_with_no_theme_leaves_defaults(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        import gza.colors as c
+        from gza.config import Config
+        from gza.colors import TaskColors
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\n")
+        Config.load(tmp_path)
+        assert c.TASK_COLORS == TaskColors()
+
+    def test_config_with_valid_theme_applies_it(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        import gza.colors as c
+        from gza.config import Config
+        from gza.colors import blue_bright
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\ntheme: blue\n")
+        Config.load(tmp_path)
+        assert c.TASK_COLORS.task_id == blue_bright
+
+    def test_config_with_invalid_theme_raises(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        from gza.config import Config, ConfigError
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\ntheme: not_a_real_theme\n")
+        with pytest.raises(ConfigError, match="theme"):
+            Config.load(tmp_path)
+
+    def test_config_with_adhoc_colors_applies_them(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        import gza.colors as c
+        from gza.config import Config
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\ncolors:\n  task_id: '#ff0000'\n  prompt: '#00ff00'\n")
+        Config.load(tmp_path)
+        assert c.TASK_COLORS.task_id == "#ff0000"
+        assert c.TASK_COLORS.prompt == "#00ff00"
+
+    def test_config_theme_stored_on_config_object(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        from gza.config import Config
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\ntheme: blue\n")
+        cfg = Config.load(tmp_path)
+        assert cfg.theme == "blue"
+
+    def test_config_colors_stored_on_config_object(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        from gza.config import Config
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\ncolors:\n  task_id: '#aabbcc'\n")
+        cfg = Config.load(tmp_path)
+        assert cfg.colors == {"task_id": "#aabbcc"}
+
+    def test_config_theme_and_colors_combined(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        """Ad-hoc colors override theme values when both are present."""
+        import gza.colors as c
+        from gza.config import Config
+        from gza.colors import blue_bright
+
+        cfg_file = tmp_path / "gza.yaml"
+        # blue theme sets task_id to blue_bright; the colors override wins
+        cfg_file.write_text(
+            "project_name: test\ntheme: blue\ncolors:\n  task_id: '#deadbe'\n"
+        )
+        Config.load(tmp_path)
+        assert c.TASK_COLORS.task_id == "#deadbe"

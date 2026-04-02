@@ -1516,7 +1516,11 @@ def cmd_attach(args: argparse.Namespace) -> int:
     )
     if result.returncode != 0:
         print(f"No tmux session found: {session_name}")
-        print("This task may have been started without tmux support.")
+        if not worker.is_background:
+            print("Foreground tasks (gza work without -b) don't use tmux sessions.")
+            print("Use -b to run tasks in the background with tmux attach support.")
+        else:
+            print("This task may have been started without tmux support.")
         return 1
 
     # Determine provider to decide attach mode
@@ -1524,6 +1528,27 @@ def cmd_attach(args: argparse.Namespace) -> int:
     provider_name = "claude"
     if task is not None:
         provider_name = (task.provider or config.provider or "claude").lower()
+
+    # When already inside tmux, use switch-client instead of attach-session
+    # to avoid the "sessions should be nested with care" error.
+    inside_tmux = bool(os.environ.get("TMUX"))
+
+    if inside_tmux:
+        # When task ends and its session is destroyed, switch back to the
+        # previous session instead of detaching from tmux entirely.
+        # Scoped to the task session (not -g) to avoid mutating global config.
+        # Requires tmux 3.2+ for session-level detach-on-destroy.
+        dod_result = subprocess.run(
+            ["tmux", "set-option", "-t", session_name,
+             "detach-on-destroy", "previous"],
+            capture_output=True,
+        )
+        if dod_result.returncode != 0:
+            print(
+                "Warning: could not set detach-on-destroy on task session. "
+                "When the task ends you may be detached from tmux.",
+                file=sys.stderr,
+            )
 
     if provider_name in _OBSERVE_ONLY_PROVIDERS:
         print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
@@ -1535,11 +1560,17 @@ def cmd_attach(args: argparse.Namespace) -> int:
             f"To intervene, stop this task (gza stop {worker.task_id}) and re-run with Claude."
         )
         print()
-        os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])
+        if inside_tmux:
+            os.execvp("tmux", ["tmux", "switch-client", "-r", "-t", session_name])
+        else:
+            os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])
     else:
         print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
         print("You have full interactive control. Ctrl-B D to detach.")
         print()
-        os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
+        if inside_tmux:
+            os.execvp("tmux", ["tmux", "switch-client", "-t", session_name])
+        else:
+            os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
 
     return 0  # unreachable after execvp but satisfies the return type

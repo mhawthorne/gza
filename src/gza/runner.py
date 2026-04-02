@@ -237,35 +237,42 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
 
 
 def load_dotenv(project_dir: Path) -> None:
-    """Load .env files from home directory and project directory.
+    """Load .env files from project .gza dir, project root, and home directory.
 
-    Home directory .env (~/.{APP_NAME}/.env) is loaded first, then project directory .env,
-    so project-specific values override home directory values.
+    Load order (lowest priority first — higher-priority sources are loaded last and
+    use override=True to win over shell environment variables and earlier sources):
+    1. ~/.{APP_NAME}/.env (home defaults, lowest priority; uses setdefault)
+    2. <project_dir>/.env (overrides shell vars and home defaults)
+    3. <project_dir>/.gza/.env (highest priority; overrides project .env and shell vars)
+
+    Shell environment variables are preserved unless overridden by sources loaded
+    with override=True (i.e., project .env and .gza/.env).
     """
-    # Load from home directory first (~/.{APP_NAME}/.env)
-    home_env = Path.home() / f".{APP_NAME}" / ".env"
-    if home_env.exists():
-        with open(home_env) as f:
+    def _load(path: Path, override: bool) -> None:
+        if not path.exists():
+            return
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
                 if "=" in line:
                     key, value = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), value.strip())
+                    k = key.strip()
+                    v = value.strip()
+                    if override:
+                        os.environ[k] = v
+                    else:
+                        os.environ.setdefault(k, v)
 
-    # Load from project directory (overrides home directory values)
-    project_env = project_dir / ".env"
-    if project_env.exists():
-        with open(project_env) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    # Use setdefault for home dir, but set directly for project to allow overrides
-                    os.environ[key.strip()] = value.strip()
+    # Lowest priority: home ~/.{APP_NAME}/.env (does not override shell or project values)
+    _load(Path.home() / f".{APP_NAME}" / ".env", override=False)
+
+    # Mid priority: project root .env (overrides shell and home; backwards compat)
+    _load(project_dir / ".env", override=True)
+
+    # Highest priority: project .gza/.env (shared across worktrees via symlink)
+    _load(project_dir / f".{APP_NAME}" / ".env", override=True)
 
 
 def slugify(text: str, max_length: int = 50) -> str:
