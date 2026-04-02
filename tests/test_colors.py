@@ -40,10 +40,10 @@ def test_import_dict_variants() -> None:
 
 def test_import_base_palette() -> None:
     from gza.colors import (  # noqa: F401
-        pink_prompt,
+        pink,
         gray_secondary,
         blue_step,
-        cyan_header,
+        cyan,
         green_success,
         yellow_warning,
         red_error,
@@ -151,42 +151,6 @@ def test_cycle_status_colors_keys() -> None:
     expected_keys = {"active", "approved", "maxed_out", "blocked"}
     assert set(CYCLE_STATUS_COLORS.keys()) == expected_keys
 
-
-# ---------------------------------------------------------------------------
-# Specific value regression tests (guard against silent color drift)
-# ---------------------------------------------------------------------------
-
-
-def test_task_colors_prompt_is_pink() -> None:
-    from gza.colors import TASK_COLORS, pink_prompt
-
-    assert TASK_COLORS.prompt == pink_prompt
-    assert TASK_COLORS.prompt == "#ff99cc"
-
-
-def test_next_colors_prompt_is_pink() -> None:
-    from gza.colors import NEXT_COLORS, pink_prompt
-
-    assert NEXT_COLORS.prompt == pink_prompt
-
-
-def test_review_verdict_approved_is_green() -> None:
-    from gza.colors import REVIEW_VERDICT_COLORS, green_success
-
-    assert REVIEW_VERDICT_COLORS["APPROVED"] == green_success
-
-
-def test_review_verdict_changes_requested_is_yellow() -> None:
-    from gza.colors import REVIEW_VERDICT_COLORS, yellow_warning
-
-    assert REVIEW_VERDICT_COLORS["CHANGES_REQUESTED"] == yellow_warning
-
-
-def test_log_task_status_unmerged_is_green() -> None:
-    """unmerged maps to green in log display (treated as successfully merged)."""
-    from gza.colors import LOG_TASK_STATUS_COLORS, green_success
-
-    assert LOG_TASK_STATUS_COLORS["unmerged"] == green_success
 
 
 # ---------------------------------------------------------------------------

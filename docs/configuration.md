@@ -39,6 +39,8 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
+| `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
+| `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
 
 ### Local Overrides (gza.local.yaml)
 

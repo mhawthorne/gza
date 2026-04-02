@@ -1222,6 +1222,8 @@ class TestReviewNextSteps:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         # Mock provider
         mock_provider = Mock()
@@ -1304,6 +1306,8 @@ class TestReviewNextSteps:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         mock_provider = Mock()
         mock_provider.name = "MockProvider"
@@ -1363,6 +1367,8 @@ class TestReviewNextSteps:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         mock_provider = Mock()
         mock_provider.name = "MockProvider"
@@ -1435,6 +1441,8 @@ class TestRunNonCodeTaskDockerGitMetadata:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = True
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         worktree_path = config.worktree_path / f"{review_task.task_id}-review"
         worktree_path.mkdir(parents=True, exist_ok=True)
@@ -1515,6 +1523,8 @@ class TestRunNonCodeTaskWorktreeReportDir:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         worktree_path = config.worktree_path / f"{review_task.task_id}-review"
 
@@ -1591,6 +1601,8 @@ class TestRunNonCodeTaskPRPosting:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         # Create review directory structure
         review_dir = tmp_path / ".gza" / "reviews"
@@ -1871,6 +1883,8 @@ class TestMaxStepsHandling:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         # Create exploration directory structure
         explore_dir = tmp_path / ".gza" / "explorations"
@@ -2118,6 +2132,8 @@ class TestResumeVerificationPrompt:
         config.get_provider_for_task.return_value = "claude"
         config.get_model_for_task.return_value = None
         config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         # Mock provider to capture the prompt
         captured_prompts = []
@@ -2237,6 +2253,8 @@ class TestResumeVerificationPrompt:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         # Mock provider to capture the prompt
         captured_prompts = []
@@ -2338,6 +2356,8 @@ class TestResumeVerificationPrompt:
         config.worktree_path = tmp_path / "worktrees"
         config.worktree_path.mkdir(parents=True, exist_ok=True)
         config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         captured_prompts: list[str] = []
 
@@ -2562,6 +2582,8 @@ class TestPersistResolvedConfig:
         config.get_provider_for_task.return_value = "claude"
         config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
 
         # Track store.update calls and what task.model/provider looked like at call time
         persisted_states: list[dict] = []
@@ -2969,6 +2991,8 @@ class TestNoChangesWithExistingCommits:
         config.get_provider_for_task.return_value = "claude"
         config.get_model_for_task.return_value = None
         config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
         return config
 
     def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -3225,6 +3249,8 @@ class TestSameBranchLineageWalk:
         config.get_provider_for_task.return_value = "claude"
         config.get_model_for_task.return_value = None
         config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
         return config
 
     def test_same_branch_uses_immediate_source_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):

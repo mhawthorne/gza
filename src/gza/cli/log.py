@@ -12,7 +12,7 @@ from rich.markup import escape as rich_escape
 from ..colors import (
     blue_step,
     dim_secondary,
-    pink_prompt,
+    pink,
     LOG_TASK_STATUS_COLORS,
     LOG_WORKER_STATUS_COLORS,
 )
@@ -983,7 +983,7 @@ def cmd_log(args: argparse.Namespace) -> int:
     console.print(_sep, soft_wrap=True)
     if task:
         prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
-        console.print(f"[{pink_prompt}]Task: {rich_escape(prompt_display)}[/{pink_prompt}]", soft_wrap=True)
+        console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
         console.print(f"[cyan]ID:[/cyan] {task.id} | [cyan]Slug:[/cyan] {rich_escape(task.task_id or '')}", soft_wrap=True)
         _status_color = LOG_TASK_STATUS_COLORS.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)

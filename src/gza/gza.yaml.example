@@ -78,6 +78,14 @@ project_name: my-project
 #   review:
 #     model: claude-sonnet-4-20250514
 
+# --- Learnings ---
+
+# Number of recent completed tasks to include in learnings update prompt (default: 25)
+# learnings_window: 25
+
+# Auto-update learnings every N completed tasks; set to 0 to disable (default: 5)
+# learnings_interval: 5
+
 # --- Claude-specific configuration ---
 # claude:
 #   # Fetch OAuth token from macOS Keychain for Docker (macOS only)

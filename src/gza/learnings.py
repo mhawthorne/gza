@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .config import DEFAULT_LEARNINGS_INTERVAL, DEFAULT_LEARNINGS_WINDOW
 from .console import console
 from .db import SqliteTaskStore, Task
 
@@ -18,8 +19,7 @@ if TYPE_CHECKING:
     from .config import Config
 
 
-DEFAULT_LEARNINGS_WINDOW = 15
-AUTO_LEARNINGS_INTERVAL = 5
+AUTO_LEARNINGS_INTERVAL = DEFAULT_LEARNINGS_INTERVAL
 LEARNINGS_HISTORY_FILE = "learnings_history.jsonl"
 
 
@@ -37,7 +37,6 @@ class LearningsResult:
 
 
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
-_HEADER_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 
 
 def _normalize_learning(text: str) -> str:
@@ -56,24 +55,9 @@ def _extract_learnings_from_output(output: str) -> list[str]:
             item = _normalize_learning(bullet_match.group(1))
             if 8 <= len(item) <= 160 and not item.lower().startswith("task id:"):
                 learnings.append(item)
-            continue
-
-        header_match = _HEADER_RE.match(line)
-        if header_match:
-            section = _normalize_learning(header_match.group(1))
-            if section and section.lower() not in {"summary", "report", "overview"}:
-                learnings.append(f"Prefer following documented {section.lower()} conventions.")
 
     return learnings
 
-
-def _fallback_learning(task: Task) -> str:
-    """Generate a fallback learning from task prompt when no bullets exist."""
-    first_line = task.prompt.splitlines()[0].strip()
-    first_line = _normalize_learning(first_line)
-    if len(first_line) > 120:
-        first_line = first_line[:117].rstrip() + "..."
-    return f"Reuse patterns from: {first_line}"
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -120,8 +104,10 @@ def _extract_existing_file_learnings(path: Path) -> list[str]:
     return _dedupe(items)
 
 
-def _build_summarization_prompt(tasks: list[Task]) -> str:
-    """Build LLM prompt for consolidating learnings from recent task outputs."""
+def _build_summarization_prompt(tasks: list[Task], existing_learnings: str = "") -> str:
+    """Build LLM prompt for incrementally updating learnings from recent task outputs."""
+    existing_section = existing_learnings.strip() if existing_learnings.strip() else "No existing learnings."
+
     task_sections = []
     for task in tasks:
         output = task.output_content or ""
@@ -136,14 +122,36 @@ def _build_summarization_prompt(tasks: list[Task]) -> str:
             f"**Output**:\n{output}"
         )
     tasks_text = "\n\n---\n\n".join(task_sections)
+    n = len(tasks)
+
     return (
-        "Analyze these completed tasks and extract 5-15 key learnings that would be useful for future tasks.\n\n"
+        "You are maintaining a knowledge base for a software project. Your job is to\n"
+        "update the project's learnings based on recent completed tasks.\n\n"
+        "## Current Learnings\n"
+        f"{existing_section}\n\n"
+        f"## Recent Completed Tasks (last {n})\n"
         f"{tasks_text}\n\n"
+        "## Instructions\n\n"
+        "Update the learnings based on the recent tasks above:\n"
+        "- ADD new patterns, conventions, or pitfalls discovered in recent tasks\n"
+        "- REVISE any existing learnings that are now outdated or wrong based on recent work\n"
+        "- KEEP existing learnings that are still valid, even if not mentioned in recent tasks\n"
+        "- REMOVE learnings only if recent tasks clearly contradict them\n\n"
         "Focus on:\n"
-        "- Reusable patterns (testing, code style, architecture)\n"
-        "- Project-specific conventions (directory structure, naming)\n"
-        "- Common mistakes to avoid\n"
-        "- Tool usage tips (CLI commands, workflows)\n"
+        "- Codebase conventions (naming, structure, idioms)\n"
+        "- Architecture decisions and rationale\n"
+        "- Testing patterns (frameworks, fixtures, assertions)\n"
+        "- Common pitfalls specific to this project\n"
+        "- Workflow preferences (tools, commands)\n\n"
+        "Do NOT include:\n"
+        '- Task-specific details that don\'t generalize\n'
+        "- Generic software engineering advice\n"
+        '- Vague platitudes ("write clean code", "test thoroughly")\n'
+        "- Repetitive or near-duplicate entries\n\n"
+        'Output format: a flat bullet list, one learning per line, starting with "- ".\n'
+        "No headers, no numbering, no sub-lists. Max 25 words per learning.\n"
+        "Each learning should be concrete and actionable — a new developer should\n"
+        "be able to follow it without additional context."
     )
 
 
@@ -151,6 +159,7 @@ def _run_learnings_task(
     store: SqliteTaskStore,
     config: "Config",
     recent_tasks: list[Task],
+    existing_learnings: str = "",
 ) -> list[str] | None:
     """Run an internal task to summarize learnings from recent task outputs.
 
@@ -162,7 +171,7 @@ def _run_learnings_task(
     """
     from . import runner as _runner_mod
 
-    prompt = _build_summarization_prompt(recent_tasks)
+    prompt = _build_summarization_prompt(recent_tasks, existing_learnings)
     learn_task = store.add(
         prompt=prompt,
         task_type="internal",
@@ -248,17 +257,19 @@ def regenerate_learnings(
     raw_learnings: list[str] = []
     learnings_path = config.project_dir / ".gza" / "learnings.md"
     previous_learnings = _extract_existing_file_learnings(learnings_path)
+    existing_learnings_text = learnings_path.read_text() if learnings_path.exists() else ""
 
     if recent_tasks:
-        llm_learnings = _run_learnings_task(store, config, recent_tasks)
+        llm_learnings = _run_learnings_task(store, config, recent_tasks, existing_learnings_text)
         if llm_learnings is not None:
             raw_learnings = llm_learnings
         else:
+            # Fallback: preserve existing learnings and append new bullets (deduplicated)
+            new_bullets: list[str] = []
             for task in recent_tasks:
                 if task.output_content:
-                    raw_learnings.extend(_extract_learnings_from_output(task.output_content))
-                else:
-                    raw_learnings.append(_fallback_learning(task))
+                    new_bullets.extend(_extract_learnings_from_output(task.output_content))
+            raw_learnings = _dedupe(previous_learnings + new_bullets)
 
     learnings = _dedupe(raw_learnings)
     if not learnings:
@@ -304,10 +315,14 @@ def regenerate_learnings(
 def maybe_auto_regenerate_learnings(
     store: SqliteTaskStore,
     config: "Config",
-    interval: int = AUTO_LEARNINGS_INTERVAL,
-    window: int = DEFAULT_LEARNINGS_WINDOW,
+    interval: int | None = None,
+    window: int | None = None,
 ) -> LearningsResult | None:
     """Regenerate learnings on periodic completed-task intervals."""
+    if interval is None:
+        interval = config.learnings_interval
+    if window is None:
+        window = config.learnings_window
     if interval <= 0:
         return None
 

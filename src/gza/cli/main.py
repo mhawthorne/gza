@@ -104,6 +104,10 @@ def main() -> int:
         help=argparse.SUPPRESS,  # Internal flag for background workers
     )
     work_parser.add_argument(
+        "--worker-id",
+        help=argparse.SUPPRESS,  # Internal: worker registry ID passed by parent
+    )
+    work_parser.add_argument(
         "--resume",
         action="store_true",
         help=argparse.SUPPRESS,  # Internal flag for resume mode
