@@ -378,6 +378,11 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         console.print("No unmerged tasks")
         return 0
 
+    total_count = len(unmerged)
+    limit = getattr(args, "limit", 5)
+    if limit > 0:
+        unmerged = unmerged[:limit]
+
     # Colors for unmerged output — defined in gza.colors.
     UNMERGED_COLORS = UNMERGED_COLORS_DICT
 
@@ -544,6 +549,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         stats_str = format_stats(root_task)
         if stats_str:
             console.print(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
+
+    if limit > 0 and total_count > limit:
+        console.print(f"\n[dim]Showing {limit} of {total_count} unmerged tasks (use -n 0 for all)[/dim]")
 
     return 0
 
