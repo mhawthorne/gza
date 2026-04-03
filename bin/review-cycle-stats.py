@@ -251,9 +251,8 @@ def main() -> int:
     for root_id, review_dates in root_reviews.items():
         if root_id not in seen_roots:
             continue
-        # Group by when the first review happened, not when the impl was created
-        earliest = min(review_dates)
-        wk = week_label(earliest)
+        # Group by when the impl was created, matching the impl grouping above
+        wk = week_label(tasks[root_id]["created_at"])
         week_data[wk]["reviews"] += len(review_dates)
         week_data[wk]["reviewed_cycles"].append(len(review_dates))
 
