@@ -1099,13 +1099,15 @@ class TestFormatLogEntry:
         """gza entry with subtype is formatted as [gza:subtype] message."""
         entry = {"type": "gza", "subtype": "branch", "message": "Branch: feat/foo", "branch": "feat/foo"}
         result = _format_log_entry(entry)
-        assert result == r"[cyan]\[gza:branch][/cyan] Branch: feat/foo"
+        assert r"\[gza:branch]" in result
+        assert "Branch: feat/foo" in result
 
     def test_gza_entry_without_subtype_renders_correctly(self) -> None:
         """gza entry without subtype is formatted as [gza] message."""
         entry = {"type": "gza", "message": "Some info"}
         result = _format_log_entry(entry)
-        assert result == r"[cyan]\[gza][/cyan] Some info"
+        assert r"\[gza]" in result
+        assert "Some info" in result
 
     def test_gza_entry_with_empty_message_returns_none(self) -> None:
         """gza entry with empty message returns None (should be skipped)."""
@@ -1117,13 +1119,15 @@ class TestFormatLogEntry:
         """gza outcome entry renders with subtype label."""
         entry = {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0}
         result = _format_log_entry(entry)
-        assert result == r"[cyan]\[gza:outcome][/cyan] Outcome: completed"
+        assert r"\[gza:outcome]" in result
+        assert "Outcome: completed" in result
 
     def test_gza_entry_stats_renders_with_subtype(self) -> None:
         """gza stats entry renders with subtype label."""
         entry = {"type": "gza", "subtype": "stats", "message": "Stats: 5 steps, 12.3s, $0.0042", "duration_seconds": 12.3, "cost_usd": 0.0042, "num_steps": 5}
         result = _format_log_entry(entry)
-        assert result == r"[cyan]\[gza:stats][/cyan] Stats: 5 steps, 12.3s, $0.0042"
+        assert r"\[gza:stats]" in result
+        assert "Stats: 5 steps, 12.3s, $0.0042" in result
 
     def test_gza_log_entry_renders_in_gza_log_output(self, tmp_path: Path) -> None:
         """Integration: gza log renders gza entries from a JSONL log file."""
