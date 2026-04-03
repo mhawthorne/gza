@@ -18,6 +18,7 @@ def test_import_singleton_instances() -> None:
         SHOW_COLORS,
         UNMERGED_COLORS,
         NEXT_COLORS,
+        ADVANCE_COLORS,
     )
 
 
@@ -29,6 +30,7 @@ def test_import_dict_variants() -> None:
         SHOW_COLORS_DICT,
         UNMERGED_COLORS_DICT,
         NEXT_COLORS_DICT,
+        ADVANCE_COLORS_DICT,
         LINEAGE_STATUS_COLORS,
         PS_STATUS_COLORS,
         LOG_TASK_STATUS_COLORS,
@@ -109,6 +111,13 @@ def test_next_colors_dict_keys() -> None:
 
     expected_keys = {"task_id", "prompt", "type", "blocked", "index"}
     assert set(NEXT_COLORS_DICT.keys()) == expected_keys
+
+
+def test_advance_colors_dict_keys() -> None:
+    from gza.colors import ADVANCE_COLORS_DICT
+
+    expected_keys = {"merge", "error", "waiting", "default"}
+    assert set(ADVANCE_COLORS_DICT.keys()) == expected_keys
 
 
 def test_lineage_status_colors_keys() -> None:

@@ -212,6 +212,16 @@ class NextColors:
     index: str = default_color
 
 
+@dataclass(frozen=True)
+class AdvanceColors:
+    """Colors for ``gza advance`` action type indicators."""
+
+    merge: str = default_color
+    error: str = default_color
+    waiting: str = default_color
+    default: str = default_color
+
+
 # ---------------------------------------------------------------------------
 # BaseColors — cross-context defaults for fields shared across multiple classes
 # ---------------------------------------------------------------------------
@@ -268,6 +278,7 @@ class Theme:
     unmerged: dict[str, str] = field(default_factory=dict)
     lineage: dict[str, str] = field(default_factory=dict)
     next_colors: dict[str, str] = field(default_factory=dict)
+    advance: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def uniform(cls, name: str, color: str) -> "Theme":
@@ -283,6 +294,7 @@ class Theme:
             unmerged=af(color, UnmergedColors),
             lineage=af(color, LineageColors),
             next_colors=af(color, NextColors),
+            advance=af(color, AdvanceColors),
         )
 
 
@@ -313,6 +325,12 @@ _THEME_MINIMAL = Theme(
         "unknown": red_error,
         "unmerged": f"{green_success} bold",
         "orphaned": yellow_warning,
+    },
+    advance={
+        "merge": green_success,
+        "error": red_error,
+        "waiting": yellow_warning,
+        # "default": cyan,
     }
 )
 
@@ -404,6 +422,7 @@ def _build_themed_instances(
     unmerged_c = _apply_domain_theme(UnmergedColors(), theme.unmerged if theme else _no, base_ov, color_overrides)
     lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
     next_c = _apply_domain_theme(NextColors(), theme.next_colors if theme else _no, base_ov, color_overrides)
+    advance_c = _apply_domain_theme(AdvanceColors(), theme.advance if theme else _no, base_ov, color_overrides)
 
     return {
         "TASK_COLORS": task_c,
@@ -413,6 +432,7 @@ def _build_themed_instances(
         "UNMERGED_COLORS": unmerged_c,
         "LINEAGE_COLORS": lineage_c,
         "NEXT_COLORS": next_c,
+        "ADVANCE_COLORS": advance_c,
         "TASK_COLORS_DICT": dataclasses.asdict(task_c),
         "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
         "WORK_OUTPUT_COLORS_DICT": dataclasses.asdict(work_c),
@@ -420,6 +440,7 @@ def _build_themed_instances(
         "UNMERGED_COLORS_DICT": dataclasses.asdict(unmerged_c),
         "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
         "NEXT_COLORS_DICT": dataclasses.asdict(next_c),
+        "ADVANCE_COLORS_DICT": dataclasses.asdict(advance_c),
         "LINEAGE_STATUS_COLORS": {
             "completed": status_c.completed,
             "failed": status_c.failed,
@@ -460,7 +481,7 @@ def set_theme(
     and ``c.TASK_COLORS`` is preferred for those.
     """
     global TASK_COLORS, STATUS_COLORS, WORK_OUTPUT_COLORS, SHOW_COLORS
-    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS
+    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, ADVANCE_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
 
@@ -472,12 +493,14 @@ def set_theme(
     UNMERGED_COLORS = inst["UNMERGED_COLORS"]
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
     NEXT_COLORS = inst["NEXT_COLORS"]
+    ADVANCE_COLORS = inst["ADVANCE_COLORS"]
 
     # Dict singletons — update in place so ``from`` imports see new values.
     for name in (
         "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "WORK_OUTPUT_COLORS_DICT",
         "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
-        "NEXT_COLORS_DICT", "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS",
+        "NEXT_COLORS_DICT", "ADVANCE_COLORS_DICT",
+        "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS",
     ):
         target = globals()[name]
         target.clear()
@@ -497,6 +520,7 @@ SHOW_COLORS: ShowColors = ShowColors()
 UNMERGED_COLORS: UnmergedColors = UnmergedColors()
 LINEAGE_COLORS: LineageColors = LineageColors()
 NEXT_COLORS: NextColors = NextColors()
+ADVANCE_COLORS: AdvanceColors = AdvanceColors()
 
 # ---------------------------------------------------------------------------
 # Dict variants (drop-in replacements for the old inline dictionaries)
@@ -509,6 +533,7 @@ SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
 LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
 NEXT_COLORS_DICT: dict[str, str] = dataclasses.asdict(NEXT_COLORS)
+ADVANCE_COLORS_DICT: dict[str, str] = dataclasses.asdict(ADVANCE_COLORS)
 
 # Lineage-status dict (subset of StatusColors, keyed by status string)
 LINEAGE_STATUS_COLORS: dict[str, str] = {

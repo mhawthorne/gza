@@ -2409,7 +2409,7 @@ class TestAdvanceCommand:
 
         spawned_types: list[str] = []
 
-        def fake_spawn(worker_args, config, task_id):
+        def fake_spawn(worker_args, config, task_id, **_kw):
             task = store.get(task_id)
             assert task is not None
             spawned_types.append(task.task_type)
@@ -2879,7 +2879,7 @@ class TestAdvanceCommand:
 
         spawn_calls = []
 
-        def fake_spawn(worker_args, config, task_id):
+        def fake_spawn(worker_args, config, task_id, **_kw):
             spawn_calls.append(task_id)
             return 0
 
@@ -2945,7 +2945,7 @@ class TestAdvanceCommand:
 
         spawn_calls = []
 
-        def fake_spawn(worker_args, config, task_id):
+        def fake_spawn(worker_args, config, task_id, **_kw):
             spawn_calls.append(task_id)
             return 0
 
@@ -2989,7 +2989,7 @@ class TestAdvanceCommand:
 
         spawn_calls = []
 
-        def fake_spawn_first_fails(worker_args, config, task_id):
+        def fake_spawn_first_fails(worker_args, config, task_id, **_kw):
             spawn_calls.append(task_id)
             # First call fails, second would succeed — but with batch=1 it should never be called
             return 1 if len(spawn_calls) == 1 else 0
@@ -3240,7 +3240,7 @@ class TestAdvanceCommand:
             call_log.append('merge')
             return 0
 
-        def fake_spawn(spawn_args, config, task_id=None):
+        def fake_spawn(spawn_args, config, task_id=None, **_kw):
             call_log.append('spawn')
             return 0
 
@@ -4546,7 +4546,7 @@ class TestAdvanceAutoPlans:
 
         spawn_calls = []
 
-        def fake_spawn(worker_args, config, task_id=None):
+        def fake_spawn(worker_args, config, task_id=None, **_kw):
             spawn_calls.append(task_id)
             return 0
 
@@ -4714,7 +4714,7 @@ class TestAdvanceAutoPlans:
 
         spawn_calls = []
 
-        def fake_spawn(worker_args, config, task_id=None):
+        def fake_spawn(worker_args, config, task_id=None, **_kw):
             spawn_calls.append(task_id)
             return 0
 

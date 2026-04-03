@@ -231,13 +231,14 @@ def _run_foreground(
         signal.signal(signal.SIGTERM, original_sigterm)
 
 
-def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None) -> int:
+def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None, quiet: bool = False) -> int:
     """Spawn a background worker process.
 
     Args:
         args: Command-line arguments
         config: Configuration object
         task_id: Specific task ID to run (optional)
+        quiet: If True, suppress verbose output (prompt, gza ps/attach hints).
     """
     # Initialize worker registry
     registry = WorkerRegistry(config.workers_path)
@@ -389,16 +390,16 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         )
         registry.register(worker_metadata)
 
-        print(f"Started worker {worker_id} (PID {pid})")
-        print(f"  Task: #{selected_task.id}")
-        if selected_task.prompt:
-            prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
-            print(f"  Prompt: {prompt_display}")
-        print()
-        print(f"Use 'gza ps' to view running workers")
-        if use_tmux:
-            print(f"Use 'gza attach {worker_id}' to attach to the session")
+        if quiet:
+            print(f"Started worker {worker_id} (PID {pid}) for task #{selected_task.id}")
         else:
+            print(f"Started worker {worker_id} (PID {pid})")
+            print(f"  Task: #{selected_task.id}")
+            if selected_task.prompt:
+                prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
+                print(f"  Prompt: {prompt_display}")
+            print()
+            print(f"Use 'gza ps' to view running workers")
             print(f"Use 'gza log -w {worker_id} -f' to follow output")
 
         return 0
@@ -520,7 +521,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         return 1
 
 
-def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: int) -> int:
+def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: int, quiet: bool = False) -> int:
     """Spawn a background worker to run a resume task.
 
     Args:
@@ -575,14 +576,17 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         )
         registry.register(worker)
 
-        print(f"Started worker {worker_id} (PID {proc.pid})")
-        print(f"  Task: #{task.id} (resuming)")
-        if task.prompt:
-            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
-            print(f"  Prompt: {prompt_display}")
-        print()
-        print(f"Use 'gza ps' to view running workers")
-        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+        if quiet:
+            print(f"Started worker {worker_id} (PID {proc.pid}) for task #{task.id} (resuming)")
+        else:
+            print(f"Started worker {worker_id} (PID {proc.pid})")
+            print(f"  Task: #{task.id} (resuming)")
+            if task.prompt:
+                prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
+                print(f"  Prompt: {prompt_display}")
+            print()
+            print(f"Use 'gza ps' to view running workers")
+            print(f"Use 'gza log -w {worker_id} -f' to follow output")
 
         return 0
 

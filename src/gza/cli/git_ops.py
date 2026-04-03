@@ -33,6 +33,7 @@ from gza.query import (
     get_improves_for_root as _get_improves_for_root_task,
 )
 from ..colors import pink
+import gza.colors as _colors
 
 from ._common import (
     DuplicateReviewError,
@@ -89,7 +90,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         console.print(f"#{task.id} {task.branch}: +{lines_added} -{lines_removed} in {files_changed} files")
         refreshed += 1
 
-    console.print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
+    print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
     return 0
 
 
@@ -1335,19 +1336,28 @@ _ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
 
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
+    ac = _colors.ADVANCE_COLORS
     if action_type == 'merge':
-        return 'green'
+        return ac.merge
     if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached'):
-        return 'red'
+        return ac.error
     if action_type in ('skip', 'wait_review', 'wait_improve'):
-        return 'yellow'
-    return 'cyan'
+        return ac.waiting
+    return ac.default
 
 
 def cmd_advance(args: argparse.Namespace) -> int:
     """Intelligently progress unmerged tasks through their lifecycle."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+
+    # Themed advance colors — resolved once after Config.load() applies the theme.
+    _ac = _colors.ADVANCE_COLORS
+    _c_tid = _colors.TASK_COLORS.task_id
+    _c_ok = _ac.merge
+    _c_err = _ac.error
+    _c_warn = _ac.waiting
+    _c_default = _ac.default
     git = Git(config.project_dir)
 
     dry_run: bool = args.dry_run
@@ -1514,7 +1524,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
                 for task, action in plan:
                     prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-                    console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -1524,16 +1534,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if plan:
                 for task, action in plan:
                     prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-                    console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
 
     if dry_run:
-        console.print(f"Would advance {len(plan)} task(s):\n")
+        print(f"Would advance {len(plan)} task(s):\n")
         for task, action in plan:
             prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-            console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
             if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
                 commit_count = git.count_commits_ahead(task.branch, target_branch)
@@ -1554,8 +1564,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     for pt in pending_tasks:
                         flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
                         prompt_display = truncate(flat_prompt, prompt_width)
-                        console.print(f"  [cyan]#{pt.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
-                        console.print(f"      [cyan]→ Start new worker[/cyan]")
+                        console.print(f"  [{_c_tid}]#{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                         print()
                 else:
                     print("No pending tasks available to fill batch\n")
@@ -1564,10 +1574,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Show the plan and prompt for confirmation
     actionable_plan = [item for item in plan if item[1]['type'] != 'skip']
     if actionable_plan:
-        console.print(f"Will advance {len(actionable_plan)} task(s):\n")
+        print(f"Will advance {len(actionable_plan)} task(s):\n")
         for task, action in plan:
             prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
-            console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
             print()
@@ -1585,8 +1595,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 for pt in new_pending_tasks:
                     flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
                     prompt_display = truncate(flat_prompt, prompt_width)
-                    console.print(f"  [cyan]#{pt.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
-                    console.print(f"      [cyan]→ Start new worker[/cyan]")
+                    console.print(f"  [{_c_tid}]#{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                     print()
 
     if not auto and (actionable_plan or new_mode):
@@ -1614,7 +1624,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         action_type = action['type']
 
         if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
-            console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
             skip_count += 1
@@ -1625,13 +1635,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Worker-spawning actions: check batch limit before proceeding
         if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
             if batch_limit is not None and workers_started >= batch_limit:
-                console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
-                console.print(f"      [yellow]— batch limit reached ({workers_started}/{batch_limit}), skipping[/yellow]")
+                console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
                 print()
                 skip_count += 1
                 continue
 
-        console.print(f"  [cyan]#{task.id}[/cyan] [{pink}]{prompt_display}[/{pink}]")
+        console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
@@ -1653,7 +1663,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
             rc = _merge_single_task(task.id, config, store, git, merge_args, target_branch)
             if rc == 0:
-                console.print(f"      [green]✓ Merged[/green]")
+                console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
                 success_count += 1
             else:
                 task_branch = task.branch
@@ -1661,17 +1671,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     task_branch is not None and not git.can_merge(task_branch, target_branch)
                 )
                 if conflict_detected:
-                    console.print(f"      [yellow]! Merge had conflicts against '{target_branch}'[/yellow]")
+                    console.print(f"      [{_c_warn}]! Merge had conflicts against '{target_branch}'[/{_c_warn}]")
                     try:
                         # _merge_single_task already attempts merge --abort.
                         # For failed squash merges, MERGE_HEAD may be absent, so
                         # force cleanup as a final fallback.
                         git.reset_hard_head()
-                        console.print("      [green]✓ Restored clean git state[/green]")
+                        console.print(f"      [{_c_ok}]✓ Restored clean git state[/{_c_ok}]")
                     except GitError as cleanup_error:
                         console.print(
-                            f"      [red]✗ Cleanup failed after merge conflict: {cleanup_error}. "
-                            f"Manual intervention required.[/red]"
+                            f"      [{_c_err}]✗ Cleanup failed after merge conflict: {cleanup_error}. "
+                            f"Manual intervention required.[/{_c_err}]"
                         )
                         error_count += 1
                         continue
@@ -1679,23 +1689,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
                     assert rebase_task.id is not None
                     console.print(
-                        f"      [green]✓ Created rebase task #{rebase_task.id} "
-                        f"(target: {target_branch})[/green]"
+                        f"      [{_c_ok}]✓ Created rebase task #{rebase_task.id} "
+                        f"(target: {target_branch})[/{_c_ok}]"
                     )
                     worker_args = argparse.Namespace(
                         no_docker=getattr(args, 'no_docker', False),
                         max_turns=None,
                     )
-                    rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+                    rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
                     workers_started += 1
                     if rebase_rc == 0:
-                        console.print(f"      [green]✓ Started rebase worker[/green]")
+                        console.print(f"      [{_c_ok}]✓ Started rebase worker[/{_c_ok}]")
                         success_count += 1
                     else:
-                        console.print(f"      [red]✗ Failed to start rebase worker[/red]")
+                        console.print(f"      [{_c_err}]✗ Failed to start rebase worker[/{_c_err}]")
                         error_count += 1
                 else:
-                    console.print(f"      [red]✗ Merge failed[/red]")
+                    console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
                     error_count += 1
 
         elif action_type == 'create_review':
@@ -1703,14 +1713,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 review_task = _create_review_task(store, task)
             except DuplicateReviewError as e:
                 review_task = e.active_review
-                console.print(f"      [yellow]SKIP: review #{review_task.id} is already {review_task.status}[/yellow]")
+                console.print(f"      [{_c_warn}]SKIP: review #{review_task.id} is already {review_task.status}[/{_c_warn}]")
                 skip_count += 1
                 continue
             except ValueError as e:
-                console.print(f"      [yellow]SKIP: {e}[/yellow]")
+                console.print(f"      [{_c_warn}]SKIP: {e}[/{_c_warn}]")
                 skip_count += 1
                 continue
-            console.print(f"      [green]✓ Created review task #{review_task.id}[/green]")
+            console.print(f"      [{_c_ok}]✓ Created review task #{review_task.id}[/{_c_ok}]")
 
             # Spawn background worker to run the review
             assert review_task.id is not None
@@ -1718,13 +1728,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started review worker[/green]")
+                console.print(f"      [{_c_ok}]✓ Started review worker[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start review worker[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start review worker[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'run_review':
@@ -1735,13 +1745,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id)
+            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started review worker for #{review_task.id}[/green]")
+                console.print(f"      [{_c_ok}]✓ Started review worker for #{review_task.id}[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start review worker for #{review_task.id}[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start review worker for #{review_task.id}[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'improve':
@@ -1758,7 +1768,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 same_branch=True,
                 group=task.group,
             )
-            console.print(f"      [green]✓ Created improve task #{improve_task.id}[/green]")
+            console.print(f"      [{_c_ok}]✓ Created improve task #{improve_task.id}[/{_c_ok}]")
 
             # Spawn background worker to run the improve task
             assert improve_task.id is not None
@@ -1766,13 +1776,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started improve worker[/green]")
+                console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start improve worker[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start improve worker[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'run_improve':
@@ -1783,31 +1793,31 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started improve worker for #{improve_task.id}[/green]")
+                console.print(f"      [{_c_ok}]✓ Started improve worker for #{improve_task.id}[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start improve worker for #{improve_task.id}[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start improve worker for #{improve_task.id}[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'resume':
             # Create a resume task and spawn a background worker for it
             resume_task = _create_resume_task(store, task)
             assert resume_task.id is not None
-            console.print(f"      [green]✓ Created resume task #{resume_task.id}[/green]")
+            console.print(f"      [{_c_ok}]✓ Created resume task #{resume_task.id}[/{_c_ok}]")
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id)
+            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started resume worker[/green]")
+                console.print(f"      [{_c_ok}]✓ Started resume worker[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start resume worker[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start resume worker[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'create_implement':
@@ -1819,43 +1829,43 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 based_on=task.id,
                 group=task.group,
             )
-            console.print(f"      [green]✓ Created implement task #{impl_task.id}[/green]")
+            console.print(f"      [{_c_ok}]✓ Created implement task #{impl_task.id}[/{_c_ok}]")
 
             assert impl_task.id is not None
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id)
+            rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started implement worker[/green]")
+                console.print(f"      [{_c_ok}]✓ Started implement worker[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start implement worker[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start implement worker[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'needs_rebase':
             assert task.id is not None
             if not task.branch:
-                console.print(f"      [red]✗ Cannot rebase: task #{task.id} has no branch[/red]")
+                console.print(f"      [{_c_err}]✗ Cannot rebase: task #{task.id} has no branch[/{_c_err}]")
                 error_count += 1
                 continue
             rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
             assert rebase_task.id is not None
-            console.print(f"      [green]✓ Created rebase task #{rebase_task.id}[/green]")
+            console.print(f"      [{_c_ok}]✓ Created rebase task #{rebase_task.id}[/{_c_ok}]")
 
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+            rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [green]✓ Started rebase worker[/green]")
+                console.print(f"      [{_c_ok}]✓ Started rebase worker[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [red]✗ Failed to start rebase worker[/red]")
+                console.print(f"      [{_c_err}]✗ Failed to start rebase worker[/{_c_err}]")
                 error_count += 1
 
         print()
@@ -1869,27 +1879,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config)
+            rc = _spawn_background_worker(worker_args, config, quiet=True)
             if rc != 0:
                 break  # no more pending tasks or error
             new_started += 1
             workers_started += 1
-        if new_started > 0:
-            console.print(f"[green]Started {new_started} new pending task(s) to fill batch[/green]")
 
     parts = []
     if success_count:
-        parts.append(f"[green]{success_count} advanced[/green]")
+        parts.append(f"[{_c_ok}]{success_count} advanced[/{_c_ok}]")
     if new_started > 0:
-        parts.append(f"[green]{new_started} new[/green]")
+        parts.append(f"[{_c_ok}]{new_started} new[/{_c_ok}]")
     if skip_count:
-        parts.append(f"[yellow]{skip_count} skipped[/yellow]")
+        parts.append(f"[{_c_warn}]{skip_count} skipped[/{_c_warn}]")
     if error_count:
-        parts.append(f"[red]{error_count} errors[/red]")
+        parts.append(f"[{_c_err}]{error_count} errors[/{_c_err}]")
     console.print(", ".join(parts) if parts else "Nothing to do")
 
     if attention_tasks:
-        console.print(f"\n[red]Needs attention ({len(attention_tasks)} task{'s' if len(attention_tasks) != 1 else ''}):[/red]")
+        console.print(f"\n[{_c_err}]Needs attention ({len(attention_tasks)} task{'s' if len(attention_tasks) != 1 else ''}):[/{_c_err}]")
         for atask, aaction in attention_tasks:
             prompt_display = truncate(atask.prompt, MAX_PROMPT_DISPLAY_SHORT)
             # Strip leading "SKIP: " prefix from description for display
@@ -1897,7 +1905,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if desc.startswith('SKIP: '):
                 desc = desc[len('SKIP: '):]
             _color = _advance_action_color(aaction['type'])
-            console.print(f"  [cyan]#{atask.id}[/cyan]  [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]#{atask.id}[/{_c_tid}]  [{pink}]{prompt_display}[/{pink}]")
             console.print(f"       [{_color}]→ {desc}[/{_color}]")
 
     return 0 if error_count == 0 else 1
