@@ -109,6 +109,7 @@ class Task:
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
+    merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
     skip_learnings: bool = False
     diff_files_changed: int | None = None  # Files changed vs. main (v13)
@@ -190,8 +191,11 @@ MIGRATION_V21_TO_V22 = "UPDATE tasks SET task_type='internal' WHERE task_type='l
 # Migration from v22 to v23
 MIGRATION_V22_TO_V23 = "ALTER TABLE tasks ADD COLUMN running_pid INTEGER;"
 
+# Migration from v23 to v24
+MIGRATION_V23_TO_V24 = "ALTER TABLE tasks ADD COLUMN merged_at TEXT;"
+
 # Schema version for migrations
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -242,8 +246,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Raw token counts for cost recalculation (v9)
     input_tokens INTEGER,
     output_tokens INTEGER,
-    -- Merge status tracking (v10)
+    -- Merge status tracking (v10, merged_at added v24)
     merge_status TEXT,
+    merged_at TEXT,
     -- Failure reason tracking (v11)
     failure_reason TEXT,
     -- Skip learnings injection (v12)
@@ -607,6 +612,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (21, MIGRATION_V20_TO_V21),
     (22, MIGRATION_V21_TO_V22),
     (23, MIGRATION_V22_TO_V23),
+    (24, MIGRATION_V23_TO_V24),
 ]
 
 
@@ -695,6 +701,7 @@ class SqliteTaskStore:
             provider=row["provider"] if "provider" in row.keys() else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in row.keys() and row["provider_is_explicit"] is not None else False,
             merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
+            merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in row.keys() and row["merged_at"] else None,
             failure_reason=row["failure_reason"] if "failure_reason" in row.keys() else None,
             skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in row.keys() and row["skip_learnings"] is not None else False,
             diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
@@ -840,6 +847,7 @@ class SqliteTaskStore:
                     provider = ?,
                     provider_is_explicit = ?,
                     merge_status = ?,
+                    merged_at = ?,
                     failure_reason = ?,
                     skip_learnings = ?,
                     diff_files_changed = ?,
@@ -885,6 +893,7 @@ class SqliteTaskStore:
                     task.provider,
                     1 if task.provider_is_explicit else 0,
                     task.merge_status,
+                    task.merged_at.isoformat() if task.merged_at else None,
                     task.failure_reason,
                     1 if task.skip_learnings else 0,
                     task.diff_files_changed,
@@ -1194,11 +1203,12 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def set_merge_status(self, task_id: int, merge_status: str | None) -> None:
-        """Set the merge_status for a task."""
+        """Set the merge_status for a task. Records merged_at when setting to 'merged'."""
+        merged_at = datetime.now(timezone.utc).isoformat() if merge_status == "merged" else None
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET merge_status = ? WHERE id = ?",
-                (merge_status, task_id),
+                "UPDATE tasks SET merge_status = ?, merged_at = ? WHERE id = ?",
+                (merge_status, merged_at, task_id),
             )
 
     def clear_review_state(self, task_id: int) -> None:

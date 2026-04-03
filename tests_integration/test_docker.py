@@ -221,6 +221,9 @@ class TestGeminiSmoke:
             use_docker=True,
             timeout_minutes=2,
             max_turns=5,
+            # Pin model to avoid "auto" selecting an unstable model in Docker's
+            # Gemini CLI version (auto-gemini-3 returns 500s on tool use).
+            model="gemini-2.5-flash",
         )
 
         provider = GeminiProvider()

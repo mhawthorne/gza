@@ -185,6 +185,14 @@ def main() -> int:
         action="store_true",
         help="Include failed tasks and check git directly for commits instead of trusting has_commits",
     )
+    unmerged_parser.add_argument(
+        "-n",
+        type=int,
+        default=5,
+        dest="limit",
+        metavar="N",
+        help="Show last N unmerged tasks (default: 5, 0 for all)",
+    )
 
     # advance command
     advance_parser = subparsers.add_parser(
