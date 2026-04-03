@@ -18,8 +18,9 @@ from ..console import (
     console,
     get_terminal_width,
     truncate,
+    shorten_prompt,
+    prompt_available_width,
     MAX_PROMPT_DISPLAY,
-    MAX_PROMPT_DISPLAY_SHORT,
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git
@@ -221,7 +222,11 @@ def cmd_history(args: argparse.Namespace) -> int:
             if task.completed_at
             else ""
         )
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        # prefix: indent + "completed " (STATUS_WIDTH+1) + "#NNN " + "(YYYY-MM-DD HH:MM) "
+        task_id_len = len(str(task.id)) + 1  # "#NNN"
+        date_len = 19 if task.completed_at else 0  # "(YYYY-MM-DD HH:MM) "
+        prefix_len = len(indent) + STATUS_WIDTH + 1 + task_id_len + date_len
+        prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
         console.print(
             f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
             f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
@@ -332,7 +337,11 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
             f"[{c['task_id']}](started {task.started_at.strftime('%Y-%m-%d %H:%M')})"
             f"[/{c['task_id']}]"
         )
-    prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+    # prefix: "⚠ orphaned  #NNN " + optional date
+    task_id_len = len(str(task.id)) + 1
+    date_len = 28 if task.started_at else 0  # "(started YYYY-MM-DD HH:MM) "
+    prefix_len = 2 + 9 + 1 + task_id_len + date_len
+    prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
     console.print(
         f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
         f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
@@ -486,8 +495,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             suffix += f" [red]failed ({root_task.failure_reason})[/red]"
 
         # Header line: task ID, completion time, prompt
-        first_line = root_task.prompt.split('\n')[0]
-        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
+        task_id_len = len(str(root_task.id)) + 1
+        date_len = 19 if root_task.completed_at else 0
+        prefix_len = 2 + task_id_len + date_len  # "⚡ #NNN (date) "
+        prompt_display = shorten_prompt(root_task.prompt, prompt_available_width(prefix=prefix_len))
         date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
 
         console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
@@ -613,10 +624,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         # Task type label
         type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
 
-        # Get first line of prompt
-        first_line = task.prompt.split('\n')[0].strip()
-        prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY_SHORT)
-
         # Status display
         status_display = task.status
 
@@ -632,7 +639,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         if task.completed_at:
             date_info = f"  {task.completed_at.strftime('%m/%d')}"
 
-        print(f"  {icon} {task.id}. {type_label}{prompt_display:<50} {status_display}{date_info}{blocked_info}")
+        # Compute available width: "  X N. [type] " prefix + " status date blocked" suffix
+        prefix_len = len(f"  {icon} {task.id}. {type_label}")
+        suffix_len = len(f" {status_display}{date_info}{blocked_info}")
+        avail = prompt_available_width(prefix=prefix_len, suffix=suffix_len)
+        prompt_display = shorten_prompt(task.prompt, avail)
+
+        print(f"  {icon} {task.id}. {type_label}{prompt_display:<{avail}} {status_display}{date_info}{blocked_info}")
 
     # Check for orphaned tasks in this group and warn the user
     registry = WorkerRegistry(config.workers_path)

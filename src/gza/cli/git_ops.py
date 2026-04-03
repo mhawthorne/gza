@@ -14,11 +14,11 @@ from ..config import Config
 from ..commit_messages import build_task_commit_message
 from ..console import (
     console,
-    get_terminal_width,
     truncate,
+    shorten_prompt,
+    prompt_available_width,
     MAX_PR_BODY_LENGTH,
     MAX_PR_TITLE_LENGTH,
-    MAX_PROMPT_DISPLAY_SHORT,
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
@@ -1294,7 +1294,8 @@ def _cmd_advance_unimplemented(
     print()
     for task in pending_tasks:
         assert task.id is not None
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        prefix_len = len(f"  #{task.id}  [{task.task_type}] ")
+        prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
         print(f"  #{task.id}  [{task.task_type}] {prompt_display}")
         print(f"       → gza implement {task.id}")
     print()
@@ -1358,6 +1359,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
     _c_err = _ac.error
     _c_warn = _ac.waiting
     _c_default = _ac.default
+    # Prefix for advance lines: "  #NNN " — compute available prompt width per task.
+    def _prompt_avail(task_id: int) -> int:
+        return prompt_available_width(prefix=len(str(task_id)) + 4)  # "  #NNN "
     git = Git(config.project_dir)
 
     dry_run: bool = args.dry_run
@@ -1523,7 +1527,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if plan:
                 print()
                 for task, action in plan:
-                    prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+                    prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
                     console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
@@ -1533,7 +1537,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # --new with no existing actions: skip straight to spawning new tasks
             if plan:
                 for task, action in plan:
-                    prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+                    prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
                     console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
@@ -1542,7 +1546,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if dry_run:
         print(f"Would advance {len(plan)} task(s):\n")
         for task, action in plan:
-            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+            prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
             if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
@@ -1559,11 +1563,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if remaining > 0:
                 pending_tasks = store.get_pending(limit=remaining)
                 if pending_tasks:
-                    prompt_width = int(get_terminal_width() * 0.7)
                     print(f"Would start {len(pending_tasks)} new pending task(s):\n")
                     for pt in pending_tasks:
-                        flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
-                        prompt_display = truncate(flat_prompt, prompt_width)
+                        prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
                         console.print(f"  [{_c_tid}]#{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                         console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                         print()
@@ -1576,7 +1578,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if actionable_plan:
         print(f"Will advance {len(actionable_plan)} task(s):\n")
         for task, action in plan:
-            prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+            prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
@@ -1590,11 +1592,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if remaining > 0:
             new_pending_tasks = store.get_pending(limit=remaining)
             if new_pending_tasks:
-                prompt_width = int(get_terminal_width() * 0.7)
                 print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
                 for pt in new_pending_tasks:
-                    flat_prompt = '. '.join(line.strip() for line in pt.prompt.splitlines() if line.strip())
-                    prompt_display = truncate(flat_prompt, prompt_width)
+                    prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
                     console.print(f"  [{_c_tid}]#{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                     print()
@@ -1620,7 +1620,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     for task, action in plan:
         assert task.id is not None
-        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY_SHORT)
+        prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
         action_type = action['type']
 
         if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
@@ -1899,7 +1899,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if attention_tasks:
         console.print(f"\n[{_c_err}]Needs attention ({len(attention_tasks)} task{'s' if len(attention_tasks) != 1 else ''}):[/{_c_err}]")
         for atask, aaction in attention_tasks:
-            prompt_display = truncate(atask.prompt, MAX_PROMPT_DISPLAY_SHORT)
+            prompt_display = shorten_prompt(atask.prompt, _prompt_avail(atask.id))
             # Strip leading "SKIP: " prefix from description for display
             desc = aaction['description']
             if desc.startswith('SKIP: '):

@@ -10,6 +10,8 @@ from .db import TaskStats
 __all__ = [
     "console",
     "truncate",
+    "shorten_prompt",
+    "prompt_available_width",
     "get_terminal_width",
     "format_duration",
     "task_header",
@@ -49,6 +51,42 @@ def truncate(text: str, max_len: int, suffix: str = '...') -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - len(suffix)] + suffix
+
+
+def prompt_available_width(prefix: int = 0, suffix: int = 0) -> int:
+    """Compute available width for a prompt, given surrounding elements.
+
+    Subtracts *prefix*, *suffix*, and a 5%-of-terminal-width padding
+    per element from the terminal width.
+
+    Args:
+        prefix: Characters consumed before the prompt (e.g. status + task ID).
+        suffix: Characters consumed after the prompt.
+    """
+    tw = get_terminal_width()
+    pad = max(1, int(tw * 0.05))
+    used = prefix + suffix
+    # One pad between prefix and prompt; one between prompt and suffix if present.
+    pads = (pad if prefix else 0) + (pad if suffix else 0)
+    return max(20, tw - used - pads)
+
+
+def shorten_prompt(text: str, available: int | None = None) -> str:
+    """Shorten a prompt to fit in *available* columns.
+
+    Collapses newlines into '. ' separators, then truncates.
+
+    Args:
+        text: The prompt text to shorten.
+        available: Maximum character width for the prompt.  Callers should
+                   compute this via :func:`prompt_available_width`.
+                   When ``None``, falls back to 60% of the terminal width.
+    """
+    if available is None:
+        available = int(get_terminal_width() * 0.6)
+    available = max(20, available)
+    flat = '. '.join(line.strip() for line in text.splitlines() if line.strip())
+    return truncate(flat, available)
 
 
 def get_terminal_width() -> int:
