@@ -332,7 +332,7 @@ class Config:
     learnings_window: int = DEFAULT_LEARNINGS_WINDOW
     learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
     tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
-    theme: str | None = None  # Named color theme ('default_dark', 'selective_neon', 'blue')
+    theme: str | None = "minimal"  # Named color theme (default: 'minimal')
     colors: dict[str, str] = field(default_factory=dict)  # Ad-hoc per-field color overrides
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
     local_override_path: Path | None = None
@@ -1005,7 +1005,7 @@ class Config:
         # Parse theme and ad-hoc color overrides.
         from .colors import BUILT_IN_THEMES, set_theme as _set_theme  # noqa: PLC0415
 
-        theme_name: str | None = data.get("theme")
+        theme_name: str | None = data.get("theme", "minimal")
         if theme_name is not None:
             if not isinstance(theme_name, str):
                 raise ConfigError("'theme' must be a string")

@@ -68,7 +68,7 @@ Edit skills in `src/gza/skills/`, never in `.claude/skills/` (installed artifact
 
 ## Config Fields (new/notable)
 
-- `theme` — built-in color theme: `default_dark`, `selective_neon`, or `blue`. See [docs/configuration.md](docs/configuration.md).
+- `theme` — built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. See [docs/configuration.md](docs/configuration.md).
 - `colors` — ad-hoc dict of `field_name: rich_color_string` applied on top of `theme`; overrides always win. Allowed in `gza.local.yaml`.
 
 ## Conventions
