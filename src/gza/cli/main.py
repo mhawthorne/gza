@@ -192,6 +192,11 @@ def main() -> int:
         metavar="N",
         help="Show last N unmerged tasks (default: 5, 0 for all)",
     )
+    unmerged_parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Reconcile unmerged tasks against live git state before listing",
+    )
 
     # advance command
     advance_parser = subparsers.add_parser(

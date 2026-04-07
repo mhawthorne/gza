@@ -71,6 +71,27 @@ _LINEAGE_REL_LABELS: dict[str, str] = {
 }
 
 
+def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
+    """Refresh merge truth and diff stats for tasks currently marked unmerged."""
+    merged_count = 0
+    refreshed_count = 0
+
+    for task in store.get_unmerged():
+        if task.id is None or not task.branch:
+            continue
+
+        if git.is_merged(task.branch, default_branch):
+            store.set_merge_status(task.id, "merged")
+            merged_count += 1
+            continue
+
+        files_changed, insertions, deletions = git.get_diff_stat_parsed(f"{default_branch}...{task.branch}")
+        store.update_diff_stats(task.id, files_changed, insertions, deletions)
+        refreshed_count += 1
+
+    return merged_count, refreshed_count
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
@@ -368,6 +389,12 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     if needs_merge_status_migration(store):
         console.print("[dim]Migrating merge status for existing tasks...[/dim]")
         migrate_merge_status(store, git)
+
+    if getattr(args, "update", False):
+        merged_count, refreshed_count = _reconcile_unmerged_tasks(store, git, default_branch)
+        console.print(
+            f"[dim]Reconciled unmerged tasks: {merged_count} merged, {refreshed_count} refreshed[/dim]"
+        )
 
     # Query tasks with merge_status='unmerged' from the database, completed only
     # --commits-only and --all flags are kept for backwards compatibility but are no-ops

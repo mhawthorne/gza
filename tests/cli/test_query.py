@@ -3140,6 +3140,60 @@ class TestUnmergedAllFlag:
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
 
+    def test_unmerged_update_marks_stale_merged_task_as_merged(self, tmp_path: Path):
+        """--update reconciles stale unmerged tasks whose branch is already merged."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Stale unmerged task",
+            task_id="20260220-stale-unmerged",
+            branch="feature/stale-unmerged",
+        )
+
+        git._run("merge", "--no-ff", "feature/stale-unmerged", "-m", "Merge stale branch")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Stale unmerged task" in result.stdout
+
+        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Reconciled unmerged tasks: 1 merged, 0 refreshed" in result.stdout
+        assert "No unmerged tasks" in result.stdout
+
+        updated_task = store.get(task.id)
+        assert updated_task.merge_status == "merged"
+
+    def test_unmerged_update_refreshes_diff_stats_for_live_branch(self, tmp_path: Path):
+        """--update refreshes cached diff stats for branches that are still unmerged."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Refresh diff stats task",
+            task_id="20260220-refresh-diff-stats",
+            branch="feature/refresh-diff-stats",
+        )
+
+        task.diff_files_changed = 99
+        task.diff_lines_added = 999
+        task.diff_lines_removed = 111
+        store.update(task)
+
+        git._run("checkout", "feature/refresh-diff-stats")
+        (tmp_path / "feature.txt").write_text("line1\nline2\n")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Update diff stats")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Reconciled unmerged tasks: 0 merged, 1 refreshed" in result.stdout
+        assert "+2/-0 LOC, 1 files" in result.stdout
+
+        updated_task = store.get(task.id)
+        assert updated_task.merge_status == "unmerged"
+        assert updated_task.diff_files_changed == 1
+        assert updated_task.diff_lines_added == 2
+        assert updated_task.diff_lines_removed == 0
+
 
 class TestUnmergedImprovedDisplay:
     """Tests for improved unmerged display (diff stats, review prominence, completed-only)."""
