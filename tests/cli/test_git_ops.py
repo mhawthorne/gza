@@ -924,6 +924,59 @@ class TestRebaseCommand:
             assert result.returncode == 0
             assert "Successfully rebased" in result.stdout
 
+    def test_rebase_cleans_up_worktree_after_mechanical_success(self, tmp_path: Path):
+        """Worktree is removed after a successful mechanical rebase (no conflicts)."""
+        from gza.config import Config
+
+        _store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase cleanup mechanical", "feature/test-cleanup-mech",
+        )
+        config = Config.load(tmp_path)
+        expected_worktree = config.worktree_path / str(task.id)
+
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Successfully rebased" in result.stdout
+        assert not expected_worktree.exists(), (
+            f"Worktree at {expected_worktree} should have been removed after successful rebase"
+        )
+
+    def test_rebase_cleans_up_worktree_on_push_failure(self, tmp_path: Path):
+        """Worktree is removed even when force-push raises GitError."""
+        from gza.cli.git_ops import cmd_rebase
+        from gza.git import GitError
+
+        _store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase cleanup push fail", "feature/test-cleanup-push",
+        )
+        config = Config.load(tmp_path)
+        expected_worktree = config.worktree_path / str(task.id)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=task.id,
+            background=False,
+            onto=None,
+            remote=False,
+            force=False,
+            resolve=False,
+        )
+
+        # Patch push_force_with_lease to simulate a push failure after a provider-resolved rebase.
+        # We also need invoke_provider_resolve to return True so the push is attempted.
+        with patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True), \
+             patch("gza.git.Git.rebase", side_effect=GitError("conflict")), \
+             patch("gza.git.Git.rebase_abort"), \
+             patch("gza.git.Git.push_force_with_lease", side_effect=GitError("push failed")):
+            with pytest.raises(GitError, match="push failed"):
+                cmd_rebase(args)
+
+        # Worktree must not exist regardless of push failure.
+        assert not expected_worktree.exists(), (
+            f"Worktree at {expected_worktree} should have been removed even after push failure"
+        )
+
 
 class TestDiffCommand:
     """Tests for 'gza diff' command."""

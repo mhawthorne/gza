@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 
@@ -433,7 +434,9 @@ def invoke_provider_resolve(
         from ..skills_utils import copy_skill
         worktree_skills_dir = worktree_path / ".claude" / "skills"
         worktree_skills_dir.mkdir(parents=True, exist_ok=True)
-        copy_skill("gza-rebase", worktree_skills_dir)
+        ok, msg = copy_skill("gza-rebase", worktree_skills_dir)
+        if not ok:
+            logger.warning("Failed to copy gza-rebase skill to worktree: %s", msg)
 
     resolve_config = replace(
         config,
@@ -576,7 +579,6 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     worktree_path = config.worktree_path / str(task.id)
     print(f"Rebasing task #{task.id}...")
     try:
-        import shutil as _shutil
         # Remove any existing worktree for this branch (may be at a different path).
         stale_path = cleanup_worktree_for_branch(git, task.branch, force=True)
         if stale_path:
@@ -587,7 +589,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         if worktree_path.exists():
             git.worktree_remove(worktree_path, force=True)
             if worktree_path.exists():
-                _shutil.rmtree(worktree_path, ignore_errors=True)
+                shutil.rmtree(worktree_path, ignore_errors=True)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         git._run("worktree", "add", str(worktree_path), task.branch)
     except GitError as e:
@@ -596,40 +598,50 @@ def cmd_rebase(args: argparse.Namespace) -> int:
 
     worktree_git = Git(worktree_path)
 
-    # Attempt a mechanical rebase inside the worktree (no LLM needed if it succeeds).
-    print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
     try:
-        worktree_git.rebase(rebase_target)
-        print(f"✓ Successfully rebased {task.branch} onto {rebase_target}")
+        # Attempt a mechanical rebase inside the worktree (no LLM needed if it succeeds).
+        print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
+        try:
+            worktree_git.rebase(rebase_target)
+            print(f"✓ Successfully rebased {task.branch} onto {rebase_target}")
+            print()
+            return 0
+
+        except GitError as e:
+            # Conflicts detected — abort so the worktree is clean before the provider runs.
+            print(f"Conflicts detected: {e}")
+            try:
+                worktree_git.rebase_abort()
+            except GitError:
+                pass
+
+        # Fall back to provider-driven resolution via /gza-rebase --auto.
+        print("Invoking provider to resolve via /gza-rebase --auto...")
+        resolved = invoke_provider_resolve(
+            task, task.branch, rebase_target, config, worktree_path=worktree_path
+        )
+
+        if not resolved:
+            print("Could not resolve conflicts automatically.")
+            print()
+            return 1
+
+        # Force-push the resolved branch (provider never pushes automatically).
+        print(f"Pushing {task.branch}...")
+        worktree_git.push_force_with_lease(task.branch)
+
+        print(f"✓ Successfully rebased {task.branch}")
         print()
         return 0
 
-    except GitError as e:
-        # Conflicts detected — abort so the worktree is clean before the provider runs.
-        print(f"Conflicts detected: {e}")
+    finally:
+        # Clean up the temporary worktree on all exit paths (success, failure, exception).
         try:
-            worktree_git.rebase_abort()
-        except GitError:
-            pass
-
-    # Fall back to provider-driven resolution via /gza-rebase --auto.
-    print("Invoking provider to resolve via /gza-rebase --auto...")
-    resolved = invoke_provider_resolve(
-        task, task.branch, rebase_target, config, worktree_path=worktree_path
-    )
-
-    if not resolved:
-        print("Could not resolve conflicts automatically.")
-        print()
-        return 1
-
-    # Force-push the resolved branch (provider never pushes automatically).
-    print(f"Pushing {task.branch}...")
-    worktree_git.push_force_with_lease(task.branch)
-
-    print(f"✓ Successfully rebased {task.branch}")
-    print()
-    return 0
+            git.worktree_remove(worktree_path, force=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        except Exception:
+            logger.warning("Failed to remove rebase worktree at %s", worktree_path)
 
 
 def cmd_checkout(args: argparse.Namespace) -> int:
