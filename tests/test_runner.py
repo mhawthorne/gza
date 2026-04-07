@@ -1191,6 +1191,47 @@ class TestTaskIdExistsBranchStrategy:
         )
         assert task_id.endswith("-my-task")
 
+    def test_explicit_type_overrides_inferred_type_in_branch_check(self):
+        """explicit_type is forwarded to generate_branch_name, overriding prompt inference."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
+        # Prompt would infer "feature" but explicit_type says "fix"
+        result = _task_id_exists(
+            "20260407-my-task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            prompt="Add a new feature",
+            branch_strategy=strategy,
+            explicit_type="fix",
+        )
+        assert result is True
+        # Must check the explicit-type branch, not the inferred-type branch
+        git.branch_exists.assert_called_once_with("fix/my-task")
+
+    def test_explicit_type_collision_triggers_suffix_in_generate_task_id(self):
+        """generate_task_id appends suffix when explicit-type branch exists."""
+        git = Mock(spec=Git)
+        strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
+
+        def branch_exists(name: str) -> bool:
+            # The fix/-prefixed base branch exists; the -2 suffix does not.
+            return name == "fix/add-a-new-feature"
+
+        git.branch_exists.side_effect = branch_exists
+
+        task_id = generate_task_id(
+            "Add a new feature",  # would infer "feature" type without explicit_type
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            branch_strategy=strategy,
+            explicit_type="fix",
+        )
+        # Base "fix/add-a-new-feature" was taken; should get a -2 suffix
+        assert task_id.endswith("-2")
+
 
 class TestComputeSlugOverride:
     """Tests for _compute_slug_override helper."""
