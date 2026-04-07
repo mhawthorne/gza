@@ -12,8 +12,8 @@ from rich.markup import escape as rich_escape
 from ..colors import (
     blue,
     pink,
-    LOG_TASK_STATUS_COLORS,
-    LOG_WORKER_STATUS_COLORS,
+    LINEAGE_STATUS_COLORS,
+    PS_STATUS_COLORS,
     SHOW_COLORS_DICT,
 )
 from ..config import Config
@@ -990,7 +990,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
         console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
         console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.task_id or '')}", soft_wrap=True)
-        _status_color = LOG_TASK_STATUS_COLORS.get(task.status, "")
+        _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
         console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
         if resolution_note:
@@ -1006,7 +1006,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         if is_running and _w_status != "running":
             # Prefer live process state when worker metadata is stale.
             _w_status = "running"
-        _w_color = LOG_WORKER_STATUS_COLORS.get(_w_status, "white")
+        _w_color = PS_STATUS_COLORS.get(_w_status, "white")
         console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
         console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
         if using_startup_log:
