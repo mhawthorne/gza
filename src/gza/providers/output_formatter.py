@@ -7,14 +7,14 @@ from dataclasses import dataclass
 from rich.console import Console
 from rich.markup import escape as rich_escape
 
-from ..colors import WorkOutputColors
+from ..colors import TaskOutputColors
 
 
 @dataclass(frozen=True)
-class OutputStyles(WorkOutputColors):
+class OutputStyles(TaskOutputColors):
     """Color and style definitions for provider stream output.
 
-    Inherits all color fields from :class:`gza.colors.WorkOutputColors`.
+    Inherits all color fields from :class:`gza.colors.TaskOutputColors`.
     """
 
 

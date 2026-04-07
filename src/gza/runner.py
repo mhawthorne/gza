@@ -12,6 +12,7 @@ from typing import Callable
 
 from .config import (
     APP_NAME,
+    BranchStrategy,
     Config,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
@@ -27,6 +28,7 @@ from .prompts import PromptBuilder
 from .providers import get_provider, Provider, RunResult
 from .colors import UNMERGED_COLORS_DICT
 from .review_verdict import parse_review_verdict
+from .branch_naming import generate_branch_name
 from .review_tasks import DuplicateReviewError, create_review_task
 
 logger = logging.getLogger(__name__)
@@ -294,6 +296,8 @@ def generate_task_id(
     git: Git | None = None,
     project_name: str | None = None,
     slug_override: str | None = None,
+    branch_strategy: "BranchStrategy | None" = None,
+    explicit_type: str | None = None,
 ) -> str:
     """Generate a task ID in YYYYMMDD-slug format, with suffix for retries."""
     if existing_id:
@@ -306,13 +310,13 @@ def generate_task_id(
         base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
-    if not _task_id_exists(base_id, log_path, git, project_name):
+    if not _task_id_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
         return base_id
 
     # Find next available suffix
     suffix = 2
     new_id = f"{base_id}-{suffix}"
-    while _task_id_exists(new_id, log_path, git, project_name):
+    while _task_id_exists(new_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
         suffix += 1
         new_id = f"{base_id}-{suffix}"
     return new_id
@@ -355,16 +359,34 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     return f"{prefix}-{root_slug}"
 
 
-def _task_id_exists(task_id: str, log_path: Path | None, git: Git | None, project_name: str | None) -> bool:
+def _task_id_exists(
+    task_id: str,
+    log_path: Path | None,
+    git: Git | None,
+    project_name: str | None,
+    prompt: str = "",
+    branch_strategy: "BranchStrategy | None" = None,
+    explicit_type: str | None = None,
+) -> bool:
     """Check if a task_id is already in use (log file or branch exists)."""
     # Check log file
     if log_path and (log_path / f"{task_id}.log").exists():
         return True
-    # Check branch
+    # Check branch using the actual branch naming pattern from config
     if git and project_name:
-        branch_name = f"{project_name}/{task_id}"
-        exists = git.branch_exists(branch_name)
-        if exists:
+        if branch_strategy is not None:
+            branch_name = generate_branch_name(
+                pattern=branch_strategy.pattern,
+                project_name=project_name,
+                task_id=task_id,
+                prompt=prompt,
+                default_type=branch_strategy.default_type,
+                explicit_type=explicit_type,
+            )
+        else:
+            # Fallback for callers that don't supply a strategy (e.g., tests or legacy callers).
+            branch_name = f"{project_name}/{task_id}"
+        if git.branch_exists(branch_name):
             return True
     return False
 
@@ -1274,6 +1296,8 @@ def run(
             git=git,
             project_name=config.project_name,
             slug_override=slug_override,
+            branch_strategy=config.branch_strategy,
+            explicit_type=task.task_type_hint,
         )
 
     task_header(task.prompt, task.task_id or "", task.task_type)
@@ -1298,8 +1322,6 @@ def _resolve_code_task_branch_name(
 
     if resume:
         # Resume but branch wasn't saved - derive from task_id using branch naming strategy
-        from gza.branch_naming import generate_branch_name
-
         assert config.branch_strategy is not None
         assert task.task_id is not None
         branch_name = generate_branch_name(
@@ -1357,8 +1379,6 @@ def _resolve_code_task_branch_name(
         return f"{config.project_name}/gza-work"
 
     # multi branch mode uses branch naming strategy
-    from gza.branch_naming import generate_branch_name
-
     assert config.branch_strategy is not None
     assert task.task_id is not None
     return generate_branch_name(
@@ -2039,6 +2059,7 @@ def _run_non_code_task(
             error_message(f"Task failed: max steps of {config.max_steps} exceeded")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
@@ -2053,6 +2074,7 @@ def _run_non_code_task(
             error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
@@ -2066,6 +2088,7 @@ def _run_non_code_task(
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
@@ -2095,6 +2118,7 @@ def _run_non_code_task(
             )
             error_message("Task failed: expected report artifact was not created")
             console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             if stale_candidates:
                 console.print(
                     "Detected report files with other names in worktree "
@@ -2149,6 +2173,17 @@ def _run_non_code_task(
             has_commits=False,
             stats=stats,
         )
+
+        # Clean up non-code worktree on success — report has been copied back, no further use
+        if git:
+            try:
+                git.worktree_remove(worktree_path, force=True)
+                if worktree_path.exists():
+                    shutil.rmtree(worktree_path, ignore_errors=True)
+            except GitError:
+                logger.warning("Failed to remove worktree %s", worktree_path)
+                if worktree_path.exists():
+                    shutil.rmtree(worktree_path, ignore_errors=True)
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = None

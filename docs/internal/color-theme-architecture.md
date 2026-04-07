@@ -20,7 +20,7 @@ Seven frozen dataclasses, one per output context:
 |-------|---------|
 | `TaskColors` | `gza history`, `gza stats` |
 | `StatusColors` | `gza ps`, lineage trees |
-| `WorkOutputColors` | Live provider stream output |
+| `TaskOutputColors` | Live provider stream output |
 | `ShowColors` | `gza show` |
 | `UnmergedColors` | `gza unmerged` |
 | `LineageColors` | `gza lineage` |
