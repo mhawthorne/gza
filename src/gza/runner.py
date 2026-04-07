@@ -2039,6 +2039,7 @@ def _run_non_code_task(
             error_message(f"Task failed: max steps of {config.max_steps} exceeded")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
@@ -2053,6 +2054,7 @@ def _run_non_code_task(
             error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
@@ -2066,6 +2068,7 @@ def _run_non_code_task(
             error_message(f"Task failed: {provider.name} exited with code {exit_code}")
             stats_line(stats, has_commits=False)
             console.print(f"Task ID: {task.id}")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             next_steps([
                 (f"gza retry {task.id}", "retry from scratch"),
                 (f"gza resume {task.id}", "resume from where it left off"),
@@ -2095,6 +2098,7 @@ def _run_non_code_task(
             )
             error_message("Task failed: expected report artifact was not created")
             console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
+            console.print(f"Worktree preserved for inspection: {worktree_path}")
             if stale_candidates:
                 console.print(
                     "Detected report files with other names in worktree "
@@ -2149,6 +2153,13 @@ def _run_non_code_task(
             has_commits=False,
             stats=stats,
         )
+
+        # Clean up non-code worktree on success — report has been copied back, no further use
+        if git:
+            try:
+                git.worktree_remove(worktree_path, force=True)
+            except GitError:
+                logger.warning("Failed to remove worktree %s", worktree_path)
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = None
