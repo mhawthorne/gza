@@ -601,6 +601,20 @@ def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) ->
 
         # Remove the worktree
         git.worktree_remove(worktree_path, force=force)
+        remaining = git.worktree_list()
+        for wt in remaining:
+            wt_branch = wt.get("branch", "")
+            if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
+                git._run("worktree", "prune", "--expire", "now", check=False)
+                remaining = git.worktree_list()
+                break
+
+        for wt in remaining:
+            wt_branch = wt.get("branch", "")
+            if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
+                raise GitError(
+                    f"worktree for branch '{branch}' is still registered at '{wt['path']}' after removal"
+                )
         return worktree_path
 
     return None
