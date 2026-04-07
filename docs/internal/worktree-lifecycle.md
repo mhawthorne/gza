@@ -24,6 +24,10 @@ Reviews also use `same_branch=True`. They check out the implementation branch in
 
 These create worktrees in `/tmp` (for Docker compatibility) based on the default branch. See `_run_non_code_task` in `runner.py`.
 
+### `gza rebase` CLI (foreground mode)
+
+`gza rebase` creates a **temporary** worktree at `config.worktree_path / task.id` for the duration of the rebase. Unlike task worktrees, this worktree is always removed after use — a `try/finally` block in `cmd_rebase` calls `git.worktree_remove(worktree_path, force=True)` on all exit paths (mechanical success, provider-resolved success, failure, and exception). If `worktree_remove` leaves the directory behind, `shutil.rmtree` is used as a fallback. This worktree is never left registered with git after `gza rebase` exits.
+
 ## Key invariant: one worktree per branch
 
 Git enforces that a branch can only be checked out in one worktree at a time. When a review or improve starts, it calls `cleanup_worktree_for_branch()` which removes any existing worktree for that branch before creating the new one. This means:

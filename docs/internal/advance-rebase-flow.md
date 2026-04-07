@@ -37,8 +37,19 @@ The worktree may have uncommitted changes (e.g., from provider initialization). 
 
 ## Failure handling
 
-If a rebase task fails, `gza advance` reports `needs_discussion` — manual intervention is required. Rebases are not automatically retried. The user can manually retry with `gza retry <id>` or rebase interactively with `gza rebase <id> --resolve`.
+If a rebase task fails, `gza advance` reports `needs_discussion` — manual intervention is required. Rebases are not automatically retried. The user can manually retry with `gza retry <id>` or rebase interactively with `gza rebase <id>`.
 
 ## Relationship to `gza rebase` CLI command
 
-The `gza rebase` CLI command and `gza advance`'s auto-rebase both use `_create_rebase_task()` to create tasks, ensuring they go through the standard runner. The `--resolve` flag on `gza rebase` handles the case where conflicts have been manually resolved.
+`gza rebase` operates entirely within a fresh worktree — it never modifies the main working tree. When invoked without `--background`:
+
+1. Any stale worktree for the task's branch is force-removed.
+2. A fresh worktree is created at `config.worktree_path / task.id`.
+3. A mechanical `git rebase` is attempted inside that worktree.
+4. If conflicts arise, the rebase is aborted and `invoke_provider_resolve` runs the provider (Claude) inside the same worktree via `/gza-rebase --auto`.
+5. On success, the rebased branch is force-pushed from the worktree.
+6. The worktree is removed on all exit paths (success, failure, exception) via a `try/finally` block.
+
+The `--resolve` and `--force` flags are accepted for backward compatibility but are no-ops — conflict resolution is always attempted automatically, and existing worktrees are always force-removed before creating a fresh one.
+
+With `--background`, `gza rebase` creates a rebase task via `_create_rebase_task()` and runs it through the standard runner, which already manages its own worktree lifecycle.
