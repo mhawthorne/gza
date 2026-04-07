@@ -679,7 +679,7 @@ def cmd_checkout(args: argparse.Namespace) -> int:
         if worktree_path:
             print(f"Removing stale worktree at {worktree_path}...")
             print(f"✓ Removed worktree")
-    except ValueError as e:
+    except (ValueError, GitError) as e:
         print(f"Error: {e}")
         return 1
 

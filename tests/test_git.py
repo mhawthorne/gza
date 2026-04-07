@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from gza.git import Git, GitError, parse_diff_numstat
+from gza.git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 
 
 class TestGitInit:
@@ -18,6 +18,27 @@ class TestGitInit:
         repo_dir.mkdir()
         git = Git(repo_dir)
         assert git.repo_dir == repo_dir
+
+
+class TestCleanupWorktreeForBranch:
+    """Tests for cleanup_worktree_for_branch helper."""
+
+    def test_raises_when_worktree_still_registered_after_remove(self, tmp_path: Path):
+        """A failed remove should not be reported as successful."""
+        git = Git(tmp_path)
+
+        with patch.object(git, "worktree_list") as mock_list, \
+             patch.object(git, "worktree_remove") as mock_remove, \
+             patch("gza.git.Git.has_changes", return_value=False):
+            mock_list.side_effect = [
+                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
+                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
+            ]
+
+            with pytest.raises(GitError, match="still registered"):
+                cleanup_worktree_for_branch(git, "feature/test", force=True)
+
+            mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
 
 
 class TestGitRun:
