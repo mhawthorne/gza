@@ -12,6 +12,7 @@ from typing import Callable
 
 from .config import (
     APP_NAME,
+    BranchStrategy,
     Config,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
@@ -294,6 +295,7 @@ def generate_task_id(
     git: Git | None = None,
     project_name: str | None = None,
     slug_override: str | None = None,
+    branch_strategy: "BranchStrategy | None" = None,
 ) -> str:
     """Generate a task ID in YYYYMMDD-slug format, with suffix for retries."""
     if existing_id:
@@ -306,13 +308,13 @@ def generate_task_id(
         base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
-    if not _task_id_exists(base_id, log_path, git, project_name):
+    if not _task_id_exists(base_id, log_path, git, project_name, prompt, branch_strategy):
         return base_id
 
     # Find next available suffix
     suffix = 2
     new_id = f"{base_id}-{suffix}"
-    while _task_id_exists(new_id, log_path, git, project_name):
+    while _task_id_exists(new_id, log_path, git, project_name, prompt, branch_strategy):
         suffix += 1
         new_id = f"{base_id}-{suffix}"
     return new_id
@@ -355,16 +357,32 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     return f"{prefix}-{root_slug}"
 
 
-def _task_id_exists(task_id: str, log_path: Path | None, git: Git | None, project_name: str | None) -> bool:
+def _task_id_exists(
+    task_id: str,
+    log_path: Path | None,
+    git: Git | None,
+    project_name: str | None,
+    prompt: str = "",
+    branch_strategy: "BranchStrategy | None" = None,
+) -> bool:
     """Check if a task_id is already in use (log file or branch exists)."""
     # Check log file
     if log_path and (log_path / f"{task_id}.log").exists():
         return True
-    # Check branch
+    # Check branch using the actual branch naming pattern from config
     if git and project_name:
-        branch_name = f"{project_name}/{task_id}"
-        exists = git.branch_exists(branch_name)
-        if exists:
+        if branch_strategy is not None:
+            from .branch_naming import generate_branch_name
+            branch_name = generate_branch_name(
+                pattern=branch_strategy.pattern,
+                project_name=project_name,
+                task_id=task_id,
+                prompt=prompt,
+                default_type=branch_strategy.default_type,
+            )
+        else:
+            branch_name = f"{project_name}/{task_id}"
+        if git.branch_exists(branch_name):
             return True
     return False
 
@@ -1274,6 +1292,7 @@ def run(
             git=git,
             project_name=config.project_name,
             slug_override=slug_override,
+            branch_strategy=config.branch_strategy,
         )
 
     task_header(task.prompt, task.task_id or "", task.task_type)
