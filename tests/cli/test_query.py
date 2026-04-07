@@ -1803,12 +1803,12 @@ class TestPsCommand:
 
         result = run_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "running-worker" in result.stdout
+        # Stale running worker (dead PID, no task_id) is pruned automatically
+        assert "running-worker" not in result.stdout
         assert "failed(startup)" in result.stdout
         assert "ordinary-failed-worker" not in result.stdout
         assert "completed-worker" not in result.stdout
 
-        registry.remove("w-test-ps-running")
         registry.remove("w-test-ps-startup-failed")
         registry.remove("w-test-ps-failed")
         registry.remove("w-test-ps-completed")
@@ -1861,17 +1861,17 @@ class TestPsCommand:
             )
         )
 
-        # Default ps: filters out ordinary completed/failed
+        # Default ps: stale running worker (dead PID, no task_id) is pruned;
+        # ordinary completed/failed are filtered out
         result = run_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "running-worker" in result.stdout
+        assert "running-worker" not in result.stdout
         assert "ordinary-failed-worker" not in result.stdout
         assert "completed-worker" not in result.stdout
 
-        # ps --all: includes everything
+        # ps --all: includes completed/failed (running was already pruned)
         result_all = run_gza("ps", "--all", "--project", str(tmp_path))
         assert result_all.returncode == 0
-        assert "running-worker" in result_all.stdout
         assert "ordinary-failed-worker" in result_all.stdout
         assert "completed-worker" in result_all.stdout
 
@@ -1880,7 +1880,6 @@ class TestPsCommand:
         assert result_status.returncode == 0
         assert "completed-worker" in result_status.stdout
 
-        registry.remove("w-all-running")
         registry.remove("w-all-failed")
         registry.remove("w-all-completed")
 
@@ -1961,6 +1960,7 @@ class TestPsCommand:
     def test_ps_handles_missing_started_timestamp(self, tmp_path: Path):
         """PS should gracefully handle invalid/missing start timestamps."""
         import json
+        import os as _os
 
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -1971,7 +1971,7 @@ class TestPsCommand:
         registry.register(
             WorkerMetadata(
                 worker_id="w-test-no-start",
-                pid=99999,
+                pid=_os.getpid(),  # use real PID so prune doesn't remove it
                 task_id=None,
                 task_slug="standalone-worker",
                 started_at="not-a-timestamp",
@@ -1999,6 +1999,7 @@ class TestPsCommand:
     def test_ps_json_order_stable_when_started_timestamps_missing(self, tmp_path: Path):
         """PS JSON ordering is deterministic when start times are unavailable."""
         import json
+        import os as _os
 
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -2012,7 +2013,7 @@ class TestPsCommand:
             registry.register(
                 WorkerMetadata(
                     worker_id=worker_id,
-                    pid=99999,
+                    pid=_os.getpid(),  # use real PID so prune doesn't remove it
                     task_id=None,
                     task_slug=None,
                     started_at="invalid",

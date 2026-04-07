@@ -18,7 +18,6 @@ from ._common import (
 from ..config import Config
 from .config_cmds import (
     cmd_clean,
-    cmd_cleanup,
     cmd_config,
     cmd_import,
     cmd_init,
@@ -475,65 +474,59 @@ def main() -> int:
     )
     add_common_args(config_parser)
 
-    # cleanup command
-    cleanup_parser = subparsers.add_parser("cleanup", help="Clean up stale worktrees, old logs, and worker metadata")
-    cleanup_parser.add_argument(
+    # clean command
+    clean_parser = subparsers.add_parser("clean", help="Clean up stale worktrees, old logs, worker metadata, and archives")
+    clean_parser.add_argument(
         "--worktrees",
         action="store_true",
         help="Only clean up stale worktrees",
     )
-    cleanup_parser.add_argument(
-        "--logs",
-        action="store_true",
-        help="Only clean up old log files",
-    )
-    cleanup_parser.add_argument(
+    clean_parser.add_argument(
         "--workers",
         action="store_true",
         help="Only clean up stale worker metadata",
     )
-    cleanup_parser.add_argument(
+    clean_parser.add_argument(
+        "--logs",
+        action="store_true",
+        help="Only clean up old log files",
+    )
+    clean_parser.add_argument(
+        "--backups",
+        action="store_true",
+        help="Only clean up old backup files",
+    )
+    clean_parser.add_argument(
         "--days",
         type=int,
         default=None,
         metavar="N",
-        help="Remove worktrees/logs older than N days (default: from config cleanup_days, or 30)",
+        help="Remove items older than N days (default: from config cleanup_days, or 30)",
     )
-    cleanup_parser.add_argument(
+    clean_parser.add_argument(
         "--keep-unmerged",
         action="store_true",
         help="Keep logs for tasks that are still unmerged",
     )
-    cleanup_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be cleaned without actually doing it",
-    )
-    cleanup_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Skip confirmation prompt before removing worktrees",
-    )
-    add_common_args(cleanup_parser)
-
-    # clean command
-    clean_parser = subparsers.add_parser("clean", help="Archive or delete old log and worker files")
     clean_parser.add_argument(
-        "--days",
-        type=int,
-        default=30,
-        metavar="N",
-        help="Archive files older than N days (default: 30), or delete archived files if --purge (default: 365)",
+        "--archive",
+        action="store_true",
+        help="Archive old log and worker files instead of deleting",
     )
     clean_parser.add_argument(
         "--purge",
         action="store_true",
-        help="Delete archived files instead of archiving (requires --days, default: 365)",
+        help="Delete previously archived files (default: older than 365 days)",
+    )
+    clean_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt before removing worktrees",
     )
     clean_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be archived/deleted without actually doing it",
+        help="Show what would be cleaned without actually doing it",
     )
     add_common_args(clean_parser)
 
@@ -1334,8 +1327,6 @@ def main() -> int:
             return cmd_validate(args)
         elif args.command == "config":
             return cmd_config(args)
-        elif args.command == "cleanup":
-            return cmd_cleanup(args)
         elif args.command == "clean":
             return cmd_clean(args)
         elif args.command == "init":

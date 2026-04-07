@@ -406,11 +406,11 @@ class TestInitCommand:
         assert "# stale local example" not in local_example_path.read_text()
 
 
-class TestCleanupCommand:
-    """Tests for 'gza cleanup' command."""
+class TestCleanCommand:
+    """Tests for 'gza clean' command (default mode)."""
 
-    def test_cleanup_dry_run(self, tmp_path: Path):
-        """Cleanup command dry run works."""
+    def test_clean_dry_run(self, tmp_path: Path):
+        """Clean command dry run works."""
         from gza.config import Config
         from gza.workers import WorkerRegistry
         from gza.git import Git
@@ -455,15 +455,15 @@ class TestCleanupCommand:
         import os
         os.utime(old_log, (old_time, old_time))
 
-        result = run_gza("cleanup", "--dry-run", "--project", str(tmp_path))
+        result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Dry run" in result.stdout
         # The old log should still exist after dry run
         assert old_log.exists()
 
-    def test_cleanup_logs_only(self, tmp_path: Path):
-        """Cleanup command with --logs flag works."""
+    def test_clean_logs_only(self, tmp_path: Path):
+        """Clean command with --logs flag works."""
         from gza.config import Config
 
         setup_config(tmp_path)
@@ -483,15 +483,15 @@ class TestCleanupCommand:
         old_time = time.time() - (60 * 24 * 60 * 60)
         os.utime(old_log, (old_time, old_time))
 
-        result = run_gza("cleanup", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs cleaned" in result.stdout
         assert not old_log.exists()
         assert new_log.exists()
 
-    def test_cleanup_workers(self, tmp_path: Path):
-        """Cleanup command cleans stale worker metadata and startup logs."""
+    def test_clean_workers(self, tmp_path: Path):
+        """Clean command cleans stale worker metadata and startup logs."""
         from gza.config import Config
         from gza.workers import WorkerRegistry, WorkerMetadata
 
@@ -522,7 +522,7 @@ class TestCleanupCommand:
         assert worker_file.exists()
         assert startup_log_file.exists()
 
-        result = run_gza("cleanup", "--workers", "--project", str(tmp_path))
+        result = run_gza("clean", "--workers", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "worker files cleaned" in result.stdout.lower()
@@ -530,8 +530,8 @@ class TestCleanupCommand:
         assert not worker_file.exists()
         assert not startup_log_file.exists()
 
-    def test_cleanup_keep_unmerged_logs(self, tmp_path: Path):
-        """Cleanup command with --keep-unmerged keeps logs for unmerged tasks."""
+    def test_clean_keep_unmerged_logs(self, tmp_path: Path):
+        """Clean command with --keep-unmerged keeps logs for unmerged tasks."""
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.git import Git
@@ -582,7 +582,7 @@ class TestCleanupCommand:
         os.utime(unmerged_log, (old_time, old_time))
         os.utime(merged_log, (old_time, old_time))
 
-        result = run_gza("cleanup", "--logs", "--days", "30", "--keep-unmerged", "--project", str(tmp_path))
+        result = run_gza("clean", "--logs", "--days", "30", "--keep-unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Unmerged task log should be kept
@@ -590,7 +590,7 @@ class TestCleanupCommand:
         # Merged task log should be removed
         assert not merged_log.exists()
 
-    def test_cleanup_lineage_aware_preserves_recent(self, tmp_path: Path):
+    def test_clean_lineage_aware_preserves_recent(self, tmp_path: Path):
         """Worktrees with recent lineage activity are preserved."""
         from gza.config import Config
         from gza.db import SqliteTaskStore
@@ -624,13 +624,13 @@ class TestCleanupCommand:
         wt_path = worktree_dir / "20260301-recent-feature"
         git._run("worktree", "add", str(wt_path), "-b", "wt-recent")
 
-        result = run_gza("cleanup", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
+        result = run_gza("clean", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Worktree should be preserved — lineage is recent
         assert wt_path.exists()
 
-    def test_cleanup_lineage_aware_removes_old(self, tmp_path: Path):
+    def test_clean_lineage_aware_removes_old(self, tmp_path: Path):
         """Worktrees with old lineage activity are removed."""
         from gza.config import Config
         from gza.db import SqliteTaskStore
@@ -664,14 +664,14 @@ class TestCleanupCommand:
         wt_path = worktree_dir / "20250101-old-feature"
         git._run("worktree", "add", str(wt_path), "-b", "wt-old")
 
-        result = run_gza("cleanup", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
+        result = run_gza("clean", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Worktree should be removed — lineage is old
         assert not wt_path.exists()
         assert "lineage inactive" in result.stdout
 
-    def test_cleanup_force_skips_prompt(self, tmp_path: Path):
+    def test_clean_force_skips_prompt(self, tmp_path: Path):
         """--force flag skips the confirmation prompt."""
         from gza.config import Config
         from gza.git import Git
@@ -698,13 +698,13 @@ class TestCleanupCommand:
         (orphan / "dummy.txt").write_text("dummy")
 
         # With --force, no stdin needed — should succeed without hanging
-        result = run_gza("cleanup", "--worktrees", "--force", "--project", str(tmp_path))
+        result = run_gza("clean", "--worktrees", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert not orphan.exists()
         assert "orphaned" in result.stdout
 
-    def test_cleanup_no_force_denies_removal(self, tmp_path: Path):
+    def test_clean_no_force_denies_removal(self, tmp_path: Path):
         """Without --force, answering 'n' skips worktree removal."""
         from gza.config import Config
         from gza.git import Git
@@ -731,15 +731,15 @@ class TestCleanupCommand:
         (orphan / "dummy.txt").write_text("dummy")
 
         # Provide 'n' via stdin
-        result = run_gza("cleanup", "--worktrees", "--project", str(tmp_path), stdin_input="n\n")
+        result = run_gza("clean", "--worktrees", "--project", str(tmp_path), stdin_input="n\n")
 
         assert result.returncode == 0
         # Orphan should still exist — user said no
         assert orphan.exists()
         assert "Skipped worktree removal" in result.stdout
 
-    def test_cleanup_uses_config_cleanup_days(self, tmp_path: Path):
-        """Cleanup uses cleanup_days from config when --days not specified."""
+    def test_clean_uses_config_cleanup_days(self, tmp_path: Path):
+        """Clean uses cleanup_days from config when --days not specified."""
         from gza.config import Config
 
         # Create config with custom cleanup_days
@@ -750,11 +750,11 @@ class TestCleanupCommand:
         assert config.cleanup_days == 7
 
 
-class TestCleanCommand:
-    """Tests for 'gza clean' command."""
+class TestCleanArchiveCommand:
+    """Tests for 'gza clean --archive' command."""
 
-    def test_clean_default_behavior(self, tmp_path: Path):
-        """Clean command archives files older than 30 days by default."""
+    def test_clean_archive_default_behavior(self, tmp_path: Path):
+        """Clean --archive archives files older than 30 days by default."""
         import time
         from datetime import datetime, timedelta, timezone
 
@@ -795,8 +795,8 @@ class TestCleanCommand:
         os.utime(recent_log, (recent_time, recent_time))
         os.utime(recent_worker, (recent_time, recent_time))
 
-        # Run clean command
-        result = run_gza("clean", "--project", str(tmp_path))
+        # Run clean --archive command
+        result = run_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Archived files older than 30 days" in result.stdout
@@ -831,8 +831,8 @@ class TestCleanCommand:
         old_time = (datetime.now(timezone.utc) - timedelta(days=8)).timestamp()
         os.utime(log_file, (old_time, old_time))
 
-        # Run with --days 7 (should archive 8-day-old file)
-        result = run_gza("clean", "--days", "7", "--project", str(tmp_path))
+        # Run with --archive --days 7 (should archive 8-day-old file)
+        result = run_gza("clean", "--archive", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Archived files older than 7 days" in result.stdout
@@ -858,8 +858,8 @@ class TestCleanCommand:
         old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
         os.utime(old_log, (old_time, old_time))
 
-        # Run with --dry-run
-        result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
+        # Run with --archive --dry-run
+        result = run_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Dry run: would archive files older than 30 days" in result.stdout
@@ -870,8 +870,8 @@ class TestCleanCommand:
         archives_dir = tmp_path / ".gza" / "archives"
         assert not (archives_dir / "logs" / "old_log.txt").exists()
 
-    def test_clean_empty_directories(self, tmp_path: Path):
-        """Clean command handles empty directories without errors."""
+    def test_clean_archive_empty_directories(self, tmp_path: Path):
+        """Clean --archive handles empty directories without errors."""
         setup_config(tmp_path)
 
         # Create empty directories
@@ -880,18 +880,18 @@ class TestCleanCommand:
         logs_dir.mkdir(parents=True, exist_ok=True)
         workers_dir.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("clean", "--project", str(tmp_path))
+        result = run_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs: 0 files" in result.stdout
         assert "Workers: 0 files" in result.stdout
 
-    def test_clean_nonexistent_directories(self, tmp_path: Path):
-        """Clean command handles nonexistent directories without errors."""
+    def test_clean_archive_nonexistent_directories(self, tmp_path: Path):
+        """Clean --archive handles nonexistent directories without errors."""
         setup_config(tmp_path)
 
         # Don't create .gza directories
-        result = run_gza("clean", "--project", str(tmp_path))
+        result = run_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs: 0 files" in result.stdout
@@ -919,7 +919,7 @@ class TestCleanCommand:
             new_time = (datetime.now(timezone.utc) - timedelta(days=5 + i)).timestamp()
             os.utime(new_file, (new_time, new_time))
 
-        result = run_gza("clean", "--project", str(tmp_path))
+        result = run_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs: 3 files" in result.stdout
@@ -949,7 +949,7 @@ class TestCleanCommand:
         old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
         os.utime(old_subdir, (old_time, old_time))
 
-        result = run_gza("clean", "--project", str(tmp_path))
+        result = run_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -973,12 +973,12 @@ class TestCleanCommand:
         os.utime(old_log, (old_time, old_time))
 
         # First run - archives the file
-        result1 = run_gza("clean", "--project", str(tmp_path))
+        result1 = run_gza("clean", "--archive", "--project", str(tmp_path))
         assert result1.returncode == 0
         assert "Logs: 1 files" in result1.stdout
 
         # Second run - should find nothing to archive
-        result2 = run_gza("clean", "--project", str(tmp_path))
+        result2 = run_gza("clean", "--archive", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "Logs: 0 files" in result2.stdout
 
@@ -1126,7 +1126,7 @@ class TestCleanCommand:
         recent_time = (datetime.now(timezone.utc) - timedelta(days=1)).timestamp()
         os.utime(recent_backup, (recent_time, recent_time))
 
-        result = run_gza("clean", "--project", str(tmp_path))
+        result = run_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Backups deleted: 1 files" in result.stdout
@@ -1151,7 +1151,7 @@ class TestCleanCommand:
         old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
         os.utime(old_backup, (old_time, old_time))
 
-        result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
+        result = run_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "gza-2026010100.db" in result.stdout
