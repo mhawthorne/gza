@@ -3194,6 +3194,45 @@ class TestUnmergedAllFlag:
         assert updated_task.diff_lines_added == 2
         assert updated_task.diff_lines_removed == 0
 
+    def test_unmerged_into_current_uses_current_branch(self, tmp_path: Path):
+        """--into-current uses live git state against the current branch."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Branch local task",
+            task_id="20260220-branch-local-task",
+            branch="feature/branch-local-task",
+        )
+
+        git._run("checkout", "-b", "integration")
+        git._run("merge", "--no-ff", "feature/branch-local-task", "-m", "Merge feature into integration")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Branch local task" in result.stdout
+
+        result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
+        assert result.returncode == 0
+        assert "Showing tasks unmerged relative to integration" in result.stdout
+        assert "No unmerged tasks" in result.stdout
+
+    def test_unmerged_target_uses_specified_branch(self, tmp_path: Path):
+        """--target uses live git state against the specified branch."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Target branch task",
+            task_id="20260220-target-branch-task",
+            branch="feature/target-branch-task",
+        )
+
+        git._run("checkout", "-b", "integration")
+        git._run("merge", "--no-ff", "feature/target-branch-task", "-m", "Merge feature into integration")
+        git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Showing tasks unmerged relative to integration" in result.stdout
+        assert "No unmerged tasks" in result.stdout
+
 
 class TestUnmergedImprovedDisplay:
     """Tests for improved unmerged display (diff stats, review prominence, completed-only)."""

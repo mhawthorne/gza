@@ -132,7 +132,14 @@ def _merge_single_task(
 
     # Check if branch already merged
     if git.is_merged(task.branch, current_branch):
-        print(f"Error: Branch '{task.branch}' is already merged into {current_branch}")
+        default_branch = git.default_branch()
+        if current_branch != default_branch and not git.is_merged(task.branch, default_branch):
+            print(
+                f"Error: Branch '{task.branch}' is already merged into current branch "
+                f"'{current_branch}', but still unmerged from default branch '{default_branch}'"
+            )
+        else:
+            print(f"Error: Branch '{task.branch}' is already merged into {current_branch}")
         return 1
 
     # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)

@@ -197,6 +197,17 @@ def main() -> int:
         action="store_true",
         help="Reconcile unmerged tasks against live git state before listing",
     )
+    target_group = unmerged_parser.add_mutually_exclusive_group()
+    target_group.add_argument(
+        "--into-current",
+        action="store_true",
+        help="List tasks unmerged relative to the current branch instead of the default branch",
+    )
+    target_group.add_argument(
+        "--target",
+        metavar="BRANCH",
+        help="List tasks unmerged relative to the specified branch instead of the default branch",
+    )
 
     # advance command
     advance_parser = subparsers.add_parser(
