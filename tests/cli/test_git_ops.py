@@ -123,6 +123,21 @@ class TestMergeCommand:
         # Should either succeed or fail gracefully (not due to flag validation)
         assert "--remote requires --rebase" not in result.stdout
 
+    def test_merge_reports_current_vs_default_branch_when_already_merged_into_current(self, tmp_path: Path):
+        """Merge explains when current-branch merge state differs from default-branch state."""
+        _store, git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Current branch only merged", "feature/test-current-only-merged",
+        )
+
+        git._run("checkout", "-b", "integration")
+        git._run("merge", "--no-ff", "feature/test-current-only-merged", "-m", "Merge into integration")
+
+        result = run_gza("merge", str(task.id), "--project", str(tmp_path), cwd=tmp_path)
+
+        assert result.returncode == 1
+        assert "already merged into current branch 'integration'" in result.stdout
+        assert "still unmerged from default branch 'main'" in result.stdout
+
 
     def test_squash_merge_creates_commit(self, tmp_path: Path):
         """Squash merge creates a commit, not just staged changes."""

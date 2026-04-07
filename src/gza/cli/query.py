@@ -92,6 +92,11 @@ def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: 
     return merged_count, refreshed_count
 
 
+def _is_branch_target_live(args: argparse.Namespace) -> bool:
+    """Whether unmerged should use a live git target instead of canonical DB state."""
+    return bool(getattr(args, "into_current", False) or getattr(args, "target", None))
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
@@ -383,23 +388,42 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     store = get_store(config)
     git = Git(config.project_dir)
     default_branch = git.default_branch()
-    print(f"On branch {git.current_branch()}")
+    current_branch = git.current_branch()
+    print(f"On branch {current_branch}")
+    target_branch = current_branch if getattr(args, "into_current", False) else (getattr(args, "target", None) or default_branch)
 
     # Backfill merge_status for existing tasks if needed (one-time migration)
     if needs_merge_status_migration(store):
-        console.print("[dim]Migrating merge status for existing tasks...[/dim]")
+        console.print(f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks...[/{TASK_COLORS['task_id']}]")
         migrate_merge_status(store, git)
 
-    if getattr(args, "update", False):
+    if getattr(args, "update", False) and not _is_branch_target_live(args):
         merged_count, refreshed_count = _reconcile_unmerged_tasks(store, git, default_branch)
         console.print(
-            f"[dim]Reconciled unmerged tasks: {merged_count} merged, {refreshed_count} refreshed[/dim]"
+            f"[{TASK_COLORS['task_id']}]Reconciled unmerged tasks: {merged_count} merged, "
+            f"{refreshed_count} refreshed[/{TASK_COLORS['task_id']}]"
         )
 
-    # Query tasks with merge_status='unmerged' from the database, completed only
-    # --commits-only and --all flags are kept for backwards compatibility but are no-ops
-    all_unmerged = store.get_unmerged()
-    unmerged = [t for t in all_unmerged if t.status == "completed"]
+    if _is_branch_target_live(args):
+        history = store.get_history(limit=None)
+        all_unmerged = [
+            t for t in history
+            if t.status == "completed"
+            and t.branch
+            and t.has_commits
+            and (t.task_type not in ("improve", "rebase") or t.based_on is None)
+            and not git.is_merged(t.branch, target_branch)
+        ]
+        unmerged = all_unmerged
+        console.print(
+            f"[{TASK_COLORS['task_id']}]Showing tasks unmerged relative to {target_branch}"
+            f"[/{TASK_COLORS['task_id']}]"
+        )
+    else:
+        # Query tasks with merge_status='unmerged' from the database, completed only
+        # --commits-only and --all flags are kept for backwards compatibility but are no-ops
+        all_unmerged = store.get_unmerged()
+        unmerged = [t for t in all_unmerged if t.status == "completed"]
 
     if not unmerged:
         console.print("No unmerged tasks")
@@ -546,23 +570,23 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 files_changed = root_task.diff_files_changed
                 insertions = root_task.diff_lines_added or 0
                 deletions = root_task.diff_lines_removed or 0
-                commit_count = git.count_commits_ahead(branch, default_branch)
+                commit_count = git.count_commits_ahead(branch, target_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
                 branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
                 if diff_str:
                     branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
             else:
-                revision_range = f"{default_branch}...{branch}"
+                revision_range = f"{target_branch}...{branch}"
                 files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
-                commit_count = git.count_commits_ahead(branch, default_branch)
+                commit_count = git.count_commits_ahead(branch, target_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
                 branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
                 if diff_str:
                     branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
             console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ({branch_detail})")
-            if not git.can_merge(branch, default_branch):
+            if not git.can_merge(branch, target_branch):
                 console.print("[yellow]⚠️  has conflicts[/yellow]")
         else:
             console.print(f"branch: [{c['branch']}]{branch}[/{c['branch']}] ([{c['task_id']}]branch deleted[/{c['task_id']}])")

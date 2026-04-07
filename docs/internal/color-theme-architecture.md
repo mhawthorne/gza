@@ -2,6 +2,8 @@
 
 Internal reference for the color/theme system in `src/gza/colors.py`.
 
+CLI output should use the theme system, not ad-hoc Rich style literals in command code. If a new output path needs a color, route it through `src/gza/colors.py` and the appropriate themed singleton instead of hardcoding tags like `[dim]`, `[cyan]`, or hex literals inline.
+
 ## Module structure
 
 Everything lives in `src/gza/colors.py`. There are no color definitions elsewhere in the codebase — a test (`test_no_hex_colors_outside_colors_module`) enforces this.
