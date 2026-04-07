@@ -2158,8 +2158,12 @@ def _run_non_code_task(
         if git:
             try:
                 git.worktree_remove(worktree_path, force=True)
+                if worktree_path.exists():
+                    shutil.rmtree(worktree_path, ignore_errors=True)
             except GitError:
                 logger.warning("Failed to remove worktree %s", worktree_path)
+                if worktree_path.exists():
+                    shutil.rmtree(worktree_path, ignore_errors=True)
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = None
