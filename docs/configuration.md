@@ -544,45 +544,6 @@ gza delete <task_id> [options]
 | `--yes`, `-y` | Skip confirmation prompt |
 | `--force`, `-f` | Deprecated alias for `--yes` |
 
-### clean
-
-Archive old log and worker files to free up disk space. By default, files are moved to `.gza/archive/` rather than deleted.
-
-```bash
-gza clean [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--days N` | Archive files older than N days (default: 30) |
-| `--purge` | Delete archived files instead of archiving (default threshold: 365 days) |
-| `--dry-run` | Show what would be archived/deleted without doing it |
-
-**Example usage:**
-
-```bash
-# Preview what would be archived (default: 30 days)
-gza clean --dry-run
-
-# Archive files older than 30 days
-gza clean
-
-# Archive files older than 7 days
-gza clean --days 7
-
-# Delete files from archive older than 365 days
-gza clean --purge
-
-# Delete archived files older than 60 days
-gza clean --purge --days 60
-```
-
-The clean command archives files from:
-- `.gza/logs/` - Task execution logs
-- `.gza/workers/` - Worker metadata and startup logs
-
-Files are moved to `.gza/archive/` based on their modification time. Use `--purge` to permanently delete archived files.
-
 ### import
 
 Import tasks from a YAML file.
@@ -854,23 +815,26 @@ When `--resolve` is used, gza runs the active task provider (`claude`, `codex`, 
 uv run gza skills-install --target codex gza-rebase --project /path/to/project
 ```
 
-### cleanup
+### clean
 
-Clean up stale worktrees, old logs, and worker artifacts.
+Clean up stale worktrees, old logs, worker metadata, and archives.
 
 ```bash
-gza cleanup [options]
+gza clean [options]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--worktrees` | Only clean up stale worktrees |
-| `--logs` | Only clean up old log files |
 | `--workers` | Only clean up stale worker metadata and startup logs |
-| `--days N` | Remove items older than N days (default: 30) |
+| `--logs` | Only clean up old log files |
+| `--backups` | Only clean up old backup files |
+| `--days N` | Remove items older than N days (default: from config cleanup_days, or 30) |
 | `--keep-unmerged` | Keep logs for tasks that are still unmerged |
-| `--dry-run` | Show what would be cleaned without doing it |
+| `--archive` | Archive old log and worker files instead of deleting |
+| `--purge` | Delete previously archived files (default: older than 365 days) |
 | `--force` | Skip confirmation prompt before removing worktrees |
+| `--dry-run` | Show what would be cleaned without doing it |
 
 ### improve
 

@@ -148,7 +148,7 @@ Merge Status: merged
 If someone merges a branch manually (not via `gza merge`), the `merge_status` remains `'unmerged'`. Options:
 
 1. **Accept this limitation**: User can run `gza merge --mark-only <task_id>` to update status
-2. **Periodic sync**: Add `gza cleanup --sync-merge-status` to re-detect from git state
+2. **Periodic sync**: Add `gza clean --sync-merge-status` to re-detect from git state
 
 Recommend option 1 for simplicity.
 

@@ -34,7 +34,7 @@ Git enforces that a branch can only be checked out in one worktree at a time. Wh
 
 ## Cleanup safety
 
-`gza cleanup` only removes **orphaned** worktree directories — directories in the worktree path that are not tracked by `git worktree list`. These are leftover directories from worktrees that git has already pruned.
+`gza clean --worktrees` only removes **orphaned** worktree directories — directories in the worktree path that are not tracked by `git worktree list`. These are leftover directories from worktrees that git has already pruned.
 
 Age-based worktree cleanup is intentionally not performed because:
 - A completed task's worktree may still be in use by a review or improve running on the same branch

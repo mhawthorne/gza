@@ -1611,7 +1611,7 @@ def _complete_code_task(
         # If parent was already merged, flip it back to unmerged — the improve
         # task added commits to the shared branch after the merge.
         parent = store.get(task.based_on)
-        if parent and parent.merge_status == "merged":
+        if parent and parent.id is not None and parent.merge_status == "merged":
             store.set_merge_status(parent.id, "unmerged")
 
     # Invalidate review state after rebase completes, since conflict resolution
@@ -1619,7 +1619,7 @@ def _complete_code_task(
     if task.task_type == "rebase" and task.based_on:
         store.invalidate_review_state(task.based_on)
         parent = store.get(task.based_on)
-        if parent and parent.merge_status == "merged":
+        if parent and parent.id is not None and parent.merge_status == "merged":
             store.set_merge_status(parent.id, "unmerged")
 
     # Rebase tasks run provider-side conflict resolution in the worktree.

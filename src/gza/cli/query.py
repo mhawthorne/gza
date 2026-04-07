@@ -1118,7 +1118,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
             f"Refusing to stop worker {args.worker_id}: "
             f"status is '{worker.status}', not 'running'."
         )
-        print("Run 'gza cleanup' to remove stale worker records.")
+        print("Run 'gza clean --workers' to remove stale worker records.")
         return 1
 
     if _has_pid_ownership_mismatch(worker, store):

@@ -111,11 +111,10 @@ def prune_terminal_dead_workers(config: Config) -> None:
         task_label = f"#{worker.task_id}" if worker.task_id is not None else "<unknown>"
         try:
             if worker.task_id is None:
-                print(
-                    f"Warning: Worker {worker.worker_id} has no associated task_id; "
-                    f"skipping prune (possible incomplete registration)",
-                    file=sys.stderr,
-                )
+                # Only prune stale workers (registered as running but PID is dead).
+                # Keep failed/completed workers so startup failures remain visible in ps.
+                if worker.status == "running" and not registry.is_running(worker.worker_id):
+                    registry.remove(worker.worker_id)
                 continue
             task = store.get(worker.task_id)
             if task is None:

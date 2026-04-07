@@ -502,12 +502,22 @@ def _find_removable_workers(registry: WorkerRegistry, store: "SqliteTaskStore") 
     return removable
 
 
-def cmd_cleanup(args: argparse.Namespace) -> int:
-    """Clean up stale worktrees, old logs, and stale worker metadata."""
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Clean up stale worktrees, old logs, worker metadata, and archives."""
     from datetime import timedelta
     import shutil
 
     config = Config.load(args.project_dir)
+
+    # Purge mode: delete previously archived files
+    if args.purge:
+        return _clean_purge(config, args)
+
+    # Archive mode: move old files to archives directory
+    if args.archive:
+        return _clean_archive(config, args)
+
+    # Default mode: smart state-based cleanup
     store = get_store(config)
     git = Git(config.project_dir)
     registry = WorkerRegistry(config.workers_path)
@@ -516,14 +526,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
+    scope_flags = (args.worktrees, args.workers, args.logs, args.backups)
+    no_scope = not any(scope_flags)
+
     # Track what was cleaned
     cleaned_worktrees: list[tuple[str, str]] = []
     cleaned_logs: list[str] = []
     cleaned_workers = 0
+    deleted_backups: list[str] = []
     errors: list[tuple[str, Exception]] = []
 
     # 1. Lineage-aware worktree cleanup
-    if args.worktrees or not (args.logs or args.workers):
+    if args.worktrees or no_scope:
         from gza.query import resolve_lineage_root, build_lineage, task_time_for_lineage
 
         print("Scanning worktrees...")
@@ -597,7 +611,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                     errors.append((worktree_path.name, e))
 
     # 2. Clean up old log files
-    if args.logs or not (args.worktrees or args.workers):
+    if args.logs or no_scope:
         print("Scanning logs...")
         if config.log_path.exists():
             # Get list of unmerged tasks if --keep-unmerged is set
@@ -647,7 +661,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                             errors.append((log_file.name, e))
 
     # 3. Clean up worker metadata for finished/stale/zombie workers
-    if args.workers or not (args.worktrees or args.logs):
+    if args.workers or no_scope:
         print("Scanning workers...")
         removable = _find_removable_workers(registry, store)
         if removable:
@@ -659,15 +673,31 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 registry.remove(worker.worker_id)
                 cleaned_workers += 1
 
+    # 4. Clean up old backup files
+    if args.backups or no_scope:
+        backups_dir = config.project_dir / ".gza" / "backups"
+        if backups_dir.exists():
+            for backup_file in backups_dir.iterdir():
+                if backup_file.is_file():
+                    if backup_file.stat().st_mtime < cutoff_timestamp:
+                        if args.dry_run:
+                            deleted_backups.append(backup_file.name)
+                        else:
+                            try:
+                                backup_file.unlink()
+                                deleted_backups.append(backup_file.name)
+                            except OSError as e:
+                                errors.append((backup_file.name, e))
+
     # Report results
     if args.dry_run:
         print(f"Dry run: would clean up resources")
         print()
     else:
-        print(f"Cleanup completed")
+        print(f"Clean completed")
         print()
 
-    if args.worktrees or not (args.logs or args.workers):
+    if args.worktrees or no_scope:
         if cleaned_worktrees:
             print(f"Worktrees cleaned: {len(cleaned_worktrees)}")
             for name, reason in cleaned_worktrees:
@@ -676,7 +706,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             print("Worktrees: nothing to clean")
         print()
 
-    if args.logs or not (args.worktrees or args.workers):
+    if args.logs or no_scope:
         if cleaned_logs:
             print(f"Logs cleaned: {len(cleaned_logs)}")
             if args.keep_unmerged:
@@ -685,8 +715,15 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             print("Logs: nothing to clean")
         print()
 
-    if args.workers or not (args.worktrees or args.logs):
+    if args.workers or no_scope:
         print(f"Worker files cleaned: {cleaned_workers}")
+        print()
+
+    if args.backups or no_scope:
+        if deleted_backups:
+            print(f"Backups cleaned: {len(deleted_backups)}")
+        else:
+            print("Backups: nothing to clean")
         print()
 
     # Report errors
@@ -699,104 +736,108 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_clean(args: argparse.Namespace) -> int:
-    """Archive or delete old log and worker files."""
+def _clean_purge(config: Config, args: argparse.Namespace) -> int:
+    """Delete previously archived files older than N days."""
     from datetime import timedelta
-    import shutil
 
-    config = Config.load(args.project_dir)
-
-    # Determine default days based on mode
-    if args.purge and args.days == 30:
-        # User didn't specify --days, use purge default
-        days = 365
-    else:
-        days = args.days
-
-    # Calculate cutoff time
+    days = args.days if args.days is not None else 365
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
-    if args.purge:
-        # Purge mode: delete files from archives directory
-        archives_dir = config.project_dir / ".gza" / "archives"
+    archives_dir = config.project_dir / ".gza" / "archives"
 
-        # Track deleted files and errors
-        deleted_logs = []
-        deleted_workers = []
-        errors = []
+    deleted_logs = []
+    deleted_workers = []
+    errors = []
 
-        # Delete from archives/logs
-        archives_logs_dir = archives_dir / "logs"
-        if archives_logs_dir.exists():
-            for log_file in archives_logs_dir.iterdir():
-                if log_file.is_file():
-                    if log_file.stat().st_mtime < cutoff_timestamp:
-                        if args.dry_run:
+    # Delete from archives/logs
+    archives_logs_dir = archives_dir / "logs"
+    if archives_logs_dir.exists():
+        for log_file in archives_logs_dir.iterdir():
+            if log_file.is_file():
+                if log_file.stat().st_mtime < cutoff_timestamp:
+                    if args.dry_run:
+                        deleted_logs.append(log_file)
+                    else:
+                        try:
+                            log_file.unlink()
                             deleted_logs.append(log_file)
-                        else:
-                            try:
-                                log_file.unlink()
-                                deleted_logs.append(log_file)
-                            except OSError as e:
-                                errors.append((log_file, e))
+                        except OSError as e:
+                            errors.append((log_file, e))
 
-        # Delete from archives/workers
-        archives_workers_dir = archives_dir / "workers"
-        if archives_workers_dir.exists():
-            for worker_file in archives_workers_dir.iterdir():
-                if worker_file.is_file():
-                    if worker_file.stat().st_mtime < cutoff_timestamp:
-                        if args.dry_run:
+    # Delete from archives/workers
+    archives_workers_dir = archives_dir / "workers"
+    if archives_workers_dir.exists():
+        for worker_file in archives_workers_dir.iterdir():
+            if worker_file.is_file():
+                if worker_file.stat().st_mtime < cutoff_timestamp:
+                    if args.dry_run:
+                        deleted_workers.append(worker_file)
+                    else:
+                        try:
+                            worker_file.unlink()
                             deleted_workers.append(worker_file)
-                        else:
-                            try:
-                                worker_file.unlink()
-                                deleted_workers.append(worker_file)
-                            except OSError as e:
-                                errors.append((worker_file, e))
+                        except OSError as e:
+                            errors.append((worker_file, e))
 
-        # Report results
-        if args.dry_run:
-            print(f"Dry run: would purge archived files older than {days} days")
-            print()
-            if deleted_logs:
-                print(f"Archived logs ({len(deleted_logs)} files):")
-                for log_file in deleted_logs:
-                    print(f"  - {log_file.name}")
-            else:
-                print("Archived logs: no files to purge")
-
-            print()
-            if deleted_workers:
-                print(f"Archived workers ({len(deleted_workers)} files):")
-                for worker_file in deleted_workers:
-                    print(f"  - {worker_file.name}")
-            else:
-                print("Archived workers: no files to purge")
+    # Report results
+    if args.dry_run:
+        print(f"Dry run: would purge archived files older than {days} days")
+        print()
+        if deleted_logs:
+            print(f"Archived logs ({len(deleted_logs)} files):")
+            for log_file in deleted_logs:
+                print(f"  - {log_file.name}")
         else:
-            print(f"Purged archived files older than {days} days:")
-            print(f"  - Archived logs: {len(deleted_logs)} files")
-            print(f"  - Archived workers: {len(deleted_workers)} files")
+            print("Archived logs: no files to purge")
 
-            # Report any errors
-            if errors:
-                print()
-                print(f"Errors ({len(errors)} files):")
-                for file, error in errors:
-                    print(f"  - {file.name}: {error}", file=sys.stderr)
-
+        print()
+        if deleted_workers:
+            print(f"Archived workers ({len(deleted_workers)} files):")
+            for worker_file in deleted_workers:
+                print(f"  - {worker_file.name}")
+        else:
+            print("Archived workers: no files to purge")
     else:
-        # Archive mode: move files to archives directory
-        archives_dir = config.project_dir / ".gza" / "archives"
+        print(f"Purged archived files older than {days} days:")
+        print(f"  - Archived logs: {len(deleted_logs)} files")
+        print(f"  - Archived workers: {len(deleted_workers)} files")
 
-        # Track archived files and errors
-        archived_logs = []
-        archived_workers = []
-        deleted_backups = []
-        errors = []
+        if errors:
+            print()
+            print(f"Errors ({len(errors)} files):")
+            for file, error in errors:
+                print(f"  - {file.name}: {error}", file=sys.stderr)
 
-        # Archive logs
+    return 0
+
+
+def _clean_archive(config: Config, args: argparse.Namespace) -> int:
+    """Archive old log and worker files to .gza/archives/."""
+    from datetime import timedelta
+    import shutil
+
+    days = args.days if args.days is not None else 30
+    cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_timestamp = cutoff_time.timestamp()
+
+    archives_dir = config.project_dir / ".gza" / "archives"
+
+    archived_logs = []
+    archived_workers = []
+    deleted_backups = []
+    errors = []
+
+    scope_flags = (
+        getattr(args, 'worktrees', False),
+        getattr(args, 'workers', False),
+        getattr(args, 'logs', False),
+        getattr(args, 'backups', False),
+    )
+    no_scope = not any(scope_flags)
+
+    # Archive logs
+    if args.logs or no_scope:
         if config.log_path.exists():
             archives_logs_dir = archives_dir / "logs"
             for log_file in config.log_path.iterdir():
@@ -806,16 +847,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
                             archived_logs.append(log_file)
                         else:
                             try:
-                                # Create archive directory if needed
                                 archives_logs_dir.mkdir(parents=True, exist_ok=True)
-                                # Move file to archive
                                 dest = archives_logs_dir / log_file.name
                                 shutil.move(str(log_file), str(dest))
                                 archived_logs.append(log_file)
                             except OSError as e:
                                 errors.append((log_file, e))
 
-        # Archive workers
+    # Archive workers
+    if args.workers or no_scope:
         if config.workers_path.exists():
             archives_workers_dir = archives_dir / "workers"
             for worker_file in config.workers_path.iterdir():
@@ -825,16 +865,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
                             archived_workers.append(worker_file)
                         else:
                             try:
-                                # Create archive directory if needed
                                 archives_workers_dir.mkdir(parents=True, exist_ok=True)
-                                # Move file to archive
                                 dest = archives_workers_dir / worker_file.name
                                 shutil.move(str(worker_file), str(dest))
                                 archived_workers.append(worker_file)
                             except OSError as e:
                                 errors.append((worker_file, e))
 
-        # Delete old backups
+    # Delete old backups
+    if args.backups or no_scope:
         backups_dir = config.project_dir / ".gza" / "backups"
         if backups_dir.exists():
             for backup_file in backups_dir.iterdir():
@@ -849,44 +888,43 @@ def cmd_clean(args: argparse.Namespace) -> int:
                             except OSError as e:
                                 errors.append((backup_file, e))
 
-        # Report results
-        if args.dry_run:
-            print(f"Dry run: would archive files older than {days} days")
-            print()
-            if archived_logs:
-                print(f"Logs ({len(archived_logs)} files):")
-                for log_file in archived_logs:
-                    print(f"  - {log_file.name}")
-            else:
-                print("Logs: no files to archive")
-
-            print()
-            if archived_workers:
-                print(f"Workers ({len(archived_workers)} files):")
-                for worker_file in archived_workers:
-                    print(f"  - {worker_file.name}")
-            else:
-                print("Workers: no files to archive")
-
-            print()
-            if deleted_backups:
-                print(f"Backups ({len(deleted_backups)} files):")
-                for backup_file in deleted_backups:
-                    print(f"  - {backup_file.name}")
-            else:
-                print("Backups: no files to delete")
+    # Report results
+    if args.dry_run:
+        print(f"Dry run: would archive files older than {days} days")
+        print()
+        if archived_logs:
+            print(f"Logs ({len(archived_logs)} files):")
+            for log_file in archived_logs:
+                print(f"  - {log_file.name}")
         else:
-            print(f"Archived files older than {days} days:")
-            print(f"  - Logs: {len(archived_logs)} files")
-            print(f"  - Workers: {len(archived_workers)} files")
-            print(f"  - Backups deleted: {len(deleted_backups)} files")
+            print("Logs: no files to archive")
 
-            # Report any errors
-            if errors:
-                print()
-                print(f"Errors ({len(errors)} files):")
-                for file, error in errors:
-                    print(f"  - {file.name}: {error}", file=sys.stderr)
+        print()
+        if archived_workers:
+            print(f"Workers ({len(archived_workers)} files):")
+            for worker_file in archived_workers:
+                print(f"  - {worker_file.name}")
+        else:
+            print("Workers: no files to archive")
+
+        print()
+        if deleted_backups:
+            print(f"Backups ({len(deleted_backups)} files):")
+            for backup_file in deleted_backups:
+                print(f"  - {backup_file.name}")
+        else:
+            print("Backups: no files to delete")
+    else:
+        print(f"Archived files older than {days} days:")
+        print(f"  - Logs: {len(archived_logs)} files")
+        print(f"  - Workers: {len(archived_workers)} files")
+        print(f"  - Backups deleted: {len(deleted_backups)} files")
+
+        if errors:
+            print()
+            print(f"Errors ({len(errors)} files):")
+            for file, error in errors:
+                print(f"  - {file.name}: {error}", file=sys.stderr)
 
     return 0
 

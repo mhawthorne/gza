@@ -1360,8 +1360,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
     _c_warn = _ac.waiting
     _c_default = _ac.default
     # Prefix for advance lines: "  #NNN " — compute available prompt width per task.
-    def _prompt_avail(task_id: int) -> int:
-        return prompt_available_width(prefix=len(str(task_id)) + 4)  # "  #NNN "
+    def _prompt_avail(task_id: int | None) -> int:
+        return prompt_available_width(prefix=len(str(task_id or 0)) + 4)  # "  #NNN "
     git = Git(config.project_dir)
 
     dry_run: bool = args.dry_run
