@@ -28,9 +28,11 @@ class TestCleanupWorktreeForBranch:
         git = Git(tmp_path)
 
         with patch.object(git, "worktree_list") as mock_list, \
+             patch.object(git, "_run") as mock_run, \
              patch.object(git, "worktree_remove") as mock_remove, \
              patch("gza.git.Git.has_changes", return_value=False):
             mock_list.side_effect = [
+                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
                 [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
                 [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
             ]
@@ -39,6 +41,27 @@ class TestCleanupWorktreeForBranch:
                 cleanup_worktree_for_branch(git, "feature/test", force=True)
 
             mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
+            mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
+
+    def test_prunes_stale_registration_after_remove(self, tmp_path: Path):
+        """Pruning should clear stale worktree registrations after removal."""
+        git = Git(tmp_path)
+
+        with patch.object(git, "worktree_list") as mock_list, \
+             patch.object(git, "_run") as mock_run, \
+             patch.object(git, "worktree_remove") as mock_remove, \
+             patch("gza.git.Git.has_changes", return_value=False):
+            mock_list.side_effect = [
+                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
+                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
+                [],
+            ]
+
+            result = cleanup_worktree_for_branch(git, "feature/test", force=True)
+
+            assert result == Path("/tmp/gza/branch")
+            mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
+            mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
 
 
 class TestGitRun:
