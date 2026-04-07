@@ -1632,9 +1632,9 @@ class TestRunNonCodeTaskDockerGitMetadata:
             )
 
         assert exit_code == 0
-        assert original_git_file.exists()
-        assert original_git_file.read_text() == original_git_content
-        assert not (worktree_path / ".git.gza-host-worktree").exists()
+        # The worktree is cleaned up on success; the hiding/restoring assertions are
+        # checked inside provider_run's side_effect above.
+        assert not worktree_path.exists()
 
 
 class TestRunNonCodeTaskWorktreeReportDir:
@@ -2081,6 +2081,143 @@ class TestMaxStepsHandling:
             assert len(pr_post_called) == 0
         finally:
             gza.runner.post_review_to_pr = original_post_review
+
+
+class TestNonCodeWorktreeCleanup:
+    """Tests for worktree cleanup behavior in _run_non_code_task."""
+
+    def _make_config(self, tmp_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        return config
+
+    def test_success_path_calls_worktree_remove(self, tmp_path: Path):
+        """On success, git.worktree_remove is called after the report is copied back."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Explore the codebase", task_type="explore")
+        task.task_id = "20260301-explore-the-codebase"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        worktree_path = config.worktree_path / f"{task.task_id}-explore"
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            # Simulate the provider creating the report inside the worktree
+            report_dir = worktree_path / ".gza" / "explorations"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.task_id}.md").write_text("# Exploration\n\nFindings.")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=3,
+                cost_usd=0.02,
+                session_id="session-1",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git, resume=False)
+
+        assert exit_code == 0
+        mock_git.worktree_remove.assert_called_once_with(worktree_path, force=True)
+
+    def test_success_path_git_error_falls_back_to_shutil_rmtree(self, tmp_path: Path):
+        """When git.worktree_remove raises GitError on cleanup, shutil.rmtree is used as fallback."""
+        from gza.git import GitError
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Explore the codebase", task_type="explore")
+        task.task_id = "20260301-explore-the-codebase"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        worktree_path = config.worktree_path / f"{task.task_id}-explore"
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            report_dir = worktree_path / ".gza" / "explorations"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.task_id}.md").write_text("# Exploration\n\nFindings.")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=3,
+                cost_usd=0.02,
+                session_id="session-2",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.worktree_remove.side_effect = GitError("worktree remove failed")
+
+        with patch("gza.runner.console"), patch("gza.runner.shutil.rmtree") as mock_rmtree:
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git, resume=False)
+
+        assert exit_code == 0
+        mock_rmtree.assert_any_call(worktree_path, ignore_errors=True)
+
+    def test_failure_path_max_steps_prints_worktree_path(self, tmp_path: Path):
+        """On max-steps failure, output should contain 'Worktree preserved for inspection'."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Explore the codebase", task_type="explore")
+        task.task_id = "20260301-explore-the-codebase"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=5.0,
+            num_steps_computed=51,
+            error_type="max_steps",
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        printed_lines: list[str] = []
+
+        def capture_print(*args, **kwargs):
+            printed_lines.append(str(args[0]) if args else "")
+
+        worktree_path = config.worktree_path / f"{task.task_id}-explore"
+
+        with patch("gza.runner.console") as mock_console:
+            mock_console.print.side_effect = capture_print
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git, resume=False)
+
+        assert exit_code == 0
+        all_output = "\n".join(printed_lines)
+        assert "Worktree preserved for inspection" in all_output
+        assert str(worktree_path) in all_output
 
 
 class TestRunStepPersistenceIntegration:
