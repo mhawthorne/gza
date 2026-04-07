@@ -21,6 +21,7 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 - `--auto` mode: unattended rebase for background workers. Same as default mode but:
   - Do NOT use AskUserQuestion — resolve all conflicts autonomously using best judgment.
   - If a conflict is truly ambiguous and cannot be resolved confidently, abort the rebase and report failure.
+  - Uncommitted changes may be present in the working tree (e.g. leftover from an interrupted run). Stash them before rebasing and restore with `git stash pop` afterwards.
 
 ### Step 1: Pre-flight checks
 

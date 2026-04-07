@@ -846,39 +846,38 @@ class TestRebaseCommand:
         assert "Removed worktree" in result.stdout
         assert "Successfully rebased" in result.stdout
 
-    def test_rebase_fails_with_dirty_worktree(self, tmp_path: Path):
-        """Rebase command fails if worktree has uncommitted changes."""
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
-            tmp_path, "Test rebase with dirty worktree", "feature/test-rebase-dirty",
-            worktree_name="test-rebase-dirty",
-        )
-
-        # Add uncommitted changes to the worktree
-        (worktree_path / "uncommitted.txt").write_text("uncommitted")
-
-        # Rebase should fail due to dirty worktree
-        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
-
-        # Verify failure
-        assert result.returncode == 1
-        assert "uncommitted changes" in result.stdout
-
     def test_rebase_force_removes_dirty_worktree(self, tmp_path: Path):
-        """Rebase --force removes worktree even with uncommitted changes."""
+        """Rebase always force-removes dirty worktrees and succeeds cleanly."""
         _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
             tmp_path, "Test rebase force", "feature/test-rebase-force",
             worktree_name="test-rebase-force",
         )
 
-        # Add uncommitted changes to the worktree
+        # Add uncommitted changes to the old worktree
         (worktree_path / "uncommitted.txt").write_text("uncommitted")
 
-        # Rebase with --force should succeed
-        result = run_gza("rebase", str(task.id), "--force", "--project", str(tmp_path))
+        # Rebase should succeed: old dirty worktree is force-removed, fresh one created
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
 
-        # Verify success
+        # Verify success — old worktree removed, rebase completed in fresh worktree
         assert result.returncode == 0
         assert "Removed worktree" in result.stdout
+        assert "Successfully rebased" in result.stdout
+
+    def test_rebase_force_flag_accepted(self, tmp_path: Path):
+        """Rebase --force flag is accepted (backward-compat no-op)."""
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase --force flag", "feature/test-rebase-force-flag",
+            worktree_name="test-rebase-force-flag",
+        )
+
+        # Add uncommitted changes to the old worktree
+        (worktree_path / "uncommitted.txt").write_text("uncommitted")
+
+        # --force is now a no-op; rebase should still succeed
+        result = run_gza("rebase", str(task.id), "--force", "--project", str(tmp_path))
+
+        assert result.returncode == 0
         assert "Successfully rebased" in result.stdout
 
     def test_rebase_without_worktree(self, tmp_path: Path):
@@ -1419,6 +1418,176 @@ class TestRebaseHelpers:
 
         result = ensure_skill("gza-rebase", "unknown-provider", tmp_path)
         assert result is False
+
+    # --- worktree-path variant tests ---
+
+    def test_invoke_provider_resolve_worktree_uses_auto_without_continue(self, tmp_path):
+        """When worktree_path is provided the provider is called with /gza-rebase --auto (no --continue)."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="claude")
+        task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False), \
+             patch("gza.skills_utils.copy_skill", return_value=(True, "installed")):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config, worktree_path=tmp_path)
+
+        assert result is True
+        mock_provider.run.assert_called_once()
+        assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
+
+    def test_invoke_provider_resolve_worktree_runs_provider_in_worktree(self, tmp_path):
+        """When worktree_path is provided the provider runs in that directory."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        config = Config(project_dir=tmp_path, project_name="test", provider="claude")
+        task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False), \
+             patch("gza.skills_utils.copy_skill", return_value=(True, "installed")):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            invoke_provider_resolve(task, "feature", "main", config, worktree_path=worktree)
+
+        # Provider must be run with the worktree as the working directory
+        assert mock_provider.run.call_args.args[3] == worktree
+
+    def test_invoke_provider_resolve_worktree_fails_if_rebase_still_in_progress(self, tmp_path):
+        """Worktree path: returns False when _is_rebase_in_progress reports True."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="claude")
+        store = SqliteTaskStore(config.db_path)
+        task = SimpleNamespace(
+            id=99,
+            task_type="implement",
+            provider=None,
+            provider_is_explicit=False,
+            model=None,
+        )
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops.load_dotenv"), \
+             patch("gza.cli.git_ops._is_rebase_in_progress", return_value=True), \
+             patch("gza.skills_utils.copy_skill", return_value=(True, "installed")):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config, worktree_path=tmp_path)
+
+        assert result is False
+        internal_tasks = store.get_history(limit=None, task_type="internal")
+        assert len(internal_tasks) == 1
+        assert internal_tasks[0].status == "failed"
+
+    def test_invoke_provider_resolve_worktree_records_auto_command_in_output(self, tmp_path):
+        """Worktree path: internal task output_content contains /gza-rebase --auto."""
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+        from gza.providers.base import RunResult
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+
+        config = Config(project_dir=tmp_path, project_name="test", provider="claude")
+        store = SqliteTaskStore(config.db_path)
+        task = SimpleNamespace(
+            id=100,
+            task_type="implement",
+            provider=None,
+            provider_is_explicit=False,
+            model=None,
+        )
+
+        with patch("gza.cli.ensure_skill", return_value=True), \
+             patch("gza.providers.get_provider") as mock_get_provider, \
+             patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False), \
+             patch("gza.skills_utils.copy_skill", return_value=(True, "installed")):
+            mock_provider = Mock()
+            mock_provider.run.return_value = RunResult(exit_code=0)
+            mock_get_provider.return_value = mock_provider
+
+            result = invoke_provider_resolve(task, "feature", "main", config, worktree_path=tmp_path)
+
+        assert result is True
+        internal_tasks = store.get_history(limit=None, task_type="internal")
+        assert len(internal_tasks) == 1
+        internal_task = internal_tasks[0]
+        assert internal_task.status == "completed"
+        assert "/gza-rebase --auto" in internal_task.output_content
+        assert "--continue" not in internal_task.output_content
+
+
+class TestIsRebaseInProgress:
+    """Tests for the _is_rebase_in_progress helper."""
+
+    def test_returns_false_when_no_git_dir(self, tmp_path):
+        """Returns False when there's no .git directory at all."""
+        from gza.cli.git_ops import _is_rebase_in_progress
+        assert _is_rebase_in_progress(tmp_path) is False
+
+    def test_returns_false_when_no_rebase_markers(self, tmp_path):
+        """Returns False for a normal repository with no rebase in progress."""
+        from gza.cli.git_ops import _is_rebase_in_progress
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        assert _is_rebase_in_progress(tmp_path) is False
+
+    def test_returns_true_when_rebase_merge_present(self, tmp_path):
+        """Returns True when .git/rebase-merge directory exists."""
+        from gza.cli.git_ops import _is_rebase_in_progress
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "rebase-merge").mkdir()
+        assert _is_rebase_in_progress(tmp_path) is True
+
+    def test_returns_true_when_rebase_apply_present(self, tmp_path):
+        """Returns True when .git/rebase-apply directory exists."""
+        from gza.cli.git_ops import _is_rebase_in_progress
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "rebase-apply").mkdir()
+        assert _is_rebase_in_progress(tmp_path) is True
+
+    def test_worktree_git_file_resolved_correctly(self, tmp_path):
+        """Follows the gitdir: pointer in a worktree .git file."""
+        from gza.cli.git_ops import _is_rebase_in_progress
+        # Simulate a real git worktree: .git is a file pointing to the gitdir
+        real_git_dir = tmp_path / "main-repo" / ".git" / "worktrees" / "wt1"
+        real_git_dir.mkdir(parents=True)
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {real_git_dir}\n")
+        # No rebase markers yet
+        assert _is_rebase_in_progress(worktree) is False
+        # Add a rebase-merge dir inside the actual git dir
+        (real_git_dir / "rebase-merge").mkdir()
+        assert _is_rebase_in_progress(worktree) is True
 
 
 class TestMergeStatusTracking:
