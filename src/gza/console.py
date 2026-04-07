@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .db import TaskStats
+import gza.colors as _colors
 
 __all__ = [
     "console",
@@ -125,20 +126,21 @@ def format_duration(seconds: float, verbose: bool = False) -> str:
 
 def task_header(prompt: str, task_id: str, task_type: str) -> None:
     """Print a styled task header with prompt, ID, and type."""
-    # Truncate prompt if too long
+    rc = _colors.RUNNER_COLORS
     prompt_display = prompt[:80] + "..." if len(prompt) > 80 else prompt
-    console.print(f"[bold cyan]=== Task: {prompt_display} ===[/bold cyan]")
-    console.print(f"    ID: [dim]{task_id}[/dim]")
-    console.print(f"    Type: [magenta]{task_type}[/magenta]")
+    console.print(f"[{rc.heading}]=== Task: {prompt_display} ===[/{rc.heading}]")
+    console.print(f"    [{rc.label}]ID:[/{rc.label}] [{rc.task_id}]{task_id}[/{rc.task_id}]")
+    console.print(f"    [{rc.label}]Type:[/{rc.label}] [{rc.task_type}]{task_type}[/{rc.task_type}]")
 
 
 def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
     """Print task statistics in a formatted line."""
+    rc = _colors.RUNNER_COLORS
     parts = []
 
     if stats.duration_seconds is not None:
         duration_str = format_duration(stats.duration_seconds)
-        parts.append(f"[dim]Runtime:[/dim] [bold]{duration_str}[/bold]")
+        parts.append(f"[{rc.label}]Runtime:[/{rc.label}] [{rc.value}]{duration_str}[/{rc.value}]")
 
     if stats.num_steps_reported is not None:
         steps_display = str(stats.num_steps_reported)
@@ -146,30 +148,30 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
             steps_display += f" (computed: {stats.num_steps_computed})"
         if stats.num_turns_reported is not None and stats.num_turns_reported != stats.num_steps_reported:
             steps_display += f" (legacy turns: {stats.num_turns_reported})"
-        parts.append(f"[dim]Steps:[/dim] [bold]{steps_display}[/bold]")
+        parts.append(f"[{rc.label}]Steps:[/{rc.label}] [{rc.value}]{steps_display}[/{rc.value}]")
     elif stats.num_steps_computed is not None:
-        parts.append(f"[dim]Steps:[/dim] [bold]{stats.num_steps_computed}[/bold]")
+        parts.append(f"[{rc.label}]Steps:[/{rc.label}] [{rc.value}]{stats.num_steps_computed}[/{rc.value}]")
     elif stats.num_turns_reported is not None:
         turns_display = str(stats.num_turns_reported)
         if stats.num_turns_computed is not None and stats.num_turns_computed != stats.num_turns_reported:
             turns_display += f" (computed: {stats.num_turns_computed})"
-        parts.append(f"[dim]Turns:[/dim] [bold]{turns_display}[/bold]")
+        parts.append(f"[{rc.label}]Turns:[/{rc.label}] [{rc.value}]{turns_display}[/{rc.value}]")
 
     if stats.input_tokens is not None or stats.output_tokens is not None:
         input_tokens = stats.input_tokens if stats.input_tokens is not None else 0
         output_tokens = stats.output_tokens if stats.output_tokens is not None else 0
-        estimated_suffix = " [yellow](estimated)[/yellow]" if stats.tokens_estimated else ""
+        estimated_suffix = f" [{rc.estimated}](estimated)[/{rc.estimated}]" if stats.tokens_estimated else ""
         parts.append(
-            f"[dim]Tokens:[/dim] [bold]in {input_tokens:,} / out {output_tokens:,}[/bold]{estimated_suffix}"
+            f"[{rc.label}]Tokens:[/{rc.label}] [{rc.value}]in {input_tokens:,} / out {output_tokens:,}[/{rc.value}]{estimated_suffix}"
         )
 
     if stats.cost_usd is not None:
-        estimated_suffix = " [yellow](estimated)[/yellow]" if stats.cost_estimated else ""
-        parts.append(f"[dim]Cost:[/dim] [bold]${stats.cost_usd:.4f}[/bold]{estimated_suffix}")
+        estimated_suffix = f" [{rc.estimated}](estimated)[/{rc.estimated}]" if stats.cost_estimated else ""
+        parts.append(f"[{rc.label}]Cost:[/{rc.label}] [{rc.value}]${stats.cost_usd:.4f}[/{rc.value}]{estimated_suffix}")
 
     if has_commits is not None:
-        commit_value = "[green]yes[/green]" if has_commits else "no"
-        parts.append(f"[dim]Commits:[/dim] {commit_value}")
+        commit_value = f"[{rc.commits_yes}]yes[/{rc.commits_yes}]" if has_commits else "no"
+        parts.append(f"[{rc.label}]Commits:[/{rc.label}] {commit_value}")
 
     if parts:
         console.print(f"Stats: {' | '.join(parts)}")
@@ -177,22 +179,26 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
 
 def success_message(title: str) -> None:
     """Print a success header."""
-    console.print(f"[bold green]=== {title} ===[/bold green]")
+    rc = _colors.RUNNER_COLORS
+    console.print(f"[{rc.success}]=== {title} ===[/{rc.success}]")
 
 
 def error_message(message: str) -> None:
     """Print an error message."""
-    console.print(f"[bold red]{message}[/bold red]")
+    rc = _colors.RUNNER_COLORS
+    console.print(f"[{rc.error}]{message}[/{rc.error}]")
 
 
 def warning_message(message: str) -> None:
     """Print a warning message."""
-    console.print(f"[yellow]{message}[/yellow]")
+    rc = _colors.RUNNER_COLORS
+    console.print(f"[{rc.warning}]{message}[/{rc.warning}]")
 
 
 def info_line(label: str, value: str) -> None:
     """Print an info line with label and value."""
-    console.print(f"{label}: {value}")
+    rc = _colors.RUNNER_COLORS
+    console.print(f"[{rc.label}]{label}:[/{rc.label}] {value}")
 
 
 def next_steps(commands: list[tuple[str, str]]) -> None:
@@ -201,6 +207,7 @@ def next_steps(commands: list[tuple[str, str]]) -> None:
     Args:
         commands: List of (command, comment) tuples
     """
+    rc = _colors.RUNNER_COLORS
     console.print("\nNext steps:")
     for command, comment in commands:
-        console.print(f"  [cyan]{command}[/cyan]           [dim]{comment}[/dim]")
+        console.print(f"  [{rc.next_cmd}]{command}[/{rc.next_cmd}]           [{rc.next_comment}]{comment}[/{rc.next_comment}]")

@@ -94,7 +94,7 @@ bold_red_error: str = "bold red"
 dim_yellow_note: str = "dim yellow"
 
 purple: str = "#cc88ff"
-orange: str = "#ffcc44"
+orange: str = "#ffbb44"
 
 # Default color for all fields when no theme is applied.
 default_color: str = "bright_white"
@@ -180,6 +180,7 @@ class UnmergedColors:
     prompt: str = default_color
     stats: str = default_color
     branch: str = default_color
+    date: str = default_color
     review_approved: str = default_color
     review_changes: str = default_color
     review_discussion: str = default_color
@@ -210,6 +211,24 @@ class NextColors:
     type: str = default_color
     blocked: str = default_color
     index: str = default_color
+
+
+@dataclass(frozen=True)
+class RunnerColors:
+    """Colors for post-task runner output (stats, headers, next steps)."""
+
+    label: str = default_color
+    value: str = default_color
+    success: str = default_color
+    error: str = default_color
+    warning: str = default_color
+    heading: str = default_color
+    task_id: str = default_color
+    task_type: str = default_color
+    next_cmd: str = default_color
+    next_comment: str = default_color
+    estimated: str = default_color
+    commits_yes: str = default_color
 
 
 @dataclass(frozen=True)
@@ -278,6 +297,7 @@ class Theme:
     unmerged: dict[str, str] = field(default_factory=dict)
     lineage: dict[str, str] = field(default_factory=dict)
     next_colors: dict[str, str] = field(default_factory=dict)
+    runner: dict[str, str] = field(default_factory=dict)
     advance: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -294,6 +314,7 @@ class Theme:
             unmerged=af(color, UnmergedColors),
             lineage=af(color, LineageColors),
             next_colors=af(color, NextColors),
+            runner=af(color, RunnerColors),
             advance=af(color, AdvanceColors),
         )
 
@@ -326,12 +347,25 @@ _THEME_MINIMAL = Theme(
         "unmerged": f"{green_success} bold",
         "orphaned": yellow_warning,
     },
+    runner={
+        "success": green_success,
+        "error": red_error,
+        "warning": yellow_warning,
+        "heading": bold_cyan_heading,
+        # "task_type": magenta_tool,
+    },
     advance={
         "merge": green_success,
         "error": red_error,
         "waiting": yellow_warning,
         # "default": cyan,
-    }
+    },
+    unmerged={
+        "review_changes": orange,
+        "review_discussion": blue,
+        "review_none": yellow_warning,
+        "review_approved": green_success,
+    },
 )
 
 _THEME_SELECTIVE_NEON = Theme(
@@ -422,6 +456,7 @@ def _build_themed_instances(
     unmerged_c = _apply_domain_theme(UnmergedColors(), theme.unmerged if theme else _no, base_ov, color_overrides)
     lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
     next_c = _apply_domain_theme(NextColors(), theme.next_colors if theme else _no, base_ov, color_overrides)
+    runner_c = _apply_domain_theme(RunnerColors(), theme.runner if theme else _no, base_ov, color_overrides)
     advance_c = _apply_domain_theme(AdvanceColors(), theme.advance if theme else _no, base_ov, color_overrides)
 
     return {
@@ -432,6 +467,7 @@ def _build_themed_instances(
         "UNMERGED_COLORS": unmerged_c,
         "LINEAGE_COLORS": lineage_c,
         "NEXT_COLORS": next_c,
+        "RUNNER_COLORS": runner_c,
         "ADVANCE_COLORS": advance_c,
         "TASK_COLORS_DICT": dataclasses.asdict(task_c),
         "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
@@ -440,6 +476,7 @@ def _build_themed_instances(
         "UNMERGED_COLORS_DICT": dataclasses.asdict(unmerged_c),
         "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
         "NEXT_COLORS_DICT": dataclasses.asdict(next_c),
+        "RUNNER_COLORS_DICT": dataclasses.asdict(runner_c),
         "ADVANCE_COLORS_DICT": dataclasses.asdict(advance_c),
         "LINEAGE_STATUS_COLORS": {
             "completed": status_c.completed,
@@ -481,7 +518,7 @@ def set_theme(
     and ``c.TASK_COLORS`` is preferred for those.
     """
     global TASK_COLORS, STATUS_COLORS, WORK_OUTPUT_COLORS, SHOW_COLORS
-    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, ADVANCE_COLORS
+    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, RUNNER_COLORS, ADVANCE_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
 
@@ -493,13 +530,14 @@ def set_theme(
     UNMERGED_COLORS = inst["UNMERGED_COLORS"]
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
     NEXT_COLORS = inst["NEXT_COLORS"]
+    RUNNER_COLORS = inst["RUNNER_COLORS"]
     ADVANCE_COLORS = inst["ADVANCE_COLORS"]
 
     # Dict singletons — update in place so ``from`` imports see new values.
     for name in (
         "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "WORK_OUTPUT_COLORS_DICT",
         "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
-        "NEXT_COLORS_DICT", "ADVANCE_COLORS_DICT",
+        "NEXT_COLORS_DICT", "RUNNER_COLORS_DICT", "ADVANCE_COLORS_DICT",
         "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS",
     ):
         target = globals()[name]
@@ -520,6 +558,7 @@ SHOW_COLORS: ShowColors = ShowColors()
 UNMERGED_COLORS: UnmergedColors = UnmergedColors()
 LINEAGE_COLORS: LineageColors = LineageColors()
 NEXT_COLORS: NextColors = NextColors()
+RUNNER_COLORS: RunnerColors = RunnerColors()
 ADVANCE_COLORS: AdvanceColors = AdvanceColors()
 
 # ---------------------------------------------------------------------------
@@ -533,6 +572,7 @@ SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
 LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
 NEXT_COLORS_DICT: dict[str, str] = dataclasses.asdict(NEXT_COLORS)
+RUNNER_COLORS_DICT: dict[str, str] = dataclasses.asdict(RUNNER_COLORS)
 ADVANCE_COLORS_DICT: dict[str, str] = dataclasses.asdict(ADVANCE_COLORS)
 
 # Lineage-status dict (subset of StatusColors, keyed by status string)
@@ -556,47 +596,4 @@ PS_STATUS_COLORS: dict[str, str] = {
     "unknown": STATUS_COLORS.unknown,
 }
 
-# Log-command task-status colors (keyed by task.status string).
-# Note: 'unmerged' maps to green (treated as successfully merged for display
-# purposes) and 'in_progress' maps to yellow — both differ from STATUS_COLORS
-# which uses yellow/cyan respectively for those states.
-# Intentionally excluded from set_theme(): these use semantic ANSI colors
-# (green_success, red_error, yellow_warning) that should remain stable across
-# themes to preserve clear pass/fail readability in log output.
-LOG_TASK_STATUS_COLORS: dict[str, str] = {
-    "completed": green_success,
-    "unmerged": green_success,
-    "failed": red_error,
-    "dropped": red_error,
-    "in_progress": yellow_warning,
-}
-
-# Log-command worker-status colors (keyed by worker.status string).
-# Intentionally excluded from set_theme() — same rationale as LOG_TASK_STATUS_COLORS.
-LOG_WORKER_STATUS_COLORS: dict[str, str] = {
-    "running": yellow_warning,
-    "in_progress": yellow_warning,
-    "completed": green_success,
-    "failed": red_error,
-    "stale": yellow_warning,
-}
-
-# Review-verdict colors for the runner's post-task verdict display.
-# Keys are uppercase verdict strings as returned by parse_review_verdict().
-# Intentionally excluded from set_theme() — same rationale as LOG_TASK_STATUS_COLORS.
-REVIEW_VERDICT_COLORS: dict[str, str] = {
-    "APPROVED": green_success,
-    "CHANGES_REQUESTED": yellow_warning,
-    "NEEDS_DISCUSSION": blue,
-}
-
-# Cycle-status colors for the ``gza show`` cycle state display.
-# Keys are cycle status strings as stored in the database.
-# Intentionally excluded from set_theme() — same rationale as LOG_TASK_STATUS_COLORS.
-CYCLE_STATUS_COLORS: dict[str, str] = {
-    "active": cyan,
-    "approved": green_success,
-    "maxed_out": yellow_warning,
-    "blocked": red_error,
-}
 

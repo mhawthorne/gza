@@ -33,10 +33,6 @@ def test_import_dict_variants() -> None:
         ADVANCE_COLORS_DICT,
         LINEAGE_STATUS_COLORS,
         PS_STATUS_COLORS,
-        LOG_TASK_STATUS_COLORS,
-        LOG_WORKER_STATUS_COLORS,
-        REVIEW_VERDICT_COLORS,
-        CYCLE_STATUS_COLORS,
     )
 
 
@@ -101,7 +97,7 @@ def test_show_colors_dict_keys() -> None:
 def test_unmerged_colors_dict_keys() -> None:
     from gza.colors import UNMERGED_COLORS_DICT
 
-    expected_keys = {"task_id", "prompt", "stats", "branch",
+    expected_keys = {"task_id", "prompt", "stats", "branch", "date",
                      "review_approved", "review_changes", "review_discussion", "review_none"}
     assert set(UNMERGED_COLORS_DICT.keys()) == expected_keys
 
@@ -134,33 +130,6 @@ def test_ps_status_colors_keys() -> None:
                      "stale", "unknown"}
     assert set(PS_STATUS_COLORS.keys()) == expected_keys
 
-
-def test_log_task_status_colors_keys() -> None:
-    from gza.colors import LOG_TASK_STATUS_COLORS
-
-    expected_keys = {"completed", "unmerged", "failed", "dropped", "in_progress"}
-    assert set(LOG_TASK_STATUS_COLORS.keys()) == expected_keys
-
-
-def test_log_worker_status_colors_keys() -> None:
-    from gza.colors import LOG_WORKER_STATUS_COLORS
-
-    expected_keys = {"running", "in_progress", "completed", "failed", "stale"}
-    assert set(LOG_WORKER_STATUS_COLORS.keys()) == expected_keys
-
-
-def test_review_verdict_colors_keys() -> None:
-    from gza.colors import REVIEW_VERDICT_COLORS
-
-    expected_keys = {"APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
-    assert set(REVIEW_VERDICT_COLORS.keys()) == expected_keys
-
-
-def test_cycle_status_colors_keys() -> None:
-    from gza.colors import CYCLE_STATUS_COLORS
-
-    expected_keys = {"active", "approved", "maxed_out", "blocked"}
-    assert set(CYCLE_STATUS_COLORS.keys()) == expected_keys
 
 
 

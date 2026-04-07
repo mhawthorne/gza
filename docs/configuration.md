@@ -131,7 +131,6 @@ From highest to lowest:
 | Lineage | `task_type`, `annotation`, `connector`, `type_label`, `relationship`, `target_highlight` |
 | Next | `type`, `blocked`, `index` |
 
-Some color dicts (`LOG_TASK_STATUS_COLORS`, `LOG_WORKER_STATUS_COLORS`, `REVIEW_VERDICT_COLORS`) are intentionally excluded from theming to preserve semantic meaning (green = pass, red = fail).
 
 ### Branch Naming Strategy
 

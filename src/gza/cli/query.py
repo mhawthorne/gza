@@ -54,7 +54,6 @@ from ..colors import (
     SHOW_COLORS_DICT,
     UNMERGED_COLORS_DICT,
     pink,
-    CYCLE_STATUS_COLORS,
 )
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
@@ -534,10 +533,13 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         verdict_label = None
         if review_verdict == "APPROVED":
             verdict_label = "✓ approved"
+            review_status_color = UNMERGED_COLORS["review_approved"]
         elif review_verdict == "CHANGES_REQUESTED":
             verdict_label = "⚠ changes requested"
+            review_status_color = UNMERGED_COLORS["review_changes"]
         elif review_verdict == "NEEDS_DISCUSSION":
             verdict_label = "💬 needs discussion"
+            review_status_color = UNMERGED_COLORS["review_discussion"]
 
         review_line = review_classification
         if review_detail:
@@ -555,7 +557,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         date_len = 19 if root_task.completed_at else 0
         prefix_len = 2 + task_id_len + date_len  # "⚡ #NNN (date) "
         prompt_display = shorten_prompt(root_task.prompt, prompt_available_width(prefix=prefix_len))
-        date_str = f"[{c['task_id']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['task_id']}]" if root_task.completed_at else ""
+        date_str = f"[{c['date']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]" if root_task.completed_at else ""
 
         console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
 
@@ -1508,7 +1510,9 @@ def cmd_show(args: argparse.Namespace) -> int:
         cycles = store.get_cycles_for_impl(task.id)
         if cycles:
             latest_cycle = cycles[0]
-            cycle_color = CYCLE_STATUS_COLORS.get(latest_cycle.status, c["value"])
+            _cycle_status_map = {"active": "in_progress", "approved": "completed", "maxed_out": "stale", "blocked": "failed"}
+            _sc = _colors.STATUS_COLORS
+            cycle_color = getattr(_sc, _cycle_status_map.get(latest_cycle.status, ""), c["value"]) or c["value"]
             console.print(
                 f"[{c['label']}]Latest Cycle:[/{c['label']}] "
                 f"[{cycle_color}]#{latest_cycle.id} {latest_cycle.status}[/{cycle_color}]"

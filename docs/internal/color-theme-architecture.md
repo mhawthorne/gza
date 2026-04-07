@@ -63,15 +63,6 @@ Registered in `BUILT_IN_THEMES` dict, keyed by name. Config validation rejects u
 
 Code imports singletons as `import gza.colors as c` and accesses `c.TASK_COLORS.field`. The `_DICT` variants exist for backward compatibility with dict-style access.
 
-### Excluded from theming
-
-These dicts use hardcoded semantic colors (green/red/yellow) and are intentionally not affected by `set_theme()`:
-
-- `LOG_TASK_STATUS_COLORS`
-- `LOG_WORKER_STATUS_COLORS`
-- `REVIEW_VERDICT_COLORS`
-- `CYCLE_STATUS_COLORS`
-
 ## Adding a new theme
 
 1. Define the theme in `src/gza/colors.py` using `Theme(...)` or `Theme.uniform(...)`.
