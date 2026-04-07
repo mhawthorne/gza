@@ -14,7 +14,7 @@ def test_import_singleton_instances() -> None:
     from gza.colors import (  # noqa: F401
         TASK_COLORS,
         STATUS_COLORS,
-        WORK_OUTPUT_COLORS,
+        TASK_OUTPUT_COLORS,
         SHOW_COLORS,
         UNMERGED_COLORS,
         NEXT_COLORS,
@@ -26,7 +26,7 @@ def test_import_dict_variants() -> None:
     from gza.colors import (  # noqa: F401
         TASK_COLORS_DICT,
         STATUS_COLORS_DICT,
-        WORK_OUTPUT_COLORS_DICT,
+        TASK_OUTPUT_COLORS_DICT,
         SHOW_COLORS_DICT,
         UNMERGED_COLORS_DICT,
         NEXT_COLORS_DICT,
@@ -77,12 +77,12 @@ def test_status_colors_dict_keys() -> None:
     assert set(STATUS_COLORS_DICT.keys()) == expected_keys
 
 
-def test_work_output_colors_dict_keys() -> None:
-    from gza.colors import WORK_OUTPUT_COLORS_DICT
+def test_task_output_colors_dict_keys() -> None:
+    from gza.colors import TASK_OUTPUT_COLORS_DICT
 
     expected_keys = {"step_header", "assistant_text", "tool_use", "error",
                      "todo_pending", "todo_in_progress", "todo_completed"}
-    assert set(WORK_OUTPUT_COLORS_DICT.keys()) == expected_keys
+    assert set(TASK_OUTPUT_COLORS_DICT.keys()) == expected_keys
 
 
 def test_show_colors_dict_keys() -> None:
@@ -138,11 +138,11 @@ def test_ps_status_colors_keys() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_output_styles_inherits_work_output_colors() -> None:
+def test_output_styles_inherits_task_output_colors() -> None:
     from gza.providers.output_formatter import OutputStyles
-    from gza.colors import WorkOutputColors
+    from gza.colors import TaskOutputColors
 
-    assert issubclass(OutputStyles, WorkOutputColors)
+    assert issubclass(OutputStyles, TaskOutputColors)
 
 
 def test_output_styles_instantiation() -> None:
@@ -442,14 +442,14 @@ class TestThemeUniform:
 
     def test_uniform_sets_all_domain_fields(self) -> None:
         from gza.colors import (
-            Theme, TaskColors, StatusColors, WorkOutputColors,
+            Theme, TaskColors, StatusColors, TaskOutputColors,
             ShowColors, UnmergedColors, LineageColors, NextColors,
         )
         import dataclasses
         t = Theme.uniform("test", "#abcdef")
         for cls, attr in [
             (TaskColors, "task"), (StatusColors, "status"),
-            (WorkOutputColors, "work_output"), (ShowColors, "show"),
+            (TaskOutputColors, "task_output"), (ShowColors, "show"),
             (UnmergedColors, "unmerged"), (LineageColors, "lineage"),
             (NextColors, "next_colors"),
         ]:

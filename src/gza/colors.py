@@ -141,8 +141,8 @@ class StatusColors:
 
 
 @dataclass(frozen=True)
-class WorkOutputColors:
-    """Colors for live provider stream output (agent work log)."""
+class TaskOutputColors:
+    """Colors for live provider stream output (agent task log)."""
 
     step_header: str = default_color
     assistant_text: str = default_color
@@ -292,7 +292,7 @@ class Theme:
     base: dict[str, str] = field(default_factory=dict)
     task: dict[str, str] = field(default_factory=dict)
     status: dict[str, str] = field(default_factory=dict)
-    work_output: dict[str, str] = field(default_factory=dict)
+    task_output: dict[str, str] = field(default_factory=dict)
     show: dict[str, str] = field(default_factory=dict)
     unmerged: dict[str, str] = field(default_factory=dict)
     lineage: dict[str, str] = field(default_factory=dict)
@@ -309,7 +309,7 @@ class Theme:
             base=af(color, BaseColors),
             task=af(color, TaskColors),
             status=af(color, StatusColors),
-            work_output=af(color, WorkOutputColors),
+            task_output=af(color, TaskOutputColors),
             show=af(color, ShowColors),
             unmerged=af(color, UnmergedColors),
             lineage=af(color, LineageColors),
@@ -374,7 +374,7 @@ _THEME_SELECTIVE_NEON = Theme(
         "task_id": blue_neon,
         "heading": pink_neon,
     },
-    work_output={
+    task_output={
         "step_header": blue_neon,
         "error": bold_red_error,
     },
@@ -451,7 +451,7 @@ def _build_themed_instances(
 
     task_c = _apply_domain_theme(TaskColors(), theme.task if theme else _no, base_ov, color_overrides)
     status_c = _apply_domain_theme(StatusColors(), theme.status if theme else _no, base_ov, color_overrides)
-    work_c = _apply_domain_theme(WorkOutputColors(), theme.work_output if theme else _no, base_ov, color_overrides)
+    work_c = _apply_domain_theme(TaskOutputColors(), theme.task_output if theme else _no, base_ov, color_overrides)
     show_c = _apply_domain_theme(ShowColors(), theme.show if theme else _no, base_ov, color_overrides)
     unmerged_c = _apply_domain_theme(UnmergedColors(), theme.unmerged if theme else _no, base_ov, color_overrides)
     lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
@@ -462,7 +462,7 @@ def _build_themed_instances(
     return {
         "TASK_COLORS": task_c,
         "STATUS_COLORS": status_c,
-        "WORK_OUTPUT_COLORS": work_c,
+        "TASK_OUTPUT_COLORS": work_c,
         "SHOW_COLORS": show_c,
         "UNMERGED_COLORS": unmerged_c,
         "LINEAGE_COLORS": lineage_c,
@@ -471,7 +471,7 @@ def _build_themed_instances(
         "ADVANCE_COLORS": advance_c,
         "TASK_COLORS_DICT": dataclasses.asdict(task_c),
         "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
-        "WORK_OUTPUT_COLORS_DICT": dataclasses.asdict(work_c),
+        "TASK_OUTPUT_COLORS_DICT": dataclasses.asdict(work_c),
         "SHOW_COLORS_DICT": dataclasses.asdict(show_c),
         "UNMERGED_COLORS_DICT": dataclasses.asdict(unmerged_c),
         "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
@@ -517,7 +517,7 @@ def set_theme(
     dataclasses cannot be mutated), so code using ``import gza.colors as c``
     and ``c.TASK_COLORS`` is preferred for those.
     """
-    global TASK_COLORS, STATUS_COLORS, WORK_OUTPUT_COLORS, SHOW_COLORS
+    global TASK_COLORS, STATUS_COLORS, TASK_OUTPUT_COLORS, SHOW_COLORS
     global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, RUNNER_COLORS, ADVANCE_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
@@ -525,7 +525,7 @@ def set_theme(
     # Frozen dataclass singletons — must replace the module-level name.
     TASK_COLORS = inst["TASK_COLORS"]
     STATUS_COLORS = inst["STATUS_COLORS"]
-    WORK_OUTPUT_COLORS = inst["WORK_OUTPUT_COLORS"]
+    TASK_OUTPUT_COLORS = inst["TASK_OUTPUT_COLORS"]
     SHOW_COLORS = inst["SHOW_COLORS"]
     UNMERGED_COLORS = inst["UNMERGED_COLORS"]
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
@@ -535,7 +535,7 @@ def set_theme(
 
     # Dict singletons — update in place so ``from`` imports see new values.
     for name in (
-        "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "WORK_OUTPUT_COLORS_DICT",
+        "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "TASK_OUTPUT_COLORS_DICT",
         "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
         "NEXT_COLORS_DICT", "RUNNER_COLORS_DICT", "ADVANCE_COLORS_DICT",
         "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS",
@@ -553,7 +553,7 @@ def set_theme(
 
 TASK_COLORS: TaskColors = TaskColors()
 STATUS_COLORS: StatusColors = StatusColors()
-WORK_OUTPUT_COLORS: WorkOutputColors = WorkOutputColors()
+TASK_OUTPUT_COLORS: TaskOutputColors = TaskOutputColors()
 SHOW_COLORS: ShowColors = ShowColors()
 UNMERGED_COLORS: UnmergedColors = UnmergedColors()
 LINEAGE_COLORS: LineageColors = LineageColors()
@@ -567,7 +567,7 @@ ADVANCE_COLORS: AdvanceColors = AdvanceColors()
 
 TASK_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_COLORS)
 STATUS_COLORS_DICT: dict[str, str] = dataclasses.asdict(STATUS_COLORS)
-WORK_OUTPUT_COLORS_DICT: dict[str, str] = dataclasses.asdict(WORK_OUTPUT_COLORS)
+TASK_OUTPUT_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_OUTPUT_COLORS)
 SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
 LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
