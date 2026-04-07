@@ -7,7 +7,7 @@ from unittest.mock import Mock, MagicMock, patch
 
 import pytest
 
-from gza.config import Config
+from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git
 from gza.providers import RunResult, ClaudeProvider
@@ -36,6 +36,7 @@ from gza.runner import (
     _squash_wip_commits,
     _run_result_to_stats,
     _slug_from_task_id,
+    _task_id_exists,
     generate_task_id,
     post_review_to_pr,
     run,
@@ -1088,6 +1089,148 @@ class TestGenerateTaskIdSlugOverride:
         )
         # Should re-use the base from existing_id, not slug_override
         assert "original-slug" in task_id
+
+
+class TestTaskIdExistsBranchStrategy:
+    """Tests for _task_id_exists using branch_strategy patterns."""
+
+    def test_default_pattern_checks_project_slash_task_id(self):
+        """Without branch_strategy, falls back to {project}/{task_id} pattern."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        result = _task_id_exists(
+            "20260407-my-task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+        )
+        assert result is True
+        git.branch_exists.assert_called_once_with("myproject/20260407-my-task")
+
+    def test_custom_pattern_uses_generate_branch_name(self):
+        """With branch_strategy, uses the actual branch naming pattern."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        strategy = BranchStrategy(pattern="{slug}", default_type="feature")
+        result = _task_id_exists(
+            "20260407-my-task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            prompt="Fix something",
+            branch_strategy=strategy,
+        )
+        assert result is True
+        # Pattern is "{slug}" — the slug part of task_id after the date
+        git.branch_exists.assert_called_once_with("my-task")
+
+    def test_type_slug_pattern_detects_existing_branch(self):
+        """Conventional {type}/{slug} pattern detects existing branch correctly."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
+        result = _task_id_exists(
+            "20260407-add-feature",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            prompt="Add a new feature",
+            branch_strategy=strategy,
+        )
+        assert result is True
+        git.branch_exists.assert_called_once_with("feature/add-feature")
+
+    def test_collision_not_detected_when_branch_absent(self):
+        """Returns False when branch does not exist."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = False
+        strategy = BranchStrategy(pattern="{slug}", default_type="feature")
+        result = _task_id_exists(
+            "20260407-my-task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            prompt="My task",
+            branch_strategy=strategy,
+        )
+        assert result is False
+
+    def test_generate_task_id_detects_collision_with_non_default_pattern(self, tmp_path: Path):
+        """generate_task_id appends suffix when slug-only branch already exists."""
+        git = Mock(spec=Git)
+        strategy = BranchStrategy(pattern="{slug}", default_type="feature")
+
+        def branch_exists(name: str) -> bool:
+            # The first call (base slug) exists; the -2 suffix does not.
+            return name == "my-task"
+
+        git.branch_exists.side_effect = branch_exists
+
+        task_id = generate_task_id(
+            "My task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            branch_strategy=strategy,
+        )
+        # Base branch "my-task" was taken, so should get a -2 suffix
+        assert task_id.endswith("-2")
+
+    def test_generate_task_id_no_collision_with_non_default_pattern(self):
+        """generate_task_id returns base id when the real branch does not exist."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = False
+        strategy = BranchStrategy(pattern="{slug}", default_type="feature")
+
+        task_id = generate_task_id(
+            "My task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            branch_strategy=strategy,
+        )
+        assert task_id.endswith("-my-task")
+
+    def test_explicit_type_overrides_inferred_type_in_branch_check(self):
+        """explicit_type is forwarded to generate_branch_name, overriding prompt inference."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
+        # Prompt would infer "feature" but explicit_type says "fix"
+        result = _task_id_exists(
+            "20260407-my-task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            prompt="Add a new feature",
+            branch_strategy=strategy,
+            explicit_type="fix",
+        )
+        assert result is True
+        # Must check the explicit-type branch, not the inferred-type branch
+        git.branch_exists.assert_called_once_with("fix/my-task")
+
+    def test_explicit_type_collision_triggers_suffix_in_generate_task_id(self):
+        """generate_task_id appends suffix when explicit-type branch exists."""
+        git = Mock(spec=Git)
+        strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
+
+        def branch_exists(name: str) -> bool:
+            # The fix/-prefixed base branch exists; the -2 suffix does not.
+            return name == "fix/add-a-new-feature"
+
+        git.branch_exists.side_effect = branch_exists
+
+        task_id = generate_task_id(
+            "Add a new feature",  # would infer "feature" type without explicit_type
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            branch_strategy=strategy,
+            explicit_type="fix",
+        )
+        # Base "fix/add-a-new-feature" was taken; should get a -2 suffix
+        assert task_id.endswith("-2")
 
 
 class TestComputeSlugOverride:
