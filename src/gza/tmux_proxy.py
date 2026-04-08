@@ -183,6 +183,9 @@ class TmuxProxy:
             try:
                 wpid, wstatus = os.waitpid(child_pid, os.WNOHANG)
                 if wpid != 0:
+                    # Child has exited; drain any output still buffered in the PTY
+                    # before returning so no terminal output is lost.
+                    self._drain_pty(pty_fd)
                     return os.waitstatus_to_exitcode(wstatus)
             except ChildProcessError:
                 return 0
@@ -230,7 +233,34 @@ class TmuxProxy:
                     except OSError:
                         break
 
+        self._drain_pty(pty_fd)
         return self._reap(child_pid)
+
+    def _drain_pty(self, pty_fd: int) -> None:
+        """Read and forward any output still buffered in the PTY after the child exits.
+
+        Uses a zero-timeout ``select`` poll so this never blocks.  Called from
+        both the WNOHANG early-exit path and from the break paths at the bottom
+        of ``_io_loop``, ensuring no terminal output is silently dropped.
+        """
+        while True:
+            try:
+                readable, _, _ = select.select([pty_fd], [], [], 0.0)
+            except (OSError, select.error, ValueError):
+                break
+            if not readable:
+                break
+            try:
+                data = os.read(pty_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            try:
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            except (OSError, BrokenPipeError):
+                break
 
     def _reap(self, child_pid: int) -> int:
         """Wait for child process and return its exit code."""
