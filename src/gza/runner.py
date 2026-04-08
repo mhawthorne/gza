@@ -52,6 +52,32 @@ def write_log_entry(log_file: "Path", entry: dict) -> None:
         logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
 
 
+def _extract_content_from_log(log_file: "Path") -> str | None:
+    """Scan a JSONL log file for a provider 'result' entry and return its text.
+
+    Providers emit a ``{"type": "result", "result": "<text>"}`` line when the
+    agent finishes.  If the agent output the review (or plan/explore) as text
+    rather than writing the expected file artifact, the content lives here.
+    """
+    try:
+        with open(log_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") == "result":
+                        result_text = entry.get("result", "")
+                        if isinstance(result_text, str) and result_text.strip():
+                            return result_text
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        logger.warning("Failed to read log file %s for content recovery", log_file)
+    return None
+
+
 def _persist_run_steps_from_result(
     store: SqliteTaskStore,
     run_id: int,
@@ -2101,58 +2127,76 @@ def _run_non_code_task(
 
         # Copy expected report artifact from worktree to main project directory.
         # For non-code tasks, provider success requires this file contract.
+        _recovered_from_log = False
         if not worktree_report_path.exists():
-            expected_relative = str(worktree_report_path.relative_to(worktree_path))
-            stale_candidates = sorted(
-                path.relative_to(worktree_path)
-                for path in worktree_report_dir.glob("*.md")
-                if path != worktree_report_path
-            )
-            mismatch_note = (
-                f" (found other report files: {', '.join(str(p) for p in stale_candidates)})"
-                if stale_candidates
-                else ""
-            )
-            failure_message = (
-                f"Outcome: failed (missing report artifact: expected {expected_relative}{mismatch_note})"
-            )
-            error_message("Task failed: expected report artifact was not created")
-            console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
-            console.print(f"Worktree preserved for inspection: {worktree_path}")
-            if stale_candidates:
-                console.print(
-                    "Detected report files with other names in worktree "
-                    f"(possible stale resume session state): {', '.join(str(p) for p in stale_candidates)}"
+            # Before failing, try to recover content from the provider's 'result' log entry.
+            # Agents sometimes output the review/report as text rather than writing the file.
+            recovered_content = _extract_content_from_log(log_file)
+            if recovered_content:
+                logger.warning(
+                    "Task %s: expected report artifact missing; recovering content from stdout log",
+                    task.task_id,
                 )
-            console.print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "outcome",
-                    "message": failure_message,
-                    "exit_code": exit_code,
-                    "failure_reason": "MISSING_REPORT_ARTIFACT",
-                },
-            )
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "stats",
-                    "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
-                    "duration_seconds": stats.duration_seconds,
-                    "cost_usd": stats.cost_usd,
-                    "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
-                },
-            )
-            store.mark_failed(
-                task,
-                log_file=str(log_file.relative_to(config.project_dir)),
-                stats=stats,
-                failure_reason="MISSING_REPORT_ARTIFACT",
-            )
-            return 0
+                console.print(
+                    "[yellow]Warning: expected report artifact was not created; "
+                    "recovering content from log (stdout)[/yellow]"
+                )
+                # Write the recovered content into the worktree path so the copy-back
+                # logic below proceeds as if the agent had written it normally.
+                worktree_report_path.write_text(recovered_content)
+                _recovered_from_log = True
+            else:
+                expected_relative = str(worktree_report_path.relative_to(worktree_path))
+                stale_candidates = sorted(
+                    path.relative_to(worktree_path)
+                    for path in worktree_report_dir.glob("*.md")
+                    if path != worktree_report_path
+                )
+                mismatch_note = (
+                    f" (found other report files: {', '.join(str(p) for p in stale_candidates)})"
+                    if stale_candidates
+                    else ""
+                )
+                failure_message = (
+                    f"Outcome: failed (missing report artifact: expected {expected_relative}{mismatch_note})"
+                )
+                error_message("Task failed: expected report artifact was not created")
+                console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
+                console.print(f"Worktree preserved for inspection: {worktree_path}")
+                if stale_candidates:
+                    console.print(
+                        "Detected report files with other names in worktree "
+                        f"(possible stale resume session state): {', '.join(str(p) for p in stale_candidates)}"
+                    )
+                console.print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "outcome",
+                        "message": failure_message,
+                        "exit_code": exit_code,
+                        "failure_reason": "MISSING_REPORT_ARTIFACT",
+                    },
+                )
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "stats",
+                        "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+                        "duration_seconds": stats.duration_seconds,
+                        "cost_usd": stats.cost_usd,
+                        "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+                    },
+                )
+                store.mark_failed(
+                    task,
+                    log_file=str(log_file.relative_to(config.project_dir)),
+                    stats=stats,
+                    failure_reason="MISSING_REPORT_ARTIFACT",
+                )
+                return 0
 
         console.print(f"Report written to: {report_file_relative}")
         # Ensure target directory exists
@@ -2184,7 +2228,8 @@ def _run_non_code_task(
                 logger.warning("Failed to remove worktree %s", worktree_path)
                 if worktree_path.exists():
                     shutil.rmtree(worktree_path, ignore_errors=True)
-        write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
+        outcome_msg = "Outcome: completed (recovered from stdout)" if _recovered_from_log else "Outcome: completed"
+        write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": outcome_msg, "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = None
         if task.task_type not in ("internal", "learn") and not task.skip_learnings:

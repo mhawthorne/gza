@@ -2806,6 +2806,110 @@ class TestNonCodeReportArtifactContract:
         host_report = tmp_path / ".gza" / "plans" / f"{plan_task.task_id}.md"
         assert not host_report.exists()
 
+    def test_missing_report_artifact_recovered_from_log(self, tmp_path: Path):
+        """If the expected report is missing but a 'result' log entry has text, recover and complete."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review feature Z", task_type="review")
+        review_task.task_id = "20260213-review-feature-z"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        review_text = "# Review\n\n**Verdict: APPROVED**\n\nLooks good."
+
+        def provider_run(_config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            # Agent outputs text to stdout (captured as 'result' event) but does NOT write the file.
+            import json as _json
+            with open(log_file, "a") as f:
+                f.write(_json.dumps({"type": "result", "subtype": "success", "result": review_text}) + "\n")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id="session-z",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed", f"Expected completed, got {refreshed.status}"
+        assert refreshed.output_content == review_text
+        assert refreshed.report_file is not None
+        host_report = tmp_path / ".gza" / "reviews" / f"{review_task.task_id}.md"
+        assert host_report.exists()
+        assert host_report.read_text() == review_text
+
+    def test_missing_report_artifact_no_result_in_log_still_fails(self, tmp_path: Path):
+        """If the expected report is missing and the log has no 'result' entry, the task still fails."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review feature W", task_type="review")
+        review_task.task_id = "20260213-review-feature-w"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=1.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            session_id="session-w",
+            error_type=None,
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
+        assert refreshed.output_content is None
+
     def test_normal_run_does_not_include_verification_prompt(self, tmp_path: Path):
         """Test that normal (non-resume) runs use the standard prompt without verification."""
         db_path = tmp_path / "test.db"
