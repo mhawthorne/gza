@@ -644,6 +644,11 @@ def main() -> int:
         action="store_true",
         help="Show raw JSON lines instead of formatted output",
     )
+    log_parser.add_argument(
+        "--page",
+        action="store_true",
+        help="Pipe output through $PAGER (default: less -R); skipped for --follow and --raw modes",
+    )
     add_common_args(log_parser)
 
     # add command
@@ -1162,6 +1167,12 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Print only the report file path",
+    )
+    show_parser.add_argument(
+        "--page",
+        action="store_true",
+        default=False,
+        help="Pipe output through $PAGER (default: less -R); skipped for --prompt, --output, and --path modes",
     )
     add_common_args(show_parser)
 

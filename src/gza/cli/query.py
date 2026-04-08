@@ -52,6 +52,7 @@ from ._common import (
     format_stats,
     get_review_verdict,
     get_store,
+    pager_context,
 )
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
@@ -1334,9 +1335,6 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
 
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
-    from ._common import _extract_failure_log_context, _resolve_task_log_path
-    from .log import _latest_worker_for_task
-
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -1366,6 +1364,20 @@ def cmd_show(args: argparse.Namespace) -> int:
             return 0
         console.print(f"[red]Error: Task #{args.task_id} has no output content[/red]")
         return 1
+
+    with pager_context(getattr(args, 'page', False), config.project_dir):
+        return _cmd_show_output(task, args, config, store)
+
+
+def _cmd_show_output(
+    task: DbTask,
+    args: argparse.Namespace,
+    config: Config,
+    store: SqliteTaskStore,
+) -> int:
+    """Render the full show output. Called within pager_context when needed."""
+    from .log import _latest_worker_for_task
+    from ._common import _resolve_task_log_path, _extract_failure_log_context
 
     # Colors for show output — defined in gza.colors.
     SHOW_COLORS = SHOW_COLORS_DICT
