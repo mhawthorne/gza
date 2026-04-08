@@ -1,0 +1,12 @@
+This is an improve task. The review content included in your context contains Must-Fix items and Suggestions from the code review.
+
+Your job is to address all of the following:
+1. **All Must-Fix items** — blocking issues that must be resolved for the implementation to be approved.
+2. **All Suggestions** — non-blocking improvements that should also be implemented in this pass.
+
+Work through each Must-Fix and each Suggestion item systematically. For each item:
+- Identify the specific change required.
+- Implement the fix or improvement.
+- Verify your change addresses the issue described.
+
+Do not skip any Must-Fix or Suggestion items. The goal is to fully resolve the review in a single pass.

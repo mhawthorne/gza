@@ -112,7 +112,22 @@ class PromptBuilder:
                 base_prompt += "\n\n" + _load_template("review.txt").format(
                     report_path=report_path
                 )
-        elif task.task_type in ("task", "implement", "improve"):
+        elif task.task_type in ("task", "implement"):
+            if summary_path:
+                base_prompt += _load_template("task_with_summary.txt").format(
+                    summary_path=summary_path
+                )
+            else:
+                base_prompt += _load_template("task_without_summary.txt")
+
+            if config.verify_command:
+                base_prompt += (
+                    f"\n\nBefore finishing, run the following verification command"
+                    f" and fix any errors: `{config.verify_command}`"
+                )
+        elif task.task_type == "improve":
+            base_prompt += "\n\n" + _load_template("improve.txt")
+
             if summary_path:
                 base_prompt += _load_template("task_with_summary.txt").format(
                     summary_path=summary_path
