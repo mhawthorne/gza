@@ -323,11 +323,11 @@ class TestPromptBuilderResumePrompt:
         """Test that resume prompt instructs agent to verify todo list."""
         result = PromptBuilder().resume_prompt()
 
-        assert "verify your todo list against the actual state" in result.lower()
-        assert "review your todo list from the previous session" in result.lower()
-        assert "verify by checking the actual code/files" in result.lower()
-        assert "update the todo list to reflect what is actually complete" in result.lower()
-        assert "continue from where you left off" in result.lower()
+        assert "interrupted" in result.lower()
+        assert "git status" in result.lower()
+        assert "git log" in result.lower()
+        assert "todo list" in result.lower()
+        assert "continue from the actual state" in result.lower()
 
     def test_resume_prompt_returns_string(self):
         """Test that resume_prompt returns a non-empty string."""
