@@ -623,6 +623,18 @@ class SqliteTaskStore:
         self.db_path = db_path
         self._ensure_db()
 
+    @classmethod
+    def default(cls, project_dir: Path | None = None) -> "SqliteTaskStore":
+        """Create a store using the db_path derived from config.
+
+        Args:
+            project_dir: Project root. Defaults to cwd.
+        """
+        from .config import Config
+
+        config = Config.load(project_dir or Path.cwd())
+        return cls(config.db_path)
+
     def _ensure_db(self) -> None:
         """Ensure database exists and schema is current."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2348,8 +2360,11 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
 # === Module-level convenience functions ===
 
 def _default_store() -> "SqliteTaskStore":
-    """Create a SqliteTaskStore using the default .gza/gza.db path relative to cwd."""
-    return SqliteTaskStore(Path(".gza/gza.db"))
+    """Create a SqliteTaskStore using config-derived db_path, with fallback."""
+    try:
+        return SqliteTaskStore.default()
+    except Exception:
+        return SqliteTaskStore(Path(".gza/gza.db"))
 
 
 def _task_to_dict(task: "Task") -> dict:

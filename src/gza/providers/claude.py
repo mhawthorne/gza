@@ -513,17 +513,22 @@ class ClaudeProvider(Provider):
                             elif tool_name == "TodoWrite":
                                 todos = tool_input.get("todos", [])
                                 todos_summary = f"{len(todos)} todos"
-                                # Show status breakdown if available
-                                if todos:
-                                    pending = sum(1 for t in todos if t.get("status") == "pending")
-                                    in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
-                                    completed = sum(1 for t in todos if t.get("status") == "completed")
+                                # Show status breakdown if available (todos may be dicts or strings)
+                                dict_todos = [t for t in todos if isinstance(t, dict)]
+                                if dict_todos:
+                                    pending = sum(1 for t in dict_todos if t.get("status") == "pending")
+                                    in_progress = sum(1 for t in dict_todos if t.get("status") == "in_progress")
+                                    completed = sum(1 for t in dict_todos if t.get("status") == "completed")
                                     todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
                                 formatter.print_tool_event(tool_name, todos_summary)
                                 # Print each todo with status icon and truncated content.
                                 for todo in todos:
-                                    status = todo.get("status", "pending")
-                                    content = todo.get("content", "")
+                                    if isinstance(todo, dict):
+                                        status = todo.get("status", "pending")
+                                        content = todo.get("content", "")
+                                    else:
+                                        status = "pending"
+                                        content = str(todo)
                                     formatter.print_todo(status, truncate_text(content, 60))
                             elif tool_name == "Edit":
                                 # Enhanced logging for Edit tool
