@@ -6,30 +6,31 @@ import os
 import re
 import shutil
 import sqlite3
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, cast
 
+from .branch_naming import generate_branch_name
+from .colors import UNMERGED_COLORS_DICT
+from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
-    BranchStrategy,
-    Config,
+    DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
-    DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
+    BranchStrategy,
+    Config,
 )
-from .commit_messages import build_task_commit_message
-from .console import console, task_header, stats_line, success_message, error_message, info_line, next_steps
+from .console import console, error_message, info_line, next_steps, stats_line, success_message, task_header
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .prompts import PromptBuilder
-from .providers import get_provider, Provider, RunResult
-from .colors import UNMERGED_COLORS_DICT
-from .review_verdict import parse_review_verdict
-from .branch_naming import generate_branch_name
+from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task
+from .review_verdict import parse_review_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def _persist_run_steps_from_result(
     accumulated = getattr(result, "_accumulated_data", None)
     if not isinstance(accumulated, dict):
         return False
-    events = accumulated.get("run_step_events")
+    events: list[Any] = accumulated.get("run_step_events")  # type: ignore[assignment]
     if not isinstance(events, list):
         return False
     store.set_log_schema_version(run_id, 2)
@@ -80,7 +81,7 @@ def _persist_run_steps_from_result(
         if fallback_outcome is not None:
             for event in reversed(events):
                 if isinstance(event, dict):
-                    event["outcome"] = fallback_outcome
+                    cast(dict[str, Any], event)["outcome"] = fallback_outcome
                     break
 
     for event in events:
@@ -406,7 +407,7 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
     if task.report_file and task.completed_at:
         path = project_dir / task.report_file
         if path.exists():
-            file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
             # If file is newer than task completion, read from file
             if file_mtime > task.completed_at:
                 return path.read_text()
@@ -557,7 +558,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
             continue
 
         review_id = review_task.id if review_task.id is not None else 0
-        if (improve.created_at, improve.id) < (review_created_at, review_id):
+        if (improve.created_at, improve.id or 0) < (review_created_at, review_id):
             prior_improves.append(improve)
 
     if not prior_improves:
@@ -566,7 +567,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     # Most recent first by completion/creation, then id.
     prior_improves.sort(
         key=lambda t: (
-            t.completed_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            t.completed_at or t.created_at or datetime.min.replace(tzinfo=UTC),
             t.id or 0,
         ),
         reverse=True,
@@ -579,7 +580,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     # Build lineage chain (oldest first for readability)
     chronological = sorted(
         prior_improves,
-        key=lambda t: (t.created_at or datetime.min.replace(tzinfo=timezone.utc), t.id or 0),
+        key=lambda t: (t.created_at or datetime.min.replace(tzinfo=UTC), t.id or 0),
     )
     chain_parts = []
     for improve in chronological:
@@ -1115,7 +1116,7 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
         )
 
     console.print(f"\n[bold cyan]=== Auto-created review task #{review_task.id} ===[/bold cyan]")
-    console.print(f"Running review task...")
+    console.print("Running review task...")
 
     # Run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
@@ -1192,7 +1193,7 @@ def run(
                 task = claimed
             else:
                 task.status = "in_progress"
-                task.started_at = datetime.now(timezone.utc)
+                task.started_at = datetime.now(UTC)
                 task.completed_at = None
                 task.failure_reason = None
                 task.running_pid = os.getpid()
@@ -1753,7 +1754,6 @@ def _run_inner(
     assert summary_path is not None, f"Code task type '{task.task_type}' must have a summary path"
     summary_dir = summary_path.parent
     summary_dir.mkdir(parents=True, exist_ok=True)
-    summary_file_relative = str(summary_path.relative_to(config.project_dir))
 
     # Create summary directory structure in worktree
     worktree_summary_dir = worktree_path / summary_dir.relative_to(config.project_dir)

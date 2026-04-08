@@ -4,7 +4,7 @@ import json
 import os
 import signal
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -88,7 +88,7 @@ class WorkerRegistry:
     _last_counter: int = 0
 
     def generate_worker_id(self) -> str:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         if timestamp == WorkerRegistry._last_timestamp:
             WorkerRegistry._last_counter += 1
         else:
@@ -107,7 +107,7 @@ class WorkerRegistry:
         if worker.pid <= 0:
             raise ValueError(f"Cannot register worker with non-positive pid: {worker.pid}")
         if worker.started_at is None:
-            worker.started_at = datetime.now(timezone.utc).isoformat()
+            worker.started_at = datetime.now(UTC).isoformat()
         metadata_path = self._metadata_path(worker.worker_id)
         metadata_path.write_text(json.dumps(worker.to_dict(), indent=2))
         self._pid_path(worker.worker_id).write_text(str(worker.pid))
@@ -154,7 +154,7 @@ class WorkerRegistry:
         if worker:
             worker.status = status
             worker.exit_code = exit_code
-            worker.completed_at = datetime.now(timezone.utc).isoformat()
+            worker.completed_at = datetime.now(UTC).isoformat()
             self.update(worker)
         pid_path = self._pid_path(worker_id)
         if pid_path.exists():

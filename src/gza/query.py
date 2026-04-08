@@ -8,11 +8,10 @@ gza.api.v0 scripting namespace.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from gza.db import SqliteTaskStore, Task
-from gza.task_slug import get_base_task_slug as _get_base_task_slug
-from gza.task_slug import get_task_slug as _get_task_slug_from_task_id
+from gza.task_slug import get_base_task_slug as _get_base_task_slug, get_task_slug as _get_task_slug_from_task_id
 
 
 @dataclass
@@ -79,13 +78,13 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     """
     since: datetime | None = None
     if f.days is not None:
-        since = datetime.now(timezone.utc) - timedelta(days=f.days)
+        since = datetime.now(UTC) - timedelta(days=f.days)
     elif f.start_date is not None:
-        since = datetime.fromisoformat(f.start_date).replace(tzinfo=timezone.utc)
+        since = datetime.fromisoformat(f.start_date).replace(tzinfo=UTC)
 
     until: datetime | None = None
     if f.end_date is not None:
-        until = datetime.fromisoformat(f.end_date).replace(tzinfo=timezone.utc)
+        until = datetime.fromisoformat(f.end_date).replace(tzinfo=UTC)
         # Include the full end date day
         until = until.replace(hour=23, minute=59, second=59)
 
@@ -148,7 +147,7 @@ def _normalize_lineage_time(value: datetime) -> datetime:
     """Normalize aware/naive datetimes for stable lineage comparisons."""
     if value.tzinfo is None:
         return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def get_task_slug(task: Task) -> str | None:

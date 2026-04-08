@@ -4,18 +4,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..config import ConfigError
+from ..config import Config, ConfigError
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
-
 from ._common import (
     SortingHelpFormatter,
+    _add_query_filter_args,
     _add_skills_install_args,
     add_common_args,
-    _add_query_filter_args,
     prune_terminal_dead_workers,
     reconcile_in_progress_tasks,
 )
-from ..config import Config
 from .config_cmds import (
     cmd_clean,
     cmd_config,
@@ -684,13 +682,13 @@ def main() -> int:
         "--based-on",
         type=int,
         metavar="ID",
-        help="Base this task on a previous task's output (sets depends_on field)",
+        help="Set lineage/parent relationship (based_on field, used for branch inheritance and context)",
     )
     add_parser.add_argument(
         "--depends-on",
         type=int,
         metavar="ID",
-        help="Set dependency on another task",
+        help="Set execution dependency (depends_on field, blocks task until dependency completes)",
     )
     add_parser.add_argument(
         "--review",
@@ -749,7 +747,14 @@ def main() -> int:
         dest="based_on_flag",
         type=int,
         metavar="ID",
-        help="Set dependency on another task",
+        help="Set lineage/parent relationship (based_on field, used for branch inheritance and context)",
+    )
+    edit_parser.add_argument(
+        "--depends-on",
+        dest="depends_on_flag",
+        type=int,
+        metavar="ID",
+        help="Set execution dependency (depends_on field, blocks task until dependency completes)",
     )
     edit_parser.add_argument(
         "--explore",

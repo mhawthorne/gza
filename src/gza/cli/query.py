@@ -8,52 +8,50 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 
 from rich.markup import escape as rich_escape
 
-from ..config import Config
-from ..console import (
-    console,
-    get_terminal_width,
-    truncate,
-    shorten_prompt,
-    prompt_available_width,
-    MAX_PROMPT_DISPLAY,
-)
-from ..db import SqliteTaskStore, Task as DbTask
-from ..git import Git
-from ..runner import get_effective_config_for_task, _get_task_output
-from ..workers import WorkerMetadata, WorkerRegistry
-
-from ._common import (
-    get_store,
-    TASK_COLORS,
-    format_stats,
-    _format_lineage,
-    _failure_summary,
-    _failure_next_steps,
-    _parse_iso,
-    get_review_verdict,
-)
-from ..colors import NEXT_COLORS_DICT
-
-from ..query import (
-    get_reviews_for_root as _get_reviews_for_root_task,
-    get_improves_for_root as _get_improves_for_root_task,
-    build_lineage_tree as _build_lineage_tree_for_root,
-    filter_lineage_tree as _filter_lineage_tree,
-    resolve_lineage_root as _resolve_lineage_root_task,
-    TaskLineageNode,
-)
 import gza.colors as _colors
+
 from ..colors import (
     LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS,
+    NEXT_COLORS_DICT,
     PS_STATUS_COLORS,
     SHOW_COLORS_DICT,
     UNMERGED_COLORS_DICT,
     pink,
+)
+from ..config import Config
+from ..console import (
+    MAX_PROMPT_DISPLAY,
+    console,
+    get_terminal_width,
+    prompt_available_width,
+    shorten_prompt,
+    truncate,
+)
+from ..db import SqliteTaskStore, Task as DbTask
+from ..git import Git
+from ..query import (
+    TaskLineageNode,
+    build_lineage_tree as _build_lineage_tree_for_root,
+    filter_lineage_tree as _filter_lineage_tree,
+    get_improves_for_root as _get_improves_for_root_task,
+    get_reviews_for_root as _get_reviews_for_root_task,
+    resolve_lineage_root as _resolve_lineage_root_task,
+)
+from ..runner import _get_task_output, get_effective_config_for_task
+from ..workers import WorkerMetadata, WorkerRegistry
+from ._common import (
+    TASK_COLORS,
+    _failure_next_steps,
+    _failure_summary,
+    _format_lineage,
+    _parse_iso,
+    format_stats,
+    get_review_verdict,
+    get_store,
 )
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
@@ -191,7 +189,7 @@ def cmd_next(args: argparse.Namespace) -> int:
 
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
-    from gza.query import HistoryFilter, query_history, query_history_with_lineage, TaskLineageNode
+    from gza.query import HistoryFilter, TaskLineageNode, query_history, query_history_with_lineage
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -381,7 +379,7 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
 
 def cmd_unmerged(args: argparse.Namespace) -> int:
     """List tasks with unmerged work on branches."""
-    from gza.db import needs_merge_status_migration, migrate_merge_status
+    from gza.db import migrate_merge_status, needs_merge_status_migration
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -778,7 +776,7 @@ def _print_ps_output(
         ]
 
     if poll_interval is not None:
-        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
         print(f"Refreshing every {poll_interval}s — last updated: {now}  (Ctrl+C to exit)")
         print()
 
@@ -1090,7 +1088,7 @@ def _format_duration(started: datetime | None, ended: datetime | None = None) ->
     """Format duration from timestamps."""
     if not started:
         return "-"
-    end_time = ended or datetime.now(timezone.utc)
+    end_time = ended or datetime.now(UTC)
     duration_sec = max(0.0, (end_time - started).total_seconds())
     if duration_sec < 60:
         return f"{duration_sec:.0f}s"
@@ -1105,7 +1103,7 @@ def _format_started(started: datetime | None) -> str:
         return "-"
     if started.tzinfo is None:
         return started.strftime("%Y-%m-%d %H:%M:%S")
-    started_utc = started.astimezone(timezone.utc)
+    started_utc = started.astimezone(UTC)
     return started_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
@@ -1153,9 +1151,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 continue
             print(f"Stopping worker {worker.worker_id} (PID {worker.pid})...")
             if registry.stop(worker.worker_id, force=args.force if hasattr(args, 'force') else False):
-                print(f"  ✓ Sent stop signal")
+                print("  ✓ Sent stop signal")
             else:
-                print(f"  ✗ Failed to stop worker")
+                print("  ✗ Failed to stop worker")
 
         return 0
 
@@ -1217,7 +1215,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
         return 1
 
     if task.status == "in_progress":
-        print(f"Error: Cannot delete in-progress task")
+        print("Error: Cannot delete in-progress task")
         return 1
 
     # Support both --force (deprecated) and --yes/-y
@@ -1234,7 +1232,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(f"✓ Deleted task #{args.task_id}")
         return 0
     else:
-        print(f"Error: Failed to delete task")
+        print("Error: Failed to delete task")
         return 1
 
 
@@ -1311,6 +1309,7 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
     is identical to what a background worker would receive.
     """
     import json
+
     from ..git import Git
     from ..runner import build_prompt, get_task_output_paths
 
@@ -1335,8 +1334,8 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
 
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
+    from ._common import _extract_failure_log_context, _resolve_task_log_path
     from .log import _latest_worker_for_task
-    from ._common import _resolve_task_log_path, _extract_failure_log_context
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -1418,9 +1417,9 @@ def cmd_show(args: argparse.Namespace) -> int:
         if task.completed_at and task.output_content:
             report_path = config.project_dir / task.report_file
             if report_path.exists():
-                file_mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=timezone.utc)
+                file_mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=UTC)
                 if file_mtime > task.completed_at:
-                    console.print(f"[yellow]Warning: Report on disk has been modified since task completion[/yellow]")
+                    console.print("[yellow]Warning: Report on disk has been modified since task completion[/yellow]")
     if task.session_id:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 

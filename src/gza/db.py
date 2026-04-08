@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -790,7 +790,7 @@ class SqliteTaskStore:
         skip_learnings: bool = False,
     ) -> Task:
         """Add a new task."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         if provider_is_explicit is None:
             provider_is_explicit = provider is not None
         with self._connect() as conn:
@@ -965,7 +965,7 @@ class SqliteTaskStore:
         Returns the updated Task on success, or None if the task was already
         claimed (CAS loss) or the database was busy.
         """
-        started_at = datetime.now(timezone.utc)
+        started_at = datetime.now(UTC)
         try:
             with self._connect() as conn:
                 cur = conn.execute(
@@ -1216,7 +1216,7 @@ class SqliteTaskStore:
 
     def set_merge_status(self, task_id: int, merge_status: str | None) -> None:
         """Set the merge_status for a task. Records merged_at when setting to 'merged'."""
-        merged_at = datetime.now(timezone.utc).isoformat() if merge_status == "merged" else None
+        merged_at = datetime.now(UTC).isoformat() if merge_status == "merged" else None
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET merge_status = ?, merged_at = ? WHERE id = ?",
@@ -1235,7 +1235,7 @@ class SqliteTaskStore:
 
         If task_id does not exist, this is a no-op (no error is raised).
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET review_cleared_at = ? WHERE id = ?",
@@ -1298,7 +1298,7 @@ class SqliteTaskStore:
 
         Raises ValueError if there is already an active cycle for this task.
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             # Enforce uniqueness: only one active cycle per implementation
             cur = conn.execute(
@@ -1354,7 +1354,7 @@ class SqliteTaskStore:
 
     def append_cycle_iteration(self, cycle_id: int, iteration_index: int) -> "TaskCycleIteration":
         """Create a new iteration record for a cycle."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -1418,7 +1418,7 @@ class SqliteTaskStore:
 
     def close_cycle(self, cycle_id: int, status: str, stop_reason: str) -> None:
         """Close a cycle with the given status and stop reason."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE task_cycles SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
@@ -1485,7 +1485,7 @@ class SqliteTaskStore:
         legacy_event_id: str | None = None,
     ) -> StepRef:
         """Create and persist a top-level message step for a run."""
-        timestamp = (started_at or datetime.now(timezone.utc)).isoformat()
+        timestamp = (started_at or datetime.now(UTC)).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT COALESCE(MAX(step_index), 0) + 1 AS next_step FROM run_steps WHERE run_id = ?",
@@ -1530,7 +1530,7 @@ class SqliteTaskStore:
         legacy_event_id: str | None = None,
     ) -> RunSubstep:
         """Append a substep/tool event under an existing step."""
-        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        ts = (timestamp or datetime.now(UTC)).isoformat()
         payload_json = json.dumps(payload)
         with self._connect() as conn:
             cur = conn.execute(
@@ -1596,7 +1596,7 @@ class SqliteTaskStore:
         completed_at: datetime | None = None,
     ) -> None:
         """Mark a step complete and persist final outcome metadata."""
-        ts = (completed_at or datetime.now(timezone.utc)).isoformat()
+        ts = (completed_at or datetime.now(UTC)).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
@@ -1969,7 +1969,7 @@ class SqliteTaskStore:
     def mark_in_progress(self, task: Task) -> None:
         """Mark a task as in progress."""
         task.status = "in_progress"
-        task.started_at = datetime.now(timezone.utc)
+        task.started_at = datetime.now(UTC)
         task.running_pid = os.getpid()
         self.update(task)
 
@@ -1988,7 +1988,7 @@ class SqliteTaskStore:
     ) -> None:
         """Mark a task as completed."""
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.running_pid = None
         task.has_commits = has_commits
         if has_commits:
@@ -2046,7 +2046,7 @@ class SqliteTaskStore:
     ) -> None:
         """Mark a task as failed."""
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.running_pid = None
         task.has_commits = has_commits
         if log_file:
@@ -2075,7 +2075,7 @@ class SqliteTaskStore:
     ) -> None:
         """Mark a task as unmerged."""
         task.status = "unmerged"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.has_commits = has_commits
         if branch:
             task.branch = branch

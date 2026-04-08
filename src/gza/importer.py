@@ -93,7 +93,7 @@ def _parse_task(
     errors: list[ValidationError] = []
 
     if not isinstance(data, dict):
-        errors.append(ValidationError(f"Task must be a mapping", task_index=index))
+        errors.append(ValidationError("Task must be a mapping", task_index=index))
         return None, errors
 
     # Required: prompt
@@ -110,7 +110,7 @@ def _parse_task(
     task_type = data.get("type", "implement")
     if task_type == "improve":
         errors.append(ValidationError(
-            f"Cannot import improve tasks directly. Use 'gza improve <task_id>' instead.",
+            "Cannot import improve tasks directly. Use 'gza improve <task_id>' instead.",
             task_index=index
         ))
     elif task_type not in ("explore", "plan", "implement", "review"):
@@ -134,7 +134,7 @@ def _parse_task(
     if depends_on is not None:
         if not isinstance(depends_on, int) or depends_on < 1:
             errors.append(ValidationError(
-                f"'depends_on' must be a positive integer (1-based index)",
+                "'depends_on' must be a positive integer (1-based index)",
                 task_index=index
             ))
             depends_on = None
@@ -193,7 +193,7 @@ def validate_import(
                 ))
             elif task.depends_on == i:
                 errors.append(ValidationError(
-                    f"Task cannot depend on itself",
+                    "Task cannot depend on itself",
                     task_index=i
                 ))
             elif task.depends_on > i:

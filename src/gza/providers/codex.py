@@ -8,14 +8,14 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from .base import (
+    DockerConfig,
     Provider,
     RunResult,
-    DockerConfig,
-    ensure_docker_image,
     build_docker_cmd,
+    ensure_docker_image,
     verify_docker_credentials,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
@@ -208,8 +208,8 @@ class CodexProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Codex to execute a task."""
         if config.use_docker:
@@ -223,8 +223,8 @@ class CodexProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Codex in Docker container."""
         docker_config = _get_docker_config(f"{config.docker_image}-codex")
@@ -273,8 +273,8 @@ class CodexProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Codex directly (no Docker)."""
         cmd = [
@@ -322,8 +322,8 @@ class CodexProvider(Provider):
         stdin_input: str | None = None,
         model: str = "",
         max_steps: int = 50,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
         formatter = StreamOutputFormatter()
