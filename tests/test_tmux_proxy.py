@@ -433,6 +433,126 @@ class TestDynamicStdinHandling:
         )
 
 
+class TestDrainPty:
+    """Tests for TmuxProxy._drain_pty()."""
+
+    def test_drain_pty_forwards_remaining_output(self):
+        """_drain_pty reads buffered data and writes it to stdout."""
+        proxy = TmuxProxy(session_name="gza-test")
+
+        remaining = [b"last line\n", b""]
+        written: list[bytes] = []
+
+        def fake_select(rds, wds, eds, timeout):
+            # Return readable only while there is data left
+            if remaining and remaining[0]:
+                return [rds[0]], [], []
+            return [], [], []
+
+        def fake_read(fd, n):
+            if remaining:
+                chunk = remaining.pop(0)
+                if not chunk:
+                    raise OSError("eof")
+                return chunk
+            raise OSError("eof")
+
+        with patch("select.select", side_effect=fake_select), \
+             patch("os.read", side_effect=fake_read), \
+             patch("sys.stdout") as mock_stdout:
+            mock_stdout.buffer = MagicMock()
+            mock_stdout.buffer.write = lambda d: written.append(d)
+            mock_stdout.buffer.flush = lambda: None
+            proxy._drain_pty(pty_fd=10)
+
+        assert b"last line\n" in written, "Remaining PTY data must be forwarded to stdout"
+
+    def test_drain_pty_stops_when_no_data_ready(self):
+        """_drain_pty exits immediately when no data is readable."""
+        proxy = TmuxProxy(session_name="gza-test")
+
+        with patch("select.select", return_value=([], [], [])), \
+             patch("os.read") as mock_read:
+            proxy._drain_pty(pty_fd=10)
+
+        mock_read.assert_not_called()
+
+    def test_drain_pty_stops_on_pty_oserror(self):
+        """_drain_pty handles OSError from os.read gracefully."""
+        proxy = TmuxProxy(session_name="gza-test")
+
+        with patch("select.select", return_value=([10], [], [])), \
+             patch("os.read", side_effect=OSError("pty closed")), \
+             patch("sys.stdout") as mock_stdout:
+            mock_stdout.buffer = MagicMock()
+            # Should not raise
+            proxy._drain_pty(pty_fd=10)
+
+    def test_drain_pty_stops_on_select_oserror(self):
+        """_drain_pty handles OSError from select gracefully."""
+        proxy = TmuxProxy(session_name="gza-test")
+
+        with patch("select.select", side_effect=OSError("bad fd")), \
+             patch("os.read") as mock_read:
+            proxy._drain_pty(pty_fd=10)
+
+        mock_read.assert_not_called()
+
+    def test_wnohang_exit_drains_pty_before_returning(self):
+        """When WNOHANG detects child exit, remaining PTY output is drained first."""
+        proxy = TmuxProxy(session_name="gza-test")
+        proxy.last_output_time = time.monotonic()
+
+        # Data that arrives in PTY after WNOHANG detects exit
+        final_data = [b"final output"]
+        drained: list[bytes] = []
+        waitpid_calls = [0]
+
+        def fake_waitpid(pid, flags):
+            waitpid_calls[0] += 1
+            if flags == os.WNOHANG and waitpid_calls[0] >= 2:
+                return (pid, 0)  # child exited
+            return (0, 0)
+
+        def fake_drain_pty(pty_fd):
+            # Simulate draining: collect remaining data
+            if final_data:
+                drained.extend(final_data)
+                final_data.clear()
+
+        with patch("gza.tmux_proxy.TmuxProxy._has_human", return_value=False), \
+             patch("select.select", return_value=([], [], [])), \
+             patch("os.waitpid", side_effect=fake_waitpid), \
+             patch("gza.tmux_proxy.TmuxProxy._drain_pty", side_effect=fake_drain_pty), \
+             patch("sys.stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            proxy._io_loop(child_pid=999, pty_fd=10)
+
+        assert drained, "_drain_pty must be called when WNOHANG detects child exit"
+
+    def test_break_path_drains_pty_before_reap(self):
+        """When the loop breaks (e.g. select error), remaining PTY output is drained."""
+        proxy = TmuxProxy(session_name="gza-test")
+
+        drained: list[bool] = []
+
+        def fake_drain_pty(pty_fd):
+            drained.append(True)
+
+        def fake_reap(child_pid):
+            return 0
+
+        with patch("gza.tmux_proxy.TmuxProxy._has_human", return_value=False), \
+             patch("select.select", side_effect=OSError("bad fd")), \
+             patch("gza.tmux_proxy.TmuxProxy._drain_pty", side_effect=fake_drain_pty), \
+             patch("gza.tmux_proxy.TmuxProxy._reap", side_effect=fake_reap), \
+             patch("sys.stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            proxy._io_loop(child_pid=999, pty_fd=10)
+
+        assert drained, "_drain_pty must be called before _reap when the loop breaks"
+
+
 class TestHasHumanCaching:
     """Tests for S1: _has_human() result is cached for 1 second."""
 
