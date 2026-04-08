@@ -442,15 +442,26 @@ def cmd_edit(args: argparse.Namespace) -> int:
             print(f"✓ Moved task #{task.id} to group '{args.group_flag}'")
             return 0
 
-    # Handle --based-on flag
+    # Handle --based-on flag (lineage/parent relationship)
     if hasattr(args, 'based_on_flag') and args.based_on_flag is not None:
-        dep_task = store.get(args.based_on_flag)
-        if not dep_task:
+        parent_task = store.get(args.based_on_flag)
+        if not parent_task:
             print(f"Error: Task #{args.based_on_flag} not found")
             return 1
-        task.depends_on = args.based_on_flag
+        task.based_on = args.based_on_flag
         store.update(task)
-        print(f"✓ Set task #{task.id} to depend on task #{args.based_on_flag}")
+        print(f"✓ Set task #{task.id} based_on task #{args.based_on_flag}")
+        return 0
+
+    # Handle --depends-on flag (execution blocking dependency)
+    if hasattr(args, 'depends_on_flag') and args.depends_on_flag is not None:
+        dep_task = store.get(args.depends_on_flag)
+        if not dep_task:
+            print(f"Error: Task #{args.depends_on_flag} not found")
+            return 1
+        task.depends_on = args.depends_on_flag
+        store.update(task)
+        print(f"✓ Set task #{task.id} to depend on task #{args.depends_on_flag}")
         return 0
 
     # Handle --review flag

@@ -304,6 +304,78 @@ class TestEditCommand:
         updated = store.get(task.id)
         assert updated.prompt == "New prompt from stdin input"
 
+    def test_cmd_edit_based_on_sets_based_on_field(self, tmp_path: Path):
+        """--based-on sets task.based_on, not task.depends_on."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        parent_task = store.add("Parent task")
+        task = store.add("Target task")
+
+        result = run_gza("edit", str(task.id), "--based-on", str(parent_task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        updated = store.get(task.id)
+        assert updated.based_on == parent_task.id
+        assert updated.depends_on is None
+
+    def test_cmd_edit_depends_on_sets_depends_on_field(self, tmp_path: Path):
+        """--depends-on sets task.depends_on, not task.based_on."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        dep_task = store.add("Dependency task")
+        task = store.add("Target task")
+
+        result = run_gza("edit", str(task.id), "--depends-on", str(dep_task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        updated = store.get(task.id)
+        assert updated.depends_on == dep_task.id
+        assert updated.based_on is None
+
+    def test_cmd_edit_based_on_nonexistent_task_errors(self, tmp_path: Path):
+        """--based-on with nonexistent target ID returns error code 1."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Target task")
+
+        result = run_gza("edit", str(task.id), "--based-on", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "999" in result.stdout
+        assert "not found" in result.stdout.lower()
+
+    def test_cmd_edit_depends_on_nonexistent_task_errors(self, tmp_path: Path):
+        """--depends-on with nonexistent target ID returns error code 1."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Target task")
+
+        result = run_gza("edit", str(task.id), "--depends-on", "999", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "999" in result.stdout
+        assert "not found" in result.stdout.lower()
+
 
 class TestRetryCommand:
     """Tests for 'gza retry' command."""
