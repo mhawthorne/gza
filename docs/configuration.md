@@ -467,7 +467,8 @@ gza edit <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `--group NAME` | Move task to group (empty `""` removes) |
-| `--based-on ID` | Set dependency |
+| `--based-on ID` | Set lineage/parent relationship (branch inheritance and context) |
+| `--depends-on ID` | Set execution dependency (blocks task until dependency completes) |
 | `--explore` | Convert to explore task |
 | `--task` | Convert to regular task |
 | `--review` | Enable automatic review task creation on completion |

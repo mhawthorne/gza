@@ -690,7 +690,7 @@ def main() -> int:
         "--depends-on",
         type=int,
         metavar="ID",
-        help="Set dependency on another task",
+        help="Set execution dependency (depends_on field, blocks task until dependency completes)",
     )
     add_parser.add_argument(
         "--review",
