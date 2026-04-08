@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Find plan/explore tasks that completed but never spawned an implementation."""
+
+from gza.db import SqliteTaskStore
+
+
+def main() -> None:
+    store = SqliteTaskStore.default()
+    tasks = store.get_history(limit=None, task_type="plan") + store.get_history(
+        limit=None, task_type="explore"
+    )
+    orphans = [
+        t
+        for t in tasks
+        if t.status == "completed" and not store.get_based_on_children(t.id)
+    ]
+    if not orphans:
+        print("No orphan plan/explore tasks found.")
+        return
+    print(f"Found {len(orphans)} completed plan/explore tasks with no implementation:")
+    for t in orphans:
+        print(f"  #{t.id} [{t.task_type}] {t.prompt[:80]}")
+
+
+if __name__ == "__main__":
+    main()

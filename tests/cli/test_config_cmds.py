@@ -1343,7 +1343,7 @@ class TestStatsCyclesCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("stats", "--cycles", "--project", str(tmp_path))
+        result = run_gza("stats", "cycles", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No cycles found" in result.stdout or "0" in result.stdout
@@ -1366,7 +1366,7 @@ class TestStatsCyclesCommand:
         store.update_cycle_iteration(it.id, review_task_id=review.id, state="terminal", review_verdict="APPROVED")
         store.close_cycle(cycle.id, status="approved", stop_reason="approved")
 
-        result = run_gza("stats", "--cycles", "--project", str(tmp_path))
+        result = run_gza("stats", "cycles", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "1" in result.stdout  # at least 1 cycle shown
@@ -1380,7 +1380,7 @@ class TestStatsCyclesCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("stats", "--cycles", "--json", "--project", str(tmp_path))
+        result = run_gza("stats", "cycles", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         data = json.loads(result.stdout)
@@ -1403,7 +1403,7 @@ class TestStatsCyclesCommand:
         store.close_cycle(cycle.id, status="maxed_out", stop_reason="max_iterations")
 
         result = run_gza(
-            "stats", "--cycles", "--task", str(impl.id), "--json",
+            "stats", "cycles", "--task", str(impl.id), "--json",
             "--project", str(tmp_path)
         )
 
@@ -1476,7 +1476,7 @@ class TestStatsCyclesCommand:
         )
         store.close_cycle(cycle.id, status="approved", stop_reason="approved")
 
-        result = run_gza("stats", "--cycles", "--json", "--project", str(tmp_path))
+        result = run_gza("stats", "cycles", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         data = json.loads(result.stdout)
@@ -1525,7 +1525,7 @@ class TestStatsCyclesCommand:
         )
         store.close_cycle(cycle.id, status="approved", stop_reason="approved")
 
-        result = run_gza("stats", "--cycles", "--project", str(tmp_path))
+        result = run_gza("stats", "cycles", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Find the improves_before_approval row in the output
@@ -1536,6 +1536,129 @@ class TestStatsCyclesCommand:
         # Must start with exactly 2 leading spaces (not 4)
         assert row.startswith("  "), f"Row should start with 2 spaces: {row!r}"
         assert not row.startswith("    "), f"Row must not have 4 leading spaces (double-indent bug): {row!r}"
+
+
+class TestStatsReviewsCommand:
+    """Tests for 'gza stats reviews' command."""
+
+    def test_stats_reviews_no_tasks(self, tmp_path: Path):
+        """gza stats reviews with no tasks shows zero counts."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement tasks: 0" in result.stdout
+        assert "Total reviews:   0" in result.stdout
+
+    def test_stats_reviews_shows_table_header(self, tmp_path: Path):
+        """gza stats reviews output includes the weekly table header."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Week" in result.stdout
+        assert "Impls" in result.stdout
+        assert "Rvws" in result.stdout
+
+    def test_stats_reviews_with_reviewed_impl(self, tmp_path: Path):
+        """gza stats reviews shows cycle stats for a reviewed implementation task."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement tasks: 1" in result.stdout
+        assert "Total reviews:   1" in result.stdout
+        assert "Reviewed:        1/1" in result.stdout
+
+    def test_stats_reviews_unreviewed_impl(self, tmp_path: Path):
+        """gza stats reviews shows impl count but no cycle stats for unreviewed impls."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement no review", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement tasks: 1" in result.stdout
+        assert "Total reviews:   0" in result.stdout
+        assert "Reviewed:        0/1" in result.stdout
+
+    def test_stats_reviews_cycle_distribution(self, tmp_path: Path):
+        """gza stats reviews shows cycle distribution for reviewed impls."""
+        from gza.db import SqliteTaskStore, TaskStats
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        for i in range(2):
+            review = store.add(f"Review {i}", task_type="review", depends_on=impl.id)
+            assert review.id is not None
+            store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Cycle distribution" in result.stdout
+
+    def test_stats_reviews_days_filter(self, tmp_path: Path):
+        """gza stats reviews --days 7 restricts to last 7 days."""
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "reviews", "--days", "7", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement tasks: 0" in result.stdout
+
+    def test_stats_reviews_default_14_day_range(self, tmp_path: Path):
+        """gza stats reviews with no date flags uses a 14-day range ending today."""
+        from datetime import date, timedelta
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        today = date.today()
+        start = today - timedelta(days=14)
+        assert str(start) in result.stdout
+        assert str(today) in result.stdout
 
 
 class TestImportCommand:

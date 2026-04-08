@@ -1,10 +1,12 @@
-IMPORTANT: Before continuing, verify your todo list against the actual state of the files.
+IMPORTANT: This task was interrupted. Do NOT trust your prior session's claims about what was completed. The session context may show you confidently stating work was done when it was not actually saved.
 
-The task was interrupted (max turns, timeout, etc.) and your todo list may show steps as in_progress that were never actually completed. Please:
+Before doing anything else, run these commands to assess the ACTUAL state:
 
-1. Review your todo list from the previous session
-2. For each item marked as in_progress or completed, verify by checking the actual code/files
-3. Update the todo list to reflect what is actually complete vs incomplete
-4. Mark any steps that weren't actually finished as pending before continuing
+1. Run `git status` and `git diff --stat` to see what uncommitted changes exist
+2. Run `git log --oneline -10` to see what was actually committed
 
-Once you've verified and updated the todo list, continue from where you left off.
+Based on the git output — not your prior messages — determine what work is actually present in the codebase. If git shows no changes and no commits, the prior session's work was lost and you must start over.
+
+Then review your todo list (if any) and update it to reflect reality. Mark items as pending if the corresponding changes are not visible in git status or git log.
+
+Continue from the actual state of the code, not from where you think you left off.
