@@ -280,7 +280,7 @@ class TestPromptDeliveryViaPty:
         )
 
     def test_long_prompt_delivery_uses_chunked_writes(self, tmp_path: Path):
-        """Prompts >2000 bytes are written in chunks to avoid PTY buffer overflow."""
+        """Prompts >2000 bytes are delivered in chunks via the IO loop."""
         from gza.tmux_proxy import _PROMPT_CHUNK_SIZE
 
         prompt_text = "x" * ((_PROMPT_CHUNK_SIZE * 2) + 100)  # ~4100+ chars
@@ -289,58 +289,58 @@ class TestPromptDeliveryViaPty:
 
         proxy = TmuxProxy(session_name="gza-42", prompt_file=str(prompt_file))
 
-        written_chunks: list[bytes] = []
+        written_to_pty: list[bytes] = []
 
-        with patch("os.write", side_effect=lambda fd, data: written_chunks.append(data) or len(data)), \
+        def fake_write(fd: int, data: bytes) -> int:
+            if fd == 10:  # pty_fd
+                written_to_pty.append(data)
+            return len(data)
+
+        call_count = [0]
+
+        def fake_waitpid(pid, flags):
+            call_count[0] += 1
+            if call_count[0] > 5:  # enough iterations for chunked delivery
+                return (pid, 0)
+            return (0, 0)
+
+        with patch("gza.tmux_proxy.TmuxProxy._has_human", return_value=False), \
+             patch("select.select", return_value=([], [], [])), \
+             patch("os.waitpid", side_effect=fake_waitpid), \
+             patch("os.write", side_effect=fake_write), \
              patch("os.unlink"), \
-             patch("time.sleep"):  # speed up test
-            proxy._write_prompt_to_pty(pty_fd=10)
+             patch("sys.stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            proxy._io_loop(child_pid=999, pty_fd=10)
 
         # Should have written in multiple chunks
-        assert len(written_chunks) > 1, (
+        assert len(written_to_pty) > 1, (
             "Long prompts must be written in multiple chunks"
         )
         # All content should be delivered
-        all_written = b"".join(written_chunks)
+        all_written = b"".join(written_to_pty)
         assert prompt_text.encode() in all_written
 
-    def test_short_prompt_written_in_single_call(self, tmp_path: Path):
-        """Prompts <=2000 bytes are written in a single os.write call."""
-        prompt_text = "Short prompt — implement hello world"
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text(prompt_text)
-
-        proxy = TmuxProxy(session_name="gza-42", prompt_file=str(prompt_file))
-
-        written_chunks: list[bytes] = []
-
-        with patch("os.write", side_effect=lambda fd, data: written_chunks.append(data) or len(data)), \
-             patch("os.unlink"):
-            proxy._write_prompt_to_pty(pty_fd=10)
-
-        assert len(written_chunks) == 1, "Short prompt must be written in a single call"
-        assert prompt_text.encode() in written_chunks[0]
-
-    def test_prompt_file_deleted_after_delivery(self, tmp_path: Path):
-        """The temp prompt file is cleaned up after delivery."""
+    def test_prompt_file_deleted_after_load(self, tmp_path: Path):
+        """The temp prompt file is cleaned up after loading, before IO loop."""
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("test prompt")
 
         proxy = TmuxProxy(session_name="gza-42", prompt_file=str(prompt_file))
 
-        with patch("os.write", return_value=0):
-            proxy._write_prompt_to_pty(pty_fd=10)
+        result = proxy._load_prompt_data()
 
-        assert not prompt_file.exists(), "Prompt temp file must be deleted after delivery"
+        assert result is not None
+        assert b"test prompt" in result
+        assert not prompt_file.exists(), "Prompt temp file must be deleted after loading"
 
-    def test_no_prompt_write_when_prompt_file_not_set(self):
-        """No write to PTY when prompt_file is None."""
+    def test_no_prompt_data_when_prompt_file_not_set(self):
+        """_load_prompt_data returns None when prompt_file is None."""
         proxy = TmuxProxy(session_name="gza-42", prompt_file=None)
 
-        with patch("os.write") as mock_write:
-            proxy._write_prompt_to_pty(pty_fd=10)
+        result = proxy._load_prompt_data()
 
-        mock_write.assert_not_called()
+        assert result is None
 
 
 class TestDynamicStdinHandling:
