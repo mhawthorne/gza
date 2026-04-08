@@ -2492,11 +2492,11 @@ class TestResumeVerificationPrompt:
             resume_session_id = captured_prompts[0]['resume_session_id']
 
             # Verify verification instructions are in the prompt
-            assert "verify your todo list against the actual state" in prompt.lower()
-            assert "review your todo list from the previous session" in prompt.lower()
-            assert "verify by checking the actual code/files" in prompt.lower()
-            assert "update the todo list to reflect what is actually complete" in prompt.lower()
-            assert "continue from where you left off" in prompt.lower()
+            assert "interrupted" in prompt.lower()
+            assert "git status" in prompt.lower()
+            assert "git log" in prompt.lower()
+            assert "todo list" in prompt.lower()
+            assert "continue from the actual state" in prompt.lower()
 
             # Verify resume_session_id was passed
             assert resume_session_id == "test-session-123"
@@ -2587,11 +2587,11 @@ class TestResumeVerificationPrompt:
         resume_session_id = captured_prompts[0]['resume_session_id']
 
         # Verify verification instructions are in the prompt
-        assert "verify your todo list against the actual state" in prompt.lower()
-        assert "review your todo list from the previous session" in prompt.lower()
-        assert "verify by checking the actual code/files" in prompt.lower()
-        assert "update the todo list to reflect what is actually complete" in prompt.lower()
-        assert "continue from where you left off" in prompt.lower()
+        assert "interrupted" in prompt.lower()
+        assert "git status" in prompt.lower()
+        assert "git log" in prompt.lower()
+        assert "todo list" in prompt.lower()
+        assert "continue from the actual state" in prompt.lower()
         assert f"Current task DB id: #{review_task.id}" in prompt
         assert f"Current task slug: {review_task.task_id}" in prompt
         assert f".gza/reviews/{review_task.task_id}.md" in prompt
