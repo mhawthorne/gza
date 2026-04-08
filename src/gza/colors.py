@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -301,7 +300,7 @@ class Theme:
     advance: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def uniform(cls, name: str, color: str) -> "Theme":
+    def uniform(cls, name: str, color: str) -> Theme:
         """Create a theme that sets every field in every domain class to *color*."""
         af = _all_fields  # local alias for brevity
         return cls(

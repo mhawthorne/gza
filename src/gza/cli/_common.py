@@ -4,24 +4,27 @@ import argparse
 import json
 import os
 import shutil
-import sqlite3
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..config import Config
 from ..console import (
-    truncate,
     MAX_PROMPT_DISPLAY,
+    truncate,
 )
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import SqliteTaskStore
+from ..db import Task as DbTask
 from ..prompts import PromptBuilder
+from ..review_tasks import DuplicateReviewError  # noqa: F401
+from ..review_tasks import create_review_task
 from ..review_verdict import parse_review_verdict
-from ..review_tasks import DuplicateReviewError, create_review_task
 from ..runner import run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -62,8 +65,6 @@ def reconcile_in_progress_tasks(config: Config) -> None:
         print(f"Warning: Skipping task reconciliation due to unexpected error: {exc}", file=sys.stderr)
         return
 
-    now = datetime.now(timezone.utc)
-    timeout_seconds = max(0, int(config.timeout_minutes) * 60)
     for task in store.get_in_progress():
         task_label = f"#{task.id}" if task.id is not None else "<unknown>"
         try:
@@ -143,8 +144,8 @@ def prune_terminal_dead_workers(config: Config) -> None:
 
 
 # Shared color palette for history and stats output — defined in gza.colors.
-import gza.colors as _colors
-from gza.colors import TASK_COLORS_DICT as TASK_COLORS
+import gza.colors as _colors  # noqa: E402
+from gza.colors import TASK_COLORS_DICT as TASK_COLORS  # noqa: E402, F401
 
 
 def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
@@ -398,7 +399,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
                 prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
                 print(f"  Prompt: {prompt_display}")
             print()
-            print(f"Use 'gza ps' to view running workers")
+            print("Use 'gza ps' to view running workers")
             print(f"Use 'gza log -w {worker_id} -f' to follow output")
 
         return 0
@@ -468,7 +469,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
 
         if startup_log_path and not startup_header_written:
             startup_log_path.write_text(
-                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
+                f"[{datetime.now(UTC).isoformat()}] worker starting pid={os.getpid()}\n"
             )
             startup_header_written = True
 
@@ -480,7 +481,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     try:
         if startup_log_path:
             startup_log_path.write_text(
-                f"[{datetime.now(timezone.utc).isoformat()}] worker starting pid={os.getpid()}\n"
+                f"[{datetime.now(UTC).isoformat()}] worker starting pid={os.getpid()}\n"
             )
             startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
@@ -514,7 +515,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED", has_commits=has_commits)
         if startup_log_path:
             with open(startup_log_path, "a") as f:
-                f.write(f"[{datetime.now(timezone.utc).isoformat()}] worker crashed: {e}\n")
+                f.write(f"[{datetime.now(UTC).isoformat()}] worker crashed: {e}\n")
         if worker_id:
             registry.mark_completed(worker_id, exit_code=1, status="failed")
         return 1
@@ -584,7 +585,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
                 prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
                 print(f"  Prompt: {prompt_display}")
             print()
-            print(f"Use 'gza ps' to view running workers")
+            print("Use 'gza ps' to view running workers")
             print(f"Use 'gza log -w {worker_id} -f' to follow output")
 
         return 0
@@ -780,7 +781,7 @@ def _create_improve_task(
     )
 
 
-from ..query import TaskLineageNode as _TaskLineageNode
+from ..query import TaskLineageNode as _TaskLineageNode  # noqa: E402
 
 
 def _format_lineage(
@@ -798,7 +799,7 @@ def _format_lineage(
     def _normalize_time(value: datetime) -> datetime:
         if value.tzinfo is None:
             return value
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.astimezone(UTC).replace(tzinfo=None)
 
     def _lineage_time(task: DbTask) -> datetime:
         return task.completed_at or task.created_at or datetime.min
@@ -1134,8 +1135,7 @@ class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
             subactions = sorted(subactions, key=lambda x: x.metavar if x.metavar else "")
 
         # Yield sorted subactions with indentation
-        for subaction in subactions:
-            yield subaction
+        yield from subactions
 
     def _metavar_formatter(self, action, default_metavar):
         """Override to sort choices alphabetically in usage string."""
@@ -1144,7 +1144,7 @@ class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
         elif action.choices is not None:
             # Sort choices alphabetically
             choice_strs = sorted(str(choice) for choice in action.choices)
-            result = '{%s}' % ','.join(choice_strs)
+            result = '{{{}}}'.format(','.join(choice_strs))
         else:
             result = default_metavar
 

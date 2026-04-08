@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import median
 
@@ -18,7 +18,6 @@ from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..workers import WorkerMetadata, WorkerRegistry
-
 from ._common import TASK_COLORS, get_store, get_task_step_count
 
 logger = logging.getLogger(__name__)
@@ -349,7 +348,7 @@ def _cmd_stats_reviews(
     if all_reviewed_cycles:
         dist = Counter(all_reviewed_cycles)
         total = len(all_reviewed_cycles)
-        print(f"\nCycle distribution (reviewed tasks only):")
+        print("\nCycle distribution (reviewed tasks only):")
         for cnt in sorted(dist.keys()):
             pct = dist[cnt] / total * 100
             bar = "#" * dist[cnt]
@@ -406,7 +405,7 @@ def _cmd_stats_reviews(
             def _stats_str(vals: list[int]) -> str:
                 return f"{int(median(vals))}/{_percentile(vals, 75)}/{_percentile(vals, 90)}/{max(vals)}"
 
-            print(f"\nIssue counts per review (parsed from markdown)")
+            print("\nIssue counts per review (parsed from markdown)")
             print(f"{'Review model':<35} {'Rvws':>5}  {'Must-fix':>16}  {'Suggestions':>16}")
             print(f"{'':35} {'':>5}  {'med/p75/p90/max':>16}  {'med/p75/p90/max':>16}")
             print("-" * 77)
@@ -537,7 +536,6 @@ def cmd_stats(args: argparse.Namespace) -> int:
     console.print()
 
     # Task table
-    from ..console import get_terminal_width
     terminal_width = get_terminal_width()
     table_width = int(terminal_width * 0.8)
 
@@ -794,6 +792,7 @@ def _find_removable_workers(registry: WorkerRegistry, store: "SqliteTaskStore") 
     avoiding the expensive PID checks for workers we can decide on via DB alone.
     """
     import json as json_lib
+
     from ..workers import WorkerMetadata
     removable = []
     for metadata_path in registry.workers_dir.glob("w-*.json"):
@@ -821,8 +820,8 @@ def _find_removable_workers(registry: WorkerRegistry, store: "SqliteTaskStore") 
 
 def cmd_clean(args: argparse.Namespace) -> int:
     """Clean up stale worktrees, old logs, worker metadata, and archives."""
-    from datetime import timedelta
     import shutil
+    from datetime import timedelta
 
     config = Config.load(args.project_dir)
 
@@ -840,7 +839,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     registry = WorkerRegistry(config.workers_path)
 
     days = args.days if args.days is not None else config.cleanup_days
-    cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_time = datetime.now(UTC) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
     scope_flags = (args.worktrees, args.workers, args.logs, args.backups)
@@ -855,7 +854,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # 1. Lineage-aware worktree cleanup
     if args.worktrees or no_scope:
-        from gza.query import resolve_lineage_root, build_lineage, task_time_for_lineage
+        from gza.query import build_lineage, resolve_lineage_root, task_time_for_lineage
 
         print("Scanning worktrees...")
         worktree_dir = config.worktree_path
@@ -1008,10 +1007,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # Report results
     if args.dry_run:
-        print(f"Dry run: would clean up resources")
+        print("Dry run: would clean up resources")
         print()
     else:
-        print(f"Clean completed")
+        print("Clean completed")
         print()
 
     if args.worktrees or no_scope:
@@ -1027,7 +1026,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         if cleaned_logs:
             print(f"Logs cleaned: {len(cleaned_logs)}")
             if args.keep_unmerged:
-                print(f"  (kept logs for unmerged tasks)")
+                print("  (kept logs for unmerged tasks)")
         else:
             print("Logs: nothing to clean")
         print()
@@ -1058,7 +1057,7 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
     from datetime import timedelta
 
     days = args.days if args.days is not None else 365
-    cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_time = datetime.now(UTC) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
     archives_dir = config.project_dir / ".gza" / "archives"
@@ -1131,11 +1130,11 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
 
 def _clean_archive(config: Config, args: argparse.Namespace) -> int:
     """Archive old log and worker files to .gza/archives/."""
-    from datetime import timedelta
     import shutil
+    from datetime import timedelta
 
     days = args.days if args.days is not None else 30
-    cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_time = datetime.now(UTC) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
     archives_dir = config.project_dir / ".gza" / "archives"
@@ -1331,7 +1330,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # Initialize the database (Config.load will now work since we have project_name)
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    get_store(config)
     print(f"✓ Initialized database at {config.db_path}")
 
     return 0
@@ -1579,14 +1578,14 @@ def cmd_skills_install(
 ) -> int:
     """Install gza skills from package to one or more target directories."""
     from ..skills_utils import (
+        copy_skill,
         get_available_skills,
+        get_bundled_skill_time,
+        get_installed_skill_time,
         get_skill_description,
         get_skill_version,
         get_skills_source_path,
         is_skill_outdated,
-        get_installed_skill_time,
-        get_bundled_skill_time,
-        copy_skill,
     )
 
     public_only = not getattr(args, "dev", False)

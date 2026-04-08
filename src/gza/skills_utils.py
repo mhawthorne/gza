@@ -9,7 +9,6 @@ import importlib.resources
 import shutil
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional
 
 from .console import console
 
@@ -26,7 +25,7 @@ def get_skills_source_path() -> Path:
     return Path(str(ref))
 
 
-def get_available_skills(public_only: bool = False) -> List[str]:
+def get_available_skills(public_only: bool = False) -> list[str]:
     """List available skill names from the bundled skills.
 
     A skill is valid if it's a directory containing a SKILL.md file (uppercase).
@@ -101,7 +100,7 @@ def get_skill_description(skill_name: str) -> str:
     return _parse_skill_frontmatter(skill_name, 'description')
 
 
-def get_skill_version(skill_name: str) -> Optional[str]:
+def get_skill_version(skill_name: str) -> str | None:
     """Extract the version from a skill's SKILL.md file.
 
     Args:
@@ -176,7 +175,7 @@ def is_skill_outdated(skill_name: str, target_dir: Path) -> bool:
         return False
 
 
-def _skill_mtime_str(path: Path) -> Optional[str]:
+def _skill_mtime_str(path: Path) -> str | None:
     """Get the modification time of a SKILL.md file as a string."""
     from datetime import datetime
     if not path.exists():
@@ -188,17 +187,17 @@ def _skill_mtime_str(path: Path) -> Optional[str]:
         return None
 
 
-def get_installed_skill_time(skill_name: str, target_dir: Path) -> Optional[str]:
+def get_installed_skill_time(skill_name: str, target_dir: Path) -> str | None:
     """Get the modification time of an installed skill."""
     return _skill_mtime_str(target_dir / skill_name / 'SKILL.md')
 
 
-def get_bundled_skill_time(skill_name: str) -> Optional[str]:
+def get_bundled_skill_time(skill_name: str) -> str | None:
     """Get the modification time of a bundled skill."""
     return _skill_mtime_str(get_skills_source_path() / skill_name / 'SKILL.md')
 
 
-def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> Tuple[bool, str]:
+def copy_skill(skill_name: str, target_dir: Path, force: bool = False) -> tuple[bool, str]:
     """Copy a skill from the package to the target directory atomically.
 
     Uses a temporary directory and atomic rename to prevent partial state

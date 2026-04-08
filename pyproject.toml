@@ -76,4 +76,17 @@ dev = [
     "pytest-xdist>=3.0",
     "mypy>=1.0",
     "types-PyYAML>=6.0",
+    "ruff>=0.9",
+    "ty>=0.0.1a1",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ty.environment]
+python-version = "3.11"

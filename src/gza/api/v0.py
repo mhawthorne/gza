@@ -35,9 +35,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from gza import query as _query
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
-from gza import query as _query
 
 __all__ = ["GzaClient", "Task", "IncompleteSnapshot"]
 

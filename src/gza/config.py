@@ -201,7 +201,7 @@ def _deep_merge_dicts(base: dict, override: dict, source_map: dict[str, str], pa
     return merged
 
 
-def _validate_local_override_data(data: dict, schema: dict[str, object], path_prefix: str = "") -> None:
+def _validate_local_override_data(data: dict, schema: dict, path_prefix: str = "") -> None:
     for key, value in data.items():
         path = f"{path_prefix}.{key}" if path_prefix else key
         allowed = schema.get(key, schema.get("*"))
@@ -267,8 +267,6 @@ class BranchStrategy:
 
     def __post_init__(self):
         """Validate the branch strategy configuration."""
-        # Validate pattern contains valid variables
-        valid_vars = {"{project}", "{task_id}", "{date}", "{slug}", "{type}"}
         # Check for invalid characters that would break git branch names
         invalid_chars = [" ", "~", "^", ":", "?", "*", "[", "\\"]
         for char in invalid_chars:
@@ -1003,7 +1001,8 @@ class Config:
         )
 
         # Parse theme and ad-hoc color overrides.
-        from .colors import BUILT_IN_THEMES, set_theme as _set_theme  # noqa: PLC0415
+        from .colors import BUILT_IN_THEMES  # noqa: PLC0415
+        from .colors import set_theme as _set_theme
 
         theme_name: str | None = data.get("theme", "minimal")
         if theme_name is not None:

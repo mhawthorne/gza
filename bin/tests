@@ -1,6 +1,8 @@
 #!/bin/sh
 set -ex
 
+uv run ruff check src/gza/
+uv run ty check src/gza/
 uv run mypy src/gza/
 uv run pytest tests/ -xv
 uv run pytest tests_integration -xv

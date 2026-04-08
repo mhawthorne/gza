@@ -4,18 +4,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..config import ConfigError
+from ..config import Config, ConfigError
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
-
 from ._common import (
     SortingHelpFormatter,
+    _add_query_filter_args,
     _add_skills_install_args,
     add_common_args,
-    _add_query_filter_args,
     prune_terminal_dead_workers,
     reconcile_in_progress_tasks,
 )
-from ..config import Config
 from .config_cmds import (
     cmd_clean,
     cmd_config,
