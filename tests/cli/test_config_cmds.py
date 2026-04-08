@@ -1644,6 +1644,22 @@ class TestStatsReviewsCommand:
         assert result.returncode == 0
         assert "Implement tasks: 0" in result.stdout
 
+    def test_stats_reviews_default_14_day_range(self, tmp_path: Path):
+        """gza stats reviews with no date flags uses a 14-day range ending today."""
+        from datetime import date, timedelta
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        today = date.today()
+        start = today - timedelta(days=14)
+        assert str(start) in result.stdout
+        assert str(today) in result.stdout
+
 
 class TestImportCommand:
     """Tests for 'gza import' command."""

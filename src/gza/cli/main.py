@@ -498,7 +498,7 @@ def main() -> int:
         "--days",
         type=int,
         metavar="N",
-        default=14,
+        default=None,
         help="Show tasks from the last N days (default: 14)",
     )
     stats_reviews_parser.add_argument(
