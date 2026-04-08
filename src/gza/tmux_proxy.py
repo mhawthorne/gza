@@ -126,19 +126,27 @@ class TmuxProxy:
         if self.prompt_file:
             self._write_prompt_to_pty(pty_fd)
 
-        # Set stdout to non-blocking so writes to the tmux pane never block.
+        # Set stdout and pty_fd to non-blocking so writes never block.
         # If the pane buffer is full, we drop output rather than deadlocking
         # (the proxy must keep draining the child PTY to prevent the child from
         # blocking on its own writes).
+        # The pty_fd must also be non-blocking: if the child's PTY input buffer
+        # is full (because the child is itself blocked writing to stdout), an
+        # auto-accept write to pty_fd would deadlock the proxy, preventing it
+        # from draining the child's output.
         stdout_fd = sys.stdout.fileno()
-        orig_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
-        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl | os.O_NONBLOCK)
+        orig_stdout_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_stdout_fl | os.O_NONBLOCK)
+
+        orig_pty_fl = fcntl.fcntl(pty_fd, fcntl.F_GETFL)
+        fcntl.fcntl(pty_fd, fcntl.F_SETFL, orig_pty_fl | os.O_NONBLOCK)
 
         try:
             return self._io_loop_inner(child_pid, pty_fd, stdout_fd)
         finally:
             # Restore blocking mode so final cleanup writes don't fail with EAGAIN
-            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl)
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_stdout_fl)
+            fcntl.fcntl(pty_fd, fcntl.F_SETFL, orig_pty_fl)
 
     def _io_loop_inner(self, child_pid: int, pty_fd: int, stdout_fd: int) -> int:
         """Inner I/O loop with non-blocking stdout."""
@@ -185,10 +193,7 @@ class TmuxProxy:
                     try:
                         data = os.read(stdin_fd, 4096)
                         if data:
-                            try:
-                                os.write(pty_fd, data)
-                            except OSError:
-                                pass
+                            self._write_pty(pty_fd, data)
                     except OSError:
                         pass
 
@@ -222,12 +227,9 @@ class TmuxProxy:
                 if idle > self.max_idle_timeout:
                     # Session appears stuck — send Ctrl-C, wait for response, then EOF
                     logger.info("Session idle for %.1fs (max %s); sending Ctrl-C + EOF", idle, self.max_idle_timeout)
-                    try:
-                        os.write(pty_fd, b"\x03")  # Ctrl-C
-                        time.sleep(3)  # Give child time to respond to Ctrl-C
-                        os.write(pty_fd, b"\x04")  # Ctrl-D / EOF
-                    except OSError:
-                        pass
+                    self._write_pty(pty_fd, b"\x03")  # Ctrl-C
+                    time.sleep(3)  # Give child time to respond to Ctrl-C
+                    self._write_pty(pty_fd, b"\x04")  # Ctrl-D / EOF
                     break
 
                 # Respect detach_grace: only auto-accept after grace period
@@ -240,11 +242,11 @@ class TmuxProxy:
                 if idle > self.auto_accept_timeout and grace_elapsed:
                     # Send Enter to accept the default prompt choice
                     logger.info("Detached and quiescent (%.1fs); sending auto-accept", idle)
-                    try:
-                        os.write(pty_fd, b"\n")
+                    if self._write_pty(pty_fd, b"\n"):
                         self.last_output_time = time.monotonic()
-                    except OSError:
-                        break
+                    # If write failed (EAGAIN), skip — the child's PTY input
+                    # buffer is full, so it hasn't consumed prior input yet.
+                    # The next select() iteration will drain child output first.
 
         self._drain_pty(pty_fd)
         return self._reap(child_pid)
@@ -264,6 +266,25 @@ class TmuxProxy:
                 logger.debug("stdout would block, dropping %d bytes", len(data))
             elif e.errno == errno.EPIPE:
                 pass  # broken pipe, session gone
+            else:
+                raise
+
+    @staticmethod
+    def _write_pty(pty_fd: int, data: bytes) -> bool:
+        """Write data to the child PTY (non-blocking). Returns True on success.
+
+        If the PTY input buffer is full (child not reading), the write is
+        skipped to prevent deadlocking the proxy's I/O loop.
+        """
+        try:
+            os.write(pty_fd, data)
+            return True
+        except OSError as e:
+            if e.errno == errno.EAGAIN:
+                logger.debug("pty_fd would block, dropping %d bytes", len(data))
+                return False
+            elif e.errno in (errno.EIO, errno.EPIPE):
+                return False  # child exited
             else:
                 raise
 
