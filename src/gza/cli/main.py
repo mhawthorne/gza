@@ -460,21 +460,58 @@ def main() -> int:
     )
     stats_parser.set_defaults(last=5)
     stats_parser.add_argument(
-        "--cycles",
+        "--json",
         action="store_true",
-        help="Show cycle analytics (review/improve iteration statistics)",
+        help="Output as machine-readable JSON",
     )
-    stats_parser.add_argument(
+    stats_subs = stats_parser.add_subparsers(dest="stats_subcommand")
+
+    # stats cycles subcommand
+    stats_cycles_parser = stats_subs.add_parser(
+        "cycles", help="Show cycle analytics (review/improve iteration statistics)"
+    )
+    add_common_args(stats_cycles_parser)
+    stats_cycles_parser.add_argument(
         "--task",
         type=int,
         dest="cycle_task_id",
         metavar="ID",
-        help="Show cycle analytics for a specific implementation task (use with --cycles)",
+        help="Show cycle analytics for a specific implementation task",
     )
-    stats_parser.add_argument(
+    stats_cycles_parser.add_argument(
         "--json",
         action="store_true",
         help="Output as machine-readable JSON",
+    )
+
+    # stats reviews subcommand
+    stats_reviews_parser = stats_subs.add_parser(
+        "reviews", help="Show review/improve cycle stats per implementation task"
+    )
+    add_common_args(stats_reviews_parser)
+    stats_reviews_parser.add_argument(
+        "--issues",
+        action="store_true",
+        help="Show per-model issue counts parsed from review content",
+    )
+    stats_reviews_parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Show tasks from the last N days (default: 14)",
+    )
+    stats_reviews_parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or after this date",
+    )
+    stats_reviews_parser.add_argument(
+        "--end-date",
+        dest="end_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or before this date",
     )
 
     # validate command
