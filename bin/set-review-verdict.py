@@ -23,11 +23,12 @@ This script handles both cases:
 """
 
 import argparse
-import json
 import re
 import sqlite3
 import sys
 from pathlib import Path
+
+from gza.runner import extract_content_from_log
 
 VALID_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION")
 
@@ -52,27 +53,6 @@ def extract_verdict(content: str) -> str | None:
     )
     if match:
         return match.group(1).upper()
-    return None
-
-
-def extract_content_from_log(log_path: Path) -> str | None:
-    """Scan a JSONL log file for a provider 'result' entry and return its text."""
-    try:
-        with open(log_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    if entry.get("type") == "result":
-                        result_text = entry.get("result", "")
-                        if isinstance(result_text, str) and result_text.strip():
-                            return result_text
-                except json.JSONDecodeError:
-                    continue
-    except OSError as exc:
-        print(f"Error reading log file {log_path}: {exc}", file=sys.stderr)
     return None
 
 

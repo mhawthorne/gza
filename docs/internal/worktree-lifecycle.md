@@ -26,6 +26,8 @@ These create worktrees in `/tmp` (for Docker compatibility) based on the default
 
 Unlike code task worktrees, non-code task worktrees are **removed on success** after the report file is copied back to the project directory. They have no further use once the report is written. On failure, the worktree is preserved for debugging and its path is printed to the console.
 
+**Log-recovery path**: When the expected report artifact is missing but content can be recovered from the provider's JSONL log (a `{"type": "result"}` entry), the task completes successfully and the worktree is cleaned up normally — not preserved. This recovery is logged as a warning and the outcome is recorded as `completed (recovered from provider log)`.
+
 ### `gza rebase` CLI (foreground mode)
 
 `gza rebase` creates a **temporary** worktree at `config.worktree_path / task.id` for the duration of the rebase. Unlike task worktrees, this worktree is always removed after use — a `try/finally` block in `cmd_rebase` calls `git.worktree_remove(worktree_path, force=True)` on all exit paths (mechanical success, provider-resolved success, failure, and exception). If `worktree_remove` leaves the directory behind, `shutil.rmtree` is used as a fallback. This worktree is never left registered with git after `gza rebase` exits.

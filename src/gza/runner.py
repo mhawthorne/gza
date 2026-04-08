@@ -37,6 +37,7 @@ __all__ = [
     "run",
     "build_prompt",
     "write_log_entry",
+    "extract_content_from_log",
     "get_effective_config_for_task",
     "post_review_to_pr",
 ]
@@ -52,13 +53,17 @@ def write_log_entry(log_file: "Path", entry: dict) -> None:
         logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
 
 
-def _extract_content_from_log(log_file: "Path") -> str | None:
+def extract_content_from_log(log_file: "Path") -> str | None:
     """Scan a JSONL log file for a provider 'result' entry and return its text.
 
     Providers emit a ``{"type": "result", "result": "<text>"}`` line when the
     agent finishes.  If the agent output the review (or plan/explore) as text
     rather than writing the expected file artifact, the content lives here.
+
+    Returns the last non-empty result entry, since a resumed session may emit
+    an intermediate result before the final one.
     """
+    last_result: str | None = None
     try:
         with open(log_file) as f:
             for line in f:
@@ -70,12 +75,12 @@ def _extract_content_from_log(log_file: "Path") -> str | None:
                     if entry.get("type") == "result":
                         result_text = entry.get("result", "")
                         if isinstance(result_text, str) and result_text.strip():
-                            return result_text
+                            last_result = result_text
                 except json.JSONDecodeError:
                     continue
     except OSError:
         logger.warning("Failed to read log file %s for content recovery", log_file)
-    return None
+    return last_result
 
 
 def _persist_run_steps_from_result(
@@ -2127,24 +2132,24 @@ def _run_non_code_task(
 
         # Copy expected report artifact from worktree to main project directory.
         # For non-code tasks, provider success requires this file contract.
-        _recovered_from_log = False
+        recovered_from_log = False
         if not worktree_report_path.exists():
             # Before failing, try to recover content from the provider's 'result' log entry.
             # Agents sometimes output the review/report as text rather than writing the file.
-            recovered_content = _extract_content_from_log(log_file)
+            recovered_content = extract_content_from_log(log_file)
             if recovered_content:
                 logger.warning(
-                    "Task %s: expected report artifact missing; recovering content from stdout log",
+                    "Task %s: expected report artifact missing; recovering content from provider log",
                     task.task_id,
                 )
                 console.print(
                     "[yellow]Warning: expected report artifact was not created; "
-                    "recovering content from log (stdout)[/yellow]"
+                    "recovering content from provider log[/yellow]"
                 )
                 # Write the recovered content into the worktree path so the copy-back
                 # logic below proceeds as if the agent had written it normally.
                 worktree_report_path.write_text(recovered_content)
-                _recovered_from_log = True
+                recovered_from_log = True
             else:
                 expected_relative = str(worktree_report_path.relative_to(worktree_path))
                 stale_candidates = sorted(
@@ -2228,7 +2233,7 @@ def _run_non_code_task(
                 logger.warning("Failed to remove worktree %s", worktree_path)
                 if worktree_path.exists():
                     shutil.rmtree(worktree_path, ignore_errors=True)
-        outcome_msg = "Outcome: completed (recovered from stdout)" if _recovered_from_log else "Outcome: completed"
+        outcome_msg = "Outcome: completed (recovered from provider log)" if recovered_from_log else "Outcome: completed"
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": outcome_msg, "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
         auto_learnings = None
