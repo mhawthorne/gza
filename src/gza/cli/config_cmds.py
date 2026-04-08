@@ -244,7 +244,7 @@ def _cmd_stats_reviews(
         if t.task_type in ("review", "improve")
         and (t.based_on is not None or t.depends_on is not None)
         and _task_dt(t) is not None
-        and start_dt <= _task_dt(t) < end_dt  # type: ignore[operator]
+        and start_dt <= _task_dt(t) < end_dt  # type: ignore
     ]
 
     # Count reviews per root impl, tracking models
@@ -272,7 +272,7 @@ def _cmd_stats_reviews(
         dt = _task_dt(t)
         if dt is None or dt < start_dt or dt >= end_dt:
             continue
-        root = find_root_impl(t.id)  # type: ignore[arg-type]
+        root = find_root_impl(t.id)  # type: ignore
         if root is not None and root not in seen_roots:
             seen_roots.add(root)
             root_impl = tasks_by_id.get(root)
@@ -382,7 +382,7 @@ def _cmd_stats_reviews(
             and t.output_content is not None
             and t.id is not None
             and _task_dt(t) is not None
-            and start_dt <= _task_dt(t) < end_dt  # type: ignore[operator]
+            and start_dt <= _task_dt(t) < end_dt  # type: ignore
         }
         print(f"\nParsing issue counts from {len(review_content)} review(s)...")
         model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -390,12 +390,12 @@ def _cmd_stats_reviews(
         for ri in ri_tasks:
             if ri.task_type != "review":
                 continue
-            content = review_content.get(ri.id)  # type: ignore[arg-type]
+            content = review_content.get(ri.id)  # type: ignore
             if content is None:
                 continue
             must_fix, sugg = _count_review_issues(content)
             if must_fix == 0 and sugg == 0:
-                unparsed.append(ri.id)  # type: ignore[arg-type]
+                unparsed.append(ri.id)  # type: ignore
             model = ri.model or "unknown"
             model_issues[model].append((must_fix, sugg))
         if unparsed:

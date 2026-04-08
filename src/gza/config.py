@@ -1001,8 +1001,10 @@ class Config:
         )
 
         # Parse theme and ad-hoc color overrides.
-        from .colors import BUILT_IN_THEMES  # noqa: PLC0415
-        from .colors import set_theme as _set_theme
+        from .colors import (
+            BUILT_IN_THEMES,  # noqa: PLC0415
+            set_theme as _set_theme,
+        )
 
         theme_name: str | None = data.get("theme", "minimal")
         if theme_name is not None:

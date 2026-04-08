@@ -18,8 +18,7 @@ from ..colors import (
 )
 from ..config import Config
 from ..console import console, format_duration, truncate
-from ..db import SqliteTaskStore
-from ..db import Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import _parse_iso, get_store
 
@@ -263,8 +262,7 @@ class _LiveLogPrinter:
     """
 
     def __init__(self, *, live: bool = True) -> None:
-        from ..providers.output_formatter import StreamOutputFormatter
-        from ..providers.output_formatter import truncate_text as _trunc
+        from ..providers.output_formatter import StreamOutputFormatter, truncate_text as _trunc
         self._fmt = StreamOutputFormatter(console=console)
         self._trunc = _trunc
         self._live = live

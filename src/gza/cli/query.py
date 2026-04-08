@@ -16,8 +16,6 @@ import gza.colors as _colors
 
 from ..colors import (
     LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS,
-)
-from ..colors import (
     NEXT_COLORS_DICT,
     PS_STATUS_COLORS,
     SHOW_COLORS_DICT,
@@ -33,25 +31,14 @@ from ..console import (
     shorten_prompt,
     truncate,
 )
-from ..db import SqliteTaskStore
-from ..db import Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git
 from ..query import (
     TaskLineageNode,
-)
-from ..query import (
     build_lineage_tree as _build_lineage_tree_for_root,
-)
-from ..query import (
     filter_lineage_tree as _filter_lineage_tree,
-)
-from ..query import (
     get_improves_for_root as _get_improves_for_root_task,
-)
-from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
-)
-from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task

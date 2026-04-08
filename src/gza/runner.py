@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 from .branch_naming import generate_branch_name
 from .colors import UNMERGED_COLORS_DICT
@@ -62,7 +63,7 @@ def _persist_run_steps_from_result(
     accumulated = getattr(result, "_accumulated_data", None)
     if not isinstance(accumulated, dict):
         return False
-    events = accumulated.get("run_step_events")
+    events: list[Any] = accumulated.get("run_step_events")  # type: ignore[assignment]
     if not isinstance(events, list):
         return False
     store.set_log_schema_version(run_id, 2)
@@ -80,7 +81,7 @@ def _persist_run_steps_from_result(
         if fallback_outcome is not None:
             for event in reversed(events):
                 if isinstance(event, dict):
-                    event["outcome"] = fallback_outcome
+                    cast(dict[str, Any], event)["outcome"] = fallback_outcome
                     break
 
     for event in events:

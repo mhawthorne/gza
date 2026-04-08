@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Auto-fix linting issues in the project source.
+# For CI/verification without auto-fix, use bin/tests or verify_command from gza.yaml.
+set -euo pipefail
+
+uv run ruff check --fix src/gza/

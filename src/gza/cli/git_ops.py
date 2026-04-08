@@ -12,11 +12,7 @@ from pathlib import Path
 import gza.colors as _colors
 from gza.query import (
     get_base_task_slug as _get_base_task_slug,
-)
-from gza.query import (
     get_improves_for_root as _get_improves_for_root_task,
-)
-from gza.query import (
     get_reviews_for_root as _get_reviews_for_root_task,
 )
 
@@ -32,8 +28,7 @@ from ..console import (
     shorten_prompt,
     truncate,
 )
-from ..db import SqliteTaskStore
-from ..db import Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
 from ..prompts import PromptBuilder

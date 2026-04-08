@@ -11,8 +11,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from gza.db import SqliteTaskStore, Task
-from gza.task_slug import get_base_task_slug as _get_base_task_slug
-from gza.task_slug import get_task_slug as _get_task_slug_from_task_id
+from gza.task_slug import get_base_task_slug as _get_base_task_slug, get_task_slug as _get_task_slug_from_task_id
 
 
 @dataclass

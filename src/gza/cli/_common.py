@@ -19,11 +19,12 @@ from ..console import (
     MAX_PROMPT_DISPLAY,
     truncate,
 )
-from ..db import SqliteTaskStore
-from ..db import Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask
 from ..prompts import PromptBuilder
-from ..review_tasks import DuplicateReviewError  # noqa: F401
-from ..review_tasks import create_review_task
+from ..review_tasks import (
+    DuplicateReviewError,  # noqa: F401
+    create_review_task,
+)
 from ..review_verdict import parse_review_verdict
 from ..runner import run
 from ..tmux_proxy import get_tmux_session_pid
