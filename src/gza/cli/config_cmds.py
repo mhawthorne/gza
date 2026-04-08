@@ -4,9 +4,12 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 
 from ..config import Config
 from ..console import console, format_duration, get_terminal_width
@@ -128,6 +131,304 @@ def _cmd_stats_cycles_task(config: Config, store: "SqliteTaskStore", impl_task_i
     return 0
 
 
+def _percentile(sorted_vals: list[int], p: float) -> int:
+    """Return the value at the p-th percentile (nearest-rank method)."""
+    if not sorted_vals:
+        return 0
+    k = max(0, min(len(sorted_vals) - 1, int(len(sorted_vals) * p / 100 + 0.5) - 1))
+    return sorted_vals[k]
+
+
+def _count_section_items(content: str, header_pattern: str) -> int:
+    """Count top-level list items under a section matching header_pattern."""
+    lines = content.split("\n")
+    i = 0
+    count = 0
+    while i < len(lines):
+        if re.match(header_pattern, lines[i].strip(), re.IGNORECASE):
+            i += 1
+            in_numbered = False
+            while i < len(lines):
+                line = lines[i]
+                stripped = line.strip()
+                if stripped == "":
+                    i += 1
+                    continue
+                if re.match(r"^\d+\.\s", stripped):
+                    count += 1
+                    in_numbered = True
+                    i += 1
+                elif line.startswith("- "):
+                    if in_numbered:
+                        i += 1
+                    else:
+                        item_text = stripped[2:].strip().rstrip(".")
+                        if item_text.lower() != "none":
+                            count += 1
+                        i += 1
+                elif line.startswith("  ") or line.startswith("\t"):
+                    i += 1
+                else:
+                    break
+        else:
+            i += 1
+    return count
+
+
+def _count_review_issues(content: str) -> tuple[int, int]:
+    """Parse review markdown and return (must_fix_count, suggestion_count)."""
+    if not content:
+        return 0, 0
+    must_fix = len(re.findall(r"^###\s+(?:M?\d+[\.\s\u2014\u2013-]|Issue\s+\d+)", content, re.MULTILINE))
+    suggestions = len(re.findall(r"^###\s+S\d+[\.\s\u2014\u2013-]", content, re.MULTILINE))
+    if must_fix == 0:
+        must_fix = _count_section_items(content, r"^(?:#+\s*)?must[- ]?fix(?:\s+issues?)?$")
+    if suggestions == 0:
+        suggestions = _count_section_items(content, r"^(?:#+\s*)?suggestions?$")
+    return must_fix, suggestions
+
+
+def _cmd_stats_reviews(
+    config: "Config",
+    store: "SqliteTaskStore",
+    start_date: date,
+    end_date: date,
+    show_issues: bool,
+) -> int:
+    """Show review/improve cycle stats per implementation task."""
+    all_tasks = store.get_all()
+    tasks_by_id = {t.id: t for t in all_tasks if t.id is not None}
+
+    start_dt = datetime(start_date.year, start_date.month, start_date.day)
+    end_dt = datetime(end_date.year, end_date.month, end_date.day) + timedelta(days=1)
+
+    def _task_dt(t: Task) -> datetime | None:
+        if t.created_at is None:
+            return None
+        if t.created_at.tzinfo is not None:
+            return t.created_at.replace(tzinfo=None)
+        return t.created_at
+
+    def find_root_impl(task_id: int, visited: set[int] | None = None) -> int | None:
+        """Walk up based_on/depends_on chains to find the root implement task."""
+        if visited is None:
+            visited = set()
+        if task_id in visited:
+            return None
+        visited.add(task_id)
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            return None
+        for parent_id in (task.based_on, task.depends_on):
+            if parent_id:
+                parent = tasks_by_id.get(parent_id)
+                if parent and parent.task_type == "implement":
+                    root = find_root_impl(parent_id, visited)
+                    return root if root is not None else parent_id
+        if task.task_type == "implement":
+            return task_id
+        return None
+
+    def week_label(dt: datetime) -> str:
+        monday = dt.date() - timedelta(days=dt.weekday())
+        sunday = monday + timedelta(days=6)
+        return f"{monday.strftime('%b %d')} - {sunday.strftime('%b %d')}"
+
+    def week_sort_key(label: str) -> date:
+        today = date.today()
+        parts = label.split(" - ")
+        return datetime.strptime(parts[0] + f" {today.year}", "%b %d %Y").date()
+
+    # Find review/improve tasks in date range that have a parent link
+    ri_tasks = [
+        t for t in all_tasks
+        if t.task_type in ("review", "improve")
+        and (t.based_on is not None or t.depends_on is not None)
+        and _task_dt(t) is not None
+        and start_dt <= _task_dt(t) < end_dt  # type: ignore[operator]
+    ]
+
+    # Count reviews per root impl, tracking models
+    root_reviews: dict[int, list[datetime]] = defaultdict(list)
+    root_review_models: dict[int, list[str | None]] = defaultdict(list)
+    for ri in ri_tasks:
+        parent_id = ri.depends_on or ri.based_on
+        if parent_id is None:
+            continue
+        root = find_root_impl(parent_id)
+        if root is None:
+            continue
+        if ri.task_type == "review":
+            dt = _task_dt(ri)
+            if dt:
+                root_reviews[root].append(dt)
+                root_review_models[root].append(ri.model)
+
+    # Find all root implement tasks in range
+    root_impls_in_range: list[Task] = []
+    seen_roots: set[int] = set()
+    for t in all_tasks:
+        if t.task_type not in ("implement", "improve"):
+            continue
+        dt = _task_dt(t)
+        if dt is None or dt < start_dt or dt >= end_dt:
+            continue
+        root = find_root_impl(t.id)  # type: ignore[arg-type]
+        if root is not None and root not in seen_roots:
+            seen_roots.add(root)
+            root_impl = tasks_by_id.get(root)
+            if root_impl is not None:
+                root_impls_in_range.append(root_impl)
+
+    total_impls = len(root_impls_in_range)
+    total_reviews = sum(len(dates) for dates in root_reviews.values())
+    reviewed_impls = {r for r in root_reviews if r in seen_roots}
+    review_pct = (len(reviewed_impls) / total_impls * 100) if total_impls else 0
+
+    # Group by week
+    week_data: dict[str, dict] = defaultdict(lambda: {"impls": 0, "reviews": 0, "reviewed_cycles": []})
+    for impl in root_impls_in_range:
+        dt = _task_dt(impl)
+        if dt:
+            week_data[week_label(dt)]["impls"] += 1
+    for root_id, review_dates in root_reviews.items():
+        if root_id not in seen_roots:
+            continue
+        root_impl = tasks_by_id.get(root_id)
+        if root_impl is None:
+            continue
+        dt = _task_dt(root_impl)
+        if dt is None:
+            continue
+        wk = week_label(dt)
+        week_data[wk]["reviews"] += len(review_dates)
+        week_data[wk]["reviewed_cycles"].append(len(review_dates))
+
+    sorted_weeks = sorted(week_data.keys(), key=week_sort_key)
+
+    print(f"\nReview cycle stats ({start_date} to {end_date})")
+    print(f"  Implement tasks: {total_impls}")
+    print(f"  Total reviews:   {total_reviews}")
+    print(f"  Reviewed:        {len(reviewed_impls)}/{total_impls} ({review_pct:.0f}%)")
+
+    print(f"\n{'Week':<22} {'Impls':>5} {'Rvws':>5} {'Rv%':>5} {'Med':>5} {'P90':>5} {'Max':>5}")
+    print("-" * 56)
+
+    all_reviewed_cycles: list[int] = []
+    total_row_impls = 0
+    total_row_reviews = 0
+
+    for wk in sorted_weeks:
+        d = week_data[wk]
+        total_row_impls += d["impls"]
+        total_row_reviews += d["reviews"]
+        cycles = sorted(d["reviewed_cycles"])
+        all_reviewed_cycles.extend(cycles)
+        rv_pct = (len(cycles) / d["impls"] * 100) if d["impls"] else 0
+        if cycles:
+            med = int(median(cycles))
+            p90 = _percentile(cycles, 90)
+            mx = max(cycles)
+            print(f"{wk:<22} {d['impls']:>5} {d['reviews']:>5} {rv_pct:>4.0f}% {med:>5} {p90:>5} {mx:>5}")
+        else:
+            print(f"{wk:<22} {d['impls']:>5} {d['reviews']:>5} {rv_pct:>4.0f}%     -     -     -")
+
+    if len(sorted_weeks) > 1:
+        all_reviewed_cycles.sort()
+        print("-" * 56)
+        rv_pct = (len(all_reviewed_cycles) / total_row_impls * 100) if total_row_impls else 0
+        if all_reviewed_cycles:
+            med = int(median(all_reviewed_cycles))
+            p90 = _percentile(all_reviewed_cycles, 90)
+            mx = max(all_reviewed_cycles)
+            print(f"{'Total':<22} {total_row_impls:>5} {total_row_reviews:>5} {rv_pct:>4.0f}% {med:>5} {p90:>5} {mx:>5}")
+        else:
+            print(f"{'Total':<22} {total_row_impls:>5} {total_row_reviews:>5} {rv_pct:>4.0f}%     -     -     -")
+
+    # Cycle distribution
+    if all_reviewed_cycles:
+        dist = Counter(all_reviewed_cycles)
+        total = len(all_reviewed_cycles)
+        print(f"\nCycle distribution (reviewed tasks only):")
+        for cnt in sorted(dist.keys()):
+            pct = dist[cnt] / total * 100
+            bar = "#" * dist[cnt]
+            print(f"  {cnt} cycles: {dist[cnt]:>3} ({pct:4.0f}%)  {bar}")
+
+    # Per-model review cycle stats
+    model_cycles: dict[str, list[int]] = defaultdict(list)
+    for root_id in reviewed_impls:
+        models = root_review_models.get(root_id, [])
+        cycle_count = len(root_reviews[root_id])
+        model_counts = Counter(m for m in models if m)
+        model = model_counts.most_common(1)[0][0] if model_counts else "unknown"
+        model_cycles[model].append(cycle_count)
+
+    def _cycle_stats_str(vals: list[int]) -> str:
+        return f"{int(median(vals))}/{_percentile(vals, 75)}/{_percentile(vals, 90)}/{max(vals)}"
+
+    if model_cycles:
+        print(f"\n{'Review model':<35} {'Impls':>5}  {'med/p75/p90/max':>16}")
+        print("-" * 60)
+        for model in sorted(model_cycles):
+            cycles_sorted = sorted(model_cycles[model])
+            print(f"{model:<35} {len(cycles_sorted):>5}  {_cycle_stats_str(cycles_sorted):>16}")
+
+    # Per-model issue counts (--issues mode)
+    if show_issues:
+        review_content = {
+            t.id: t.output_content
+            for t in all_tasks
+            if t.task_type == "review"
+            and t.output_content is not None
+            and t.id is not None
+            and _task_dt(t) is not None
+            and start_dt <= _task_dt(t) < end_dt  # type: ignore[operator]
+        }
+        print(f"\nParsing issue counts from {len(review_content)} review(s)...")
+        model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        unparsed: list[int] = []
+        for ri in ri_tasks:
+            if ri.task_type != "review":
+                continue
+            content = review_content.get(ri.id)  # type: ignore[arg-type]
+            if content is None:
+                continue
+            must_fix, sugg = _count_review_issues(content)
+            if must_fix == 0 and sugg == 0:
+                unparsed.append(ri.id)  # type: ignore[arg-type]
+            model = ri.model or "unknown"
+            model_issues[model].append((must_fix, sugg))
+        if unparsed:
+            ids = ", ".join(f"#{i}" for i in unparsed)
+            print(f"\nwarning: could not parse issues from {len(unparsed)} review(s): {ids}", file=sys.stderr)
+        if model_issues:
+            def _stats_str(vals: list[int]) -> str:
+                return f"{int(median(vals))}/{_percentile(vals, 75)}/{_percentile(vals, 90)}/{max(vals)}"
+
+            print(f"\nIssue counts per review (parsed from markdown)")
+            print(f"{'Review model':<35} {'Rvws':>5}  {'Must-fix':>16}  {'Suggestions':>16}")
+            print(f"{'':35} {'':>5}  {'med/p75/p90/max':>16}  {'med/p75/p90/max':>16}")
+            print("-" * 77)
+            all_fixes: list[int] = []
+            all_suggs: list[int] = []
+            for model in sorted(model_issues):
+                pairs = model_issues[model]
+                n = len(pairs)
+                fixes = sorted(mf for mf, _ in pairs)
+                suggs = sorted(sg for _, sg in pairs)
+                all_fixes.extend(fixes)
+                all_suggs.extend(suggs)
+                print(f"{model:<35} {n:>5}  {_stats_str(fixes):>16}  {_stats_str(suggs):>16}")
+            if len(model_issues) > 1:
+                all_fixes.sort()
+                all_suggs.sort()
+                print("-" * 77)
+                print(f"{'Total':<35} {len(all_fixes):>5}  {_stats_str(all_fixes):>16}  {_stats_str(all_suggs):>16}")
+
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     """Show cost and usage statistics."""
     from gza.query import HistoryFilter, query_history
@@ -135,17 +436,33 @@ def cmd_stats(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    show_cycles: bool = getattr(args, 'cycles', False)
+    stats_subcommand: str | None = getattr(args, 'stats_subcommand', None)
     as_json: bool = getattr(args, 'json', False)
-    cycle_task_id: int | None = getattr(args, 'cycle_task_id', None)
 
-    # --cycles mode: show cycle analytics
-    if show_cycles:
+    # cycles subcommand
+    if stats_subcommand == "cycles":
+        cycle_task_id: int | None = getattr(args, 'cycle_task_id', None)
         if cycle_task_id is not None:
             return _cmd_stats_cycles_task(config, store, cycle_task_id, as_json)
         return _cmd_stats_cycles(config, store, as_json)
 
-    # Build filter from shared query args
+    # reviews subcommand
+    if stats_subcommand == "reviews":
+        today = date.today()
+        raw_end: str | None = getattr(args, 'end_date', None)
+        raw_start: str | None = getattr(args, 'start_date', None)
+        raw_days: int | None = getattr(args, 'days', None)
+        end_date_r = datetime.strptime(raw_end, "%Y-%m-%d").date() if raw_end else today
+        if raw_start:
+            start_date_r = datetime.strptime(raw_start, "%Y-%m-%d").date()
+        elif raw_days:
+            start_date_r = end_date_r - timedelta(days=raw_days)
+        else:
+            start_date_r = end_date_r - timedelta(days=14)
+        show_issues: bool = getattr(args, 'issues', False)
+        return _cmd_stats_reviews(config, store, start_date_r, end_date_r, show_issues)
+
+    # Build filter from shared query args (default stats view)
     limit: int | None = None if getattr(args, 'all', False) else getattr(args, 'last', 5)
     task_type: str | None = getattr(args, 'type', None)
     days: int | None = getattr(args, 'days', None)
