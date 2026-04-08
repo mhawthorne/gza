@@ -115,6 +115,63 @@ class TestDockerConfig:
         assert "GOOGLE_API_KEY" in config.env_vars
         assert "GOOGLE_APPLICATION_CREDENTIALS" in config.env_vars
 
+    def test_claude_provider_uses_per_provider_image_tag(self, tmp_path):
+        """ClaudeProvider should append '-claude' to docker_image for its image tag."""
+        from unittest.mock import patch, MagicMock
+        from gza.providers.claude import ClaudeProvider
+        from gza.config import Config
+
+        provider = ClaudeProvider()
+        config = Config(project_dir=tmp_path, project_name="myproj", provider="claude", use_docker=True)
+        config.docker_image = "myproj-gza"
+
+        with patch("gza.providers.claude._get_docker_config") as mock_get_cfg, \
+             patch("gza.providers.claude.ensure_docker_image", return_value=True), \
+             patch("gza.providers.claude.build_docker_cmd", return_value=["docker"]), \
+             patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)):
+            mock_get_cfg.return_value = MagicMock(image_name="myproj-gza-claude", cli_command="claude", env_vars=[])
+            provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
+
+        mock_get_cfg.assert_called_once_with("myproj-gza-claude")
+
+    def test_codex_provider_uses_per_provider_image_tag(self, tmp_path):
+        """CodexProvider should append '-codex' to docker_image for its image tag."""
+        from unittest.mock import patch, MagicMock
+        from gza.providers.codex import CodexProvider
+        from gza.config import Config
+
+        provider = CodexProvider()
+        config = Config(project_dir=tmp_path, project_name="myproj", provider="codex", use_docker=True)
+        config.docker_image = "myproj-gza"
+
+        with patch("gza.providers.codex._get_docker_config") as mock_get_cfg, \
+             patch("gza.providers.codex.ensure_docker_image", return_value=True), \
+             patch("gza.providers.codex.build_docker_cmd", return_value=["docker"]), \
+             patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)):
+            mock_get_cfg.return_value = MagicMock(image_name="myproj-gza-codex", cli_command="codex", env_vars=[])
+            provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
+
+        mock_get_cfg.assert_called_once_with("myproj-gza-codex")
+
+    def test_gemini_provider_uses_per_provider_image_tag(self, tmp_path):
+        """GeminiProvider should append '-gemini' to docker_image for its image tag."""
+        from unittest.mock import patch, MagicMock
+        from gza.providers.gemini import GeminiProvider
+        from gza.config import Config
+
+        provider = GeminiProvider()
+        config = Config(project_dir=tmp_path, project_name="myproj", provider="gemini", use_docker=True)
+        config.docker_image = "myproj-gza"
+
+        with patch("gza.providers.gemini._get_docker_config") as mock_get_cfg, \
+             patch("gza.providers.gemini.ensure_docker_image", return_value=True), \
+             patch("gza.providers.gemini.build_docker_cmd", return_value=["docker", "run", "--rm", "myproj-gza-gemini"]), \
+             patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)):
+            mock_get_cfg.return_value = MagicMock(image_name="myproj-gza-gemini", cli_command="gemini", env_vars=[])
+            provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
+
+        mock_get_cfg.assert_called_once_with("myproj-gza-gemini")
+
 
 class TestProviderCommandLogging:
     """Tests for provider command logging output."""
@@ -2636,47 +2693,12 @@ class TestEnsureDockerImage:
         image_time = dockerfile_mtime + 100  # Image created after Dockerfile
 
         with patch("gza.providers.base._get_image_created_time", return_value=image_time):
-            with patch("gza.providers.base._get_image_label", return_value="testcli"):
-                with patch("gza.providers.base.subprocess.run") as mock_run:
-                    result = ensure_docker_image(docker_config, tmp_path)
+            with patch("gza.providers.base.subprocess.run") as mock_run:
+                result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is True
         # subprocess.run should NOT be called (no build needed)
         mock_run.assert_not_called()
-
-    def test_rebuilds_when_image_label_mismatch(self, tmp_path):
-        """Should rebuild image when existing tag was built for another CLI."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@openai/codex",
-            cli_command="codex",
-            config_dir=None,
-            env_vars=[],
-        )
-
-        # Create Dockerfile
-        etc_dir = tmp_path / "etc"
-        etc_dir.mkdir()
-        dockerfile = etc_dir / "Dockerfile.codex"
-        dockerfile.write_text("FROM node:20-slim")
-
-        # Image exists and is newer, but label mismatch should still rebuild
-        dockerfile_mtime = dockerfile.stat().st_mtime
-        image_time = dockerfile_mtime + 100
-
-        with patch("gza.providers.base._get_image_created_time", return_value=image_time):
-            with patch("gza.providers.base._get_image_label", return_value="claude"):
-                with patch("gza.providers.base.subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=0)
-                    result = ensure_docker_image(docker_config, tmp_path)
-
-        assert result is True
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args[0][0]
-        assert call_args[:3] == ["docker", "build", "-t"]
-        assert "--label" in call_args
-        assert "gza.cli_command=codex" in call_args
-        assert "gza.npm_package=@openai/codex" in call_args
 
     def test_rebuilds_when_dockerfile_newer(self, tmp_path):
         """Should rebuild image when Dockerfile is newer than image."""
@@ -2699,10 +2721,9 @@ class TestEnsureDockerImage:
         image_time = dockerfile_mtime - 100  # Image created before Dockerfile
 
         with patch("gza.providers.base._get_image_created_time", return_value=image_time):
-            with patch("gza.providers.base._get_image_label", return_value="testcli"):
-                with patch("gza.providers.base.subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=0)
-                    result = ensure_docker_image(docker_config, tmp_path)
+            with patch("gza.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is True
         # Verify docker build was called
