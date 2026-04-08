@@ -684,7 +684,7 @@ def main() -> int:
         "--based-on",
         type=int,
         metavar="ID",
-        help="Base this task on a previous task's output (sets depends_on field)",
+        help="Set lineage/parent relationship (based_on field, used for branch inheritance and context)",
     )
     add_parser.add_argument(
         "--depends-on",
@@ -749,7 +749,14 @@ def main() -> int:
         dest="based_on_flag",
         type=int,
         metavar="ID",
-        help="Set dependency on another task",
+        help="Set lineage/parent relationship (based_on field, used for branch inheritance and context)",
+    )
+    edit_parser.add_argument(
+        "--depends-on",
+        dest="depends_on_flag",
+        type=int,
+        metavar="ID",
+        help="Set execution dependency (depends_on field, blocks task until dependency completes)",
     )
     edit_parser.add_argument(
         "--explore",
