@@ -6,6 +6,8 @@ after a quiescence timeout. When a human attaches, all I/O passes through
 to the terminal.
 """
 
+import errno
+import fcntl
 import logging
 import os
 import pty
@@ -87,7 +89,6 @@ class TmuxProxy:
         # Forward SIGWINCH (terminal resize) to the child PTY
         def _forward_sigwinch(signum: int, frame: object) -> None:
             try:
-                import fcntl
                 import termios
                 winsize = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
                 fcntl.ioctl(pty_fd, termios.TIOCSWINSZ, winsize)
@@ -125,6 +126,22 @@ class TmuxProxy:
         if self.prompt_file:
             self._write_prompt_to_pty(pty_fd)
 
+        # Set stdout to non-blocking so writes to the tmux pane never block.
+        # If the pane buffer is full, we drop output rather than deadlocking
+        # (the proxy must keep draining the child PTY to prevent the child from
+        # blocking on its own writes).
+        stdout_fd = sys.stdout.fileno()
+        orig_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl | os.O_NONBLOCK)
+
+        try:
+            return self._io_loop_inner(child_pid, pty_fd, stdout_fd)
+        finally:
+            # Restore blocking mode so final cleanup writes don't fail with EAGAIN
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl)
+
+    def _io_loop_inner(self, child_pid: int, pty_fd: int, stdout_fd: int) -> int:
+        """Inner I/O loop with non-blocking stdout."""
         # Track whether a human was attached on the previous iteration
         _prev_has_human = self._has_human()
         _first_output = True
@@ -155,11 +172,7 @@ class TmuxProxy:
                         if not data:
                             # EOF from child PTY → child has exited
                             return self._reap(child_pid)
-                        try:
-                            sys.stdout.buffer.write(data)
-                            sys.stdout.buffer.flush()
-                        except (OSError, BrokenPipeError):
-                            pass
+                        self._write_stdout(stdout_fd, data)
                         self.last_output_time = time.monotonic()
                         if _first_output:
                             logger.info("First output received from child process")
@@ -236,12 +249,35 @@ class TmuxProxy:
         self._drain_pty(pty_fd)
         return self._reap(child_pid)
 
+    @staticmethod
+    def _write_stdout(stdout_fd: int, data: bytes) -> None:
+        """Write data to stdout (non-blocking). Drops data on EAGAIN rather than blocking.
+
+        This prevents deadlock: if the tmux pane buffer is full, we drop output
+        so the proxy keeps draining the child PTY.  Lost output in the tmux pane
+        is cosmetic; a blocked proxy deadlocks the entire task.
+        """
+        try:
+            os.write(stdout_fd, data)
+        except OSError as e:
+            if e.errno == errno.EAGAIN:
+                logger.debug("stdout would block, dropping %d bytes", len(data))
+            elif e.errno == errno.EPIPE:
+                pass  # broken pipe, session gone
+            else:
+                raise
+
     def _drain_pty(self, pty_fd: int) -> None:
         """Read and forward any output still buffered in the PTY after the child exits.
 
         Uses a zero-timeout ``select`` poll so this never blocks.  Called from
         both the WNOHANG early-exit path and from the break paths at the bottom
         of ``_io_loop``, ensuring no terminal output is silently dropped.
+
+        Note: this may be called after stdout has been restored to blocking mode
+        (from the finally block in _io_loop), so it uses sys.stdout.buffer.write
+        which is acceptable here since the child has already exited and there is
+        no deadlock risk.
         """
         while True:
             try:

@@ -4309,6 +4309,59 @@ class TestAdvanceCommand:
         assert len(first_resume_children) == 1
 
 
+    def test_advance_new_batch_spawns_distinct_tasks(self, tmp_path: Path):
+        """advance --new --batch N spawns a separate worker for each pending task.
+
+        Regression: previously all N workers were spawned without explicit task IDs,
+        so each one peeked at get_next_pending() and all displayed/claimed the same task.
+        """
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        self._setup_git_repo(tmp_path)
+
+        # Create 4 pending tasks
+        t1 = store.add("Task one", task_type="implement")
+        t2 = store.add("Task two", task_type="implement")
+        t3 = store.add("Task three", task_type="implement")
+        t4 = store.add("Task four", task_type="implement")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=4,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        spawned_task_ids: list[int | None] = []
+
+        def fake_spawn(_args, _config, task_id=None, quiet=False):
+            spawned_task_ids.append(task_id)
+            return 0
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        # Each of the 4 pending tasks should have been passed as an explicit task_id
+        assert len(spawned_task_ids) == 4
+        assert set(spawned_task_ids) == {t1.id, t2.id, t3.id, t4.id}
+
+
 class TestAdvanceMergeSquashThreshold:
     """Tests for merge_squash_threshold feature in gza advance."""
 

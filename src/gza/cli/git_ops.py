@@ -1930,15 +1930,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # --new: start pending tasks to fill remaining batch slots
     new_started = 0
     if new_mode and batch_limit is not None and workers_started < batch_limit:
-        remaining = batch_limit - workers_started
-        for _ in range(remaining):
+        # Use the pre-fetched new_pending_tasks list so each worker gets a
+        # distinct task.  If we didn't pre-fetch (e.g. no confirmation prompt
+        # was shown), fetch now.
+        if not new_pending_tasks:
+            remaining = batch_limit - workers_started
+            new_pending_tasks = store.get_pending(limit=remaining)
+        for pt in new_pending_tasks:
+            if workers_started >= batch_limit:
+                break
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
             )
-            rc = _spawn_background_worker(worker_args, config, quiet=True)
+            rc = _spawn_background_worker(worker_args, config, task_id=pt.id, quiet=True)
             if rc != 0:
-                break  # no more pending tasks or error
+                break  # error spawning
             new_started += 1
             workers_started += 1
 

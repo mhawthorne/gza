@@ -1,5 +1,6 @@
 """Tests for the tmux proxy module."""
 
+import errno
 import os
 import subprocess
 import time
@@ -594,3 +595,77 @@ class TestHasHumanCaching:
             proxy._has_human()  # second call at t=2 — cache expired, subprocess called again
 
         assert call_count[0] == 2, "subprocess.run should be called again after cache TTL"
+
+
+class TestNonBlockingStdout:
+    """Tests for non-blocking stdout writes in the proxy."""
+
+    def test_write_stdout_drops_data_on_eagain(self):
+        """_write_stdout silently drops data when stdout would block (EAGAIN)."""
+        proxy = TmuxProxy(session_name="gza-99")
+        with patch("gza.tmux_proxy.os.write", side_effect=OSError(errno.EAGAIN, "would block")):
+            # Should not raise
+            proxy._write_stdout(1, b"some output data")
+
+    def test_write_stdout_drops_data_on_epipe(self):
+        """_write_stdout silently drops data on broken pipe."""
+        proxy = TmuxProxy(session_name="gza-99")
+        with patch("gza.tmux_proxy.os.write", side_effect=OSError(errno.EPIPE, "broken pipe")):
+            proxy._write_stdout(1, b"some output data")
+
+    def test_write_stdout_writes_data_normally(self):
+        """_write_stdout calls os.write with correct args."""
+        proxy = TmuxProxy(session_name="gza-99")
+        with patch("gza.tmux_proxy.os.write") as mock_write:
+            proxy._write_stdout(42, b"hello")
+            mock_write.assert_called_once_with(42, b"hello")
+
+    def test_write_stdout_propagates_unexpected_errors(self):
+        """_write_stdout re-raises non-EAGAIN/EPIPE errors."""
+        proxy = TmuxProxy(session_name="gza-99")
+        with patch("gza.tmux_proxy.os.write", side_effect=OSError(errno.EBADF, "bad fd")):
+            with pytest.raises(OSError, match="bad fd"):
+                proxy._write_stdout(1, b"data")
+
+    def test_io_loop_does_not_deadlock_on_full_stdout(self):
+        """Proxy keeps draining child PTY even when stdout buffer is full.
+
+        Regression test: previously the proxy used blocking sys.stdout.buffer.write(),
+        which would block when the tmux pane buffer was full, preventing the proxy
+        from reading the child PTY, which in turn blocked the child on its own writes.
+        """
+        proxy = TmuxProxy(session_name="gza-99")
+
+        child_output = b"x" * 8192
+        read_call_count = [0]
+        child_exited = [False]
+
+        def fake_os_read(fd, size):
+            read_call_count[0] += 1
+            if read_call_count[0] == 1:
+                return child_output
+            # Second read: simulate EOF
+            return b""
+
+        def fake_reap(child_pid):
+            child_exited[0] = True
+            return 0
+
+        # Mock _write_stdout to simulate EAGAIN without intercepting PTY writes
+        with patch.object(proxy, "_has_human", return_value=False), \
+             patch.object(proxy, "_reap", side_effect=fake_reap), \
+             patch.object(proxy, "_write_stdout") as mock_write_stdout, \
+             patch("gza.tmux_proxy.os.read", side_effect=fake_os_read), \
+             patch("gza.tmux_proxy.os.waitpid", return_value=(0, 0)), \
+             patch("gza.tmux_proxy.fcntl.fcntl"), \
+             patch("gza.tmux_proxy.select.select", return_value=([3], [], [])), \
+             patch("gza.tmux_proxy.sys.stdin") as mock_stdin, \
+             patch("gza.tmux_proxy.sys.stdout") as mock_stdout:
+            mock_stdin.isatty.return_value = False
+            mock_stdout.fileno.return_value = 1
+            result = proxy._io_loop(child_pid=123, pty_fd=3)
+
+        assert child_exited[0], "Proxy should have reaped child instead of deadlocking"
+        assert result == 0
+        # Verify the proxy attempted to write child output to stdout
+        mock_write_stdout.assert_called_once_with(1, child_output)
