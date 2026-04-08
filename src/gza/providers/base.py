@@ -176,32 +176,23 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     rebuild_reason: str | None = None
     image_time = _get_image_created_time(docker_config.image_name)
     if image_time is not None:
-        # Rebuild when an existing shared tag was built for a different CLI.
-        # This handles provider switches (e.g., claude -> codex) safely.
-        image_cli = _get_image_label(docker_config.image_name, "gza.cli_command")
-        if image_cli != docker_config.cli_command:
-            rebuild_reason = (
-                f"provider mismatch (image cli: {image_cli or 'unknown'}, "
-                f"requested cli: {docker_config.cli_command})"
-            )
-        else:
-            # Image exists - check if Dockerfile is newer
-            if dockerfile_path.exists():
-                dockerfile_time = dockerfile_path.stat().st_mtime
-                if dockerfile_time > image_time:
-                    rebuild_reason = f"{dockerfile_path.name} is newer than image"
-                else:
-                    print(
-                        f"Using Docker image {docker_config.image_name} "
-                        f"(up-to-date for {docker_config.cli_command})"
-                    )
-                    return True  # Image is up-to-date
+        # Image exists - check if Dockerfile is newer
+        if dockerfile_path.exists():
+            dockerfile_time = dockerfile_path.stat().st_mtime
+            if dockerfile_time > image_time:
+                rebuild_reason = f"{dockerfile_path.name} is newer than image"
             else:
                 print(
                     f"Using Docker image {docker_config.image_name} "
-                    f"(up-to-date for {docker_config.cli_command}; no {dockerfile_path.name} timestamp to compare)"
+                    f"(up-to-date for {docker_config.cli_command})"
                 )
-                return True  # No Dockerfile to compare, image exists
+                return True  # Image is up-to-date
+        else:
+            print(
+                f"Using Docker image {docker_config.image_name} "
+                f"(up-to-date for {docker_config.cli_command}; no {dockerfile_path.name} timestamp to compare)"
+            )
+            return True  # No Dockerfile to compare, image exists
     else:
         rebuild_reason = "image not found"
 

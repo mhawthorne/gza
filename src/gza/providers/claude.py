@@ -176,7 +176,7 @@ class ClaudeProvider(Provider):
         """Verify credentials work in Docker."""
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
-        docker_config = _get_docker_config(config.docker_image)
+        docker_config = _get_docker_config(f"{config.docker_image}-claude")
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
             return False
@@ -257,7 +257,7 @@ class ClaudeProvider(Provider):
         """Run Claude in Docker container."""
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
-        docker_config = _get_docker_config(config.docker_image)
+        docker_config = _get_docker_config(f"{config.docker_image}-claude")
 
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
