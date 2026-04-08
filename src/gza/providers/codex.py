@@ -164,7 +164,7 @@ class CodexProvider(Provider):
 
     def _verify_docker(self, config: Config) -> bool:
         """Verify credentials work in Docker."""
-        docker_config = _get_docker_config(config.docker_image)
+        docker_config = _get_docker_config(f"{config.docker_image}-codex")
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
             return False
@@ -227,7 +227,7 @@ class CodexProvider(Provider):
         on_step_count: Optional[Callable[[int], None]] = None,
     ) -> RunResult:
         """Run Codex in Docker container."""
-        docker_config = _get_docker_config(config.docker_image)
+        docker_config = _get_docker_config(f"{config.docker_image}-codex")
 
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
