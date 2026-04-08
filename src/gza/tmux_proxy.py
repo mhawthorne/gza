@@ -145,7 +145,7 @@ class TmuxProxy:
 
             try:
                 readable, _, _ = select.select(read_fds, [], [], 0.2)
-            except (OSError, select.error, ValueError):
+            except (OSError, ValueError):
                 break
 
             for fd in readable:
@@ -246,7 +246,7 @@ class TmuxProxy:
         while True:
             try:
                 readable, _, _ = select.select([pty_fd], [], [], 0.0)
-            except (OSError, select.error, ValueError):
+            except (OSError, ValueError):
                 break
             if not readable:
                 break

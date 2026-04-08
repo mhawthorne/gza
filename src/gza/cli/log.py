@@ -4,23 +4,23 @@ import argparse
 import json
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.markup import escape as rich_escape
 
 from ..colors import (
-    blue,
-    pink,
     LINEAGE_STATUS_COLORS,
     PS_STATUS_COLORS,
     SHOW_COLORS_DICT,
+    blue,
+    pink,
 )
 from ..config import Config
 from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import get_store, _parse_iso
+from ._common import _parse_iso, get_store
 
 
 def _lc() -> str:
@@ -599,7 +599,7 @@ def _format_log_entry(entry: dict) -> str | None:
 
 def _task_run_sort_key(task: DbTask) -> tuple[datetime, int]:
     """Sort key for selecting latest task run attempt deterministically."""
-    timestamp = task.started_at or task.completed_at or task.created_at or datetime.min.replace(tzinfo=timezone.utc)
+    timestamp = task.started_at or task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC)
     return (timestamp, task.id or -1)
 
 
@@ -766,7 +766,7 @@ def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMet
     workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
     if not workers:
         return None
-    workers.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
+    workers.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=UTC), w.worker_id))
     return workers[-1]
 
 
@@ -806,7 +806,7 @@ def _running_worker_id_for_task(registry: WorkerRegistry, task_id: int) -> str |
     running = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
     if not running:
         return None
-    running.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=timezone.utc), w.worker_id))
+    running.sort(key=lambda w: (_parse_iso(w.started_at) or datetime.min.replace(tzinfo=UTC), w.worker_id))
     return running[-1].worker_id
 
 
@@ -929,7 +929,7 @@ def cmd_log(args: argparse.Namespace) -> int:
             is_running = worker_id_for_follow is not None
 
     if not log_path:
-        print(f"Error: No log file found")
+        print("Error: No log file found")
         return 1
 
     if not log_path.exists():
@@ -1116,7 +1116,7 @@ def _tail_log_file(
                     console.print(rich_escape(line), soft_wrap=True)
 
         # Initial read
-        with open(log_path, 'r') as f:
+        with open(log_path) as f:
             lines = f.readlines()
         if tail_lines:
             lines = lines[-tail_lines:]
@@ -1135,7 +1135,7 @@ def _tail_log_file(
 
             current_size = log_path.stat().st_size
             if current_size > last_size:
-                with open(log_path, 'r') as f:
+                with open(log_path) as f:
                     lines = f.readlines()
 
                 new_lines = lines[last_line_count:]
@@ -1146,7 +1146,7 @@ def _tail_log_file(
             # Check if worker is still running
             if worker_id and not registry.is_running(worker_id):
                 time.sleep(0.5)
-                with open(log_path, 'r') as f:
+                with open(log_path) as f:
                     lines = f.readlines()
                 _process_lines(lines[last_line_count:])
                 break
@@ -1156,7 +1156,7 @@ def _tail_log_file(
                 latest_task = store.get(task_id)
                 if latest_task is None or latest_task.status != "in_progress":
                     time.sleep(0.5)
-                    with open(log_path, 'r') as f:
+                    with open(log_path) as f:
                         lines = f.readlines()
                     _process_lines(lines[last_line_count:])
                     break

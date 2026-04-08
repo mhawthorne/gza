@@ -13,12 +13,14 @@ mechanism and leave other sub-modules using the real implementation.
 import sys as _sys
 import types as _types
 
-from . import _common as _common_mod  # noqa: F401
-from . import config_cmds as _config_cmds_mod  # noqa: F401
-from . import execution as _execution_mod  # noqa: F401
-from . import git_ops as _git_ops_mod  # noqa: F401
-from . import log as _log_mod  # noqa: F401
-from . import query as _query_mod  # noqa: F401
+from . import (
+    _common as _common_mod,  # noqa: F401
+    config_cmds as _config_cmds_mod,  # noqa: F401
+    execution as _execution_mod,  # noqa: F401
+    git_ops as _git_ops_mod,  # noqa: F401
+    log as _log_mod,  # noqa: F401
+    query as _query_mod,  # noqa: F401
+)
 from .main import main  # noqa: F401
 
 # Sub-modules list for attribute propagation

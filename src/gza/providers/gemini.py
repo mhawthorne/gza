@@ -9,14 +9,14 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from .base import (
+    DockerConfig,
     Provider,
     RunResult,
-    DockerConfig,
-    ensure_docker_image,
     build_docker_cmd,
+    ensure_docker_image,
     verify_docker_credentials,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
@@ -159,8 +159,8 @@ class GeminiProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Gemini to execute a task."""
         # Note: Gemini doesn't currently support session resumption
@@ -174,7 +174,7 @@ class GeminiProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Gemini in Docker container."""
         image_name = f"{config.docker_image}-gemini"
@@ -213,7 +213,7 @@ class GeminiProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Gemini directly."""
         cmd = [
@@ -244,7 +244,7 @@ class GeminiProvider(Provider):
         cwd: Path | None = None,
         chat_text_display_length: int = 0,
         max_steps: int = 50,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
         formatter = StreamOutputFormatter()

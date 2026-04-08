@@ -2,7 +2,7 @@
 
 project_name: gza
 
-verify_command: 'uv run mypy src/ && uv run pytest tests/ -x -q'
+verify_command: 'uv run ruff check src/gza/ && uv run ty check src/gza/ && uv run mypy src/ && uv run pytest tests/ -x -q'
 
 branch_strategy: date_slug
 

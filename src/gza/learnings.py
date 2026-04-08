@@ -7,7 +7,7 @@ import re
 import subprocess
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -72,7 +72,7 @@ def _dedupe(items: list[str]) -> list[str]:
 
 def _format_learnings_markdown(learnings: list[str], task_count: int) -> str:
     """Format learnings as markdown."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         "# Project Learnings",
         "",
@@ -157,7 +157,7 @@ def _build_summarization_prompt(tasks: list[Task], existing_learnings: str = "")
 
 def _run_learnings_task(
     store: SqliteTaskStore,
-    config: "Config",
+    config: Config,
     recent_tasks: list[Task],
     existing_learnings: str = "",
 ) -> list[str] | None:
@@ -199,7 +199,7 @@ def _run_learnings_task(
     return learnings if learnings else None
 
 
-def _spawn_background_learnings_update(config: "Config", window: int) -> bool:
+def _spawn_background_learnings_update(config: Config, window: int) -> bool:
     """Start detached `gza learnings update` process.
 
     Returns True when spawning succeeds. Returns False if process creation
@@ -230,7 +230,7 @@ def _spawn_background_learnings_update(config: "Config", window: int) -> bool:
     return True
 
 
-def _append_history_entry(config: "Config", entry: dict) -> None:
+def _append_history_entry(config: Config, entry: dict) -> None:
     """Append a JSONL history record for learnings regeneration.
 
     Best-effort only: failures should not block task completion.
@@ -246,7 +246,7 @@ def _append_history_entry(config: "Config", entry: dict) -> None:
 
 def regenerate_learnings(
     store: SqliteTaskStore,
-    config: "Config",
+    config: Config,
     window: int = DEFAULT_LEARNINGS_WINDOW,
 ) -> LearningsResult:
     """Regenerate `.gza/learnings.md` from recent completed tasks."""
@@ -289,7 +289,7 @@ def regenerate_learnings(
     _append_history_entry(
         config,
         {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": datetime.now(UTC).isoformat(),
             "window": window,
             "tasks_used": len(recent_tasks),
             "learnings_count": len(learnings),
@@ -314,7 +314,7 @@ def regenerate_learnings(
 
 def maybe_auto_regenerate_learnings(
     store: SqliteTaskStore,
-    config: "Config",
+    config: Config,
     interval: int | None = None,
     window: int | None = None,
 ) -> LearningsResult | None:

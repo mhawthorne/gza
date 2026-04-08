@@ -3,10 +3,10 @@
 import shutil
 
 from rich.console import Console
-from rich.table import Table
+
+import gza.colors as _colors
 
 from .db import TaskStats
-import gza.colors as _colors
 
 __all__ = [
     "console",

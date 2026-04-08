@@ -11,9 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
-
-from ..config import APP_NAME
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -106,7 +104,6 @@ def _get_image_created_time(image_name: str) -> float | None:
     Returns:
         Unix timestamp of image creation, or None if image doesn't exist.
     """
-    import json
 
     result = subprocess.run(
         ["docker", "image", "inspect", image_name, "--format", "{{.Created}}"],
@@ -303,7 +300,7 @@ def build_docker_cmd(
                 pass
 
     # Always install a `gza` shim so bare `gza ...` works inside task containers.
-    setup_commands = [GZA_SHIM_SETUP_COMMAND.strip()]
+    setup_commands: list[str] = [GZA_SHIM_SETUP_COMMAND.strip()]
     if docker_setup_command.strip():
         setup_commands.append(docker_setup_command.strip())
     combined_setup_command = "\n".join(setup_commands)
@@ -395,7 +392,7 @@ def verify_docker_credentials(
             config_path = Path.home() / docker_config.config_dir
             if not config_path.exists():
                 print(f"\n  Hint: {config_path} directory not found")
-                print(f"  You may need to set the API key environment variable or run the login command")
+                print("  You may need to set the API key environment variable or run the login command")
 
         return False
     except subprocess.TimeoutExpired:
@@ -462,8 +459,8 @@ class Provider(ABC):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run the provider to execute a task.
 

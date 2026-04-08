@@ -6,46 +6,45 @@ import os
 import shutil
 import subprocess
 import sys
-
-logger = logging.getLogger(__name__)
 from datetime import datetime
 from pathlib import Path
 
-from ..config import Config
+import gza.colors as _colors
+from gza.query import (
+    get_base_task_slug as _get_base_task_slug,
+    get_improves_for_root as _get_improves_for_root_task,
+    get_reviews_for_root as _get_reviews_for_root_task,
+)
+
+from .. import runner as runner_mod
+from ..colors import pink
 from ..commit_messages import build_task_commit_message
+from ..config import Config
 from ..console import (
-    console,
-    truncate,
-    shorten_prompt,
-    prompt_available_width,
     MAX_PR_BODY_LENGTH,
     MAX_PR_TITLE_LENGTH,
+    console,
+    prompt_available_width,
+    shorten_prompt,
+    truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
 from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task, load_dotenv
-from .. import runner as runner_mod
-
-from gza.query import (
-    get_base_task_slug as _get_base_task_slug,
-    get_reviews_for_root as _get_reviews_for_root_task,
-    get_improves_for_root as _get_improves_for_root_task,
-)
-from ..colors import pink
-import gza.colors as _colors
-
 from ._common import (
     DuplicateReviewError,
-    _create_review_task,
-    get_store,
-    get_review_verdict,
-    _create_resume_task,
     _create_rebase_task,
-    _spawn_background_worker,
+    _create_resume_task,
+    _create_review_task,
     _spawn_background_resume_worker,
+    _spawn_background_worker,
+    get_review_verdict,
+    get_store,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -169,7 +168,7 @@ def _merge_single_task(
             rebase_target = current_branch
             if hasattr(args, 'remote') and args.remote:
                 # Fetch from origin first
-                print(f"Fetching from origin...")
+                print("Fetching from origin...")
                 git.fetch("origin")
                 print("✓ Fetched from origin")
                 rebase_target = f"origin/{current_branch}"
@@ -186,7 +185,6 @@ def _merge_single_task(
             print(f"✓ Fast-forwarded {current_branch} to {task.branch}")
         else:
             # Regular merge or squash merge
-            merge_type = "squash merging" if args.squash else "merging"
             print(f"Merging '{task.branch}' into '{current_branch}'...")
 
             # For squash merge, create a commit message from the task
@@ -418,6 +416,7 @@ def invoke_provider_resolve(
     --continue`` (rebase already in progress in the main working tree).
     """
     from dataclasses import replace
+
     from ..providers import get_provider
 
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
@@ -567,7 +566,6 @@ def cmd_rebase(args: argparse.Namespace) -> int:
 
     # Get current branch and determine rebase target
     current_branch = git.current_branch()
-    default_branch = git.default_branch()
     print(f"On branch {current_branch}")
 
     # Determine rebase target: use --onto if provided, else current branch
@@ -575,7 +573,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
 
     # Handle --remote flag
     if hasattr(args, 'remote') and args.remote:
-        print(f"Fetching from origin...")
+        print("Fetching from origin...")
         git.fetch("origin")
         print("✓ Fetched from origin")
         rebase_target = f"origin/{rebase_target}"
@@ -590,7 +588,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         stale_path = cleanup_worktree_for_branch(git, task.branch, force=True)
         if stale_path:
             print(f"Removing stale worktree at {stale_path}...")
-            print(f"✓ Removed worktree")
+            print("✓ Removed worktree")
         # Also clean up the target path if it still exists (may be an orphaned dir
         # not registered with git, in which case worktree_remove is a no-op).
         if worktree_path.exists():
@@ -685,7 +683,7 @@ def cmd_checkout(args: argparse.Namespace) -> int:
         worktree_path = cleanup_worktree_for_branch(git, branch, force=args.force)
         if worktree_path:
             print(f"Removing stale worktree at {worktree_path}...")
-            print(f"✓ Removed worktree")
+            print("✓ Removed worktree")
     except (ValueError, GitError) as e:
         print(f"Error: {e}")
         return 1

@@ -5,27 +5,26 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from ..query import get_base_task_slug as _get_base_task_slug
 from ..config import Config
 from ..console import format_duration
 from ..db import (
-    SqliteTaskStore,
     TaskCycle,
     add_task_interactive,
     edit_task_interactive,
     validate_prompt,
 )
 from ..git import Git
+from ..query import get_base_task_slug as _get_base_task_slug
 from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
-
 from ._common import (
     DuplicateReviewError,
     _create_improve_task,
     _create_resume_task,
     _create_review_task,
+    _run_as_worker,
     _run_foreground,
     _spawn_background_resume_worker,
     _spawn_background_worker,
@@ -33,8 +32,6 @@ from ._common import (
     get_review_verdict,
     get_store,
 )
-
-from ._common import _run_as_worker
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
@@ -198,7 +195,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         registry.mark_completed(worker_id, exit_code=0, status="completed")
         return 0
 
-    except Exception as e:
+    except Exception:
         # Clean up worker registration on exception
         registry.mark_completed(worker_id, exit_code=1, status="failed")
         raise
@@ -347,7 +344,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("Error: Cannot use both --prompt-file and --edit")
             return 1
         try:
-            with open(args.prompt_file, 'r') as f:
+            with open(args.prompt_file) as f:
                 prompt_text = f.read().strip()
         except FileNotFoundError:
             print(f"Error: File not found: {args.prompt_file}")
@@ -514,7 +511,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
             print("Error: Cannot use both --prompt-file and --prompt")
             return 1
         try:
-            with open(args.prompt_file, 'r') as f:
+            with open(args.prompt_file) as f:
                 new_prompt = f.read().strip()
         except FileNotFoundError:
             print(f"Error: File not found: {args.prompt_file}")
@@ -701,7 +698,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     task.status = args.status
 
     if args.status in ("completed", "failed", "dropped"):
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
     else:
         task.completed_at = None
 
@@ -895,7 +892,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     Loops: create+run review -> parse verdict -> if CHANGES_REQUESTED create+run improve -> repeat.
     Stops on APPROVED, max iterations reached, NEEDS_DISCUSSION, or failure.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     config = Config.load(args.project_dir)
     if hasattr(args, 'no_docker') and args.no_docker:
@@ -983,7 +980,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             review_task = _create_review_task(store, impl_task)
         except ValueError as e:
             print(f"  Error creating review: {e}")
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "review_failed"
             summary_rows.append((iteration, None, None, None))
@@ -1002,7 +999,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         rc = _run_foreground(config, task_id=review_task.id)
         if rc != 0:
             print(f"  Review #{review_task.id} failed (exit code {rc})")
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "review_failed"
             summary_rows.append((iteration, review_task.id, None, None))
@@ -1020,14 +1017,14 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"  Review #{review_task.id}: verdict={verdict or '(none)'}")
 
         if verdict == "APPROVED":
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "approved"
             final_stop_reason = "approved"
             summary_rows.append((iteration, review_task.id, verdict, None))
             break
 
         if verdict == "NEEDS_DISCUSSION" or verdict is None:
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "needs_discussion" if verdict == "NEEDS_DISCUSSION" else "no_verdict"
             summary_rows.append((iteration, review_task.id, verdict, None))
@@ -1036,7 +1033,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         # verdict == "CHANGES_REQUESTED"
         if iteration >= max_iterations - 1:
             # This was the last iteration
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "maxed_out"
             final_stop_reason = "max_iterations"
             summary_rows.append((iteration, review_task.id, verdict, None))
@@ -1050,7 +1047,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             improve_task = _create_improve_task(store, impl_task, review_task)
         except ValueError as e:
             print(f"  Error creating improve: {e}")
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "improve_failed"
             summary_rows.append((iteration, review_task.id, verdict, None))
@@ -1069,13 +1066,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         rc = _run_foreground(config, task_id=improve_task.id)
         if rc != 0:
             print(f"  Improve #{improve_task.id} failed (exit code {rc})")
-            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(timezone.utc))
+            store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "improve_failed"
             summary_rows.append((iteration, review_task.id, verdict, improve_task.id))
             break
 
-        store.update_cycle_iteration(iter_record.id, state="improve_completed", ended_at=datetime.now(timezone.utc))
+        store.update_cycle_iteration(iter_record.id, state="improve_completed", ended_at=datetime.now(UTC))
         summary_rows.append((iteration, review_task.id, verdict, improve_task.id))
 
         # Reviews in subsequent iterations still target the original impl_task because

@@ -9,25 +9,25 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
-from collections.abc import Callable
-
-logger = logging.getLogger(__name__)
+from typing import TYPE_CHECKING, Any
 
 from .base import (
+    DockerConfig,
     Provider,
     RunResult,
-    DockerConfig,
-    ensure_docker_image,
     build_docker_cmd,
+    ensure_docker_image,
     verify_docker_credentials,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
 if TYPE_CHECKING:
     from ..config import Config
+
+logger = logging.getLogger(__name__)
 
 
 def _format_tool_param(value: object) -> str:
@@ -220,8 +220,8 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Claude to execute a task."""
         if config.use_docker:
@@ -251,8 +251,8 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
         if config.claude.fetch_auth_token_from_keychain:
@@ -281,8 +281,8 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         resume_session_id: str | None = None,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
         # When running inside a tmux session, use interactive mode so the proxy
@@ -370,8 +370,8 @@ class ClaudeProvider(Provider):
         stdin_input: str | None = None,
         model: str = "",
         chat_text_display_length: int = 0,
-        on_session_id: Optional[Callable[[str], None]] = None,
-        on_step_count: Optional[Callable[[int], None]] = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
         formatter = StreamOutputFormatter()
