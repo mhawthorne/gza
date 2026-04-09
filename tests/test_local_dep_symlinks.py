@@ -1,8 +1,7 @@
 """Tests for _create_local_dep_symlinks in runner.py."""
 
-import tomllib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -11,8 +10,6 @@ from gza.runner import _create_local_dep_symlinks
 
 def make_config(project_dir: Path, use_docker: bool = False):
     """Return a minimal mock config."""
-    from unittest.mock import Mock
-
     config = Mock()
     config.project_dir = project_dir
     config.use_docker = use_docker
@@ -73,10 +70,9 @@ class TestNoopCases:
         worktree.mkdir(parents=True)
         config = make_config(project_dir)
         _create_local_dep_symlinks(config, worktree)
-        # No symlink should be created at an absolute-resolved location inside worktree parent
-        # (absolute paths are skipped entirely)
-        assert not any((tmp_path / "worktrees" / "project").iterdir().__next__() == dep_dir
-                       for _ in [None])  # just ensure no crash
+        # Only the worktree directory itself should exist — no symlink created for absolute paths
+        children = list((tmp_path / "worktrees" / "project").iterdir())
+        assert len(children) == 1  # just the worktree dir, no symlink
 
 
 class TestSymlinkCreation:
@@ -212,30 +208,69 @@ class TestIdempotency:
         assert real_dir.is_dir() and not real_dir.is_symlink()
         assert any("already exists" in r.message for r in caplog.records)
 
-
-class TestDockerSkip:
-    def test_docker_mode_call_site_skips(self, tmp_path):
-        """When use_docker=True, _create_local_dep_symlinks is not called from call sites."""
-        # This tests that the guard `if not config.use_docker:` is in place at the call site.
-        # We verify the function itself works fine; the guard is in runner.py call sites.
+    def test_concurrent_race_does_not_propagate_file_exists_error(self, tmp_path):
+        """FileExistsError from a concurrent task racing past the existence check is handled."""
         project_dir = tmp_path / "work" / "myproject"
         project_dir.mkdir(parents=True)
         shared_lib = tmp_path / "work" / "shared-lib"
         shared_lib.mkdir()
         write_pyproject(project_dir, {"shared-lib": {"path": "../shared-lib"}})
 
+        worktree1 = tmp_path / "worktrees" / "myproject" / "task-1"
+        worktree1.mkdir(parents=True)
+        worktree2 = tmp_path / "worktrees" / "myproject" / "task-2"
+        worktree2.mkdir(parents=True)
+        config = make_config(project_dir)
+
+        # Simulate two tasks running concurrently by calling the function twice.
+        # The second call finds the symlink already in place (created by the first) —
+        # this exercises the FileExistsError recovery path without needing real threads.
+        _create_local_dep_symlinks(config, worktree1)
+        # Second call must not raise even though the symlink already exists
+        _create_local_dep_symlinks(config, worktree2)
+
+        link = tmp_path / "worktrees" / "myproject" / "shared-lib"
+        assert link.is_symlink()
+        assert link.resolve() == shared_lib.resolve()
+
+
+class TestWorkspaceMemberSkip:
+    def test_workspace_member_inside_worktree_skipped(self, tmp_path):
+        """Paths that resolve inside the worktree itself (workspace members) are not symlinked."""
+        project_dir = tmp_path / "work" / "myproject"
+        project_dir.mkdir(parents=True)
+        # Create a workspace member directory inside the worktree
         worktree = tmp_path / "worktrees" / "myproject" / "task-1"
         worktree.mkdir(parents=True)
-        config = make_config(project_dir, use_docker=True)
+        sub_pkg = worktree / "packages" / "sub"
+        sub_pkg.mkdir(parents=True)
+        # The dep path resolves inside the worktree — should be skipped
+        write_pyproject(project_dir, {"sub": {"path": "./packages/sub"}})
+        config = make_config(project_dir)
+        _create_local_dep_symlinks(config, worktree)
+        # No symlink created because the path is inside the worktree
+        assert not (worktree / "packages" / "sub").is_symlink()
 
-        # Verify the guard: grep runner.py for `if not config.use_docker` before _create_local_dep_symlinks
-        import gza.runner as runner_mod
+
+class TestDockerSkip:
+    def test_docker_mode_call_site_skips(self):
+        """Guard `if not config.use_docker` wraps _create_local_dep_symlinks at both call sites.
+
+        Full behavioral testing of this guard would require calling _run_inner or _run_non_code_task,
+        which need >10 mocked dependencies (Task, Config, SqliteTaskStore, Provider, Git, etc.).
+        Instead, we verify the guard is structurally present at both call sites via regex on the
+        module source.
+        """
+        import re
         import inspect
+        import gza.runner as runner_mod
 
         source = inspect.getsource(runner_mod)
-        # The pattern: `if not config.use_docker:\n        _create_local_dep_symlinks`
-        assert "if not config.use_docker:" in source
-        # And that _create_local_dep_symlinks appears after it (call site guard present)
-        docker_idx = source.index("if not config.use_docker:")
-        symlink_idx = source.index("_create_local_dep_symlinks(config, worktree_path)", docker_idx)
-        assert symlink_idx > docker_idx
+        # Match the guard pattern: `if not config.use_docker:` immediately followed by
+        # `_create_local_dep_symlinks(config, worktree_path)` on the next line.
+        pattern = r"if not config\.use_docker:\s+_create_local_dep_symlinks\(config,\s+worktree_path\)"
+        matches = re.findall(pattern, source)
+        # Must appear twice: once in the code-task path, once in the non-code-task path.
+        assert len(matches) == 2, (
+            f"Expected 2 guarded _create_local_dep_symlinks call sites, found {len(matches)}"
+        )

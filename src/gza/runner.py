@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tomllib
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1179,8 +1180,6 @@ def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
     references resolve to the same real directories as they would from the
     original project root.
     """
-    import tomllib
-
     pyproject = config.project_dir / "pyproject.toml"
     if not pyproject.exists():
         return
@@ -1189,7 +1188,7 @@ def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
         with open(pyproject, "rb") as f:
             data = tomllib.load(f)
     except Exception:
-        logger.warning("Failed to parse %s; skipping local dep symlinks", pyproject)
+        logger.warning("Failed to read/parse %s; skipping local dep symlinks", pyproject)
         return
 
     sources = data.get("tool", {}).get("uv", {}).get("sources", {})
@@ -1229,8 +1228,19 @@ def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
                 dep_real_path,
             )
             continue
-        symlink_location.symlink_to(dep_real_path)
-        logger.info("Created symlink %s -> %s", symlink_location, dep_real_path)
+        try:
+            symlink_location.symlink_to(dep_real_path)
+            logger.info("Created symlink %s -> %s", symlink_location, dep_real_path)
+        except FileExistsError:
+            # Lost the race with a concurrent task — verify the winner created the right symlink
+            if symlink_location.is_symlink() and symlink_location.resolve() == dep_real_path:
+                logger.debug("Symlink %s created by concurrent task; skipping", symlink_location)
+            else:
+                logger.warning(
+                    "Path %s appeared during symlink creation and does not point to %s; skipping",
+                    symlink_location,
+                    dep_real_path,
+                )
 
 
 def run(
