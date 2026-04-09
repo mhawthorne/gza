@@ -191,7 +191,7 @@ class TestLogCommand:
         store = SqliteTaskStore(db_path)
         task = store.add("Fallback log path task")
         task.status = "completed"
-        task.task_id = "20260227-fallback-log"
+        task.slug = "20260227-fallback-log"
         task.log_file = ".gza/logs/missing.log"
         store.update(task)
 
@@ -305,7 +305,7 @@ class TestLogCommand:
 
         root = store.add("Original failed task")
         assert root.id is not None
-        root.task_id = "20260227-chain-root"
+        root.slug = "20260227-chain-root"
         root.status = "failed"
         root.log_file = ".gza/logs/root.log"
         root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
@@ -313,7 +313,7 @@ class TestLogCommand:
 
         retry_a = store.add("Retry A", based_on=root.id, task_type=root.task_type)
         assert retry_a.id is not None
-        retry_a.task_id = "20260227-chain-a"
+        retry_a.slug = "20260227-chain-a"
         retry_a.status = "failed"
         retry_a.log_file = ".gza/logs/retry_a.log"
         retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
@@ -321,7 +321,7 @@ class TestLogCommand:
 
         retry_b = store.add("Retry B", based_on=root.id, task_type=root.task_type)
         assert retry_b.id is not None
-        retry_b.task_id = "20260227-chain-b"
+        retry_b.slug = "20260227-chain-b"
         retry_b.status = "completed"
         retry_b.log_file = ".gza/logs/retry_b.log"
         retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
@@ -489,7 +489,7 @@ class TestLogCommand:
             worker_id="w-20260227-010101",
             pid=os.getpid(),
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-02-27T01:01:01+00:00",
             status="running",
             log_file=task.log_file,
@@ -672,7 +672,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for slug lookup")
-        task.task_id = "20260108-test-slug"
+        task.slug = "20260108-test-slug"
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
         store.update(task)
@@ -699,7 +699,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add("Test task for partial slug")
-        task.task_id = "20260108-partial-slug-test"
+        task.slug = "20260108-partial-slug-test"
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
         store.update(task)
@@ -755,7 +755,7 @@ class TestLogCommand:
             worker_id=worker_id,
             pid=12345,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-01-08T00:00:00Z",
             status="completed",
             log_file=".gza/logs/test.log",
@@ -814,7 +814,7 @@ class TestLogCommand:
             worker_id="w-test-startup-failure",
             pid=12345,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-01-08T00:00:00Z",
             status="failed",
             log_file=None,
@@ -890,7 +890,7 @@ class TestLogCommand:
             worker_id="w-test-main-wins",
             pid=12345,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-01-08T00:00:00Z",
             status="failed",
             log_file=None,
@@ -926,7 +926,7 @@ class TestLogCommand:
 
         task = store.add("Task lookup startup fallback")
         assert task.id is not None
-        task.task_id = "20260318-task-startup-fallback"
+        task.slug = "20260318-task-startup-fallback"
         task.status = "failed"
         task.log_file = ".gza/logs/missing-main.log"
         store.update(task)
@@ -938,7 +938,7 @@ class TestLogCommand:
             worker_id="w-test-task-startup-fallback",
             pid=12345,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-03-18T00:00:00Z",
             status="failed",
             log_file=None,
@@ -953,7 +953,7 @@ class TestLogCommand:
         if query_mode == "task_id":
             result = run_gza("log", str(task.id), "--project", str(tmp_path))
         else:
-            result = run_gza("log", "--slug", task.task_id, "--project", str(tmp_path))
+            result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Using startup log (main task log not available)." in result.stdout
@@ -972,7 +972,7 @@ class TestLogCommand:
 
         task = store.add("Task lookup main log precedence")
         assert task.id is not None
-        task.task_id = "20260318-task-main-precedence"
+        task.slug = "20260318-task-main-precedence"
         task.status = "failed"
         task.log_file = ".gza/logs/task-main.log"
         store.update(task)
@@ -984,7 +984,7 @@ class TestLogCommand:
             worker_id="w-test-task-main-precedence",
             pid=12345,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-03-18T00:00:00Z",
             status="failed",
             log_file=None,
@@ -1003,7 +1003,7 @@ class TestLogCommand:
         if query_mode == "task_id":
             result = run_gza("log", str(task.id), "--project", str(tmp_path))
         else:
-            result = run_gza("log", "--slug", task.task_id, "--project", str(tmp_path))
+            result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "task-main-output" in result.stdout
@@ -1023,7 +1023,7 @@ class TestLogCommand:
 
         task = store.add("Task lookup with no available logs")
         assert task.id is not None
-        task.task_id = "20260318-task-no-logs"
+        task.slug = "20260318-task-no-logs"
         task.status = "failed"
         task.log_file = ".gza/logs/task-missing.log"
         store.update(task)
@@ -1035,7 +1035,7 @@ class TestLogCommand:
             worker_id="w-test-task-no-logs",
             pid=12345,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-03-18T00:00:00Z",
             status="failed",
             log_file=None,
@@ -1047,7 +1047,7 @@ class TestLogCommand:
         if query_mode == "task_id":
             result = run_gza("log", str(task.id), "--project", str(tmp_path))
         else:
-            result = run_gza("log", "--slug", task.task_id, "--project", str(tmp_path))
+            result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: Log file not found at" in result.stdout

@@ -949,7 +949,7 @@ def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | 
     """Return True when worker failed before main task logging initialized."""
     if worker is None:
         return False
-    has_startup_hint = bool(worker.startup_log_file) or bool(task and task.task_id)
+    has_startup_hint = bool(worker.startup_log_file) or bool(task and task.slug)
     if worker.status != "failed" or not has_startup_hint:
         return False
     has_main_log = bool(task and task.log_file)
@@ -1027,8 +1027,8 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
     task_id = task.id if task and task.id is not None else worker.task_id if worker else None
     task_display = ""
-    if task and task.task_id:
-        task_display = task.task_id
+    if task and task.slug:
+        task_display = task.slug
     elif task:
         task_display = truncate(task.prompt, 25)
     elif worker:
@@ -1062,7 +1062,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "is_stale": is_stale,
         "is_orphaned": is_orphaned,
         "startup_failure": startup_failure,
-        "startup_log_file": (f".gza/workers/{task.task_id}.startup.log" if task and task.task_id else (worker.startup_log_file if worker else None)),
+        "startup_log_file": (f".gza/workers/{task.slug}.startup.log" if task and task.slug else (worker.startup_log_file if worker else None)),
         "sort_timestamp": started.isoformat() if started else "",
     }
 
@@ -1336,7 +1336,7 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
     output = {
         "task_id": task.id,
         "task_type": task.task_type,
-        "task_slug": task.task_id,
+        "task_slug": task.slug,
         "branch": task.branch,
         "prompt": prompt,
         "report_path": str(report_path) if report_path else None,
@@ -1413,8 +1413,8 @@ def _cmd_show_output(
     if task.merge_status:
         console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
-    if task.task_id:
-        console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{task.task_id}[/{c['value']}]")
+    if task.slug:
+        console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{task.slug}[/{c['value']}]")
     if task.based_on:
         console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task #{task.based_on}[/{c['value']}]")
     if task.depends_on:

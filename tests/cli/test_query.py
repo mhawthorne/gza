@@ -850,7 +850,7 @@ class TestShowCommand:
                 worker_id="w-20260227-000001",
                 pid=12345,
                 task_id=task.id,
-                task_slug=task.task_id,
+                task_slug=task.slug,
                 started_at="2026-02-27T00:00:00+00:00",
                 status="failed",
                 log_file=task.log_file,
@@ -968,7 +968,7 @@ class TestShowCommand:
                 worker_id="w-20260318-startup-failure",
                 pid=12345,
                 task_id=task.id,
-                task_slug=task.task_id,
+                task_slug=task.slug,
                 started_at="2026-03-18T00:00:00+00:00",
                 status="failed",
                 log_file=None,
@@ -1457,7 +1457,7 @@ class TestPsCommand:
         task = store.get(task.id)
         assert task is not None
         task.running_pid = os.getpid()
-        task.task_id = "20260319-claim-no-id"
+        task.slug = "20260319-claim-no-id"
         store.update(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1500,7 +1500,7 @@ class TestPsCommand:
         task = store.get(task.id)
         assert task is not None
         task.running_pid = os.getpid()
-        task.task_id = "20260319-healthy-no-id"
+        task.slug = "20260319-healthy-no-id"
         store.update(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1539,7 +1539,7 @@ class TestPsCommand:
         task = store.get(task.id)
         assert task is not None
         task.running_pid = os.getpid()
-        task.task_id = "20260319-claimed-label"
+        task.slug = "20260319-claimed-label"
         store.update(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1561,7 +1561,7 @@ class TestPsCommand:
         rows, _ = _build_ps_rows(registry, store, include_completed=False)
         assert len(rows) == 1
         assert rows[0]["task_id"] == task.id
-        assert rows[0]["task"] == task.task_id
+        assert rows[0]["task"] == task.slug
         assert rows[0]["task"] != ""
         assert not rows[0]["task"].startswith("task #")
 
@@ -2699,7 +2699,7 @@ class TestUnmergedReviewStatus:
         review.status = "completed"
         review.completed_at = datetime.now(timezone.utc)
         review.depends_on = task.id
-        review.task_id = "20260212-review-implementation"
+        review.slug = "20260212-review-implementation"
         review.output_content = review_output
         store.update(review)
 
@@ -2729,7 +2729,7 @@ class TestUnmergedReviewStatus:
         review1.status = "completed"
         review1.completed_at = datetime.now(timezone.utc)
         review1.depends_on = task.id
-        review1.task_id = "20260212-first-review"
+        review1.slug = "20260212-first-review"
         review1.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review1)
 
@@ -2741,7 +2741,7 @@ class TestUnmergedReviewStatus:
         review2.status = "completed"
         review2.completed_at = datetime.now(timezone.utc)
         review2.depends_on = task.id
-        review2.task_id = "20260212-second-review"
+        review2.slug = "20260212-second-review"
         review2.output_content = "**Verdict: APPROVED**"
         store.update(review2)
 
@@ -2760,7 +2760,7 @@ class TestUnmergedReviewStatus:
         older_review.status = "completed"
         older_review.completed_at = datetime.now(timezone.utc)
         older_review.depends_on = task.id
-        older_review.task_id = "20260212-older-review"
+        older_review.slug = "20260212-older-review"
         older_review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(older_review)
 
@@ -2770,7 +2770,7 @@ class TestUnmergedReviewStatus:
         latest_review.status = "completed"
         latest_review.completed_at = datetime.now(timezone.utc)
         latest_review.depends_on = task.id
-        latest_review.task_id = "20260212-latest-review"
+        latest_review.slug = "20260212-latest-review"
         latest_review.output_content = None
         latest_review.report_file = None
         store.update(latest_review)
@@ -2789,7 +2789,7 @@ class TestUnmergedReviewStatus:
         older_review.status = "completed"
         older_review.completed_at = datetime.now(timezone.utc)
         older_review.depends_on = task.id
-        older_review.task_id = "20260212-older-review"
+        older_review.slug = "20260212-older-review"
         older_review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(older_review)
 
@@ -2802,7 +2802,7 @@ class TestUnmergedReviewStatus:
         latest_review.status = "completed"
         latest_review.completed_at = datetime.now(timezone.utc)
         latest_review.depends_on = task.id
-        latest_review.task_id = "20260212-latest-review"
+        latest_review.slug = "20260212-latest-review"
         latest_review.output_content = None
         latest_review.report_file = None
         store.update(latest_review)
@@ -2824,7 +2824,7 @@ class TestUnmergedReviewStatus:
         review = store.add("review simplify-mixer-by-removing-the-people-strategy", task_type="review")
         review.status = "completed"
         review.completed_at = datetime.now(timezone.utc)
-        review.task_id = "20260225-review-simplify-mixer-by-removing-the-people-strategy-2"
+        review.slug = "20260225-review-simplify-mixer-by-removing-the-people-strategy-2"
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
 
@@ -2843,7 +2843,7 @@ class TestUnmergedReviewStatus:
         review.status = "completed"
         review.completed_at = datetime.now(timezone.utc)
         review.depends_on = task.id
-        review.task_id = "20260212-review-implementation"
+        review.slug = "20260212-review-implementation"
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
 
@@ -2874,7 +2874,7 @@ class TestUnmergedReviewStatus:
         review1.status = "completed"
         review1.completed_at = datetime.now(timezone.utc)
         review1.depends_on = task.id
-        review1.task_id = "20260212-review"
+        review1.slug = "20260212-review"
         review1.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review1)
 
@@ -2889,7 +2889,7 @@ class TestUnmergedReviewStatus:
         review2.status = "completed"
         review2.completed_at = datetime.now(timezone.utc)
         review2.depends_on = task.id
-        review2.task_id = "20260212-second-review"
+        review2.slug = "20260212-second-review"
         review2.output_content = "**Verdict: APPROVED**"
         store.update(review2)
 
@@ -3044,7 +3044,7 @@ class TestUnmergedAllFlag:
         task2.branch = "feature/merged"
         task2.has_commits = True
         task2.merge_status = "merged"
-        task2.task_id = "20260220-merged"
+        task2.slug = "20260220-merged"
         task2.completed_at = datetime.now(timezone.utc)
         store.update(task2)
 
@@ -3100,7 +3100,7 @@ class TestUnmergedAllFlag:
         task.branch = "feature/nonexistent-branch"
         task.has_commits = True
         task.merge_status = "unmerged"
-        task.task_id = "20260220-deleted-branch"
+        task.slug = "20260220-deleted-branch"
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
 

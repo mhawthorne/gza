@@ -2,7 +2,7 @@
 
 ## How tasks use worktrees
 
-Each task type creates a worktree at `config.worktree_path / task.task_id`.
+Each task type creates a worktree at `config.worktree_path / task.slug`.
 
 ### Code tasks (implement, improve)
 
@@ -13,7 +13,7 @@ When a code task is finalized with uncommitted changes, gza writes a single comm
 - Subject derived from task summary when available, then task prompt, and finally a deterministic fallback (`gza task <slug>` or `Task #<id>`).
 - Body metadata lines:
   - `Task #<id>`
-  - `Slug: <task_id>`
+  - `Slug: <slug>`
   - `Gza-Review: #<id>` for improve tasks tied to a review
 
 ### Review tasks

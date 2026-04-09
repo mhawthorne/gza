@@ -199,21 +199,21 @@ def get_task_output_paths(
     report_path: Path | None = None
     summary_path: Path | None = None
 
-    if not task.task_id:
+    if not task.slug:
         return None, None
 
     if task.task_type in ("task", "implement", "improve", "rebase"):
-        summary_path = project_dir / SUMMARY_DIR / f"{task.task_id}.md"
+        summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
     elif task.task_type == "explore":
-        report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.task_id}.md"
+        report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.slug}.md"
     elif task.task_type == "plan":
-        report_path = project_dir / PLAN_DIR / f"{task.task_id}.md"
+        report_path = project_dir / PLAN_DIR / f"{task.slug}.md"
     elif task.task_type == "review":
-        report_path = project_dir / REVIEW_DIR / f"{task.task_id}.md"
+        report_path = project_dir / REVIEW_DIR / f"{task.slug}.md"
     elif task.task_type in ("internal", "learn"):
-        report_path = project_dir / INTERNAL_DIR / f"{task.task_id}.md"
+        report_path = project_dir / INTERNAL_DIR / f"{task.slug}.md"
     else:
-        report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.task_id}.md"
+        report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.slug}.md"
 
     return report_path, summary_path
 
@@ -322,48 +322,59 @@ def slugify(text: str, max_length: int = 50) -> str:
     return slug
 
 
-def generate_task_id(
+def generate_slug(
     prompt: str,
     existing_id: str | None = None,
     log_path: Path | None = None,
     git: Git | None = None,
     project_name: str | None = None,
+    project_prefix: str | None = None,
     slug_override: str | None = None,
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
 ) -> str:
-    """Generate a task ID in YYYYMMDD-slug format, with suffix for retries."""
+    """Generate a task slug in YYYYMMDD-{project_prefix}-slug format, with suffix for retries."""
     if existing_id:
         # This is a retry - strip any existing suffix to get base
         base_id = re.sub(r'-\d+$', '', existing_id)
     else:
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
-        slug = slug_override if slug_override is not None else slugify(prompt)
-        base_id = f"{date_prefix}-{slug}"
+        if slug_override is not None:
+            # slug_override already encodes full lineage context (e.g. "rev-myproj-add-feature")
+            # so do not prepend project_prefix — it would double-embed the prefix for chained tasks
+            base_id = f"{date_prefix}-{slug_override}"
+        else:
+            slug = slugify(prompt)
+            if project_prefix:
+                base_id = f"{date_prefix}-{project_prefix}-{slug}"
+            else:
+                base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
-    if not _task_id_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
+    if not _slug_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
         return base_id
 
     # Find next available suffix
     suffix = 2
     new_id = f"{base_id}-{suffix}"
-    while _task_id_exists(new_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
+    while _slug_exists(new_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
         suffix += 1
         new_id = f"{base_id}-{suffix}"
     return new_id
 
 
-def _slug_from_task_id(task_id: str) -> str:
-    """Extract the slug portion from a task_id (strips date prefix and retry suffix)."""
-    parts = task_id.split('-', 1)
+
+def _extract_slug_suffix(slug: str) -> str:
+    """Extract the non-date portion from a slug (strips date prefix and retry suffix)."""
+    parts = slug.split('-', 1)
     if len(parts) == 2:
-        slug = parts[1]
+        suffix = parts[1]
         # Remove retry suffix (-2, -3, etc.)
-        slug = re.sub(r'-\d+$', '', slug)
-        return slug
-    return task_id
+        suffix = re.sub(r'-\d+$', '', suffix)
+        return suffix
+    return slug
+
 
 
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
@@ -384,15 +395,15 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     from . import query as _query
     root = _query.resolve_lineage_root(store, task)
 
-    if root.task_id:
-        root_slug = _slug_from_task_id(root.task_id)
+    if root.slug:
+        root_slug = _extract_slug_suffix(root.slug)
     else:
         root_slug = slugify(root.prompt)
 
     return f"{prefix}-{root_slug}"
 
 
-def _task_id_exists(
+def _slug_exists(
     task_id: str,
     log_path: Path | None,
     git: Git | None,
@@ -401,7 +412,7 @@ def _task_id_exists(
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
 ) -> bool:
-    """Check if a task_id is already in use (log file or branch exists)."""
+    """Check if a slug is already in use (log file or branch exists)."""
     # Check log file
     if log_path and (log_path / f"{task_id}.log").exists():
         return True
@@ -456,8 +467,8 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
 
     # Final fallback for code-task summaries when report_file/output_content are absent.
     # This supports older tasks where summary content exists only on disk.
-    if task.task_id and task.task_type in {"task", "implement", "improve"}:
-        summary_path = project_dir / SUMMARY_DIR / f"{task.task_id}.md"
+    if task.slug and task.task_type in {"task", "implement", "improve"}:
+        summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
         if summary_path.exists():
             return summary_path.read_text()
 
@@ -931,14 +942,14 @@ def _save_wip_changes(
     diff = worktree_git._run("diff", "--cached", check=False).stdout
 
     # Save diff to backup file
-    if task.task_id and diff:
-        wip_file = wip_dir / f"{task.task_id}.diff"
+    if task.slug and diff:
+        wip_file = wip_dir / f"{task.slug}.diff"
         wip_file.write_text(diff)
         console.print(f"[yellow]Saved WIP diff to: {wip_file.relative_to(config.project_dir)}[/yellow]")
 
     # Commit changes with --no-verify
     try:
-        worktree_git._run("commit", "--no-verify", "-m", f"WIP: gza task interrupted\n\nTask ID: {task.task_id}")
+        worktree_git._run("commit", "--no-verify", "-m", f"WIP: gza task interrupted\n\nTask ID: {task.slug}")
         console.print(f"[yellow]Saved WIP commit on branch: {branch_name}[/yellow]")
     except GitError as e:
         # If commit fails, that's okay - we have the diff backup
@@ -965,7 +976,7 @@ def _restore_wip_changes(
         original_task_id: Optional task_id of the original failed task (for
             finding the WIP diff file when resuming via a new task).
     """
-    if not task.task_id and not original_task_id:
+    if not task.slug and not original_task_id:
         return
 
     # Check if the last commit is a WIP commit
@@ -982,7 +993,7 @@ def _restore_wip_changes(
     # task's id, so check that first, then fall back to the new task's id.
     wip_dir = config.project_dir / WIP_DIR
     wip_file = None
-    for candidate_id in filter(None, [original_task_id, task.task_id]):
+    for candidate_id in filter(None, [original_task_id, task.slug]):
         candidate = wip_dir / f"{candidate_id}.diff"
         if candidate.exists():
             wip_file = candidate
@@ -997,7 +1008,7 @@ def _restore_wip_changes(
                 result = worktree_git._run("apply", "--cached", stdin=diff_content.encode(), check=False)
                 if result.returncode == 0:
                     # Commit the restored changes
-                    worktree_git._run("commit", "--no-verify", "-m", f"WIP: restored from diff\n\nTask ID: {task.task_id}")
+                    worktree_git._run("commit", "--no-verify", "-m", f"WIP: restored from diff\n\nTask ID: {task.slug}")
                     console.print("[green]Successfully restored WIP changes from diff[/green]")
                 else:
                     console.print(f"[yellow]Warning: Could not apply WIP diff: {result.stderr}[/yellow]")
@@ -1135,7 +1146,10 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
         Exit code from running the review task.
     """
     try:
-        review_task = create_review_task(store, completed_task, prompt_mode="auto")
+        review_task = create_review_task(
+            store, completed_task, prompt_mode="auto",
+            project_prefix=config.project_prefix or None,
+        )
     except DuplicateReviewError as e:
         review_task = e.active_review
         if review_task.status == "in_progress":
@@ -1388,23 +1402,24 @@ def run(
     except GitError:
         pass  # May fail if offline, continue anyway
 
-    # Generate task_id - checks for collisions with existing branches/logs
-    # Always generate when task_id is not set (new tasks, including new resume tasks).
-    # Keep existing task_id only when resuming a task that already has one assigned.
-    if task.task_id is None:
+    # Generate slug — checks for collisions with existing branches/logs.
+    # Always generate when slug is not set (new tasks, including new resume tasks).
+    # Keep existing slug only when resuming a task that already has one assigned.
+    if task.slug is None:
         slug_override = _compute_slug_override(task, store)
-        task.task_id = generate_task_id(
+        task.slug = generate_slug(
             task.prompt,
             existing_id=None,
             log_path=config.log_path,
             git=git,
             project_name=config.project_name,
+            project_prefix=config.project_prefix,
             slug_override=slug_override,
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
         )
 
-    task_header(task.prompt, task.task_id or "", task.task_type)
+    task_header(task.prompt, task.slug or "", task.task_type)
 
     return _run_inner(task, task_config, config, store, provider, git, resume=resume, open_after=open_after)
 
@@ -1427,11 +1442,11 @@ def _resolve_code_task_branch_name(
     if resume:
         # Resume but branch wasn't saved - derive from task_id using branch naming strategy
         assert config.branch_strategy is not None
-        assert task.task_id is not None
+        assert task.slug is not None
         branch_name = generate_branch_name(
             pattern=config.branch_strategy.pattern,
             project_name=config.project_name,
-            task_id=task.task_id,
+            task_id=task.slug,
             prompt=task.prompt,
             default_type=config.branch_strategy.default_type,
             explicit_type=task.task_type_hint,
@@ -1484,11 +1499,11 @@ def _resolve_code_task_branch_name(
 
     # multi branch mode uses branch naming strategy
     assert config.branch_strategy is not None
-    assert task.task_id is not None
+    assert task.slug is not None
     return generate_branch_name(
         pattern=config.branch_strategy.pattern,
         project_name=config.project_name,
-        task_id=task.task_id,
+        task_id=task.slug,
         prompt=task.prompt,
         default_type=config.branch_strategy.default_type,
         explicit_type=task.task_type_hint,
@@ -1667,13 +1682,13 @@ def _complete_code_task(
             commit_subject = _build_code_task_commit_subject(
                 task.prompt,
                 worktree_summary_path,
-                fallback_subject=_default_code_task_commit_subject(task.task_id, task.id),
+                fallback_subject=_default_code_task_commit_subject(task.slug, task.id),
             )
 
             commit_message = build_task_commit_message(
                 commit_subject,
                 task_id=task.id,
-                task_slug=task.task_id,
+                task_slug=task.slug,
                 review_task_id=review_task_id,
             )
             worktree_git.commit(commit_message)
@@ -1701,18 +1716,9 @@ def _complete_code_task(
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
 
-    # Mark completed
-    store.mark_completed(
-        task,
-        branch=branch_name,
-        log_file=str(log_file.relative_to(config.project_dir)),
-        output_content=output_content,
-        has_commits=True,
-        stats=stats,
-        diff_files_changed=diff_files,
-        diff_lines_added=diff_added,
-        diff_lines_removed=diff_removed,
-    )
+    # Write final log entries before marking completed in DB, so that
+    # `gza log -f` (which checks task status) doesn't break out of the
+    # follow loop before the log file is fully written.
     write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
     write_log_entry(
         log_file,
@@ -1724,6 +1730,20 @@ def _complete_code_task(
             "cost_usd": stats.cost_usd,
             "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
         },
+    )
+
+    # Mark completed — after log entries are flushed so readers see the
+    # full log before the status transitions away from in_progress.
+    store.mark_completed(
+        task,
+        branch=branch_name,
+        log_file=str(log_file.relative_to(config.project_dir)),
+        output_content=output_content,
+        has_commits=True,
+        stats=stats,
+        diff_files_changed=diff_files,
+        diff_lines_added=diff_added,
+        diff_lines_removed=diff_removed,
     )
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
@@ -1807,8 +1827,8 @@ def _run_inner(
         return 1
 
     # Create worktree path
-    assert task.task_id is not None
-    worktree_path = config.worktree_path / task.task_id
+    assert task.slug is not None
+    worktree_path = config.worktree_path / task.slug
 
     if not _setup_code_task_worktree(
         task,
@@ -1832,7 +1852,7 @@ def _run_inner(
         if task.based_on:
             original_task = store.get(task.based_on)
             if original_task:
-                original_task_id = original_task.task_id
+                original_task_id = original_task.slug
         _restore_wip_changes(task, worktree_git, config, branch_name, original_task_id=original_task_id)
 
     # Persist branch early so it's available if the process is killed before completion
@@ -1842,13 +1862,13 @@ def _run_inner(
 
     # Setup logging - use task_id for naming (logs stay in main project)
     config.log_path.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_path / f"{task.task_id}.log"
+    log_file = config.log_path / f"{task.slug}.log"
     # Persist log_file early so it's available if the process is killed before completion
     task.log_file = str(log_file.relative_to(config.project_dir))
     store.update(task)
 
     # Write orchestration pre-run entries
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
 
@@ -2026,13 +2046,13 @@ def _run_non_code_task(
 
     # Setup logging
     config.log_path.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_path / f"{task.task_id}.log"
+    log_file = config.log_path / f"{task.slug}.log"
     # Persist log_file early so it's available if the process is killed before completion
     task.log_file = str(log_file.relative_to(config.project_dir))
     store.update(task)
 
     # Write orchestration pre-run entries
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.task_id}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
 
     # Setup report file based on task type
@@ -2051,8 +2071,8 @@ def _run_non_code_task(
     report_file_relative = str(report_path.relative_to(config.project_dir))
 
     # Create worktree in /tmp for Docker compatibility on macOS
-    assert task.task_id is not None
-    worktree_path = config.worktree_path / f"{task.task_id}-{task.task_type}"
+    assert task.slug is not None
+    worktree_path = config.worktree_path / f"{task.slug}-{task.task_type}"
 
     try:
         # Get default branch to base worktree on
@@ -2102,7 +2122,7 @@ def _run_non_code_task(
         if resume:
             prompt = PromptBuilder().resume_prompt(
                 task_id=task.id,
-                task_slug=task.task_id,
+                task_slug=task.slug,
                 report_path=prompt_report_path,
             )
         else:
@@ -2218,7 +2238,7 @@ def _run_non_code_task(
             if recovered_content:
                 logger.warning(
                     "Task %s: expected report artifact missing; recovering content from provider log",
-                    task.task_id,
+                    task.slug,
                 )
                 console.print(
                     "[yellow]Warning: expected report artifact was not created; "
@@ -2290,17 +2310,6 @@ def _run_non_code_task(
         # Read output content for storage in DB
         output_content = report_path.read_text()
 
-        # Mark completed with report file reference (no branch, no commits)
-        store.mark_completed(
-            task,
-            branch=None,
-            log_file=str(log_file.relative_to(config.project_dir)),
-            report_file=report_file_relative,
-            output_content=output_content,
-            has_commits=False,
-            stats=stats,
-        )
-
         # Clean up non-code worktree on success — report has been copied back, no further use
         if git:
             try:
@@ -2311,9 +2320,23 @@ def _run_non_code_task(
                 logger.warning("Failed to remove worktree %s", worktree_path)
                 if worktree_path.exists():
                     shutil.rmtree(worktree_path, ignore_errors=True)
+
+        # Write final log entries before marking completed in DB, so that
+        # `gza log -f` doesn't break out of the follow loop prematurely.
         outcome_msg = "Outcome: completed (recovered from provider log)" if recovered_from_log else "Outcome: completed"
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": outcome_msg, "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+
+        # Mark completed — after log entries are flushed.
+        store.mark_completed(
+            task,
+            branch=None,
+            log_file=str(log_file.relative_to(config.project_dir)),
+            report_file=report_file_relative,
+            output_content=output_content,
+            has_commits=False,
+            stats=stats,
+        )
         auto_learnings = None
         if task.task_type not in ("internal", "learn") and not task.skip_learnings:
             auto_learnings = maybe_auto_regenerate_learnings(store, config)

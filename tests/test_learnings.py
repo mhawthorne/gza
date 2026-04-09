@@ -377,7 +377,7 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     config.use_docker = False
 
     internal_task = store.add("Learn prompt", task_type="internal", skip_learnings=True)
-    internal_task.task_id = "20260101-learn-prompt"
+    internal_task.slug = "20260101-learn-prompt"
     store.update(internal_task)
 
     mock_provider = Mock()
@@ -395,9 +395,9 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     mock_git.default_branch.return_value = "main"
     mock_git._run.return_value = Mock(returncode=0)
 
-    report_dir = tmp_path / "worktrees" / f"{internal_task.task_id}-internal" / ".gza" / "internal"
+    report_dir = tmp_path / "worktrees" / f"{internal_task.slug}-internal" / ".gza" / "internal"
     report_dir.mkdir(parents=True, exist_ok=True)
-    (report_dir / f"{internal_task.task_id}.md").write_text("# Internal report\n")
+    (report_dir / f"{internal_task.slug}.md").write_text("# Internal report\n")
 
     with patch("gza.runner.console"), \
          patch("gza.runner.maybe_auto_regenerate_learnings") as mock_auto:

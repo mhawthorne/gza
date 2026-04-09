@@ -1,22 +1,10 @@
 # gza stats subcommands
 
-> **Status: Implemented** — Describes current behavior as of 2026-04-08.
+> **Status: Implemented** — Describes current behavior as of 2026-04-09.
 
 ## Overview
 
-`gza stats` has two subcommands for analytics: `cycles` and `reviews`.
-
-## gza stats cycles
-
-Shows review/improve iteration statistics across all tasks.
-
-```bash
-gza stats cycles              # Show cycle analytics summary
-gza stats cycles --task N     # Show cycle detail for a specific task
-gza stats cycles --json       # Output as JSON
-```
-
-This subcommand was previously exposed as `gza stats --cycles` (removed as of 2026-04-08).
+`gza stats` has one subcommand: `reviews`. Running `gza stats` without a subcommand prints help text.
 
 ## gza stats reviews
 
@@ -49,4 +37,5 @@ The three-way priority for determining the start date:
 ### Notes
 
 - `bin/review-cycle-stats.py` was removed in the same PR this subcommand was added. Use `gza stats reviews` instead.
+- `gza stats cycles` was removed as of 2026-04-09. Use `gza stats reviews` instead.
 - Output uses `print()` (plain text) rather than Rich markup, consistent with the original script and suitable for piping.

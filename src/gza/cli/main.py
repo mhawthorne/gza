@@ -448,39 +448,10 @@ def main() -> int:
     add_common_args(pr_parser)
 
     # stats command
-    stats_parser = subparsers.add_parser("stats", help="Show cost and usage statistics")
+    stats_parser = subparsers.add_parser("stats", help="Review analytics (use 'gza stats reviews')")
     add_common_args(stats_parser)
-    _add_query_filter_args(stats_parser)
-    stats_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Show all tasks (no limit)",
-    )
-    stats_parser.set_defaults(last=5)
-    stats_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output as machine-readable JSON",
-    )
     stats_subs = stats_parser.add_subparsers(dest="stats_subcommand")
-
-    # stats cycles subcommand
-    stats_cycles_parser = stats_subs.add_parser(
-        "cycles", help="Show cycle analytics (review/improve iteration statistics)"
-    )
-    add_common_args(stats_cycles_parser)
-    stats_cycles_parser.add_argument(
-        "--task",
-        type=int,
-        dest="cycle_task_id",
-        metavar="ID",
-        help="Show cycle analytics for a specific implementation task",
-    )
-    stats_cycles_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output as machine-readable JSON",
-    )
+    stats_parser.set_defaults(_stats_parser=stats_parser)
 
     # stats reviews subcommand
     stats_reviews_parser = stats_subs.add_parser(

@@ -56,6 +56,6 @@ Practical examples showing common workflows with Gza.
 | Merge to main | `gza merge <task_id> --squash` |
 | View group tasks | `gza group <group>` |
 | View history | `gza history` |
-| View stats | `gza stats` |
+| View stats | `gza stats reviews` |
 | Manage learnings | `gza learnings show` |
 | Set task status | `gza set-status <task_id> dropped` |

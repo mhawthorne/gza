@@ -69,7 +69,7 @@ class TestGetTaskSlug:
     @patch("gza.query._get_task_slug_from_task_id")
     def test_delegates_to_task_slug_module(self, mock_fn):
         mock_fn.return_value = "my-feature"
-        task = _make_task(task_id="20260305-my-feature")
+        task = _make_task(slug="20260305-my-feature")
         result = get_task_slug(task)
         mock_fn.assert_called_once_with("20260305-my-feature")
         assert result == "my-feature"
@@ -77,7 +77,7 @@ class TestGetTaskSlug:
     @patch("gza.query._get_task_slug_from_task_id")
     def test_none_task_id(self, mock_fn):
         mock_fn.return_value = None
-        task = _make_task(task_id=None)
+        task = _make_task(slug=None)
         result = get_task_slug(task)
         mock_fn.assert_called_once_with(None)
         assert result is None
@@ -87,7 +87,7 @@ class TestGetBaseTaskSlug:
     @patch("gza.query._get_base_task_slug")
     def test_delegates_to_task_slug_module(self, mock_fn):
         mock_fn.return_value = "my-feature"
-        task = _make_task(task_id="20260305-my-feature-2")
+        task = _make_task(slug="20260305-my-feature-2")
         result = get_base_task_slug(task)
         mock_fn.assert_called_once_with("20260305-my-feature-2")
         assert result == "my-feature"
@@ -95,7 +95,7 @@ class TestGetBaseTaskSlug:
     @patch("gza.query._get_base_task_slug")
     def test_none_task_id(self, mock_fn):
         mock_fn.return_value = None
-        task = _make_task(task_id=None)
+        task = _make_task(slug=None)
         result = get_base_task_slug(task)
         mock_fn.assert_called_once_with(None)
         assert result is None
@@ -128,14 +128,14 @@ class TestGetReviewsForRoot:
         store.get_reviews_for_task.return_value = []
         unlinked_review = _make_task(id=20, task_type="review")
         store.get_unlinked_reviews_for_slug.return_value = [unlinked_review]
-        root = _make_task(id=1, task_id="20260305-my-feature")
+        root = _make_task(id=1, slug="20260305-my-feature")
         result = get_reviews_for_root(store, root)
         assert result == [unlinked_review]
 
     def test_returns_empty_when_no_slug_for_fallback(self):
         store = MagicMock()
         store.get_reviews_for_task.return_value = []
-        root = _make_task(id=1, task_id=None)
+        root = _make_task(id=1, slug=None)
         result = get_reviews_for_root(store, root)
         assert result == []
         store.get_unlinked_reviews_for_slug.assert_not_called()
@@ -144,7 +144,7 @@ class TestGetReviewsForRoot:
         store = MagicMock()
         store.get_reviews_for_task.return_value = []
         store.get_unlinked_reviews_for_slug.return_value = []
-        root = _make_task(id=1, task_id="20260305-my-feature")
+        root = _make_task(id=1, slug="20260305-my-feature")
         result = get_reviews_for_root(store, root)
         assert result == []
 

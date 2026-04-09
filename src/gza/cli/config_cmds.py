@@ -12,122 +12,15 @@ from pathlib import Path
 from statistics import median
 
 from ..config import Config
-from ..console import console, format_duration, get_terminal_width
+from ..console import console
 from ..db import SqliteTaskStore, Task
 from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import TASK_COLORS, get_store, get_task_step_count
+from ._common import get_store
 
 logger = logging.getLogger(__name__)
-
-
-def _format_percentile_row(label: str, pdata: dict | None) -> str:
-    """Format a percentile stats row for display."""
-    if pdata is None:
-        return f"  {label:<28} (no data)"
-    return (
-        f"  {label:<28} min={pdata['min']:.1f}  avg={pdata['avg']:.1f}  "
-        f"median={pdata['median']:.1f}  p90={pdata['p90']:.1f}  max={pdata['max']:.1f}  "
-        f"(n={pdata['count']})"
-    )
-
-
-def _cmd_stats_cycles(config: Config, store: "SqliteTaskStore", as_json: bool) -> int:
-    """Show project-wide cycle analytics."""
-    agg = store.get_cycle_aggregate_stats()
-
-    if as_json:
-        print(json.dumps(agg, indent=2))
-        return 0
-
-    total = agg["total_cycles"]
-    approved = agg["approved_cycles"]
-    print("Cycle Analytics")
-    print("=" * 60)
-    print(f"  Total cycles:    {total}")
-    print(f"  Approved:        {approved}")
-    if total > 0:
-        other = total - approved
-        print(f"  Other (blocked/maxed): {other}")
-    print()
-    if total == 0:
-        print("  No cycles found. Run 'gza iterate <impl-id>' to start one.")
-        return 0
-
-    print("  Improves before approval (approved cycles only):")
-    print(_format_percentile_row("improves_before_approval", agg["improves_before_approval"]))
-    print()
-    print("  Per-cycle review/improve counts (all closed cycles):")
-    print(_format_percentile_row("reviews_per_cycle", agg["reviews_per_cycle"]))
-    print(_format_percentile_row("improves_per_cycle", agg["improves_per_cycle"]))
-    print()
-    print("  Cycle duration (seconds, all closed cycles):")
-    print(_format_percentile_row("cycle_duration_seconds", agg["cycle_duration_seconds"]))
-    return 0
-
-
-def _cmd_stats_cycles_task(config: Config, store: "SqliteTaskStore", impl_task_id: int, as_json: bool) -> int:
-    """Show per-implementation cycle analytics."""
-    impl_task = store.get(impl_task_id)
-    if not impl_task:
-        print(f"Error: Task #{impl_task_id} not found")
-        return 1
-
-    cycles = store.get_cycles_for_impl(impl_task_id)
-
-    if as_json:
-        result: dict = {
-            "impl_task_id": impl_task_id,
-            "cycle_count": len(cycles),
-            "cycles": [],
-        }
-        for cycle in cycles:
-            iters = store.get_cycle_iterations(cycle.id)
-            result["cycles"].append({
-                "id": cycle.id,
-                "status": cycle.status,
-                "stop_reason": cycle.stop_reason,
-                "max_iterations": cycle.max_iterations,
-                "started_at": cycle.started_at.isoformat(),
-                "ended_at": cycle.ended_at.isoformat() if cycle.ended_at else None,
-                "iterations": [
-                    {
-                        "iteration_index": it.iteration_index,
-                        "review_task_id": it.review_task_id,
-                        "review_verdict": it.review_verdict,
-                        "improve_task_id": it.improve_task_id,
-                        "state": it.state,
-                    }
-                    for it in iters
-                ],
-            })
-        print(json.dumps(result, indent=2))
-        return 0
-
-    print(f"Cycle History for Implementation #{impl_task_id}")
-    print(f"  Prompt: {impl_task.prompt[:80]}{'...' if len(impl_task.prompt) > 80 else ''}")
-    print("=" * 60)
-    if not cycles:
-        print("  No cycles found.")
-        return 0
-
-    for cycle in cycles:
-        iters = store.get_cycle_iterations(cycle.id)
-        duration_str = ""
-        if cycle.ended_at and cycle.started_at:
-            duration_s = (cycle.ended_at - cycle.started_at).total_seconds()
-            duration_str = f"  ({format_duration(duration_s, verbose=True)})"
-        print(f"\nCycle #{cycle.id}  status={cycle.status}  stop={cycle.stop_reason or '-'}{duration_str}")
-        print(f"  {'Iter':<6} {'Review':>8} {'Verdict':<22} {'Improve':>8} State")
-        for it in iters:
-            iter_str = str(it.iteration_index + 1)
-            rev_str = f"#{it.review_task_id}" if it.review_task_id else "-"
-            verdict_str = it.review_verdict or "-"
-            imp_str = f"#{it.improve_task_id}" if it.improve_task_id else "-"
-            print(f"  {iter_str:<6} {rev_str:>8} {verdict_str:<22} {imp_str:>8} {it.state}")
-    return 0
 
 
 def _percentile(sorted_vals: list[int], p: float) -> int:
@@ -429,21 +322,17 @@ def _cmd_stats_reviews(
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    """Show cost and usage statistics."""
-    from gza.query import HistoryFilter, query_history
+    """Show review analytics. Use 'gza stats reviews' to see review analytics."""
+    stats_subcommand: str | None = getattr(args, 'stats_subcommand', None)
+
+    if stats_subcommand is None:
+        parser = getattr(args, '_stats_parser', None)
+        if parser is not None:
+            parser.print_help()
+        return 0
 
     config = Config.load(args.project_dir)
     store = get_store(config)
-
-    stats_subcommand: str | None = getattr(args, 'stats_subcommand', None)
-    as_json: bool = getattr(args, 'json', False)
-
-    # cycles subcommand
-    if stats_subcommand == "cycles":
-        cycle_task_id: int | None = getattr(args, 'cycle_task_id', None)
-        if cycle_task_id is not None:
-            return _cmd_stats_cycles_task(config, store, cycle_task_id, as_json)
-        return _cmd_stats_cycles(config, store, as_json)
 
     # reviews subcommand
     if stats_subcommand == "reviews":
@@ -460,137 +349,6 @@ def cmd_stats(args: argparse.Namespace) -> int:
             start_date_r = end_date_r - timedelta(days=14)
         show_issues: bool = getattr(args, 'issues', False)
         return _cmd_stats_reviews(config, store, start_date_r, end_date_r, show_issues)
-
-    # Build filter from shared query args (default stats view)
-    limit: int | None = None if getattr(args, 'all', False) else getattr(args, 'last', 5)
-    task_type: str | None = getattr(args, 'type', None)
-    days: int | None = getattr(args, 'days', None)
-    start_date: str | None = getattr(args, 'start_date', None)
-    end_date: str | None = getattr(args, 'end_date', None)
-
-    f = HistoryFilter(
-        limit=limit,
-        task_type=task_type,
-        days=days,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    tasks = query_history(store, f)
-
-    if not tasks:
-        console.print("No completed, failed, or dropped tasks")
-        return 0
-
-    if as_json:
-        json_tasks = [
-            {
-                "id": t.id,
-                "task_id": t.task_id,
-                "status": t.status,
-                "task_type": t.task_type,
-                "prompt": t.prompt,
-                "cost_usd": t.cost_usd,
-                "duration_seconds": t.duration_seconds,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "completed_at": t.completed_at.isoformat() if t.completed_at else None,
-            }
-            for t in tasks
-        ]
-        print(json.dumps(json_tasks, indent=2))
-        return 0
-
-    # Compute summary from filtered task list
-    c = TASK_COLORS
-    n_completed = sum(1 for t in tasks if t.status == "completed")
-    n_failed = sum(1 for t in tasks if t.status == "failed")
-    n_dropped = sum(1 for t in tasks if t.status == "dropped")
-    total_cost = sum(t.cost_usd or 0 for t in tasks)
-    total_duration = sum(t.duration_seconds or 0 for t in tasks)
-    total_steps = sum((get_task_step_count(t) or 0) for t in tasks)
-    tasks_with_cost = n_completed + n_failed + n_dropped
-    avg_cost = total_cost / tasks_with_cost if tasks_with_cost else 0
-
-    # Section header
-    console.print(f"[{c['header']}]Summary[/{c['header']}]")
-    console.print("=" * 50)
-    dropped_str = f", [{c['failure']}]{n_dropped} dropped[/{c['failure']}]" if n_dropped > 0 else ""
-    console.print(
-        f"  [{c['label']}]Tasks:[/{c['label']}]       "
-        f"  [{c['success']}]{n_completed} completed[/{c['success']}]"
-        f", [{c['failure']}]{n_failed} failed[/{c['failure']}]"
-        f"{dropped_str}"
-    )
-    console.print(
-        f"  [{c['label']}]Total cost:[/{c['label']}]   [{c['value']}]${total_cost:.2f}[/{c['value']}]"
-    )
-    console.print(
-        f"  [{c['label']}]Total time:[/{c['label']}]   [{c['value']}]{format_duration(total_duration, verbose=True)}[/{c['value']}]"
-    )
-    console.print(
-        f"  [{c['label']}]Total steps:[/{c['label']}]  [{c['value']}]{total_steps}[/{c['value']}]"
-    )
-    if tasks_with_cost:
-        console.print(
-            f"  [{c['label']}]Avg cost:[/{c['label']}]     [{c['value']}]${avg_cost:.2f}/task[/{c['value']}]"
-        )
-    console.print()
-
-    # Task table
-    terminal_width = get_terminal_width()
-    table_width = int(terminal_width * 0.8)
-
-    # Fixed column widths
-    status_width = 8
-    id_width = 6
-    type_width = 10
-    cost_width = 8
-    turns_width = 6
-    time_width = 8
-    len_width = 5
-
-    # Calculate remaining space for prompt column
-    fixed_width = status_width + id_width + type_width + cost_width + turns_width + time_width + len_width + 7
-    prompt_width = max(20, table_width - fixed_width)
-
-    label = "All" if getattr(args, 'all', False) else f"Last {len(tasks)}"
-    console.print(f"[{c['header']}]{label} Tasks[/{c['header']}]")
-    console.print("=" * 50)
-
-    # Table header
-    console.print(f"{'Status':<{status_width}} {'ID':>{id_width}} {'Type':<{type_width}} {'Cost':>{cost_width}} {'Steps':>{turns_width}} {'Time':>{time_width}} {'Len':>{len_width}}  Prompt")
-    console.print("-" * table_width)
-
-    for task in tasks:
-        is_ok = task.status == "completed"
-        status_str = "✓" if is_ok else "✗"
-        status_col = (
-            f"[{c['success']}]{status_str:<{status_width}}[/{c['success']}]" if is_ok
-            else f"[{c['failure']}]{status_str:<{status_width}}[/{c['failure']}]"
-        )
-        id_str = f"#{task.id}" if task.id is not None else "-"
-        type_str = task.task_type[:type_width] if task.task_type else "-"
-        cost_str = f"${task.cost_usd:.4f}" if task.cost_usd is not None else "-"
-        resolved_steps = get_task_step_count(task)
-        turns_str = str(resolved_steps) if resolved_steps is not None else "-"
-        time_str = format_duration(task.duration_seconds, verbose=True) if task.duration_seconds else "-"
-        prompt_len = len(task.prompt)
-        len_str = str(prompt_len)
-        prompt = task.prompt
-        if len(prompt) > prompt_width:
-            prompt = prompt[:prompt_width - 3] + "..."
-
-        # Use console.print for colorized status; pad manually to preserve alignment
-        id_col = f"[{c['task_id']}]{id_str:>{id_width}}[/{c['task_id']}]"
-        type_col = f"[{c['stats']}]{type_str:<{type_width}}[/{c['stats']}]"
-        prompt_col = f"[{c['prompt']}]{prompt}[/{c['prompt']}]"
-        console.print(
-            f"{status_col} {id_col} {type_col} {cost_str:>{cost_width}} {turns_str:>{turns_width}} {time_str:>{time_width}} {len_str:>{len_width}}  {prompt_col}"
-        )
-
-    console.print()
-    console.print(
-        f"[{c['label']}]Total for shown:[/{c['label']}] [{c['value']}]${sum(t.cost_usd or 0 for t in tasks):.2f}[/{c['value']}]"
-    )
 
     return 0
 
@@ -876,7 +634,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
                     # Git-tracked worktree — check lineage age
                     wt_name = worktree_path.name
-                    task = store.get_by_task_id(wt_name)
+                    task = store.get_by_slug(wt_name)
                     if task is None:
                         # No task in DB for this worktree — treat as orphaned
                         pending_worktree_removals.append((worktree_path, "no task in DB"))
@@ -941,8 +699,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                         if task.status == "completed" and task.branch and task.has_commits:
                             try:
                                 if task.merge_status != "merged" and not git.is_merged(task.branch, default_branch):
-                                    if task.task_id:
-                                        unmerged_task_ids.add(task.task_id)
+                                    if task.slug:
+                                        unmerged_task_ids.add(task.slug)
                             except Exception:
                                 logger.warning(
                                     "Failed to check merge state for task #%s branch=%s during cleanup",

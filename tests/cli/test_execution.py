@@ -1609,7 +1609,7 @@ class TestImplementCommand:
         store = SqliteTaskStore(db_path)
 
         plan_task = store.add("Plan auth migration", task_type="plan")
-        plan_task.task_id = "20260226-plan-auth-migration"
+        plan_task.slug = "20260226-plan-auth-migration"
         plan_task.status = "completed"
         plan_task.completed_at = datetime.now(timezone.utc)
         store.update(plan_task)
@@ -1634,7 +1634,7 @@ class TestImplementCommand:
         store = SqliteTaskStore(db_path)
 
         plan_task = store.add("Plan auth migration", task_type="plan")
-        plan_task.task_id = "20260226-plan-auth-migration-2"
+        plan_task.slug = "20260226-plan-auth-migration-2"
         plan_task.status = "completed"
         plan_task.completed_at = datetime.now(timezone.utc)
         store.update(plan_task)
@@ -3092,7 +3092,7 @@ class TestMarkCompletedCommand:
             worker_id="w-20260301-120000",
             pid=99999,  # non-existent PID
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-03-01T12:00:00+00:00",
             status="running",
             log_file=None,
@@ -3151,7 +3151,7 @@ class TestMarkCompletedCommand:
             worker_id="w-20260301-130000",
             pid=99998,
             task_id=task.id,
-            task_slug=task.task_id,
+            task_slug=task.slug,
             started_at="2026-03-01T13:00:00+00:00",
             status="failed",
             log_file=None,

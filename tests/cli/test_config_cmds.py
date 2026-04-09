@@ -147,6 +147,87 @@ class TestValidateCommand:
         assert "unknown mode 'xyz'" in result.stdout
 
 
+class TestProjectPrefixValidation:
+    """Tests for project_prefix config field validation."""
+
+    def test_project_prefix_valid_accepted(self, tmp_path: Path):
+        """Valid project_prefix is accepted without error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: myproj\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+    def test_project_prefix_defaults_to_project_name(self, tmp_path: Path):
+        """When project_prefix is absent, it defaults to project_name."""
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\n")
+        config = Config.load(tmp_path)
+        assert config.project_prefix == "myproject"
+
+    def test_project_prefix_too_long_rejected(self, tmp_path: Path):
+        """project_prefix longer than 12 characters raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: toolongprefix\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_invalid_chars_rejected(self, tmp_path: Path):
+        """project_prefix with uppercase letters raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: MyProj\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_hyphen_start_rejected(self, tmp_path: Path):
+        """project_prefix starting with a hyphen raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: -myproj\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_non_string_rejected(self, tmp_path: Path):
+        """project_prefix that is not a string raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: 123\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        # YAML parses 123 as an integer, triggering type validation
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_trailing_hyphen_rejected(self, tmp_path: Path):
+        """project_prefix with a trailing hyphen is rejected (M3)."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: myproj-\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_default_sanitized_from_invalid_project_name(self, tmp_path: Path):
+        """When project_name is not a valid prefix, defaulted project_prefix is sanitized (M2)."""
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: MyLargeProjectName\n")
+        config = Config.load(tmp_path)
+        # Sanitized prefix must be lowercase, alphanumeric+hyphens, no leading/trailing hyphens,
+        # max 12 chars, and non-empty
+        prefix = config.project_prefix
+        assert prefix, "project_prefix must not be empty after sanitization"
+        assert prefix == prefix.lower(), f"project_prefix must be lowercase, got: {prefix!r}"
+        assert len(prefix) <= 12, f"project_prefix must be at most 12 chars, got: {prefix!r}"
+        assert not prefix.startswith("-"), f"project_prefix must not start with hyphen, got: {prefix!r}"
+        assert not prefix.endswith("-"), f"project_prefix must not end with hyphen, got: {prefix!r}"
+        import re as _re
+        assert _re.match(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$', prefix), (
+            f"project_prefix has invalid characters: {prefix!r}"
+        )
+
+
 class TestConfigEnvVars:
     """Tests for environment variable overrides in config."""
 
@@ -554,7 +635,7 @@ class TestCleanCommand:
         store = SqliteTaskStore(config.db_path)
         unmerged_task = store.add("Unmerged feature", task_type="implement")
         unmerged_task.status = "completed"
-        unmerged_task.task_id = "20200101-unmerged"
+        unmerged_task.slug = "20200101-unmerged"
         unmerged_task.branch = "feature/unmerged"
         unmerged_task.has_commits = True
         unmerged_task.completed_at = datetime.now(timezone.utc)
@@ -613,7 +694,7 @@ class TestCleanCommand:
         # Create a task with recent activity
         store = SqliteTaskStore(config.db_path)
         task = store.add("Recent feature", task_type="implement")
-        task.task_id = "20260301-recent-feature"
+        task.slug = "20260301-recent-feature"
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
@@ -653,7 +734,7 @@ class TestCleanCommand:
         # Create a task with old activity
         store = SqliteTaskStore(config.db_path)
         task = store.add("Old feature", task_type="implement")
-        task.task_id = "20250101-old-feature"
+        task.slug = "20250101-old-feature"
         task.status = "completed"
         task.completed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
         store.update(task)
@@ -1159,385 +1240,6 @@ class TestCleanArchiveCommand:
         assert old_backup.exists()
 
 
-class TestStatsCommand:
-    """Tests for 'gza stats' command."""
-
-    def test_stats_uses_computed_steps_when_reported_missing(self, tmp_path: Path):
-        """gza stats should display computed steps for computed-only providers."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("Computed-only stats task", task_type="implement")
-        store.mark_completed(
-            task,
-            has_commits=False,
-            stats=TaskStats(num_steps_computed=5, cost_usd=0.12, duration_seconds=30.0),
-        )
-
-        result = run_gza("stats", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Total steps:  5" in result.stdout
-        assert re.search(r"✓\s+#1\s+implement\s+\$0\.1200\s+5\s", result.stdout)
-
-    def test_stats_summary_computed_from_filtered_tasks(self, tmp_path: Path):
-        """gza stats --last N computes summary only from the N filtered tasks."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        # Add 3 tasks with distinct costs
-        for i, cost in enumerate([0.10, 0.20, 0.30], start=1):
-            t = store.add(f"Task {i}", task_type="implement")
-            store.mark_completed(
-                t,
-                has_commits=False,
-                stats=TaskStats(cost_usd=cost, duration_seconds=10.0),
-            )
-
-        # Show only last 1 — summary should reflect only the most recent task ($0.30)
-        result = run_gza("stats", "--last", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Total cost in summary should match only the 1 shown task
-        assert "$0.30" in result.stdout
-
-    def test_stats_all_flag_shows_all_tasks(self, tmp_path: Path):
-        """gza stats --all shows every task without a limit."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        for i in range(8):
-            t = store.add(f"Task {i}", task_type="implement")
-            store.mark_completed(t, has_commits=False, stats=TaskStats(cost_usd=0.01))
-
-        result = run_gza("stats", "--all", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        for i in range(8):
-            assert f"Task {i}" in result.stdout
-
-    def test_stats_type_filter(self, tmp_path: Path):
-        """gza stats --type filters to matching task type."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.05))
-
-        rev = store.add("Review code", task_type="review")
-        store.mark_completed(rev, has_commits=False, stats=TaskStats(cost_usd=0.02))
-
-        result = run_gza("stats", "--type", "review", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Review code" in result.stdout
-        assert "Implement feature" not in result.stdout
-
-    def test_stats_no_tasks_message(self, tmp_path: Path):
-        """gza stats prints a message when no matching tasks exist."""
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        result = run_gza("stats", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No completed, failed, or dropped tasks" in result.stdout
-
-    def test_stats_status_column_alignment(self, tmp_path: Path):
-        """gza stats renders status symbol with correct column spacing (M1 fix)."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("Alignment test task", task_type="implement")
-        store.mark_completed(
-            task,
-            has_commits=False,
-            stats=TaskStats(cost_usd=0.12, duration_seconds=30.0),
-        )
-
-        result = run_gza("stats", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Status symbol followed by whitespace then task ID — no markup bleed
-        assert re.search(r"✓\s+#\d+\s+", result.stdout)
-
-    def test_stats_dropped_task_not_counted_as_failed(self, tmp_path: Path):
-        """gza stats counts only 'failed' tasks as failed, not 'dropped' (M2 fix)."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        completed = store.add("Completed task", task_type="implement")
-        store.mark_completed(
-            completed,
-            has_commits=False,
-            stats=TaskStats(cost_usd=0.05),
-        )
-
-        # Mark a task as dropped via set-status
-        dropped = store.add("Dropped task", task_type="implement")
-        dropped.status = "dropped"
-        store.update(dropped)
-
-        result = run_gza("stats", "--all", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # 1 completed, 0 failed — dropped must not inflate failed count
-        assert "1 completed" in result.stdout
-        assert "0 failed" in result.stdout
-
-    def test_stats_json_respects_type_filter(self, tmp_path: Path):
-        """gza stats --type --json returns only matching task types (M3 fix)."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.05))
-
-        rev = store.add("Review code", task_type="review")
-        store.mark_completed(rev, has_commits=False, stats=TaskStats(cost_usd=0.02))
-
-        result = run_gza("stats", "--type", "review", "--json", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["task_type"] == "review"
-
-
-class TestStatsCyclesCommand:
-    """Tests for 'gza stats --cycles' command."""
-
-    def test_stats_cycles_no_data(self, tmp_path: Path):
-        """gza stats --cycles with no cycles prints zero-data message."""
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        result = run_gza("stats", "cycles", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No cycles found" in result.stdout or "0" in result.stdout
-
-    def test_stats_cycles_with_approved_cycle(self, tmp_path: Path):
-        """gza stats --cycles reports correct counts for an approved cycle."""
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        cycle = store.start_cycle(impl.id)
-        it = store.append_cycle_iteration(cycle.id, 0)
-        review = store.add("Review", task_type="review")
-        assert review.id is not None
-        store.update_cycle_iteration(it.id, review_task_id=review.id, state="terminal", review_verdict="APPROVED")
-        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
-
-        result = run_gza("stats", "cycles", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "1" in result.stdout  # at least 1 cycle shown
-        assert "approved" in result.stdout.lower() or "Approved" in result.stdout
-
-    def test_stats_cycles_json_output(self, tmp_path: Path):
-        """gza stats --cycles --json outputs valid JSON."""
-        import json
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        result = run_gza("stats", "cycles", "--json", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        assert "total_cycles" in data
-        assert "approved_cycles" in data
-
-    def test_stats_cycles_task_json(self, tmp_path: Path):
-        """gza stats --cycles --task <id> --json outputs per-impl cycle data."""
-        import json
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        cycle = store.start_cycle(impl.id)
-        store.close_cycle(cycle.id, status="maxed_out", stop_reason="max_iterations")
-
-        result = run_gza(
-            "stats", "cycles", "--task", str(impl.id), "--json",
-            "--project", str(tmp_path)
-        )
-
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        assert data["impl_task_id"] == impl.id
-        assert data["cycle_count"] == 1
-        assert data["cycles"][0]["status"] == "maxed_out"
-
-    def test_stats_without_cycles_flag_unchanged(self, tmp_path: Path):
-        """gza stats without --cycles shows the normal task stats table."""
-        from gza.db import SqliteTaskStore, TaskStats
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        task = store.add("A task", task_type="implement")
-        store.mark_completed(
-            task,
-            has_commits=False,
-            stats=TaskStats(num_steps_computed=3, cost_usd=0.05, duration_seconds=10.0),
-        )
-
-        result = run_gza("stats", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Total cost" in result.stdout
-        assert "Tasks" in result.stdout
-        # Should NOT show cycle analytics headers
-        assert "Cycle Analytics" not in result.stdout
-
-    def test_stats_cycles_improves_before_approval_metric(self, tmp_path: Path):
-        """gza stats --cycles --json reports improves_before_approval key (not iterations_to_approval)."""
-        import json
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        cycle = store.start_cycle(impl.id)
-
-        # Iteration 0: review + improve (CHANGES_REQUESTED)
-        review0 = store.add("Review 0", task_type="review")
-        improve0 = store.add("Improve 0", task_type="improve")
-        assert review0.id is not None and improve0.id is not None
-        it0 = store.append_cycle_iteration(cycle.id, 0)
-        store.update_cycle_iteration(
-            it0.id,
-            review_task_id=review0.id,
-            improve_task_id=improve0.id,
-            state="improve_completed",
-            review_verdict="CHANGES_REQUESTED",
-        )
-
-        # Iteration 1: review only (APPROVED)
-        review1 = store.add("Review 1", task_type="review")
-        assert review1.id is not None
-        it1 = store.append_cycle_iteration(cycle.id, 1)
-        store.update_cycle_iteration(
-            it1.id,
-            review_task_id=review1.id,
-            state="terminal",
-            review_verdict="APPROVED",
-        )
-        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
-
-        result = run_gza("stats", "cycles", "--json", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        # Key must be improves_before_approval, NOT iterations_to_approval
-        assert "improves_before_approval" in data
-        assert "iterations_to_approval" not in data
-        assert data["improves_before_approval"]["min"] == 1.0
-
-    def test_stats_cycles_human_readable_indentation(self, tmp_path: Path):
-        """Human-readable stats rows have exactly 2 leading spaces, not 4.
-
-        Regression test for the double-indentation bug where call sites passed
-        labels with '  ' prefix while _format_percentile_row already adds '  '.
-        """
-        from gza.db import SqliteTaskStore
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        cycle = store.start_cycle(impl.id)
-
-        # One iteration with improve (CHANGES_REQUESTED) followed by APPROVED
-        review0 = store.add("Review 0", task_type="review")
-        improve0 = store.add("Improve 0", task_type="improve")
-        assert review0.id is not None and improve0.id is not None
-        it0 = store.append_cycle_iteration(cycle.id, 0)
-        store.update_cycle_iteration(
-            it0.id,
-            review_task_id=review0.id,
-            improve_task_id=improve0.id,
-            state="improve_completed",
-            review_verdict="CHANGES_REQUESTED",
-        )
-        review1 = store.add("Review 1", task_type="review")
-        assert review1.id is not None
-        it1 = store.append_cycle_iteration(cycle.id, 1)
-        store.update_cycle_iteration(
-            it1.id,
-            review_task_id=review1.id,
-            state="terminal",
-            review_verdict="APPROVED",
-        )
-        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
-
-        result = run_gza("stats", "cycles", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Find the improves_before_approval row in the output
-        lines = result.stdout.splitlines()
-        matching = [ln for ln in lines if "improves_before_approval" in ln]
-        assert matching, "Expected an 'improves_before_approval' row in output"
-        row = matching[0]
-        # Must start with exactly 2 leading spaces (not 4)
-        assert row.startswith("  "), f"Row should start with 2 spaces: {row!r}"
-        assert not row.startswith("    "), f"Row must not have 4 leading spaces (double-indent bug): {row!r}"
-
-
 class TestStatsReviewsCommand:
     """Tests for 'gza stats reviews' command."""
 
@@ -1659,6 +1361,27 @@ class TestStatsReviewsCommand:
         start = today - timedelta(days=14)
         assert str(start) in result.stdout
         assert str(today) in result.stdout
+
+
+class TestStatsCommand:
+    """Tests for the 'gza stats' parent command."""
+
+    def test_stats_no_subcommand_prints_help(self, tmp_path: Path):
+        """gza stats with no subcommand exits 0 and prints help containing 'reviews'."""
+        setup_config(tmp_path)
+
+        result = run_gza("stats", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "reviews" in result.stdout
+
+    def test_stats_cycles_subcommand_not_found(self, tmp_path: Path):
+        """gza stats cycles exits non-zero since the subcommand was removed."""
+        setup_config(tmp_path)
+
+        result = run_gza("stats", "cycles", "--project", str(tmp_path))
+
+        assert result.returncode != 0
 
 
 class TestImportCommand:

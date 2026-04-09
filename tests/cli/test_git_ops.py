@@ -227,7 +227,7 @@ class TestMergeCommand:
         # Create a task with a descriptive prompt
         task_prompt = "Implement user authentication with JWT tokens"
         task = store.add(task_prompt)
-        task.task_id = "20260401-impl-auth-jwt"
+        task.slug = "20260401-impl-auth-jwt"
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         task.branch = "feature/auth"
@@ -250,7 +250,7 @@ class TestMergeCommand:
 
         # Verify the commit message contains task information
         assert f"Task #{task.id}" in commit_message, "Commit message should include task ID"
-        assert f"Slug: {task.task_id}" in commit_message, "Commit message should include task slug"
+        assert f"Slug: {task.slug}" in commit_message, "Commit message should include task slug"
         assert "Squash merge" in commit_message, "Commit message should indicate squash merge"
 
     def test_branch_shows_as_merged_after_squash(self, tmp_path: Path):
@@ -4831,7 +4831,7 @@ class TestAdvanceAutoPlans:
         self._setup_git_repo(tmp_path)
 
         plan = self._create_completed_plan(store, "Design auth system")
-        plan.task_id = "20260305-design-auth-system-2"
+        plan.slug = "20260305-design-auth-system-2"
         store.update(plan)
 
         spawn_calls = []
@@ -5128,7 +5128,7 @@ class TestPrCommand:
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
         source_task = store.add("Add auth and metrics", task_type="implement")
-        source_task.task_id = "20260318-impl-auth-and-metrics"
+        source_task.slug = "20260318-impl-auth-and-metrics"
         store.update(source_task)
 
         def _mock_run(_config, task_id=None, **_kwargs):
@@ -5166,7 +5166,7 @@ class TestPrCommand:
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
         source_task = store.add("Add auth and metrics", task_type="implement")
-        source_task.task_id = "20260318-impl-auth-and-metrics"
+        source_task.slug = "20260318-impl-auth-and-metrics"
         store.update(source_task)
 
         def _mock_run(_config, task_id=None, **_kwargs):
@@ -5198,7 +5198,7 @@ class TestPrCommand:
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
         source_task = store.add("Add auth and metrics", task_type="implement")
-        source_task.task_id = "20260318-impl-auth-and-metrics"
+        source_task.slug = "20260318-impl-auth-and-metrics"
         store.update(source_task)
 
         with patch(
