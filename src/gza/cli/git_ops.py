@@ -1155,6 +1155,135 @@ def cmd_diff(args: argparse.Namespace) -> int:
         return 1
 
 
+def _generate_pr_content(
+    task: DbTask,
+    commit_log: str,
+    diff_stat: str,
+    config: Config,
+    store: SqliteTaskStore,
+) -> tuple[str, str]:
+    """Generate PR title and body using an internal task.
+
+    Args:
+        task: The task to create a PR for
+        commit_log: Git log output for the branch
+        diff_stat: Git diff --stat output
+
+    Returns:
+        Tuple of (title, body)
+    """
+    # Build prompt using the strict PR description contract template.
+    prompt = PromptBuilder().pr_description_prompt(
+        task_prompt=task.prompt,
+        commit_log=commit_log,
+        diff_stat=diff_stat,
+    )
+
+    internal_task = store.add(
+        prompt=prompt,
+        task_type="internal",
+        skip_learnings=True,
+    )
+
+    if internal_task.id is None:
+        return _fallback_pr_content(task, commit_log)
+    internal_task_id = internal_task.id
+
+    def _mark_internal_task_failed_if_nonterminal() -> None:
+        refreshed = store.get(internal_task_id)
+        if refreshed is None:
+            return
+        if refreshed.status in {"pending", "in_progress"}:
+            store.mark_failed(refreshed, failure_reason="UNKNOWN")
+
+    try:
+        exit_code = runner_mod.run(config, task_id=internal_task_id)
+    except Exception as exc:
+        _mark_internal_task_failed_if_nonterminal()
+        print(
+            f"Warning: PR description internal task #{internal_task_id} failed: {exc}",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    completed_task = store.get(internal_task_id)
+    if exit_code != 0 or completed_task is None or completed_task.status != "completed":
+        _mark_internal_task_failed_if_nonterminal()
+        print(
+            f"Warning: PR description internal task #{internal_task_id} did not complete successfully",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    response = (completed_task.output_content or "").strip()
+    if not response:
+        print(
+            f"Warning: PR description internal task #{internal_task_id} produced no output",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    has_title = any(line.startswith("TITLE:") for line in response.splitlines())
+    has_body = any(line.strip() == "BODY:" for line in response.splitlines())
+    if not (has_title and has_body):
+        print(
+            f"Warning: PR description internal task #{internal_task_id} produced malformed output",
+            file=sys.stderr,
+        )
+        return _fallback_pr_content(task, commit_log)
+
+    return _parse_pr_response(response, task)
+
+
+
+def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
+    """Parse Claude's response into title and body."""
+    lines = response.split("\n")
+    title = ""
+    body_lines = []
+    in_body = False
+
+    for line in lines:
+        if line.startswith("TITLE:"):
+            title = line[6:].strip()
+        elif line.strip() == "BODY:":
+            in_body = True
+        elif in_body:
+            body_lines.append(line)
+
+    if not title:
+        # Use task_id or first line of prompt
+        title = task.slug or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
+
+    body = "\n".join(body_lines).strip()
+    if not body:
+        body = f"Task: {truncate(task.prompt, MAX_PR_BODY_LENGTH)}"
+
+    return title, body
+
+
+def _fallback_pr_content(task: DbTask, commit_log: str) -> tuple[str, str]:
+    """Generate simple PR content without AI."""
+    # Title from task_id or prompt
+    if task.slug:
+        # Convert slug like "20240106-add-feature" to "Add feature"
+        parts = task.slug.split("-")[1:]  # Remove date prefix
+        title = " ".join(parts).capitalize()
+    else:
+        title = truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
+
+    body = f"""## Task Prompt
+
+> {truncate(task.prompt, MAX_PR_BODY_LENGTH).replace(chr(10), chr(10) + '> ')}
+
+## Commits
+```
+{commit_log}
+```
+"""
+    return title, body
+
+
 def cmd_pr(args: argparse.Namespace) -> int:
     """Create a GitHub PR from a completed task."""
     config = Config.load(args.project_dir)

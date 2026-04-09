@@ -26,7 +26,6 @@ def extract_task_id_suffix(task_id: object | None) -> str:
         return suffix
     return task_id_str
 
-
 def get_task_slug(slug: str | None) -> str | None:
     """Extract the slug portion from a full task slug, preserving any trailing revision suffix.
 

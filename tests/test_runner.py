@@ -2451,7 +2451,6 @@ class TestComputeSlugOverride:
         result = _compute_slug_override(task, store)
         assert result is None
 
-
 class TestReviewNextSteps:
     """Tests for next steps output after review task completion."""
 
