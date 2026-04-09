@@ -127,6 +127,7 @@ If the review requests changes, improve and re-review:
 
 ```bash
 # Address review feedback (continues on the same branch)
+# You can pass the implement, improve, or review task ID — gza auto-resolves to the root implementation.
 gza improve 1
 
 # Review again

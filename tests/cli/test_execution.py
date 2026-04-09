@@ -1766,8 +1766,8 @@ class TestImproveCommand:
         assert result.returncode == 1
         assert "is a plan task" in result.stdout
 
-    def test_improve_with_review_task_id_suggests_impl(self, tmp_path: Path):
-        """Improve command on review task suggests using implementation task ID."""
+    def test_improve_accepts_review_task_id_and_resolves_impl(self, tmp_path: Path):
+        """Improve command accepts a review task ID and auto-resolves to the implement task."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -1786,12 +1786,54 @@ class TestImproveCommand:
         review_task.completed_at = datetime.now(timezone.utc)
         store.update(review_task)
 
-        # Run improve command with review task ID
-        result = run_gza("improve", "2", "--project", str(tmp_path))
+        # Run improve command with review task ID — should resolve to impl task and succeed
+        result = run_gza("improve", str(review_task.id), "--queue", "--project", str(tmp_path))
 
-        assert result.returncode == 1
-        assert "is a review task" in result.stdout
-        assert "gza improve 1" in result.stdout
+        assert result.returncode == 0, result.stdout
+        assert "Created improve task" in result.stdout
+        assert f"Based on: implementation #{impl_task.id}" in result.stdout
+
+    def test_improve_accepts_improve_task_id_and_resolves_impl(self, tmp_path: Path):
+        """Improve command accepts an improve task ID and auto-resolves to the implement task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(timezone.utc)
+        store.update(review_task)
+
+        # First improve task
+        assert impl_task.id is not None
+        assert review_task.id is not None
+        improve_task = store.add(
+            "Improve", task_type="improve", based_on=impl_task.id, depends_on=review_task.id, same_branch=True
+        )
+        improve_task.status = "completed"
+        improve_task.completed_at = datetime.now(timezone.utc)
+        store.update(improve_task)
+
+        # Add a second review so a new improve can be created
+        review_task2 = store.add("Review 2", task_type="review", depends_on=impl_task.id)
+        review_task2.status = "completed"
+        review_task2.completed_at = datetime.now(timezone.utc)
+        store.update(review_task2)
+
+        # Run improve command with improve task ID — should resolve to impl task
+        result = run_gza("improve", str(improve_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert "Created improve task" in result.stdout
+        assert f"Based on: implementation #{impl_task.id}" in result.stdout
 
     def test_improve_uses_most_recent_review(self, tmp_path: Path):
         """Improve command uses the most recent review when multiple exist."""
@@ -2033,7 +2075,7 @@ class TestReviewCommand:
         assert review_task.group == "auth-feature"  # inherited from implementation
 
     def test_review_fails_on_non_implementation_task(self, tmp_path: Path):
-        """Review command fails if task is not an implementation/improve task."""
+        """Review command fails if task is not an implementation/improve/review task."""
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
@@ -2051,7 +2093,7 @@ class TestReviewCommand:
         result = run_gza("review", "1", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "is a plan task, not an implementation/improve task" in result.stdout
+        assert "is a plan task, not an implementation, improve, or review task" in result.stdout
 
     def test_review_accepts_improve_task_and_targets_implementation(self, tmp_path: Path):
         """Review command accepts improve tasks and reviews the base implementation."""
@@ -2092,6 +2134,41 @@ class TestReviewCommand:
         assert review_task.task_type == "review"
         assert review_task.depends_on == impl_task.id
         assert review_task.group == "auth"
+
+    def test_review_accepts_review_task_id_and_targets_implementation(self, tmp_path: Path):
+        """Review command accepts a review task ID and creates a new review on the base implementation."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create completed implementation task
+        impl_task = store.add("Implement feature", task_type="implement", group="feat")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-implement-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Create a completed review task for the implementation
+        assert impl_task.id is not None
+        existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
+        existing_review.status = "completed"
+        existing_review.completed_at = datetime.now(timezone.utc)
+        store.update(existing_review)
+
+        # Run review command with the existing review task ID
+        result = run_gza("review", str(existing_review.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert "Created review task #3" in result.stdout
+        assert "Implementation: #1" in result.stdout
+
+        new_review = store.get(3)
+        assert new_review is not None
+        assert new_review.task_type == "review"
+        assert new_review.depends_on == impl_task.id
 
     def test_review_fails_on_non_completed_task(self, tmp_path: Path):
         """Review command fails if implementation is not completed."""

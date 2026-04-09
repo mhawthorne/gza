@@ -848,7 +848,7 @@ gza improve <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Implementation task ID to improve |
+| `impl_task_id` | Task ID (implement, improve, or review — auto-resolves to root implementation) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
@@ -869,7 +869,7 @@ gza review <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Implementation task ID to review |
+| `task_id` | Task ID (implement, improve, or review — auto-resolves to root implementation) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
