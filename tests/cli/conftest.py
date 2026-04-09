@@ -132,7 +132,7 @@ def setup_unmerged_env(
     task.branch = branch
     task.has_commits = has_commits
     task.merge_status = merge_status
-    task.task_id = task_id
+    task.slug = task_id
     store.update(task)
 
     # Create feature branch (with a commit only if has_commits is True)

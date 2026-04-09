@@ -698,8 +698,8 @@ def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
             path = config.project_dir / path
         candidates.append(path)
 
-    if task.task_id:
-        inferred = config.log_path / f"{task.task_id}.log"
+    if task.slug:
+        inferred = config.log_path / f"{task.slug}.log"
         candidates.append(inferred)
 
     deduped: list[Path] = []
@@ -715,8 +715,8 @@ def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
 
 def _task_startup_log_path(config: Config, task: DbTask | None, worker: WorkerMetadata | None = None) -> Path | None:
     """Resolve deterministic startup log path from task slug, with legacy fallback."""
-    if task and task.task_id:
-        deterministic = config.workers_path / f"{task.task_id}.startup.log"
+    if task and task.slug:
+        deterministic = config.workers_path / f"{task.slug}.startup.log"
         if deterministic.exists():
             return deterministic
     if worker and worker.startup_log_file:
@@ -724,8 +724,8 @@ def _task_startup_log_path(config: Config, task: DbTask | None, worker: WorkerMe
         if not startup_path.is_absolute():
             startup_path = config.project_dir / startup_path
         return startup_path
-    if task and task.task_id:
-        return config.workers_path / f"{task.task_id}.startup.log"
+    if task and task.slug:
+        return config.workers_path / f"{task.slug}.startup.log"
     return None
 
 
@@ -878,12 +878,12 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     elif args.slug:
         # Look up by slug (exact or partial match)
-        requested_task = store.get_by_task_id(query)
+        requested_task = store.get_by_slug(query)
         if not requested_task:
             # Try partial match
             all_tasks = store.get_all()
             for t in all_tasks:
-                if t.task_id and query in t.task_id:
+                if t.slug and query in t.slug:
                     requested_task = t
                     break
         if not requested_task:
@@ -991,7 +991,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         if task:
             prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
             console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
-            console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.task_id or '')}", soft_wrap=True)
+            console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.slug or '')}", soft_wrap=True)
             _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
             _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
             console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)

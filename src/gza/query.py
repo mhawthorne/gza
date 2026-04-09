@@ -157,7 +157,7 @@ def get_task_slug(task: Task) -> str | None:
     '-2', '-3' are preserved so callers that need an exact match against the
     original task_id slug string get the right value.
     """
-    return _get_task_slug_from_task_id(task.task_id)
+    return _get_task_slug_from_task_id(task.slug)
 
 
 def get_base_task_slug(task: Task) -> str | None:
@@ -167,7 +167,7 @@ def get_base_task_slug(task: Task) -> str | None:
     revision suffix such as '-2' or '-3'. Use this when matching across task
     retries/revisions.
     """
-    return _get_base_task_slug(task.task_id)
+    return _get_base_task_slug(task.slug)
 
 
 def get_reviews_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:

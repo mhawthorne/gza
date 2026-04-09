@@ -22,8 +22,8 @@ def build_auto_review_prompt(impl_task: Task) -> str:
 
     Preserves the historical slug-first prompt semantics used by runner auto-review.
     """
-    if impl_task.task_id:
-        parts = impl_task.task_id.split("-", 1)
+    if impl_task.slug:
+        parts = impl_task.slug.split("-", 1)
         if len(parts) == 2:
             slug = re.sub(r"-\d+$", "", parts[1])
             return f"review {slug}"

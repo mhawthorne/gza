@@ -297,6 +297,7 @@ class BranchStrategy:
 class Config:
     project_dir: Path
     project_name: str  # Required - no default
+    project_prefix: str = ""  # Short prefix for task slugs; defaults to project_name if empty
     tasks_file: str = DEFAULT_TASKS_FILE
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
@@ -341,6 +342,10 @@ class Config:
     def __post_init__(self):
         if not self.docker_image:
             self.docker_image = f"{self.project_name}-gza"
+
+        # Default project_prefix to project_name if not explicitly set
+        if not self.project_prefix:
+            self.project_prefix = self.project_name
 
         # Set default branch strategy if not provided
         if self.branch_strategy is None:
@@ -521,7 +526,7 @@ class Config:
 
         # Validate and warn about unknown keys
         valid_fields = {
-            "project_name", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -544,6 +549,21 @@ class Config:
                 f"'project_name' is required in {config_path}\n"
                 f"Add 'project_name: your-project-name' to the config file."
             )
+
+        # Parse and validate project_prefix
+        import re as _re
+        _PREFIX_RE = _re.compile(r'^[a-z0-9][a-z0-9-]*$')
+        project_prefix_raw = data.get("project_prefix", "")
+        if project_prefix_raw:
+            if not isinstance(project_prefix_raw, str):
+                raise ConfigError("'project_prefix' must be a string")
+            if len(project_prefix_raw) < 1 or len(project_prefix_raw) > 12:
+                raise ConfigError("'project_prefix' must be between 1 and 12 characters")
+            if not _PREFIX_RE.match(project_prefix_raw):
+                raise ConfigError(
+                    "'project_prefix' must contain only lowercase alphanumeric characters and hyphens, "
+                    "and must start with a letter or digit"
+                )
 
         # Support both new "defaults" section and old flat structure
         # If "defaults" exists, use it; otherwise use top-level fields
@@ -1040,6 +1060,7 @@ class Config:
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
+            project_prefix=project_prefix_raw,
             tasks_file=data.get("tasks_file", DEFAULT_TASKS_FILE),
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
             use_docker=use_docker,
@@ -1121,7 +1142,7 @@ class Config:
 
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
-            "project_name", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",

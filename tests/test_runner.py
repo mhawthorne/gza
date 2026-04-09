@@ -50,7 +50,7 @@ class TestGetTaskOutputPaths:
     def _make_task(self, store, task_type):
         """Create a task with a task_id slug set."""
         task = store.add(prompt=f"Test {task_type}", task_type=task_type)
-        task.task_id = f"20260101-test-{task_type}"
+        task.slug = f"20260101-test-{task_type}"
         store.update(task)
         return task
 
@@ -83,7 +83,7 @@ class TestGetTaskOutputPaths:
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="No slug", task_type="implement")
         # task_id is None by default (slug not yet generated)
-        assert task.task_id is None
+        assert task.slug is None
         report_path, summary_path = get_task_output_paths(task, tmp_path)
         assert report_path is None
         assert summary_path is None
@@ -388,12 +388,12 @@ class TestReviewContextFromChain:
             depends_on=review2.id,
         )
         improve2.status = "completed"
-        improve2.task_id = "20260227-improve-2"
+        improve2.slug = "20260227-improve-2"
         store.update(improve2)
 
         summary_dir = tmp_path / ".gza" / "summaries"
         summary_dir.mkdir(parents=True, exist_ok=True)
-        (summary_dir / f"{improve2.task_id}.md").write_text(
+        (summary_dir / f"{improve2.slug}.md").write_text(
             "# What was accomplished\n- Reduced retry loops\n- Added guardrails\n"
         )
 
@@ -753,12 +753,12 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260129-add-docker-volumes"
+        impl_task.slug = "20260129-add-docker-volumes"
         store.update(impl_task)
 
         # Get the task to verify task_id is set
         impl_task = store.get(impl_task.id)
-        assert impl_task.task_id == "20260129-add-docker-volumes"
+        assert impl_task.slug == "20260129-add-docker-volumes"
 
         # Create a mock config and run function that captures the review task
         config = Mock(spec=Config)
@@ -806,7 +806,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260129-fix-authentication-bug-2"
+        impl_task.slug = "20260129-fix-authentication-bug-2"
         store.update(impl_task)
 
         config = Mock(spec=Config)
@@ -892,7 +892,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         impl_task.branch = "gza/20260211-add-user-authentication"
         impl_task.pr_number = 123
         store.update(impl_task)
@@ -937,7 +937,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         store.update(impl_task)
 
         config = Mock(spec=Config)
@@ -970,7 +970,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         store.update(impl_task)
 
         # Create an in_progress review
@@ -1014,7 +1014,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         store.update(impl_task)
 
         # Create a pending review
@@ -1240,7 +1240,7 @@ class TestComputeSlugOverride:
         """Review tasks get 'rev-' prefix with root task's slug."""
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(prompt="Add docker volumes", task_type="implement")
-        impl_task.task_id = "20260129-add-docker-volumes"
+        impl_task.slug = "20260129-add-docker-volumes"
         store.update(impl_task)
 
         review_task = store.add(
@@ -1256,7 +1256,7 @@ class TestComputeSlugOverride:
         """Implement tasks get 'impl-' prefix with root task's slug."""
         store = SqliteTaskStore(tmp_path / "test.db")
         plan_task = store.add(prompt="Add authentication system", task_type="plan")
-        plan_task.task_id = "20260129-add-authentication-system"
+        plan_task.slug = "20260129-add-authentication-system"
         store.update(plan_task)
 
         impl_task = store.add(
@@ -1272,7 +1272,7 @@ class TestComputeSlugOverride:
         """Improve tasks get 'impr-' prefix with root task's slug."""
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(prompt="Add docker volumes", task_type="implement")
-        impl_task.task_id = "20260129-add-docker-volumes"
+        impl_task.slug = "20260129-add-docker-volumes"
         store.update(impl_task)
 
         improve_task = store.add(
@@ -1317,7 +1317,7 @@ class TestComputeSlugOverride:
         """Root task_id retry suffix is stripped from slug."""
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(prompt="Fix auth", task_type="implement")
-        impl_task.task_id = "20260129-fix-auth-2"
+        impl_task.slug = "20260129-fix-auth-2"
         store.update(impl_task)
 
         review_task = store.add(
@@ -1344,7 +1344,7 @@ class TestReviewNextSteps:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         impl_task.branch = "gza/20260211-add-user-authentication"
         store.update(impl_task)
 
@@ -1354,7 +1354,7 @@ class TestReviewNextSteps:
             task_type="review",
             depends_on=impl_task.id,
         )
-        review_task.task_id = "20260212-review-the-implementation"
+        review_task.slug = "20260212-review-the-implementation"
         store.update(review_task)
 
         # Setup config
@@ -1389,10 +1389,10 @@ class TestReviewNextSteps:
         mock_git.get_diff.return_value = ""
 
         # Create worktree directory and report file
-        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
-        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+        report_file = worktree_review_dir / f"{review_task.slug}.md"
         report_file.write_text("# Review\n\nChanges requested.")
 
         # Capture console output by collecting print calls
@@ -1430,7 +1430,7 @@ class TestReviewNextSteps:
 
         impl_task = store.add(prompt="Add user authentication", task_type="implement")
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         impl_task.branch = "gza/20260211-add-user-authentication"
         store.update(impl_task)
 
@@ -1439,7 +1439,7 @@ class TestReviewNextSteps:
             task_type="review",
             depends_on=impl_task.id,
         )
-        review_task.task_id = "20260212-review-the-implementation"
+        review_task.slug = "20260212-review-the-implementation"
         store.update(review_task)
 
         config = Mock(spec=Config)
@@ -1469,10 +1469,10 @@ class TestReviewNextSteps:
         mock_git.get_diff_numstat.return_value = ""
         mock_git.get_diff.return_value = ""
 
-        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
-        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+        report_file = worktree_review_dir / f"{review_task.slug}.md"
         report_file.write_text(report_content)
 
         printed_lines: list[str] = []
@@ -1500,7 +1500,7 @@ class TestReviewNextSteps:
             prompt="Explore codebase",
             task_type="explore",
         )
-        explore_task.task_id = "20260212-explore-codebase"
+        explore_task.slug = "20260212-explore-codebase"
         store.update(explore_task)
 
         config = Mock(spec=Config)
@@ -1529,10 +1529,10 @@ class TestReviewNextSteps:
         mock_git.default_branch.return_value = "main"
         mock_git._run.return_value = Mock(returncode=0)
 
-        worktree_path = config.worktree_path / f"{explore_task.task_id}-explore"
+        worktree_path = config.worktree_path / f"{explore_task.slug}-explore"
         worktree_explore_dir = worktree_path / ".gza" / "explorations"
         worktree_explore_dir.mkdir(parents=True, exist_ok=True)
-        report_file = worktree_explore_dir / f"{explore_task.task_id}.md"
+        report_file = worktree_explore_dir / f"{explore_task.slug}.md"
         report_file.write_text("# Exploration\n\nFindings here.")
 
         printed_lines: list[str] = []
@@ -1565,7 +1565,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
 
         impl_task = store.add(prompt="Implement feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.task_id = "20260225-implement-feature"
+        impl_task.slug = "20260225-implement-feature"
         impl_task.branch = "test/feature-branch"
         store.update(impl_task)
 
@@ -1574,7 +1574,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
             task_type="review",
             depends_on=impl_task.id,
         )
-        review_task.task_id = "20260225-review-feature"
+        review_task.slug = "20260225-review-feature"
         store.update(review_task)
 
         config = Mock(spec=Config)
@@ -1587,7 +1587,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
         config.learnings_interval = 0
         config.learnings_window = 25
 
-        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
         worktree_path.mkdir(parents=True, exist_ok=True)
         original_git_file = worktree_path / ".git"
         original_git_content = "gitdir: /nonexistent/host/path/.git/worktrees/review\n"
@@ -1595,7 +1595,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
 
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
-        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+        report_file = worktree_review_dir / f"{review_task.slug}.md"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             assert not (worktree_path / ".git").exists()
@@ -1647,7 +1647,7 @@ class TestRunNonCodeTaskWorktreeReportDir:
 
         impl_task = store.add(prompt="Implement feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.task_id = "20260225-implement-feature"
+        impl_task.slug = "20260225-implement-feature"
         impl_task.branch = "test/feature-branch"
         store.update(impl_task)
 
@@ -1656,7 +1656,7 @@ class TestRunNonCodeTaskWorktreeReportDir:
             task_type="review",
             depends_on=impl_task.id,
         )
-        review_task.task_id = "20260225-review-feature"
+        review_task.slug = "20260225-review-feature"
         store.update(review_task)
 
         config = Mock(spec=Config)
@@ -1669,13 +1669,13 @@ class TestRunNonCodeTaskWorktreeReportDir:
         config.learnings_interval = 0
         config.learnings_window = 25
 
-        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             # Simulate provider writing the report file in the worktree
             worktree_review_dir = worktree_path / ".gza" / "reviews"
             worktree_review_dir.mkdir(parents=True, exist_ok=True)
-            report_file = worktree_review_dir / f"{review_task.task_id}.md"
+            report_file = worktree_review_dir / f"{review_task.slug}.md"
             report_file.write_text("# Review\n\nVerdict: APPROVED")
             return RunResult(
                 exit_code=0,
@@ -1703,7 +1703,7 @@ class TestRunNonCodeTaskWorktreeReportDir:
 
         assert exit_code == 0
         # Verify the report was copied from worktree to project dir
-        project_report = tmp_path / ".gza" / "reviews" / f"{review_task.task_id}.md"
+        project_report = tmp_path / ".gza" / "reviews" / f"{review_task.slug}.md"
         assert project_report.exists()
         assert "APPROVED" in project_report.read_text()
 
@@ -1722,7 +1722,7 @@ class TestRunNonCodeTaskPRPosting:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260211-add-user-authentication"
+        impl_task.slug = "20260211-add-user-authentication"
         impl_task.branch = "gza/20260211-add-user-authentication"
         impl_task.pr_number = 123
         store.update(impl_task)
@@ -1733,7 +1733,7 @@ class TestRunNonCodeTaskPRPosting:
             task_type="review",
             depends_on=impl_task.id,
         )
-        review_task.task_id = "20260212-review-the-implementation"
+        review_task.slug = "20260212-review-the-implementation"
         store.update(review_task)
 
         # Setup config
@@ -1782,10 +1782,10 @@ class TestRunNonCodeTaskPRPosting:
         mock_git.get_diff.return_value = ""
 
         # Create worktree directory and report file (simulating provider writing it)
-        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
-        report_file = worktree_review_dir / f"{review_task.task_id}.md"
+        report_file = worktree_review_dir / f"{review_task.slug}.md"
         report_file.write_text("# Review\n\nLooks good!")
 
         import gza.runner
@@ -1853,7 +1853,7 @@ class TestMaxStepsHandling:
         store = SqliteTaskStore(db_path)
 
         task = store.add(prompt="Plan task", task_type="plan")
-        task.task_id = "20260225-plan-task"
+        task.slug = "20260225-plan-task"
         store.update(task)
 
         config = Mock(spec=Config)
@@ -1894,7 +1894,7 @@ class TestMaxStepsHandling:
         store = SqliteTaskStore(db_path)
 
         task = store.add(prompt="Plan task", task_type="plan")
-        task.task_id = "20260225-plan-task"
+        task.slug = "20260225-plan-task"
         store.update(task)
 
         config = Mock(spec=Config)
@@ -1957,7 +1957,7 @@ class TestMaxStepsHandling:
         store = SqliteTaskStore(db_path)
 
         task = store.add(prompt="Plan task", task_type="plan")
-        task.task_id = "20260225-plan-task"
+        task.slug = "20260225-plan-task"
         store.update(task)
 
         config = Mock(spec=Config)
@@ -2015,7 +2015,7 @@ class TestMaxStepsHandling:
             prompt="Explore the codebase",
             task_type="explore",
         )
-        explore_task.task_id = "20260212-explore-the-codebase"
+        explore_task.slug = "20260212-explore-the-codebase"
         store.update(explore_task)
 
         # Setup config
@@ -2058,10 +2058,10 @@ class TestMaxStepsHandling:
         mock_git._run.return_value = Mock(returncode=0)
 
         # Create worktree directory and report file
-        worktree_path = config.worktree_path / f"{explore_task.task_id}-explore"
+        worktree_path = config.worktree_path / f"{explore_task.slug}-explore"
         worktree_explore_dir = worktree_path / ".gza" / "explorations"
         worktree_explore_dir.mkdir(parents=True, exist_ok=True)
-        report_file = worktree_explore_dir / f"{explore_task.task_id}.md"
+        report_file = worktree_explore_dir / f"{explore_task.slug}.md"
         report_file.write_text("# Exploration\n\nFindings here.")
 
         import gza.runner
@@ -2105,17 +2105,17 @@ class TestNonCodeWorktreeCleanup:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Explore the codebase", task_type="explore")
-        task.task_id = "20260301-explore-the-codebase"
+        task.slug = "20260301-explore-the-codebase"
         store.update(task)
 
         config = self._make_config(tmp_path)
-        worktree_path = config.worktree_path / f"{task.task_id}-explore"
+        worktree_path = config.worktree_path / f"{task.slug}-explore"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             # Simulate the provider creating the report inside the worktree
             report_dir = worktree_path / ".gza" / "explorations"
             report_dir.mkdir(parents=True, exist_ok=True)
-            (report_dir / f"{task.task_id}.md").write_text("# Exploration\n\nFindings.")
+            (report_dir / f"{task.slug}.md").write_text("# Exploration\n\nFindings.")
             return RunResult(
                 exit_code=0,
                 duration_seconds=2.0,
@@ -2146,16 +2146,16 @@ class TestNonCodeWorktreeCleanup:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Explore the codebase", task_type="explore")
-        task.task_id = "20260301-explore-the-codebase"
+        task.slug = "20260301-explore-the-codebase"
         store.update(task)
 
         config = self._make_config(tmp_path)
-        worktree_path = config.worktree_path / f"{task.task_id}-explore"
+        worktree_path = config.worktree_path / f"{task.slug}-explore"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = worktree_path / ".gza" / "explorations"
             report_dir.mkdir(parents=True, exist_ok=True)
-            (report_dir / f"{task.task_id}.md").write_text("# Exploration\n\nFindings.")
+            (report_dir / f"{task.slug}.md").write_text("# Exploration\n\nFindings.")
             return RunResult(
                 exit_code=0,
                 duration_seconds=2.0,
@@ -2185,7 +2185,7 @@ class TestNonCodeWorktreeCleanup:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Explore the codebase", task_type="explore")
-        task.task_id = "20260301-explore-the-codebase"
+        task.slug = "20260301-explore-the-codebase"
         store.update(task)
 
         config = self._make_config(tmp_path)
@@ -2208,7 +2208,7 @@ class TestNonCodeWorktreeCleanup:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        worktree_path = config.worktree_path / f"{task.task_id}-explore"
+        worktree_path = config.worktree_path / f"{task.slug}-explore"
 
         with patch("gza.runner.console") as mock_console:
             mock_console.print.side_effect = capture_print
@@ -2230,7 +2230,7 @@ class TestRunStepPersistenceIntegration:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Plan task", task_type="plan")
-        task.task_id = "20260226-plan-task"
+        task.slug = "20260226-plan-task"
         store.update(task)
 
         config = Mock(spec=Config)
@@ -2313,7 +2313,7 @@ class TestRunStepPersistenceIntegration:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Plan task", task_type="plan")
-        task.task_id = "20260302-plan-task"
+        task.slug = "20260302-plan-task"
         store.update(task)
 
         config = Mock(spec=Config)
@@ -2386,7 +2386,7 @@ class TestResumeVerificationPrompt:
             prompt="Implement feature X",
             task_type="implement",
         )
-        task.task_id = "20260212-implement-feature-x"
+        task.slug = "20260212-implement-feature-x"
         task.branch = "gza/20260212-implement-feature-x"
         task.session_id = "test-session-123"
         store.mark_failed(task, log_file="logs/test.log", stats=None)
@@ -2471,13 +2471,13 @@ class TestResumeVerificationPrompt:
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
             # Create worktree directory
-            worktree_path = config.worktree_path / task.task_id
+            worktree_path = config.worktree_path / task.slug
             worktree_path.mkdir(parents=True, exist_ok=True)
 
             # Create summary file in worktree
             summary_dir = worktree_path / ".gza" / "summaries"
             summary_dir.mkdir(parents=True, exist_ok=True)
-            summary_file = summary_dir / f"{task.task_id}.md"
+            summary_file = summary_dir / f"{task.slug}.md"
             summary_file.write_text("# Summary\n\nCompleted the task.")
 
             # Run with resume=True
@@ -2512,7 +2512,7 @@ class TestResumeVerificationPrompt:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.task_id = "20260212-implement-feature-x"
+        impl_task.slug = "20260212-implement-feature-x"
         impl_task.branch = "gza/20260212-implement-feature-x"
         store.update(impl_task)
 
@@ -2521,7 +2521,7 @@ class TestResumeVerificationPrompt:
             task_type="review",
             depends_on=impl_task.id,
         )
-        review_task.task_id = "20260212-review-feature-x"
+        review_task.slug = "20260212-review-feature-x"
         review_task.session_id = "test-session-456"
         store.mark_failed(review_task, log_file="logs/test.log", stats=None)
 
@@ -2564,11 +2564,11 @@ class TestResumeVerificationPrompt:
         mock_git.worktree_remove = Mock()
 
         # Create worktree directory and report file
-        worktree_path = config.worktree_path / f"{review_task.task_id}-review"
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
         worktree_path.mkdir(parents=True, exist_ok=True)
         review_dir = worktree_path / ".gza" / "reviews"
         review_dir.mkdir(parents=True, exist_ok=True)
-        report_file = review_dir / f"{review_task.task_id}.md"
+        report_file = review_dir / f"{review_task.slug}.md"
         report_file.write_text("# Review\n\nLooks good!")
 
         # Mock post_review_to_pr to avoid GitHub CLI dependency
@@ -2593,8 +2593,8 @@ class TestResumeVerificationPrompt:
         assert "todo list" in prompt.lower()
         assert "continue from the actual state" in prompt.lower()
         assert f"Current task DB id: #{review_task.id}" in prompt
-        assert f"Current task slug: {review_task.task_id}" in prompt
-        assert f".gza/reviews/{review_task.task_id}.md" in prompt
+        assert f"Current task slug: {review_task.slug}" in prompt
+        assert f".gza/reviews/{review_task.slug}.md" in prompt
 
         # Verify resume_session_id was passed
         assert resume_session_id == "test-session-456"
@@ -2606,7 +2606,7 @@ class TestResumeVerificationPrompt:
 
         impl_task = store.add(prompt="Implement feature X", task_type="implement")
         impl_task.status = "completed"
-        impl_task.task_id = "20260212-implement-feature-x"
+        impl_task.slug = "20260212-implement-feature-x"
         impl_task.branch = "gza/20260212-implement-feature-x"
         store.update(impl_task)
 
@@ -2615,7 +2615,7 @@ class TestResumeVerificationPrompt:
             task_type="review",
             depends_on=impl_task.id,
         )
-        failed_review.task_id = "20260212-review-feature-x"
+        failed_review.slug = "20260212-review-feature-x"
         failed_review.session_id = "resume-session-abc"
         store.mark_failed(failed_review, log_file="logs/failed.log", stats=None)
 
@@ -2625,7 +2625,7 @@ class TestResumeVerificationPrompt:
             depends_on=impl_task.id,
             based_on=failed_review.id,
         )
-        resumed_review.task_id = "20260213-review-feature-x-2"
+        resumed_review.slug = "20260213-review-feature-x-2"
         resumed_review.session_id = failed_review.session_id
         store.update(resumed_review)
 
@@ -2645,7 +2645,7 @@ class TestResumeVerificationPrompt:
             captured_prompts.append(prompt)
             report_dir = _work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
-            (report_dir / f"{resumed_review.task_id}.md").write_text("# Review\n\nVerdict: APPROVED")
+            (report_dir / f"{resumed_review.slug}.md").write_text("# Review\n\nVerdict: APPROVED")
             return RunResult(
                 exit_code=0,
                 duration_seconds=2.0,
@@ -2675,9 +2675,9 @@ class TestResumeVerificationPrompt:
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
         assert f"Current task DB id: #{resumed_review.id}" in prompt
-        assert f"Current task slug: {resumed_review.task_id}" in prompt
-        assert f".gza/reviews/{resumed_review.task_id}.md" in prompt
-        assert f".gza/reviews/{failed_review.task_id}.md" not in prompt
+        assert f"Current task slug: {resumed_review.slug}" in prompt
+        assert f".gza/reviews/{resumed_review.slug}.md" in prompt
+        assert f".gza/reviews/{failed_review.slug}.md" not in prompt
 
 
 class TestNonCodeReportArtifactContract:
@@ -2690,7 +2690,7 @@ class TestNonCodeReportArtifactContract:
 
         impl_task = store.add(prompt="Implement feature X", task_type="implement")
         impl_task.status = "completed"
-        impl_task.task_id = "20260212-implement-feature-x"
+        impl_task.slug = "20260212-implement-feature-x"
         impl_task.branch = "gza/20260212-implement-feature-x"
         store.update(impl_task)
 
@@ -2699,7 +2699,7 @@ class TestNonCodeReportArtifactContract:
             task_type="review",
             depends_on=impl_task.id,
         )
-        prior_review.task_id = "20260212-review-feature-x"
+        prior_review.slug = "20260212-review-feature-x"
         prior_review.session_id = "resume-session-stale"
         store.mark_failed(prior_review, log_file="logs/prior.log", stats=None)
 
@@ -2709,7 +2709,7 @@ class TestNonCodeReportArtifactContract:
             depends_on=impl_task.id,
             based_on=prior_review.id,
         )
-        resumed_review.task_id = "20260213-review-feature-x-2"
+        resumed_review.slug = "20260213-review-feature-x-2"
         resumed_review.session_id = prior_review.session_id
         store.update(resumed_review)
 
@@ -2726,7 +2726,7 @@ class TestNonCodeReportArtifactContract:
         def provider_run(_config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             review_dir = work_dir / ".gza" / "reviews"
             review_dir.mkdir(parents=True, exist_ok=True)
-            (review_dir / f"{prior_review.task_id}.md").write_text("# Review\n\nVerdict: APPROVED")
+            (review_dir / f"{prior_review.slug}.md").write_text("# Review\n\nVerdict: APPROVED")
             return RunResult(
                 exit_code=0,
                 duration_seconds=3.0,
@@ -2756,7 +2756,7 @@ class TestNonCodeReportArtifactContract:
         assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
         assert refreshed.report_file is None
         assert refreshed.output_content is None
-        expected_host_report = tmp_path / ".gza" / "reviews" / f"{resumed_review.task_id}.md"
+        expected_host_report = tmp_path / ".gza" / "reviews" / f"{resumed_review.slug}.md"
         assert not expected_host_report.exists()
 
     def test_non_code_success_without_expected_report_marks_failed_and_skips_copy_back(self, tmp_path: Path):
@@ -2765,7 +2765,7 @@ class TestNonCodeReportArtifactContract:
         store = SqliteTaskStore(db_path)
 
         plan_task = store.add(prompt="Plan feature Y", task_type="plan")
-        plan_task.task_id = "20260213-plan-feature-y"
+        plan_task.slug = "20260213-plan-feature-y"
         store.update(plan_task)
 
         config = Mock(spec=Config)
@@ -2803,7 +2803,7 @@ class TestNonCodeReportArtifactContract:
         assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
         assert refreshed.report_file is None
         assert refreshed.output_content is None
-        host_report = tmp_path / ".gza" / "plans" / f"{plan_task.task_id}.md"
+        host_report = tmp_path / ".gza" / "plans" / f"{plan_task.slug}.md"
         assert not host_report.exists()
 
     def test_missing_report_artifact_recovered_from_log(self, tmp_path: Path):
@@ -2812,7 +2812,7 @@ class TestNonCodeReportArtifactContract:
         store = SqliteTaskStore(db_path)
 
         review_task = store.add(prompt="Review feature Z", task_type="review")
-        review_task.task_id = "20260213-review-feature-z"
+        review_task.slug = "20260213-review-feature-z"
         store.update(review_task)
 
         config = Mock(spec=Config)
@@ -2860,7 +2860,7 @@ class TestNonCodeReportArtifactContract:
         assert refreshed.status == "completed", f"Expected completed, got {refreshed.status}"
         assert refreshed.output_content == review_text
         assert refreshed.report_file is not None
-        host_report = tmp_path / ".gza" / "reviews" / f"{review_task.task_id}.md"
+        host_report = tmp_path / ".gza" / "reviews" / f"{review_task.slug}.md"
         assert host_report.exists()
         assert host_report.read_text() == review_text
 
@@ -2870,7 +2870,7 @@ class TestNonCodeReportArtifactContract:
         store = SqliteTaskStore(db_path)
 
         review_task = store.add(prompt="Review feature W", task_type="review")
-        review_task.task_id = "20260213-review-feature-w"
+        review_task.slug = "20260213-review-feature-w"
         store.update(review_task)
 
         config = Mock(spec=Config)
@@ -3056,7 +3056,7 @@ class TestWIPFunctionality:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
 
         # Create a mock git repo
         worktree_path = tmp_path / "worktree"
@@ -3092,7 +3092,7 @@ class TestWIPFunctionality:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
 
         # Create a git repo with initial commit
         worktree_path = tmp_path / "worktree"
@@ -3125,7 +3125,7 @@ class TestWIPFunctionality:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
 
         # Create a git repo with WIP commit
         worktree_path = tmp_path / "worktree"
@@ -3154,7 +3154,7 @@ class TestWIPFunctionality:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
 
         # Create a git repo
         worktree_path = tmp_path / "worktree"
@@ -3197,7 +3197,7 @@ index 0000000..9daeafb
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
 
         # Create a git repo with multiple WIP commits
         worktree_path = tmp_path / "worktree"
@@ -3243,7 +3243,7 @@ index 0000000..9daeafb
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
 
         # Create a git repo with normal commits
         worktree_path = tmp_path / "worktree"
@@ -3389,7 +3389,7 @@ class TestNoChangesWithExistingCommits:
             prompt="Implement feature X",
             task_type="implement",
         )
-        task.task_id = "20260212-implement-feature-x"
+        task.slug = "20260212-implement-feature-x"
         task.branch = "test/20260212-implement-feature-x"
         task.session_id = "test-session-123"
         store.mark_failed(task, log_file="logs/test.log", stats=None)
@@ -3439,7 +3439,7 @@ class TestNoChangesWithExistingCommits:
 
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
-            worktree_path = config.worktree_path / task.task_id
+            worktree_path = config.worktree_path / task.slug
             worktree_path.mkdir(parents=True, exist_ok=True)
 
             result = run(config, task_id=task.id, resume=True)
@@ -3463,7 +3463,7 @@ class TestNoChangesWithExistingCommits:
             prompt="Implement feature Y",
             task_type="implement",
         )
-        task.task_id = "20260212-implement-feature-y"
+        task.slug = "20260212-implement-feature-y"
         task.branch = "test/20260212-implement-feature-y"
         store.mark_in_progress(task)
 
@@ -3511,7 +3511,7 @@ class TestNoChangesWithExistingCommits:
 
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
-            worktree_path = config.worktree_path / task.task_id
+            worktree_path = config.worktree_path / task.slug
             worktree_path.mkdir(parents=True, exist_ok=True)
 
             result = run(config, task_id=task.id, resume=False)
@@ -3644,7 +3644,7 @@ class TestSameBranchLineageWalk:
 
         # Task #1: implementation with a branch
         impl_task = store.add(prompt="Implement feature", task_type="implement")
-        impl_task.task_id = "20260301-implement-feature"
+        impl_task.slug = "20260301-implement-feature"
         impl_task.branch = "test/20260301-implement-feature"
         store.mark_in_progress(impl_task)
         store.mark_completed(impl_task, log_file="logs/impl.log", stats=None)
@@ -3656,7 +3656,7 @@ class TestSameBranchLineageWalk:
             based_on=impl_task.id,
             same_branch=True,
         )
-        improve_task.task_id = "20260301-improve-feature"
+        improve_task.slug = "20260301-improve-feature"
         store.mark_in_progress(improve_task)
 
         config = self._make_config(tmp_path, db_path)
@@ -3703,7 +3703,7 @@ class TestSameBranchLineageWalk:
 
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
-            worktree_path = config.worktree_path / improve_task.task_id
+            worktree_path = config.worktree_path / improve_task.slug
             worktree_path.mkdir(parents=True, exist_ok=True)
 
             result = run(config, task_id=improve_task.id)
@@ -3721,7 +3721,7 @@ class TestSameBranchLineageWalk:
 
         # Task #324: implementation with a branch
         impl_task = store.add(prompt="Implement feature", task_type="implement")
-        impl_task.task_id = "20260301-implement-feature"
+        impl_task.slug = "20260301-implement-feature"
         impl_task.branch = "test/20260301-implement-feature"
         store.mark_in_progress(impl_task)
         store.mark_completed(impl_task, log_file="logs/impl.log", stats=None)
@@ -3733,7 +3733,7 @@ class TestSameBranchLineageWalk:
             based_on=impl_task.id,
             same_branch=True,
         )
-        killed_task.task_id = "20260301-improve-killed"
+        killed_task.slug = "20260301-improve-killed"
         # branch is NOT set (simulating killed before persistence)
         store.mark_in_progress(killed_task)
         store.mark_failed(killed_task, log_file="logs/killed.log", stats=None)
@@ -3745,7 +3745,7 @@ class TestSameBranchLineageWalk:
             based_on=killed_task.id,
             same_branch=True,
         )
-        retry_task.task_id = "20260301-improve-retry"
+        retry_task.slug = "20260301-improve-retry"
         store.mark_in_progress(retry_task)
 
         config = self._make_config(tmp_path, db_path)
@@ -3792,7 +3792,7 @@ class TestSameBranchLineageWalk:
 
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
-            worktree_path = config.worktree_path / retry_task.task_id
+            worktree_path = config.worktree_path / retry_task.slug
             worktree_path.mkdir(parents=True, exist_ok=True)
 
             result = run(config, task_id=retry_task.id)
@@ -3812,7 +3812,7 @@ class TestSameBranchLineageWalk:
 
         # Task #1: implementation with a valid branch
         impl_task = store.add(prompt="Implement feature", task_type="implement")
-        impl_task.task_id = "20260301-implement-feature"
+        impl_task.slug = "20260301-implement-feature"
         impl_task.branch = "test/20260301-implement-feature"
         store.mark_in_progress(impl_task)
         store.mark_completed(impl_task, log_file="logs/impl.log", stats=None)
@@ -3824,7 +3824,7 @@ class TestSameBranchLineageWalk:
             based_on=impl_task.id,
             same_branch=True,
         )
-        middle_task.task_id = "20260301-improve-deleted-branch"
+        middle_task.slug = "20260301-improve-deleted-branch"
         middle_task.branch = "test/20260301-improve-deleted-branch"
         store.mark_in_progress(middle_task)
         store.mark_failed(middle_task, log_file="logs/middle.log", stats=None)
@@ -3836,7 +3836,7 @@ class TestSameBranchLineageWalk:
             based_on=middle_task.id,
             same_branch=True,
         )
-        retry_task.task_id = "20260301-improve-retry"
+        retry_task.slug = "20260301-improve-retry"
         store.mark_in_progress(retry_task)
 
         config = self._make_config(tmp_path, db_path)
@@ -3886,7 +3886,7 @@ class TestSameBranchLineageWalk:
 
             mock_git_class.side_effect = [mock_git, mock_worktree_git]
 
-            worktree_path = config.worktree_path / retry_task.task_id
+            worktree_path = config.worktree_path / retry_task.slug
             worktree_path.mkdir(parents=True, exist_ok=True)
 
             result = run(config, task_id=retry_task.id)
@@ -3903,7 +3903,7 @@ class TestSameBranchLineageWalk:
 
         # Task with no branch
         impl_task = store.add(prompt="Implement feature", task_type="implement")
-        impl_task.task_id = "20260301-implement-feature"
+        impl_task.slug = "20260301-implement-feature"
         # branch NOT set
         store.mark_in_progress(impl_task)
         store.mark_failed(impl_task, log_file="logs/impl.log", stats=None)
@@ -3915,7 +3915,7 @@ class TestSameBranchLineageWalk:
             based_on=impl_task.id,
             same_branch=True,
         )
-        improve_task.task_id = "20260301-improve-feature"
+        improve_task.slug = "20260301-improve-feature"
         store.mark_in_progress(improve_task)
 
         config = self._make_config(tmp_path, db_path)
@@ -3951,13 +3951,13 @@ class TestSameBranchLineageWalk:
 
         # Task A: no branch yet
         task_a = store.add(prompt="Task A", task_type="implement")
-        task_a.task_id = "20260301-task-a"
+        task_a.slug = "20260301-task-a"
         store.mark_in_progress(task_a)
         store.mark_failed(task_a, log_file="logs/a.log", stats=None)
 
         # Task B: based_on A, also no branch
         task_b = store.add(prompt="Task B", task_type="improve", based_on=task_a.id, same_branch=True)
-        task_b.task_id = "20260301-task-b"
+        task_b.slug = "20260301-task-b"
         store.mark_in_progress(task_b)
         store.mark_failed(task_b, log_file="logs/b.log", stats=None)
 
@@ -3969,7 +3969,7 @@ class TestSameBranchLineageWalk:
 
         # Task C: based_on B, same_branch=True — will walk B -> A -> B (cycle)
         task_c = store.add(prompt="Task C", task_type="improve", based_on=task_b.id, same_branch=True)
-        task_c.task_id = "20260301-task-c"
+        task_c.slug = "20260301-task-c"
         store.mark_in_progress(task_c)
 
         config = self._make_config(tmp_path, db_path)
@@ -4019,18 +4019,18 @@ class TestExtractedRunInnerHelpers:
         config = self._make_config(tmp_path)
 
         impl = store.add(prompt="impl", task_type="implement")
-        impl.task_id = "20260317-impl"
+        impl.slug = "20260317-impl"
         impl.branch = "test/impl"
         store.mark_in_progress(impl)
         store.mark_completed(impl, log_file="logs/impl.log", stats=None)
 
         failed_improve = store.add(prompt="improve1", task_type="improve", based_on=impl.id, same_branch=True)
-        failed_improve.task_id = "20260317-improve1"
+        failed_improve.slug = "20260317-improve1"
         store.mark_in_progress(failed_improve)
         store.mark_failed(failed_improve, log_file="logs/improve1.log", stats=None)
 
         retry = store.add(prompt="improve2", task_type="improve", based_on=failed_improve.id, same_branch=True)
-        retry.task_id = "20260317-improve2"
+        retry.slug = "20260317-improve2"
 
         git = Mock(spec=Git)
         git.branch_exists.side_effect = lambda branch: branch == "test/impl"
@@ -4058,7 +4058,7 @@ class TestExtractedRunInnerHelpers:
     def test_setup_code_task_worktree_resume_missing_branch_fails(self, tmp_path: Path):
         """Resume/same_branch setup should fail early if branch no longer exists."""
         config = self._make_config(tmp_path)
-        task = Task(id=1, prompt="resume task", task_type="implement", task_id="20260317-task")
+        task = Task(id=1, prompt="resume task", task_type="implement", slug="20260317-task")
         git = Mock(spec=Git)
         git.branch_exists.return_value = False
 
@@ -4079,13 +4079,13 @@ class TestExtractedRunInnerHelpers:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement X", task_type="implement")
-        task.task_id = "20260317-impl-x"
+        task.slug = "20260317-impl-x"
         store.mark_in_progress(task)
 
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{task.task_id}.log"
+        log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
 
         worktree_git = Mock(spec=Git)
@@ -4104,7 +4104,7 @@ class TestExtractedRunInnerHelpers:
             0,
             pre_run_status=set(),
             worktree_summary_path=tmp_path / "worktree-summary.md",
-            summary_path=tmp_path / ".gza" / "summaries" / f"{task.task_id}.md",
+            summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
             summary_dir=tmp_path / ".gza" / "summaries",
         )
 
@@ -4118,13 +4118,13 @@ class TestExtractedRunInnerHelpers:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement selective staging", task_type="implement")
-        task.task_id = "20260317-selective"
+        task.slug = "20260317-selective"
         store.mark_in_progress(task)
 
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{task.task_id}.log"
+        log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
 
         pre_status = {("M", "pre_existing.txt")}
@@ -4136,8 +4136,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n1\t0\tnew_file.txt\n"
 
         summary_dir = tmp_path / ".gza" / "summaries"
-        summary_path = summary_dir / f"{task.task_id}.md"
-        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
         worktree_summary_path.write_text("## Summary\n\n- done\n")
 
@@ -4177,13 +4177,13 @@ class TestExtractedRunInnerHelpers:
             based_on=parent.id,
             same_branch=True,
         )
-        rebase_task.task_id = "20260401-rebase-push"
+        rebase_task.slug = "20260401-rebase-push"
         store.mark_in_progress(rebase_task)
 
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{rebase_task.task_id}.log"
+        log_file = log_dir / f"{rebase_task.slug}.log"
         log_file.write_text("")
 
         worktree_git = Mock(spec=Git)
@@ -4202,7 +4202,7 @@ class TestExtractedRunInnerHelpers:
                 0,
                 pre_run_status=set(),
                 worktree_summary_path=tmp_path / "missing-summary.md",
-                summary_path=tmp_path / ".gza" / "summaries" / f"{rebase_task.task_id}.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{rebase_task.slug}.md",
                 summary_dir=tmp_path / ".gza" / "summaries",
                 skip_commit=True,
             )
@@ -4218,7 +4218,7 @@ class TestExtractedRunInnerHelpers:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Improve implementation based on review", task_type="improve")
-        task.task_id = "20260401-improve-commit-subject"
+        task.slug = "20260401-improve-commit-subject"
         store.mark_in_progress(task)
 
         review_task = store.add(prompt="Review implementation", task_type="review")
@@ -4228,7 +4228,7 @@ class TestExtractedRunInnerHelpers:
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{task.task_id}.log"
+        log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
 
         pre_status = set()
@@ -4239,8 +4239,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
 
         summary_dir = tmp_path / ".gza" / "summaries"
-        summary_path = summary_dir / f"{task.task_id}.md"
-        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
         worktree_summary_path.write_text(
             "- Use task summary for commit subject\n"
@@ -4266,7 +4266,7 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         commit_message = worktree_git.commit.call_args.args[0]
         assert commit_message.startswith("Use task summary for commit subject Include task metadata trailers")
-        assert f"\n\nTask #{task.id}\nSlug: {task.task_id}\n" in commit_message
+        assert f"\n\nTask #{task.id}\nSlug: {task.slug}\n" in commit_message
         assert f"Gza-Review: #{review_task.id}" in commit_message
 
     def test_build_code_task_commit_subject_falls_back_to_word_boundary_prompt(self, tmp_path: Path):
@@ -4291,13 +4291,13 @@ class TestExtractedRunInnerHelpers:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="   \n\t", task_type="implement")
-        task.task_id = "20260401-blank-prompt-fallback"
+        task.slug = "20260401-blank-prompt-fallback"
         store.mark_in_progress(task)
 
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{task.task_id}.log"
+        log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
 
         pre_status = set()
@@ -4308,8 +4308,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
 
         summary_dir = tmp_path / ".gza" / "summaries"
-        summary_path = summary_dir / f"{task.task_id}.md"
-        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
 
         with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
             rc = _complete_code_task(
@@ -4329,7 +4329,7 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 0
         commit_message = worktree_git.commit.call_args.args[0]
-        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+        assert commit_message.splitlines()[0] == f"gza task {task.slug}"
 
     @pytest.mark.parametrize(
         ("summary_error", "expected_warning"),
@@ -4349,13 +4349,13 @@ class TestExtractedRunInnerHelpers:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="   \n\t", task_type="implement")
-        task.task_id = "20260401-summary-read-error-fallback"
+        task.slug = "20260401-summary-read-error-fallback"
         store.mark_in_progress(task)
 
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{task.task_id}.log"
+        log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
 
         pre_status = set()
@@ -4366,8 +4366,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
 
         summary_dir = tmp_path / ".gza" / "summaries"
-        summary_path = summary_dir / f"{task.task_id}.md"
-        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
         worktree_summary_path.write_text("placeholder summary")
 
@@ -4405,7 +4405,7 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 0
         commit_message = worktree_git.commit.call_args.args[0]
-        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+        assert commit_message.splitlines()[0] == f"gza task {task.slug}"
         assert expected_warning in caplog.text
         refreshed = store.get(task.id)
         assert refreshed is not None
@@ -4428,13 +4428,13 @@ class TestExtractedRunInnerHelpers:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="   \n\t", task_type="implement")
-        task.task_id = "20260401-summary-read-persistent-failure"
+        task.slug = "20260401-summary-read-persistent-failure"
         store.mark_in_progress(task)
 
         config = self._make_config(tmp_path)
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{task.task_id}.log"
+        log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
 
         pre_status = set()
@@ -4445,8 +4445,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
 
         summary_dir = tmp_path / ".gza" / "summaries"
-        summary_path = summary_dir / f"{task.task_id}.md"
-        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.task_id}.md"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
         worktree_summary_path.write_text("placeholder summary")
 
@@ -4480,7 +4480,7 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 0
         commit_message = worktree_git.commit.call_args.args[0]
-        assert commit_message.splitlines()[0] == f"gza task {task.task_id}"
+        assert commit_message.splitlines()[0] == f"gza task {task.slug}"
         assert "Failed to read summary file for commit subject" in caplog.text
         assert "Failed to read summary file for task completion output" in caplog.text
 
@@ -4624,7 +4624,7 @@ class TestExceptionHandlerMarkFailed:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
         task.branch = "test-branch"
         store.mark_in_progress(task)
 
@@ -4634,7 +4634,7 @@ class TestExceptionHandlerMarkFailed:
         # Simulate what the GitError handler does
         log_path = tmp_path / "logs"
         log_path.mkdir()
-        log_file = log_path / f"{task.task_id}.log"
+        log_file = log_path / f"{task.slug}.log"
         log_file.write_text("")
 
         config = Mock(spec=Config)
@@ -4652,13 +4652,13 @@ class TestExceptionHandlerMarkFailed:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Test task", task_type="implement")
-        task.task_id = "20260212-test-task"
+        task.slug = "20260212-test-task"
         task.branch = "test-branch"
         store.mark_in_progress(task)
 
         log_path = tmp_path / "logs"
         log_path.mkdir()
-        log_file = log_path / f"{task.task_id}.log"
+        log_file = log_path / f"{task.slug}.log"
         log_file.write_text("")
 
         config = Mock(spec=Config)
@@ -4675,12 +4675,12 @@ class TestExceptionHandlerMarkFailed:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Explore something", task_type="explore")
-        task.task_id = "20260212-explore-task"
+        task.slug = "20260212-explore-task"
         store.mark_in_progress(task)
 
         log_path = tmp_path / "logs"
         log_path.mkdir()
-        log_file = log_path / f"{task.task_id}.log"
+        log_file = log_path / f"{task.slug}.log"
         log_file.write_text("")
 
         config = Mock(spec=Config)

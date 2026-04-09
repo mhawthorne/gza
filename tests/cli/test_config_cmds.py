@@ -554,7 +554,7 @@ class TestCleanCommand:
         store = SqliteTaskStore(config.db_path)
         unmerged_task = store.add("Unmerged feature", task_type="implement")
         unmerged_task.status = "completed"
-        unmerged_task.task_id = "20200101-unmerged"
+        unmerged_task.slug = "20200101-unmerged"
         unmerged_task.branch = "feature/unmerged"
         unmerged_task.has_commits = True
         unmerged_task.completed_at = datetime.now(timezone.utc)
@@ -613,7 +613,7 @@ class TestCleanCommand:
         # Create a task with recent activity
         store = SqliteTaskStore(config.db_path)
         task = store.add("Recent feature", task_type="implement")
-        task.task_id = "20260301-recent-feature"
+        task.slug = "20260301-recent-feature"
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
@@ -653,7 +653,7 @@ class TestCleanCommand:
         # Create a task with old activity
         store = SqliteTaskStore(config.db_path)
         task = store.add("Old feature", task_type="implement")
-        task.task_id = "20250101-old-feature"
+        task.slug = "20250101-old-feature"
         task.status = "completed"
         task.completed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
         store.update(task)

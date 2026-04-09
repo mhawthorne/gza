@@ -77,7 +77,7 @@ class Task:
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
     task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
-    task_id: str | None = None  # YYYYMMDD-slug format
+    slug: str | None = None  # YYYYMMDD-slug format (DB column: task_id)
     branch: str | None = None
     log_file: str | None = None
     report_file: str | None = None
@@ -682,7 +682,7 @@ class SqliteTaskStore:
             prompt=row["prompt"].decode("utf-8", errors="replace") if isinstance(row["prompt"], bytes) else row["prompt"],
             status=row["status"],
             task_type=row["task_type"],
-            task_id=row["task_id"],
+            slug=row["task_id"],
             branch=row["branch"],
             log_file=row["log_file"],
             report_file=row["report_file"],
@@ -814,10 +814,10 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
-    def get_by_task_id(self, task_id: str) -> Task | None:
-        """Get a task by task_id (slug)."""
+    def get_by_slug(self, slug: str) -> Task | None:
+        """Get a task by slug (the task_id DB column)."""
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            cur = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (slug,))
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
@@ -876,7 +876,7 @@ class SqliteTaskStore:
                     task.prompt,
                     task.status,
                     task.task_type,
-                    task.task_id,
+                    task.slug,
                     task.branch,
                     task.log_file,
                     task.report_file,
@@ -2265,8 +2265,8 @@ def add_task_interactive(
     based_on_slug = None
     if based_on:
         based_on_task = store.get(based_on)
-        if based_on_task and based_on_task.task_id:
-            based_on_slug = based_on_task.task_id[9:]  # Skip YYYYMMDD-
+        if based_on_task and based_on_task.slug:
+            based_on_slug = based_on_task.slug[9:]  # Skip YYYYMMDD-
 
     while True:
         prompt = edit_prompt(
@@ -2374,7 +2374,7 @@ def _task_to_dict(task: "Task") -> dict:
         "prompt": task.prompt,
         "status": task.status,
         "task_type": task.task_type,
-        "task_id": task.task_id,
+        "task_id": task.slug,
         "branch": task.branch,
         "log_file": task.log_file,
         "report_file": task.report_file,

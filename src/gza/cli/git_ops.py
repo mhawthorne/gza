@@ -195,7 +195,7 @@ def _merge_single_task(
                 commit_message = build_task_commit_message(
                     task.prompt,
                     task_id=task.id,
-                    task_slug=task.task_id,
+                    task_slug=task.slug,
                     subject_prefix="Squash merge: ",
                 )
 
@@ -887,7 +887,7 @@ def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
 
     if not title:
         # Use task_id or first line of prompt
-        title = task.task_id or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
+        title = task.slug or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
 
     body = "\n".join(body_lines).strip()
     if not body:
@@ -899,9 +899,9 @@ def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
 def _fallback_pr_content(task: DbTask, commit_log: str) -> tuple[str, str]:
     """Generate simple PR content without AI."""
     # Title from task_id or prompt
-    if task.task_id:
+    if task.slug:
         # Convert slug like "20240106-add-feature" to "Add feature"
-        parts = task.task_id.split("-")[1:]  # Remove date prefix
+        parts = task.slug.split("-")[1:]  # Remove date prefix
         title = " ".join(parts).capitalize()
     else:
         title = truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
