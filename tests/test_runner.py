@@ -2154,7 +2154,6 @@ class TestGenerateSlugProjectPrefix:
         slug = generate_slug("Normal task prompt", project_prefix="gza")
         assert slug.endswith("-gza-normal-task-prompt") or "-gza-normal-task-prompt-" in slug
 
-
 class TestTaskIdExistsBranchStrategy:
     """Tests for _slug_exists using branch_strategy patterns."""
 
