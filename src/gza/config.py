@@ -3,6 +3,7 @@
 import copy
 import logging
 import os
+import re
 import sys
 import warnings
 from dataclasses import dataclass, field
@@ -14,6 +15,11 @@ APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
 logger = logging.getLogger(__name__)
+
+# Compiled regex for validating project_prefix values.
+# Requires first and last chars to be alphanumeric (prevents leading/trailing hyphens).
+# Single-character prefixes (just one alphanumeric) are also valid.
+_PREFIX_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
 
 __all__ = [
     "APP_NAME",
@@ -345,7 +351,15 @@ class Config:
 
         # Default project_prefix to project_name if not explicitly set
         if not self.project_prefix:
-            self.project_prefix = self.project_name
+            # Sanitize: lowercase, replace non-alphanumeric chars with hyphens,
+            # strip leading/trailing hyphens, truncate to 12 chars
+            sanitized = re.sub(r'[^a-z0-9-]', '-', self.project_name.lower())
+            sanitized = sanitized.strip('-')
+            # Collapse multiple consecutive hyphens
+            sanitized = re.sub(r'-+', '-', sanitized)
+            # Truncate and strip any trailing hyphen produced by truncation
+            sanitized = sanitized[:12].rstrip('-')
+            self.project_prefix = sanitized or self.project_name[:12].lower()
 
         # Set default branch strategy if not provided
         if self.branch_strategy is None:
@@ -551,13 +565,11 @@ class Config:
             )
 
         # Parse and validate project_prefix
-        import re as _re
-        _PREFIX_RE = _re.compile(r'^[a-z0-9][a-z0-9-]*$')
         project_prefix_raw = data.get("project_prefix", "")
         if project_prefix_raw:
             if not isinstance(project_prefix_raw, str):
                 raise ConfigError("'project_prefix' must be a string")
-            if len(project_prefix_raw) < 1 or len(project_prefix_raw) > 12:
+            if len(project_prefix_raw) > 12:
                 raise ConfigError("'project_prefix' must be between 1 and 12 characters")
             if not _PREFIX_RE.match(project_prefix_raw):
                 raise ConfigError(
@@ -1165,6 +1177,18 @@ class Config:
             errors.append("'project_name' is required")
         elif not isinstance(data["project_name"], str):
             errors.append("'project_name' must be a string")
+
+        if "project_prefix" in data and data["project_prefix"]:
+            prefix_val = data["project_prefix"]
+            if not isinstance(prefix_val, str):
+                errors.append("'project_prefix' must be a string")
+            elif len(prefix_val) > 12:
+                errors.append("'project_prefix' must be between 1 and 12 characters")
+            elif not _PREFIX_RE.match(prefix_val):
+                errors.append(
+                    "'project_prefix' must contain only lowercase alphanumeric characters and hyphens, "
+                    "and must start with a letter or digit"
+                )
 
         if "tasks_file" in data and not isinstance(data["tasks_file"], str):
             errors.append("'tasks_file' must be a string")

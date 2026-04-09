@@ -35,9 +35,9 @@ from gza.runner import (
     _restore_wip_changes,
     _squash_wip_commits,
     _run_result_to_stats,
-    _slug_from_task_id,
-    _task_id_exists,
-    generate_task_id,
+    _extract_slug_suffix,
+    _slug_exists,
+    generate_slug,
     post_review_to_pr,
     run,
     write_log_entry,
@@ -1048,25 +1048,25 @@ class TestReviewTaskSlugGeneration:
             gza.runner.run = original_run
 
 
-class TestSlugFromTaskId:
-    """Tests for _slug_from_task_id helper."""
+class TestExtractSlugSuffix:
+    """Tests for _extract_slug_suffix helper."""
 
     def test_strips_date_prefix(self):
-        assert _slug_from_task_id("20260129-add-docker-volumes") == "add-docker-volumes"
+        assert _extract_slug_suffix("20260129-add-docker-volumes") == "add-docker-volumes"
 
     def test_strips_date_prefix_and_retry_suffix(self):
-        assert _slug_from_task_id("20260129-fix-auth-bug-2") == "fix-auth-bug"
+        assert _extract_slug_suffix("20260129-fix-auth-bug-2") == "fix-auth-bug"
 
     def test_no_dash_returns_original(self):
-        assert _slug_from_task_id("nodash") == "nodash"
+        assert _extract_slug_suffix("nodash") == "nodash"
 
 
-class TestGenerateTaskIdSlugOverride:
-    """Tests for generate_task_id with slug_override parameter."""
+class TestGenerateSlugSlugOverride:
+    """Tests for generate_slug with slug_override parameter."""
 
     def test_slug_override_used_instead_of_prompt(self, tmp_path: Path):
         """slug_override replaces the slug derived from prompt."""
-        task_id = generate_task_id(
+        task_id = generate_slug(
             "some long generic prompt text",
             slug_override="rev-add-docker-volumes",
         )
@@ -1074,7 +1074,7 @@ class TestGenerateTaskIdSlugOverride:
 
     def test_slug_override_none_falls_back_to_prompt(self, tmp_path: Path):
         """When slug_override is None, slug is derived from prompt as usual."""
-        task_id = generate_task_id(
+        task_id = generate_slug(
             "Add docker volumes support",
             slug_override=None,
         )
@@ -1082,7 +1082,7 @@ class TestGenerateTaskIdSlugOverride:
 
     def test_slug_override_not_used_on_retry(self, tmp_path: Path):
         """slug_override is ignored when existing_id is provided (retry path)."""
-        task_id = generate_task_id(
+        task_id = generate_slug(
             "some prompt",
             existing_id="20260101-original-slug",
             slug_override="rev-something-else",
@@ -1091,14 +1091,38 @@ class TestGenerateTaskIdSlugOverride:
         assert "original-slug" in task_id
 
 
+class TestGenerateSlugProjectPrefix:
+    """Tests for generate_slug with project_prefix parameter."""
+
+    def test_project_prefix_included_in_slug(self):
+        """When project_prefix is set, slug is prefixed with it after the date."""
+        slug = generate_slug("Add auth support", project_prefix="myproj")
+        # Expected: YYYYMMDD-myproj-add-auth-support
+        assert "-myproj-" in slug
+        assert slug.endswith("-myproj-add-auth-support") or "-myproj-add-auth-support-" in slug
+
+    def test_no_project_prefix_slug_unchanged(self):
+        """When project_prefix is None or empty, slug is derived from prompt only."""
+        slug = generate_slug("Add auth support", project_prefix=None)
+        assert "-myproj-" not in slug
+        assert "add-auth-support" in slug
+
+    def test_project_prefix_empty_string_omitted(self):
+        """Empty string project_prefix is treated as no prefix."""
+        slug = generate_slug("Add auth support", project_prefix="")
+        assert "add-auth-support" in slug
+        # Should not have a double-dash from empty prefix
+        assert "--" not in slug
+
+
 class TestTaskIdExistsBranchStrategy:
-    """Tests for _task_id_exists using branch_strategy patterns."""
+    """Tests for _slug_exists using branch_strategy patterns."""
 
     def test_default_pattern_checks_project_slash_task_id(self):
         """Without branch_strategy, falls back to {project}/{task_id} pattern."""
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1112,7 +1136,7 @@ class TestTaskIdExistsBranchStrategy:
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
         strategy = BranchStrategy(pattern="{slug}", default_type="feature")
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1129,7 +1153,7 @@ class TestTaskIdExistsBranchStrategy:
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
         strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-add-feature",
             log_path=None,
             git=git,
@@ -1145,7 +1169,7 @@ class TestTaskIdExistsBranchStrategy:
         git = Mock(spec=Git)
         git.branch_exists.return_value = False
         strategy = BranchStrategy(pattern="{slug}", default_type="feature")
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1155,8 +1179,8 @@ class TestTaskIdExistsBranchStrategy:
         )
         assert result is False
 
-    def test_generate_task_id_detects_collision_with_non_default_pattern(self, tmp_path: Path):
-        """generate_task_id appends suffix when slug-only branch already exists."""
+    def test_generate_slug_detects_collision_with_non_default_pattern(self, tmp_path: Path):
+        """generate_slug appends suffix when slug-only branch already exists."""
         git = Mock(spec=Git)
         strategy = BranchStrategy(pattern="{slug}", default_type="feature")
 
@@ -1166,7 +1190,7 @@ class TestTaskIdExistsBranchStrategy:
 
         git.branch_exists.side_effect = branch_exists
 
-        task_id = generate_task_id(
+        task_id = generate_slug(
             "My task",
             log_path=None,
             git=git,
@@ -1176,13 +1200,13 @@ class TestTaskIdExistsBranchStrategy:
         # Base branch "my-task" was taken, so should get a -2 suffix
         assert task_id.endswith("-2")
 
-    def test_generate_task_id_no_collision_with_non_default_pattern(self):
-        """generate_task_id returns base id when the real branch does not exist."""
+    def test_generate_slug_no_collision_with_non_default_pattern(self):
+        """generate_slug returns base id when the real branch does not exist."""
         git = Mock(spec=Git)
         git.branch_exists.return_value = False
         strategy = BranchStrategy(pattern="{slug}", default_type="feature")
 
-        task_id = generate_task_id(
+        task_id = generate_slug(
             "My task",
             log_path=None,
             git=git,
@@ -1197,7 +1221,7 @@ class TestTaskIdExistsBranchStrategy:
         git.branch_exists.return_value = True
         strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
         # Prompt would infer "feature" but explicit_type says "fix"
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1210,8 +1234,8 @@ class TestTaskIdExistsBranchStrategy:
         # Must check the explicit-type branch, not the inferred-type branch
         git.branch_exists.assert_called_once_with("fix/my-task")
 
-    def test_explicit_type_collision_triggers_suffix_in_generate_task_id(self):
-        """generate_task_id appends suffix when explicit-type branch exists."""
+    def test_explicit_type_collision_triggers_suffix_in_generate_slug(self):
+        """generate_slug appends suffix when explicit-type branch exists."""
         git = Mock(spec=Git)
         strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
 
@@ -1221,7 +1245,7 @@ class TestTaskIdExistsBranchStrategy:
 
         git.branch_exists.side_effect = branch_exists
 
-        task_id = generate_task_id(
+        task_id = generate_slug(
             "Add a new feature",  # would infer "feature" type without explicit_type
             log_path=None,
             git=git,
@@ -1328,6 +1352,40 @@ class TestComputeSlugOverride:
 
         result = _compute_slug_override(review_task, store)
         assert result == "rev-fix-auth"
+
+    def test_no_double_prefix_when_root_slug_contains_project_prefix(self, tmp_path: Path):
+        """Review task slug must not double-embed the project prefix.
+
+        Root slug:   20260409-myproj-add-feature
+        Override:    rev-myproj-add-feature   (from _compute_slug_override)
+        generate_slug with project_prefix="myproj" and slug_override set must
+        NOT prepend the prefix again, yielding 20260409-rev-myproj-add-feature,
+        NOT 20260409-myproj-rev-myproj-add-feature.
+        """
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(prompt="Add feature", task_type="implement")
+        impl_task.slug = "20260409-myproj-add-feature"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="review myproj-add-feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        slug_override = _compute_slug_override(review_task, store)
+        assert slug_override == "rev-myproj-add-feature"
+
+        final_slug = generate_slug(
+            review_task.prompt,
+            project_prefix="myproj",
+            slug_override=slug_override,
+        )
+        # Prefix "myproj" should appear exactly once in the result
+        assert final_slug.count("myproj") == 1, (
+            f"Expected 'myproj' exactly once in slug, got: {final_slug}"
+        )
+        assert "rev-myproj-add-feature" in final_slug
 
 
 class TestReviewNextSteps:

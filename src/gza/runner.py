@@ -322,25 +322,34 @@ def slugify(text: str, max_length: int = 50) -> str:
     return slug
 
 
-def generate_task_id(
+def generate_slug(
     prompt: str,
     existing_id: str | None = None,
     log_path: Path | None = None,
     git: Git | None = None,
     project_name: str | None = None,
+    project_prefix: str | None = None,
     slug_override: str | None = None,
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
 ) -> str:
-    """Generate a task ID in YYYYMMDD-slug format, with suffix for retries."""
+    """Generate a task slug in YYYYMMDD-{project_prefix}-slug format, with suffix for retries."""
     if existing_id:
         # This is a retry - strip any existing suffix to get base
         base_id = re.sub(r'-\d+$', '', existing_id)
     else:
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
-        slug = slug_override if slug_override is not None else slugify(prompt)
-        base_id = f"{date_prefix}-{slug}"
+        if slug_override is not None:
+            # slug_override already encodes full lineage context (e.g. "rev-myproj-add-feature")
+            # so do not prepend project_prefix — it would double-embed the prefix for chained tasks
+            base_id = f"{date_prefix}-{slug_override}"
+        else:
+            slug = slugify(prompt)
+            if project_prefix:
+                base_id = f"{date_prefix}-{project_prefix}-{slug}"
+            else:
+                base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
     if not _slug_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
@@ -355,15 +364,17 @@ def generate_task_id(
     return new_id
 
 
-def _slug_from_task_id(task_id: str) -> str:
-    """Extract the slug portion from a task_id (strips date prefix and retry suffix)."""
-    parts = task_id.split('-', 1)
+
+def _extract_slug_suffix(slug: str) -> str:
+    """Extract the non-date portion from a slug (strips date prefix and retry suffix)."""
+    parts = slug.split('-', 1)
     if len(parts) == 2:
-        slug = parts[1]
+        suffix = parts[1]
         # Remove retry suffix (-2, -3, etc.)
-        slug = re.sub(r'-\d+$', '', slug)
-        return slug
-    return task_id
+        suffix = re.sub(r'-\d+$', '', suffix)
+        return suffix
+    return slug
+
 
 
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
@@ -385,7 +396,7 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     root = _query.resolve_lineage_root(store, task)
 
     if root.slug:
-        root_slug = _slug_from_task_id(root.slug)
+        root_slug = _extract_slug_suffix(root.slug)
     else:
         root_slug = slugify(root.prompt)
 
@@ -1135,7 +1146,10 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
         Exit code from running the review task.
     """
     try:
-        review_task = create_review_task(store, completed_task, prompt_mode="auto")
+        review_task = create_review_task(
+            store, completed_task, prompt_mode="auto",
+            project_prefix=config.project_prefix or None,
+        )
     except DuplicateReviewError as e:
         review_task = e.active_review
         if review_task.status == "in_progress":
@@ -1388,17 +1402,18 @@ def run(
     except GitError:
         pass  # May fail if offline, continue anyway
 
-    # Generate task_id - checks for collisions with existing branches/logs
-    # Always generate when task_id is not set (new tasks, including new resume tasks).
-    # Keep existing task_id only when resuming a task that already has one assigned.
+    # Generate slug — checks for collisions with existing branches/logs.
+    # Always generate when slug is not set (new tasks, including new resume tasks).
+    # Keep existing slug only when resuming a task that already has one assigned.
     if task.slug is None:
         slug_override = _compute_slug_override(task, store)
-        task.slug = generate_task_id(
+        task.slug = generate_slug(
             task.prompt,
             existing_id=None,
             log_path=config.log_path,
             git=git,
             project_name=config.project_name,
+            project_prefix=config.project_prefix,
             slug_override=slug_override,
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
