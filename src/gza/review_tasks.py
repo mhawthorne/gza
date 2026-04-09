@@ -17,15 +17,21 @@ class DuplicateReviewError(ValueError):
         )
 
 
-def build_auto_review_prompt(impl_task: Task) -> str:
+def build_auto_review_prompt(impl_task: Task, project_prefix: str | None = None) -> str:
     """Build prompt text for runner auto-created reviews.
 
     Preserves the historical slug-first prompt semantics used by runner auto-review.
+    When project_prefix is provided, it is stripped from the slug-derived description
+    so the prompt contains only the semantic portion (e.g. "review add-feature" rather
+    than "review myproj-add-feature").
     """
     if impl_task.slug:
         parts = impl_task.slug.split("-", 1)
         if len(parts) == 2:
             slug = re.sub(r"-\d+$", "", parts[1])
+            # Strip project_prefix if present at the start of the slug portion
+            if project_prefix and slug.startswith(f"{project_prefix}-"):
+                slug = slug[len(project_prefix) + 1:]
             return f"review {slug}"
 
     review_prompt = f"Review task #{impl_task.id}"
@@ -41,6 +47,7 @@ def create_review_task(
     model: str | None = None,
     provider: str | None = None,
     prompt_mode: Literal["cli", "auto"] = "cli",
+    project_prefix: str | None = None,
 ) -> Task:
     """Create a review task for a completed implementation task.
 
@@ -64,7 +71,7 @@ def create_review_task(
         raise DuplicateReviewError(active_reviews[0])
 
     if prompt_mode == "auto":
-        review_prompt = build_auto_review_prompt(impl_task)
+        review_prompt = build_auto_review_prompt(impl_task, project_prefix=project_prefix)
     else:
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
 

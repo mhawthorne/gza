@@ -36,7 +36,7 @@ from gza.runner import (
     _squash_wip_commits,
     _run_result_to_stats,
     _slug_from_task_id,
-    _task_id_exists,
+    _slug_exists,
     generate_task_id,
     post_review_to_pr,
     run,
@@ -1091,14 +1091,41 @@ class TestGenerateTaskIdSlugOverride:
         assert "original-slug" in task_id
 
 
+class TestGenerateSlugProjectPrefix:
+    """Tests for generate_slug (generate_task_id) with project_prefix parameter."""
+
+    def test_project_prefix_included_in_slug(self):
+        """When project_prefix is set, slug is prefixed with it after the date."""
+        from gza.runner import generate_slug
+        slug = generate_slug("Add auth support", project_prefix="myproj")
+        # Expected: YYYYMMDD-myproj-add-auth-support
+        assert "-myproj-" in slug
+        assert slug.endswith("-myproj-add-auth-support") or "-myproj-add-auth-support-" in slug
+
+    def test_no_project_prefix_slug_unchanged(self):
+        """When project_prefix is None or empty, slug is derived from prompt only."""
+        from gza.runner import generate_slug
+        slug = generate_slug("Add auth support", project_prefix=None)
+        assert "-myproj-" not in slug
+        assert "add-auth-support" in slug
+
+    def test_project_prefix_empty_string_omitted(self):
+        """Empty string project_prefix is treated as no prefix."""
+        from gza.runner import generate_slug
+        slug = generate_slug("Add auth support", project_prefix="")
+        assert "add-auth-support" in slug
+        # Should not have a double-dash from empty prefix
+        assert "--" not in slug
+
+
 class TestTaskIdExistsBranchStrategy:
-    """Tests for _task_id_exists using branch_strategy patterns."""
+    """Tests for _slug_exists using branch_strategy patterns."""
 
     def test_default_pattern_checks_project_slash_task_id(self):
         """Without branch_strategy, falls back to {project}/{task_id} pattern."""
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1112,7 +1139,7 @@ class TestTaskIdExistsBranchStrategy:
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
         strategy = BranchStrategy(pattern="{slug}", default_type="feature")
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1129,7 +1156,7 @@ class TestTaskIdExistsBranchStrategy:
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
         strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-add-feature",
             log_path=None,
             git=git,
@@ -1145,7 +1172,7 @@ class TestTaskIdExistsBranchStrategy:
         git = Mock(spec=Git)
         git.branch_exists.return_value = False
         strategy = BranchStrategy(pattern="{slug}", default_type="feature")
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1197,7 +1224,7 @@ class TestTaskIdExistsBranchStrategy:
         git.branch_exists.return_value = True
         strategy = BranchStrategy(pattern="{type}/{slug}", default_type="feature")
         # Prompt would infer "feature" but explicit_type says "fix"
-        result = _task_id_exists(
+        result = _slug_exists(
             "20260407-my-task",
             log_path=None,
             git=git,
@@ -1328,6 +1355,42 @@ class TestComputeSlugOverride:
 
         result = _compute_slug_override(review_task, store)
         assert result == "rev-fix-auth"
+
+    def test_no_double_prefix_when_root_slug_contains_project_prefix(self, tmp_path: Path):
+        """Review task slug must not double-embed the project prefix.
+
+        Root slug:   20260409-myproj-add-feature
+        Override:    rev-myproj-add-feature   (from _compute_slug_override)
+        generate_slug with project_prefix="myproj" and slug_override set must
+        NOT prepend the prefix again, yielding 20260409-rev-myproj-add-feature,
+        NOT 20260409-myproj-rev-myproj-add-feature.
+        """
+        from gza.runner import generate_slug
+
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(prompt="Add feature", task_type="implement")
+        impl_task.slug = "20260409-myproj-add-feature"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="review myproj-add-feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        slug_override = _compute_slug_override(review_task, store)
+        assert slug_override == "rev-myproj-add-feature"
+
+        final_slug = generate_slug(
+            review_task.prompt,
+            project_prefix="myproj",
+            slug_override=slug_override,
+        )
+        # Prefix "myproj" should appear exactly once in the result
+        assert final_slug.count("myproj") == 1, (
+            f"Expected 'myproj' exactly once in slug, got: {final_slug}"
+        )
+        assert "rev-myproj-add-feature" in final_slug
 
 
 class TestReviewNextSteps:
