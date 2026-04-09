@@ -205,7 +205,7 @@ def _cmd_stats_reviews(
         if t.created_at is None:
             return None
         if t.created_at.tzinfo is not None:
-            return t.created_at.replace(tzinfo=None)
+            return t.created_at.astimezone().replace(tzinfo=None)
         return t.created_at
 
     def find_root_impl(task_id: int, visited: set[int] | None = None) -> int | None:
