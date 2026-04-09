@@ -494,6 +494,7 @@ gza log <identifier> [options]
 | `--follow`, `-f` | Follow log in real-time |
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
+| `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
 By default, the identifier is treated as a task ID (numeric).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
@@ -649,6 +650,7 @@ gza show <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `--full` | Show full output without truncation |
+| `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--prompt`, `--output`, and `--path` modes |
 
 ### resume
 

@@ -20,7 +20,7 @@ from ..config import Config
 from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import _parse_iso, get_store
+from ._common import _parse_iso, get_store, pager_context
 
 
 def _lc() -> str:
@@ -961,109 +961,111 @@ def cmd_log(args: argparse.Namespace) -> int:
             store if task else None,
         )
 
-    # Static display mode - show summary or full turns
-    try:
-        log_data, entries, content = _load_log_file_entries(log_path)
+    use_page = getattr(args, 'page', False)
+    with pager_context(use_page, config.project_dir):
+        # Static display mode - show summary or full turns
+        try:
+            log_data, entries, content = _load_log_file_entries(log_path)
 
-        if log_data is None and not entries:
-            # If we have content but couldn't parse any JSON, it's likely a startup error
-            if content:
-                if using_startup_log:
-                    console.print(f"[{_lc()}]Startup log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
-                    console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
-                console.print("[red]Task failed during startup (no Claude session):[/red]", soft_wrap=True)
-                # Display the raw error message, indented for clarity
-                for line in content.split('\n'):
-                    console.print(f"  {rich_escape(line)}", soft_wrap=True)
-                return 1
+            if log_data is None and not entries:
+                # If we have content but couldn't parse any JSON, it's likely a startup error
+                if content:
+                    if using_startup_log:
+                        console.print(f"[{_lc()}]Startup log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+                        console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
+                    console.print("[red]Task failed during startup (no Claude session):[/red]", soft_wrap=True)
+                    # Display the raw error message, indented for clarity
+                    for line in content.split('\n'):
+                        console.print(f"  {rich_escape(line)}", soft_wrap=True)
+                    return 1
+                else:
+                    console.print("Error: No log entries found in log file", soft_wrap=True)
+                    return 1
+        except Exception as e:
+            print(f"Error: Failed to read log file: {e}")
+            return 1
+
+        # Display header
+        _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
+        console.print(_sep, soft_wrap=True)
+        if task:
+            prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
+            console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
+            console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.task_id or '')}", soft_wrap=True)
+            _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
+            _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
+            console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
+            if resolution_note:
+                console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
+            console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+            if using_startup_log:
+                console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
+            if task.branch:
+                console.print(f"[{_lc()}]Branch:[/{_lc()}] {rich_escape(task.branch)}", soft_wrap=True)
+        elif worker:
+            console.print(f"[{_lc()}]Worker:[/{_lc()}] {rich_escape(worker.worker_id)}", soft_wrap=True)
+            _w_status = worker.status if worker.status else "unknown"
+            if is_running and _w_status != "running":
+                # Prefer live process state when worker metadata is stale.
+                _w_status = "running"
+            _w_color = PS_STATUS_COLORS.get(_w_status, "white")
+            console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
+            console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+            if using_startup_log:
+                console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
+        console.print(_sep, soft_wrap=True)
+        console.print()
+
+        timeline_mode = getattr(args, "timeline_mode", None)
+        if timeline_mode and entries:
+            _display_step_timeline(entries, verbose=timeline_mode == "verbose")
+        elif entries:
+            printer = _LiveLogPrinter(live=False)
+            any_printed = False
+            for entry in entries:
+                printer.process(entry)
+                any_printed = True
+            if not any_printed and log_data:
+                if "result" in log_data:
+                    console.print(rich_escape(log_data["result"]), soft_wrap=True)
+                else:
+                    subtype = log_data.get("subtype", "unknown")
+                    console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
+                    if log_data.get("errors"):
+                        console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
             else:
-                console.print("Error: No log entries found in log file", soft_wrap=True)
-                return 1
-    except Exception as e:
-        print(f"Error: Failed to read log file: {e}")
-        return 1
-
-    # Display header
-    _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
-    console.print(_sep, soft_wrap=True)
-    if task:
-        prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
-        console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
-        console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.task_id or '')}", soft_wrap=True)
-        _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
-        _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
-        console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
-        if resolution_note:
-            console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
-        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
-        if using_startup_log:
-            console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
-        if task.branch:
-            console.print(f"[{_lc()}]Branch:[/{_lc()}] {rich_escape(task.branch)}", soft_wrap=True)
-    elif worker:
-        console.print(f"[{_lc()}]Worker:[/{_lc()}] {rich_escape(worker.worker_id)}", soft_wrap=True)
-        _w_status = worker.status if worker.status else "unknown"
-        if is_running and _w_status != "running":
-            # Prefer live process state when worker metadata is stale.
-            _w_status = "running"
-        _w_color = PS_STATUS_COLORS.get(_w_status, "white")
-        console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
-        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
-        if using_startup_log:
-            console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
-    console.print(_sep, soft_wrap=True)
-    console.print()
-
-    timeline_mode = getattr(args, "timeline_mode", None)
-    if timeline_mode and entries:
-        _display_step_timeline(entries, verbose=timeline_mode == "verbose")
-    elif entries:
-        printer = _LiveLogPrinter(live=False)
-        any_printed = False
-        for entry in entries:
-            printer.process(entry)
-            any_printed = True
-        if not any_printed and log_data:
+                console.print("No displayable log entries found.", soft_wrap=True)
+        elif log_data:
+            # Extract and display the result field (which contains markdown)
             if "result" in log_data:
                 console.print(rich_escape(log_data["result"]), soft_wrap=True)
             else:
+                # No result - show the subtype (e.g., error_max_turns)
                 subtype = log_data.get("subtype", "unknown")
                 console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
                 if log_data.get("errors"):
                     console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
         else:
-            console.print("No displayable log entries found.", soft_wrap=True)
-    elif log_data:
-        # Extract and display the result field (which contains markdown)
-        if "result" in log_data:
-            console.print(rich_escape(log_data["result"]), soft_wrap=True)
-        else:
-            # No result - show the subtype (e.g., error_max_turns)
-            subtype = log_data.get("subtype", "unknown")
-            console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
-            if log_data.get("errors"):
-                console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
-    else:
-        # No result entry yet - show compact step timeline
-        _display_step_timeline(entries, verbose=False)
+            # No result entry yet - show compact step timeline
+            _display_step_timeline(entries, verbose=False)
 
-    console.print()
-    console.print(_sep, soft_wrap=True)
+        console.print()
+        console.print(_sep, soft_wrap=True)
 
-    # Display summary stats if available
-    if log_data:
-        if "duration_ms" in log_data:
-            duration_sec = log_data["duration_ms"] / 1000
-            console.print(f"[{_lc()}]Duration:[/{_lc()}] {format_duration(duration_sec, verbose=True)}", soft_wrap=True)
-        step_count = _result_step_count(log_data)
-        if step_count is not None:
-            console.print(f"[{_lc()}]Steps:[/{_lc()}] {step_count}", soft_wrap=True)
-            if "num_steps" not in log_data and "num_steps_reported" not in log_data and "num_turns" in log_data:
-                console.print(f"[{_lc()}]Legacy turns:[/{_lc()}] {log_data['num_turns']}", soft_wrap=True)
-        if "total_cost_usd" in log_data:
-            console.print(f"[{_lc()}]Cost:[/{_lc()}] ${log_data['total_cost_usd']:.4f}", soft_wrap=True)
+        # Display summary stats if available
+        if log_data:
+            if "duration_ms" in log_data:
+                duration_sec = log_data["duration_ms"] / 1000
+                console.print(f"[{_lc()}]Duration:[/{_lc()}] {format_duration(duration_sec, verbose=True)}", soft_wrap=True)
+            step_count = _result_step_count(log_data)
+            if step_count is not None:
+                console.print(f"[{_lc()}]Steps:[/{_lc()}] {step_count}", soft_wrap=True)
+                if "num_steps" not in log_data and "num_steps_reported" not in log_data and "num_turns" in log_data:
+                    console.print(f"[{_lc()}]Legacy turns:[/{_lc()}] {log_data['num_turns']}", soft_wrap=True)
+            if "total_cost_usd" in log_data:
+                console.print(f"[{_lc()}]Cost:[/{_lc()}] ${log_data['total_cost_usd']:.4f}", soft_wrap=True)
 
-    return 0
+        return 0
 
 
 def _tail_log_file(
