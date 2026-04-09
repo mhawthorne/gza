@@ -195,7 +195,7 @@ def _merge_single_task(
                 commit_message = build_task_commit_message(
                     task.prompt,
                     task_id=task.id,
-                    task_slug=task.task_id,
+                    task_slug=task.slug,
                     subject_prefix="Squash merge: ",
                 )
 
@@ -820,7 +820,7 @@ def _generate_pr_content(
     )
 
     if internal_task.id is None:
-        return _fallback_pr_content(task, commit_log)
+        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
     internal_task_id = internal_task.id
 
     def _mark_internal_task_failed_if_nonterminal() -> None:
@@ -838,7 +838,7 @@ def _generate_pr_content(
             f"Warning: PR description internal task #{internal_task_id} failed: {exc}",
             file=sys.stderr,
         )
-        return _fallback_pr_content(task, commit_log)
+        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
 
     completed_task = store.get(internal_task_id)
     if exit_code != 0 or completed_task is None or completed_task.status != "completed":
@@ -847,7 +847,7 @@ def _generate_pr_content(
             f"Warning: PR description internal task #{internal_task_id} did not complete successfully",
             file=sys.stderr,
         )
-        return _fallback_pr_content(task, commit_log)
+        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
 
     response = (completed_task.output_content or "").strip()
     if not response:
@@ -855,7 +855,7 @@ def _generate_pr_content(
             f"Warning: PR description internal task #{internal_task_id} produced no output",
             file=sys.stderr,
         )
-        return _fallback_pr_content(task, commit_log)
+        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
 
     has_title = any(line.startswith("TITLE:") for line in response.splitlines())
     has_body = any(line.strip() == "BODY:" for line in response.splitlines())
@@ -864,7 +864,7 @@ def _generate_pr_content(
             f"Warning: PR description internal task #{internal_task_id} produced malformed output",
             file=sys.stderr,
         )
-        return _fallback_pr_content(task, commit_log)
+        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
 
     return _parse_pr_response(response, task)
 
@@ -887,7 +887,7 @@ def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
 
     if not title:
         # Use task_id or first line of prompt
-        title = task.task_id or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
+        title = task.slug or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
 
     body = "\n".join(body_lines).strip()
     if not body:
@@ -896,13 +896,19 @@ def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
     return title, body
 
 
-def _fallback_pr_content(task: DbTask, commit_log: str) -> tuple[str, str]:
+def _fallback_pr_content(
+    task: DbTask, commit_log: str, project_prefix: str | None = None
+) -> tuple[str, str]:
     """Generate simple PR content without AI."""
     # Title from task_id or prompt
-    if task.task_id:
-        # Convert slug like "20240106-add-feature" to "Add feature"
-        parts = task.task_id.split("-")[1:]  # Remove date prefix
-        title = " ".join(parts).capitalize()
+    if task.slug:
+        # Convert slug like "20240106-myproj-add-feature" to "Add feature"
+        # Strip date prefix (8-digit prefix + hyphen)
+        slug_no_date = task.slug.split("-", 1)[1] if "-" in task.slug else task.slug
+        # Strip project_prefix if present at the start
+        if project_prefix and slug_no_date.startswith(f"{project_prefix}-"):
+            slug_no_date = slug_no_date[len(project_prefix) + 1:]
+        title = slug_no_date.replace("-", " ").capitalize()
     else:
         title = truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
 

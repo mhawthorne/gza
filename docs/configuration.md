@@ -17,6 +17,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `project_prefix` | String | *(project_name)* | Short prefix for generated task slugs (1–12 chars, lowercase alphanumeric + hyphens). Defaults to `project_name`. Slugs become `YYYYMMDD-{project_prefix}-description`. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |

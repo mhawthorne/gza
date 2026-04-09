@@ -1483,7 +1483,7 @@ class TestEditPromptDefaultContent:
 
         # Create a plan task with a known task_id containing a slug
         plan_task = store.add(prompt="Design feature X", task_type="plan")
-        plan_task.task_id = "20260223-design-feature-x"
+        plan_task.slug = "20260223-design-feature-x"
         store.update(plan_task)
 
         editor_content = []

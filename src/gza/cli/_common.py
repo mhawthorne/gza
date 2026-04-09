@@ -155,9 +155,9 @@ from gza.colors import TASK_COLORS_DICT as TASK_COLORS  # noqa: E402, F401
 
 def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
     """Return deterministic startup log path for a task."""
-    if not task.task_id:
+    if not task.slug:
         return None
-    startup_log_path = config.workers_path / f"{task.task_id}.startup.log"
+    startup_log_path = config.workers_path / f"{task.slug}.startup.log"
     startup_log_path.parent.mkdir(parents=True, exist_ok=True)
     return startup_log_path
 

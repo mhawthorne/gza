@@ -634,7 +634,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
                     # Git-tracked worktree — check lineage age
                     wt_name = worktree_path.name
-                    task = store.get_by_task_id(wt_name)
+                    task = store.get_by_slug(wt_name)
                     if task is None:
                         # No task in DB for this worktree — treat as orphaned
                         pending_worktree_removals.append((worktree_path, "no task in DB"))
@@ -699,8 +699,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                         if task.status == "completed" and task.branch and task.has_commits:
                             try:
                                 if task.merge_status != "merged" and not git.is_merged(task.branch, default_branch):
-                                    if task.task_id:
-                                        unmerged_task_ids.add(task.task_id)
+                                    if task.slug:
+                                        unmerged_task_ids.add(task.slug)
                             except Exception:
                                 logger.warning(
                                     "Failed to check merge state for task #%s branch=%s during cleanup",

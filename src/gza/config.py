@@ -3,6 +3,7 @@
 import copy
 import logging
 import os
+import re
 import sys
 import warnings
 from dataclasses import dataclass, field
@@ -14,6 +15,11 @@ APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
 logger = logging.getLogger(__name__)
+
+# Compiled regex for validating project_prefix values.
+# Requires first and last chars to be alphanumeric (prevents leading/trailing hyphens).
+# Single-character prefixes (just one alphanumeric) are also valid.
+_PREFIX_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
 
 __all__ = [
     "APP_NAME",
@@ -297,6 +303,7 @@ class BranchStrategy:
 class Config:
     project_dir: Path
     project_name: str  # Required - no default
+    project_prefix: str = ""  # Short prefix for task slugs; defaults to project_name if empty
     tasks_file: str = DEFAULT_TASKS_FILE
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
@@ -341,6 +348,18 @@ class Config:
     def __post_init__(self):
         if not self.docker_image:
             self.docker_image = f"{self.project_name}-gza"
+
+        # Default project_prefix to project_name if not explicitly set
+        if not self.project_prefix:
+            # Sanitize: lowercase, replace non-alphanumeric chars with hyphens,
+            # strip leading/trailing hyphens, truncate to 12 chars
+            sanitized = re.sub(r'[^a-z0-9-]', '-', self.project_name.lower())
+            sanitized = sanitized.strip('-')
+            # Collapse multiple consecutive hyphens
+            sanitized = re.sub(r'-+', '-', sanitized)
+            # Truncate and strip any trailing hyphen produced by truncation
+            sanitized = sanitized[:12].rstrip('-')
+            self.project_prefix = sanitized or self.project_name[:12].lower()
 
         # Set default branch strategy if not provided
         if self.branch_strategy is None:
@@ -521,7 +540,7 @@ class Config:
 
         # Validate and warn about unknown keys
         valid_fields = {
-            "project_name", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -544,6 +563,19 @@ class Config:
                 f"'project_name' is required in {config_path}\n"
                 f"Add 'project_name: your-project-name' to the config file."
             )
+
+        # Parse and validate project_prefix
+        project_prefix_raw = data.get("project_prefix", "")
+        if project_prefix_raw:
+            if not isinstance(project_prefix_raw, str):
+                raise ConfigError("'project_prefix' must be a string")
+            if len(project_prefix_raw) > 12:
+                raise ConfigError("'project_prefix' must be between 1 and 12 characters")
+            if not _PREFIX_RE.match(project_prefix_raw):
+                raise ConfigError(
+                    "'project_prefix' must contain only lowercase alphanumeric characters and hyphens, "
+                    "and must start with a letter or digit"
+                )
 
         # Support both new "defaults" section and old flat structure
         # If "defaults" exists, use it; otherwise use top-level fields
@@ -1040,6 +1072,7 @@ class Config:
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
+            project_prefix=project_prefix_raw,
             tasks_file=data.get("tasks_file", DEFAULT_TASKS_FILE),
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
             use_docker=use_docker,
@@ -1121,7 +1154,7 @@ class Config:
 
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
-            "project_name", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -1144,6 +1177,18 @@ class Config:
             errors.append("'project_name' is required")
         elif not isinstance(data["project_name"], str):
             errors.append("'project_name' must be a string")
+
+        if "project_prefix" in data and data["project_prefix"]:
+            prefix_val = data["project_prefix"]
+            if not isinstance(prefix_val, str):
+                errors.append("'project_prefix' must be a string")
+            elif len(prefix_val) > 12:
+                errors.append("'project_prefix' must be between 1 and 12 characters")
+            elif not _PREFIX_RE.match(prefix_val):
+                errors.append(
+                    "'project_prefix' must contain only lowercase alphanumeric characters and hyphens, "
+                    "and must start with a letter or digit"
+                )
 
         if "tasks_file" in data and not isinstance(data["tasks_file"], str):
             errors.append("'tasks_file' must be a string")

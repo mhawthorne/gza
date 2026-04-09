@@ -18,7 +18,7 @@ def _task(**overrides) -> Task:
         prompt="implement widgets",
         status="completed",
         task_type="implement",
-        task_id=None,
+        slug=None,
     )
     defaults.update(overrides)
     return Task(**defaults)
@@ -53,38 +53,38 @@ class TestDuplicateReviewError:
 
 class TestBuildAutoReviewPrompt:
     def test_slug_from_task_id(self):
-        task = _task(task_id="20260315-add-widget-support-1")
+        task = _task(slug="20260315-add-widget-support-1")
         result = build_auto_review_prompt(task)
         assert result == "review add-widget-support"
 
     def test_slug_without_trailing_revision(self):
-        task = _task(task_id="20260315-refactor-db")
+        task = _task(slug="20260315-refactor-db")
         result = build_auto_review_prompt(task)
         assert result == "review refactor-db"
 
     def test_slug_strips_only_trailing_number(self):
-        task = _task(task_id="20260315-fix-bug-42")
+        task = _task(slug="20260315-fix-bug-42")
         result = build_auto_review_prompt(task)
         assert result == "review fix-bug"
 
     def test_fallback_when_no_task_id(self):
-        task = _task(id=5, task_id=None, prompt="build the thing")
+        task = _task(id=5, slug=None, prompt="build the thing")
         result = build_auto_review_prompt(task)
         assert result == "Review task #5: build the thing"
 
     def test_fallback_when_task_id_has_no_dash(self):
-        task = _task(id=5, task_id="nodash", prompt="build the thing")
+        task = _task(id=5, slug="nodash", prompt="build the thing")
         result = build_auto_review_prompt(task)
         assert result == "Review task #5: build the thing"
 
     def test_fallback_includes_truncated_prompt(self):
         long_prompt = "x" * 200
-        task = _task(id=3, task_id=None, prompt=long_prompt)
+        task = _task(id=3, slug=None, prompt=long_prompt)
         result = build_auto_review_prompt(task)
         assert result == f"Review task #3: {'x' * 100}"
 
     def test_fallback_without_prompt(self):
-        task = _task(id=3, task_id=None, prompt=None)
+        task = _task(id=3, slug=None, prompt=None)
         result = build_auto_review_prompt(task)
         assert result == "Review task #3"
 
@@ -144,7 +144,7 @@ class TestCreateReviewTask:
 
     def test_auto_prompt_mode(self):
         store = self._mock_store()
-        task = _task(id=10, task_id="20260315-add-feature-1", group="mygroup", based_on=5)
+        task = _task(id=10, slug="20260315-add-feature-1", group="mygroup", based_on=5)
         create_review_task(store, task, prompt_mode="auto")
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["prompt"] == "review add-feature"

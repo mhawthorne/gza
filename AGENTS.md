@@ -68,6 +68,7 @@ Edit skills in `src/gza/skills/`, never in `.claude/skills/` (installed artifact
 
 ## Config Fields (new/notable)
 
+- `project_prefix` — short slug prefix for generated task IDs (1–12 chars, lowercase alphanumeric + hyphens, must start with a letter or digit). Defaults to `project_name` when unset. Affects the `task.slug` value: slugs become `YYYYMMDD-{project_prefix}-{slug}`. See [docs/configuration.md](docs/configuration.md).
 - `theme` — built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. See [docs/configuration.md](docs/configuration.md).
 - `colors` — ad-hoc dict of `field_name: rich_color_string` applied on top of `theme`; overrides always win. Allowed in `gza.local.yaml`.
 

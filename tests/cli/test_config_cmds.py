@@ -147,6 +147,87 @@ class TestValidateCommand:
         assert "unknown mode 'xyz'" in result.stdout
 
 
+class TestProjectPrefixValidation:
+    """Tests for project_prefix config field validation."""
+
+    def test_project_prefix_valid_accepted(self, tmp_path: Path):
+        """Valid project_prefix is accepted without error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: myproj\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+    def test_project_prefix_defaults_to_project_name(self, tmp_path: Path):
+        """When project_prefix is absent, it defaults to project_name."""
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\n")
+        config = Config.load(tmp_path)
+        assert config.project_prefix == "myproject"
+
+    def test_project_prefix_too_long_rejected(self, tmp_path: Path):
+        """project_prefix longer than 12 characters raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: toolongprefix\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_invalid_chars_rejected(self, tmp_path: Path):
+        """project_prefix with uppercase letters raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: MyProj\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_hyphen_start_rejected(self, tmp_path: Path):
+        """project_prefix starting with a hyphen raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: -myproj\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_non_string_rejected(self, tmp_path: Path):
+        """project_prefix that is not a string raises a config error."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: 123\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        # YAML parses 123 as an integer, triggering type validation
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_trailing_hyphen_rejected(self, tmp_path: Path):
+        """project_prefix with a trailing hyphen is rejected (M3)."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: myproject\nproject_prefix: myproj-\n")
+        result = run_gza("validate", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "project_prefix" in result.stdout
+
+    def test_project_prefix_default_sanitized_from_invalid_project_name(self, tmp_path: Path):
+        """When project_name is not a valid prefix, defaulted project_prefix is sanitized (M2)."""
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: MyLargeProjectName\n")
+        config = Config.load(tmp_path)
+        # Sanitized prefix must be lowercase, alphanumeric+hyphens, no leading/trailing hyphens,
+        # max 12 chars, and non-empty
+        prefix = config.project_prefix
+        assert prefix, "project_prefix must not be empty after sanitization"
+        assert prefix == prefix.lower(), f"project_prefix must be lowercase, got: {prefix!r}"
+        assert len(prefix) <= 12, f"project_prefix must be at most 12 chars, got: {prefix!r}"
+        assert not prefix.startswith("-"), f"project_prefix must not start with hyphen, got: {prefix!r}"
+        assert not prefix.endswith("-"), f"project_prefix must not end with hyphen, got: {prefix!r}"
+        import re as _re
+        assert _re.match(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$', prefix), (
+            f"project_prefix has invalid characters: {prefix!r}"
+        )
+
+
 class TestConfigEnvVars:
     """Tests for environment variable overrides in config."""
 
@@ -554,7 +635,7 @@ class TestCleanCommand:
         store = SqliteTaskStore(config.db_path)
         unmerged_task = store.add("Unmerged feature", task_type="implement")
         unmerged_task.status = "completed"
-        unmerged_task.task_id = "20200101-unmerged"
+        unmerged_task.slug = "20200101-unmerged"
         unmerged_task.branch = "feature/unmerged"
         unmerged_task.has_commits = True
         unmerged_task.completed_at = datetime.now(timezone.utc)
@@ -613,7 +694,7 @@ class TestCleanCommand:
         # Create a task with recent activity
         store = SqliteTaskStore(config.db_path)
         task = store.add("Recent feature", task_type="implement")
-        task.task_id = "20260301-recent-feature"
+        task.slug = "20260301-recent-feature"
         task.status = "completed"
         task.completed_at = datetime.now(timezone.utc)
         store.update(task)
@@ -653,7 +734,7 @@ class TestCleanCommand:
         # Create a task with old activity
         store = SqliteTaskStore(config.db_path)
         task = store.add("Old feature", task_type="implement")
-        task.task_id = "20250101-old-feature"
+        task.slug = "20250101-old-feature"
         task.status = "completed"
         task.completed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
         store.update(task)
