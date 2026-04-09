@@ -906,9 +906,9 @@ def main() -> int:
     # improve command
     improve_parser = subparsers.add_parser("improve", help="Create an improve task based on implementation and review")
     improve_parser.add_argument(
-        "impl_task_id",
+        "task_id",
         type=int,
-        help="Implementation task ID to improve",
+        help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     improve_parser.add_argument(
         "--review",
@@ -1077,7 +1077,7 @@ def main() -> int:
     review_parser.add_argument(
         "task_id",
         type=int,
-        help="Implementation or improve task ID to review",
+        help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     review_parser.add_argument(
         "--queue", "-q",

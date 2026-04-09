@@ -218,5 +218,5 @@ The complete workflow:
 1. **Plan** - `gza add --type plan` → `gza work <id>` → review `.gza/plans/`
 2. **Implement** - `gza add --type implement --based-on <plan_id>` → `gza work <id>`
 3. **Review** - `gza review <impl_id>`
-4. **Improve** (if needed) - `gza improve <impl_id>` → `gza review <impl_id>`
+4. **Improve** (if needed) - `gza improve <task_id>` → `gza review <task_id>` (accepts implement, improve, or review ID — auto-resolves)
 5. **Merge** - `gza pr <impl_id>` → `gza merge <impl_id> --squash`

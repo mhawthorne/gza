@@ -157,22 +157,6 @@ class TmuxProxy:
         _pending_prompt = prompt_bytes
         _prompt_offset = 0
 
-        # Set stdout to non-blocking so writes to the tmux pane never block.
-        # If the pane buffer is full, we drop output rather than deadlocking
-        # (the proxy must keep draining the child PTY to prevent the child from
-        # blocking on its own writes).
-        stdout_fd = sys.stdout.fileno()
-        orig_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
-        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl | os.O_NONBLOCK)
-
-        try:
-            return self._io_loop_inner(child_pid, pty_fd, stdout_fd)
-        finally:
-            # Restore blocking mode so final cleanup writes don't fail with EAGAIN
-            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl)
-
-    def _io_loop_inner(self, child_pid: int, pty_fd: int, stdout_fd: int) -> int:
-        """Inner I/O loop with non-blocking stdout."""
         # Track whether a human was attached on the previous iteration
         _prev_has_human = self._has_human()
         _first_output = True

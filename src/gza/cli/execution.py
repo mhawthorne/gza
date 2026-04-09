@@ -791,7 +791,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    impl_task, err = _resolve_impl_task(store, args.impl_task_id)
+    impl_task, err = _resolve_impl_task(store, args.task_id)
     if err:
         print(f"Error: {err}")
         return 1
@@ -923,6 +923,8 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     dry_run: bool = getattr(args, 'dry_run', False)
     continue_existing: bool = getattr(args, 'continue_cycle', False)
 
+    # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
+    # it manages the full review/improve cycle lifecycle and requires the root impl task.
     impl_task = store.get(args.impl_task_id)
     if not impl_task:
         print(f"Error: Task #{args.impl_task_id} not found")
