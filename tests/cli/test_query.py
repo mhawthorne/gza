@@ -3720,7 +3720,12 @@ class TestLineageCommand:
         assert "0.1234" in result.stdout
 
     def test_lineage_child_shows_relationship_label(self, tmp_path: Path):
-        """Lineage command shows relationship type on child edges."""
+        """Relationship label is shown only when it differs from the task type.
+
+        A review child of type 'review' has rel='review' == type_str='review', so
+        the bracket label is suppressed (redundant).  A 'task'-typed child with
+        depends_on has rel='depends' != type_str='task', so [depends] IS shown.
+        """
         from gza.db import SqliteTaskStore
         from datetime import datetime, timezone
 
@@ -3736,16 +3741,23 @@ class TestLineageCommand:
         impl.completed_at = now
         store.update(impl)
 
+        # rel="review" == type_str="review" → label suppressed
         review = store.add("Review feature impl", task_type="review", depends_on=impl.id)
         review.status = "completed"
         review.completed_at = now
         store.update(review)
 
+        # rel="depends" != type_str="task" → label shown
+        dep = store.add("Dependent task", task_type="task", depends_on=impl.id)
+        dep.status = "pending"
+        store.update(dep)
+
         result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "[review]" in result.stdout
         assert "Review feature impl" in result.stdout
+        assert "[review]" not in result.stdout
+        assert "[depends]" in result.stdout
 
     def test_lineage_rel_label_brackets_are_rendered_literally(self, tmp_path: Path):
         """Relationship labels render as [rel] text, not as Rich markup tags."""

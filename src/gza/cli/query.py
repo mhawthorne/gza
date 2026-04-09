@@ -1271,7 +1271,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
         lc = _colors.LINEAGE_COLORS
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel else ""
+        rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel and rel != type_str else ""
 
         stats = format_stats(t)
         stats_part = f" [{lc.stats}]({stats})[/{lc.stats}]" if stats else ""
