@@ -61,6 +61,7 @@ DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
+DEFAULT_LEARNINGS_MAX_ITEMS = 50
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_image": None,
@@ -329,6 +330,7 @@ class Config:
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     learnings_window: int = DEFAULT_LEARNINGS_WINDOW
     learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
+    learnings_max_items: int = DEFAULT_LEARNINGS_MAX_ITEMS
     tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
     theme: str | None = "minimal"  # Named color theme (default: 'minimal')
     colors: dict[str, str] = field(default_factory=dict)  # Ad-hoc per-field color overrides
@@ -529,7 +531,7 @@ class Config:
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
             "tmux",
-            "learnings_window", "learnings_interval",
+            "learnings_window", "learnings_interval", "learnings_max_items",
             "theme", "colors",
         }
         for key in data.keys():
@@ -953,6 +955,13 @@ class Config:
         if learnings_interval < 0:
             raise ConfigError("learnings_interval must be a non-negative integer")
 
+        try:
+            learnings_max_items = int(data.get("learnings_max_items", DEFAULT_LEARNINGS_MAX_ITEMS))
+        except (TypeError, ValueError):
+            raise ConfigError("learnings_max_items must be a positive integer")
+        if learnings_max_items < 1:
+            raise ConfigError("learnings_max_items must be a positive integer")
+
         # Parse tmux configuration
         tmux_data = data.get("tmux") or {}
         if not isinstance(tmux_data, dict):
@@ -1064,6 +1073,7 @@ class Config:
             review_context_file_limit=review_context_file_limit,
             learnings_window=learnings_window,
             learnings_interval=learnings_interval,
+            learnings_max_items=learnings_max_items,
             tmux=tmux_config,
             theme=theme_name,
             colors=colors,
@@ -1121,6 +1131,8 @@ class Config:
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
             "tmux",
+            "learnings_window", "learnings_interval", "learnings_max_items",
+            "theme", "colors",
         }
 
         for key in data.keys():

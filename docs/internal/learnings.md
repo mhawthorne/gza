@@ -5,7 +5,7 @@ After each completed task (on interval), gza can automatically update `.gza/lear
 ## How It Works
 
 1. An `internal` task is created in the DB with `skip_learnings=True` (to prevent recursion) and run via the standard runner — same as explore/plan/review tasks (worktree, provider, status transitions).
-2. The LLM produces bullet-point learnings from recent task outputs; these replace/merge into `.gza/learnings.md`.
+2. The LLM produces categorized learnings (topic headers + bullets) from recent task outputs; these replace/merge into `.gza/learnings.md`.
 3. On any failure (non-zero exit, exception), gza falls back to the existing regex-based extraction.
 4. The `internal` task is kept in the DB for observability (visible via `gza history --type internal`).
 5. Auto-regeneration background spawn uses the canonical CLI entrypoint (`uv run gza ...`) to ensure the same environment resolution as normal project commands.

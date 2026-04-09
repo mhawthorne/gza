@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tomllib
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1171,6 +1172,77 @@ def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
     shutil.copy2(src, dst_dir / "learnings.md")
 
 
+def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
+    """Create symlinks for local path dependencies so uv can resolve them in worktrees.
+
+    Parses [tool.uv.sources] from the project's pyproject.toml and creates
+    symlinks in the worktree's ancestor directories so that relative path
+    references resolve to the same real directories as they would from the
+    original project root.
+    """
+    pyproject = config.project_dir / "pyproject.toml"
+    if not pyproject.exists():
+        return
+
+    try:
+        with open(pyproject, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        logger.warning("Failed to read/parse %s; skipping local dep symlinks", pyproject)
+        return
+
+    sources = data.get("tool", {}).get("uv", {}).get("sources", {})
+    if not sources:
+        return
+
+    for _dep_name, entry in sources.items():
+        if not isinstance(entry, dict):
+            continue
+        raw_path = entry.get("path")
+        if not raw_path:
+            continue
+        dep_rel = Path(raw_path)
+        # Skip absolute paths — they work everywhere without symlinks
+        if dep_rel.is_absolute():
+            continue
+        dep_real_path = (config.project_dir / dep_rel).resolve()
+        if not dep_real_path.exists():
+            logger.debug("Local dep %s does not exist on disk; skipping symlink", dep_real_path)
+            continue
+        # Compute where the symlink should land (resolve relative path from worktree)
+        symlink_location = (worktree_path / dep_rel).resolve()
+        # Skip paths inside the worktree itself (workspace members)
+        try:
+            symlink_location.relative_to(worktree_path)
+            continue
+        except ValueError:
+            pass
+        symlink_location.parent.mkdir(parents=True, exist_ok=True)
+        if symlink_location.exists() or symlink_location.is_symlink():
+            if symlink_location.is_symlink() and symlink_location.resolve() == dep_real_path:
+                logger.debug("Symlink %s already points to %s; skipping", symlink_location, dep_real_path)
+                continue
+            logger.warning(
+                "Path %s already exists and does not point to %s; skipping symlink creation",
+                symlink_location,
+                dep_real_path,
+            )
+            continue
+        try:
+            symlink_location.symlink_to(dep_real_path)
+            logger.info("Created symlink %s -> %s", symlink_location, dep_real_path)
+        except FileExistsError:
+            # Lost the race with a concurrent task — verify the winner created the right symlink
+            if symlink_location.is_symlink() and symlink_location.resolve() == dep_real_path:
+                logger.debug("Symlink %s created by concurrent task; skipping", symlink_location)
+            else:
+                logger.warning(
+                    "Path %s appeared during symlink creation and does not point to %s; skipping",
+                    symlink_location,
+                    dep_real_path,
+                )
+
+
 def run(
     config: Config,
     task_id: int | None = None,
@@ -1830,6 +1902,9 @@ def _run_inner(
     # Copy learnings file into worktree so the agent can read it
     _copy_learnings_to_worktree(config, worktree_path)
 
+    if not config.use_docker:
+        _create_local_dep_symlinks(config, worktree_path)
+
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
 
@@ -2042,6 +2117,9 @@ def _run_non_code_task(
         # Internal orchestration tasks do not implicitly consume learnings context.
         if task.task_type not in ("internal", "learn"):
             _copy_learnings_to_worktree(config, worktree_path)
+
+        if not config.use_docker:
+            _create_local_dep_symlinks(config, worktree_path)
 
         def _on_session_id_non_code(session_id: str) -> None:
             """Persist session_id as soon as it is first seen during streaming."""
