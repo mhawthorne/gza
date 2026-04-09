@@ -1025,16 +1025,17 @@ def cmd_log(args: argparse.Namespace) -> int:
             for entry in entries:
                 printer.process(entry)
                 any_printed = True
-            if not any_printed and log_data:
-                if "result" in log_data:
-                    console.print(rich_escape(log_data["result"]), soft_wrap=True)
+            if not any_printed:
+                if log_data:
+                    if "result" in log_data:
+                        console.print(rich_escape(log_data["result"]), soft_wrap=True)
+                    else:
+                        subtype = log_data.get("subtype", "unknown")
+                        console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
+                        if log_data.get("errors"):
+                            console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
                 else:
-                    subtype = log_data.get("subtype", "unknown")
-                    console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
-                    if log_data.get("errors"):
-                        console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
-            else:
-                console.print("No displayable log entries found.", soft_wrap=True)
+                    console.print("No displayable log entries found.", soft_wrap=True)
         elif log_data:
             # Extract and display the result field (which contains markdown)
             if "result" in log_data:

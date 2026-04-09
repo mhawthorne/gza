@@ -1701,18 +1701,9 @@ def _complete_code_task(
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
 
-    # Mark completed
-    store.mark_completed(
-        task,
-        branch=branch_name,
-        log_file=str(log_file.relative_to(config.project_dir)),
-        output_content=output_content,
-        has_commits=True,
-        stats=stats,
-        diff_files_changed=diff_files,
-        diff_lines_added=diff_added,
-        diff_lines_removed=diff_removed,
-    )
+    # Write final log entries before marking completed in DB, so that
+    # `gza log -f` (which checks task status) doesn't break out of the
+    # follow loop before the log file is fully written.
     write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
     write_log_entry(
         log_file,
@@ -1724,6 +1715,20 @@ def _complete_code_task(
             "cost_usd": stats.cost_usd,
             "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
         },
+    )
+
+    # Mark completed — after log entries are flushed so readers see the
+    # full log before the status transitions away from in_progress.
+    store.mark_completed(
+        task,
+        branch=branch_name,
+        log_file=str(log_file.relative_to(config.project_dir)),
+        output_content=output_content,
+        has_commits=True,
+        stats=stats,
+        diff_files_changed=diff_files,
+        diff_lines_added=diff_added,
+        diff_lines_removed=diff_removed,
     )
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
@@ -2290,17 +2295,6 @@ def _run_non_code_task(
         # Read output content for storage in DB
         output_content = report_path.read_text()
 
-        # Mark completed with report file reference (no branch, no commits)
-        store.mark_completed(
-            task,
-            branch=None,
-            log_file=str(log_file.relative_to(config.project_dir)),
-            report_file=report_file_relative,
-            output_content=output_content,
-            has_commits=False,
-            stats=stats,
-        )
-
         # Clean up non-code worktree on success — report has been copied back, no further use
         if git:
             try:
@@ -2311,9 +2305,23 @@ def _run_non_code_task(
                 logger.warning("Failed to remove worktree %s", worktree_path)
                 if worktree_path.exists():
                     shutil.rmtree(worktree_path, ignore_errors=True)
+
+        # Write final log entries before marking completed in DB, so that
+        # `gza log -f` doesn't break out of the follow loop prematurely.
         outcome_msg = "Outcome: completed (recovered from provider log)" if recovered_from_log else "Outcome: completed"
         write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": outcome_msg, "exit_code": 0})
         write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+
+        # Mark completed — after log entries are flushed.
+        store.mark_completed(
+            task,
+            branch=None,
+            log_file=str(log_file.relative_to(config.project_dir)),
+            report_file=report_file_relative,
+            output_content=output_content,
+            has_commits=False,
+            stats=stats,
+        )
         auto_learnings = None
         if task.task_type not in ("internal", "learn") and not task.skip_learnings:
             auto_learnings = maybe_auto_regenerate_learnings(store, config)
