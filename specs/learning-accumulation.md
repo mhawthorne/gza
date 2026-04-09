@@ -376,7 +376,7 @@ Not required for the fixes above:
 ## Resolved Questions
 
 ### 1. Categorization Strategy
-**Decision**: Flat list (Option C). No headers or categories. If the file gets large, revisit in Phase 4.
+**Decision**: Topic headers with bullets (revised from flat list). Learnings are grouped under `## Topic` H2 headers chosen by the LLM (e.g., "Testing Patterns", "Git Workflow"). Longer-term, split into separate files per topic.
 
 ### 2. Deduplication
 **Decision**: Simple string matching (Option B) as a safety net. With incremental updates, the LLM is also instructed to avoid near-duplicates, so string dedupe is a backstop rather than the primary mechanism.

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import DEFAULT_LEARNINGS_INTERVAL, DEFAULT_LEARNINGS_WINDOW
+from .config import DEFAULT_LEARNINGS_INTERVAL, DEFAULT_LEARNINGS_MAX_ITEMS, DEFAULT_LEARNINGS_WINDOW
 from .console import console
 from .db import SqliteTaskStore, Task
 
@@ -37,6 +37,7 @@ class LearningsResult:
 
 
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+_TOPIC_RE = re.compile(r"^##\s+(.+?)\s*$")
 
 
 def _normalize_learning(text: str) -> str:
@@ -46,18 +47,40 @@ def _normalize_learning(text: str) -> str:
     return cleaned
 
 
-def _extract_learnings_from_output(output: str) -> list[str]:
-    """Extract compact bullet learnings from markdown-ish output."""
-    learnings: list[str] = []
+# Type alias: topic -> list of bullet strings
+CategorizedLearnings = dict[str, list[str]]
+
+DEFAULT_TOPIC = "General"
+
+
+def _extract_learnings_from_output(output: str) -> CategorizedLearnings:
+    """Extract categorized bullet learnings from markdown-ish output.
+
+    Expects ``## Topic`` headers followed by ``- bullet`` lines.
+    Bullets before any header go under DEFAULT_TOPIC.
+    """
+    categories: CategorizedLearnings = {}
+    current_topic = DEFAULT_TOPIC
     for line in output.splitlines():
+        topic_match = _TOPIC_RE.match(line)
+        if topic_match:
+            current_topic = topic_match.group(1).strip()
+            continue
         bullet_match = _BULLET_RE.match(line)
         if bullet_match:
             item = _normalize_learning(bullet_match.group(1))
             if 8 <= len(item) <= 160 and not item.lower().startswith("task id:"):
-                learnings.append(item)
+                categories.setdefault(current_topic, []).append(item)
 
-    return learnings
+    return categories
 
+
+def _flatten_categorized(categorized: CategorizedLearnings) -> list[str]:
+    """Flatten categorized learnings to a flat list for delta tracking."""
+    items: list[str] = []
+    for bullets in categorized.values():
+        items.extend(bullets)
+    return items
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -70,41 +93,66 @@ def _dedupe(items: list[str]) -> list[str]:
     return list(seen.values())
 
 
-def _format_learnings_markdown(learnings: list[str], task_count: int) -> str:
-    """Format learnings as markdown."""
+def _dedupe_categorized(categorized: CategorizedLearnings) -> CategorizedLearnings:
+    """Case-insensitive dedupe within each topic, preserving topic order."""
+    result: CategorizedLearnings = {}
+    for topic, items in categorized.items():
+        deduped = _dedupe(items)
+        if deduped:
+            result[topic] = deduped
+    return result
+
+
+def _merge_categorized(
+    existing: CategorizedLearnings, new: CategorizedLearnings
+) -> CategorizedLearnings:
+    """Merge new categorized learnings into existing, deduplicating per topic."""
+    merged: CategorizedLearnings = {}
+    all_topics = list(existing.keys())
+    for topic in new:
+        if topic not in all_topics:
+            all_topics.append(topic)
+    for topic in all_topics:
+        combined = list(existing.get(topic, [])) + list(new.get(topic, []))
+        deduped = _dedupe(combined)
+        if deduped:
+            merged[topic] = deduped
+    return merged
+
+
+def _format_learnings_markdown(learnings: CategorizedLearnings, task_count: int) -> str:
+    """Format categorized learnings as markdown with topic headers."""
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         "# Project Learnings",
         "",
         f"Last updated: {timestamp} (from {task_count} completed tasks)",
-        "",
-        "## Recent Patterns",
     ]
-    lines.extend(f"- {item}" for item in learnings)
+    for topic, items in learnings.items():
+        lines.append("")
+        lines.append(f"## {topic}")
+        lines.extend(f"- {item}" for item in items)
     lines.append("")
     return "\n".join(lines)
 
 
-def _extract_existing_file_learnings(path: Path) -> list[str]:
-    """Extract bullet learnings from an existing learnings file."""
+def _extract_existing_file_learnings(path: Path) -> CategorizedLearnings:
+    """Extract categorized bullet learnings from an existing learnings file."""
     if not path.exists():
-        return []
+        return {}
     try:
         content = path.read_text()
     except OSError:
-        return []
+        return {}
 
-    items: list[str] = []
-    for line in content.splitlines():
-        match = _BULLET_RE.match(line)
-        if match:
-            item = _normalize_learning(match.group(1))
-            if item:
-                items.append(item)
-    return _dedupe(items)
+    return _dedupe_categorized(_extract_learnings_from_output(content))
 
 
-def _build_summarization_prompt(tasks: list[Task], existing_learnings: str = "") -> str:
+def _build_summarization_prompt(
+    tasks: list[Task],
+    existing_learnings: str = "",
+    max_items: int = DEFAULT_LEARNINGS_MAX_ITEMS,
+) -> str:
     """Build LLM prompt for incrementally updating learnings from recent task outputs."""
     existing_section = existing_learnings.strip() if existing_learnings.strip() else "No existing learnings."
 
@@ -148,10 +196,19 @@ def _build_summarization_prompt(tasks: list[Task], existing_learnings: str = "")
         "- Generic software engineering advice\n"
         '- Vague platitudes ("write clean code", "test thoroughly")\n'
         "- Repetitive or near-duplicate entries\n\n"
-        'Output format: a flat bullet list, one learning per line, starting with "- ".\n'
-        "No headers, no numbering, no sub-lists. Max 25 words per learning.\n"
+        "Output format: organize learnings under topic headers.\n"
+        'Each topic is a markdown H2 header (e.g., "## Testing Patterns").\n'
+        'Under each topic, list learnings as bullet points starting with "- ".\n'
+        "Choose short, descriptive topic names (2-4 words). Group related learnings together.\n"
+        "Typical topics: Testing Patterns, Git Workflow, Code Style, Architecture,\n"
+        "Configuration, Error Handling, CLI Commands — but use whatever fits the content.\n"
+        "No numbering, no sub-lists. Max 25 words per learning.\n"
         "Each learning should be concrete and actionable — a new developer should\n"
-        "be able to follow it without additional context."
+        "be able to follow it without additional context.\n\n"
+        f"IMPORTANT: Keep the total number of learnings to at most {max_items} items.\n"
+        "If the combined list exceeds this limit, consolidate related items and\n"
+        "drop the least generalizable or most project-specific entries.\n"
+        "Prefer keeping broadly useful process knowledge over one-off bug fixes."
     )
 
 
@@ -160,18 +217,19 @@ def _run_learnings_task(
     config: Config,
     recent_tasks: list[Task],
     existing_learnings: str = "",
-) -> list[str] | None:
+    max_items: int = DEFAULT_LEARNINGS_MAX_ITEMS,
+) -> CategorizedLearnings | None:
     """Run an internal task to summarize learnings from recent task outputs.
 
     Creates an ``internal`` task and runs it via the standard runner (same as
     explore/plan/review tasks — worktree, provider, status transitions).
     The task is kept in the DB for observability.
 
-    Returns extracted bullet-point learnings, or None on any failure.
+    Returns categorized learnings, or None on any failure.
     """
     from . import runner as _runner_mod
 
-    prompt = _build_summarization_prompt(recent_tasks, existing_learnings)
+    prompt = _build_summarization_prompt(recent_tasks, existing_learnings, max_items=max_items)
     learn_task = store.add(
         prompt=prompt,
         task_type="internal",
@@ -196,7 +254,18 @@ def _run_learnings_task(
         return None
 
     learnings = _extract_learnings_from_output(refreshed.output_content)
-    return learnings if learnings else None
+    if not learnings:
+        return None
+
+    # Clean up the report file — the parsed result lives in .gza/learnings.md
+    # and the raw output is preserved in task.output_content in the DB.
+    from .runner import get_task_output_paths
+
+    report_path, _ = get_task_output_paths(refreshed, config.project_dir)
+    if report_path and report_path.exists():
+        report_path.unlink()
+
+    return learnings
 
 
 def _spawn_background_learnings_update(config: Config, window: int) -> bool:
@@ -254,36 +323,42 @@ def regenerate_learnings(
         raise ValueError("window must be positive")
 
     recent_tasks = store.get_recent_completed(limit=window)
-    raw_learnings: list[str] = []
+    categorized: CategorizedLearnings = {}
     learnings_path = config.project_dir / ".gza" / "learnings.md"
-    previous_learnings = _extract_existing_file_learnings(learnings_path)
+    previous_categorized = _extract_existing_file_learnings(learnings_path)
     existing_learnings_text = learnings_path.read_text() if learnings_path.exists() else ""
 
     if recent_tasks:
-        llm_learnings = _run_learnings_task(store, config, recent_tasks, existing_learnings_text)
+        llm_learnings = _run_learnings_task(
+            store, config, recent_tasks, existing_learnings_text,
+            max_items=config.learnings_max_items,
+        )
         if llm_learnings is not None:
-            raw_learnings = llm_learnings
+            categorized = llm_learnings
         else:
             # Fallback: preserve existing learnings and append new bullets (deduplicated)
-            new_bullets: list[str] = []
+            new_categorized: CategorizedLearnings = {}
             for task in recent_tasks:
                 if task.output_content:
-                    new_bullets.extend(_extract_learnings_from_output(task.output_content))
-            raw_learnings = _dedupe(previous_learnings + new_bullets)
+                    task_learnings = _extract_learnings_from_output(task.output_content)
+                    new_categorized = _merge_categorized(new_categorized, task_learnings)
+            categorized = _merge_categorized(previous_categorized, new_categorized)
 
-    learnings = _dedupe(raw_learnings)
-    if not learnings:
-        learnings = ["No strong patterns extracted yet; keep tasks explicit and scoped."]
+    categorized = _dedupe_categorized(categorized)
+    if not categorized:
+        categorized = {DEFAULT_TOPIC: ["No strong patterns extracted yet; keep tasks explicit and scoped."]}
 
-    previous_set = {item.lower() for item in previous_learnings}
-    current_set = {item.lower() for item in learnings}
+    previous_flat = _flatten_categorized(previous_categorized)
+    current_flat = _flatten_categorized(categorized)
+    previous_set = {item.lower() for item in previous_flat}
+    current_set = {item.lower() for item in current_flat}
     retained_count = len(previous_set & current_set)
     added_count = len(current_set - previous_set)
     removed_count = len(previous_set - current_set)
     baseline = max(len(previous_set), 1)
     churn_percent = round(((added_count + removed_count) / baseline) * 100, 1)
 
-    content = _format_learnings_markdown(learnings, len(recent_tasks))
+    content = _format_learnings_markdown(categorized, len(recent_tasks))
     learnings_path.parent.mkdir(parents=True, exist_ok=True)
     learnings_path.write_text(content)
     _append_history_entry(
@@ -292,7 +367,7 @@ def regenerate_learnings(
             "timestamp_utc": datetime.now(UTC).isoformat(),
             "window": window,
             "tasks_used": len(recent_tasks),
-            "learnings_count": len(learnings),
+            "learnings_count": len(current_flat),
             "added_count": added_count,
             "removed_count": removed_count,
             "retained_count": retained_count,
@@ -304,7 +379,7 @@ def regenerate_learnings(
     return LearningsResult(
         path=learnings_path,
         tasks_used=len(recent_tasks),
-        learnings_count=len(learnings),
+        learnings_count=len(current_flat),
         added_count=added_count,
         removed_count=removed_count,
         retained_count=retained_count,

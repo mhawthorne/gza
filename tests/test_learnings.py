@@ -8,9 +8,12 @@ from unittest.mock import patch, MagicMock
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.learnings import (
+    CategorizedLearnings,
+    DEFAULT_TOPIC,
     LearningsResult,
     _build_summarization_prompt,
     _extract_learnings_from_output,
+    _flatten_categorized,
     regenerate_learnings,
     maybe_auto_regenerate_learnings,
 )
@@ -212,7 +215,7 @@ def test_regenerate_learnings_writes_history_log(tmp_path: Path):
 
 
 def test_llm_path_calls_runner_and_parses_output(tmp_path: Path):
-    """LLM summarization should call runner.run and parse bullet points from output."""
+    """LLM summarization should call runner.run and parse categorized output."""
     store = _new_store(tmp_path)
     config = Config(project_dir=tmp_path, project_name="test")
 
@@ -223,7 +226,12 @@ def test_llm_path_calls_runner_and_parses_output(tmp_path: Path):
         learn_task = store.get(task_id)
         assert learn_task is not None
         learn_task.status = "completed"
-        learn_task.output_content = "- Use pytest fixtures\n- Always run type checks\n"
+        learn_task.output_content = (
+            "## Testing Patterns\n"
+            "- Use pytest fixtures\n"
+            "## Code Quality\n"
+            "- Always run type checks\n"
+        )
         store.update(learn_task)
         return 0
 
@@ -232,7 +240,9 @@ def test_llm_path_calls_runner_and_parses_output(tmp_path: Path):
 
     assert result.tasks_used == 1
     content = result.path.read_text()
+    assert "## Testing Patterns" in content
     assert "Use pytest fixtures" in content
+    assert "## Code Quality" in content
     assert "Always run type checks" in content
 
 
@@ -396,20 +406,26 @@ def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     mock_auto.assert_not_called()
 
 
-def test_extract_learnings_ignores_headers(tmp_path: Path):
-    """Header lines must not produce 'Prefer following documented X' garbage."""
+def test_extract_learnings_categorizes_by_topic():
+    """H2 headers become topic keys; bullets go under them."""
     output = (
         "# Summary\n"
         "## Testing Patterns\n"
         "### Recent Changes\n"
         "- Use pytest fixtures for database setup\n"
         "- Run uv run pytest before finishing\n"
+        "## Git Workflow\n"
+        "- Never force push to main\n"
     )
     results = _extract_learnings_from_output(output)
-    assert all("Prefer following documented" not in item for item in results)
-    assert "Use pytest fixtures for database setup" in results
-    assert "Run uv run pytest before finishing" in results
-    assert len(results) == 2
+    assert "Testing Patterns" in results
+    assert "Use pytest fixtures for database setup" in results["Testing Patterns"]
+    assert "Run uv run pytest before finishing" in results["Testing Patterns"]
+    assert "Git Workflow" in results
+    assert "Never force push to main" in results["Git Workflow"]
+    all_items = _flatten_categorized(results)
+    assert all("Prefer following documented" not in item for item in all_items)
+    assert len(all_items) == 3
 
 
 def test_build_summarization_prompt_includes_existing_learnings():
@@ -423,7 +439,7 @@ def test_build_summarization_prompt_includes_existing_learnings():
     assert "ADD new patterns" in prompt
     assert "KEEP existing learnings" in prompt
     assert "Do NOT include" in prompt
-    assert "No headers, no numbering" in prompt
+    assert "topic headers" in prompt
 
 
 def test_build_summarization_prompt_no_existing_learnings():
@@ -457,10 +473,11 @@ def test_fallback_preserves_existing_learnings_when_llm_fails(tmp_path: Path):
 
 
 def test_config_learnings_fields_default():
-    """Config must have learnings_window=25 and learnings_interval=5 by default."""
+    """Config must have learnings_window=25, learnings_interval=5, learnings_max_items=50 by default."""
     config = Config(project_dir=Path("/tmp"), project_name="test")
     assert config.learnings_window == 25
     assert config.learnings_interval == 5
+    assert config.learnings_max_items == 50
 
 
 def test_maybe_auto_regenerate_uses_config_interval_and_window(tmp_path: Path):
@@ -482,14 +499,24 @@ def test_maybe_auto_regenerate_uses_config_interval_and_window(tmp_path: Path):
 
 
 def test_learnings_config_fields_no_unknown_warning(tmp_path: Path, capsys):
-    """learnings_window and learnings_interval must not produce unknown-field warnings."""
+    """learnings_window, learnings_interval, and learnings_max_items must not produce unknown-field warnings."""
     config_file = tmp_path / "gza.yaml"
     config_file.write_text(
-        "project_name: test\nlearnings_window: 30\nlearnings_interval: 10\n"
+        "project_name: test\nlearnings_window: 30\nlearnings_interval: 10\nlearnings_max_items: 40\n"
     )
     config = Config.load(tmp_path)
     captured = capsys.readouterr()
     assert "learnings_window" not in captured.err
     assert "learnings_interval" not in captured.err
+    assert "learnings_max_items" not in captured.err
     assert config.learnings_window == 30
     assert config.learnings_interval == 10
+    assert config.learnings_max_items == 40
+
+
+def test_build_summarization_prompt_includes_max_items_cap():
+    """Prompt must include the max items cap."""
+    from gza.db import Task
+    tasks: list[Task] = []
+    prompt = _build_summarization_prompt(tasks, max_items=30)
+    assert "at most 30 items" in prompt
