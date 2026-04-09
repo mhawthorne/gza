@@ -1,6 +1,7 @@
 """Shared helpers, constants, and lightweight utilities used across CLI sub-modules."""
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -10,9 +11,12 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from rich.pager import Pager
 
 from ..config import Config
 from ..console import (
@@ -1248,3 +1252,77 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         metavar="YYYY-MM-DD",
         help="Show only tasks on or before this date",
     )
+
+
+def _get_pager(repo_dir: Path) -> str:
+    """Determine which pager to use for output.
+
+    Checks in order:
+    1. $GIT_PAGER environment variable
+    2. git config core.pager
+    3. $PAGER environment variable
+    4. Falls back to 'less -R'
+
+    Args:
+        repo_dir: Path to git repository (used for git config lookup)
+
+    Returns:
+        The pager command to use
+    """
+    git_pager = os.environ.get('GIT_PAGER')
+    if git_pager:
+        return git_pager
+
+    try:
+        result = subprocess.run(
+            ["git", "config", "core.pager"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug("Failed to read git core.pager config", exc_info=True)
+
+    pager = os.environ.get('PAGER')
+    if pager:
+        return pager
+
+    return 'less -R'
+
+
+class _GzaPager(Pager):
+    """Rich Pager implementation that pipes content through the configured pager command."""
+
+    def __init__(self, pager_cmd: str) -> None:
+        self._pager_cmd = pager_cmd
+
+    def show(self, content: str) -> None:
+        pager_proc = subprocess.Popen(
+            self._pager_cmd,
+            stdin=subprocess.PIPE,
+            shell=True,
+        )
+        pager_proc.communicate(content.encode('utf-8', errors='replace'))
+
+
+def pager_context(use_page: bool, project_dir: Path) -> contextlib.AbstractContextManager:
+    """Return a context manager that pipes Rich console output through the configured pager.
+
+    When ``use_page`` is False or stdout is not a TTY, returns a no-op context.
+
+    Args:
+        use_page: Whether paging was requested (e.g. ``args.page``).
+        project_dir: Project root used to resolve the pager command.
+
+    Returns:
+        A context manager; use it as ``with pager_context(...): ...``.
+    """
+    if use_page and sys.stdout.isatty():
+        from ..console import console
+        pager_cmd = _get_pager(project_dir)
+        return console.pager(pager=_GzaPager(pager_cmd), styles=True)
+    return nullcontext()

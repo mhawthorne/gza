@@ -371,7 +371,7 @@ WORKER        TASK               STATUS     DURATION
 w-001         #42 implement-auth stalled    45m (no activity 12m)
 w-002         #45 fix-caching    running    3m
 
-! Worker w-001 may be stalled. Consider: gza stop w-001 && gza retry 42
+! Worker w-001 may be stalled. Consider: gza kill 42 && gza retry 42
 ```
 
 ---

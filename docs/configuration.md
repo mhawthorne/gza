@@ -494,6 +494,7 @@ gza log <identifier> [options]
 | `--follow`, `-f` | Follow log in real-time |
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
+| `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
 By default, the identifier is treated as a task ID (numeric).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
@@ -607,19 +608,21 @@ Runtime reconciliation notes:
   - `TIMEOUT` when runtime exceeds configured `timeout_minutes`.
 - `gza ps` merges worker rows and DB in-progress tasks by task ownership, so healthy background runs appear as one active task row.
 
-### stop
+### kill
 
-Stop workers.
+Kill a running task.
 
 ```bash
-gza stop [worker_id] [options]
+gza kill [task_id] [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `worker_id` | Worker ID to stop |
-| `--all` | Stop all running workers |
-| `--force` | Force kill (SIGKILL) |
+| `task_id` | Task ID to kill (optional if `--all` is used) |
+| `--all` | Kill all running tasks |
+| `--force`, `-9` | Send SIGKILL immediately (skip SIGTERM) |
+
+Sends SIGTERM and waits 3 seconds; escalates to SIGKILL if the process is still alive. Sets the task status to `failed` with `failure_reason=KILLED`.
 
 ### validate
 
@@ -649,6 +652,7 @@ gza show <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `--full` | Show full output without truncation |
+| `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--prompt`, `--output`, and `--path` modes |
 
 ### resume
 
@@ -846,7 +850,7 @@ gza improve <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Implementation task ID to improve |
+| `impl_task_id` | Task ID (implement, improve, or review — auto-resolves to root implementation) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
@@ -867,7 +871,7 @@ gza review <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Implementation task ID to review |
+| `task_id` | Task ID (implement, improve, or review — auto-resolves to root implementation) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
@@ -1230,16 +1234,16 @@ task_types:
     timeout_minutes: 45
 ```
 
-### Worker won't stop
+### Task won't stop
 
-If `gza stop` doesn't work, force kill:
+If `gza kill` doesn't work, force kill:
 
 ```bash
-gza stop <worker_id> --force
+gza kill <task_id> --force
 ```
 
-Or stop all workers:
+Or kill all running tasks:
 
 ```bash
-gza stop --all --force
+gza kill --all --force
 ```

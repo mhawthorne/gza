@@ -53,12 +53,12 @@ from .query import (
     cmd_delete,
     cmd_groups,
     cmd_history,
+    cmd_kill,
     cmd_lineage,
     cmd_next,
     cmd_ps,
     cmd_show,
     cmd_status,
-    cmd_stop,
     cmd_unmerged,
 )
 
@@ -644,6 +644,11 @@ def main() -> int:
         action="store_true",
         help="Show raw JSON lines instead of formatted output",
     )
+    log_parser.add_argument(
+        "--page",
+        action="store_true",
+        help="Pipe output through $PAGER (default: less -R); skipped for --follow and --raw modes",
+    )
     add_common_args(log_parser)
 
     # add command
@@ -906,9 +911,9 @@ def main() -> int:
     # improve command
     improve_parser = subparsers.add_parser("improve", help="Create an improve task based on implementation and review")
     improve_parser.add_argument(
-        "impl_task_id",
+        "task_id",
         type=int,
-        help="Implementation task ID to improve",
+        help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     improve_parser.add_argument(
         "--review",
@@ -1077,7 +1082,7 @@ def main() -> int:
     review_parser.add_argument(
         "task_id",
         type=int,
-        help="Implementation or improve task ID to review",
+        help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     review_parser.add_argument(
         "--queue", "-q",
@@ -1162,6 +1167,12 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Print only the report file path",
+    )
+    show_parser.add_argument(
+        "--page",
+        action="store_true",
+        default=False,
+        help="Pipe output through $PAGER (default: less -R); skipped for --prompt, --output, and --path modes",
     )
     add_common_args(show_parser)
 
@@ -1250,24 +1261,25 @@ def main() -> int:
         )
         add_common_args(ps_parser)
 
-    # stop command
-    stop_parser = subparsers.add_parser("stop", help="Stop a running worker")
-    stop_parser.add_argument(
-        "worker_id",
+    # kill command
+    kill_parser = subparsers.add_parser("kill", help="Kill a running task")
+    kill_parser.add_argument(
+        "task_id",
         nargs="?",
-        help="Worker ID to stop (optional if --all is used)",
+        type=int,
+        help="Task ID to kill (optional if --all is used)",
     )
-    stop_parser.add_argument(
+    kill_parser.add_argument(
         "--all",
         action="store_true",
-        help="Stop all running workers",
+        help="Kill all running tasks",
     )
-    stop_parser.add_argument(
-        "--force",
+    kill_parser.add_argument(
+        "--force", "-9",
         action="store_true",
-        help="Force kill (SIGKILL instead of SIGTERM)",
+        help="Skip SIGTERM and send SIGKILL immediately",
     )
-    add_common_args(stop_parser)
+    add_common_args(kill_parser)
 
     # mark-completed command
     mark_completed_parser = subparsers.add_parser(
@@ -1335,7 +1347,7 @@ def main() -> int:
 
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
-        "work", "ps", "status", "stop", "advance", "retry",
+        "work", "ps", "status", "kill", "advance", "retry",
         "mark-completed", "set-status", "history",
     }
 
@@ -1423,8 +1435,8 @@ def main() -> int:
             return cmd_status(args)
         elif args.command in ("ps", "status"):
             return cmd_ps(args)
-        elif args.command == "stop":
-            return cmd_stop(args)
+        elif args.command == "kill":
+            return cmd_kill(args)
         elif args.command == "mark-completed":
             return cmd_mark_completed(args)
         elif args.command == "set-status":

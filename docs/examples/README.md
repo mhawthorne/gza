@@ -45,7 +45,7 @@ Practical examples showing common workflows with Gza.
 | View active/startup-failed workers | `gza ps` |
 | Tail worker logs | `gza log -w <worker_id> -f` |
 | View task log | `gza log <task_id>` |
-| Stop a worker | `gza stop <worker_id>` |
+| Kill a running task | `gza kill <task_id>` |
 | Create review | `gza review <impl_id>` |
 | Address feedback | `gza improve <impl_id>` |
 | Resume failed task | `gza resume <task_id>` |

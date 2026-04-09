@@ -38,6 +38,7 @@ from ._common import (
     _create_rebase_task,
     _create_resume_task,
     _create_review_task,
+    _get_pager,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     get_review_verdict,
@@ -786,49 +787,6 @@ def cmd_diff(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Error running git diff: {e}", file=sys.stderr)
         return 1
-
-
-def _get_pager(repo_dir: Path) -> str:
-    """Determine which pager to use for git diff output.
-
-    Checks in order:
-    1. $GIT_PAGER environment variable
-    2. git config core.pager
-    3. $PAGER environment variable
-    4. Falls back to 'less'
-
-    Args:
-        repo_dir: Path to git repository
-
-    Returns:
-        The pager command to use
-    """
-    # Check $GIT_PAGER
-    git_pager = os.environ.get('GIT_PAGER')
-    if git_pager:
-        return git_pager
-
-    # Check git config core.pager
-    try:
-        result = subprocess.run(
-            ["git", "config", "core.pager"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        logger.debug("Failed to read git core.pager config", exc_info=True)
-
-    # Check $PAGER
-    pager = os.environ.get('PAGER')
-    if pager:
-        return pager
-
-    # Default to 'less -R' (-R interprets ANSI color codes)
-    return 'less -R'
 
 
 def _generate_pr_content(

@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from ..config import Config
 from ..console import format_duration
 from ..db import (
+    SqliteTaskStore,
+    Task as DbTask,
     TaskCycle,
     add_task_interactive,
     edit_task_interactive,
@@ -729,6 +731,53 @@ def _cleanup_worker_registry(config: "Config", task_id: int) -> None:
         registry.mark_completed(worker.worker_id, exit_code=0, status="completed")
 
 
+def _resolve_impl_task(
+    store: SqliteTaskStore, task_id: int
+) -> tuple[DbTask, None] | tuple[None, str]:
+    """Walk up the lineage chain to find the root implement task.
+
+    Accepts implement, review, or improve task IDs and resolves to the
+    root implement task.  Returns ``(impl_task, None)`` on success or
+    ``(None, error_message)`` on failure.
+    """
+    task = store.get(task_id)
+    if not task:
+        return None, f"Task #{task_id} not found"
+
+    if task.task_type == "implement":
+        return task, None
+
+    if task.task_type == "improve":
+        if not task.based_on:
+            return None, f"Improve task #{task.id} has no based_on implementation task"
+        parent = store.get(task.based_on)
+        if parent is None:
+            return None, f"Improve task #{task.id} points to task #{task.based_on}, which was not found"
+        if parent.task_type != "implement":
+            return None, (
+                f"Improve task #{task.id} points to task #{task.based_on}, "
+                "which is not an implementation task"
+            )
+        return parent, None
+
+    if task.task_type == "review":
+        if not task.depends_on:
+            return None, f"Review task #{task.id} has no depends_on implementation task"
+        parent = store.get(task.depends_on)
+        if parent is None:
+            return None, f"Review task #{task.id} points to task #{task.depends_on}, which was not found"
+        if parent.task_type != "implement":
+            return None, (
+                f"Review task #{task.id} points to task #{task.depends_on}, "
+                "which is not an implementation task"
+            )
+        return parent, None
+
+    return None, (
+        f"Task #{task_id} is a {task.task_type} task, not an implementation, improve, or review task"
+    )
+
+
 def cmd_improve(args: argparse.Namespace) -> int:
     """Create an improve task based on an implementation task and its most recent review."""
     config = Config.load(args.project_dir)
@@ -742,20 +791,11 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    impl_task = store.get(args.impl_task_id)
-    if not impl_task:
-        print(f"Error: Task #{args.impl_task_id} not found")
+    impl_task, err = _resolve_impl_task(store, args.task_id)
+    if err:
+        print(f"Error: {err}")
         return 1
-
-    # Validate that it's an implementation task
-    if impl_task.task_type != "implement":
-        print(f"Error: Task #{args.impl_task_id} is a {impl_task.task_type} task. Provide the implementation task ID:")
-        # Find if there's an implementation task this review depends on
-        if impl_task.task_type == "review" and impl_task.depends_on:
-            dep_task = store.get(impl_task.depends_on)
-            if dep_task and dep_task.task_type == "implement":
-                print(f"  gza improve {impl_task.depends_on}")
-        return 1
+    assert impl_task is not None
 
     # Find the most recent review task for this implementation
     assert impl_task.id is not None
@@ -816,32 +856,12 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    # Resolve target implementation from provided task
-    source_task = store.get(args.task_id)
-    if not source_task:
-        print(f"Error: Task #{args.task_id} not found")
+    # Resolve target implementation from provided task (accepts implement, improve, or review)
+    impl_task, err = _resolve_impl_task(store, args.task_id)
+    if err:
+        print(f"Error: {err}")
         return 1
-
-    impl_task = source_task
-    if source_task.task_type == "improve":
-        if source_task.based_on:
-            candidate = store.get(source_task.based_on)
-            if candidate and candidate.task_type == "implement":
-                impl_task = candidate
-            else:
-                print(
-                    f"Error: Improve task #{source_task.id} points to task #{source_task.based_on}, "
-                    "which is not an implementation task"
-                )
-                return 1
-        else:
-            print(f"Error: Improve task #{source_task.id} has no based_on implementation task")
-            return 1
-
-    # Validate that the effective target is an implementation task
-    if impl_task.task_type != "implement":
-        print(f"Error: Task #{args.task_id} is a {source_task.task_type} task, not an implementation/improve task")
-        return 1
+    assert impl_task is not None
 
     # Check if task is completed
     if impl_task.status != "completed":
@@ -903,6 +923,8 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     dry_run: bool = getattr(args, 'dry_run', False)
     continue_existing: bool = getattr(args, 'continue_cycle', False)
 
+    # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
+    # it manages the full review/improve cycle lifecycle and requires the root impl task.
     impl_task = store.get(args.impl_task_id)
     if not impl_task:
         print(f"Error: Task #{args.impl_task_id} not found")

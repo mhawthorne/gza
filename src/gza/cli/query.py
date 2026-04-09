@@ -1,10 +1,11 @@
 """CLI commands for querying and displaying task state.
 
-Covers: next, history, unmerged, groups, status, ps, stop, delete, show, attach.
+Covers: next, history, unmerged, groups, status, ps, kill, delete, show, attach.
 """
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -52,6 +53,7 @@ from ._common import (
     format_stats,
     get_review_verdict,
     get_store,
+    pager_context,
 )
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
@@ -1107,101 +1109,114 @@ def _format_started(started: datetime | None) -> str:
     return started_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _has_pid_ownership_mismatch(worker: WorkerMetadata, store: SqliteTaskStore) -> bool:
-    """Return True when task runtime ownership disagrees with worker metadata PID."""
-    if worker.task_id is None:
-        return False
-    task = store.get(worker.task_id)
-    return (
-        task is not None
-        and task.status == "in_progress"
-        and task.running_pid is not None
-        and task.running_pid != worker.pid
+def _kill_task(
+    task: DbTask,
+    registry: WorkerRegistry,
+    store: SqliteTaskStore,
+    force: bool,
+    workers: list[WorkerMetadata] | None = None,
+) -> bool:
+    """Kill a single in-progress task. Returns True on success.
+
+    Resolves the PID from the worker record if available, falling back to
+    task.running_pid for the tmux-bug case where no worker record exists.
+    Sends SIGTERM, waits 3 seconds, escalates to SIGKILL if still alive.
+    With force=True, skips straight to SIGKILL.
+    Always marks the task failed with failure_reason=KILLED.
+
+    Pass pre-fetched ``workers`` to avoid redundant registry scans when
+    killing multiple tasks in sequence.
+    """
+    # Resolve PID: prefer live worker record, fall back to task.running_pid
+    if workers is None:
+        workers = registry.list_all(include_completed=False)
+    worker = next(
+        (w for w in workers if w.task_id == task.id and w.status == "running"),
+        None,
     )
 
+    if worker is not None:
+        pid = worker.pid
+    elif task.running_pid is not None:
+        pid = task.running_pid
+    else:
+        print(f"Error: Task #{task.id} has no associated process to kill")
+        return False
 
-def cmd_stop(args: argparse.Namespace) -> int:
-    """Stop a running worker."""
+    if force:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            print(f"✓ Sent SIGKILL to task #{task.id} (PID {pid})")
+        except OSError as exc:
+            print(f"✗ Failed to kill task #{task.id}: {exc}")
+            return False
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            print(f"✗ Failed to kill task #{task.id}: {exc}")
+            return False
+        print(f"Sent SIGTERM to task #{task.id} (PID {pid}), waiting 3s...")
+        time.sleep(3)
+        try:
+            os.kill(pid, 0)
+            # Still running — escalate
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print("  Process still alive — escalated to SIGKILL")
+            except OSError:
+                pass
+        except OSError:
+            pass  # Already dead after SIGTERM
+
+    # Mark the task as failed with KILLED reason
+    store.mark_failed(
+        task,
+        log_file=task.log_file,
+        branch=task.branch,
+        has_commits=task.has_commits or False,
+        failure_reason="KILLED",
+    )
+
+    # Clean up worker record if present
+    if worker is not None:
+        registry.mark_completed(worker.worker_id, exit_code=1, status="failed")
+
+    print(f"✓ Task #{task.id} killed")
+    return True
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    """Kill a running task."""
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
+    force = args.force
 
-    # Validate arguments
-    if not hasattr(args, 'worker_id') or (not args.worker_id and not (hasattr(args, 'all') and args.all)):
-        print("Error: Must specify worker_id or use --all")
-        return 1
-
-    if hasattr(args, 'all') and args.all:
-        # Stop all running workers
-        workers = registry.list_all(include_completed=False)
-        running_workers = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
-
-        if not running_workers:
-            print("No running workers to stop")
+    if args.all:
+        tasks = store.get_in_progress()
+        if not tasks:
+            print("No running tasks to kill")
             return 0
+        # Pre-fetch worker list once to avoid O(N) registry scans.
+        workers = registry.list_all(include_completed=False)
+        results = [_kill_task(task, registry, store, force, workers) for task in tasks]
+        return 0 if all(results) else 1
 
-        for worker in running_workers:
-            if _has_pid_ownership_mismatch(worker, store):
-                task = store.get(worker.task_id) if worker.task_id is not None else None
-                running_pid = task.running_pid if task is not None else None
-                print(
-                    f"Skipping worker {worker.worker_id}: PID ownership mismatch "
-                    f"(worker PID {worker.pid}, task running_pid {running_pid})."
-                )
-                continue
-            print(f"Stopping worker {worker.worker_id} (PID {worker.pid})...")
-            if registry.stop(worker.worker_id, force=args.force if hasattr(args, 'force') else False):
-                print("  ✓ Sent stop signal")
-            else:
-                print("  ✗ Failed to stop worker")
-
-        return 0
-
-    # Stop specific worker
-    maybe_worker = registry.get(args.worker_id)
-    if not maybe_worker:
-        print(f"Error: Worker {args.worker_id} not found")
-        return 1
-    worker = maybe_worker
-
-    if worker.status != "running":
-        print(
-            f"Refusing to stop worker {args.worker_id}: "
-            f"status is '{worker.status}', not 'running'."
-        )
-        print("Run 'gza clean --workers' to remove stale worker records.")
+    if not args.task_id:
+        print("Error: Must specify task_id or use --all")
         return 1
 
-    if _has_pid_ownership_mismatch(worker, store):
-        task = store.get(worker.task_id) if worker.task_id is not None else None
-        running_pid = task.running_pid if task is not None else None
-        print(
-            f"Refusing to stop worker {args.worker_id}: PID ownership mismatch "
-            f"(worker PID {worker.pid}, task running_pid {running_pid})."
-        )
+    maybe_task = store.get(args.task_id)
+    if maybe_task is None:
+        print(f"Error: Task #{args.task_id} not found")
         return 1
 
-    if not registry.is_running(args.worker_id):
-        print(f"Worker {args.worker_id} is not running (process not found)")
-        registry.mark_completed(args.worker_id, exit_code=1, status="stale")
+    if maybe_task.status != "in_progress":
+        print(f"Error: Task #{args.task_id} is not running (status: {maybe_task.status})")
         return 1
 
-    print(f"Stopping worker {args.worker_id} (PID {worker.pid})...")
-    if registry.stop(args.worker_id, force=args.force if hasattr(args, 'force') else False):
-        print("✓ Sent stop signal")
-
-        # Wait a moment and check if it stopped
-        time.sleep(1)
-        if not registry.is_running(args.worker_id):
-            print("✓ Worker stopped")
-            registry.mark_completed(args.worker_id, exit_code=1, status="failed")
-        else:
-            print("Worker is still running, may take a moment to shut down")
-
-        return 0
-    else:
-        print("✗ Failed to stop worker")
-        return 1
+    return 0 if _kill_task(maybe_task, registry, store, force) else 1
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
@@ -1270,7 +1285,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
         lc = _colors.LINEAGE_COLORS
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel else ""
+        rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel and rel != type_str else ""
 
         stats = format_stats(t)
         stats_part = f" [{lc.stats}]({stats})[/{lc.stats}]" if stats else ""
@@ -1334,9 +1349,6 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
 
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
-    from ._common import _extract_failure_log_context, _resolve_task_log_path
-    from .log import _latest_worker_for_task
-
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -1366,6 +1378,20 @@ def cmd_show(args: argparse.Namespace) -> int:
             return 0
         console.print(f"[red]Error: Task #{args.task_id} has no output content[/red]")
         return 1
+
+    with pager_context(getattr(args, 'page', False), config.project_dir):
+        return _cmd_show_output(task, args, config, store)
+
+
+def _cmd_show_output(
+    task: DbTask,
+    args: argparse.Namespace,
+    config: Config,
+    store: SqliteTaskStore,
+) -> int:
+    """Render the full show output. Called within pager_context when needed."""
+    from .log import _latest_worker_for_task
+    from ._common import _resolve_task_log_path, _extract_failure_log_context
 
     # Colors for show output — defined in gza.colors.
     SHOW_COLORS = SHOW_COLORS_DICT
@@ -1633,7 +1659,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         )
         print("output but cannot interact. Use Ctrl-B D to detach.")
         print(
-            f"To intervene, stop this task (gza stop {worker.task_id}) and re-run with Claude."
+            f"To intervene, stop this task (gza kill {worker.task_id}) and re-run with Claude."
         )
         print()
         if inside_tmux:
