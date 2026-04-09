@@ -68,7 +68,7 @@ $ gza attach 43
 Attaching to task #43 (provider: codex)...
 Note: Codex runs in headless mode. You can observe output but cannot
 interact. Use Ctrl-B D to detach.
-To intervene, stop this task (gza stop 43) and re-run with Claude.
+To intervene, stop this task (gza kill 43) and re-run with Claude.
 ```
 
 ### Why still use tmux for non-interactive providers?
@@ -355,7 +355,7 @@ def cmd_attach(args, config):
         print(f"Attaching to task #{worker.task_id} (provider: {provider})...")
         print(f"Note: {provider.title()} runs in headless mode. You can observe")
         print("output but cannot interact. Use Ctrl-B D to detach.")
-        print(f"To intervene, stop this task (gza stop {worker.task_id}) and re-run with Claude.")
+        print(f"To intervene, stop this task (gza kill {worker.task_id}) and re-run with Claude.")
         print()
         # Attach read-only since interaction is pointless
         os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])

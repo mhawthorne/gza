@@ -122,26 +122,41 @@ class TmuxProxy:
 
     def _io_loop(self, child_pid: int, pty_fd: int) -> int:
         """Core select-based I/O loop."""
-        # Deliver initial prompt to child process via PTY before entering main loop
-        if self.prompt_file:
-            self._write_prompt_to_pty(pty_fd)
+        # Load prompt data early but do NOT write it yet — the pty_fd is still
+        # in blocking mode and the child may be producing startup output.
+        # Writing now risks a deadlock: parent blocks on write while child
+        # blocks on its own stdout write because nobody is draining the PTY.
+        prompt_bytes = self._load_prompt_data()
 
-        # Set stdout to non-blocking so writes to the tmux pane never block.
+        # Set stdout and pty_fd to non-blocking so writes never block.
         # If the pane buffer is full, we drop output rather than deadlocking
         # (the proxy must keep draining the child PTY to prevent the child from
         # blocking on its own writes).
+        # The pty_fd must also be non-blocking: if the child's PTY input buffer
+        # is full (because the child is itself blocked writing to stdout), an
+        # auto-accept write to pty_fd would deadlock the proxy, preventing it
+        # from draining the child's output.
         stdout_fd = sys.stdout.fileno()
-        orig_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
-        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl | os.O_NONBLOCK)
+        orig_stdout_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_stdout_fl | os.O_NONBLOCK)
+
+        orig_pty_fl = fcntl.fcntl(pty_fd, fcntl.F_GETFL)
+        fcntl.fcntl(pty_fd, fcntl.F_SETFL, orig_pty_fl | os.O_NONBLOCK)
 
         try:
-            return self._io_loop_inner(child_pid, pty_fd, stdout_fd)
+            return self._io_loop_inner(child_pid, pty_fd, stdout_fd, prompt_bytes)
         finally:
             # Restore blocking mode so final cleanup writes don't fail with EAGAIN
-            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_fl)
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, orig_stdout_fl)
+            fcntl.fcntl(pty_fd, fcntl.F_SETFL, orig_pty_fl)
 
-    def _io_loop_inner(self, child_pid: int, pty_fd: int, stdout_fd: int) -> int:
+    def _io_loop_inner(self, child_pid: int, pty_fd: int, stdout_fd: int, prompt_bytes: bytes | None = None) -> int:
         """Inner I/O loop with non-blocking stdout."""
+        # Prompt delivery state: chunks are written inside the select loop so
+        # we keep draining child output between writes, preventing deadlock.
+        _pending_prompt = prompt_bytes
+        _prompt_offset = 0
+
         # Track whether a human was attached on the previous iteration
         _prev_has_human = self._has_human()
         _first_output = True
@@ -185,10 +200,7 @@ class TmuxProxy:
                     try:
                         data = os.read(stdin_fd, 4096)
                         if data:
-                            try:
-                                os.write(pty_fd, data)
-                            except OSError:
-                                pass
+                            self._write_pty(pty_fd, data)
                     except OSError:
                         pass
 
@@ -202,6 +214,19 @@ class TmuxProxy:
                     return os.waitstatus_to_exitcode(wstatus)
             except ChildProcessError:
                 return 0
+
+            # Deliver pending prompt one chunk at a time, interleaved with
+            # the select loop so we keep draining child output between writes.
+            # This prevents deadlock when the child produces startup output
+            # that fills the PTY buffer before it starts reading stdin.
+            if _pending_prompt is not None and _prompt_offset < len(_pending_prompt):
+                chunk = _pending_prompt[_prompt_offset : _prompt_offset + _PROMPT_CHUNK_SIZE]
+                if self._write_pty(pty_fd, chunk):
+                    _prompt_offset += len(chunk)
+                    if _prompt_offset >= len(_pending_prompt):
+                        _pending_prompt = None
+                        logger.info("Prompt delivery complete")
+                # If write failed (EAGAIN), retry next iteration after draining output
 
             # Track human attach/detach transitions for grace period
             current_has_human = self._has_human()
@@ -222,12 +247,9 @@ class TmuxProxy:
                 if idle > self.max_idle_timeout:
                     # Session appears stuck — send Ctrl-C, wait for response, then EOF
                     logger.info("Session idle for %.1fs (max %s); sending Ctrl-C + EOF", idle, self.max_idle_timeout)
-                    try:
-                        os.write(pty_fd, b"\x03")  # Ctrl-C
-                        time.sleep(3)  # Give child time to respond to Ctrl-C
-                        os.write(pty_fd, b"\x04")  # Ctrl-D / EOF
-                    except OSError:
-                        pass
+                    self._write_pty(pty_fd, b"\x03")  # Ctrl-C
+                    time.sleep(3)  # Give child time to respond to Ctrl-C
+                    self._write_pty(pty_fd, b"\x04")  # Ctrl-D / EOF
                     break
 
                 # Respect detach_grace: only auto-accept after grace period
@@ -240,11 +262,11 @@ class TmuxProxy:
                 if idle > self.auto_accept_timeout and grace_elapsed:
                     # Send Enter to accept the default prompt choice
                     logger.info("Detached and quiescent (%.1fs); sending auto-accept", idle)
-                    try:
-                        os.write(pty_fd, b"\n")
+                    if self._write_pty(pty_fd, b"\n"):
                         self.last_output_time = time.monotonic()
-                    except OSError:
-                        break
+                    # If write failed (EAGAIN), skip — the child's PTY input
+                    # buffer is full, so it hasn't consumed prior input yet.
+                    # The next select() iteration will drain child output first.
 
         self._drain_pty(pty_fd)
         return self._reap(child_pid)
@@ -264,6 +286,25 @@ class TmuxProxy:
                 logger.debug("stdout would block, dropping %d bytes", len(data))
             elif e.errno == errno.EPIPE:
                 pass  # broken pipe, session gone
+            else:
+                raise
+
+    @staticmethod
+    def _write_pty(pty_fd: int, data: bytes) -> bool:
+        """Write data to the child PTY (non-blocking). Returns True on success.
+
+        If the PTY input buffer is full (child not reading), the write is
+        skipped to prevent deadlocking the proxy's I/O loop.
+        """
+        try:
+            os.write(pty_fd, data)
+            return True
+        except OSError as e:
+            if e.errno == errno.EAGAIN:
+                logger.debug("pty_fd would block, dropping %d bytes", len(data))
+                return False
+            elif e.errno in (errno.EIO, errno.EPIPE):
+                return False  # child exited
             else:
                 raise
 
@@ -306,37 +347,25 @@ class TmuxProxy:
         except ChildProcessError:
             return 0
 
-    def _write_prompt_to_pty(self, pty_fd: int) -> None:
-        """Deliver the initial task prompt to the child process via the PTY master fd.
+    def _load_prompt_data(self) -> bytes | None:
+        """Load the initial task prompt from the temp file and delete it.
 
-        The proxy "types" the prompt into the session so Claude receives it as if
-        a user had typed it at the terminal. For short prompts (≤2000 bytes) the
-        bytes are written in one call; longer prompts are chunked to avoid
-        overflowing the PTY line-discipline input buffer.
-
-        The prompt file is deleted after delivery (it is a one-shot temp file).
+        Returns the prompt bytes (with trailing newline) or None if no prompt
+        file was configured or reading failed.  The actual delivery to the PTY
+        happens inside ``_io_loop_inner`` in non-blocking chunks interleaved
+        with draining child output, preventing deadlock.
         """
         if not self.prompt_file:
-            return
+            return None
         try:
             from pathlib import Path as _Path
             prompt_bytes = _Path(self.prompt_file).read_bytes()
             if not prompt_bytes.endswith(b"\n"):
                 prompt_bytes += b"\n"
-            if len(prompt_bytes) <= _PROMPT_CHUNK_SIZE:
-                os.write(pty_fd, prompt_bytes)
-            else:
-                # Long prompt: write in chunks with brief pauses so the PTY
-                # buffer does not fill before the child process reads it.
-                for i in range(0, len(prompt_bytes), _PROMPT_CHUNK_SIZE):
-                    try:
-                        os.write(pty_fd, prompt_bytes[i : i + _PROMPT_CHUNK_SIZE])
-                        time.sleep(0.05)
-                    except OSError as e:
-                        logger.warning("Failed to write prompt chunk to PTY: %s", e)
-                        break
+            return prompt_bytes
         except Exception as e:
-            logger.warning("Failed to deliver prompt to PTY: %s", e)
+            logger.warning("Failed to read prompt file: %s", e)
+            return None
         finally:
             # Clean up the temp file — it is only needed for delivery.
             try:

@@ -45,27 +45,27 @@ $ gza ps --all
 $ gza log -w w-20260108-160001 -f
 ```
 
-## Stop a single worker
+## Kill a single task
 
 ```bash
-$ gza stop w-20260108-160001
-Stopped: w-20260108-160001
+$ gza kill 101
+Killed: #101 (pid 55555)
 ```
 
-## Stop all workers
+## Kill all running tasks
 
 ```bash
-$ gza stop --all
-Stopped: w-20260108-160001
-Stopped: w-20260108-160002
-Stopped: w-20260108-160003
-Stopped: w-20260108-160004
+$ gza kill --all
+Killed: #101 (pid 55555)
+Killed: #102 (pid 55556)
+Killed: #103 (pid 55557)
+Killed: #104 (pid 55558)
 ```
 
-Force kill if workers are unresponsive:
+Force kill if tasks are unresponsive:
 
 ```bash
-$ gza stop --all --force
+$ gza kill --all --force
 ```
 
 ## Worker behavior

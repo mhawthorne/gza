@@ -206,19 +206,6 @@ def test_registry_list_all_ignores_entries_with_zero_pid(temp_workers_dir):
     assert workers == []
 
 
-def test_registry_stop_does_not_signal_for_non_numeric_pid(temp_workers_dir):
-    """Malformed non-numeric pid should not trigger os.kill."""
-    registry = WorkerRegistry(temp_workers_dir)
-    (temp_workers_dir / "w-bad-nonnumeric-pid.json").write_text(
-        '{"worker_id": "w-bad-nonnumeric-pid", "task_id": 1, "pid": "not-a-number"}'
-    )
-
-    with patch("gza.workers.os.kill") as mock_kill:
-        assert registry.stop("w-bad-nonnumeric-pid") is False
-        assert registry.is_running("w-bad-nonnumeric-pid") is False
-
-    mock_kill.assert_not_called()
-
 
 def test_registry_is_running(temp_workers_dir):
     """Test checking if worker is running."""
