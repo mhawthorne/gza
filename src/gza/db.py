@@ -1118,7 +1118,7 @@ class SqliteTaskStore:
 
         A task is resumable if:
         - status = 'failed'
-        - failure_reason IN ('MAX_STEPS', 'MAX_TURNS')
+        - failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')
         - session_id IS NOT NULL
         """
         with self._connect() as conn:
@@ -1126,7 +1126,7 @@ class SqliteTaskStore:
                 """
                 SELECT * FROM tasks
                 WHERE status = 'failed'
-                AND failure_reason IN ('MAX_STEPS', 'MAX_TURNS')
+                AND failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')
                 AND session_id IS NOT NULL
                 ORDER BY completed_at DESC, id DESC
                 """
@@ -1137,7 +1137,7 @@ class SqliteTaskStore:
         """Count consecutive failed ancestors with resumable failure reasons.
 
         Walks the based_on chain upward from task_id's parent, counting how many
-        consecutive failed ancestors have failure_reason in ('MAX_STEPS', 'MAX_TURNS').
+        consecutive failed ancestors have failure_reason in ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE').
         This tells us how many times we've already tried resuming (not counting task_id itself).
 
         Examples:
@@ -1171,7 +1171,7 @@ class SqliteTaskStore:
                 if row is None:
                     break
                 based_on, status, failure_reason = row["based_on"], row["status"], row["failure_reason"]
-                if status == "failed" and failure_reason in ("MAX_STEPS", "MAX_TURNS"):
+                if status == "failed" and failure_reason in ("MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"):
                     depth += 1
                     current_id = based_on
                 else:
