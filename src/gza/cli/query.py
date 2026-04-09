@@ -1390,8 +1390,8 @@ def _cmd_show_output(
     store: SqliteTaskStore,
 ) -> int:
     """Render the full show output. Called within pager_context when needed."""
+    from ._common import _extract_failure_log_context, _resolve_task_log_path
     from .log import _latest_worker_for_task
-    from ._common import _resolve_task_log_path, _extract_failure_log_context
 
     # Colors for show output — defined in gza.colors.
     SHOW_COLORS = SHOW_COLORS_DICT
