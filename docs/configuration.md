@@ -608,19 +608,21 @@ Runtime reconciliation notes:
   - `TIMEOUT` when runtime exceeds configured `timeout_minutes`.
 - `gza ps` merges worker rows and DB in-progress tasks by task ownership, so healthy background runs appear as one active task row.
 
-### stop
+### kill
 
-Stop workers.
+Kill a running task.
 
 ```bash
-gza stop [worker_id] [options]
+gza kill [task_id] [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `worker_id` | Worker ID to stop |
-| `--all` | Stop all running workers |
-| `--force` | Force kill (SIGKILL) |
+| `task_id` | Task ID to kill (optional if `--all` is used) |
+| `--all` | Kill all running tasks |
+| `--force`, `-9` | Send SIGKILL immediately (skip SIGTERM) |
+
+Sends SIGTERM and waits 3 seconds; escalates to SIGKILL if the process is still alive. Sets the task status to `failed` with `failure_reason=KILLED`.
 
 ### validate
 
@@ -1232,16 +1234,16 @@ task_types:
     timeout_minutes: 45
 ```
 
-### Worker won't stop
+### Task won't stop
 
-If `gza stop` doesn't work, force kill:
+If `gza kill` doesn't work, force kill:
 
 ```bash
-gza stop <worker_id> --force
+gza kill <task_id> --force
 ```
 
-Or stop all workers:
+Or kill all running tasks:
 
 ```bash
-gza stop --all --force
+gza kill --all --force
 ```

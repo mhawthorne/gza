@@ -32,7 +32,7 @@ gza attach 42
 2. **Structured output** — JSONL streaming is preserved for unattended execution, giving reliable step counting, session ID capture, and log parsing
 3. **Real interactivity** — when attached, you get the actual Claude Code TUI, not a proxy pretending to be you
 4. **Clean separation** — unattended = pipe mode (robust), attended = interactive mode (full-featured)
-5. **Resilient by design** — killing and resuming workers is already a well-tested path (`gza stop` + `gza resume`)
+5. **Resilient by design** — killing and resuming workers is already a well-tested path (`gza kill` + `gza resume`)
 
 ## Design
 
@@ -45,7 +45,7 @@ gza attach 42
 
 ### The attach flow
 
-`gza attach 42` is effectively `gza stop 42` + `gza resume 42 --interactive`:
+`gza attach 42` is effectively `gza kill 42` + `gza resume 42 --interactive`:
 
 1. Look up worker metadata, find the running worker for task 42
 2. Stop the worker (SIGTERM to the `gza work` process)
@@ -74,7 +74,7 @@ The entire approach depends on Claude's `--resume` flag reliably picking up wher
 Killing Claude mid-turn is not a new risk. It already happens when:
 - Max turns is reached
 - Network dies
-- User runs `gza stop`
+- User runs `gza kill`
 - Process is OOM-killed
 
 `--resume` handles all of these.
@@ -122,6 +122,6 @@ This spec supersedes the proxy-based auto-accept approach described in `specs/tm
 
 3. ~~**Step counting across mode switches:**~~ Resolved — step counting from JSONL covers the `-p` portions. For interactive sessions, track attach count, wall clock duration, and note it in task stats. Exact step counts during interactive mode aren't needed — the primary purpose of max turns (preventing runaway cost) is still served since `-p` mode enforces it during unattended execution.
 
-4. ~~**Auto-resume on detach:**~~ Resolved — detach always auto-resumes in background. Stopping is a separate action (`gza stop`). Detach means "I'm done intervening, carry on."
+4. ~~**Auto-resume on detach:**~~ Resolved — detach always auto-resumes in background. Killing is a separate action (`gza kill`). Detach means "I'm done intervening, carry on."
 
 5. ~~**`gza attach --observe` for Claude tasks:**~~ Resolved — not needed. `gza log -f` already covers observation. No reason to duplicate functionality.

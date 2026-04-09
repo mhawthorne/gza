@@ -107,24 +107,24 @@ gza logs w-20260107-001 --follow
 **Output format**:
 Same as current foreground execution—tool names, intermediate text, etc.
 
-### 4. `gza stop <worker_id>`
+### 4. `gza kill <task_id>`
 
-Gracefully stop a running worker.
+Kill a running task.
 
 ```bash
-gza stop w-20260107-001
+gza kill 42
 
-# Force kill
-gza stop --force w-20260107-001
+# Force kill (skip SIGTERM grace period)
+gza kill --force 42
 
-# Stop all running workers
-gza stop --all
+# Kill all running tasks
+gza kill --all
 ```
 
 **Behavior**:
-- Sends SIGTERM (or SIGKILL with `--force`)
-- Worker cleanup runs (worktree removal, status update)
-- Task marked as `failed` with interruption note
+- Sends SIGTERM, waits 3 seconds, escalates to SIGKILL if still alive
+- With `--force`, skips straight to SIGKILL
+- Task marked as `failed` with `failure_reason=KILLED`
 
 ---
 
@@ -281,8 +281,8 @@ def claim_next_task(store: SqliteTaskStore) -> Task | None:
 | `gza ps -a` | List all workers (including completed) |
 | `gza logs <id>` | Tail worker logs |
 | `gza logs <id> --no-follow` | Show full log without following |
-| `gza stop <id>` | Stop a worker |
-| `gza stop --all` | Stop all workers |
+| `gza kill <task_id>` | Kill a running task |
+| `gza kill --all` | Kill all running tasks |
 
 ---
 

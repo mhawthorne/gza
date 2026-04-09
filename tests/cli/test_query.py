@@ -3448,136 +3448,257 @@ class TestNextCommandWithDependencies:
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
 
 
-class TestStopCommandSafety:
-    """Safety tests for stopping workers."""
+class TestKillCommand:
+    """Tests for the 'gza kill' command."""
 
-    def test_stop_refuses_non_running_worker_even_if_pid_is_live(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """A non-running worker record should never be signaled."""
-        from gza.cli.query import cmd_stop
-        from gza.workers import WorkerMetadata, WorkerRegistry
+    def test_kill_refuses_non_in_progress_task(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """kill must reject tasks that are not in_progress."""
+        from gza.cli.query import cmd_kill
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        task = store.add("Completed task")
+        assert task.id is not None
 
-        workers_path = tmp_path / ".gza" / "workers"
-        workers_path.mkdir(parents=True, exist_ok=True)
-        registry = WorkerRegistry(workers_path)
-        registry.register(
-            WorkerMetadata(
-                worker_id="w-stop-safety",
-                task_id=None,
-                pid=os.getpid(),
-                status="completed",
-            )
-        )
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            worker_id="w-stop-safety",
-            all=False,
-            force=False,
-        )
-        with patch("gza.cli.query.WorkerRegistry.stop") as mock_stop:
-            rc = cmd_stop(args)
+        args = argparse.Namespace(project_dir=tmp_path, task_id=task.id, all=False, force=False)
+        with patch("gza.cli.query.os.kill") as mock_kill:
+            rc = cmd_kill(args)
 
         captured = capsys.readouterr()
         assert rc == 1
-        assert "Refusing to stop worker w-stop-safety" in captured.out
-        mock_stop.assert_not_called()
+        assert "not running" in captured.out
+        mock_kill.assert_not_called()
 
-    def test_stop_all_skips_worker_with_pid_ownership_mismatch(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """stop --all must skip workers whose task running_pid points to another process."""
-        from gza.cli.query import cmd_stop
+    def test_kill_task_not_found(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """kill must report an error for unknown task IDs."""
+        from gza.cli.query import cmd_kill
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(project_dir=tmp_path, task_id=99999, all=False, force=False)
+        rc = cmd_kill(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "not found" in captured.out
+
+    def test_kill_signals_via_worker_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """kill sends SIGTERM to the worker PID found in the registry."""
+        from gza.cli.query import cmd_kill
         from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
-        task = store.add("Mismatch task")
+        task = store.add("Running task")
         assert task.id is not None
         task.status = "in_progress"
-        task.running_pid = os.getpid() + 12345
+        task.running_pid = 12345
         store.update(task)
 
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_path)
-        registry.register(
-            WorkerMetadata(
-                worker_id="w-stop-all-mismatch",
-                task_id=task.id,
-                pid=os.getpid(),
-                status="running",
-            )
-        )
+        registry.register(WorkerMetadata(worker_id="w-kill-1", task_id=task.id, pid=12345, status="running"))
 
-        args = argparse.Namespace(project_dir=tmp_path, worker_id=None, all=True, force=False)
-        with patch("gza.cli.query.WorkerRegistry.stop") as mock_stop:
-            rc = cmd_stop(args)
+        args = argparse.Namespace(project_dir=tmp_path, task_id=task.id, all=False, force=False)
+        # Patch os.kill so SIGTERM appears sent and process dies immediately (OSError on signal 0)
+        def fake_kill(pid: int, sig: int) -> None:
+            if sig == 0:
+                raise OSError("no such process")
+        with patch("gza.cli.query.os.kill", side_effect=fake_kill) as mock_kill:
+            with patch("gza.cli.query.time.sleep"):
+                rc = cmd_kill(args)
 
         captured = capsys.readouterr()
         assert rc == 0
-        assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
-        mock_stop.assert_not_called()
+        assert "Task #" in captured.out and "killed" in captured.out
+        # Confirm SIGTERM was sent
+        import signal
+        mock_kill.assert_any_call(12345, signal.SIGTERM)
+        # Task status must be KILLED
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "KILLED"
 
-    def test_stop_all_only_signals_ownership_valid_workers(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+    def test_kill_escalates_to_sigkill_when_process_survives_sigterm(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """stop --all should signal only workers whose PID ownership matches task.running_pid."""
-        from gza.cli.query import cmd_stop
+        """If the process survives SIGTERM for 3 seconds, kill escalates to SIGKILL."""
+        import signal as _signal
+
+        from gza.cli.query import cmd_kill
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        task = store.add("Stubborn task")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.running_pid = 22222
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(WorkerMetadata(worker_id="w-kill-2", task_id=task.id, pid=22222, status="running"))
+
+        args = argparse.Namespace(project_dir=tmp_path, task_id=task.id, all=False, force=False)
+        # signal 0 succeeds (process still alive after SIGTERM), others succeed silently
+        def fake_kill(pid: int, sig: int) -> None:
+            pass  # process "survives" every signal check
+        with patch("gza.cli.query.os.kill", side_effect=fake_kill):
+            with patch("gza.cli.query.time.sleep"):
+                rc = cmd_kill(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "SIGKILL" in captured.out or "escalated" in captured.out.lower()
+
+    def test_kill_force_sends_sigkill_immediately(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """--force skips SIGTERM and sends SIGKILL immediately."""
+        import signal as _signal
+
+        from gza.cli.query import cmd_kill
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        task = store.add("Force kill task")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.running_pid = 33333
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(WorkerMetadata(worker_id="w-kill-3", task_id=task.id, pid=33333, status="running"))
+
+        args = argparse.Namespace(project_dir=tmp_path, task_id=task.id, all=False, force=True)
+        with patch("gza.cli.query.os.kill") as mock_kill:
+            rc = cmd_kill(args)
+
+        assert rc == 0
+        mock_kill.assert_called_once_with(33333, _signal.SIGKILL)
+
+    def test_kill_uses_running_pid_when_no_worker_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """tmux bug case: no worker record, kill falls back to task.running_pid."""
+        import signal as _signal
+
+        from gza.cli.query import cmd_kill
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        task = store.add("Orphaned task")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.running_pid = 44444
+        store.update(task)
+
+        args = argparse.Namespace(project_dir=tmp_path, task_id=task.id, all=False, force=True)
+        with patch("gza.cli.query.os.kill") as mock_kill:
+            rc = cmd_kill(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        mock_kill.assert_called_once_with(44444, _signal.SIGKILL)
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "KILLED"
+
+    def test_kill_all_kills_all_in_progress_tasks(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """--all kills every in-progress task."""
+        import signal as _signal
+
+        from gza.cli.query import cmd_kill
         from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
 
-        valid_task = store.add("Valid task")
-        assert valid_task.id is not None
-        valid_task.status = "in_progress"
-        valid_task.running_pid = os.getpid()
-        store.update(valid_task)
+        task1 = store.add("Task A")
+        assert task1.id is not None
+        task1.status = "in_progress"
+        task1.running_pid = 55555
+        store.update(task1)
 
-        mismatch_task = store.add("Mismatch task")
-        assert mismatch_task.id is not None
-        mismatch_task.status = "in_progress"
-        mismatch_task.running_pid = os.getpid() + 54321
-        store.update(mismatch_task)
+        task2 = store.add("Task B")
+        assert task2.id is not None
+        task2.status = "in_progress"
+        task2.running_pid = 66666
+        store.update(task2)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        registry.register(WorkerMetadata(worker_id="w-all-1", task_id=task1.id, pid=55555, status="running"))
+        registry.register(WorkerMetadata(worker_id="w-all-2", task_id=task2.id, pid=66666, status="running"))
+
+        args = argparse.Namespace(project_dir=tmp_path, task_id=None, all=True, force=True)
+        with patch("gza.cli.query.os.kill") as mock_kill:
+            rc = cmd_kill(args)
+
+        assert rc == 0
+        killed_pids = {c.args[0] for c in mock_kill.call_args_list if c.args[1] == _signal.SIGKILL}
+        assert {55555, 66666} == killed_pids
+
+    def test_kill_all_no_running_tasks(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """--all exits cleanly with a message when no tasks are running."""
+        from gza.cli.query import cmd_kill
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(project_dir=tmp_path, task_id=None, all=True, force=False)
+        rc = cmd_kill(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "No running tasks" in captured.out
+
+    def test_kill_all_returns_nonzero_when_some_kills_fail(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """--all returns 1 if any task could not be killed (e.g. no PID)."""
+        from gza.cli.query import cmd_kill
+        from gza.db import SqliteTaskStore
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+
+        # Task with a valid PID — kill will succeed.
+        task_ok = store.add("Task with PID")
+        assert task_ok.id is not None
+        task_ok.status = "in_progress"
+        task_ok.running_pid = 55555
+        store.update(task_ok)
 
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_path)
         registry.register(
-            WorkerMetadata(
-                worker_id="w-stop-all-valid",
-                task_id=valid_task.id,
-                pid=os.getpid(),
-                status="running",
-            )
-        )
-        registry.register(
-            WorkerMetadata(
-                worker_id="w-stop-all-mismatch",
-                task_id=mismatch_task.id,
-                pid=os.getpid(),
-                status="running",
-            )
+            WorkerMetadata(worker_id="w-ok-1", task_id=task_ok.id, pid=55555, status="running")
         )
 
-        args = argparse.Namespace(project_dir=tmp_path, worker_id=None, all=True, force=False)
-        with patch("gza.cli.query.WorkerRegistry.stop", return_value=True) as mock_stop:
-            rc = cmd_stop(args)
+        # Task with no PID and no worker record — kill will fail.
+        task_no_pid = store.add("Task without PID")
+        assert task_no_pid.id is not None
+        task_no_pid.status = "in_progress"
+        task_no_pid.running_pid = None
+        store.update(task_no_pid)
 
-        captured = capsys.readouterr()
-        assert rc == 0
-        assert "Stopping worker w-stop-all-valid" in captured.out
-        assert "Skipping worker w-stop-all-mismatch: PID ownership mismatch" in captured.out
-        called_workers = [call.args[0] for call in mock_stop.call_args_list]
-        assert called_workers == ["w-stop-all-valid"]
+        args = argparse.Namespace(project_dir=tmp_path, task_id=None, all=True, force=True)
+        with patch("gza.cli.query.os.kill"):
+            rc = cmd_kill(args)
+
+        assert rc == 1
 
 
 class TestLineageCommand:

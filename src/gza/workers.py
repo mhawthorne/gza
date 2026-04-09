@@ -2,7 +2,6 @@
 
 import json
 import os
-import signal
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -159,17 +158,6 @@ class WorkerRegistry:
         pid_path = self._pid_path(worker_id)
         if pid_path.exists():
             pid_path.unlink()
-
-    def stop(self, worker_id: str, force: bool = False) -> bool:
-        worker = self.get(worker_id)
-        if not worker or worker.pid <= 0:
-            return False
-        try:
-            sig = signal.SIGKILL if force else signal.SIGTERM
-            os.kill(worker.pid, sig)
-            return True
-        except (OSError, ValueError):
-            return False
 
     def cleanup_stale(self) -> int:
         count = 0
