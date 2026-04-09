@@ -589,6 +589,32 @@ class TestRetryCommand:
         assert new_task is not None
         assert new_task.status == "pending"
 
+    def test_retry_blocked_if_successful_retry_exists(self, tmp_path: Path):
+        """Retry command fails if the task already has a child retry with status completed."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        # Create original failed task
+        original = store.add("Original task")
+        original.status = "failed"
+        original.completed_at = datetime.now(timezone.utc)
+        store.update(original)
+
+        # Create a successful retry child
+        retry = store.add("Original task", based_on=1)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(timezone.utc)
+        store.update(retry)
+
+        result = run_gza("retry", "1", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: Task #1 already has a successful retry (#2)." in result.stdout
+
 
 class TestResumeCommand:
     """Tests for 'gza resume' command."""
