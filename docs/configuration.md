@@ -501,23 +501,20 @@ If no main task log exists yet, `gza log` can fall back to worker startup logs i
 
 ### stats
 
-Show task statistics.
+Show review cycle statistics. Run `gza stats reviews` to see analytics.
+
+#### stats reviews
 
 ```bash
-gza stats [options]
+gza stats reviews [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--all` | Show all tasks (no limit) |
-| `--type TYPE` | Filter by task type |
-| `--days N` | Show only tasks from the last N days |
+| `--days N` | Show only tasks from the last N days (default: 14) |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
-| `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
-| `--cycles` | Show cycle analytics (review/improve iteration statistics) |
-| `--task ID` | Show cycle analytics for a specific task (use with `--cycles`) |
-| `--json` | Output as machine-readable JSON |
+| `--end-date YYYY-MM-DD` | Show only tasks on or before this date (default: today) |
+| `--issues` | Show per-model must-fix and suggestion counts |
 
 ### pr
 
