@@ -14,7 +14,7 @@ def test_import_singleton_instances() -> None:
     from gza.colors import (  # noqa: F401
         TASK_COLORS,
         STATUS_COLORS,
-        TASK_OUTPUT_COLORS,
+        TASK_STREAM_COLORS,
         SHOW_COLORS,
         UNMERGED_COLORS,
         NEXT_COLORS,
@@ -26,7 +26,7 @@ def test_import_dict_variants() -> None:
     from gza.colors import (  # noqa: F401
         TASK_COLORS_DICT,
         STATUS_COLORS_DICT,
-        TASK_OUTPUT_COLORS_DICT,
+        TASK_STREAM_COLORS_DICT,
         SHOW_COLORS_DICT,
         UNMERGED_COLORS_DICT,
         NEXT_COLORS_DICT,
@@ -77,12 +77,12 @@ def test_status_colors_dict_keys() -> None:
     assert set(STATUS_COLORS_DICT.keys()) == expected_keys
 
 
-def test_task_output_colors_dict_keys() -> None:
-    from gza.colors import TASK_OUTPUT_COLORS_DICT
+def test_task_stream_colors_dict_keys() -> None:
+    from gza.colors import TASK_STREAM_COLORS_DICT
 
     expected_keys = {"step_header", "assistant_text", "tool_use", "error",
                      "todo_pending", "todo_in_progress", "todo_completed"}
-    assert set(TASK_OUTPUT_COLORS_DICT.keys()) == expected_keys
+    assert set(TASK_STREAM_COLORS_DICT.keys()) == expected_keys
 
 
 def test_show_colors_dict_keys() -> None:
@@ -134,26 +134,45 @@ def test_ps_status_colors_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OutputStyles inheritance test
+# StreamOutputFormatter default styles
 # ---------------------------------------------------------------------------
 
 
-def test_output_styles_inherits_task_output_colors() -> None:
-    from gza.providers.output_formatter import OutputStyles
-    from gza.colors import TaskOutputColors
+def test_stream_formatter_uses_themed_singleton() -> None:
+    import gza.colors as c
+    from gza.providers.output_formatter import StreamOutputFormatter
 
-    assert issubclass(OutputStyles, TaskOutputColors)
+    try:
+        c.set_theme("minimal")
+        formatter = StreamOutputFormatter()
+        assert formatter.styles is c.TASK_STREAM_COLORS
+        assert formatter.styles.step_header == c.TASK_STREAM_COLORS.step_header
+    finally:
+        c.set_theme(None)
 
 
-def test_output_styles_instantiation() -> None:
-    from gza.providers.output_formatter import OutputStyles
+def test_build_rich_theme_returns_none_when_empty() -> None:
+    import gza.colors as c
 
-    styles = OutputStyles()
-    # Verify inherited fields are accessible
-    assert styles.step_header
-    assert styles.assistant_text
-    assert styles.tool_use
-    assert styles.error
+    try:
+        c.set_theme(None)
+        assert c.build_rich_theme() is None
+    finally:
+        c.set_theme(None)
+
+
+def test_build_rich_theme_populated_under_minimal() -> None:
+    import gza.colors as c
+    from rich.theme import Theme as RichTheme
+
+    try:
+        c.set_theme("minimal")
+        rich_theme = c.build_rich_theme()
+        assert isinstance(rich_theme, RichTheme)
+        assert "repr.number" in c.RICH_STYLES_DICT
+        assert "repr.path" in c.RICH_STYLES_DICT
+    finally:
+        c.set_theme(None)
 
 
 # ---------------------------------------------------------------------------
@@ -442,14 +461,14 @@ class TestThemeUniform:
 
     def test_uniform_sets_all_domain_fields(self) -> None:
         from gza.colors import (
-            Theme, TaskColors, StatusColors, TaskOutputColors,
+            Theme, TaskColors, StatusColors, TaskStreamColors,
             ShowColors, UnmergedColors, LineageColors, NextColors,
         )
         import dataclasses
         t = Theme.uniform("test", "#abcdef")
         for cls, attr in [
             (TaskColors, "task"), (StatusColors, "status"),
-            (TaskOutputColors, "task_output"), (ShowColors, "show"),
+            (TaskStreamColors, "task_stream"), (ShowColors, "show"),
             (UnmergedColors, "unmerged"), (LineageColors, "lineage"),
             (NextColors, "next_colors"),
         ]:

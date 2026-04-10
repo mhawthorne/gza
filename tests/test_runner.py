@@ -1459,9 +1459,15 @@ class TestReviewNextSteps:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch('gza.runner.console') as mock_console, \
+        with patch('gza.runner.console') as mock_runner_console, \
+             patch('gza.console.console') as mock_console_console, \
              patch('gza.runner.post_review_to_pr'):
-            mock_console.print.side_effect = capture_print
+            # task_footer prints via gza.console.console; runner.py prints
+            # pre/post diagnostic lines via gza.runner.console. Route both
+            # through the same capture function so the assertion sees the
+            # combined output.
+            mock_runner_console.print.side_effect = capture_print
+            mock_console_console.print.side_effect = capture_print
 
             exit_code = _run_non_code_task(
                 review_task, config, store, mock_provider, mock_git, resume=False
@@ -1538,15 +1544,21 @@ class TestReviewNextSteps:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch('gza.runner.console') as mock_console, \
+        with patch('gza.runner.console') as mock_runner_console, \
+             patch('gza.console.console') as mock_console_console, \
              patch('gza.runner.post_review_to_pr'):
-            mock_console.print.side_effect = capture_print
+            mock_runner_console.print.side_effect = capture_print
+            mock_console_console.print.side_effect = capture_print
             exit_code = _run_non_code_task(
                 review_task, config, store, mock_provider, mock_git, resume=False
             )
 
         assert exit_code == 0
-        assert "Verdict: " in "\n".join(printed_lines)
+        # task_footer emits Rich markup like "[bright_white]Verdict:[/bright_white]",
+        # so the literal "Verdict: " (with trailing space) doesn't appear — the
+        # closing bracket sits between the colon and the space. Assert against
+        # the unstyled "Verdict:" substring plus the verdict value.
+        assert "Verdict:" in "\n".join(printed_lines)
         assert expected_verdict in "\n".join(printed_lines)
 
     def test_non_review_task_does_not_suggest_improve(self, tmp_path: Path):
@@ -1598,8 +1610,10 @@ class TestReviewNextSteps:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch('gza.runner.console') as mock_console:
-            mock_console.print.side_effect = capture_print
+        with patch('gza.runner.console') as mock_runner_console, \
+             patch('gza.console.console') as mock_console_console:
+            mock_runner_console.print.side_effect = capture_print
+            mock_console_console.print.side_effect = capture_print
 
             exit_code = _run_non_code_task(
                 explore_task, config, store, mock_provider, mock_git, resume=False
@@ -2268,13 +2282,18 @@ class TestNonCodeWorktreeCleanup:
 
         worktree_path = config.worktree_path / f"{task.slug}-explore"
 
-        with patch("gza.runner.console") as mock_console:
-            mock_console.print.side_effect = capture_print
+        with patch("gza.runner.console") as mock_runner_console, \
+             patch("gza.console.console") as mock_console_console:
+            mock_runner_console.print.side_effect = capture_print
+            mock_console_console.print.side_effect = capture_print
             exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         all_output = "\n".join(printed_lines)
-        assert "Worktree preserved for inspection" in all_output
+        # Failure footer surfaces the preserved worktree via the "Worktree:" field
+        # in the centralized task_footer (see src/gza/console.py). The old
+        # "Worktree preserved for inspection" phrasing is gone.
+        assert "Worktree:" in all_output
         assert str(worktree_path) in all_output
 
 

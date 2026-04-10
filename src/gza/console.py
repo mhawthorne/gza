@@ -1,12 +1,18 @@
 """Rich console output helpers for gza."""
 
 import shutil
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 
 import gza.colors as _colors
 
-from .db import TaskStats
+from .db import Task, TaskStats
+
+if TYPE_CHECKING:
+    from .db import SqliteTaskStore
+    from .learnings import LearningsResult
 
 __all__ = [
     "console",
@@ -16,12 +22,11 @@ __all__ = [
     "get_terminal_width",
     "format_duration",
     "task_header",
+    "task_footer",
     "stats_line",
-    "success_message",
     "error_message",
     "warning_message",
     "info_line",
-    "next_steps",
     "MAX_PROMPT_DISPLAY_SHORT",
     "MAX_PROMPT_DISPLAY",
     "MAX_PR_TITLE_LENGTH",
@@ -124,13 +129,28 @@ def format_duration(seconds: float, verbose: bool = False) -> str:
         return f"{hours}h {mins}m"
 
 
-def task_header(prompt: str, task_id: str, task_type: str) -> None:
-    """Print a styled task header with prompt, ID, and type."""
+def task_header(prompt: str, task_id: str, task_type: str, slug: str | None = None) -> None:
+    """Print a styled task header with prompt, ID, type, and optional slug.
+
+    Header format — a four-dash separator bounds a flat, unindented block:
+
+        ----
+        Task: <prompt>
+        ID: <task_id>
+        Slug: <slug>      (omitted when slug is None or empty)
+        Type: <task_type>
+        ----
+    """
     rc = _colors.RUNNER_COLORS
     prompt_display = prompt[:80] + "..." if len(prompt) > 80 else prompt
-    console.print(f"[{rc.heading}]=== Task: {prompt_display} ===[/{rc.heading}]")
-    console.print(f"    [{rc.label}]ID:[/{rc.label}] [{rc.task_id}]{task_id}[/{rc.task_id}]")
-    console.print(f"    [{rc.label}]Type:[/{rc.label}] [{rc.task_type}]{task_type}[/{rc.task_type}]")
+    separator = f"[{rc.heading}]----[/{rc.heading}]"
+    console.print(separator)
+    console.print(f"[{rc.label}]Task:[/{rc.label}] [{rc.heading}]{prompt_display}[/{rc.heading}]")
+    console.print(f"[{rc.label}]ID:[/{rc.label}] [{rc.task_id}]{task_id}[/{rc.task_id}]")
+    if slug:
+        console.print(f"[{rc.label}]Slug:[/{rc.label}] [{rc.task_id}]{slug}[/{rc.task_id}]")
+    console.print(f"[{rc.label}]Type:[/{rc.label}] [{rc.task_type}]{task_type}[/{rc.task_type}]")
+    console.print(separator)
 
 
 def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
@@ -177,12 +197,6 @@ def stats_line(stats: TaskStats, has_commits: bool | None = None) -> None:
         console.print(f"Stats: {' | '.join(parts)}")
 
 
-def success_message(title: str) -> None:
-    """Print a success header."""
-    rc = _colors.RUNNER_COLORS
-    console.print(f"[{rc.success}]=== {title} ===[/{rc.success}]")
-
-
 def error_message(message: str) -> None:
     """Print an error message."""
     rc = _colors.RUNNER_COLORS
@@ -201,13 +215,146 @@ def info_line(label: str, value: str) -> None:
     console.print(f"[{rc.label}]{label}:[/{rc.label}] {value}")
 
 
-def next_steps(commands: list[tuple[str, str]]) -> None:
-    """Print a list of next step commands with comments.
+def _status_is_failure(status: str) -> bool:
+    """A status string represents a failure outcome when it doesn't start with 'Done'."""
+    return not status.startswith("Done")
 
-    Args:
-        commands: List of (command, comment) tuples
+
+def _recommend_next_steps(
+    task: Task,
+    *,
+    status: str,
+    store: "SqliteTaskStore | None" = None,
+) -> list[tuple[str, str]]:
+    """Return suggested next-step commands for a task, based on type and outcome.
+
+    This is the single place that decides what next-step hints get printed at
+    the end of a task. All per-task-type dispatch lives here — callers pass the
+    task, the status string, and (optionally) a task store, and this function
+    decides.
+
+    The ``store`` is optional so that simple consumers (tests, ad-hoc callers)
+    don't need a database. When provided, it's available for lineage-aware
+    recommendations — e.g., walking ``task.based_on`` / ``task.depends_on``
+    chains to tailor suggestions to the surrounding task graph. Today's rules
+    only need ``task.id`` / ``task.depends_on``, but the parameter is in place
+    so new rules can grow here without another signature change.
+
+    Returns a list of ``(command, description)`` tuples. An empty list means no
+    suggestions should be printed.
+    """
+    _ = store  # reserved for lineage-aware recommendations; see docstring
+    if task.id is None:
+        return []
+
+    if _status_is_failure(status):
+        return [
+            (f"gza retry {task.id}", "retry from scratch"),
+            (f"gza resume {task.id}", "resume from where it left off"),
+        ]
+
+    # Success path: dispatch by task type.
+    if task.task_type in ("implement", "improve", "rebase"):
+        return [
+            (f"gza merge {task.id}", "merge branch for task"),
+            (f"gza pr {task.id}", "create a PR"),
+        ]
+    if task.task_type == "explore":
+        return [(f"gza add --based-on {task.id}", "implement based on this exploration")]
+    if task.task_type == "plan":
+        return [(f"gza implement {task.id}", "implement this plan")]
+    if task.task_type == "review" and task.depends_on is not None:
+        return [(f"gza improve {task.depends_on}", "address review feedback")]
+    return []
+
+
+def task_footer(
+    task: Task,
+    stats: TaskStats | None = None,
+    *,
+    status: str,
+    branch: str | None = None,
+    report: str | None = None,
+    verdict: str | None = None,
+    worktree: str | Path | None = None,
+    learnings: "LearningsResult | None" = None,
+    store: "SqliteTaskStore | None" = None,
+) -> None:
+    """Print the end-of-task footer.
+
+    Mirrors :func:`task_header`: the block is bounded by a four-dash separator,
+    every line is flat (no indentation), and optional fields are omitted when
+    not applicable. Suggested next-step commands (if any) are rendered inside
+    the block, just before the closing separator, via
+    :func:`_recommend_next_steps`.
     """
     rc = _colors.RUNNER_COLORS
-    console.print("\nNext steps:")
-    for command, comment in commands:
-        console.print(f"  [{rc.next_cmd}]{command}[/{rc.next_cmd}]           [{rc.next_comment}]{comment}[/{rc.next_comment}]")
+    separator = f"[{rc.heading}]----[/{rc.heading}]"
+
+    status_color = rc.error if _status_is_failure(status) else rc.success
+
+    console.print(separator)
+    console.print(f"[{rc.label}]Status:[/{rc.label}] [{status_color}]{status}[/{status_color}]")
+    if task.id is not None:
+        console.print(f"[{rc.label}]ID:[/{rc.label}] [{rc.task_id}]{task.id}[/{rc.task_id}]")
+    if task.slug:
+        console.print(f"[{rc.label}]Slug:[/{rc.label}] [{rc.task_id}]{task.slug}[/{rc.task_id}]")
+    console.print(f"[{rc.label}]Type:[/{rc.label}] [{rc.task_type}]{task.task_type}[/{rc.task_type}]")
+
+    if stats is not None:
+        _print_stats_as_footer_line(stats)
+
+    if branch:
+        console.print(f"[{rc.label}]Branch:[/{rc.label}] [blue]{branch}[/blue]")
+    if report:
+        console.print(f"[{rc.label}]Report:[/{rc.label}] {report}")
+    if verdict:
+        from .colors import UNMERGED_COLORS_DICT
+        verdict_key = {
+            "APPROVED": "review_approved",
+            "CHANGES_REQUESTED": "review_changes",
+            "NEEDS_DISCUSSION": "review_discussion",
+        }.get(verdict)
+        verdict_color = UNMERGED_COLORS_DICT.get(verdict_key, "white") if verdict_key else "white"
+        console.print(f"[{rc.label}]Verdict:[/{rc.label}] [{verdict_color}]{verdict}[/{verdict_color}]")
+    if worktree:
+        console.print(f"[{rc.label}]Worktree:[/{rc.label}] {worktree}")
+    if learnings is not None:
+        console.print(
+            f"[{rc.label}]Learnings:[/{rc.label}] "
+            f"updated from {learnings.tasks_used} tasks "
+            f"(+{learnings.added_count}/-{learnings.removed_count}/={learnings.retained_count}, "
+            f"churn {learnings.churn_percent:.1f}%)"
+        )
+
+    steps = _recommend_next_steps(task, status=status, store=store)
+    if steps:
+        console.print(f"[{rc.label}]Next steps:[/{rc.label}]")
+        for command, comment in steps:
+            console.print(
+                f"  [{rc.next_cmd}]{command}[/{rc.next_cmd}]  [{rc.next_comment}]{comment}[/{rc.next_comment}]"
+            )
+
+    console.print(separator)
+
+
+def _print_stats_as_footer_line(stats: TaskStats) -> None:
+    """Internal: render a single ``Stats: ...`` line inside the footer.
+
+    Lives alongside :func:`task_footer` so the footer owns all of its own
+    layout. ``stats_line()`` remains the public helper for callers that want
+    the standalone, pre-refactor form (still used by a few log paths).
+    """
+    rc = _colors.RUNNER_COLORS
+    parts = []
+    if stats.duration_seconds is not None:
+        parts.append(f"[{rc.value}]{format_duration(stats.duration_seconds)}[/{rc.value}]")
+    if stats.num_steps_reported is not None:
+        parts.append(f"[{rc.value}]{stats.num_steps_reported} steps[/{rc.value}]")
+    elif stats.num_steps_computed is not None:
+        parts.append(f"[{rc.value}]{stats.num_steps_computed} steps[/{rc.value}]")
+    if stats.cost_usd is not None:
+        estimated_suffix = f" [{rc.estimated}](estimated)[/{rc.estimated}]" if stats.cost_estimated else ""
+        parts.append(f"[{rc.value}]${stats.cost_usd:.4f}[/{rc.value}]{estimated_suffix}")
+    if parts:
+        console.print(f"[{rc.label}]Stats:[/{rc.label}] {' | '.join(parts)}")

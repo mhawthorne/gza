@@ -892,6 +892,12 @@ def main() -> int:
         help="Auto-create review task on completion",
     )
     improve_parser.add_argument(
+        "--review-id",
+        type=int,
+        metavar="ID",
+        help="Explicit review task ID to base the improve on (overrides auto-pick of most recent completed review)",
+    )
+    improve_parser.add_argument(
         "--queue", "-q",
         action="store_true",
         help="Add task to queue without executing immediately",

@@ -2039,6 +2039,236 @@ class TestImproveCommand:
         assert improve_task is not None
         assert improve_task.provider == "gemini"
 
+    def test_improve_skips_dropped_review_and_picks_earlier_completed(self, tmp_path: Path):
+        """Auto-pick must ignore dropped reviews even if their completed_at is more recent.
+
+        Regression for the trap where a user accidentally creates a duplicate
+        review, drops it, and then `gza improve` keeps binding new improve tasks
+        to the dropped review (because get_reviews_for_task orders by
+        completed_at DESC with no status filter).
+        """
+        from gza.db import SqliteTaskStore
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        # Older, real, completed review.
+        good_review = store.add("First review", task_type="review", depends_on=impl_task.id)
+        good_review.status = "completed"
+        good_review.completed_at = datetime.now(timezone.utc)
+        store.update(good_review)
+
+        # Newer, dropped review (would sort first by completed_at DESC).
+        time.sleep(0.01)
+        bad_review = store.add("Accidental duplicate review", task_type="review", depends_on=impl_task.id)
+        bad_review.status = "dropped"
+        bad_review.completed_at = datetime.now(timezone.utc)
+        store.update(bad_review)
+
+        result = run_gza("improve", "1", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert f"Review: #{good_review.id}" in result.stdout
+        assert f"Review: #{bad_review.id}" not in result.stdout
+
+        # Confirm the improve task's dependency points at the good review.
+        improve_task = store.get(4)
+        assert improve_task is not None
+        assert improve_task.depends_on == good_review.id
+
+    def test_improve_skips_failed_review(self, tmp_path: Path):
+        """Auto-pick must also ignore failed reviews — same reasoning as dropped."""
+        from gza.db import SqliteTaskStore
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        good_review = store.add("Good review", task_type="review", depends_on=impl_task.id)
+        good_review.status = "completed"
+        good_review.completed_at = datetime.now(timezone.utc)
+        store.update(good_review)
+
+        time.sleep(0.01)
+        failed_review = store.add("Failed review", task_type="review", depends_on=impl_task.id)
+        failed_review.status = "failed"
+        failed_review.completed_at = datetime.now(timezone.utc)
+        store.update(failed_review)
+
+        result = run_gza("improve", "1", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert f"Review: #{good_review.id}" in result.stdout
+
+    def test_improve_errors_when_all_reviews_are_dropped(self, tmp_path: Path):
+        """When every review is dropped/failed, surface a clear error."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        dropped_review = store.add("Dropped review", task_type="review", depends_on=impl_task.id)
+        dropped_review.status = "dropped"
+        dropped_review.completed_at = datetime.now(timezone.utc)
+        store.update(dropped_review)
+
+        result = run_gza("improve", "1", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "no usable review" in result.stdout
+        assert "--review-id" in result.stdout
+
+    def test_improve_review_id_flag_picks_explicit_review(self, tmp_path: Path):
+        """--review-id overrides auto-pick and uses the specified review."""
+        from gza.db import SqliteTaskStore
+        import time
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        older_review = store.add("Older review", task_type="review", depends_on=impl_task.id)
+        older_review.status = "completed"
+        older_review.completed_at = datetime.now(timezone.utc)
+        store.update(older_review)
+
+        time.sleep(0.01)
+        newer_review = store.add("Newer review", task_type="review", depends_on=impl_task.id)
+        newer_review.status = "completed"
+        newer_review.completed_at = datetime.now(timezone.utc)
+        store.update(newer_review)
+
+        # Without --review-id, auto-pick would choose the newer one.
+        # With --review-id, we force the older one.
+        result = run_gza(
+            "improve", "1",
+            "--review-id", str(older_review.id),
+            "--queue",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 0, result.stdout
+        assert f"Review: #{older_review.id}" in result.stdout
+
+        improve_task = store.get(4)
+        assert improve_task is not None
+        assert improve_task.depends_on == older_review.id
+
+    def test_improve_review_id_flag_rejects_review_of_different_impl(self, tmp_path: Path):
+        """--review-id must belong to the same implementation task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_a = store.add("Feature A", task_type="implement")
+        impl_a.status = "completed"
+        impl_a.completed_at = datetime.now(timezone.utc)
+        store.update(impl_a)
+
+        impl_b = store.add("Feature B", task_type="implement")
+        impl_b.status = "completed"
+        impl_b.completed_at = datetime.now(timezone.utc)
+        store.update(impl_b)
+
+        # Review belongs to impl_b, not impl_a.
+        review_of_b = store.add("Review B", task_type="review", depends_on=impl_b.id)
+        review_of_b.status = "completed"
+        review_of_b.completed_at = datetime.now(timezone.utc)
+        store.update(review_of_b)
+
+        result = run_gza(
+            "improve", str(impl_a.id),
+            "--review-id", str(review_of_b.id),
+            "--queue",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert f"reviews task #{impl_b.id}" in result.stdout
+
+    def test_improve_review_id_flag_rejects_non_review_task(self, tmp_path: Path):
+        """--review-id must point at a review task, not an implement/improve task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        result = run_gza(
+            "improve", str(impl_task.id),
+            "--review-id", str(impl_task.id),  # not a review
+            "--queue",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "not a review" in result.stdout
+
+    def test_improve_review_id_flag_rejects_nonexistent_review(self, tmp_path: Path):
+        """--review-id must refer to an existing task."""
+        from gza.db import SqliteTaskStore
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(timezone.utc)
+        store.update(impl_task)
+
+        result = run_gza(
+            "improve", str(impl_task.id),
+            "--review-id", "9999",
+            "--queue",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Review task #9999 not found" in result.stdout
+
 
 class TestReviewCommand:
     """Tests for the 'gza review' command."""
