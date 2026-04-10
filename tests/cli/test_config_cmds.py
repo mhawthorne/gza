@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
 
 
 class TestConfigRequirements:
@@ -1273,9 +1273,7 @@ class TestStatsReviewsCommand:
         from gza.db import SqliteTaskStore, TaskStats
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -1297,9 +1295,7 @@ class TestStatsReviewsCommand:
         from gza.db import SqliteTaskStore, TaskStats
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl = store.add("Implement no review", task_type="implement")
         assert impl.id is not None
@@ -1317,9 +1313,7 @@ class TestStatsReviewsCommand:
         from gza.db import SqliteTaskStore, TaskStats
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -1404,9 +1398,7 @@ class TestSyncReportCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Plan something", task_type="plan")
         assert task.id is not None
@@ -1433,9 +1425,7 @@ class TestSyncReportCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Review feature", task_type="review")
         assert task.id is not None
@@ -1462,9 +1452,7 @@ class TestSyncReportCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Explore codebase", task_type="explore")
         assert task.id is not None
@@ -1491,9 +1479,7 @@ class TestSyncReportCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Plan task", task_type="plan")
         assert task.id is not None
@@ -1521,9 +1507,7 @@ class TestSyncReportCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Code task", task_type="implement")
         result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
@@ -1571,9 +1555,7 @@ class TestLearningsCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Implement testing flow", task_type="implement")
         store.mark_completed(task, output_content="- Use dedicated fixtures for tests\n", has_commits=False)

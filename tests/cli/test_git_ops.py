@@ -15,7 +15,7 @@ from gza.cli import _determine_advance_action, cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, setup_git_repo_with_task_branch, LOG_FIXTURES_DIR
+from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, setup_git_repo_with_task_branch, LOG_FIXTURES_DIR
 
 
 class TestMergeCommand:
@@ -79,9 +79,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo with a remote
         git = Git(tmp_path)
@@ -146,9 +144,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -209,9 +205,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -260,9 +254,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -313,7 +305,9 @@ class TestMergeCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        from gza.config import Config
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(db_path, prefix=config.project_prefix)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -349,7 +343,7 @@ class TestMergeCommand:
 
         # Verify success
         assert result.returncode == 0
-        assert "Marked task #1 as merged" in result.stdout
+        assert f"Marked task #{task.id} as merged" in result.stdout
 
         # Verify branch was NOT deleted
         assert git.branch_exists("feature/mark-only")
@@ -366,9 +360,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -416,9 +408,7 @@ class TestMergeCommand:
         from gza.git import Git
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -455,9 +445,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -514,9 +502,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -585,9 +571,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Initialize a git repo
         git = Git(tmp_path)
@@ -662,9 +646,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = Git(tmp_path)
         git._run("init", "-b", "main")
@@ -714,9 +696,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = Git(tmp_path)
         git._run("init", "-b", "main")
@@ -754,9 +734,7 @@ class TestMergeCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = Git(tmp_path)
         git._run("init", "-b", "main")
@@ -1077,16 +1055,16 @@ class TestDiffCommand:
         # Return to main
         git._run("checkout", "main")
 
-        # Create task in database with branch
+        # Create task in database with branch (use same prefix as config: testproject)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = SqliteTaskStore(db_path, prefix="testproject")
         task = store.add("Test task", task_type="implement")
         task.branch = "task-1-test"
         store.update(task)
 
-        # Run diff with task ID
-        result = run_gza("diff", "1", "--project", str(tmp_path))
+        # Run diff with task ID (use full task.id so resolve_id returns it as-is)
+        result = run_gza("diff", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Should show the diff between main and task branch
@@ -1094,7 +1072,12 @@ class TestDiffCommand:
         assert "modified" in result.stdout or "initial" in result.stdout
 
     def test_diff_with_task_id_not_found(self, tmp_path: Path):
-        """Diff command shows error when task ID not found."""
+        """Diff command falls back to git when task ID-like arg is not found in DB.
+
+        This mirrors cmd_checkout behaviour: a _looks_like_task_id() match that
+        doesn't resolve to a real task is passed through to git as a branch/ref.
+        git will fail with a non-zero exit code when the ref is also invalid.
+        """
         from gza.git import Git
 
         setup_config(tmp_path)
@@ -1106,11 +1089,11 @@ class TestDiffCommand:
         # Create empty database
         setup_db_with_tasks(tmp_path, [])
 
-        # Run diff with non-existent task ID
+        # Run diff with non-existent task ID — falls back to git, which fails
+        # because "999" is not a valid git ref either.
         result = run_gza("diff", "999", "--project", str(tmp_path))
 
-        assert result.returncode == 1
-        assert "Error: Task #999 not found" in result.stdout
+        assert result.returncode != 0
 
     def test_diff_with_task_id_no_branch(self, tmp_path: Path):
         """Diff command shows error when task has no branch."""
@@ -1123,18 +1106,18 @@ class TestDiffCommand:
         git = Git(tmp_path)
         git._run("init", "-b", "main")
 
-        # Create task without branch
+        # Create task without branch (use same prefix as config: testproject)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = SqliteTaskStore(db_path, prefix="testproject")
         task = store.add("Test task", task_type="implement")
         # Don't set task.branch
 
         # Run diff with task ID that has no branch
-        result = run_gza("diff", "1", "--project", str(tmp_path))
+        result = run_gza("diff", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "Error: Task #1 has no branch" in result.stdout
+        assert f"Error: Task #{task.id} has no branch" in result.stdout
 
     def test_diff_with_non_numeric_argument(self, tmp_path: Path):
         """Diff command passes non-numeric arguments through to git diff."""
@@ -1680,9 +1663,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -1718,9 +1699,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -1752,9 +1731,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -1786,9 +1763,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -1835,9 +1810,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Merged feature task")
         task.status = "completed"
@@ -1857,9 +1830,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Unmerged feature")
         task.status = "completed"
@@ -1880,9 +1851,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Regular completed task")
         task.status = "completed"
@@ -1900,9 +1869,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Test show merge status")
         task.status = "completed"
@@ -1920,9 +1887,7 @@ class TestMergeStatusTracking:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Test show no merge status")
         task.status = "completed"
@@ -1938,9 +1903,7 @@ class TestMergeStatusTracking:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Test task with skip learnings", skip_learnings=True)
 
@@ -1953,9 +1916,7 @@ class TestMergeStatusTracking:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Normal task")
 
@@ -1968,9 +1929,7 @@ class TestMergeStatusTracking:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create a completed plan task with output_content in DB
         task = store.add("Plan something", task_type="plan")
@@ -1998,9 +1957,7 @@ class TestMergeStatusTracking:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create a completed task with a future completed_at
         task = store.add("Plan task", task_type="plan")
@@ -2027,9 +1984,7 @@ class TestMergeStatusTracking:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Explore something", task_type="explore")
         assert task.id is not None
@@ -2093,7 +2048,7 @@ class TestAdvanceCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        SqliteTaskStore(db_path)  # create empty db
+        make_store(tmp_path)  # create empty db
 
         self._setup_git_repo(tmp_path)
 
@@ -2105,9 +2060,7 @@ class TestAdvanceCommand:
         """advance --dry-run shows planned actions without executing."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2121,9 +2074,7 @@ class TestAdvanceCommand:
         """advance merges a task whose review is APPROVED."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2154,9 +2105,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.git import Git
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -2196,9 +2145,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -2250,9 +2197,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         git._run("checkout", "-b", "agent-sessions")
@@ -2299,9 +2244,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = store.add("Explore fallback behavior", task_type="explore")
@@ -2350,9 +2293,7 @@ class TestAdvanceCommand:
         from gza.cli import cmd_advance
         from gza.git import GitError
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = store.add("Explore fallback reset failure", task_type="explore")
@@ -2407,9 +2348,7 @@ class TestAdvanceCommand:
         """advance skips a task when a rebase child is already in progress."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -2451,9 +2390,7 @@ class TestAdvanceCommand:
         """advance returns needs_discussion when a rebase child has failed."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -2497,9 +2434,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -2544,9 +2479,7 @@ class TestAdvanceCommand:
         from gza.cli import cmd_advance
         from unittest.mock import patch
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2578,9 +2511,7 @@ class TestAdvanceCommand:
         from gza.cli import cmd_advance
         from unittest.mock import patch
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2623,9 +2554,7 @@ class TestAdvanceCommand:
         from gza.cli import cmd_advance
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
         impl_task = self._create_implement_task_with_branch(
             store,
@@ -2708,9 +2637,7 @@ class TestAdvanceCommand:
         """advance with a specific task ID only advances that task."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task1 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature A")
@@ -2731,6 +2658,37 @@ class TestAdvanceCommand:
         assert store.get(task1.id).merge_status == "merged"
         assert store.get(task2.id).merge_status == "unmerged"
 
+    def test_advance_bare_integer_id_resolves_correctly(self, tmp_path: Path):
+        """advance with a bare legacy integer ID resolves to the correct task (M1 regression)."""
+        from gza.db import _decode_base36
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path, "Feature via integer ID")
+
+        # Give the task an approved review so it can merge
+        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(timezone.utc)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        # Extract the integer that corresponds to this task's base36 suffix.
+        # e.g. task.id == "gza-1" → suffix "1" → integer 1
+        suffix = task.id.split("-", 1)[1]
+        integer_id = str(_decode_base36(suffix))
+
+        # Passing the bare integer should resolve to the correct task (not "not found")
+        result = run_gza("advance", integer_id, "--auto", "--project", str(tmp_path))
+        assert result.returncode == 0, (
+            f"Expected rc=0 but got {result.returncode}; stdout={result.stdout!r}"
+        )
+        assert "not found" not in result.stdout.lower(), (
+            f"'not found' in output means resolve_id() was not called: {result.stdout!r}"
+        )
+        assert store.get(task.id).merge_status == "merged"
+
     def test_advance_max_limits_batch(self, tmp_path: Path):
         """advance --max N limits the number of tasks processed."""
         import argparse
@@ -2738,9 +2696,7 @@ class TestAdvanceCommand:
         from gza.cli import cmd_advance
         from unittest.mock import patch
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task1 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature A")
@@ -2776,9 +2732,7 @@ class TestAdvanceCommand:
         """advance spawns a worker for a pending review instead of skipping."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2799,9 +2753,7 @@ class TestAdvanceCommand:
         """advance skips a task whose review is in_progress."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2826,7 +2778,7 @@ class TestAdvanceCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        SqliteTaskStore(db_path)  # create db
+        make_store(tmp_path)  # create db
         self._setup_git_repo(tmp_path)
 
         result = run_gza("advance", "9999", "--project", str(tmp_path))
@@ -2837,9 +2789,7 @@ class TestAdvanceCommand:
         """advance --dry-run does not modify task state or create tasks."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2865,9 +2815,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         self._setup_git_repo(tmp_path)
 
@@ -2900,9 +2848,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -2939,9 +2885,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -2981,9 +2925,7 @@ class TestAdvanceCommand:
         from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3029,9 +2971,7 @@ class TestAdvanceCommand:
         """advance with a specific already-merged task ID exits with 0 early."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3051,9 +2991,7 @@ class TestAdvanceCommand:
         from gza.cli import cmd_advance
         from unittest.mock import patch
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3097,9 +3035,7 @@ class TestAdvanceCommand:
     def test_advance_batch_limits_worker_spawning(self, tmp_path: Path):
         """advance --batch B stops after B workers have been started."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -3148,9 +3084,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\nadvance_requires_review: false\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -3209,9 +3143,7 @@ class TestAdvanceCommand:
     def test_advance_batch_enforced_on_failed_spawn(self, tmp_path: Path):
         """advance --batch 1 attempts only one spawn even when the first spawn fails."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -3266,9 +3198,7 @@ class TestAdvanceCommand:
     def test_advance_spawn_worker_failure_increments_error_count(self, tmp_path: Path):
         """advance returns 1 when _spawn_background_worker fails for an improve task."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3302,9 +3232,7 @@ class TestAdvanceCommand:
     def test_advance_interactive_shows_plan_and_prompts(self, tmp_path: Path):
         """advance without --auto shows plan and prompts for confirmation."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3331,9 +3259,7 @@ class TestAdvanceCommand:
     def test_advance_interactive_aborts_on_no(self, tmp_path: Path):
         """advance without --auto exits without executing when user answers 'n'."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3365,9 +3291,7 @@ class TestAdvanceCommand:
     def test_advance_interactive_eof_aborts(self, tmp_path: Path):
         """advance without --auto exits cleanly when stdin is closed (EOFError)."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3389,9 +3313,7 @@ class TestAdvanceCommand:
     def test_advance_auto_flag_skips_prompt(self, tmp_path: Path):
         """advance --auto executes without prompting."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3434,9 +3356,7 @@ class TestAdvanceCommand:
         from unittest.mock import patch
         from datetime import datetime, timezone
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
 
@@ -3503,9 +3423,7 @@ class TestAdvanceCommand:
             "advance_create_reviews: true\n"
             "advance_requires_review: true\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3537,9 +3455,7 @@ class TestAdvanceCommand:
             "advance_create_reviews: false\n"
             "advance_requires_review: true\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3555,9 +3471,7 @@ class TestAdvanceCommand:
             "project_name: test-project\n"
             "advance_requires_review: false\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3588,9 +3502,7 @@ class TestAdvanceCommand:
             "advance_create_reviews: true\n"
             "advance_requires_review: true\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3634,9 +3546,7 @@ class TestAdvanceCommand:
         """advance creates a review for unreviewed implement tasks with default config."""
         # Default config — no explicit advance_* flags
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3668,9 +3578,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\nmax_review_cycles: 2\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3703,9 +3611,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\nmax_review_cycles: 3\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3731,9 +3637,7 @@ class TestAdvanceCommand:
     def test_advance_rebase_after_review_forces_new_review(self, tmp_path: Path):
         """advance creates a new review when rebase completed after latest review."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3770,9 +3674,7 @@ class TestAdvanceCommand:
     def test_advance_rebase_after_review_idempotent(self, tmp_path: Path):
         """advance does not create duplicate reviews after a rebase — reuses pending review."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3820,9 +3722,7 @@ class TestAdvanceCommand:
     def test_advance_rebase_before_review_does_not_force_new_review(self, tmp_path: Path):
         """advance does NOT force new review when rebase completed before the latest review."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3859,9 +3759,7 @@ class TestAdvanceCommand:
     def test_advance_no_rebases_no_effect_on_review(self, tmp_path: Path):
         """advance with no rebase tasks does not affect review flow."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3885,9 +3783,7 @@ class TestAdvanceCommand:
     def test_advance_multiple_rebases_only_latest_matters(self, tmp_path: Path):
         """advance checks only the latest rebase against the latest review."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3936,9 +3832,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\nmax_review_cycles: 1\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -3979,9 +3873,7 @@ class TestAdvanceCommand:
         """--max-review-cycles overrides the config value."""
         # Config has default max_review_cycles=3; 2 completed improves would normally allow more
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -4015,9 +3907,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\nmax_review_cycles: 1\n"
         )
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
@@ -4054,9 +3944,7 @@ class TestAdvanceCommand:
         """advance creates a resume child task and spawns worker for MAX_STEPS failed task."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -4078,9 +3966,7 @@ class TestAdvanceCommand:
         """advance creates a resume child task and spawns worker for MAX_TURNS failed task."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         failed_task = self._create_failed_task(store, session_id="sess-xyz", failure_reason="MAX_TURNS")
@@ -4098,9 +3984,7 @@ class TestAdvanceCommand:
         """advance skips a failed task when chain depth >= max_resume_attempts."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         # Create a chain: original (MAX_STEPS) → first_resume (MAX_STEPS)
@@ -4131,9 +4015,7 @@ class TestAdvanceCommand:
         """advance skips a failed task that already has a pending/in_progress child."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -4155,9 +4037,7 @@ class TestAdvanceCommand:
         """advance skips a failed task whose resume child already completed."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -4179,9 +4059,7 @@ class TestAdvanceCommand:
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         # Original task #198 equivalent — failed with MAX_STEPS
@@ -4207,9 +4085,7 @@ class TestAdvanceCommand:
         """advance --no-resume-failed excludes failed tasks from processing."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -4223,9 +4099,7 @@ class TestAdvanceCommand:
         """advance --dry-run shows resume action without executing."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -4244,9 +4118,7 @@ class TestAdvanceCommand:
         """advance with a specific failed resumable task ID works."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -4263,9 +4135,7 @@ class TestAdvanceCommand:
         """advance skips failed tasks without session_id (not resumable)."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         # Task with no session_id — not resumable
@@ -4280,9 +4150,7 @@ class TestAdvanceCommand:
         """advance --max-resume-attempts N overrides the config value."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         # Create a chain of depth 1: original (MAX_STEPS) → first_resume (MAX_STEPS)
@@ -4316,9 +4184,7 @@ class TestAdvanceCommand:
         so each one peeked at get_next_pending() and all displayed/claimed the same task.
         """
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         self._setup_git_repo(tmp_path)
 
@@ -4404,9 +4270,7 @@ class TestAdvanceMergeSquashThreshold:
         from gza.cli import cmd_advance
         from unittest.mock import patch, call
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 3 commits on branch, but threshold is 0 (disabled)
@@ -4439,9 +4303,7 @@ class TestAdvanceMergeSquashThreshold:
         from gza.cli import cmd_advance
         from unittest.mock import patch
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 3 commits, threshold=2 → should squash
@@ -4473,9 +4335,7 @@ class TestAdvanceMergeSquashThreshold:
         from gza.cli import cmd_advance
         from unittest.mock import patch
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 2 commits, threshold=3 → should NOT squash
@@ -4504,9 +4364,7 @@ class TestAdvanceMergeSquashThreshold:
         """--squash-threshold N overrides config.merge_squash_threshold: dry-run shows auto-squash."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 2 commits; passing --squash-threshold 2 on the CLI should trigger auto-squash
@@ -4520,9 +4378,7 @@ class TestAdvanceMergeSquashThreshold:
         """Dry-run output includes '(auto-squash, N commits)' when threshold is met."""
         from gza.db import SqliteTaskStore
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 3 commits, threshold=2 in config → auto-squash annotation should appear
@@ -4573,9 +4429,7 @@ class TestAdvanceUnimplementedCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Design the authentication system", task_type="plan")
         explore = store.add("Explore auth provider options", task_type="explore")
@@ -4602,9 +4456,7 @@ class TestAdvanceUnimplementedCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         from datetime import datetime, timezone
 
@@ -4632,9 +4484,7 @@ class TestAdvanceUnimplementedCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Plan E", task_type="plan")
         explore = store.add("Explore E", task_type="explore")
@@ -4658,9 +4508,7 @@ class TestAdvanceUnimplementedCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         from datetime import datetime, timezone
 
@@ -4693,9 +4541,7 @@ class TestAdvanceUnimplementedCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         from datetime import datetime, timezone
 
@@ -4719,9 +4565,7 @@ class TestAdvanceUnimplementedCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan_with_impl = store.add("Plan with impl", task_type="plan")
         plan_with_impl.status = "completed"
@@ -4754,9 +4598,7 @@ class TestAdvanceUnimplementedCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Plan D", task_type="plan")
         explore = store.add("Explore D", task_type="explore")
@@ -4825,9 +4667,7 @@ class TestAdvanceAutoPlans:
         import io
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         plan = self._create_completed_plan(store, "Design auth system")
@@ -4877,9 +4717,7 @@ class TestAdvanceAutoPlans:
         import io
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         plan = self._create_completed_plan(store, "Design auth system")
@@ -4915,9 +4753,7 @@ class TestAdvanceAutoPlans:
             "project_name: test-project\nadvance_requires_review: false\n"
         )
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
         plan = self._create_completed_plan(store, "Design feature X")
@@ -4955,9 +4791,7 @@ class TestAdvanceAutoPlans:
             "project_name: test-project\nadvance_requires_review: false\n"
         )
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
         self._create_completed_plan(store, "Design feature X")
@@ -4993,9 +4827,7 @@ class TestAdvanceAutoPlans:
         import io
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
         # Create two completed plans
@@ -5040,7 +4872,7 @@ class TestPrCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         from gza.db import SqliteTaskStore
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
         result = run_gza("pr", "999", "--project", str(tmp_path))
 
@@ -5064,9 +4896,7 @@ class TestPrCommand:
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Completed task without branch")
         task.status = "completed"
         task.branch = None
@@ -5084,9 +4914,7 @@ class TestPrCommand:
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Completed task without commits")
         task.status = "completed"
         task.branch = "feature/test"
@@ -5104,9 +4932,7 @@ class TestPrCommand:
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Mark-only merged task")
         task.status = "completed"
         task.branch = "feature/mark-only-pr"
@@ -5254,9 +5080,7 @@ class TestRefreshCommand:
         git._run("commit", "-m", "Add new file")
         git._run("checkout", "main")
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Test task", task_type="implement")
         task.status = "completed"
@@ -5292,9 +5116,7 @@ class TestRefreshCommand:
         setup_config(tmp_path)
         self._setup_git_repo(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("No branch task", task_type="explore")
         task.status = "completed"
@@ -5312,9 +5134,7 @@ class TestRefreshCommand:
         setup_config(tmp_path)
         self._setup_git_repo(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task with deleted branch", task_type="implement")
         task.status = "completed"
@@ -5348,9 +5168,7 @@ class TestRefreshCommand:
         git._run("commit", "-m", "Task 2 work")
         git._run("checkout", "main")
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task1 = store.add("Task 1", task_type="implement")
         task1.status = "completed"

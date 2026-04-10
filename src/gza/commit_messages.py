@@ -38,7 +38,7 @@ def format_commit_subject(prompt: str, max_len: int = MAX_PR_TITLE_LENGTH, prefi
     return f"{safe_prefix}{subject}"
 
 
-def format_task_trailers(task_id: int, task_slug: str | None, review_task_id: int | None = None) -> str:
+def format_task_trailers(task_id: str, task_slug: str | None, review_task_id: str | None = None) -> str:
     """Build canonical trailer lines for task-linked commits."""
     lines = [f"Task #{task_id}"]
     if task_slug:
@@ -50,9 +50,9 @@ def format_task_trailers(task_id: int, task_slug: str | None, review_task_id: in
 
 def build_task_commit_message(
     prompt: str,
-    task_id: int,
+    task_id: str,
     task_slug: str | None,
-    review_task_id: int | None = None,
+    review_task_id: str | None = None,
     subject_prefix: str = "",
     subject_max_len: int = MAX_PR_TITLE_LENGTH,
 ) -> str:

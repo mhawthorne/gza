@@ -10,18 +10,24 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "KNOWN_FAILURE_REASONS",
+    "ManualMigrationRequired",
     "Task",
     "TaskStats",
     "TaskCycle",
     "TaskCycleIteration",
     "SqliteTaskStore",
     "extract_failure_reason",
+    "run_v25_migration",
+    "preview_v25_migration",
+    "check_migration_status",
+    "resolve_task_id",
+    "task_id_numeric_key",
 ]
 
 
@@ -29,6 +35,61 @@ __all__ = [
 KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "TIMEOUT", "WORKER_DIED", "KILLED", "UNKNOWN"}
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
+
+# Base-36 alphabet (digits 0-9 then lowercase a-z)
+_B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _encode_base36(n: int) -> str:
+    """Encode a positive integer to a base-36 string."""
+    if n == 0:
+        return "0"
+    result: list[str] = []
+    while n > 0:
+        result.append(_B36_CHARS[n % 36])
+        n //= 36
+    return "".join(reversed(result))
+
+
+def _decode_base36(s: str) -> int:
+    """Decode a base-36 string to an integer."""
+    return int(s, 36)
+
+
+def task_id_numeric_key(task_id: str | None) -> int:
+    """Return an integer sort key for a task ID that preserves creation order.
+
+    Task IDs are ``{prefix}-{base36_seq}`` (e.g. ``"gza-1a2b"``).  Sorting
+    them as plain strings is wrong: ``"gza-10"`` (decimal 36) sorts *before*
+    ``"gza-2"`` (decimal 2) because ``"1" < "2"`` lexicographically.  This
+    helper decodes the numeric suffix so comparisons are correct.
+
+    Returns 0 for ``None``, empty, or IDs without a hyphen (e.g. legacy bare
+    integers stored as strings), and 0 for suffixes that fail base-36 parsing.
+    """
+    if not task_id or "-" not in task_id:
+        return 0
+    suffix = task_id.rsplit("-", 1)[-1]
+    try:
+        return int(suffix, 36)
+    except ValueError:
+        return 0
+
+
+class ManualMigrationRequired(Exception):
+    """Raised when the DB needs a manual schema migration (e.g. v25).
+
+    Callers should run ``gza migrate`` (or call :func:`run_v25_migration`)
+    and then re-open the store.
+    """
+
+    def __init__(self, pending_versions: list[int]) -> None:
+        self.pending_versions = pending_versions
+        versions_str = ", ".join(f"v{v}" for v in pending_versions)
+        super().__init__(
+            f"Database requires manual migration(s): {versions_str}. "
+            "Run 'gza migrate' to upgrade."
+        )
 
 
 def _compute_percentiles(values: list[float]) -> dict | None:
@@ -73,15 +134,15 @@ def _compute_percentiles(values: list[float]) -> dict | None:
 @dataclass
 class Task:
     """A task in the database."""
-    id: int | None  # None for unsaved tasks
+    id: str | None  # None for unsaved tasks; project-prefixed base36 (e.g. "gza-1a2b")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
     task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
-    slug: str | None = None  # YYYYMMDD-slug format (DB column: task_id)
+    slug: str | None = None  # YYYYMMDD-slug format (DB column: slug, was task_id)
     branch: str | None = None
     log_file: str | None = None
     report_file: str | None = None
-    based_on: int | None = None  # Reference to parent task id
+    based_on: str | None = None  # Reference to parent task id (string)
     has_commits: bool | None = None
     duration_seconds: float | None = None
     num_steps_reported: int | None = None  # Step count reported by the provider
@@ -97,7 +158,7 @@ class Task:
     completed_at: datetime | None = None
     # New fields for task import/chaining
     group: str | None = None  # Group name for related tasks
-    depends_on: int | None = None  # Task ID this task depends on
+    depends_on: str | None = None  # Task ID this task depends on (string)
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
     same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
@@ -117,7 +178,7 @@ class Task:
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
-    cycle_id: int | None = None  # Cycle this task belongs to (v18)
+    cycle_id: int | None = None  # Cycle this task belongs to (v18); internal int PK of task_cycles
     cycle_iteration_index: int | None = None  # Iteration index within cycle (v18)
     cycle_role: str | None = None  # 'review' or 'improve' within a cycle (v18)
 
@@ -148,8 +209,8 @@ class TaskStats:
 @dataclass
 class TaskCycle:
     """A cycle of review/improve iterations for an implementation task."""
-    id: int
-    implementation_task_id: int
+    id: int  # Internal integer PK (not exposed to users)
+    implementation_task_id: str  # References tasks.id (project-prefixed base36)
     status: str  # active | approved | maxed_out | blocked
     max_iterations: int
     started_at: datetime
@@ -160,12 +221,12 @@ class TaskCycle:
 @dataclass
 class TaskCycleIteration:
     """A single iteration within a cycle (one review + optional improve)."""
-    id: int
-    cycle_id: int
+    id: int  # Internal integer PK
+    cycle_id: int  # References task_cycles.id (internal integer)
     iteration_index: int
-    review_task_id: int | None
+    review_task_id: str | None  # References tasks.id (project-prefixed base36)
     review_verdict: str | None
-    improve_task_id: int | None
+    improve_task_id: str | None  # References tasks.id (project-prefixed base36)
     state: str  # review_created | review_completed | improve_created | improve_completed | terminal
     started_at: datetime
     ended_at: datetime | None
@@ -195,23 +256,32 @@ MIGRATION_V22_TO_V23 = "ALTER TABLE tasks ADD COLUMN running_pid INTEGER;"
 MIGRATION_V23_TO_V24 = "ALTER TABLE tasks ADD COLUMN merged_at TEXT;"
 
 # Schema version for migrations
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
+
+# Migration versions that require manual intervention (gza migrate).
+# These are NOT run automatically in _ensure_db.
+_MANUAL_MIGRATION_VERSIONS: frozenset[int] = frozenset({25})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
 
+CREATE TABLE IF NOT EXISTS project_sequences (
+    prefix TEXT PRIMARY KEY,
+    next_seq INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY,
     prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     task_type TEXT NOT NULL DEFAULT 'implement',
-    task_id TEXT,
+    slug TEXT,
     branch TEXT,
     log_file TEXT,
     report_file TEXT,
-    based_on INTEGER REFERENCES tasks(id),
+    based_on TEXT REFERENCES tasks(id),
     has_commits INTEGER,
     duration_seconds REAL,
     num_steps_reported INTEGER,
@@ -224,51 +294,37 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at TEXT,
     running_pid INTEGER,
     completed_at TEXT,
-    -- New fields for task import/chaining (v2)
+    -- Task import/chaining (v2+)
     "group" TEXT,
-    depends_on INTEGER REFERENCES tasks(id),
+    depends_on TEXT REFERENCES tasks(id),
     spec TEXT,
     create_review INTEGER DEFAULT 0,
-    -- New field for task chaining (v3)
     same_branch INTEGER DEFAULT 0,
-    -- New fields (v4)
     task_type_hint TEXT,
     output_content TEXT,
-    -- New field for task resume (v5)
     session_id TEXT,
-    -- New field for PR tracking (v6)
     pr_number INTEGER,
-    -- New fields for per-task model/provider overrides (v7)
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
-    -- num_turns_reported and num_turns_computed added inline above (v8)
-    -- Raw token counts for cost recalculation (v9)
     input_tokens INTEGER,
     output_tokens INTEGER,
-    -- Merge status tracking (v10, merged_at added v24)
     merge_status TEXT,
     merged_at TEXT,
-    -- Failure reason tracking (v11)
     failure_reason TEXT,
-    -- Skip learnings injection (v12)
     skip_learnings INTEGER DEFAULT 0,
-    -- Diff stats vs. main branch (v13)
     diff_files_changed INTEGER,
     diff_lines_added INTEGER,
     diff_lines_removed INTEGER,
-    -- Review state cleared by improve task (v14)
     review_cleared_at TEXT,
-    -- Log entry schema marker (v17): 1=legacy turn/event logs, 2=message-step logs
     log_schema_version INTEGER DEFAULT 1,
-    -- Cycle tracking (v18): nullable FK and metadata for cycle orchestration
     cycle_id INTEGER,
     cycle_iteration_index INTEGER,
     cycle_role TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_slug ON tasks(slug);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
 CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
@@ -276,7 +332,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
 
 CREATE TABLE IF NOT EXISTS run_steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES tasks(id),
+    run_id TEXT NOT NULL REFERENCES tasks(id),
     step_index INTEGER NOT NULL,
     step_id TEXT NOT NULL,
     provider TEXT NOT NULL,
@@ -294,7 +350,7 @@ CREATE TABLE IF NOT EXISTS run_steps (
 
 CREATE TABLE IF NOT EXISTS run_substeps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES tasks(id),
+    run_id TEXT NOT NULL REFERENCES tasks(id),
     step_id INTEGER NOT NULL REFERENCES run_steps(id),
     substep_index INTEGER NOT NULL,
     substep_id TEXT NOT NULL,
@@ -316,7 +372,7 @@ CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
 
 CREATE TABLE IF NOT EXISTS task_cycles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    implementation_task_id INTEGER NOT NULL REFERENCES tasks(id),
+    implementation_task_id TEXT NOT NULL REFERENCES tasks(id),
     status TEXT NOT NULL DEFAULT 'active',
     max_iterations INTEGER NOT NULL DEFAULT 3,
     started_at TEXT NOT NULL,
@@ -328,9 +384,9 @@ CREATE TABLE IF NOT EXISTS task_cycle_iterations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cycle_id INTEGER NOT NULL REFERENCES task_cycles(id),
     iteration_index INTEGER NOT NULL,
-    review_task_id INTEGER REFERENCES tasks(id),
+    review_task_id TEXT REFERENCES tasks(id),
     review_verdict TEXT,
-    improve_task_id INTEGER REFERENCES tasks(id),
+    improve_task_id TEXT REFERENCES tasks(id),
     state TEXT NOT NULL DEFAULT 'review_created',
     started_at TEXT NOT NULL,
     ended_at TEXT
@@ -519,7 +575,7 @@ class StepRef:
     """Opaque step reference used when writing substeps/finalization."""
 
     id: int
-    run_id: int
+    run_id: str  # References tasks.id (project-prefixed base36)
     step_index: int
     step_id: str
 
@@ -529,7 +585,7 @@ class RunStep:
     """Persisted top-level message step for a run."""
 
     id: int
-    run_id: int
+    run_id: str  # References tasks.id (project-prefixed base36)
     step_index: int
     step_id: str
     provider: str
@@ -548,7 +604,7 @@ class RunSubstep:
     """Persisted substep/tool event under a top-level message step."""
 
     id: int
-    run_id: int
+    run_id: str  # References tasks.id (project-prefixed base36)
     step_id: int
     substep_index: int
     substep_id: str
@@ -589,7 +645,7 @@ def extract_failure_reason(log_file_path: Path) -> str:
 
     return last_reason if last_reason is not None else "UNKNOWN"
 
-_MIGRATIONS: list[tuple[int, str]] = [
+_MIGRATIONS: list[tuple[int, str | None]] = [
     (2, MIGRATION_V1_TO_V2),
     (3, MIGRATION_V2_TO_V3),
     (4, MIGRATION_V3_TO_V4),
@@ -613,14 +669,16 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (22, MIGRATION_V21_TO_V22),
     (23, MIGRATION_V22_TO_V23),
     (24, MIGRATION_V23_TO_V24),
+    (25, None),  # Manual migration: INTEGER PK → TEXT base36 IDs (run via 'gza migrate')
 ]
 
 
 class SqliteTaskStore:
     """SQLite-based task storage."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, prefix: str = "gza"):
         self.db_path = db_path
+        self._prefix = prefix
         self._ensure_db()
 
     @classmethod
@@ -633,10 +691,15 @@ class SqliteTaskStore:
         from .config import Config
 
         config = Config.load(project_dir or Path.cwd())
-        return cls(config.db_path)
+        return cls(config.db_path, prefix=config.project_prefix)
 
     def _ensure_db(self) -> None:
-        """Ensure database exists and schema is current."""
+        """Ensure database exists and schema is current.
+
+        Raises:
+            ManualMigrationRequired: When the DB needs a manual migration (e.g. v25).
+                The caller should run :func:`run_v25_migration` then re-open the store.
+        """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             # Check if schema_version table exists
@@ -644,7 +707,7 @@ class SqliteTaskStore:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
             )
             if cur.fetchone() is None:
-                # Fresh database - create full schema
+                # Fresh database - create full v25 schema directly
                 conn.executescript(SCHEMA)
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
             else:
@@ -653,18 +716,27 @@ class SqliteTaskStore:
                 row = cur.fetchone()
                 current_version = row["version"] if row else 0
 
+                pending_manual: list[int] = []
                 for target_version, migration_sql in _MIGRATIONS:
                     if current_version < target_version:
-                        for stmt in migration_sql.strip().split(";"):
-                            stmt = stmt.strip()
-                            if stmt:
-                                try:
-                                    conn.execute(stmt)
-                                except sqlite3.OperationalError:
-                                    # Column/table/index might already exist
-                                    pass
+                        if target_version in _MANUAL_MIGRATION_VERSIONS:
+                            pending_manual.append(target_version)
+                            # Don't advance current_version; stop processing further
+                            break
+                        if migration_sql is not None:
+                            for stmt in migration_sql.strip().split(";"):
+                                stmt = stmt.strip()
+                                if stmt:
+                                    try:
+                                        conn.execute(stmt)
+                                    except sqlite3.OperationalError:
+                                        # Column/table/index might already exist
+                                        pass
                         conn.execute("UPDATE schema_version SET version = ?", (target_version,))
                         current_version = target_version
+
+                if pending_manual:
+                    raise ManualMigrationRequired(pending_manual)
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -677,57 +749,65 @@ class SqliteTaskStore:
 
     def _row_to_task(self, row: sqlite3.Row) -> Task:
         """Convert a database row to a Task."""
+        keys = row.keys()
+        # Support both old column name ('task_id') and new ('slug') for migration compat
+        if "slug" in keys:
+            slug_val = row["slug"]
+        elif "task_id" in keys:
+            slug_val = row["task_id"]
+        else:
+            slug_val = None
         return Task(
             id=row["id"],
             prompt=row["prompt"].decode("utf-8", errors="replace") if isinstance(row["prompt"], bytes) else row["prompt"],
             status=row["status"],
             task_type=row["task_type"],
-            slug=row["task_id"],
+            slug=slug_val,
             branch=row["branch"],
             log_file=row["log_file"],
             report_file=row["report_file"],
             based_on=row["based_on"],
             has_commits=bool(row["has_commits"]) if row["has_commits"] is not None else None,
             duration_seconds=row["duration_seconds"],
-            num_steps_reported=row["num_steps_reported"] if "num_steps_reported" in row.keys() else None,
-            num_steps_computed=row["num_steps_computed"] if "num_steps_computed" in row.keys() else None,
-            num_turns_reported=row["num_turns_reported"] if "num_turns_reported" in row.keys() else None,
-            num_turns_computed=row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
+            num_steps_reported=row["num_steps_reported"] if "num_steps_reported" in keys else None,
+            num_steps_computed=row["num_steps_computed"] if "num_steps_computed" in keys else None,
+            num_turns_reported=row["num_turns_reported"] if "num_turns_reported" in keys else None,
+            num_turns_computed=row["num_turns_computed"] if "num_turns_computed" in keys else None,
             cost_usd=row["cost_usd"],
-            input_tokens=row["input_tokens"] if "input_tokens" in row.keys() else None,
-            output_tokens=row["output_tokens"] if "output_tokens" in row.keys() else None,
+            input_tokens=row["input_tokens"] if "input_tokens" in keys else None,
+            output_tokens=row["output_tokens"] if "output_tokens" in keys else None,
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
-            running_pid=row["running_pid"] if "running_pid" in row.keys() else None,
+            running_pid=row["running_pid"] if "running_pid" in keys else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
             group=row["group"],
             depends_on=row["depends_on"],
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
             same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
-            task_type_hint=row["task_type_hint"] if "task_type_hint" in row.keys() else None,
-            output_content=row["output_content"] if "output_content" in row.keys() else None,
-            session_id=row["session_id"] if "session_id" in row.keys() else None,
-            pr_number=row["pr_number"] if "pr_number" in row.keys() else None,
-            model=row["model"] if "model" in row.keys() else None,
-            provider=row["provider"] if "provider" in row.keys() else None,
-            provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in row.keys() and row["provider_is_explicit"] is not None else False,
-            merge_status=row["merge_status"] if "merge_status" in row.keys() else None,
-            merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in row.keys() and row["merged_at"] else None,
-            failure_reason=row["failure_reason"] if "failure_reason" in row.keys() else None,
-            skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in row.keys() and row["skip_learnings"] is not None else False,
-            diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
-            diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
-            diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
-            review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in row.keys() and row["review_cleared_at"] else None,
+            task_type_hint=row["task_type_hint"] if "task_type_hint" in keys else None,
+            output_content=row["output_content"] if "output_content" in keys else None,
+            session_id=row["session_id"] if "session_id" in keys else None,
+            pr_number=row["pr_number"] if "pr_number" in keys else None,
+            model=row["model"] if "model" in keys else None,
+            provider=row["provider"] if "provider" in keys else None,
+            provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
+            merge_status=row["merge_status"] if "merge_status" in keys else None,
+            merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in keys and row["merged_at"] else None,
+            failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
+            skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in keys and row["skip_learnings"] is not None else False,
+            diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in keys else None,
+            diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in keys else None,
+            diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in keys else None,
+            review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in keys and row["review_cleared_at"] else None,
             log_schema_version=(
                 row["log_schema_version"]
-                if "log_schema_version" in row.keys() and row["log_schema_version"] is not None
+                if "log_schema_version" in keys and row["log_schema_version"] is not None
                 else 1
             ),
-            cycle_id=row["cycle_id"] if "cycle_id" in row.keys() else None,
-            cycle_iteration_index=row["cycle_iteration_index"] if "cycle_iteration_index" in row.keys() else None,
-            cycle_role=row["cycle_role"] if "cycle_role" in row.keys() else None,
+            cycle_id=row["cycle_id"] if "cycle_id" in keys else None,
+            cycle_iteration_index=row["cycle_iteration_index"] if "cycle_iteration_index" in keys else None,
+            cycle_role=row["cycle_role"] if "cycle_role" in keys else None,
         )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
@@ -773,13 +853,34 @@ class SqliteTaskStore:
 
     # === Task CRUD ===
 
+    def _next_id(self, conn: sqlite3.Connection) -> str:
+        """Allocate the next project-prefixed base36 task ID (within an open connection).
+
+        Uses a single RETURNING statement so the increment and read are atomic —
+        no concurrent writer can observe the same sequence value.
+        """
+        # INSERT path (fresh DB, no existing row): inserts next_seq=1 and
+        # RETURNING returns 1 directly — no increment — so the first task is
+        # {prefix}-1, not {prefix}-0.
+        # ON CONFLICT path (row already exists): increments and returns the new
+        # value.  After v25 migration the row is seeded at max_old_int_id, so
+        # the first post-migration task gets max_old_int_id + 1.
+        cur = conn.execute(
+            "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, 1) "
+            "ON CONFLICT(prefix) DO UPDATE SET next_seq = next_seq + 1 "
+            "RETURNING next_seq",
+            (self._prefix,),
+        )
+        seq = int(cur.fetchone()["next_seq"])
+        return f"{self._prefix}-{_encode_base36(seq)}"
+
     def add(
         self,
         prompt: str,
         task_type: str = "implement",
-        based_on: int | None = None,
+        based_on: str | None = None,
         group: str | None = None,
-        depends_on: int | None = None,
+        depends_on: str | None = None,
         spec: str | None = None,
         create_review: bool = False,
         same_branch: bool = False,
@@ -789,35 +890,34 @@ class SqliteTaskStore:
         provider_is_explicit: bool | None = None,
         skip_learnings: bool = False,
     ) -> Task:
-        """Add a new task."""
+        """Add a new task. Returns the created Task with its generated string ID."""
         now = datetime.now(UTC).isoformat()
         if provider_is_explicit is None:
             provider_is_explicit = provider is not None
         with self._connect() as conn:
-            cur = conn.execute(
+            new_id = self._next_id(conn)
+            conn.execute(
                 """
-                INSERT INTO tasks (prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if provider_is_explicit else 0, 1 if skip_learnings else 0),
+                (new_id, prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if provider_is_explicit else 0, 1 if skip_learnings else 0),
             )
-            task_id = cur.lastrowid
-            assert task_id is not None
-            result = self.get(task_id)
+            result = self.get(new_id)
             assert result is not None
             return result
 
-    def get(self, task_id: int) -> Task | None:
-        """Get a task by ID."""
+    def get(self, task_id: str) -> Task | None:
+        """Get a task by its string ID (e.g. 'gza-1a2b')."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
     def get_by_slug(self, slug: str) -> Task | None:
-        """Get a task by slug (the task_id DB column)."""
+        """Get a task by slug (YYYYMMDD-... format, stored in the 'slug' DB column)."""
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (slug,))
+            cur = conn.execute("SELECT * FROM tasks WHERE slug = ?", (slug,))
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
@@ -830,7 +930,7 @@ class SqliteTaskStore:
                     prompt = ?,
                     status = ?,
                     task_type = ?,
-                    task_id = ?,
+                    slug = ?,
                     branch = ?,
                     log_file = ?,
                     report_file = ?,
@@ -920,7 +1020,7 @@ class SqliteTaskStore:
                 ),
             )
 
-    def delete(self, task_id: int) -> bool:
+    def delete(self, task_id: str) -> bool:
         """Delete a task by ID. Returns True if deleted."""
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -959,7 +1059,7 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
-    def try_mark_in_progress(self, task_id: int, pid: int) -> Task | None:
+    def try_mark_in_progress(self, task_id: str, pid: int) -> Task | None:
         """Compare-and-swap pending -> in_progress for a specific task.
 
         Returns the updated Task on success, or None if the task was already
@@ -1073,14 +1173,14 @@ class SqliteTaskStore:
                 query = f"""
                     SELECT * FROM tasks
                     {where_clause}
-                    ORDER BY completed_at DESC, id DESC
+                    ORDER BY completed_at DESC, created_at DESC
                 """
                 cur = conn.execute(query, params)
             else:
                 query = f"""
                     SELECT * FROM tasks
                     {where_clause}
-                    ORDER BY completed_at DESC, id DESC
+                    ORDER BY completed_at DESC, created_at DESC
                     LIMIT ?
                 """
                 params.append(str(limit))
@@ -1088,16 +1188,16 @@ class SqliteTaskStore:
 
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_based_on_children(self, task_id: int) -> list[Task]:
+    def get_based_on_children(self, task_id: str) -> list[Task]:
         """Return tasks where based_on = task_id (direct lineage descendants)."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM tasks WHERE based_on = ? ORDER BY id ASC",
+                "SELECT * FROM tasks WHERE based_on = ? ORDER BY created_at ASC",
                 (task_id,),
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_lineage_children(self, task_id: int) -> list[Task]:
+    def get_lineage_children(self, task_id: str) -> list[Task]:
         """Return direct lineage children linked by based_on or depends_on.
 
         This is the canonical query used by lineage tree construction.
@@ -1107,7 +1207,7 @@ class SqliteTaskStore:
                 """
                 SELECT * FROM tasks
                 WHERE based_on = ? OR depends_on = ?
-                ORDER BY created_at ASC, id ASC
+                ORDER BY created_at ASC
                 """,
                 (task_id, task_id),
             )
@@ -1128,12 +1228,12 @@ class SqliteTaskStore:
                 WHERE status = 'failed'
                 AND failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')
                 AND session_id IS NOT NULL
-                ORDER BY completed_at DESC, id DESC
+                ORDER BY completed_at DESC, created_at DESC
                 """
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def count_resume_chain_depth(self, task_id: int) -> int:
+    def count_resume_chain_depth(self, task_id: str) -> int:
         """Count consecutive failed ancestors with resumable failure reasons.
 
         Walks the based_on chain upward from task_id's parent, counting how many
@@ -1141,11 +1241,11 @@ class SqliteTaskStore:
         This tells us how many times we've already tried resuming (not counting task_id itself).
 
         Examples:
-          - Task #1 failed MAX_STEPS, based_on=None → depth=0 (no prior attempts)
-          - Task #2 failed MAX_STEPS, based_on=#1 (also MAX_STEPS) → depth=1 (one prior attempt)
-          - Task #3 failed MAX_STEPS, based_on=#2 → depth=2 (two prior attempts)
+          - Task gza-1 failed MAX_STEPS, based_on=None → depth=0 (no prior attempts)
+          - Task gza-2 failed MAX_STEPS, based_on=gza-1 (also MAX_STEPS) → depth=1 (one prior)
+          - Task gza-3 failed MAX_STEPS, based_on=gza-2 → depth=2 (two prior attempts)
         """
-        seen_ids: set[int] = set()
+        seen_ids: set[str] = set()
         seen_ids.add(task_id)
         # Start from the parent (based_on of task_id)
         with self._connect() as conn:
@@ -1156,7 +1256,7 @@ class SqliteTaskStore:
             row = cur.fetchone()
             if row is None:
                 return 0
-            current_id: int | None = row["based_on"]
+            current_id: str | None = row["based_on"]
 
             depth = 0
             while current_id is not None:
@@ -1186,7 +1286,7 @@ class SqliteTaskStore:
                 SELECT * FROM tasks
                 WHERE status = 'completed'
                   AND task_type != 'internal'
-                ORDER BY completed_at DESC, id DESC
+                ORDER BY completed_at DESC, created_at DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -1214,7 +1314,7 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def set_merge_status(self, task_id: int, merge_status: str | None) -> None:
+    def set_merge_status(self, task_id: str, merge_status: str | None) -> None:
         """Set the merge_status for a task. Records merged_at when setting to 'merged'."""
         merged_at = datetime.now(UTC).isoformat() if merge_status == "merged" else None
         with self._connect() as conn:
@@ -1223,7 +1323,7 @@ class SqliteTaskStore:
                 (merge_status, merged_at, task_id),
             )
 
-    def clear_review_state(self, task_id: int) -> None:
+    def clear_review_state(self, task_id: str) -> None:
         """Clear the review state on an implementation task.
 
         Called when an improve task completes, to indicate that the previous
@@ -1242,7 +1342,7 @@ class SqliteTaskStore:
                 (now, task_id),
             )
 
-    def invalidate_review_state(self, task_id: int) -> None:
+    def invalidate_review_state(self, task_id: str) -> None:
         """Invalidate review state on a task so it requires a new review.
 
         Called when a rebase task completes, since conflict resolution may have
@@ -1257,7 +1357,7 @@ class SqliteTaskStore:
                 (task_id,),
             )
 
-    def set_log_schema_version(self, task_id: int, version: int) -> None:
+    def set_log_schema_version(self, task_id: str, version: int) -> None:
         """Set the persisted log schema marker for a task/run."""
         with self._connect() as conn:
             conn.execute(
@@ -1293,7 +1393,7 @@ class SqliteTaskStore:
             ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
         )
 
-    def start_cycle(self, impl_task_id: int, max_iterations: int = 3) -> "TaskCycle":
+    def start_cycle(self, impl_task_id: str, max_iterations: int = 3) -> "TaskCycle":
         """Start a new cycle for an implementation task.
 
         Raises ValueError if there is already an active cycle for this task.
@@ -1325,7 +1425,7 @@ class SqliteTaskStore:
             assert row is not None
             return self._row_to_task_cycle(row)
 
-    def get_active_cycle_for_impl(self, impl_task_id: int) -> "TaskCycle | None":
+    def get_active_cycle_for_impl(self, impl_task_id: str) -> "TaskCycle | None":
         """Get the active cycle for an implementation task, if any."""
         with self._connect() as conn:
             cur = conn.execute(
@@ -1335,7 +1435,7 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return self._row_to_task_cycle(row) if row else None
 
-    def get_cycles_for_impl(self, impl_task_id: int) -> "list[TaskCycle]":
+    def get_cycles_for_impl(self, impl_task_id: str) -> "list[TaskCycle]":
         """Get all cycles for an implementation task, newest first."""
         with self._connect() as conn:
             cur = conn.execute(
@@ -1374,9 +1474,9 @@ class SqliteTaskStore:
         self,
         iteration_id: int,
         *,
-        review_task_id: int | None = None,
+        review_task_id: str | None = None,
         review_verdict: str | None = None,
-        improve_task_id: int | None = None,
+        improve_task_id: str | None = None,
         state: str | None = None,
         ended_at: datetime | None = None,
     ) -> None:
@@ -1475,7 +1575,7 @@ class SqliteTaskStore:
 
     def emit_step(
         self,
-        run_id: int,
+        run_id: str,
         message: str | None,
         *,
         provider: str,
@@ -1629,7 +1729,7 @@ class SqliteTaskStore:
             if cur.rowcount == 0:
                 raise ValueError(f"Unknown step reference: {step_ref.id}")
 
-    def count_steps(self, run_id: int) -> int:
+    def count_steps(self, run_id: str) -> int:
         """Count the number of run_steps rows for a given run_id."""
         with self._connect() as conn:
             cur = conn.execute(
@@ -1639,7 +1739,7 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return int(row["cnt"]) if row else 0
 
-    def get_run_steps(self, run_id: int) -> list[RunStep]:
+    def get_run_steps(self, run_id: str) -> list[RunStep]:
         """Get all stored run steps for a run, ordered by step index."""
         with self._connect() as conn:
             cur = conn.execute(
@@ -1687,7 +1787,7 @@ class SqliteTaskStore:
             cur = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC")
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_impl_based_on_ids(self) -> set[int]:
+    def get_impl_based_on_ids(self) -> set[str]:
         """Return the set of plan IDs that already have an implement task.
 
         Checks both based_on and depends_on, since implement tasks may
@@ -1703,7 +1803,7 @@ class SqliteTaskStore:
             )
             return {row[0] for row in cur.fetchall()}
 
-    def get_reviews_for_task(self, task_id: int) -> list[Task]:
+    def get_reviews_for_task(self, task_id: str) -> list[Task]:
         """Get all review tasks that depend on the given task, ordered by completed_at DESC.
 
         Reviews are ordered by completed_at so that the most recently completed
@@ -1736,7 +1836,7 @@ class SqliteTaskStore:
                   AND status = 'completed'
                   AND depends_on IS NULL
                   AND (
-                    task_id LIKE ?
+                    slug LIKE ?
                     OR prompt LIKE ?
                   )
                 ORDER BY completed_at DESC NULLS LAST
@@ -1745,7 +1845,7 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_improve_tasks_for(self, impl_task_id: int, review_task_id: int) -> list[Task]:
+    def get_improve_tasks_for(self, impl_task_id: str, review_task_id: str) -> list[Task]:
         """Get improve tasks that match the given implementation and review task IDs."""
         with self._connect() as conn:
             cur = conn.execute(
@@ -1758,7 +1858,7 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_improve_tasks_by_root(self, root_task_id: int) -> list[Task]:
+    def get_improve_tasks_by_root(self, root_task_id: str) -> list[Task]:
         """Get all improve tasks whose based_on points to root_task_id.
 
         This remains for review/improve workflow logic; lineage display should
@@ -1775,7 +1875,7 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def get_impl_tasks_by_depends_on_or_based_on(self, task_id: int) -> list[Task]:
+    def get_impl_tasks_by_depends_on_or_based_on(self, task_id: str) -> list[Task]:
         """Get implement tasks that depend on or are based on a given task.
 
         Kept for implementation-focused callers that only need implement tasks.
@@ -1877,7 +1977,7 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def _find_successful_retry(self, task_id: int) -> bool:
+    def _find_successful_retry(self, task_id: str) -> bool:
         """Check if any completed task exists in the retry chain rooted at task_id.
 
         Follows based_on links forward (task_id → retries → retries of retries)
@@ -1888,8 +1988,8 @@ class SqliteTaskStore:
         successful retries. A dropped task means the work was deliberately abandoned,
         not completed. Only status='completed' unblocks a dependency chain.
         """
-        visited: set[int] = set()
-        queue = [task_id]
+        visited: set[str] = set()
+        queue: list[str] = [task_id]
         while queue:
             current_id = queue.pop(0)
             if current_id in visited:
@@ -1906,7 +2006,7 @@ class SqliteTaskStore:
                     queue.append(row["id"])
         return False
 
-    def is_task_blocked(self, task: Task) -> tuple[bool, int | None, str | None]:
+    def is_task_blocked(self, task: Task) -> tuple[bool, str | None, str | None]:
         """Check if a task is blocked by an incomplete dependency.
 
         When the direct dependency has failed, follows the retry chain (via
@@ -2017,7 +2117,7 @@ class SqliteTaskStore:
 
     def update_diff_stats(
         self,
-        task_id: int,
+        task_id: str,
         files_changed: int | None,
         lines_added: int | None,
         lines_removed: int | None,
@@ -2175,11 +2275,11 @@ TASK_TEMPLATE_HEADER = """# Enter your task prompt below.
 def edit_prompt(
     initial_content: str = "",
     task_type: str = "task",
-    based_on: int | None = None,
+    based_on: str | None = None,
     based_on_slug: str | None = None,
     spec: str | None = None,
     group: str | None = None,
-    depends_on: int | None = None,
+    depends_on: str | None = None,
     create_review: bool = False,
     same_branch: bool = False,
     model: str | None = None,
@@ -2246,10 +2346,10 @@ def edit_prompt(
 def add_task_interactive(
     store: SqliteTaskStore,
     task_type: str = "task",
-    based_on: int | None = None,
+    based_on: str | None = None,
     spec: str | None = None,
     group: str | None = None,
-    depends_on: int | None = None,
+    depends_on: str | None = None,
     create_review: bool = False,
     same_branch: bool = False,
     task_type_hint: str | None = None,
@@ -2414,7 +2514,7 @@ def _task_to_dict(task: "Task") -> dict:
     }
 
 
-def get_task(task_id: int) -> dict:
+def get_task(task_id: str) -> dict:
     """Get a task by ID as a JSON-serializable dict.
 
     Auto-discovers the DB at .gza/gza.db relative to cwd.
@@ -2429,7 +2529,7 @@ def get_task(task_id: int) -> dict:
     return _task_to_dict(task)
 
 
-def get_task_log_path(task_id: int) -> str | None:
+def get_task_log_path(task_id: str) -> str | None:
     """Get the log_file path for a task.
 
     Auto-discovers the DB at .gza/gza.db relative to cwd.
@@ -2442,7 +2542,7 @@ def get_task_log_path(task_id: int) -> str | None:
     return task.log_file
 
 
-def get_task_report_path(task_id: int) -> str | None:
+def get_task_report_path(task_id: str) -> str | None:
     """Get the report_file path for a task.
 
     Auto-discovers the DB at .gza/gza.db relative to cwd.
@@ -2505,3 +2605,528 @@ def validate_prompt(prompt: str) -> list[str]:
         errors.append("Prompt is too long (maximum 10000 characters)")
 
     return errors
+
+
+# === Manual migration v25: INTEGER PK → TEXT base36 IDs ===
+
+def check_migration_status(db_path: Path) -> dict:
+    """Return the current schema version and any pending migrations.
+
+    Returns:
+        dict with keys:
+            current_version: int — current schema version in the DB
+            target_version: int — SCHEMA_VERSION constant
+            pending_auto: list[int] — auto migration versions not yet applied
+            pending_manual: list[int] — manual migration versions not yet applied
+    """
+    if not db_path.exists():
+        return {
+            "current_version": 0,
+            "target_version": SCHEMA_VERSION,
+            "pending_auto": [],
+            "pending_manual": [],
+        }
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        )
+        if cur.fetchone() is None:
+            current = 0
+        else:
+            cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+            row = cur.fetchone()
+            current = row["version"] if row else 0
+    finally:
+        conn.close()
+
+    pending_auto = [v for v, sql in _MIGRATIONS if v > current and v not in _MANUAL_MIGRATION_VERSIONS]
+    pending_manual = [v for v, sql in _MIGRATIONS if v > current and v in _MANUAL_MIGRATION_VERSIONS]
+    return {
+        "current_version": current,
+        "target_version": SCHEMA_VERSION,
+        "pending_auto": pending_auto,
+        "pending_manual": pending_manual,
+    }
+
+
+def run_v25_migration(db_path: Path, prefix: str) -> None:
+    """Migrate database from v24 (INTEGER PKs) to v25 (TEXT base36 PKs).
+
+    Steps:
+    1. Create a backup of the DB file at <db_path>.backup.pre-v25.db
+    2. Recreate all affected tables with TEXT PKs
+    3. Convert old integer IDs to ``{prefix}-{base36(id)}``
+    4. Rename the ``task_id`` column to ``slug``
+    5. Populate ``project_sequences`` from the highest integer ID seen
+    6. Update schema_version to 25
+
+    This is idempotent if called on an already-v25 database.
+
+    Raises:
+        RuntimeError: if the DB is not at version 24 (or 0 for fresh empty DB).
+    """
+    import shutil
+
+    # isolation_level=None puts the connection in autocommit mode so that the
+    # backup check below (lines ~2668-2671) runs *outside* any transaction.
+    # We then open an explicit BEGIN/COMMIT/ROLLBACK block ourselves to wrap the
+    # destructive schema changes atomically.  This is intentional: autocommit +
+    # manual BEGIN gives finer control over when the transaction starts than
+    # Python's default deferred-transaction mode.
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        )
+        if cur.fetchone() is None:
+            current = 0
+        else:
+            cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+            row = cur.fetchone()
+            current = row["version"] if row else 0
+
+        if current == SCHEMA_VERSION:
+            return  # Already up-to-date
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(f"DB is at v{current}, newer than v{SCHEMA_VERSION}")
+        if current < 24 and current != 0:
+            raise RuntimeError(
+                f"DB is at v{current}. Auto-migrate to v24 first by opening the store."
+            )
+
+        # --- backup ---
+        backup_path = db_path.with_suffix(".backup.pre-v25.db")
+        if not backup_path.exists():
+            shutil.copy2(db_path, backup_path)
+            logger.info("v25 migration: backup written to %s", backup_path)
+
+        def _id(old_id: int | str | None) -> str | None:
+            if old_id is None:
+                return None
+            if isinstance(old_id, str):
+                return old_id  # Already a prefixed string ID (idempotent)
+            return f"{prefix}-{_encode_base36(old_id)}"
+
+        conn.execute("BEGIN")
+
+        # --- project_sequences ---
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS project_sequences (
+                prefix TEXT PRIMARY KEY,
+                next_seq INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+
+        # Find max old integer id (if any tasks exist)
+        try:
+            cur = conn.execute("SELECT MAX(id) AS max_id FROM tasks")
+            max_id_row = cur.fetchone()
+            max_int_id = max_id_row["max_id"] if max_id_row and max_id_row["max_id"] else 0
+        except sqlite3.OperationalError:
+            max_int_id = 0
+
+        if max_int_id and isinstance(max_int_id, int):
+            # Use max_int_id (not max_int_id + 1) so that _next_id's increment
+            # produces max_int_id + 1 as the first post-migration task ID (no gap).
+            conn.execute(
+                "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, ?) "
+                "ON CONFLICT(prefix) DO UPDATE SET next_seq = MAX(next_seq, ?)",
+                (prefix, max_int_id, max_int_id),
+            )
+
+        # --- tasks table migration ---
+        # Check if 'task_id' column exists (v24) or 'slug' (already migrated partially)
+        cur = conn.execute("PRAGMA table_info(tasks)")
+        col_names = {row["name"] for row in cur.fetchall()}
+        slug_col = "slug" if "slug" in col_names else "task_id"
+
+        conn.execute("""
+            CREATE TABLE tasks_v25 (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                slug TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on TEXT REFERENCES tasks_v25(id),
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                running_pid INTEGER,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on TEXT REFERENCES tasks_v25(id),
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                provider_is_explicit INTEGER DEFAULT 0,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                merged_at TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                log_schema_version INTEGER DEFAULT 1,
+                cycle_id INTEGER,
+                cycle_iteration_index INTEGER,
+                cycle_role TEXT
+            )
+        """)
+
+        cur = conn.execute("SELECT * FROM tasks")  # noqa: S608
+        rows = cur.fetchall()
+        for row in rows:
+            old_id = row["id"]
+            new_id = _id(old_id)
+            based_on_new = _id(row["based_on"])
+            depends_on_new = _id(row["depends_on"])
+            slug_val = row[slug_col]
+            conn.execute(
+                """
+                INSERT INTO tasks_v25 (
+                    id, prompt, status, task_type, slug, branch, log_file, report_file,
+                    based_on, has_commits, duration_seconds, num_steps_reported,
+                    num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
+                    cost_usd, created_at, started_at, running_pid, completed_at,
+                    "group", depends_on, spec, create_review, same_branch, task_type_hint,
+                    output_content, session_id, pr_number, model, provider, provider_is_explicit,
+                    input_tokens, output_tokens, merge_status, merged_at, failure_reason,
+                    skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
+                    review_cleared_at, log_schema_version, cycle_id, cycle_iteration_index,
+                    cycle_role
+                ) VALUES (
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                )
+                """,
+                (
+                    new_id, row["prompt"], row["status"], row["task_type"], slug_val,
+                    row["branch"], row["log_file"], row["report_file"],
+                    based_on_new, row["has_commits"], row["duration_seconds"],
+                    row["num_steps_reported"] if "num_steps_reported" in row.keys() else None,
+                    row["num_steps_computed"] if "num_steps_computed" in row.keys() else None,
+                    row["num_turns"] if "num_turns" in row.keys() else None,
+                    row["num_turns_reported"] if "num_turns_reported" in row.keys() else None,
+                    row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
+                    row["cost_usd"], row["created_at"], row["started_at"],
+                    row["running_pid"] if "running_pid" in row.keys() else None,
+                    row["completed_at"],
+                    row["group"],
+                    depends_on_new,
+                    row["spec"],
+                    row["create_review"] if "create_review" in row.keys() else 0,
+                    row["same_branch"] if "same_branch" in row.keys() else 0,
+                    row["task_type_hint"] if "task_type_hint" in row.keys() else None,
+                    row["output_content"] if "output_content" in row.keys() else None,
+                    row["session_id"] if "session_id" in row.keys() else None,
+                    row["pr_number"] if "pr_number" in row.keys() else None,
+                    row["model"] if "model" in row.keys() else None,
+                    row["provider"] if "provider" in row.keys() else None,
+                    row["provider_is_explicit"] if "provider_is_explicit" in row.keys() else 0,
+                    row["input_tokens"] if "input_tokens" in row.keys() else None,
+                    row["output_tokens"] if "output_tokens" in row.keys() else None,
+                    row["merge_status"] if "merge_status" in row.keys() else None,
+                    row["merged_at"] if "merged_at" in row.keys() else None,
+                    row["failure_reason"] if "failure_reason" in row.keys() else None,
+                    row["skip_learnings"] if "skip_learnings" in row.keys() else 0,
+                    row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
+                    row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
+                    row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
+                    row["review_cleared_at"] if "review_cleared_at" in row.keys() else None,
+                    row["log_schema_version"] if "log_schema_version" in row.keys() else 1,
+                    row["cycle_id"] if "cycle_id" in row.keys() else None,
+                    row["cycle_iteration_index"] if "cycle_iteration_index" in row.keys() else None,
+                    row["cycle_role"] if "cycle_role" in row.keys() else None,
+                ),
+            )
+
+        # --- task_cycles table migration ---
+        conn.execute("""
+            CREATE TABLE task_cycles_v25 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                implementation_task_id TEXT NOT NULL REFERENCES tasks_v25(id),
+                status TEXT NOT NULL DEFAULT 'active',
+                max_iterations INTEGER NOT NULL DEFAULT 3,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                stop_reason TEXT
+            )
+        """)
+        try:
+            cur = conn.execute("SELECT * FROM task_cycles")
+            for row in cur.fetchall():
+                conn.execute(
+                    "INSERT INTO task_cycles_v25 (id, implementation_task_id, status, max_iterations, started_at, ended_at, stop_reason) VALUES (?,?,?,?,?,?,?)",
+                    (row["id"], _id(row["implementation_task_id"]), row["status"],
+                     row["max_iterations"], row["started_at"], row["ended_at"], row["stop_reason"]),
+                )
+        except sqlite3.OperationalError:
+            logger.debug("v25 migration: task_cycles table did not exist, skipping")
+
+        # --- task_cycle_iterations table migration ---
+        conn.execute("""
+            CREATE TABLE task_cycle_iterations_v25 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL REFERENCES task_cycles_v25(id),
+                iteration_index INTEGER NOT NULL,
+                review_task_id TEXT REFERENCES tasks_v25(id),
+                review_verdict TEXT,
+                improve_task_id TEXT REFERENCES tasks_v25(id),
+                state TEXT NOT NULL DEFAULT 'review_created',
+                started_at TEXT NOT NULL,
+                ended_at TEXT
+            )
+        """)
+        try:
+            cur = conn.execute("SELECT * FROM task_cycle_iterations")
+            for row in cur.fetchall():
+                conn.execute(
+                    "INSERT INTO task_cycle_iterations_v25 (id, cycle_id, iteration_index, review_task_id, review_verdict, improve_task_id, state, started_at, ended_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (row["id"], row["cycle_id"], row["iteration_index"],
+                     _id(row["review_task_id"]), row["review_verdict"],
+                     _id(row["improve_task_id"]), row["state"], row["started_at"], row["ended_at"]),
+                )
+        except sqlite3.OperationalError:
+            logger.debug("v25 migration: task_cycle_iterations table did not exist, skipping")
+
+        # --- run_steps table migration ---
+        conn.execute("""
+            CREATE TABLE run_steps_v25 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES tasks_v25(id),
+                step_index INTEGER NOT NULL,
+                step_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                message_role TEXT NOT NULL,
+                message_text TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT,
+                summary TEXT,
+                legacy_turn_id TEXT,
+                legacy_event_id TEXT,
+                UNIQUE(run_id, step_index),
+                UNIQUE(run_id, step_id)
+            )
+        """)
+        try:
+            cur = conn.execute("SELECT * FROM run_steps")
+            for row in cur.fetchall():
+                conn.execute(
+                    "INSERT INTO run_steps_v25 (id, run_id, step_index, step_id, provider, message_role, message_text, started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["id"], _id(row["run_id"]), row["step_index"], row["step_id"],
+                     row["provider"], row["message_role"], row["message_text"],
+                     row["started_at"], row["completed_at"], row["outcome"],
+                     row["summary"], row["legacy_turn_id"], row["legacy_event_id"]),
+                )
+        except sqlite3.OperationalError:
+            logger.debug("v25 migration: run_steps table did not exist, skipping")
+
+        # --- run_substeps table migration ---
+        conn.execute("""
+            CREATE TABLE run_substeps_v25 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES tasks_v25(id),
+                step_id INTEGER NOT NULL REFERENCES run_steps_v25(id),
+                substep_index INTEGER NOT NULL,
+                substep_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                call_id TEXT,
+                payload_json TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                legacy_turn_id TEXT,
+                legacy_event_id TEXT,
+                UNIQUE(step_id, substep_index),
+                UNIQUE(step_id, substep_id)
+            )
+        """)
+        try:
+            cur = conn.execute("SELECT * FROM run_substeps")
+            for row in cur.fetchall():
+                conn.execute(
+                    "INSERT INTO run_substeps_v25 (id, run_id, step_id, substep_index, substep_id, type, source, call_id, payload_json, timestamp, legacy_turn_id, legacy_event_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["id"], _id(row["run_id"]), row["step_id"], row["substep_index"],
+                     row["substep_id"], row["type"], row["source"], row["call_id"],
+                     row["payload_json"], row["timestamp"], row["legacy_turn_id"],
+                     row["legacy_event_id"]),
+                )
+        except sqlite3.OperationalError:
+            logger.debug("v25 migration: run_substeps table did not exist, skipping")
+
+        # --- drop old tables, rename new ones ---
+        for tbl in ("run_substeps", "run_steps", "task_cycle_iterations", "task_cycles", "tasks"):
+            conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        for tbl in ("tasks", "task_cycles", "task_cycle_iterations", "run_steps", "run_substeps"):
+            try:
+                conn.execute(f"ALTER TABLE {tbl}_v25 RENAME TO {tbl}")
+            except sqlite3.OperationalError:
+                logger.debug("v25 migration: %s_v25 table did not exist, skipping rename", tbl)
+
+        # --- recreate indexes ---
+        for stmt in """
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_slug ON tasks(slug);
+CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
+CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
+CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
+CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_steps_step_index ON run_steps(run_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
+CREATE INDEX IF NOT EXISTS idx_task_cycles_impl_id ON task_cycles(implementation_task_id);
+CREATE INDEX IF NOT EXISTS idx_task_cycles_status ON task_cycles(status);
+CREATE INDEX IF NOT EXISTS idx_task_cycle_iterations_cycle_idx ON task_cycle_iterations(cycle_id, iteration_index);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cycle_iterations(cycle_id, iteration_index);
+CREATE INDEX IF NOT EXISTS idx_tasks_cycle_id ON tasks(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
+""".strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    logger.debug("v25 migration: could not create index (table may not exist): %s", stmt[:60])
+
+        # --- update schema version ---
+        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+
+        conn.execute("COMMIT")
+        logger.info("v25 migration complete: %s", db_path)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_task_id(arg: str, project_prefix: str) -> str:
+    """Resolve a user-supplied task ID argument to a canonical string ID.
+
+    Handles three forms:
+    - Full prefixed ID: ``"gza-3f"`` → ``"gza-3f"`` (returned as-is)
+    - Bare decimal integer: ``"42"`` → ``"{prefix}-{base36(42)}"``
+      Decimal integers are treated as legacy pre-migration integer IDs and
+      converted to their base36 equivalent, so users with muscle memory of old
+      integer IDs can still find their tasks after the v25 migration.
+    - Bare base36 suffix: ``"3f"`` → ``"{prefix}-3f"``
+
+    The returned value is the string to pass to ``store.get()``.
+
+    Note: any hyphenated string (e.g. ``"feature-branch"``) is treated as a
+    full prefixed ID and returned unchanged.  The caller is responsible for
+    handling the resulting ``store.get()`` returning ``None``; the "not found"
+    error message is more actionable than a format-validation error here.
+    """
+    arg = arg.strip()
+    if not arg:
+        raise ValueError("Empty task ID")
+    # Full prefixed ID already (contains a hyphen) — returned as-is.
+    # Callers handle store.get() returning None for unrecognised IDs.
+    if "-" in arg:
+        return arg
+    # Bare decimal integer → interpret as legacy pre-migration integer ID
+    if arg.isdigit() and int(arg) > 0:
+        return f"{project_prefix}-{_encode_base36(int(arg))}"
+    # Bare base36 suffix — prepend project prefix.
+    # Note: an all-alpha string like "abc" becomes "{prefix}-abc", which looks
+    # like a valid task ID but may not exist in the DB.  The caller is
+    # responsible for handling store.get() returning None in that case.
+    return f"{project_prefix}-{arg}"
+
+
+class _MigrationPreview(TypedDict):
+    task_count: int
+    samples: list[tuple[int, str]]
+    first_post_migration_id: str
+
+
+def preview_v25_migration(db_path: Path, prefix: str, sample_limit: int = 10) -> _MigrationPreview:
+    """Return a preview of what run_v25_migration would do, without writing anything.
+
+    Returns a TypedDict with keys:
+    - ``task_count``: total number of tasks in the DB
+    - ``samples``: list of ``(old_id, new_id)`` tuples for the first ``sample_limit`` tasks
+    - ``first_post_migration_id``: the first ID that would be assigned to a new task
+      after migration (i.e. ``{prefix}-{base36(max_id + 1)}``)
+
+    Note: This function is only meaningful on pre-v25 databases.  On a database that has
+    already been migrated to v25, all task IDs are TEXT strings so there are no integer
+    IDs to convert — ``samples`` will be empty and ``first_post_migration_id`` will be
+    ``""`` to indicate the result is not applicable.  Use :func:`check_migration_status`
+    to determine whether v25 migration is pending before calling this function.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Determine the current schema version so we can short-circuit on already-migrated DBs.
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            )
+            if cur.fetchone() is not None:
+                cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+                row = cur.fetchone()
+                current_version = row["version"] if row else 0
+            else:
+                current_version = 0
+        except sqlite3.OperationalError:
+            current_version = 0
+
+        if current_version >= SCHEMA_VERSION:
+            # Already migrated — no integer IDs remain to convert.
+            try:
+                cur2 = conn.execute("SELECT COUNT(*) AS cnt FROM tasks")
+                row2 = cur2.fetchone()
+                task_count = row2["cnt"] if row2 else 0
+            except sqlite3.OperationalError:
+                task_count = 0
+            return {
+                "task_count": task_count,
+                "samples": [],
+                "first_post_migration_id": "",
+            }
+
+        try:
+            cur = conn.execute("SELECT id FROM tasks ORDER BY id ASC LIMIT ?", (sample_limit,))
+            samples_raw = [(row["id"], f"{prefix}-{_encode_base36(row['id'])}") for row in cur.fetchall()
+                           if isinstance(row["id"], int)]
+            cur2 = conn.execute("SELECT COUNT(*) AS cnt, MAX(id) AS max_id FROM tasks")
+            row = cur2.fetchone()
+            task_count = row["cnt"] if row else 0
+            max_id = row["max_id"] if row and row["max_id"] else 0
+        except sqlite3.OperationalError:
+            samples_raw = []
+            task_count = 0
+            max_id = 0
+    finally:
+        conn.close()
+
+    first_post = f"{prefix}-{_encode_base36(max_id + 1)}" if max_id else f"{prefix}-1"
+    return {
+        "task_count": task_count,
+        "samples": samples_raw,
+        "first_post_migration_id": first_post,
+    }

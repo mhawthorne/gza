@@ -12,7 +12,7 @@ import pytest
 from gza.cli import _format_log_entry, _build_step_timeline
 from gza.db import SqliteTaskStore
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
 
 
 class TestLogCommand:
@@ -28,7 +28,9 @@ class TestLogCommand:
         # Create a task with a log file
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        from gza.config import Config
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(db_path, prefix=config.project_prefix)
         task = store.add("Test task for log")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -48,7 +50,7 @@ class TestLogCommand:
         }
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task completed successfully!" in result.stdout
@@ -64,9 +66,7 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task for JSONL log")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -78,7 +78,7 @@ class TestLogCommand:
         log_file = log_dir / "test.log"
         log_file.write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Finished." in result.stdout
@@ -94,9 +94,7 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task that hit max turns")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -135,9 +133,7 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create a task with a log file path that doesn't exist
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task with missing log")
         task.status = "completed"
         task.log_file = ".gza/logs/nonexistent.log"
@@ -156,9 +152,7 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task with incomplete log")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -186,9 +180,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Fallback log path task")
         task.status = "completed"
         task.slug = "20260227-fallback-log"
@@ -215,9 +207,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         original = store.add("Original failed task")
         assert original.id is not None
@@ -252,9 +242,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         root = store.add("Original failed task")
         assert root.id is not None
@@ -299,9 +287,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         root = store.add("Original failed task")
         assert root.id is not None
@@ -349,9 +335,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         root = store.add("Original task", task_type="implement")
         assert root.id is not None
@@ -403,9 +387,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         root = store.add("Root task", task_type="implement")
         assert root.id is not None
@@ -443,9 +425,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Default render parity task")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -473,9 +453,7 @@ class TestLogCommand:
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Running task for follow")
         assert task.id is not None
         task.status = "in_progress"
@@ -535,9 +513,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Completed task with persisted log")
         task.status = "completed"
         task.log_file = ".gza/logs/static.log"
@@ -565,9 +541,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Step timeline task")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -589,9 +563,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Verbose step timeline task")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -613,9 +585,7 @@ class TestLogCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Legacy log task")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -640,26 +610,26 @@ class TestLogCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         from gza.db import SqliteTaskStore
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
-        result = run_gza("log", "999", "--project", str(tmp_path))
+        result = run_gza("log", "test-project-zzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "Task 999 not found" in result.stdout
+        assert "not found" in result.stdout
 
-    def test_log_by_task_id_invalid_id(self, tmp_path: Path):
-        """Log command by task ID rejects non-numeric ID."""
+    def test_log_by_task_id_nonexistent(self, tmp_path: Path):
+        """Log command by task ID reports not found for nonexistent ID."""
         setup_config(tmp_path)
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         from gza.db import SqliteTaskStore
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
-        result = run_gza("log", "not-a-number", "--project", str(tmp_path))
+        result = run_gza("log", "not-a-real-id", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "not a valid task ID" in result.stdout
+        assert "not found" in result.stdout
 
     def test_log_by_slug_exact_match(self, tmp_path: Path):
         """Log command with --slug finds task by exact slug."""
@@ -668,9 +638,7 @@ class TestLogCommand:
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task for slug lookup")
         task.slug = "20260108-test-slug"
         task.status = "completed"
@@ -695,9 +663,7 @@ class TestLogCommand:
 
         setup_config(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task for partial slug")
         task.slug = "20260108-partial-slug-test"
         task.status = "completed"
@@ -722,7 +688,7 @@ class TestLogCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         from gza.db import SqliteTaskStore
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
         result = run_gza("log", "--slug", "nonexistent-slug", "--project", str(tmp_path))
 
@@ -738,9 +704,7 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create task
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task for worker lookup")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"
@@ -782,7 +746,7 @@ class TestLogCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         from gza.db import SqliteTaskStore
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
         # Create empty workers directory
         workers_path = tmp_path / ".gza" / "workers"
@@ -799,9 +763,7 @@ class TestLogCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task that failed before runner log setup")
         task.status = "failed"
@@ -840,7 +802,7 @@ class TestLogCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
@@ -874,9 +836,7 @@ class TestLogCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task with both main and startup logs")
         task.status = "failed"
@@ -920,9 +880,7 @@ class TestLogCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task lookup startup fallback")
         assert task.id is not None
@@ -966,9 +924,7 @@ class TestLogCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task lookup main log precedence")
         assert task.id is not None
@@ -1017,9 +973,7 @@ class TestLogCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task lookup with no available logs")
         assert task.id is not None
@@ -1059,9 +1013,7 @@ class TestLogCommand:
         setup_config(tmp_path)
 
         # Create a task with a log file
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Test task with startup failure")
         task.status = "failed"
         task.log_file = ".gza/logs/test-startup-error.log"
@@ -1086,10 +1038,10 @@ class TestLogCommand:
         """Log command defaults to task ID lookup without any flag."""
         setup_config(tmp_path)
 
-        result = run_gza("log", "123", "--project", str(tmp_path))
+        result = run_gza("log", "test-project-zzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "Task 123 not found" in result.stdout
+        assert "not found" in result.stdout
 
 
 class TestFormatLogEntry:
@@ -1132,9 +1084,7 @@ class TestFormatLogEntry:
     def test_gza_log_entry_renders_in_gza_log_output(self, tmp_path: Path) -> None:
         """Integration: gza log renders gza entries from a JSONL log file."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Orchestration logging integration test")
         task.status = "completed"
         task.log_file = ".gza/logs/test.log"

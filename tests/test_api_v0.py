@@ -75,8 +75,8 @@ class TestGetLineage:
         setup_config(tmp_path)
         make_store(tmp_path)  # ensure db is created
         client = make_client(tmp_path)
-        with pytest.raises(KeyError, match="999"):
-            client.get_lineage(999)
+        with pytest.raises(KeyError, match="not found"):
+            client.get_lineage("test-project-zzz")
 
     def test_single_task_returns_list_of_one(self, tmp_path: Path):
         setup_config(tmp_path)

@@ -28,6 +28,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from gza.config import Config
+from gza.db import resolve_task_id
 from gza.runner import extract_content_from_log
 
 VALID_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION")
@@ -58,7 +60,7 @@ def extract_verdict(content: str) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("task_id", type=int, help="Review task ID")
+    parser.add_argument("task_id", type=str, help="Review task ID")
     parser.add_argument("--verdict", choices=VALID_VERDICTS, help="Explicitly set this verdict (skip parsing)")
     parser.add_argument("--from-log", action="store_true", help="Extract review content from the task's log file and backfill output_content")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be updated without writing")
@@ -73,12 +75,15 @@ def main() -> int:
         print(f"Database not found at {db_path}", file=sys.stderr)
         return 1
 
+    config = Config.load(Path("."))
+    resolved_task_id = resolve_task_id(args.task_id, config.project_prefix)
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     row = conn.execute(
         "SELECT id, task_type, output_content, cycle_id, cycle_iteration_index, log_file FROM tasks WHERE id = ?",
-        (args.task_id,),
+        (resolved_task_id,),
     ).fetchone()
     if not row:
         print(f"Task {args.task_id} not found", file=sys.stderr)

@@ -250,7 +250,7 @@ def import_tasks(
     messages: list[str] = []
 
     # Map local index -> actual task ID
-    index_to_id: dict[int, int] = {}
+    index_to_id: dict[int, str] = {}
 
     for i, import_task in enumerate(tasks, 1):
         # Check for duplicates

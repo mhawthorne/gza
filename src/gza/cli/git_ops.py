@@ -39,10 +39,12 @@ from ._common import (
     _create_resume_task,
     _create_review_task,
     _get_pager,
+    _looks_like_task_id,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     get_review_verdict,
     get_store,
+    resolve_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,9 +59,10 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
     if args.task_id is not None:
         # Single task by ID
-        task = store.get(args.task_id)
+        task_id = resolve_id(config, args.task_id)
+        task = store.get(task_id)
         if task is None:
-            console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
+            console.print(f"[red]Error: Task #{task_id} not found[/red]")
             return 1
         tasks_to_refresh = [task]
     else:
@@ -96,7 +99,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
 
 def _merge_single_task(
-    task_id: int,
+    task_id: str,
     config: Config,
     store,
     git: Git,
@@ -283,7 +286,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     print(f"On branch {current_branch}")
 
     # Determine the list of task IDs to merge
-    task_ids = list(args.task_ids)
+    task_ids = [resolve_id(config, tid) for tid in args.task_ids]
 
     use_all = getattr(args, 'all', False)
     if use_all:
@@ -294,7 +297,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         for task in reversed(history):
             if task.id in seen_ids:
                 continue
-            if task.status in ("completed", "unmerged") and task.branch and task.has_commits:
+            if task.id is not None and task.status in ("completed", "unmerged") and task.branch and task.has_commits:
                 if task.merge_status != "merged" and not git.is_merged(task.branch, current_branch):
                     task_ids.append(task.id)
                     seen_ids.add(task.id)
@@ -523,22 +526,23 @@ def invoke_provider_resolve(
 def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
+    task_id = resolve_id(config, args.task_id)
 
     # Handle background mode - create a rebase task and run through the standard runner
     if getattr(args, 'background', False):
         store = get_store(config)
-        task = store.get(args.task_id)
+        task = store.get(task_id)
         if not task:
-            print(f"Error: Task #{args.task_id} not found")
+            print(f"Error: Task #{task_id} not found")
             return 1
         if not task.branch:
-            print(f"Error: Task #{args.task_id} has no branch")
+            print(f"Error: Task #{task_id} has no branch")
             return 1
         git = Git(config.project_dir)
         target = getattr(args, 'onto', None) or git.default_branch()
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
-        rebase_task = _create_rebase_task(store, args.task_id, task.branch, target)
+        rebase_task = _create_rebase_task(store, task_id, task.branch, target)
         worker_args = argparse.Namespace(no_docker=False, max_turns=None)
         return _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
 
@@ -546,9 +550,9 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
 
     # Get the task
-    task = store.get(args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     # Validate task state
@@ -660,19 +664,21 @@ def cmd_checkout(args: argparse.Namespace) -> int:
     task = None
     branch = None
 
-    if args.task_id_or_branch.isdigit():
-        # It's a task ID
-        task = store.get(int(args.task_id_or_branch))
-        if not task:
-            print(f"Error: Task #{args.task_id_or_branch} not found")
-            return 1
-        if not task.branch:
-            print(f"Error: Task #{task.id} has no branch")
-            return 1
-        branch = task.branch
+    arg = args.task_id_or_branch
+    if _looks_like_task_id(arg):
+        resolved_task_id = resolve_id(config, arg)
+        task = store.get(resolved_task_id)
+        if task is not None:
+            if not task.branch:
+                print(f"Error: Task #{task.id} has no branch")
+                return 1
+            branch = task.branch
+        else:
+            # Not found as a task ID — fall back to treating it as a branch name
+            branch = arg
     else:
         # It's a branch name
-        branch = args.task_id_or_branch
+        branch = arg
 
     # Check if branch exists
     if not git.branch_exists(branch):
@@ -714,22 +720,22 @@ def cmd_diff(args: argparse.Namespace) -> int:
     # Process arguments - check if first arg is a task ID
     diff_args = args.diff_args if hasattr(args, 'diff_args') and args.diff_args else []
 
-    if diff_args and diff_args[0].isdigit():
-        # First argument is a numeric task ID
-        task_id = int(diff_args[0])
+    if diff_args and not diff_args[0].startswith("-") and _looks_like_task_id(diff_args[0]):
+        # First argument looks like a task ID (bare integer, base36, or prefixed)
+        task_id: str = resolve_id(config, diff_args[0])
         task = store.get(task_id)
 
         if not task:
-            print(f"Error: Task #{task_id} not found")
-            return 1
-
-        if not task.branch:
+            # Not found as a task ID — fall back to treating arg as a branch/ref, same
+            # as cmd_checkout does, since the heuristic is intentionally permissive.
+            pass
+        elif not task.branch:
             print(f"Error: Task #{task_id} has no branch")
             return 1
-
-        # Replace task ID with branch diff range
-        default_branch = git.default_branch()
-        diff_args = [f"{default_branch}...{task.branch}"] + diff_args[1:]
+        else:
+            # Replace task ID with branch diff range
+            default_branch = git.default_branch()
+            diff_args = [f"{default_branch}...{task.branch}"] + diff_args[1:]
 
     # Add any additional arguments passed to gza diff
     if diff_args:
@@ -932,9 +938,10 @@ def cmd_pr(args: argparse.Namespace) -> int:
     gh = GitHub()
 
     # Get the task first (validate task exists and state before checking gh)
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     # Validate task state
@@ -1018,7 +1025,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
 
-def _count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: int) -> int:
+def _count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
     """Count completed review/improve cycles for an implementation task.
 
     Counts completed improve tasks for the root task, since each improve
@@ -1034,7 +1041,7 @@ def _determine_advance_action(
     git: Git,
     task: DbTask,
     target_branch: str,
-    impl_based_on_ids: set[int] | None = None,
+    impl_based_on_ids: set[str] | None = None,
 ) -> dict:
     """Determine the next action needed to advance a task.
 
@@ -1301,7 +1308,7 @@ def _cmd_advance_unimplemented(
     # Find tasks that have no implement task pointing at them (via based_on).
     # Use a targeted query instead of a full table scan to avoid loading every
     # task (including output_content blobs) into memory.
-    impl_based_on_ids: set[int] = store.get_impl_based_on_ids()
+    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
     pending_tasks = [task for task in all_completed if task.id not in impl_based_on_ids]
 
@@ -1381,15 +1388,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
     _c_warn = _ac.waiting
     _c_default = _ac.default
     # Prefix for advance lines: "  #NNN " — compute available prompt width per task.
-    def _prompt_avail(task_id: int | None) -> int:
-        return prompt_available_width(prefix=len(str(task_id or 0)) + 4)  # "  #NNN "
+    def _prompt_avail(task_id: str | None) -> int:
+        return prompt_available_width(prefix=len(task_id or "") + 4)  # "  #NNN "
     git = Git(config.project_dir)
 
     dry_run: bool = args.dry_run
     auto: bool = getattr(args, 'auto', False)
     max_tasks: int | None = getattr(args, 'max', None)
     batch_limit: int | None = getattr(args, 'batch', None)
-    task_id: int | None = getattr(args, 'task_id', None)
+    task_id: str | None = resolve_id(config, args.task_id) if getattr(args, 'task_id', None) is not None else None
     plans_mode: bool = getattr(args, 'plans', False)
     unimplemented_mode: bool = getattr(args, 'unimplemented', False)
     create_mode: bool = getattr(args, 'create', False)
@@ -1435,7 +1442,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     # Pre-compute the set of plan IDs that already have implement children
     # to avoid repeated DB queries in _determine_advance_action.
-    impl_based_on_ids: set[int] = store.get_impl_based_on_ids()
+    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
     # Determine which tasks to advance
     if task_id is not None:

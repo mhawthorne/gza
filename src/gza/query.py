@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from gza.db import SqliteTaskStore, Task
+from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 from gza.task_slug import get_base_task_slug as _get_base_task_slug, get_task_slug as _get_task_slug_from_task_id
 
 
@@ -107,7 +107,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     return tasks
 
 
-def get_task_lineage(store: SqliteTaskStore, task_id: int, depth: int) -> TaskLineageNode:
+def get_task_lineage(store: SqliteTaskStore, task_id: str, depth: int) -> TaskLineageNode:
     """Return lineage tree rooted at the resolved lineage root for task_id."""
     task = store.get(task_id)
     if task is None:
@@ -122,7 +122,7 @@ def query_history_with_lineage(
     """Return filtered history with lineage trees expanded to f.lineage_depth."""
     tasks = query_history(store, f)
     root_nodes: list[TaskLineageNode] = []
-    seen_root_ids: set[int] = set()
+    seen_root_ids: set[str] = set()
 
     for task in tasks:
         root = resolve_lineage_root(store, task)
@@ -230,7 +230,9 @@ def _lineage_child_sort_key(parent: Task, child: Task) -> tuple[int, datetime, i
     }.get(relation, 8)
 
     child_time = _normalize_lineage_time(task_time_for_lineage(child))
-    child_id = child.id if child.id is not None else 10**9
+    # task_id_numeric_key expects str | None; guard against legacy integer IDs
+    id_str = child.id if isinstance(child.id, str) else None
+    child_id = task_id_numeric_key(id_str)  # returns int; 0 for None/non-string
     return (relation_rank, child_time, child_id)
 
 
@@ -246,7 +248,7 @@ def build_lineage_tree(
     if root_task.id is None:
         return root
 
-    attached_ids: set[int] = {root_task.id}
+    attached_ids: set[str] = {root_task.id}
 
     def _populate(node: TaskLineageNode) -> None:
         if max_depth is not None and node.depth >= max_depth:
@@ -346,8 +348,8 @@ def build_lineage(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     return flatten_lineage_tree(build_lineage_tree(store, root_task, max_depth=None))
 
 
-def _get_parent_ids(task: Task) -> list[int]:
-    parent_ids: list[int] = []
+def _get_parent_ids(task: Task) -> list[str]:
+    parent_ids: list[str] = []
     if task.based_on is not None:
         parent_ids.append(task.based_on)
     if task.depends_on is not None:
@@ -360,7 +362,7 @@ def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
     if task.id is None:
         return task
 
-    graph_nodes: dict[int, Task] = {task.id: task}
+    graph_nodes: dict[str, Task] = {task.id: task}
     to_visit = _get_parent_ids(task)
 
     while to_visit:
@@ -386,7 +388,6 @@ def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
 
     def _root_order_key(candidate: Task) -> tuple[datetime, int]:
         ts = _normalize_lineage_time(task_time_for_lineage(candidate))
-        candidate_id = candidate.id if candidate.id is not None else 10**9
-        return (ts, candidate_id)
+        return (ts, task_id_numeric_key(candidate.id))
 
     return sorted(candidates, key=_root_order_key)[0]

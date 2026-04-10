@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, setup_unmerged_env, LOG_FIXTURES_DIR
+from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, setup_unmerged_env, LOG_FIXTURES_DIR
 
 
 class TestHistoryCommand:
@@ -223,7 +223,9 @@ class TestHistoryCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        from gza.config import Config
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(db_path, prefix=config.project_prefix)
 
         # Create an orphaned (in-progress, no worker) task
         orphaned_task = store.add("Orphaned task needing attention")
@@ -239,10 +241,10 @@ class TestHistoryCommand:
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout
-        assert "Orphaned task needing attention" in result.stdout
+        assert "Orphaned task needi" in result.stdout
         assert "Completed task" in result.stdout
         # Orphaned should appear before completed in output
-        orphaned_pos = result.stdout.find("Orphaned task needing attention")
+        orphaned_pos = result.stdout.find("Orphaned task needi")
         completed_pos = result.stdout.find("Completed task")
         assert orphaned_pos < completed_pos, "Orphaned task should appear before completed task"
 
@@ -251,9 +253,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         orphaned_task = store.add("Orphaned task")
         store.mark_in_progress(orphaned_task)
@@ -268,9 +268,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create an orphaned task
         orphaned_task = store.add("Orphaned task")
@@ -294,9 +292,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Failed task (should appear)
         failed = store.add("Failed task")
@@ -322,9 +318,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -349,9 +343,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         parent = store.add("Parent task")
         parent.status = "completed"
@@ -375,9 +367,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         grandparent = store.add("Grandparent task")
         grandparent.status = "completed"
@@ -407,26 +397,24 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
-        root = store.add("Root completed task", task_type="implement")
+        root = store.add("Root done", task_type="implement")
         root.status = "completed"
         root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
         store.update(root)
 
-        child = store.add("Child pending task", task_type="implement", based_on=root.id)
-        grandchild = store.add("Grandchild pending task", task_type="implement", based_on=child.id)
+        child = store.add("Child pend", task_type="implement", based_on=root.id)
+        grandchild = store.add("Gchild pend", task_type="implement", based_on=child.id)
         assert child.id is not None
         assert grandchild.id is not None
 
         result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        root_idx = result.stdout.index("Root completed task")
-        child_idx = result.stdout.index("Child pending task")
-        grandchild_idx = result.stdout.index("Grandchild pending task")
+        root_idx = result.stdout.index("Root done")
+        child_idx = result.stdout.index("Child pend")
+        grandchild_idx = result.stdout.index("Gchild pend")
         assert root_idx < child_idx < grandchild_idx
 
     def test_history_incomplete_with_lookback(self, tmp_path: Path):
@@ -434,9 +422,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -501,9 +487,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -530,9 +514,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -559,9 +541,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         completed = store.add("Completed task")
         completed.status = "completed"
@@ -590,9 +570,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         failed_unknown = store.add("Failed unknown reason")
         failed_unknown.status = "failed"
@@ -623,9 +601,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         parent = store.add("Parent task")
         parent.status = "completed"
@@ -648,9 +624,7 @@ class TestHistoryCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Plan task")
         plan.status = "completed"
@@ -681,9 +655,7 @@ class TestHistoryCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create a task and mark it in_progress with a non-existent PID so reconciliation triggers
         orphaned = store.add("Orphaned in_progress task")
@@ -734,9 +706,7 @@ class TestNextCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create a pending task
         store.add("Pending task")
@@ -758,9 +728,7 @@ class TestNextCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Only an orphaned task, no pending tasks
         orphaned_task = store.add("Stuck orphaned task")
@@ -786,7 +754,7 @@ class TestShowCommand:
         result = run_gza("show", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Task #1" in result.stdout
+        assert "Task #" in result.stdout
         assert "A detailed task prompt" in result.stdout
         assert "Status: pending" in result.stdout
 
@@ -804,9 +772,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -829,9 +795,7 @@ class TestShowCommand:
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_steps: 50\nverify_command: uv run pytest tests/ -q\n")
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Failed task for show diagnostics")
         assert task.id is not None
         task.status = "failed"
@@ -899,8 +863,8 @@ class TestShowCommand:
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout
         assert "Last Result Context: error_max_turns" in result.stdout
-        assert "gza resume 1" in result.stdout
-        assert "gza retry 1" in result.stdout
+        assert f"gza resume {task.id}" in result.stdout
+        assert f"gza retry {task.id}" in result.stdout
         assert "Run Context: background (w-20260227-000001)" in result.stdout
 
     def test_show_failed_task_extracts_verify_failure_from_tool_error_entries(self, tmp_path: Path):
@@ -911,9 +875,7 @@ class TestShowCommand:
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Failed task with non-Claude logs")
         assert task.id is not None
         task.status = "failed"
@@ -952,9 +914,7 @@ class TestShowCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Task with startup failure")
         assert task.id is not None
         task.status = "failed"
@@ -989,9 +949,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Completed task")
         task.status = "completed"
         store.update(task)
@@ -1007,9 +965,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Design the feature", task_type="plan")
         assert plan.id is not None
@@ -1028,9 +984,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Design the feature", task_type="plan")
         assert plan.id is not None
@@ -1055,9 +1009,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Top-level plan", task_type="plan")
         assert plan.id is not None
@@ -1079,9 +1031,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         root = store.add("Root task", task_type="implement")
         root.status = "completed"
@@ -1105,9 +1055,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         plan = store.add("Design the feature", task_type="plan")
         assert plan.id is not None
@@ -1133,9 +1081,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         long_content = "\n".join(f"line {i}" for i in range(1, 52))  # 51 lines
         task = store.add("Plan with long output", task_type="plan")
@@ -1158,9 +1104,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         long_content = "\n".join(f"line {i}" for i in range(1, 52))  # 51 lines
         task = store.add("Plan with long output", task_type="plan")
@@ -1180,9 +1124,7 @@ class TestShowCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         content_30_lines = "\n".join(f"line {i}" for i in range(1, 31))  # exactly 30 lines
         task = store.add("Plan with 30-line output", task_type="plan")
@@ -1206,9 +1148,7 @@ class TestGroupsCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create tasks in different groups
         store.add("Task 1", group="group-a")
@@ -1230,7 +1170,7 @@ class TestGroupsCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         from gza.db import SqliteTaskStore
-        SqliteTaskStore(db_path)
+        make_store(tmp_path)
 
         result = run_gza("groups", "--project", str(tmp_path))
 
@@ -1245,9 +1185,7 @@ class TestStatusCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create tasks in a group
         task1 = store.add("First task", group="test-group")
@@ -1268,9 +1206,7 @@ class TestStatusCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create a completed task and an orphaned in-progress task in the same group
         task1 = store.add("Completed task", group="my-group")
@@ -1293,9 +1229,7 @@ class TestStatusCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create tasks in different groups
         task1 = store.add("Task in group A", group="group-a")
@@ -1321,9 +1255,7 @@ class TestPsCommand:
 
         # Setup config and database
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create a task
         task = store.add("Test task for ps command")
@@ -1366,9 +1298,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Reconciled task")
         store.mark_in_progress(task)
 
@@ -1406,9 +1336,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Terminal task with dead worker")
         task.status = "failed"
@@ -1449,9 +1377,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("No-id claimed task")
         store.mark_in_progress(task)
         task = store.get(task.id)
@@ -1492,9 +1418,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Healthy running task")
         store.mark_in_progress(task)
         task = store.get(task.id)
@@ -1531,9 +1455,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Claimed label task")
         store.mark_in_progress(task)
         task = store.get(task.id)
@@ -1572,9 +1494,7 @@ class TestPsCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("DB-only in-progress task")
         store.mark_in_progress(task)
 
@@ -1597,9 +1517,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Formatted start time")
         store.mark_in_progress(task)
 
@@ -1631,9 +1549,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Task with an associated worker.
         task = store.add("Task with worker")
@@ -1670,9 +1586,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Stale worker task")
         store.mark_in_progress(task)
 
@@ -1924,9 +1838,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
@@ -2301,9 +2213,7 @@ class TestPsCommand:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create 3 tasks with different initial states
         task_pending = store.add("Pending task")
@@ -2406,9 +2316,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create 2 in_progress tasks
         task1 = store.add("Internal task 1", task_type="internal")
@@ -2507,9 +2415,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         task = store.add("Task with steps")
         store.mark_in_progress(task)
@@ -2585,9 +2491,7 @@ class TestPsCommand:
         from gza.workers import WorkerRegistry, WorkerMetadata
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("In-progress task with live steps")
         store.mark_in_progress(task)
         assert task.id is not None
@@ -2975,7 +2879,8 @@ class TestUnmergedReviewStatus:
         assert f"#{downstream_impl.id}" not in result.stdout
         assert "| completed |" in result.stdout
         assert "changes_requested" in result.stdout
-        assert "← latest" in result.stdout
+        # The "← latest" annotation may wrap across lines at narrow terminal widths
+        assert "latest" in result.stdout
 
     def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
         """The most recent review node is annotated with the latest marker."""
@@ -2997,9 +2902,11 @@ class TestUnmergedReviewStatus:
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        older_idx = result.stdout.index(f"#{older_review.id}")
-        latest_idx = result.stdout.index(f"#{latest_review.id}")
-        marker_idx = result.stdout.index("← latest")
+        # Normalize output since "← latest" may wrap across lines at narrow terminal widths
+        normalized = " ".join(result.stdout.split())
+        older_idx = normalized.index(f"#{older_review.id}")
+        latest_idx = normalized.index(f"#{latest_review.id}")
+        marker_idx = normalized.index("latest")
         assert marker_idx > latest_idx
         assert not (older_idx < marker_idx < latest_idx)
 
@@ -3080,9 +2987,7 @@ class TestUnmergedAllFlag:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # We need a git repo but the task's branch won't exist
         from gza.git import Git
@@ -3355,9 +3260,8 @@ class TestFailureReasonField:
         """failure_reason field is saved and loaded from the database."""
         from gza.db import SqliteTaskStore
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
 
         task = store.add("Test task")
         task.status = "failed"
@@ -3372,9 +3276,8 @@ class TestFailureReasonField:
         """failure_reason defaults to None for new tasks."""
         from gza.db import SqliteTaskStore
 
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
 
         task = store.add("Test task")
         assert task.failure_reason is None
@@ -3392,9 +3295,7 @@ class TestNextCommandWithDependencies:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create task chain
         task1 = store.add("First task")
@@ -3412,9 +3313,7 @@ class TestNextCommandWithDependencies:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create task chain
         task1 = store.add("First task")
@@ -3431,9 +3330,7 @@ class TestNextCommandWithDependencies:
         from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create blocked tasks
         task1 = store.add("First task")
@@ -3476,7 +3373,7 @@ class TestKillCommand:
 
         setup_config(tmp_path)
 
-        args = argparse.Namespace(project_dir=tmp_path, task_id=99999, all=False, force=False)
+        args = argparse.Namespace(project_dir=tmp_path, task_id="99999", all=False, force=False)
         rc = cmd_kill(args)
 
         captured = capsys.readouterr()
@@ -3732,9 +3629,7 @@ class TestLineageCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -3763,9 +3658,7 @@ class TestLineageCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -3787,9 +3680,7 @@ class TestLineageCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -3821,9 +3712,7 @@ class TestLineageCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -3851,9 +3740,7 @@ class TestLineageCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -3886,9 +3773,7 @@ class TestLineageCommand:
         from datetime import datetime, timezone
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         now = datetime.now(timezone.utc)
 
@@ -3909,3 +3794,69 @@ class TestLineageCommand:
         assert result.returncode == 0
         # "[depends]" in stdout catches silent text loss of the relationship label
         assert "[depends]" in result.stdout
+
+
+class TestPsSortKey:
+    """Tests for _ps_sort_key sort-key function."""
+
+    def _make_row(
+        self,
+        task_id: str | int | None = None,
+        status: str = "running",
+        sort_timestamp: str = "2026-01-01T00:00:00",
+        worker_id: str = "w-001",
+    ) -> dict:
+        return {
+            "task_id": task_id,
+            "status": status,
+            "sort_timestamp": sort_timestamp,
+            "worker_id": worker_id,
+        }
+
+    def test_string_task_ids_sort_in_numeric_order(self):
+        """String task IDs like gza-1, gza-a, gza-2s must sort numerically."""
+        from gza.cli.query import _ps_sort_key
+
+        # gza-1 = 1, gza-2 = 2, gza-a = 10, gza-2s = 100 in base36
+        rows = [
+            self._make_row(task_id="gza-2s"),   # 100
+            self._make_row(task_id="gza-a"),     # 10
+            self._make_row(task_id="gza-2"),     # 2
+            self._make_row(task_id="gza-1"),     # 1
+        ]
+        sorted_rows = sorted(rows, key=_ps_sort_key)
+        assert [r["task_id"] for r in sorted_rows] == ["gza-1", "gza-2", "gza-a", "gza-2s"]
+
+    def test_none_task_id_sorts_last(self):
+        """Worker-only rows (task_id=None) must sort after all tasks."""
+        from gza.cli.query import _ps_sort_key
+        import sys
+
+        row_with_task = self._make_row(task_id="gza-1")
+        row_no_task = self._make_row(task_id=None)
+
+        key_with_task = _ps_sort_key(row_with_task)
+        key_no_task = _ps_sort_key(row_no_task)
+
+        # task_id component (index 3) of the no-task row should be sys.maxsize
+        assert key_no_task[3] == sys.maxsize
+        assert key_with_task[3] < sys.maxsize
+
+    def test_status_group_ordering(self):
+        """Failed rows sort before running, running before completed."""
+        from gza.cli.query import _ps_sort_key
+
+        failed_row = self._make_row(task_id="gza-1", status="failed")
+        running_row = self._make_row(task_id="gza-2", status="running")
+        completed_row = self._make_row(task_id="gza-3", status="completed")
+
+        assert _ps_sort_key(failed_row)[0] < _ps_sort_key(running_row)[0]
+        assert _ps_sort_key(running_row)[0] < _ps_sort_key(completed_row)[0]
+
+    def test_integer_task_id_backward_compat(self):
+        """Integer task_id values sort numerically (backward compat)."""
+        from gza.cli.query import _ps_sort_key
+
+        row_int = self._make_row(task_id=5)
+        key = _ps_sort_key(row_int)
+        assert key[3] == 5

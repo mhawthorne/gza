@@ -157,7 +157,7 @@ class PromptBuilder:
     def resume_prompt(
         self,
         *,
-        task_id: int | None = None,
+        task_id: str | None = None,
         task_slug: str | None = None,
         report_path: Path | None = None,
     ) -> str:
@@ -204,7 +204,7 @@ class PromptBuilder:
             diff_stat=diff_stat,
         )
 
-    def improve_task_prompt(self, task_id: int, review_id: int) -> str:
+    def improve_task_prompt(self, task_id: str, review_id: str) -> str:
         """Build the prompt for an improve task.
 
         Args:
@@ -217,7 +217,7 @@ class PromptBuilder:
         return f"Improve implementation of task #{task_id} based on review #{review_id}"
 
     def review_task_prompt(
-        self, impl_task_id: int, impl_prompt: str | None = None
+        self, impl_task_id: str, impl_prompt: str | None = None
     ) -> str:
         """Build the prompt for a review task.
 

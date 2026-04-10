@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -23,7 +24,7 @@ from ..console import (
     MAX_PROMPT_DISPLAY,
     truncate,
 )
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import ManualMigrationRequired, SqliteTaskStore, Task as DbTask, resolve_task_id, task_id_numeric_key
 from ..prompts import PromptBuilder
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
@@ -36,8 +37,48 @@ from ..workers import WorkerMetadata, WorkerRegistry
 
 
 def get_store(config: Config) -> SqliteTaskStore:
-    """Get the SQLite task store."""
-    return SqliteTaskStore(config.db_path)
+    """Get the SQLite task store.
+
+    Raises:
+        ManualMigrationRequired: If the DB needs a manual schema upgrade.
+            Callers should run ``gza migrate`` to fix this.
+    """
+    return SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+
+
+def resolve_id(config: Config, arg: str) -> str:
+    """Resolve a user-supplied task ID argument to a canonical string ID.
+
+    Wraps :func:`gza.db.resolve_task_id` using the project prefix from config.
+    """
+    return resolve_task_id(arg, config.project_prefix)
+
+
+# Matches "{prefix}-{base36_suffix}" where prefix is 1-12 lowercase alphanumeric chars.
+# This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
+_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[a-z0-9]+$")
+
+
+def _looks_like_task_id(arg: str) -> bool:
+    """Return True if *arg* looks like a task ID rather than a branch name.
+
+    Matches three forms:
+    - Bare decimal integer, e.g. ``"42"`` (legacy backward-compat)
+    - Bare base36 suffix, e.g. ``"3f"`` (alphanumeric containing at least one digit)
+    - Prefixed ID, e.g. ``"gza-3f"`` (lowercase-alphanumeric prefix ≤12 chars, then ``-``,
+      then base36 suffix) — rejects branch names like ``"feature-add-logging"``
+
+    The bare base36 form is intentionally permissive: short alphanumeric branch names
+    like ``"v2"`` or ``"hotfix3"`` also match.  This is safe because callers such as
+    ``cmd_checkout`` and ``cmd_diff`` fall back to treating the argument as a branch
+    name when ``store.get()`` returns None.  Do not tighten this heuristic without
+    preserving that fallback path.
+    """
+    if arg.isdigit():
+        return True
+    if arg.isalnum() and not arg.isalpha():
+        return True
+    return bool(_TASK_ID_RE.match(arg))
 
 
 def _branch_has_commits(config: Config, branch: str | None) -> bool:
@@ -63,6 +104,9 @@ def reconcile_in_progress_tasks(config: Config) -> None:
     """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
     try:
         store = get_store(config)
+    except ManualMigrationRequired:
+        # DB needs gza migrate — skip reconciliation silently
+        return
     except (sqlite3.Error, OSError, ValueError) as exc:
         print(f"Warning: Skipping task reconciliation due to setup error: {exc}", file=sys.stderr)
         return
@@ -184,7 +228,7 @@ def _spawn_detached_worker_process(
 
 def _run_foreground(
     config: Config,
-    task_id: int | None,
+    task_id: str | None,
     resume: bool = False,
     open_after: bool = False,
 ) -> int:
@@ -236,7 +280,7 @@ def _run_foreground(
         signal.signal(signal.SIGTERM, original_sigterm)
 
 
-def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: int | None = None, quiet: bool = False) -> int:
+def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: str | None = None, quiet: bool = False) -> int:
     """Spawn a background worker process.
 
     Args:
@@ -526,7 +570,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         return 1
 
 
-def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: int, quiet: bool = False) -> int:
+def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: str, quiet: bool = False) -> int:
     """Spawn a background worker to run a resume task.
 
     Args:
@@ -602,7 +646,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
 
 def _create_rebase_task(
     store: SqliteTaskStore,
-    parent_task_id: int,
+    parent_task_id: str,
     branch: str,
     target_branch: str,
 ) -> DbTask:
@@ -809,7 +853,7 @@ def _format_lineage(
     def _lineage_time(task: DbTask) -> datetime:
         return task.completed_at or task.created_at or datetime.min
 
-    latest_review_task_id: int | None = None
+    latest_review_task_id: str | None = None
     if annotate:
         review_tasks: list[DbTask] = []
 
@@ -825,7 +869,7 @@ def _format_lineage(
                 review_tasks,
                 key=lambda task: (
                     _normalize_time(_lineage_time(task)),
-                    task.id if task.id is not None else -1,
+                    task_id_numeric_key(task.id),
                 ),
             )
             latest_review_task_id = latest_review.id
