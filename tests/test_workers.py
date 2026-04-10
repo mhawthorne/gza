@@ -22,7 +22,7 @@ def test_worker_metadata_serialization():
     worker = WorkerMetadata(
         worker_id="w-20260107-123456",
         pid=12345,
-        task_id="gza-000001",
+        task_id="gza-1",
         task_slug="20260107-test-task",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -65,7 +65,7 @@ def test_registry_register_and_get(temp_workers_dir):
     worker = WorkerMetadata(
         worker_id="w-test-001",
         pid=12345,
-        task_id="gza-000001",
+        task_id="gza-1",
         task_slug="20260107-test",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -98,7 +98,7 @@ def test_registry_update(temp_workers_dir):
     worker = WorkerMetadata(
         worker_id="w-test-002",
         pid=12346,
-        task_id="gza-000002",
+        task_id="gza-2",
         task_slug="20260107-test-2",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -153,7 +153,7 @@ def test_registry_list_filter_completed(temp_workers_dir):
     running = WorkerMetadata(
         worker_id="w-running",
         pid=10001,
-        task_id="gza-000001",
+        task_id="gza-1",
         task_slug="20260107-running",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -166,7 +166,7 @@ def test_registry_list_filter_completed(temp_workers_dir):
     completed = WorkerMetadata(
         worker_id="w-completed",
         pid=10002,
-        task_id="gza-000002",
+        task_id="gza-2",
         task_slug="20260107-completed",
         started_at=datetime.now(UTC).isoformat(),
         status="completed",
@@ -190,7 +190,7 @@ def test_registry_list_filter_completed(temp_workers_dir):
 def test_registry_list_all_ignores_entries_without_pid(temp_workers_dir):
     """Malformed metadata without pid should be ignored."""
     registry = WorkerRegistry(temp_workers_dir)
-    (temp_workers_dir / "w-bad-missing-pid.json").write_text('{"worker_id": "w-bad-missing-pid", "task_id": "gza-000001"}')
+    (temp_workers_dir / "w-bad-missing-pid.json").write_text('{"worker_id": "w-bad-missing-pid", "task_id": "gza-1"}')
 
     workers = registry.list_all(include_completed=True)
     assert workers == []
@@ -199,7 +199,7 @@ def test_registry_list_all_ignores_entries_without_pid(temp_workers_dir):
 def test_registry_list_all_ignores_entries_with_zero_pid(temp_workers_dir):
     """Non-positive pid metadata should be ignored."""
     registry = WorkerRegistry(temp_workers_dir)
-    (temp_workers_dir / "w-bad-zero-pid.json").write_text('{"worker_id": "w-bad-zero-pid", "task_id": "gza-000001", "pid": 0}')
+    (temp_workers_dir / "w-bad-zero-pid.json").write_text('{"worker_id": "w-bad-zero-pid", "task_id": "gza-1", "pid": 0}')
 
     workers = registry.list_all(include_completed=True)
     assert workers == []
@@ -215,7 +215,7 @@ def test_registry_is_running(temp_workers_dir):
     worker = WorkerMetadata(
         worker_id="w-test-running",
         pid=my_pid,
-        task_id="gza-000001",
+        task_id="gza-1",
         task_slug="20260107-test",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -231,7 +231,7 @@ def test_registry_is_running(temp_workers_dir):
     fake_worker = WorkerMetadata(
         worker_id="w-test-fake",
         pid=999999,  # Very unlikely to be a real PID
-        task_id="gza-000002",
+        task_id="gza-2",
         task_slug="20260107-fake",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -251,7 +251,7 @@ def test_registry_mark_completed(temp_workers_dir):
     worker = WorkerMetadata(
         worker_id="w-test-complete",
         pid=12347,
-        task_id="gza-000003",
+        task_id="gza-3",
         task_slug="20260107-complete",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -281,7 +281,7 @@ def test_registry_remove(temp_workers_dir):
     worker = WorkerMetadata(
         worker_id="w-test-remove",
         pid=12348,
-        task_id="gza-000004",
+        task_id="gza-4",
         task_slug="20260107-remove",
         started_at=datetime.now(UTC).isoformat(),
         status="running",
@@ -312,7 +312,7 @@ def test_registry_remove_deletes_startup_log_artifact(temp_workers_dir):
     worker = WorkerMetadata(
         worker_id="w-test-remove-startup",
         pid=12349,
-        task_id="gza-000005",
+        task_id="gza-5",
         task_slug="20260107-remove-startup",
         started_at=datetime.now(UTC).isoformat(),
         status="failed",
@@ -336,7 +336,7 @@ def test_registry_remove_rejects_absolute_path_outside_workers_dir(temp_workers_
     worker = WorkerMetadata(
         worker_id="w-test-abs-escape",
         pid=12350,
-        task_id="gza-000006",
+        task_id="gza-6",
         task_slug="20260107-abs-escape",
         started_at=datetime.now(UTC).isoformat(),
         status="failed",
@@ -360,7 +360,7 @@ def test_registry_remove_rejects_traversal_path(temp_workers_dir, tmp_path):
     worker = WorkerMetadata(
         worker_id="w-test-traversal",
         pid=12351,
-        task_id="gza-000007",
+        task_id="gza-7",
         task_slug="20260107-traversal",
         started_at=datetime.now(UTC).isoformat(),
         status="failed",
@@ -383,7 +383,7 @@ def test_registry_remove_deletes_valid_startup_log_under_workers_dir(temp_worker
     worker = WorkerMetadata(
         worker_id="w-test-valid",
         pid=12352,
-        task_id="gza-000008",
+        task_id="gza-8",
         task_slug="20260107-valid",
         started_at=datetime.now(UTC).isoformat(),
         status="failed",
@@ -405,7 +405,7 @@ def test_registry_cleanup_stale(temp_workers_dir):
     stale_worker = WorkerMetadata(
         worker_id="w-test-stale",
         pid=999998,  # Fake PID
-        task_id="gza-000005",
+        task_id="gza-5",
         task_slug="20260107-stale",
         started_at=datetime.now(UTC).isoformat(),
         status="running",

@@ -994,7 +994,7 @@ gza refresh [task_id] [options]
 
 ### migrate
 
-Run pending manual database migrations. Currently handles the v25 migration that converts INTEGER primary keys to project-prefixed base36 TEXT IDs (e.g. `gza-1a2b`).
+Run pending manual database migrations. This includes v25 (INTEGER primary keys to project-prefixed base36 TEXT IDs) and v26 (base36 TEXT IDs to project-prefixed decimal IDs like `gza-1234`).
 
 ```bash
 gza migrate [--status] [--dry-run] [--yes/-y]
@@ -1006,11 +1006,11 @@ gza migrate [--status] [--dry-run] [--yes/-y]
 | `--dry-run` | Preview what the migration would change without writing any data |
 | `--yes`, `-y` | Skip the confirmation prompt and run migrations immediately |
 
-When run without flags, `gza migrate` prompts for confirmation before applying the migration. The migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup at `<db_path>.backup.pre-v25.db`. It is safe to re-run: calling it on an already-migrated database is a no-op.
+When run without flags, `gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
 
 On successful migration, the backup path is printed to stdout so you can locate it for rollback if needed.
 
-Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`). After the v25 migration, the sequence is seeded at the previous maximum integer ID, so the first post-migration task gets `{prefix}-{base36(max_id + 1)}`.
+Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`) and are variable-length decimal (`{prefix}-{n}`).
 
 Task ID validation is format-based (`{prefix}-{base36}`) and does not require the prefix to match your current `project_prefix`. A mismatched but valid full ID is accepted by parsing and then fails later as "not found" if it does not exist in the current project database.
 

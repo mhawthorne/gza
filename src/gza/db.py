@@ -25,7 +25,9 @@ __all__ = [
     "SqliteTaskStore",
     "extract_failure_reason",
     "run_v25_migration",
+    "run_v26_migration",
     "preview_v25_migration",
+    "preview_v26_migration",
     "check_migration_status",
     "resolve_task_id",
     "task_id_numeric_key",
@@ -52,53 +54,44 @@ class InvalidTaskIdError(ValueError):
     """Raised when a user-supplied task ID is not a full prefixed ID."""
 
 
-def _encode_base36(n: int, width: int = _TASK_ID_SEQ_WIDTH) -> str:
-    """Encode a non-negative integer to a zero-padded base-36 string.
-
-    Padded to ``width`` characters (default 6) so task IDs have fixed width
-    and sort correctly as plain strings.  Pass ``width=0`` to disable padding.
-    """
+def _encode_v25_base36(n: int) -> str:
+    """Encode integer IDs the same way v25 migration encoded them."""
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    width = 6
     if n < 0:
         raise ValueError("n must be non-negative")
     if n == 0:
-        return "0".zfill(width) if width else "0"
+        return "0".zfill(width)
     result: list[str] = []
     while n > 0:
-        result.append(_B36_CHARS[n % 36])
+        result.append(chars[n % 36])
         n //= 36
-    encoded = "".join(reversed(result))
-    return encoded.zfill(width) if width else encoded
-
-
-def _decode_base36(s: str) -> int:
-    """Decode a base-36 string to an integer (handles leading zeros)."""
-    return int(s, 36)
+    return "".join(reversed(result)).zfill(width)
 
 
 def task_id_numeric_key(task_id: str | None) -> int:
     """Return an integer sort key for a task ID that preserves creation order.
 
-    Task IDs are ``{prefix}-{base36_seq}`` (e.g. ``"gza-0001a2"``).  With
-    fixed-width zero-padded suffixes string sort already matches numeric
-    order, but this helper remains useful for mixed/legacy data where
-    unpadded suffixes may exist alongside padded ones.
+    Task IDs are ``{prefix}-{decimal_seq}`` (e.g. ``"gza-1234"``). String sort
+    does not match numeric order for variable-width decimal IDs
+    (``gza-10`` vs ``gza-2``), so callers should sort via this helper.
 
     Returns 0 for ``None``, empty, or IDs without a hyphen (e.g. legacy bare
-    integers stored as strings), and 0 for suffixes that fail base-36 parsing.
+    integers stored as strings), and 0 for suffixes that fail decimal parsing.
     """
     if not task_id or "-" not in task_id:
         return 0
     suffix = task_id.rsplit("-", 1)[-1]
     try:
-        return int(suffix, 36)
+        return int(suffix)
     except ValueError:
         return 0
 
 
 class ManualMigrationRequired(Exception):
-    """Raised when the DB needs a manual schema migration (e.g. v25).
+    """Raised when the DB needs a manual schema migration (e.g. v25/v26).
 
-    Callers should run ``gza migrate`` (or call :func:`run_v25_migration`)
+    Callers should run ``gza migrate`` (or call the relevant manual migration)
     and then re-open the store.
     """
 
@@ -153,7 +146,7 @@ def _compute_percentiles(values: list[float]) -> dict | None:
 @dataclass
 class Task:
     """A task in the database."""
-    id: str | None  # None for unsaved tasks; project-prefixed base36 (e.g. "gza-1a2b")
+    id: str | None  # None for unsaved tasks; project-prefixed decimal (e.g. "gza-1234")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
     task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
@@ -229,7 +222,7 @@ class TaskStats:
 class TaskCycle:
     """A cycle of review/improve iterations for an implementation task."""
     id: int  # Internal integer PK (not exposed to users)
-    implementation_task_id: str  # References tasks.id (project-prefixed base36)
+    implementation_task_id: str  # References tasks.id (project-prefixed decimal)
     status: str  # active | approved | maxed_out | blocked
     max_iterations: int
     started_at: datetime
@@ -243,9 +236,9 @@ class TaskCycleIteration:
     id: int  # Internal integer PK
     cycle_id: int  # References task_cycles.id (internal integer)
     iteration_index: int
-    review_task_id: str | None  # References tasks.id (project-prefixed base36)
+    review_task_id: str | None  # References tasks.id (project-prefixed decimal)
     review_verdict: str | None
-    improve_task_id: str | None  # References tasks.id (project-prefixed base36)
+    improve_task_id: str | None  # References tasks.id (project-prefixed decimal)
     state: str  # review_created | review_completed | improve_created | improve_completed | terminal
     started_at: datetime
     ended_at: datetime | None
@@ -275,11 +268,11 @@ MIGRATION_V22_TO_V23 = "ALTER TABLE tasks ADD COLUMN running_pid INTEGER;"
 MIGRATION_V23_TO_V24 = "ALTER TABLE tasks ADD COLUMN merged_at TEXT;"
 
 # Schema version for migrations
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
-_MANUAL_MIGRATION_VERSIONS: frozenset[int] = frozenset({25})
+_MANUAL_MIGRATION_VERSIONS: frozenset[int] = frozenset({25, 26})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -594,7 +587,7 @@ class StepRef:
     """Opaque step reference used when writing substeps/finalization."""
 
     id: int
-    run_id: str  # References tasks.id (project-prefixed base36)
+    run_id: str  # References tasks.id (project-prefixed decimal)
     step_index: int
     step_id: str
 
@@ -604,7 +597,7 @@ class RunStep:
     """Persisted top-level message step for a run."""
 
     id: int
-    run_id: str  # References tasks.id (project-prefixed base36)
+    run_id: str  # References tasks.id (project-prefixed decimal)
     step_index: int
     step_id: str
     provider: str
@@ -623,7 +616,7 @@ class RunSubstep:
     """Persisted substep/tool event under a top-level message step."""
 
     id: int
-    run_id: str  # References tasks.id (project-prefixed base36)
+    run_id: str  # References tasks.id (project-prefixed decimal)
     step_id: int
     substep_index: int
     substep_id: str
@@ -688,7 +681,8 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (22, MIGRATION_V21_TO_V22),
     (23, MIGRATION_V22_TO_V23),
     (24, MIGRATION_V23_TO_V24),
-    (25, None),  # Manual migration: INTEGER PK → TEXT base36 IDs (run via 'gza migrate')
+    (25, None),  # Manual migration: INTEGER PK → TEXT IDs
+    (26, None),  # Manual migration: base36-text IDs → decimal-text IDs
 ]
 
 
@@ -716,8 +710,8 @@ class SqliteTaskStore:
         """Ensure database exists and schema is current.
 
         Raises:
-            ManualMigrationRequired: When the DB needs a manual migration (e.g. v25).
-                The caller should run :func:`run_v25_migration` then re-open the store.
+            ManualMigrationRequired: When the DB needs a manual migration (e.g. v25/v26).
+                The caller should run ``gza migrate`` then re-open the store.
         """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -726,7 +720,7 @@ class SqliteTaskStore:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
             )
             if cur.fetchone() is None:
-                # Fresh database - create full v25 schema directly
+                # Fresh database - create full current schema directly
                 conn.executescript(SCHEMA)
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
             else:
@@ -873,7 +867,7 @@ class SqliteTaskStore:
     # === Task CRUD ===
 
     def _next_id(self, conn: sqlite3.Connection) -> str:
-        """Allocate the next project-prefixed base36 task ID (within an open connection).
+        """Allocate the next project-prefixed decimal task ID (within an open connection).
 
         Uses a single RETURNING statement so the increment and read are atomic —
         no concurrent writer can observe the same sequence value.
@@ -882,7 +876,7 @@ class SqliteTaskStore:
         # RETURNING returns 1 directly — no increment — so the first task is
         # {prefix}-1, not {prefix}-0.
         # ON CONFLICT path (row already exists): increments and returns the new
-        # value.  After v25 migration the row is seeded at max_old_int_id, so
+        # value. After v25/v26 migrations the row is seeded to preserve continuity, so
         # the first post-migration task gets max_old_int_id + 1.
         cur = conn.execute(
             "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, 1) "
@@ -891,7 +885,7 @@ class SqliteTaskStore:
             (self._prefix,),
         )
         seq = int(cur.fetchone()["next_seq"])
-        return f"{self._prefix}-{_encode_base36(seq)}"
+        return f"{self._prefix}-{seq}"
 
     def add(
         self,
@@ -927,7 +921,7 @@ class SqliteTaskStore:
             return result
 
     def get(self, task_id: str) -> Task | None:
-        """Get a task by its string ID (e.g. 'gza-1a2b')."""
+        """Get a task by its string ID (e.g. 'gza-1234')."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
             row = cur.fetchone()
@@ -2679,7 +2673,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
     3. Convert old integer IDs to ``{prefix}-{base36(id)}``
     4. Rename the ``task_id`` column to ``slug``
     5. Populate ``project_sequences`` from the highest integer ID seen
-    6. Update schema_version to 25
+    6. Update schema_version to 25 (v26 may run afterwards)
 
     This is idempotent if called on an already-v25 database.
 
@@ -2707,10 +2701,11 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
             row = cur.fetchone()
             current = row["version"] if row else 0
 
-        if current == SCHEMA_VERSION:
+        target_version = 25
+        if current == target_version:
             return  # Already up-to-date
-        if current > SCHEMA_VERSION:
-            raise RuntimeError(f"DB is at v{current}, newer than v{SCHEMA_VERSION}")
+        if current > target_version:
+            raise RuntimeError(f"DB is at v{current}, newer than v{target_version}")
         if current < 24 and current != 0:
             raise RuntimeError(
                 f"DB is at v{current}. Auto-migrate to v24 first by opening the store."
@@ -2727,7 +2722,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 return None
             if isinstance(old_id, str):
                 return old_id  # Already a prefixed string ID (idempotent)
-            return f"{prefix}-{_encode_base36(old_id)}"
+            return f"{prefix}-{_encode_v25_base36(old_id)}"
 
         conn.execute("BEGIN")
 
@@ -3030,7 +3025,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)
                     logger.debug("v25 migration: could not create index (table may not exist): %s", stmt[:60])
 
         # --- update schema version ---
-        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+        conn.execute("UPDATE schema_version SET version = ?", (target_version,))
 
         conn.execute("COMMIT")
         logger.info("v25 migration complete: %s", db_path)
@@ -3038,6 +3033,149 @@ CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)
         conn.execute("ROLLBACK")
         raise
     finally:
+        conn.close()
+
+
+def run_v26_migration(db_path: Path) -> None:
+    """Migrate database from v25 (base36 text IDs) to v26 (decimal text IDs).
+
+    This migration is a pure ID-string rewrite across all task-ID columns.
+    It is idempotent on v26 databases.
+    """
+    import shutil
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    foreign_keys_original = 1
+    in_transaction = False
+    try:
+        cur = conn.execute("PRAGMA foreign_keys")
+        row = cur.fetchone()
+        foreign_keys_original = int(row[0]) if row is not None else 1
+
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        )
+        if cur.fetchone() is None:
+            current = 0
+        else:
+            cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+            row = cur.fetchone()
+            current = row["version"] if row else 0
+
+        target_version = 26
+        if current == target_version:
+            return
+        if current != 25:
+            raise RuntimeError(
+                f"v26 migration requires DB at v25; found v{current}. Run prior migrations first."
+            )
+
+        backup_path = db_path.with_suffix(".backup.pre-v26.db")
+        if not backup_path.exists():
+            shutil.copy2(db_path, backup_path)
+            logger.info("v26 migration: backup written to %s", backup_path)
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN")
+        in_transaction = True
+
+        conn.execute("DROP TABLE IF EXISTS _v26_task_id_map")
+        conn.execute("""
+            CREATE TEMP TABLE _v26_task_id_map (
+                old_id TEXT PRIMARY KEY,
+                new_id TEXT NOT NULL UNIQUE
+            )
+        """)
+
+        cur = conn.execute("SELECT id FROM tasks")
+        prefix_to_max: dict[str, int] = {}
+        for row in cur.fetchall():
+            old_id = row["id"]
+            if not isinstance(old_id, str) or "-" not in old_id:
+                raise RuntimeError(f"Invalid task ID for v26 migration: {old_id!r}")
+            prefix, old_suffix = old_id.rsplit("-", 1)
+            decoded = _decode_base36(old_suffix)
+            new_id = f"{prefix}-{decoded}"
+            conn.execute(
+                "INSERT INTO _v26_task_id_map (old_id, new_id) VALUES (?, ?)",
+                (old_id, new_id),
+            )
+            prefix_to_max[prefix] = max(prefix_to_max.get(prefix, 0), decoded)
+
+        # Rewrite all FK/reference columns first, then the tasks PK.
+        conn.execute("""
+            UPDATE tasks
+            SET based_on = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = tasks.based_on)
+            WHERE based_on IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE tasks
+            SET depends_on = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = tasks.depends_on)
+            WHERE depends_on IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE task_cycles
+            SET implementation_task_id = (
+                SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = task_cycles.implementation_task_id
+            )
+            WHERE implementation_task_id IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE task_cycle_iterations
+            SET review_task_id = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = task_cycle_iterations.review_task_id)
+            WHERE review_task_id IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE task_cycle_iterations
+            SET improve_task_id = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = task_cycle_iterations.improve_task_id)
+            WHERE improve_task_id IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE run_steps
+            SET run_id = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = run_steps.run_id)
+            WHERE run_id IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE run_substeps
+            SET run_id = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = run_substeps.run_id)
+            WHERE run_id IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+        conn.execute("""
+            UPDATE tasks
+            SET id = (SELECT m.new_id FROM _v26_task_id_map m WHERE m.old_id = tasks.id)
+            WHERE id IN (SELECT old_id FROM _v26_task_id_map)
+        """)
+
+        # Heal project_sequences if it drifted from decoded task IDs.
+        for prefix, max_decoded in prefix_to_max.items():
+            desired_next_seq = max_decoded
+            cur = conn.execute(
+                "SELECT next_seq FROM project_sequences WHERE prefix = ?",
+                (prefix,),
+            )
+            row = cur.fetchone()
+            existing = int(row["next_seq"]) if row is not None else None
+            if existing != desired_next_seq:
+                conn.execute(
+                    "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, ?) "
+                    "ON CONFLICT(prefix) DO UPDATE SET next_seq = excluded.next_seq",
+                    (prefix, desired_next_seq),
+                )
+
+        conn.execute("UPDATE schema_version SET version = ?", (target_version,))
+        conn.execute("COMMIT")
+        in_transaction = False
+        logger.info("v26 migration complete: %s", db_path)
+    except Exception:
+        if in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        try:
+            conn.execute(f"PRAGMA foreign_keys = {foreign_keys_original}")
+        except Exception:
+            pass
         conn.close()
 
 
@@ -3112,7 +3250,8 @@ def preview_v25_migration(
         except sqlite3.OperationalError:
             current_version = 0
 
-        if current_version >= SCHEMA_VERSION:
+        target_version = 25
+        if current_version >= target_version:
             # Already migrated — no integer IDs remain to convert.
             try:
                 cur2 = conn.execute("SELECT COUNT(*) AS cnt FROM tasks")
@@ -3128,7 +3267,7 @@ def preview_v25_migration(
             }
 
         def _format_sample(old_id: int) -> tuple[int, str]:
-            return (old_id, f"{prefix}-{_encode_base36(old_id)}")
+            return (old_id, f"{prefix}-{_encode_v25_base36(old_id)}")
 
         try:
             cur = conn.execute("SELECT id FROM tasks ORDER BY id ASC LIMIT ?", (sample_limit,))
@@ -3162,10 +3301,87 @@ def preview_v25_migration(
     finally:
         conn.close()
 
-    first_post = f"{prefix}-{_encode_base36(max_id + 1)}" if max_id else f"{prefix}-{_encode_base36(1)}"
+    first_post = (
+        f"{prefix}-{_encode_v25_base36(max_id + 1)}"
+        if max_id
+        else f"{prefix}-{_encode_v25_base36(1)}"
+    )
     return {
         "task_count": task_count,
         "samples": samples_raw,
         "random_samples": random_samples_raw,
         "first_post_migration_id": first_post,
     }
+
+
+class _MigrationV26Preview(TypedDict):
+    task_count: int
+    samples: list[tuple[str, str]]
+    random_samples: list[tuple[str, str]]
+
+
+def preview_v26_migration(
+    db_path: Path,
+    sample_limit: int = 10,
+    random_sample_limit: int = 10,
+) -> _MigrationV26Preview:
+    """Return a preview of v26 ID rewrites (base36 text IDs -> decimal IDs)."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            )
+            if cur.fetchone() is not None:
+                cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+                row = cur.fetchone()
+                current_version = row["version"] if row else 0
+            else:
+                current_version = 0
+        except sqlite3.OperationalError:
+            current_version = 0
+
+        if current_version != 25:
+            try:
+                cur2 = conn.execute("SELECT COUNT(*) AS cnt FROM tasks")
+                row2 = cur2.fetchone()
+                task_count = row2["cnt"] if row2 else 0
+            except sqlite3.OperationalError:
+                task_count = 0
+            return {
+                "task_count": task_count,
+                "samples": [],
+                "random_samples": [],
+            }
+
+        def _convert(old_id: str) -> tuple[str, str]:
+            prefix, suffix = old_id.rsplit("-", 1)
+            return (old_id, f"{prefix}-{_decode_base36(suffix)}")
+
+        cur = conn.execute("SELECT id FROM tasks ORDER BY id ASC LIMIT ?", (sample_limit,))
+        first_rows = [row["id"] for row in cur.fetchall() if isinstance(row["id"], str)]
+        samples = [_convert(old_id) for old_id in first_rows]
+
+        random_samples: list[tuple[str, str]] = []
+        if first_rows and random_sample_limit > 0:
+            cur2 = conn.execute(
+                "SELECT id FROM tasks WHERE id NOT IN (SELECT id FROM tasks ORDER BY id ASC LIMIT ?) "
+                "ORDER BY RANDOM() LIMIT ?",
+                (sample_limit, random_sample_limit),
+            )
+            random_ids = sorted(
+                row["id"] for row in cur2.fetchall() if isinstance(row["id"], str)
+            )
+            random_samples = [_convert(old_id) for old_id in random_ids]
+
+        cur3 = conn.execute("SELECT COUNT(*) AS cnt FROM tasks")
+        row3 = cur3.fetchone()
+        task_count = row3["cnt"] if row3 else 0
+        return {
+            "task_count": task_count,
+            "samples": samples,
+            "random_samples": random_samples,
+        }
+    finally:
+        conn.close()

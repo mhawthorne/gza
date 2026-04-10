@@ -54,7 +54,7 @@ def resolve_id(config: Config, arg: str) -> str:
     return resolve_task_id(arg, config.project_prefix)
 
 
-# Matches "{prefix}-{base36_suffix}" where prefix is 1-12 lowercase alphanumeric chars.
+# Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[a-z0-9]+$")
 

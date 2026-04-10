@@ -15,7 +15,7 @@ gza next                  # List pending tasks
 gza history [--incomplete]  # List recent/failed/unmerged tasks
 gza advance               # Progress unmerged tasks through lifecycle
 gza lineage <id>          # Show task's ancestor/descendant tree
-gza migrate [--status]    # Run manual DB migrations (e.g. v25 integer→text PKs)
+gza migrate [--status]    # Run manual DB migrations (e.g. v25/v26 task-ID migrations)
 ```
 
 See `docs/` for detailed documentation:
@@ -49,7 +49,7 @@ See `docs/` for detailed documentation:
 
 ## Architecture
 
-Tasks are stored in SQLite (`.gza/gza.db`). `db.Task` is the single canonical task model/storage API. Task IDs are project-prefixed base36 strings (e.g. `gza-1a2b`). Migration v25 converted integer PKs to this format; existing DBs must run `gza migrate` once. `ManualMigrationRequired` is raised on open when the migration is pending.
+Tasks are stored in SQLite (`.gza/gza.db`). `db.Task` is the single canonical task model/storage API. Task IDs are project-prefixed variable-length decimal strings (e.g. `gza-1234`). Existing DBs may require manual migrations (`gza migrate`) for v25/v26 transitions. `ManualMigrationRequired` is raised on open when a manual migration is pending.
 
 Key modules: `src/gza/db.py` (storage), `src/gza/cli/` (CLI), `src/gza/runner.py` (execution), `src/gza/config.py` (config).
 
@@ -69,7 +69,7 @@ Edit skills in `src/gza/skills/`, never in `.claude/skills/` (installed artifact
 
 ## Config Fields (new/notable)
 
-- `project_prefix` — prefix for generated task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs). Defaults to `project_name`. Task IDs take the form `{prefix}-{base36_seq}` (e.g. `gza-1a2b`). Also affects `task.slug`: `YYYYMMDD-{prefix}-{slug}`. See [docs/configuration.md](docs/configuration.md).
+- `project_prefix` — prefix for generated task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs). Defaults to `project_name`. Task IDs take the form `{prefix}-{decimal_seq}` (e.g. `gza-1234`). Also affects `task.slug`: `YYYYMMDD-{prefix}-{slug}`. See [docs/configuration.md](docs/configuration.md).
 - `theme` — built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. See [docs/configuration.md](docs/configuration.md).
 - `colors` — ad-hoc dict of `field_name: rich_color_string` applied on top of `theme`; overrides always win. Allowed in `gza.local.yaml`.
 

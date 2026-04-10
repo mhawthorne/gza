@@ -1,5 +1,6 @@
 """Tests for database operations and task chaining."""
 
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -11,11 +12,12 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
-    _encode_base36,
     check_migration_status,
     preview_v25_migration,
+    preview_v26_migration,
     resolve_task_id,
     run_v25_migration,
+    run_v26_migration,
 )
 
 
@@ -297,11 +299,11 @@ class TestTaskChaining:
         # Open with SqliteTaskStore to trigger auto-migrations, then run manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Verify migration worked
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.prompt == "Old task"
         assert task.group is None  # New field should be NULL
@@ -319,18 +321,18 @@ class TestTaskMethods:
 
     def test_is_explore(self):
         """Test is_explore method."""
-        task = Task(id="gza-000001", prompt="Test", task_type="explore")
+        task = Task(id="gza-1", prompt="Test", task_type="explore")
         assert task.is_explore() is True
 
-        task = Task(id="gza-000001", prompt="Test", task_type="implement")
+        task = Task(id="gza-1", prompt="Test", task_type="implement")
         assert task.is_explore() is False
 
     def test_is_blocked(self):
         """Test is_blocked method."""
-        task = Task(id="gza-000001", prompt="Test", depends_on="gza-000005")
+        task = Task(id="gza-1", prompt="Test", depends_on="gza-5")
         assert task.is_blocked() is True
 
-        task = Task(id="gza-000001", prompt="Test", depends_on=None)
+        task = Task(id="gza-1", prompt="Test", depends_on=None)
         assert task.is_blocked() is False
 
 
@@ -425,7 +427,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         # Open with SqliteTaskStore - auto-migrates up to v24, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -436,7 +438,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved (with NULL output_content)
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.output_content is None
 
@@ -538,7 +540,7 @@ class TestTaskResume:
         # Open with SqliteTaskStore - auto-migrates up to v24, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version
@@ -549,7 +551,7 @@ class TestTaskResume:
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved (with NULL session_id)
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.session_id is None
 
@@ -726,7 +728,7 @@ class TestNumTurnsFields:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version updated
@@ -737,7 +739,7 @@ class TestNumTurnsFields:
         assert version == SCHEMA_VERSION
 
         # Verify old task migrated: num_turns_reported populated from num_turns
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.num_turns_reported == 15
         assert task.num_turns_computed is None
@@ -914,7 +916,7 @@ class TestTokenCountFields:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version updated
@@ -925,7 +927,7 @@ class TestTokenCountFields:
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved with NULL token counts
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.input_tokens is None
         assert task.output_tokens is None
@@ -1288,7 +1290,7 @@ class TestMergeStatus:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version updated
@@ -1299,7 +1301,7 @@ class TestMergeStatus:
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved with NULL merge_status
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.merge_status is None
 
@@ -1359,7 +1361,7 @@ class TestEditPromptDefaultContent:
                 content = f.read()
                 editor_content.append(content)
             # Verify the default prompt is present
-            assert "Implement plan from task gza-000016" in content
+            assert "Implement plan from task #gza-16" in content
             # Return success without modifying the file
             class Result:
                 returncode = 0
@@ -1370,15 +1372,15 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content="",
             task_type="implement",
-            based_on="gza-000016",
+            based_on="gza-16",
         )
 
         # Verify the default prompt was included in the editor
         assert len(editor_content) == 1
-        assert "Implement plan from task gza-000016" in editor_content[0]
+        assert "Implement plan from task #gza-16" in editor_content[0]
 
         # Verify the result includes the default
-        assert result == "Implement plan from task gza-000016"
+        assert result == "Implement plan from task #gza-16"
 
     def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt includes the slug in the default prompt when provided."""
@@ -1402,13 +1404,13 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content="",
             task_type="implement",
-            based_on="gza-000016",
+            based_on="gza-16",
             based_on_slug="design-feature-x",
         )
 
         assert len(editor_content) == 1
-        assert "Implement plan from task gza-000016: design-feature-x" in editor_content[0]
-        assert result == "Implement plan from task gza-000016: design-feature-x"
+        assert "Implement plan from task #gza-16: design-feature-x" in editor_content[0]
+        assert result == "Implement plan from task #gza-16: design-feature-x"
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
@@ -1433,12 +1435,12 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content="",
             task_type="plan",  # Not implement
-            based_on="gza-000016",
+            based_on="gza-16",
         )
 
         # Verify no default prompt was added for plan type
         assert len(editor_content) == 1
-        assert "Implement plan from task gza-000016" not in editor_content[0]
+        assert "Implement plan from task #gza-16" not in editor_content[0]
 
         # Verify empty result since editor was "empty"
         assert result is None
@@ -1496,7 +1498,7 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content=custom_content,
             task_type="implement",
-            based_on="gza-000016",
+            based_on="gza-16",
         )
 
         # Verify custom content is present, not the default
@@ -1762,7 +1764,7 @@ class TestFailureReasonTracking:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version updated
@@ -1773,13 +1775,13 @@ class TestFailureReasonTracking:
         assert version == SCHEMA_VERSION
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
-        failed_task = store.get("gza-000001")
+        failed_task = store.get("gza-1")
         assert failed_task is not None
         assert failed_task.status == "failed"
         assert failed_task.failure_reason == "UNKNOWN"
 
         # Verify pending task was NOT backfilled
-        pending_task = store.get("gza-000002")
+        pending_task = store.get("gza-2")
         assert pending_task is not None
         assert pending_task.status == "pending"
         assert pending_task.failure_reason is None
@@ -1936,7 +1938,7 @@ class TestDiffStats:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Check schema version updated
@@ -1947,7 +1949,7 @@ class TestDiffStats:
         assert version == SCHEMA_VERSION
 
         # Verify existing task has NULL diff stats
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.diff_files_changed is None
         assert task.diff_lines_added is None
@@ -2019,7 +2021,7 @@ class TestReviewClearedAt:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         # Verify schema version updated
@@ -2030,7 +2032,7 @@ class TestReviewClearedAt:
         assert version == SCHEMA_VERSION
 
         # Verify existing task can be retrieved with NULL review_cleared_at
-        task = store.get("gza-000001")
+        task = store.get("gza-1")
         assert task is not None
         assert task.review_cleared_at is None
 
@@ -2581,7 +2583,7 @@ class TestStepColumnsMigration:
 
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
         conn = sqlite3.connect(db_path)
@@ -2590,7 +2592,7 @@ class TestStepColumnsMigration:
         conn.close()
         assert version == SCHEMA_VERSION
 
-        migrated = store.get("gza-000001")
+        migrated = store.get("gza-1")
         assert migrated is not None
         assert migrated.num_steps_reported == 4
         assert migrated.num_steps_computed == 3
@@ -2617,7 +2619,7 @@ class TestRunStepPersistence:
         # Auto-migrations v16+ re-add run_steps/run_substeps; v25 is manual
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         SqliteTaskStore(db_path)
 
         conn = sqlite3.connect(db_path)
@@ -2808,7 +2810,7 @@ class TestRunStepPersistence:
         # Auto-migrations v16+ re-add run_steps/run_substeps; v25 is manual
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         SqliteTaskStore(db_path)
         SqliteTaskStore(db_path)  # Second open should be idempotent
 
@@ -2905,12 +2907,12 @@ class TestRunStepPersistence:
 
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         SqliteTaskStore(db_path)
 
         conn = sqlite3.connect(db_path)
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 'gza-000001'").fetchone()[0]
+        value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 'gza-1'").fetchone()[0]
         conn.close()
 
         assert version == SCHEMA_VERSION
@@ -2996,7 +2998,7 @@ class TestCycleOrchestratorSchema:
         # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         SqliteTaskStore(db_path)
 
         # Verify schema version updated
@@ -3085,7 +3087,7 @@ class TestCycleOrchestratorSchema:
         # Opening with SqliteTaskStore should run auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         SqliteTaskStore(db_path)
 
         conn = sqlite3.connect(db_path)
@@ -3557,63 +3559,47 @@ class TestGetBasedOnChildren:
         ids = [c.id for c in children]
         assert ids == [c1.id, c2.id, c3.id]
 
-    def test_chronological_order_across_base36_boundary(self, tmp_path: Path):
-        """Children spanning the seq=35→36 range sort by creation order.
-
-        With fixed-width zero-padded base36 IDs (width 6), the historical
-        single→two-char boundary no longer produces lexicographic surprises:
-        seq=35 → '{prefix}-00000z' and seq=36 → '{prefix}-000010' sort in the
-        expected numeric order as plain strings.  This test remains as a
-        regression guard: if someone ever drops the padding, ordering here
-        would regress.
-        """
+    def test_chronological_order_across_decimal_width_boundary(self, tmp_path: Path):
+        """Children spanning seq=9→10 remain in numeric creation order."""
         store = SqliteTaskStore(tmp_path / "test.db")
 
         # Advance the sequence counter so parent lands at seq=9
         for _ in range(8):
             store.add("filler")
 
-        parent = store.add("parent")  # seq=9 → '{prefix}-000009'
+        parent = store.add("parent")  # seq=9
         assert parent.id is not None
         prefix = parent.id.rsplit("-", 1)[0]
-        assert parent.id == f"{prefix}-000009", f"expected seq-9 parent, got {parent.id}"
+        assert parent.id == f"{prefix}-9", f"expected seq-9 parent, got {parent.id}"
 
-        # Create 27 children: seq 10…36 — crosses the seq=35→36 range where
-        # unpadded encoding would flip from 'z' (1 char) to '10' (2 chars).
+        # Create children: seq 10..36.
         children = [store.add(f"child {i}", based_on=parent.id) for i in range(27)]
 
-        # Verify the boundary task IDs are zero-padded to width 6
-        assert children[25].id == f"{prefix}-00000z", f"expected {prefix}-00000z, got {children[25].id}"
-        assert children[26].id == f"{prefix}-000010", f"expected {prefix}-000010, got {children[26].id}"
+        assert children[0].id == f"{prefix}-10", f"expected {prefix}-10, got {children[0].id}"
+        assert children[26].id == f"{prefix}-36", f"expected {prefix}-36, got {children[26].id}"
 
         result = store.get_based_on_children(parent.id)
         assert [t.id for t in result] == [t.id for t in children], (
-            "get_based_on_children returned wrong order across base36 boundary"
+            "get_based_on_children returned wrong order across decimal width boundary"
         )
 
     def test_identical_timestamps_do_not_invert_via_id_lexicographic_sort(self, tmp_path: Path):
-        """With identical created_at, ordering must not invert at the seq=35→36 range.
-
-        With fixed-width padding, ``{prefix}-00000z`` < ``{prefix}-000010`` lexicographically,
-        matching numeric order — so string-sort tie-breakers would also produce
-        correct ordering.  This test retains the created_at-based tie-break path to
-        guard against regressions if padding is ever dropped.
-        """
+        """With identical created_at, ordering must not invert at seq=9→10."""
         store = SqliteTaskStore(tmp_path / "test.db")
 
-        # Advance sequence so the next two tasks land at seq=35 and seq=36
-        for _ in range(34):
+        # Advance sequence so parent is seq=8 and children are seq=9,10.
+        for _ in range(7):
             store.add("filler")
 
-        parent = store.add("parent")  # seq=35 → '{prefix}-00000z'
+        parent = store.add("parent")  # seq=8
         assert parent.id is not None
         prefix = parent.id.rsplit("-", 1)[0]
 
-        earlier = store.add("earlier child", based_on=parent.id)  # seq=36 → '{prefix}-000010'
-        later = store.add("later child", based_on=parent.id)      # seq=37 → '{prefix}-000011'
+        earlier = store.add("earlier child", based_on=parent.id)  # seq=9
+        later = store.add("later child", based_on=parent.id)      # seq=10
 
-        assert earlier.id == f"{prefix}-000010", f"expected {prefix}-000010, got {earlier.id}"
-        assert later.id == f"{prefix}-000011", f"expected {prefix}-000011, got {later.id}"
+        assert earlier.id == f"{prefix}-9", f"expected {prefix}-9, got {earlier.id}"
+        assert later.id == f"{prefix}-10", f"expected {prefix}-10, got {later.id}"
 
         # Force identical created_at on both children — this triggers the tie-breaker scenario
         shared_ts = earlier.created_at
@@ -3622,7 +3608,7 @@ class TestGetBasedOnChildren:
 
         result = store.get_based_on_children(parent.id)
         result_ids = [t.id for t in result]
-        # Insertion order: earlier ({prefix}-000010) before later ({prefix}-000011)
+        # Insertion order: earlier ({prefix}-9) before later ({prefix}-10)
         assert result_ids == [earlier.id, later.id], (
             f"expected [{earlier.id}, {later.id}] but got {result_ids} — "
             "id ASC lexicographic tie-break may have incorrectly sorted the results"
@@ -3630,56 +3616,48 @@ class TestGetBasedOnChildren:
 
 
 class TestGetHistoryOrderByBase36Boundary:
-    """Regression tests for get_history ORDER BY correctness with TEXT IDs.
-
-    With INTEGER PKs, ORDER BY id DESC gave chronological order.  With
-    fixed-width zero-padded TEXT IDs (e.g. ``gza-00000z`` vs ``gza-000010``),
-    lexicographic order matches numeric order, so ORDER BY id DESC is correct
-    again.  We still prefer created_at DESC as the primary sort so this test
-    guards against regressions if padding is ever dropped.
-    """
+    """Regression tests for get_history ORDER BY correctness with TEXT IDs."""
 
     def test_history_orders_by_created_at_when_completed_at_tied(self, tmp_path: Path):
         """get_history uses created_at DESC as tie-breaker when completed_at values match.
 
-        ``{prefix}-000010`` (decimal 36) must sort AFTER ``{prefix}-00000z`` (decimal 35)
-        in descending order, because it was created later.  With fixed-width padding,
-        ``000010`` > ``00000z`` lexicographically too, so both ordering strategies
-        agree — but this test ensures created_at remains authoritative.
+        ``{prefix}-10`` must sort after ``{prefix}-9`` in descending order because
+        it was created later, even though plain string ordering would place ``9``
+        ahead of ``10``.
         """
         store = SqliteTaskStore(tmp_path / "test.db")
 
-        # Advance sequence to 34 so next two tasks land at seq 35 and 36
-        for _ in range(34):
+        # Advance sequence to 8 so next two tasks land at seq 9 and 10.
+        for _ in range(8):
             store.add("filler")
 
-        task_z = store.add("task at boundary z")   # seq=35 → '{prefix}-00000z'
-        task_10 = store.add("task at boundary 10") # seq=36 → '{prefix}-000010'
+        task_9 = store.add("task at boundary 9")
+        task_10 = store.add("task at boundary 10")
 
-        assert task_z.id is not None and task_10.id is not None
-        prefix = task_z.id.rsplit("-", 1)[0]
-        assert task_z.id == f"{prefix}-00000z", f"expected {prefix}-00000z, got {task_z.id}"
-        assert task_10.id == f"{prefix}-000010", f"expected {prefix}-000010, got {task_10.id}"
+        assert task_9.id is not None and task_10.id is not None
+        prefix = task_9.id.rsplit("-", 1)[0]
+        assert task_9.id == f"{prefix}-9", f"expected {prefix}-9, got {task_9.id}"
+        assert task_10.id == f"{prefix}-10", f"expected {prefix}-10, got {task_10.id}"
 
         # Complete both with the SAME completed_at so created_at is the tie-breaker
         same_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        task_z.completed_at = same_time
-        task_z.status = "completed"
-        store.update(task_z)
+        task_9.completed_at = same_time
+        task_9.status = "completed"
+        store.update(task_9)
         task_10.completed_at = same_time
         task_10.status = "completed"
         store.update(task_10)
 
         history = store.get_history(limit=None)
-        our_tasks = [t for t in history if t.id in {task_z.id, task_10.id}]
+        our_tasks = [t for t in history if t.id in {task_9.id, task_10.id}]
 
         assert len(our_tasks) == 2
-        # task_10 was created AFTER task_z → with DESC it should appear first
+        # task_10 was created after task_9, so with DESC it should appear first.
         assert our_tasks[0].id == task_10.id, (
-            f"Expected {task_10.id} (created later, seq 36) first in DESC order, "
-            f"got {our_tasks[0].id}. Buggy ORDER BY id DESC places 'z' before '10'."
+            f"Expected {task_10.id} (created later) first in DESC order, "
+            f"got {our_tasks[0].id}. Buggy ORDER BY id DESC can place '9' before '10'."
         )
-        assert our_tasks[1].id == task_z.id
+        assert our_tasks[1].id == task_9.id
 
 
 class TestGetLineageChildren:
@@ -3811,7 +3789,7 @@ class TestMigrationV19ToV20:
         # Open the store — auto-migrations, then manual v25
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
         tasks = store.get_all()
 
@@ -3896,7 +3874,7 @@ class TestMigrationV21ToV22:
 
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
         tasks = store.get_all()
 
@@ -3958,7 +3936,6 @@ class TestResolveTaskId:
     def test_uses_project_prefix(self) -> None:
         assert resolve_task_id("myapp-000001", "myapp") == "myapp-000001"
         assert resolve_task_id("other-000001", "myapp") == "other-000001"
-
 
 def _make_v24_db(db_path: "Path") -> None:
     """Create a minimal v24 database suitable for v25 migration tests.
@@ -4028,11 +4005,17 @@ def _make_v24_db(db_path: "Path") -> None:
         SqliteTaskStore(db_path)
 
 
+def _run_v25_v26_migrations(db_path: Path, prefix: str = "gza") -> None:
+    """Run the manual migration chain required for legacy DB fixtures."""
+    run_v25_migration(db_path, prefix)
+    run_v26_migration(db_path)
+
+
 class TestMigrationUtilityFunctions:
-    """Tests for check_migration_status(), preview_v25_migration(), and migration idempotency."""
+    """Tests for migration utilities and manual migration chaining."""
 
     def test_check_migration_status_on_v24_db(self, tmp_path: Path) -> None:
-        """check_migration_status on a v24 DB reports pending_manual=[25]."""
+        """check_migration_status on a v24 DB reports pending_manual=[25, 26]."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
 
@@ -4041,13 +4024,13 @@ class TestMigrationUtilityFunctions:
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
         assert status["pending_auto"] == []
-        assert status["pending_manual"] == [25]
+        assert status["pending_manual"] == [25, 26]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
         """check_migration_status on a fully-migrated DB reports no pending migrations."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
 
         status = check_migration_status(db_path)
 
@@ -4075,15 +4058,12 @@ class TestMigrationUtilityFunctions:
         preview = preview_v25_migration(db_path, "gza")
 
         assert preview["task_count"] == 3
-        # base36 encodings are zero-padded to width 6 for fixed-width sort order.
-        # Samples are (old_int, new_str) tuples — assert structure, not just strings.
         assert ("gza-000001", "gza-000001") not in preview["samples"]
         assert preview["samples"][0] == (1, "gza-000001")
         assert preview["samples"][1] == (2, "gza-000002")
         assert preview["samples"][2] == (3, "gza-000003")
         # Only 3 tasks, all consumed by the first-samples path → no random tail to sample
         assert preview["random_samples"] == []
-        # First post-migration ID = base36(3+1) = "4" → padded "000004"
         assert preview["first_post_migration_id"] == "gza-000004"
 
     def test_preview_v25_migration_includes_random_tail_samples(self, tmp_path: Path) -> None:
@@ -4116,17 +4096,19 @@ class TestMigrationUtilityFunctions:
         for old_id, new_id in preview["random_samples"]:
             assert old_id > 10, f"random sample id {old_id} should be > first_limit (10)"
             assert old_id <= 50
-            assert new_id == f"gza-{_encode_base36(old_id)}"
+            # v25 still previews canonical base36 IDs.
+            suffix = new_id.split("-", 1)[1]
+            assert int(suffix, 36) == old_id
         # No overlap between first and random samples
         first_ids = {old for old, _ in preview["samples"]}
         random_ids = {old for old, _ in preview["random_samples"]}
         assert first_ids.isdisjoint(random_ids)
 
     def test_preview_v25_migration_on_already_migrated_db(self, tmp_path: Path) -> None:
-        """preview_v25_migration on an already-v25 DB returns empty samples."""
+        """preview_v25_migration on a v26 DB returns empty samples."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
 
         preview = preview_v25_migration(db_path, "gza")
 
@@ -4144,12 +4126,12 @@ class TestMigrationUtilityFunctions:
         # Second call must not raise
         run_v25_migration(db_path, "gza")
 
-        # DB must still be openable and at the target version
-        store = SqliteTaskStore(db_path)
-        assert store is not None
+        status = check_migration_status(db_path)
+        assert status["current_version"] == 25
+        assert status["pending_manual"] == [26]
 
     def test_migration_preserves_fk_references(self, tmp_path: Path) -> None:
-        """run_v25_migration converts based_on and depends_on FK values to base36 text IDs."""
+        """Manual migrations preserve based_on and depends_on FK values."""
         import sqlite3
 
         db_path = tmp_path / "test.db"
@@ -4166,13 +4148,103 @@ class TestMigrationUtilityFunctions:
         conn.commit()
         conn.close()
 
-        run_v25_migration(db_path, "gza")
+        _run_v25_v26_migrations(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
-        parent = store.get("gza-000001")
-        child = store.get("gza-000002")
+        parent = store.get("gza-1")
+        child = store.get("gza-2")
         assert parent is not None
         assert child is not None
-        # FK columns must be base36-converted AND zero-padded to canonical width
-        assert child.based_on == "gza-000001"
-        assert child.depends_on == "gza-000001"
+        # FK columns must stay consistent after v25->v26 rewrite.
+        assert child.based_on == "gza-1"
+        assert child.depends_on == "gza-1"
+
+    def test_run_v26_migration_rewrites_base36_to_decimal(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, based_on, depends_on, created_at) VALUES (2, 'child', 1, 1, '2024-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+        run_v26_migration(db_path)
+        store = SqliteTaskStore(db_path)
+
+        parent = store.get("gza-1")
+        child = store.get("gza-2")
+        assert parent is not None
+        assert child is not None
+        assert child.based_on == "gza-1"
+        assert child.depends_on == "gza-1"
+
+    def test_run_v26_migration_idempotent_on_v26_db(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+        _run_v25_v26_migrations(db_path, "gza")
+
+        run_v26_migration(db_path)
+        status = check_migration_status(db_path)
+        assert status["current_version"] == 26
+        assert status["pending_manual"] == []
+
+    def test_run_v26_migration_rejects_v24_db(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        with pytest.raises(RuntimeError, match="requires DB at v25"):
+            run_v26_migration(db_path)
+
+    def test_preview_v26_migration_shows_samples(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+        run_v25_migration(db_path, "gza")
+
+        preview = preview_v26_migration(db_path)
+        assert preview["task_count"] >= 0
+        # For empty task sets there are no samples; when present, all convert to decimal suffixes.
+        for old_id, new_id in preview["samples"] + preview["random_samples"]:
+            assert "-" in old_id and "-" in new_id
+            assert new_id.rsplit("-", 1)[-1].isdigit()
+
+    def test_v24_to_v26_chains_via_gza_migrate(self, tmp_path: Path) -> None:
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "gza.yaml").write_text("project_name: gza\n")
+        _make_v24_db(db_path)
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, based_on, depends_on, created_at) VALUES (2, 'child', 1, 1, '2024-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--yes", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stderr
+
+        status = check_migration_status(db_path)
+        assert status["current_version"] == 26
+        assert status["pending_manual"] == []
+
+        store = SqliteTaskStore(db_path, prefix="gza")
+        child = store.get("gza-2")
+        assert child is not None
+        assert child.based_on == "gza-1"
+        assert child.depends_on == "gza-1"

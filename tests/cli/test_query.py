@@ -3785,22 +3785,21 @@ class TestPsSortKey:
         }
 
     def test_string_task_ids_sort_in_numeric_order(self):
-        """String task IDs sort numerically by decoded base36 suffix."""
+        """String task IDs sort numerically by decimal suffix."""
         from gza.cli.query import _ps_sort_key
 
-        # Padded base36: 1="000001", 2="000002", 10="00000a", 100="00002s"
         rows = [
-            self._make_row(task_id="gza-00002s"),  # 100
-            self._make_row(task_id="gza-00000a"),  # 10
-            self._make_row(task_id="gza-000002"),  # 2
-            self._make_row(task_id="gza-000001"),  # 1
+            self._make_row(task_id="gza-100"),
+            self._make_row(task_id="gza-10"),
+            self._make_row(task_id="gza-2"),  # 2
+            self._make_row(task_id="gza-1"),  # 1
         ]
         sorted_rows = sorted(rows, key=_ps_sort_key)
         assert [r["task_id"] for r in sorted_rows] == [
-            "gza-000001",
-            "gza-000002",
-            "gza-00000a",
-            "gza-00002s",
+            "gza-1",
+            "gza-2",
+            "gza-10",
+            "gza-100",
         ]
 
     def test_none_task_id_sorts_last(self):
@@ -3809,7 +3808,7 @@ class TestPsSortKey:
 
         from gza.cli.query import _ps_sort_key
 
-        row_with_task = self._make_row(task_id="gza-000001")
+        row_with_task = self._make_row(task_id="gza-1")
         row_no_task = self._make_row(task_id=None)
 
         key_with_task = _ps_sort_key(row_with_task)
@@ -3823,9 +3822,9 @@ class TestPsSortKey:
         """Failed rows sort before running, running before completed."""
         from gza.cli.query import _ps_sort_key
 
-        failed_row = self._make_row(task_id="gza-000001", status="failed")
-        running_row = self._make_row(task_id="gza-000002", status="running")
-        completed_row = self._make_row(task_id="gza-000003", status="completed")
+        failed_row = self._make_row(task_id="gza-1", status="failed")
+        running_row = self._make_row(task_id="gza-2", status="running")
+        completed_row = self._make_row(task_id="gza-3", status="completed")
 
         assert _ps_sort_key(failed_row)[0] < _ps_sort_key(running_row)[0]
         assert _ps_sort_key(running_row)[0] < _ps_sort_key(completed_row)[0]

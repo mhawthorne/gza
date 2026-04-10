@@ -48,7 +48,7 @@ class WorkerMetadata:
         if raw_task_id is None:
             task_id = None
         else:
-            # Legacy integer values become bare strings (e.g. "123"), not base36 IDs.
+            # Legacy integer values become bare strings (e.g. "123"), not prefixed IDs.
             # Workers are ephemeral; callers resolve via resolve_task_id if needed.
             task_id = str(raw_task_id)
 

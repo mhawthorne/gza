@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Compiled regex for validating project_prefix values.
 # Only lowercase alphanumeric — no hyphens, since the hyphen is the separator
-# between prefix and base36 suffix in task IDs (e.g., "gza-3f").
+# between prefix and numeric suffix in task IDs (e.g., "gza-42").
 _PREFIX_RE = re.compile(r'^[a-z0-9]+$')
 
 __all__ = [
