@@ -2665,7 +2665,7 @@ class TestAdvanceCommand:
         store.update(review)
 
         # Extract the integer that corresponds to this task's base36 suffix.
-        # e.g. task.id == "gza-1" → suffix "1" → integer 1
+        # e.g. task.id == "gza-000001" → suffix "000001" → integer 1
         suffix = task.id.split("-", 1)[1]
         integer_id = str(_decode_base36(suffix))
 

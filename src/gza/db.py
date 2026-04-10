@@ -39,30 +39,43 @@ _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 # Base-36 alphabet (digits 0-9 then lowercase a-z)
 _B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
+# Fixed width for the base36 sequence suffix in task IDs.  6 chars covers
+# 36^6 = 2,176,782,336 values per project prefix — effectively unbounded for
+# any real project.  Fixed width means string sort order matches numeric order
+# without custom collation, so ``gza-000002`` sorts before ``gza-000010``.
+_TASK_ID_SEQ_WIDTH = 6
 
-def _encode_base36(n: int) -> str:
-    """Encode a positive integer to a base-36 string."""
+
+def _encode_base36(n: int, width: int = _TASK_ID_SEQ_WIDTH) -> str:
+    """Encode a non-negative integer to a zero-padded base-36 string.
+
+    Padded to ``width`` characters (default 6) so task IDs have fixed width
+    and sort correctly as plain strings.  Pass ``width=0`` to disable padding.
+    """
+    if n < 0:
+        raise ValueError("n must be non-negative")
     if n == 0:
-        return "0"
+        return "0".zfill(width) if width else "0"
     result: list[str] = []
     while n > 0:
         result.append(_B36_CHARS[n % 36])
         n //= 36
-    return "".join(reversed(result))
+    encoded = "".join(reversed(result))
+    return encoded.zfill(width) if width else encoded
 
 
 def _decode_base36(s: str) -> int:
-    """Decode a base-36 string to an integer."""
+    """Decode a base-36 string to an integer (handles leading zeros)."""
     return int(s, 36)
 
 
 def task_id_numeric_key(task_id: str | None) -> int:
     """Return an integer sort key for a task ID that preserves creation order.
 
-    Task IDs are ``{prefix}-{base36_seq}`` (e.g. ``"gza-1a2b"``).  Sorting
-    them as plain strings is wrong: ``"gza-10"`` (decimal 36) sorts *before*
-    ``"gza-2"`` (decimal 2) because ``"1" < "2"`` lexicographically.  This
-    helper decodes the numeric suffix so comparisons are correct.
+    Task IDs are ``{prefix}-{base36_seq}`` (e.g. ``"gza-0001a2"``).  With
+    fixed-width zero-padded suffixes string sort already matches numeric
+    order, but this helper remains useful for mixed/legacy data where
+    unpadded suffixes may exist alongside padded ones.
 
     Returns 0 for ``None``, empty, or IDs without a hyphen (e.g. legacy bare
     integers stored as strings), and 0 for suffixes that fail base-36 parsing.
@@ -3050,11 +3063,11 @@ def resolve_task_id(arg: str, project_prefix: str) -> str:
     # Bare decimal integer → interpret as legacy pre-migration integer ID
     if arg.isdigit() and int(arg) > 0:
         return f"{project_prefix}-{_encode_base36(int(arg))}"
-    # Bare base36 suffix — prepend project prefix.
-    # Note: an all-alpha string like "abc" becomes "{prefix}-abc", which looks
-    # like a valid task ID but may not exist in the DB.  The caller is
-    # responsible for handling store.get() returning None in that case.
-    return f"{project_prefix}-{arg}"
+    # Bare base36 suffix — pad to canonical width and prepend project prefix.
+    # Inputs shorter than the canonical width are left-padded so users can
+    # type ``gza show hi`` and find ``gza-0000hi``.  Inputs already at (or
+    # beyond) the canonical width pass through unchanged.
+    return f"{project_prefix}-{arg.zfill(_TASK_ID_SEQ_WIDTH)}"
 
 
 class _MigrationPreview(TypedDict):
@@ -3124,7 +3137,7 @@ def preview_v25_migration(db_path: Path, prefix: str, sample_limit: int = 10) ->
     finally:
         conn.close()
 
-    first_post = f"{prefix}-{_encode_base36(max_id + 1)}" if max_id else f"{prefix}-1"
+    first_post = f"{prefix}-{_encode_base36(max_id + 1)}" if max_id else f"{prefix}-{_encode_base36(1)}"
     return {
         "task_count": task_count,
         "samples": samples_raw,

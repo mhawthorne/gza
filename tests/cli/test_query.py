@@ -241,10 +241,12 @@ class TestHistoryCommand:
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout
-        assert "Orphaned task needi" in result.stdout
+        # Prompt may be truncated — assert a prefix short enough to survive
+        # layout changes as task IDs widen (e.g. the v25 padding to width 6).
+        assert "Orphaned task" in result.stdout
         assert "Completed task" in result.stdout
         # Orphaned should appear before completed in output
-        orphaned_pos = result.stdout.find("Orphaned task needi")
+        orphaned_pos = result.stdout.find("Orphaned task")
         completed_pos = result.stdout.find("Completed task")
         assert orphaned_pos < completed_pos, "Orphaned task should appear before completed task"
 
@@ -3768,18 +3770,23 @@ class TestPsSortKey:
         }
 
     def test_string_task_ids_sort_in_numeric_order(self):
-        """String task IDs like gza-1, gza-a, gza-2s must sort numerically."""
+        """String task IDs sort numerically by decoded base36 suffix."""
         from gza.cli.query import _ps_sort_key
 
-        # gza-1 = 1, gza-2 = 2, gza-a = 10, gza-2s = 100 in base36
+        # Padded base36: 1="000001", 2="000002", 10="00000a", 100="00002s"
         rows = [
-            self._make_row(task_id="gza-2s"),   # 100
-            self._make_row(task_id="gza-a"),     # 10
-            self._make_row(task_id="gza-2"),     # 2
-            self._make_row(task_id="gza-1"),     # 1
+            self._make_row(task_id="gza-00002s"),  # 100
+            self._make_row(task_id="gza-00000a"),  # 10
+            self._make_row(task_id="gza-000002"),  # 2
+            self._make_row(task_id="gza-000001"),  # 1
         ]
         sorted_rows = sorted(rows, key=_ps_sort_key)
-        assert [r["task_id"] for r in sorted_rows] == ["gza-1", "gza-2", "gza-a", "gza-2s"]
+        assert [r["task_id"] for r in sorted_rows] == [
+            "gza-000001",
+            "gza-000002",
+            "gza-00000a",
+            "gza-00002s",
+        ]
 
     def test_none_task_id_sorts_last(self):
         """Worker-only rows (task_id=None) must sort after all tasks."""
@@ -3787,7 +3794,7 @@ class TestPsSortKey:
 
         from gza.cli.query import _ps_sort_key
 
-        row_with_task = self._make_row(task_id="gza-1")
+        row_with_task = self._make_row(task_id="gza-000001")
         row_no_task = self._make_row(task_id=None)
 
         key_with_task = _ps_sort_key(row_with_task)
@@ -3801,9 +3808,9 @@ class TestPsSortKey:
         """Failed rows sort before running, running before completed."""
         from gza.cli.query import _ps_sort_key
 
-        failed_row = self._make_row(task_id="gza-1", status="failed")
-        running_row = self._make_row(task_id="gza-2", status="running")
-        completed_row = self._make_row(task_id="gza-3", status="completed")
+        failed_row = self._make_row(task_id="gza-000001", status="failed")
+        running_row = self._make_row(task_id="gza-000002", status="running")
+        completed_row = self._make_row(task_id="gza-000003", status="completed")
 
         assert _ps_sort_key(failed_row)[0] < _ps_sort_key(running_row)[0]
         assert _ps_sort_key(running_row)[0] < _ps_sort_key(completed_row)[0]
