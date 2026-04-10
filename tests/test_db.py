@@ -11,6 +11,7 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
+    _encode_base36,
     check_migration_status,
     preview_v25_migration,
     resolve_task_id,
@@ -4096,8 +4097,46 @@ class TestMigrationUtilityFunctions:
         assert preview["samples"][0] == (1, "gza-000001")
         assert preview["samples"][1] == (2, "gza-000002")
         assert preview["samples"][2] == (3, "gza-000003")
+        # Only 3 tasks, all consumed by the first-samples path → no random tail to sample
+        assert preview["random_samples"] == []
         # First post-migration ID = base36(3+1) = "4" → padded "000004"
         assert preview["first_post_migration_id"] == "gza-000004"
+
+    def test_preview_v25_migration_includes_random_tail_samples(self, tmp_path: Path) -> None:
+        """preview_v25_migration returns up to N random samples from IDs beyond the first N."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        # Insert 50 tasks so there's a meaningful tail beyond the first 10
+        conn = sqlite3.connect(db_path)
+        for i in range(50):
+            conn.execute(
+                "INSERT INTO tasks (prompt, created_at) VALUES (?, ?)",
+                (f"Task {i + 1}", "2024-01-01T00:00:00+00:00"),
+            )
+        conn.commit()
+        conn.close()
+
+        preview = preview_v25_migration(db_path, "gza", sample_limit=10, random_sample_limit=10)
+
+        assert preview["task_count"] == 50
+        assert len(preview["samples"]) == 10
+        # First samples are sequential from id=1
+        assert preview["samples"][0] == (1, "gza-000001")
+        assert preview["samples"][9] == (10, "gza-00000a")
+
+        # Random samples: exactly 10, all drawn from IDs > 10, all well-formed
+        assert len(preview["random_samples"]) == 10
+        for old_id, new_id in preview["random_samples"]:
+            assert old_id > 10, f"random sample id {old_id} should be > first_limit (10)"
+            assert old_id <= 50
+            assert new_id == f"gza-{_encode_base36(old_id)}"
+        # No overlap between first and random samples
+        first_ids = {old for old, _ in preview["samples"]}
+        random_ids = {old for old, _ in preview["random_samples"]}
+        assert first_ids.isdisjoint(random_ids)
 
     def test_preview_v25_migration_on_already_migrated_db(self, tmp_path: Path) -> None:
         """preview_v25_migration on an already-v25 DB returns empty samples."""
@@ -4109,6 +4148,7 @@ class TestMigrationUtilityFunctions:
 
         # Already migrated: no integer IDs to convert
         assert preview["samples"] == []
+        assert preview["random_samples"] == []
         assert preview["first_post_migration_id"] == ""
 
     def test_run_v25_migration_idempotent(self, tmp_path: Path) -> None:
