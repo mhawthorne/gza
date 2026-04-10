@@ -2648,9 +2648,8 @@ class TestAdvanceCommand:
         assert store.get(task1.id).merge_status == "merged"
         assert store.get(task2.id).merge_status == "unmerged"
 
-    def test_advance_bare_integer_id_resolves_correctly(self, tmp_path: Path):
-        """advance with a bare legacy integer ID resolves to the correct task (M1 regression)."""
-        from gza.db import _decode_base36
+    def test_advance_rejects_bare_integer_id(self, tmp_path: Path):
+        """advance requires a full prefixed task ID."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2664,20 +2663,10 @@ class TestAdvanceCommand:
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
-        # Extract the integer that corresponds to this task's base36 suffix.
-        # e.g. task.id == "gza-000001" → suffix "000001" → integer 1
-        suffix = task.id.split("-", 1)[1]
-        integer_id = str(_decode_base36(suffix))
-
-        # Passing the bare integer should resolve to the correct task (not "not found")
-        result = run_gza("advance", integer_id, "--auto", "--project", str(tmp_path))
-        assert result.returncode == 0, (
-            f"Expected rc=0 but got {result.returncode}; stdout={result.stdout!r}"
-        )
-        assert "not found" not in result.stdout.lower(), (
-            f"'not found' in output means resolve_id() was not called: {result.stdout!r}"
-        )
-        assert store.get(task.id).merge_status == "merged"
+        result = run_gza("advance", "1", "--auto", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
+        assert store.get(task.id).merge_status == "unmerged"
 
     def test_advance_max_limits_batch(self, tmp_path: Path):
         """advance --max N limits the number of tasks processed."""
@@ -2768,7 +2757,7 @@ class TestAdvanceCommand:
         make_store(tmp_path)  # create db
         self._setup_git_repo(tmp_path)
 
-        result = run_gza("advance", "9999", "--project", str(tmp_path))
+        result = run_gza("advance", "testproject-999999", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "not found" in result.stdout
 
@@ -4840,7 +4829,7 @@ class TestPrCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("pr", "999", "--project", str(tmp_path))
+        result = run_gza("pr", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -4851,7 +4840,7 @@ class TestPrCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_gza("pr", "1", "--project", str(tmp_path))
+        result = run_gza("pr", "testproject-000001", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not completed" in result.stdout
@@ -4868,7 +4857,7 @@ class TestPrCommand:
         task.has_commits = True
         store.update(task)
 
-        result = run_gza("pr", "1", "--project", str(tmp_path))
+        result = run_gza("pr", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no branch" in result.stdout
@@ -4885,7 +4874,7 @@ class TestPrCommand:
         task.has_commits = False
         store.update(task)
 
-        result = run_gza("pr", "1", "--project", str(tmp_path))
+        result = run_gza("pr", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no commits" in result.stdout
@@ -4903,7 +4892,7 @@ class TestPrCommand:
         task.merge_status = "merged"
         store.update(task)
 
-        result = run_gza("pr", "1", "--project", str(tmp_path))
+        result = run_gza("pr", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "already marked as merged" in result.stdout
@@ -5067,7 +5056,7 @@ class TestRefreshCommand:
         """gza refresh <id> returns error when task doesn't exist."""
         setup_config(tmp_path)
         self._setup_git_repo(tmp_path)
-        result = run_gza("refresh", "9999", "--project", str(tmp_path))
+        result = run_gza("refresh", "testproject-999999", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "not found" in result.stdout or "not found" in result.stderr
 

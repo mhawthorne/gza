@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ..config import Config, ConfigError
 from ..db import (
+    InvalidTaskIdError,
     ManualMigrationRequired,
     SqliteTaskStore,
     check_migration_status,
@@ -83,7 +84,7 @@ def main() -> int:
         "task_ids",
         nargs="*",
         type=str,
-        help="Specific task ID(s) to run (optional, can specify multiple)",
+        help="Specific full task ID(s) to run (optional, can specify multiple)",
     )
     add_common_args(work_parser)
     work_parser.add_argument(
@@ -132,7 +133,7 @@ def main() -> int:
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task's tmux session")
     attach_parser.add_argument(
         "worker_id",
-        help="Worker ID (e.g. w-20260301-1) or task ID (numeric) to attach to",
+        help="Worker ID (e.g. w-20260301-1) or full task ID (e.g. gza-000001) to attach to",
     )
     add_common_args(attach_parser)
 
@@ -225,7 +226,7 @@ def main() -> int:
         type=str,
         nargs="?",
         metavar="task_id",
-        help="Specific task ID to advance (omit to advance all eligible tasks)",
+        help="Specific full task ID to advance (omit to advance all eligible tasks)",
     )
     advance_parser.add_argument(
         "--dry-run",
@@ -326,7 +327,7 @@ def main() -> int:
         type=str,
         nargs="?",
         metavar="task_id",
-        help="Task ID to refresh (omit to refresh all unmerged tasks)",
+        help="Full task ID to refresh (omit to refresh all unmerged tasks)",
     )
     refresh_group.add_argument(
         "--include-failed",
@@ -342,7 +343,7 @@ def main() -> int:
         type=str,
         nargs="*",
         metavar="task_id",
-        help="Task ID(s) to merge",
+        help="Full task ID(s) to merge",
     )
     merge_parser.add_argument(
         "--all",
@@ -386,7 +387,7 @@ def main() -> int:
     rebase_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to rebase",
+        help="Full task ID to rebase",
     )
     rebase_parser.add_argument(
         "--onto",
@@ -418,7 +419,7 @@ def main() -> int:
     checkout_parser = subparsers.add_parser("checkout", help="Checkout a task's branch, removing stale worktree if needed")
     checkout_parser.add_argument(
         "task_id_or_branch",
-        help="Task ID or branch name to checkout",
+        help="Full task ID or branch name to checkout",
     )
     checkout_parser.add_argument(
         "--force", "-f",
@@ -441,7 +442,7 @@ def main() -> int:
     pr_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to create PR from",
+        help="Full task ID to create PR from",
     )
     pr_parser.add_argument(
         "--title",
@@ -572,7 +573,7 @@ def main() -> int:
     log_parser = subparsers.add_parser("log", help="Display log for a task or worker")
     log_parser.add_argument(
         "identifier",
-        help="Task ID (numeric), slug, or worker ID",
+        help="Full task ID, slug, or worker ID",
     )
     log_parser.add_argument(
         "--slug", "-s",
@@ -717,7 +718,7 @@ def main() -> int:
     edit_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to edit",
+        help="Full task ID to edit",
     )
     edit_parser.add_argument(
         "--group",
@@ -812,7 +813,7 @@ def main() -> int:
     delete_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to delete",
+        help="Full task ID to delete",
     )
     delete_parser.add_argument(
         "--force", "-f",
@@ -831,7 +832,7 @@ def main() -> int:
     retry_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to retry",
+        help="Full task ID to retry",
     )
     retry_parser.add_argument(
         "--no-docker",
@@ -861,7 +862,7 @@ def main() -> int:
     resume_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to resume",
+        help="Full task ID to resume",
     )
     resume_parser.add_argument(
         "--no-docker",
@@ -891,7 +892,7 @@ def main() -> int:
     improve_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
+        help="Full task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     improve_parser.add_argument(
         "--review",
@@ -902,7 +903,7 @@ def main() -> int:
         "--review-id",
         type=str,
         metavar="ID",
-        help="Explicit review task ID to base the improve on (overrides auto-pick of most recent completed review)",
+        help="Explicit full review task ID to base the improve on (overrides auto-pick of most recent completed review)",
     )
     improve_parser.add_argument(
         "--queue", "-q",
@@ -946,7 +947,7 @@ def main() -> int:
     cycle_parser.add_argument(
         "impl_task_id",
         type=str,
-        help="Implementation task ID to cycle",
+        help="Full implementation task ID to cycle",
     )
     cycle_parser.add_argument(
         "--max-iterations",
@@ -985,7 +986,7 @@ def main() -> int:
     implement_parser.add_argument(
         "plan_task_id",
         type=str,
-        help="Completed plan task ID to implement",
+        help="Completed plan full task ID to implement",
     )
     implement_parser.add_argument(
         "prompt",
@@ -1066,7 +1067,7 @@ def main() -> int:
     review_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
+        help="Full task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     review_parser.add_argument(
         "--queue", "-q",
@@ -1117,7 +1118,7 @@ def main() -> int:
     lineage_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to show lineage for",
+        help="Full task ID to show lineage for",
     )
     add_common_args(lineage_parser)
 
@@ -1126,7 +1127,7 @@ def main() -> int:
     show_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to show",
+        help="Full task ID to show",
     )
     show_parser.add_argument(
         "--full",
@@ -1169,7 +1170,7 @@ def main() -> int:
         type=str,
         nargs="?",
         default=None,
-        help="Task ID to sync (optional if --all is used)",
+        help="Full task ID to sync (optional if --all is used)",
     )
     sync_report_parser.add_argument(
         "--all",
@@ -1251,7 +1252,7 @@ def main() -> int:
         "task_id",
         nargs="?",
         type=str,
-        help="Task ID to kill (optional if --all is used)",
+        help="Full task ID to kill (optional if --all is used)",
     )
     kill_parser.add_argument(
         "--all",
@@ -1273,7 +1274,7 @@ def main() -> int:
     mark_completed_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to mark as completed",
+        help="Full task ID to mark as completed",
     )
     mark_completed_mode_group = mark_completed_parser.add_mutually_exclusive_group()
     mark_completed_mode_group.add_argument(
@@ -1296,7 +1297,7 @@ def main() -> int:
     set_status_parser.add_argument(
         "task_id",
         type=str,
-        help="Task ID to update",
+        help="Full task ID to update",
     )
     set_status_parser.add_argument(
         "status",
@@ -1458,6 +1459,9 @@ def main() -> int:
         print("Run 'gza migrate' to upgrade the database.", file=sys.stderr)
         return 1
     except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except InvalidTaskIdError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 

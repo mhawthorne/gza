@@ -316,7 +316,7 @@ class TestEditCommand:
 
         task = store.add("Target task")
 
-        result = run_gza("edit", str(task.id), "--based-on", "999", "--project", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--based-on", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower()
@@ -329,7 +329,7 @@ class TestEditCommand:
 
         task = store.add("Target task")
 
-        result = run_gza("edit", str(task.id), "--depends-on", "999", "--project", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--depends-on", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower()
@@ -389,7 +389,7 @@ class TestRetryCommand:
         """Retry command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("retry", "999", "--project", str(tmp_path))
+        result = run_gza("retry", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -556,12 +556,10 @@ class TestRetryCommand:
 
     def test_retry_blocked_if_successful_retry_exists(self, tmp_path: Path):
         """Retry command fails if the task already has a child retry with status completed."""
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         # Create original failed task
         original = store.add("Original task")
@@ -951,9 +949,19 @@ class TestWorkCommandMultiTask:
         # Try to run with one valid and one invalid task ID
         result = run_gza("work", str(task1.id), "test-project-zzz", "--no-docker", "--project", str(tmp_path))
 
-        # Should error about the invalid task ID
+        # Should error about invalid task ID format
         assert result.returncode != 0
-        assert "not found" in result.stdout or "not found" in result.stderr
+        assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
+
+    def test_work_rejects_shorthand_task_id(self, tmp_path: Path):
+        """Work command requires full prefixed task IDs."""
+        setup_config(tmp_path)
+        make_store(tmp_path).add("Test task 1")
+
+        result = run_gza("work", "42", "--no-docker", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "Use a full prefixed task ID" in result.stderr or "Use a full prefixed task ID" in result.stdout
 
     def test_work_validates_task_status(self, tmp_path: Path):
         """Work command validates that tasks are in pending status."""
@@ -1484,7 +1492,7 @@ class TestImplementCommand:
         """Implement command validates referenced plan task exists."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("implement", "999", "--project", str(tmp_path))
+        result = run_gza("implement", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -1781,7 +1789,7 @@ class TestImproveCommand:
         result = run_gza("improve", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "not found" in result.stdout
+        assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
     def test_improve_warns_on_incomplete_review(self, tmp_path: Path):
         """Improve command warns if the review is not yet completed."""
@@ -1939,7 +1947,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
@@ -1980,7 +1988,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
@@ -2011,7 +2019,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
@@ -2039,7 +2047,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
@@ -2081,7 +2089,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_a = store.add("Feature A", task_type="implement")
         impl_a.status = "completed"
@@ -2116,7 +2124,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
@@ -2140,7 +2148,7 @@ class TestImproveCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
@@ -2307,7 +2315,7 @@ class TestReviewCommand:
         result = run_gza("review", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "not found" in result.stdout
+        assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
     def test_review_inherits_based_on_from_implementation(self, tmp_path: Path):
         """Review task inherits based_on from implementation to find plan."""
@@ -2583,6 +2591,7 @@ class TestReviewCommand:
         mock_config = MagicMock()
         mock_config.project_dir = tmp_path
         mock_config.use_docker = False
+        mock_config.project_prefix = "testproject"
 
         # Wrap get_reviews_for_task to count calls
         original_get_reviews = store.get_reviews_for_task
@@ -2802,6 +2811,7 @@ class TestIterateCommand:
         mock_config = MagicMock()
         mock_config.project_dir = tmp_path
         mock_config.use_docker = False
+        mock_config.project_prefix = "testproject"
 
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
@@ -2887,6 +2897,7 @@ class TestIterateCommand:
         mock_config = MagicMock()
         mock_config.project_dir = tmp_path
         mock_config.use_docker = False
+        mock_config.project_prefix = "testproject"
 
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
@@ -2953,7 +2964,7 @@ class TestMarkCompletedCommand:
         """mark-completed errors on a nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("mark-completed", "999", "--project", str(tmp_path))
+        result = run_gza("mark-completed", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -3244,7 +3255,7 @@ class TestSetStatusCommand:
         """set-status errors when task does not exist."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("set-status", "999", "failed", "--project", str(tmp_path))
+        result = run_gza("set-status", "testproject-999999", "failed", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout

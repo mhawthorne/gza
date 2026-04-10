@@ -62,22 +62,8 @@ _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[a-z0-9]+$")
 def _looks_like_task_id(arg: str) -> bool:
     """Return True if *arg* looks like a task ID rather than a branch name.
 
-    Matches three forms:
-    - Bare decimal integer, e.g. ``"42"`` (legacy backward-compat)
-    - Bare base36 suffix, e.g. ``"3f"`` (alphanumeric containing at least one digit)
-    - Prefixed ID, e.g. ``"gza-3f"`` (lowercase-alphanumeric prefix ≤12 chars, then ``-``,
-      then base36 suffix) — rejects branch names like ``"feature-add-logging"``
-
-    The bare base36 form is intentionally permissive: short alphanumeric branch names
-    like ``"v2"`` or ``"hotfix3"`` also match.  This is safe because callers such as
-    ``cmd_checkout`` and ``cmd_diff`` fall back to treating the argument as a branch
-    name when ``store.get()`` returns None.  Do not tighten this heuristic without
-    preserving that fallback path.
+    Matches only full prefixed IDs, e.g. ``"gza-3f"``.
     """
-    if arg.isdigit():
-        return True
-    if arg.isalnum() and not arg.isalpha():
-        return True
     return bool(_TASK_ID_RE.match(arg))
 
 
