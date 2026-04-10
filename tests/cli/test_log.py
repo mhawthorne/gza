@@ -2,17 +2,17 @@
 
 
 import json
-import subprocess
 import os
-from datetime import datetime, timezone
+import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from gza.cli import _format_log_entry, _build_step_timeline
+from gza.cli import _build_step_timeline, _format_log_entry
 from gza.db import SqliteTaskStore
 
-from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import LOG_FIXTURES_DIR, make_store, run_gza, setup_config
 
 
 class TestLogCommand:
@@ -21,7 +21,6 @@ class TestLogCommand:
     def test_log_by_task_id_single_json_format(self, tmp_path: Path):
         """Log command by task ID parses single JSON format with successful result."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -61,7 +60,6 @@ class TestLogCommand:
 
     def test_log_by_task_id_jsonl_format(self, tmp_path: Path):
         """Log command by task ID parses step-first JSONL format with successful result."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -89,7 +87,6 @@ class TestLogCommand:
     def test_log_by_task_id_error_max_turns(self, tmp_path: Path):
         """Log command by task ID handles JSONL format with error_max_turns result."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -128,7 +125,6 @@ class TestLogCommand:
 
     def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
         """Log command by task ID handles missing log file."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -147,7 +143,6 @@ class TestLogCommand:
     def test_log_by_task_id_no_result_entry(self, tmp_path: Path):
         """Log command by task ID shows compact step timeline when no result entry exists."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -177,7 +172,6 @@ class TestLogCommand:
     def test_log_by_task_id_falls_back_to_inferred_log_path(self, tmp_path: Path):
         """Task lookup should render entries from inferred slug log when task.log_file is stale."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -204,7 +198,6 @@ class TestLogCommand:
     def test_log_by_task_id_resolves_to_latest_retry_resume_attempt(self, tmp_path: Path):
         """Task lookup resolves deterministically to latest same-type based_on attempt."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -219,7 +212,7 @@ class TestLogCommand:
         assert retry.id is not None
         retry.status = "completed"
         retry.log_file = ".gza/logs/retry.log"
-        retry.started_at = datetime.now(timezone.utc)
+        retry.started_at = datetime.now(UTC)
         store.update(retry)
 
         log_dir = tmp_path / ".gza" / "logs"
@@ -239,7 +232,6 @@ class TestLogCommand:
     def test_log_by_task_id_non_root_query_stays_within_its_retry_chain(self, tmp_path: Path):
         """Querying a retry should not jump to a newer same-type sibling chain."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -248,21 +240,21 @@ class TestLogCommand:
         assert root.id is not None
         root.status = "failed"
         root.log_file = ".gza/logs/root.log"
-        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=UTC)
         store.update(root)
 
         retry_a = store.add("Retry A", based_on=root.id, task_type=root.task_type)
         assert retry_a.id is not None
         retry_a.status = "failed"
         retry_a.log_file = ".gza/logs/retry_a.log"
-        retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=UTC)
         store.update(retry_a)
 
         retry_b = store.add("Retry B", based_on=root.id, task_type=root.task_type)
         assert retry_b.id is not None
         retry_b.status = "completed"
         retry_b.log_file = ".gza/logs/retry_b.log"
-        retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=UTC)
         store.update(retry_b)
 
         log_dir = tmp_path / ".gza" / "logs"
@@ -284,7 +276,6 @@ class TestLogCommand:
     def test_log_by_slug_non_root_query_stays_within_its_retry_chain(self, tmp_path: Path):
         """Slug lookup should not jump to a newer same-type sibling chain."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -294,7 +285,7 @@ class TestLogCommand:
         root.slug = "20260227-chain-root"
         root.status = "failed"
         root.log_file = ".gza/logs/root.log"
-        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=UTC)
         store.update(root)
 
         retry_a = store.add("Retry A", based_on=root.id, task_type=root.task_type)
@@ -302,7 +293,7 @@ class TestLogCommand:
         retry_a.slug = "20260227-chain-a"
         retry_a.status = "failed"
         retry_a.log_file = ".gza/logs/retry_a.log"
-        retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        retry_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=UTC)
         store.update(retry_a)
 
         retry_b = store.add("Retry B", based_on=root.id, task_type=root.task_type)
@@ -310,7 +301,7 @@ class TestLogCommand:
         retry_b.slug = "20260227-chain-b"
         retry_b.status = "completed"
         retry_b.log_file = ".gza/logs/retry_b.log"
-        retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        retry_b.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=UTC)
         store.update(retry_b)
 
         log_dir = tmp_path / ".gza" / "logs"
@@ -332,7 +323,6 @@ class TestLogCommand:
     def test_log_by_task_id_latest_attempt_ignores_mixed_type_lineage_nodes(self, tmp_path: Path):
         """Latest-attempt resolution should only consider same-type retry/resume attempts."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -341,28 +331,28 @@ class TestLogCommand:
         assert root.id is not None
         root.status = "failed"
         root.log_file = ".gza/logs/root.log"
-        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=UTC)
         store.update(root)
 
         retry = store.add("Retry task", based_on=root.id, task_type="implement")
         assert retry.id is not None
         retry.status = "completed"
         retry.log_file = ".gza/logs/retry.log"
-        retry.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        retry.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=UTC)
         store.update(retry)
 
         review = store.add("Review task", based_on=root.id, task_type="review")
         assert review.id is not None
         review.status = "completed"
         review.log_file = ".gza/logs/review.log"
-        review.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        review.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=UTC)
         store.update(review)
 
         improve = store.add("Improve task", based_on=review.id, task_type="improve")
         assert improve.id is not None
         improve.status = "completed"
         improve.log_file = ".gza/logs/improve.log"
-        improve.started_at = datetime(2026, 2, 26, 13, 0, tzinfo=timezone.utc)
+        improve.started_at = datetime(2026, 2, 26, 13, 0, tzinfo=UTC)
         store.update(improve)
 
         log_dir = tmp_path / ".gza" / "logs"
@@ -384,32 +374,31 @@ class TestLogCommand:
     def test_resolve_latest_attempt_for_task_excludes_parallel_same_type_sibling_chains(self, tmp_path: Path):
         """Resolver should stay within the queried task's direct same-type chain."""
         from gza.cli import _resolve_latest_attempt_for_task
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         root = store.add("Root task", task_type="implement")
         assert root.id is not None
-        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=timezone.utc)
+        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=UTC)
         root.status = "failed"
         store.update(root)
 
         chain_a = store.add("Chain A", based_on=root.id, task_type="implement")
         assert chain_a.id is not None
-        chain_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        chain_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=UTC)
         chain_a.status = "failed"
         store.update(chain_a)
 
         chain_a_resume = store.add("Chain A Resume", based_on=chain_a.id, task_type="implement")
         assert chain_a_resume.id is not None
-        chain_a_resume.started_at = datetime(2026, 2, 26, 12, 10, tzinfo=timezone.utc)
+        chain_a_resume.started_at = datetime(2026, 2, 26, 12, 10, tzinfo=UTC)
         chain_a_resume.status = "completed"
         store.update(chain_a_resume)
 
         sibling_chain = store.add("Sibling Chain", based_on=root.id, task_type="implement")
         assert sibling_chain.id is not None
-        sibling_chain.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=timezone.utc)
+        sibling_chain.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=UTC)
         sibling_chain.status = "completed"
         store.update(sibling_chain)
 
@@ -422,7 +411,6 @@ class TestLogCommand:
     def test_log_default_mode_renders_entries_when_result_exists(self, tmp_path: Path):
         """Default formatted output should include entry rendering, not metadata-only output."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -448,8 +436,8 @@ class TestLogCommand:
         """-t -f should follow via live worker when a task is actively running."""
         import argparse
         import json
+
         from gza.cli import cmd_log
-        from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -510,7 +498,6 @@ class TestLogCommand:
     def test_log_follow_by_task_not_running_falls_back_to_static_output(self, tmp_path: Path):
         """-t -f should print persisted logs and exit when task is not actively running."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -538,7 +525,6 @@ class TestLogCommand:
 
     def test_log_steps_compact_renders_step_labels(self, tmp_path: Path):
         """--steps renders compact step-first timeline anchors."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -560,7 +546,6 @@ class TestLogCommand:
 
     def test_log_steps_verbose_renders_substep_labels(self, tmp_path: Path):
         """--steps-verbose renders S<n>.<m> substep labels."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -582,7 +567,6 @@ class TestLogCommand:
 
     def test_log_turns_alias_reads_legacy_turn_only_logs(self, tmp_path: Path):
         """Deprecated --turns alias still renders verbose step timeline for turn-only logs."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -609,7 +593,6 @@ class TestLogCommand:
         # Create empty database
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.db import SqliteTaskStore
         make_store(tmp_path)
 
         result = run_gza("log", "test-project-zzz", "--project", str(tmp_path))
@@ -623,7 +606,6 @@ class TestLogCommand:
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.db import SqliteTaskStore
         make_store(tmp_path)
 
         result = run_gza("log", "not-a-real-id", "--project", str(tmp_path))
@@ -634,7 +616,6 @@ class TestLogCommand:
     def test_log_by_slug_exact_match(self, tmp_path: Path):
         """Log command with --slug finds task by exact slug."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -659,7 +640,6 @@ class TestLogCommand:
     def test_log_by_slug_partial_match(self, tmp_path: Path):
         """Log command with --slug finds task by partial slug match."""
         import json
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -687,7 +667,6 @@ class TestLogCommand:
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.db import SqliteTaskStore
         make_store(tmp_path)
 
         result = run_gza("log", "--slug", "nonexistent-slug", "--project", str(tmp_path))
@@ -698,8 +677,8 @@ class TestLogCommand:
     def test_log_by_worker_success(self, tmp_path: Path):
         """Log command with --worker finds log via worker registry."""
         import json
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
 
@@ -745,7 +724,6 @@ class TestLogCommand:
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.db import SqliteTaskStore
         make_store(tmp_path)
 
         # Create empty workers directory
@@ -759,8 +737,7 @@ class TestLogCommand:
 
     def test_log_by_worker_falls_back_to_startup_log_when_main_missing(self, tmp_path: Path):
         """Worker lookup uses startup log when no main task log exists."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -796,8 +773,7 @@ class TestLogCommand:
 
     def test_log_by_worker_shows_failed_status_for_startup_failure_without_task(self, tmp_path: Path):
         """Worker-only view should show failed status when worker metadata is failed."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -832,8 +808,7 @@ class TestLogCommand:
 
     def test_log_by_worker_prefers_main_log_over_startup_log(self, tmp_path: Path):
         """Worker log resolution should prefer main task log when both exist."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -876,8 +851,7 @@ class TestLogCommand:
     @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
     def test_log_task_lookup_falls_back_to_startup_log_when_main_missing(self, tmp_path: Path, query_mode: str):
         """Task lookup should use latest worker startup log when task log is missing."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -920,8 +894,7 @@ class TestLogCommand:
     @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
     def test_log_task_lookup_prefers_main_log_over_startup_log(self, tmp_path: Path, query_mode: str):
         """Task lookup should prefer task log when both task and startup logs are present."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -969,8 +942,7 @@ class TestLogCommand:
     @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
     def test_log_task_lookup_reports_clear_error_when_no_task_or_startup_log(self, tmp_path: Path, query_mode: str):
         """Task lookup should return a clear missing-log error when no logs exist."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1008,7 +980,6 @@ class TestLogCommand:
 
     def test_log_by_task_id_startup_failure(self, tmp_path: Path):
         """Log command shows startup error when log contains non-JSON content."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 

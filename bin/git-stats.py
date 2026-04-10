@@ -202,7 +202,7 @@ def main():
     if args.per_day:
         # Calculate how many days to show based on --since
         now = datetime.now()
-        today = datetime(now.year, now.month, now.day)
+        datetime(now.year, now.month, now.day)
 
         since = args.since
         if since == "midnight":

@@ -4,7 +4,7 @@
 import argparse
 import os
 import signal as signal_mod
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +15,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.workers import WorkerRegistry
 
-from .conftest import get_latest_task, make_store, run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import get_latest_task, make_store, run_gza, setup_config, setup_db_with_tasks
 
 
 class TestAddCommand:
@@ -97,10 +97,9 @@ class TestAddCommand:
 
     def test_add_with_prompt_file_and_options(self, tmp_path: Path):
         """Add command with --prompt-file works with other options."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
 
         # Create a file with prompt text
         prompt_file = tmp_path / "task_prompt.txt"
@@ -125,7 +124,6 @@ class TestEditCommand:
 
     def test_edit_group(self, tmp_path: Path):
         """Edit command can change task group."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -143,7 +141,6 @@ class TestEditCommand:
 
     def test_edit_remove_group(self, tmp_path: Path):
         """Edit command can remove task from group."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -161,7 +158,6 @@ class TestEditCommand:
 
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -179,7 +175,6 @@ class TestEditCommand:
 
     def test_edit_with_prompt_file(self, tmp_path: Path):
         """Edit command can update prompt from file."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -201,7 +196,6 @@ class TestEditCommand:
 
     def test_edit_with_prompt_file_not_found(self, tmp_path: Path):
         """Edit command handles missing file gracefully."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -215,7 +209,6 @@ class TestEditCommand:
 
     def test_edit_with_prompt_text(self, tmp_path: Path):
         """Edit command can update prompt from command line."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -233,7 +226,6 @@ class TestEditCommand:
 
     def test_edit_with_prompt_validation_error(self, tmp_path: Path):
         """Edit command validates prompt length."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -252,7 +244,6 @@ class TestEditCommand:
 
     def test_edit_prompt_and_prompt_file_conflict(self, tmp_path: Path):
         """Edit command rejects both --prompt and --prompt-file."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -269,7 +260,6 @@ class TestEditCommand:
 
     def test_edit_with_prompt_from_stdin(self, tmp_path: Path):
         """Edit command can read prompt from stdin using --prompt -."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -288,7 +278,6 @@ class TestEditCommand:
 
     def test_cmd_edit_based_on_sets_based_on_field(self, tmp_path: Path):
         """--based-on sets task.based_on, not task.depends_on."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -305,7 +294,6 @@ class TestEditCommand:
 
     def test_cmd_edit_depends_on_sets_depends_on_field(self, tmp_path: Path):
         """--depends-on sets task.depends_on, not task.based_on."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -322,7 +310,6 @@ class TestEditCommand:
 
     def test_cmd_edit_based_on_nonexistent_task_errors(self, tmp_path: Path):
         """--based-on with nonexistent target ID returns error code 1."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -336,7 +323,6 @@ class TestEditCommand:
 
     def test_cmd_edit_depends_on_nonexistent_task_errors(self, tmp_path: Path):
         """--depends-on with nonexistent target ID returns error code 1."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -358,7 +344,7 @@ class TestRetryCommand:
         store = make_store(tmp_path)
         task = store.add("Original task", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
@@ -377,7 +363,7 @@ class TestRetryCommand:
         store = make_store(tmp_path)
         task = store.add("Failed task")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
@@ -392,7 +378,9 @@ class TestRetryCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_gza("retry", "1", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("retry", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Can only retry completed or failed" in result.stdout
@@ -408,16 +396,15 @@ class TestRetryCommand:
 
     def test_retry_preserves_task_fields(self, tmp_path: Path):
         """Retry command preserves task metadata and linkage fields."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
 
         # Create a dependency task first
         dep_task = store.add("Dependency task")
         dep_task.status = "completed"
-        dep_task.completed_at = datetime.now(timezone.utc)
+        dep_task.completed_at = datetime.now(UTC)
         store.update(dep_task)
 
         # Create a task with metadata
@@ -434,7 +421,7 @@ class TestRetryCommand:
             provider="codex",
         )
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Retry the task
@@ -461,15 +448,14 @@ class TestRetryCommand:
 
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
 
         task = store.add("Task with stale resolved provider")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.provider = "claude"
         task.provider_is_explicit = False
         store.update(task)
@@ -485,7 +471,6 @@ class TestRetryCommand:
 
     def test_retry_with_background_flag(self, tmp_path: Path):
         """Retry command with --background spawns a worker for the new task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -493,7 +478,7 @@ class TestRetryCommand:
         # Create a failed task
         task = store.add("Failed task to retry")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Create workers directory
@@ -519,7 +504,6 @@ class TestRetryCommand:
 
     def test_retry_runs_by_default(self, tmp_path: Path):
         """Retry command runs the newly created task immediately by default."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -527,7 +511,7 @@ class TestRetryCommand:
         # Create a failed task
         task = store.add("Failed task to retry")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Run retry without any flags (will fail due to missing API key, but we can verify it tries)
@@ -546,7 +530,6 @@ class TestRetryCommand:
 
     def test_retry_with_queue_flag(self, tmp_path: Path):
         """Retry command with --queue adds task to queue without executing."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -554,7 +537,7 @@ class TestRetryCommand:
         # Create a failed task
         task = store.add("Failed task to retry")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Run retry with --queue flag
@@ -577,7 +560,6 @@ class TestResumeCommand:
 
     def test_resume_with_background_flag(self, tmp_path: Path):
         """Resume command with --background creates a new task and spawns a worker."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -586,7 +568,7 @@ class TestResumeCommand:
         task = store.add("Failed task to resume")
         task.status = "failed"
         task.session_id = "test-session-123"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Create workers directory
@@ -615,7 +597,6 @@ class TestResumeCommand:
 
     def test_resume_without_session_id_fails(self, tmp_path: Path):
         """Resume command fails for tasks without session ID."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -623,11 +604,11 @@ class TestResumeCommand:
         # Create a failed task without session ID
         task = store.add("Failed task without session")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Try to resume
-        result = run_gza("resume", "1", "--project", str(tmp_path))
+        result = run_gza("resume", str(task.id), "--project", str(tmp_path))
 
         # Verify it fails with helpful message
         assert result.returncode == 1
@@ -640,14 +621,15 @@ class TestResumeCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_gza("resume", "1", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("resume", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Can only resume failed or orphaned tasks" in result.stdout
 
     def test_resume_runs_by_default(self, tmp_path: Path):
         """Resume command runs the new task immediately by default."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -656,7 +638,7 @@ class TestResumeCommand:
         task = store.add("Failed task to resume")
         task.status = "failed"
         task.session_id = "test-session-123"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Run resume without any special flags (will fail due to missing API key, but we can verify it tries)
@@ -677,7 +659,6 @@ class TestResumeCommand:
 
     def test_resume_with_queue_flag(self, tmp_path: Path):
         """Resume command with --queue adds task to queue without executing."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -686,7 +667,7 @@ class TestResumeCommand:
         task = store.add("Failed task to resume")
         task.status = "failed"
         task.session_id = "test-session-123"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Run resume with --queue flag
@@ -706,7 +687,6 @@ class TestResumeCommand:
 
     def test_resume_creates_new_task_preserves_original(self, tmp_path: Path):
         """Resume creates a new pending task, leaving original task as failed."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -720,7 +700,7 @@ class TestResumeCommand:
         task.cost_usd = 1.50
         task.duration_seconds = 300.0
         task.log_file = ".gza/logs/20260101-implement-feature-x.log"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Run resume (will fail trying to run due to missing API key/git, but task should be created)
@@ -753,7 +733,6 @@ class TestResumeCommand:
 
     def test_resume_orphaned_in_progress_task_succeeds(self, tmp_path: Path):
         """Resume command succeeds for an orphaned in_progress task (no live worker)."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -762,7 +741,7 @@ class TestResumeCommand:
         task = store.add("Orphaned in-progress task")
         task.status = "in_progress"
         task.session_id = "orphaned-session-456"
-        task.started_at = datetime.now(timezone.utc)
+        task.started_at = datetime.now(UTC)
         store.update(task)
 
         # No worker files exist — task is orphaned
@@ -788,7 +767,6 @@ class TestResumeCommand:
         """Resume command fails for an in_progress task that has a live worker."""
         import subprocess as sp
 
-        from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -798,7 +776,7 @@ class TestResumeCommand:
         task = store.add("Still-running task")
         task.status = "in_progress"
         task.session_id = "running-session-789"
-        task.started_at = datetime.now(timezone.utc)
+        task.started_at = datetime.now(UTC)
         store.update(task)
 
         # Spawn a real sleeping process to act as the live worker
@@ -812,14 +790,14 @@ class TestResumeCommand:
                 pid=sleeper.pid,
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
             )
             registry.register(worker)
 
-            result = run_gza("resume", "1", "--project", str(tmp_path))
+            result = run_gza("resume", str(task.id), "--project", str(tmp_path))
         finally:
             sleeper.kill()
             sleeper.wait()
@@ -834,7 +812,6 @@ class TestWorkCommandMultiTask:
 
     def test_work_with_single_task_id(self, tmp_path: Path):
         """Work command accepts a single task ID."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -852,7 +829,6 @@ class TestWorkCommandMultiTask:
 
     def test_work_with_multiple_task_ids(self, tmp_path: Path):
         """Work command accepts multiple task IDs."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -871,7 +847,6 @@ class TestWorkCommandMultiTask:
 
     def test_work_background_with_multiple_task_ids(self, tmp_path: Path):
         """Work command with --background spawns workers for multiple task IDs."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -894,10 +869,10 @@ class TestWorkCommandMultiTask:
     def test_work_background_subprocess_uses_project_flag(self, tmp_path: Path):
         """Background worker subprocess command uses --project flag, not bare positional arg."""
         import argparse
+        from unittest.mock import patch
+
         from gza.cli import _spawn_background_worker
         from gza.config import Config
-        from gza.db import SqliteTaskStore
-        from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -925,7 +900,6 @@ class TestWorkCommandMultiTask:
 
     def test_work_with_no_task_ids(self, tmp_path: Path):
         """Work command works without task IDs (runs next pending)."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -941,7 +915,6 @@ class TestWorkCommandMultiTask:
 
     def test_work_validates_all_task_ids_before_execution(self, tmp_path: Path):
         """Work command validates all task IDs before starting execution."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -958,8 +931,7 @@ class TestWorkCommandMultiTask:
 
     def test_work_validates_task_status(self, tmp_path: Path):
         """Work command validates that tasks are in pending status."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -967,7 +939,7 @@ class TestWorkCommandMultiTask:
         # Add a completed task
         task1 = store.add("Test task 1")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
         # Try to run the completed task
@@ -979,15 +951,14 @@ class TestWorkCommandMultiTask:
 
     def test_work_worker_mode_rejects_completed_task(self, tmp_path: Path):
         """Worker-mode explicit execution should return non-zero for non-pending tasks."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Completed task")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("work", "--worker-mode", str(task.id), "--no-docker", "--project", str(tmp_path))
@@ -996,7 +967,6 @@ class TestWorkCommandMultiTask:
 
     def test_work_warns_about_orphaned_tasks_before_starting(self, tmp_path: Path):
         """Work command warns about orphaned in-progress tasks before starting new work."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1027,11 +997,11 @@ class TestBackgroundWorkerCommand:
         as a bare positional argument, which argparse would try to parse as a task_id
         (type=int), causing the worker subprocess to crash on startup.
         """
-        from unittest.mock import patch, MagicMock
-        from gza.db import SqliteTaskStore
+        import argparse
+        from unittest.mock import MagicMock, patch
+
         from gza.cli import _spawn_background_worker
         from gza.config import Config
-        import argparse
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1084,12 +1054,12 @@ class TestBackgroundWorkerCommand:
 
     def test_background_worker_without_explicit_task_does_not_pass_task_id(self, tmp_path: Path):
         """No-id background work should not pass a selected task ID to child runner."""
-        from unittest.mock import patch, MagicMock
-        from gza.db import SqliteTaskStore
+        import argparse
+        from unittest.mock import MagicMock, patch
+
         from gza.cli import _spawn_background_worker
         from gza.config import Config
         from gza.workers import WorkerRegistry
-        import argparse
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1137,11 +1107,11 @@ class TestBackgroundWorkerCommand:
         Same regression as test_background_worker_command_uses_project_flag but
         for _spawn_background_resume_worker.
         """
-        from unittest.mock import patch, MagicMock
-        from gza.db import SqliteTaskStore
+        import argparse
+        from unittest.mock import MagicMock, patch
+
         from gza.cli import _spawn_background_resume_worker
         from gza.config import Config
-        import argparse
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1190,13 +1160,12 @@ class TestBackgroundWorkerCommand:
 
     def test_background_worker_registers_startup_log_file(self, tmp_path: Path):
         """Background worker captures early stdout/stderr into startup log metadata."""
-        from unittest.mock import patch, MagicMock
         import argparse
         import subprocess as sp
+        from unittest.mock import MagicMock, patch
 
         from gza.cli import _spawn_background_worker
         from gza.config import Config
-        from gza.db import SqliteTaskStore
         from gza.workers import WorkerRegistry
 
         setup_config(tmp_path)
@@ -1274,7 +1243,6 @@ class TestReconciliation:
         """WORKER_DIED reconciliation sets has_commits=True when branch has commits."""
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
-        from gza.db import SqliteTaskStore
         from gza.git import Git
 
         setup_config(tmp_path)
@@ -1318,7 +1286,6 @@ class TestReconciliation:
         """WORKER_DIED reconciliation sets has_commits=False when branch has no commits."""
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
-        from gza.db import SqliteTaskStore
         from gza.git import Git
 
         setup_config(tmp_path)
@@ -1352,11 +1319,10 @@ class TestReconciliation:
 
     def test_prune_terminal_dead_workers_removes_completed_task_worker(self, tmp_path: Path):
         """Terminal task workers with dead PIDs should be pruned from the registry."""
-        import os
         import subprocess
+
         from gza.cli._common import prune_terminal_dead_workers
         from gza.config import Config
-        from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -1364,7 +1330,7 @@ class TestReconciliation:
 
         task = store.add("Completed task with stale worker metadata")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Use a PID known to be dead: start a process, wait for it to exit, then use its PID.
@@ -1391,9 +1357,9 @@ class TestReconciliation:
     def test_prune_terminal_dead_workers_keeps_in_progress_task_worker(self, tmp_path: Path):
         """Non-terminal task workers should not be pruned by terminal cleanup."""
         import os
+
         from gza.cli._common import prune_terminal_dead_workers
         from gza.config import Config
-        from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -1420,9 +1386,9 @@ class TestReconciliation:
     def test_prune_terminal_dead_workers_keeps_live_worker_for_terminal_task(self, tmp_path: Path):
         """Live worker PID for a terminal task must NOT be pruned (is_running guard)."""
         import os
+
         from gza.cli._common import prune_terminal_dead_workers
         from gza.config import Config
-        from gza.db import SqliteTaskStore
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -1430,8 +1396,8 @@ class TestReconciliation:
 
         task = store.add("Terminal task with live worker still flushing")
         task.status = "failed"
-        from datetime import datetime, timezone
-        task.completed_at = datetime.now(timezone.utc)
+        from datetime import datetime
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         config = Config.load(tmp_path)
@@ -1458,14 +1424,13 @@ class TestImplementCommand:
 
     def test_implement_creates_task_from_completed_plan(self, tmp_path: Path):
         """Implement command creates an implementation task and queues it."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         plan_task = store.add("Plan authentication rollout", task_type="plan")
         plan_task.status = "completed"
-        plan_task.completed_at = datetime.now(timezone.utc)
+        plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
         result = run_gza(
@@ -1500,14 +1465,13 @@ class TestImplementCommand:
 
     def test_implement_fails_for_non_plan_task(self, tmp_path: Path):
         """Implement command requires a plan task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Not a plan", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("implement", str(task.id), "--project", str(tmp_path))
@@ -1517,7 +1481,6 @@ class TestImplementCommand:
 
     def test_implement_fails_for_incomplete_plan_task(self, tmp_path: Path):
         """Implement command requires the plan task to be completed."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1531,7 +1494,6 @@ class TestImplementCommand:
 
     def test_implement_derives_prompt_from_plan_slug_when_omitted(self, tmp_path: Path):
         """Implement command derives prompt from the plan task slug when prompt omitted."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1539,7 +1501,7 @@ class TestImplementCommand:
         plan_task = store.add("Plan auth migration", task_type="plan")
         plan_task.slug = "20260226-plan-auth-migration"
         plan_task.status = "completed"
-        plan_task.completed_at = datetime.now(timezone.utc)
+        plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
         result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
@@ -1555,7 +1517,6 @@ class TestImplementCommand:
 
     def test_implement_derives_prompt_from_base_plan_slug_when_retry_suffix_present(self, tmp_path: Path):
         """Implement command strips numeric retry suffix from plan slug."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1563,7 +1524,7 @@ class TestImplementCommand:
         plan_task = store.add("Plan auth migration", task_type="plan")
         plan_task.slug = "20260226-plan-auth-migration-2"
         plan_task.status = "completed"
-        plan_task.completed_at = datetime.now(timezone.utc)
+        plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
         result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
@@ -1583,7 +1544,6 @@ class TestImproveCommand:
 
     def test_improve_creates_task_from_implementation_and_review(self, tmp_path: Path):
         """Improve command creates an improve task with correct relationships."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1592,13 +1552,13 @@ class TestImproveCommand:
         impl_task = store.add("Add user authentication", task_type="implement", group="auth-feature")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-user-authentication"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create a completed review task
         review_task = store.add("Review implementation", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         # Run improve command with --queue to only create (not run)
@@ -1621,7 +1581,6 @@ class TestImproveCommand:
 
     def test_improve_with_review_flag(self, tmp_path: Path):
         """Improve command with --review flag sets create_review."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1630,12 +1589,12 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         # Run improve command with --review flag and --queue to only create (not run)
@@ -1651,7 +1610,6 @@ class TestImproveCommand:
 
     def test_improve_fails_without_review(self, tmp_path: Path):
         """Improve command fails if implementation has no review."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1659,7 +1617,7 @@ class TestImproveCommand:
         # Create implementation task without review
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Run improve command
@@ -1671,7 +1629,6 @@ class TestImproveCommand:
 
     def test_improve_fails_on_non_implement_task(self, tmp_path: Path):
         """Improve command fails if task is not an implementation task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1679,18 +1636,17 @@ class TestImproveCommand:
         # Create a plan task
         plan_task = store.add("Plan feature", task_type="plan")
         plan_task.status = "completed"
-        plan_task.completed_at = datetime.now(timezone.utc)
+        plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
         # Run improve command
-        result = run_gza("improve", "1", "--project", str(tmp_path))
+        result = run_gza("improve", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is a plan task" in result.stdout
 
     def test_improve_accepts_review_task_id_and_resolves_impl(self, tmp_path: Path):
         """Improve command accepts a review task ID and auto-resolves to the implement task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1698,12 +1654,12 @@ class TestImproveCommand:
         # Create implementation and review tasks
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         # Run improve command with review task ID — should resolve to impl task and succeed
@@ -1715,19 +1671,18 @@ class TestImproveCommand:
 
     def test_improve_accepts_improve_task_id_and_resolves_impl(self, tmp_path: Path):
         """Improve command accepts an improve task ID and auto-resolves to the implement task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         # First improve task
@@ -1737,13 +1692,13 @@ class TestImproveCommand:
             "Improve", task_type="improve", based_on=impl_task.id, depends_on=review_task.id, same_branch=True
         )
         improve_task.status = "completed"
-        improve_task.completed_at = datetime.now(timezone.utc)
+        improve_task.completed_at = datetime.now(UTC)
         store.update(improve_task)
 
         # Add a second review so a new improve can be created
         review_task2 = store.add("Review 2", task_type="review", depends_on=impl_task.id)
         review_task2.status = "completed"
-        review_task2.completed_at = datetime.now(timezone.utc)
+        review_task2.completed_at = datetime.now(UTC)
         store.update(review_task2)
 
         # Run improve command with improve task ID — should resolve to impl task
@@ -1755,7 +1710,6 @@ class TestImproveCommand:
 
     def test_improve_uses_most_recent_review(self, tmp_path: Path):
         """Improve command uses the most recent review when multiple exist."""
-        from gza.db import SqliteTaskStore
         import time
 
         setup_config(tmp_path)
@@ -1765,21 +1719,21 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create first review task
         time.sleep(0.01)  # Ensure different timestamps
         review_task1 = store.add("First review", task_type="review", depends_on=impl_task.id)
         review_task1.status = "completed"
-        review_task1.completed_at = datetime.now(timezone.utc)
+        review_task1.completed_at = datetime.now(UTC)
         store.update(review_task1)
 
         # Create second review task (more recent)
         time.sleep(0.01)  # Ensure different timestamps
         review_task2 = store.add("Second review", task_type="review", depends_on=impl_task.id)
         review_task2.status = "completed"
-        review_task2.completed_at = datetime.now(timezone.utc)
+        review_task2.completed_at = datetime.now(UTC)
         store.update(review_task2)
 
         # Run improve command with --queue to only create (not run)
@@ -1805,7 +1759,6 @@ class TestImproveCommand:
 
     def test_improve_warns_on_incomplete_review(self, tmp_path: Path):
         """Improve command warns if the review is not yet completed."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1814,11 +1767,11 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create a pending review task (not completed)
-        review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
+        store.add("Review", task_type="review", depends_on=impl_task.id)
         # Leave status as 'pending' (default)
 
         # Run improve command with --queue to only create (not run)
@@ -1833,7 +1786,6 @@ class TestImproveCommand:
 
     def test_improve_prevents_duplicate(self, tmp_path: Path):
         """Improve command refuses to create a duplicate improve task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1842,13 +1794,13 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create a completed review task
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         # Create an existing improve task for the same impl+review pair
@@ -1860,10 +1812,10 @@ class TestImproveCommand:
         )
 
         # Run improve command - should fail with duplicate error
-        result = run_gza("improve", "1", "--project", str(tmp_path))
+        result = run_gza("improve", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"improve task already exists" in result.stdout
+        assert "improve task already exists" in result.stdout
         assert f"#{existing_improve.id}" in result.stdout
 
         # Verify no new task was created (still only 3 tasks)
@@ -1872,7 +1824,6 @@ class TestImproveCommand:
 
     def test_improve_runs_by_default(self, tmp_path: Path):
         """Improve command runs the task immediately by default (without any flags)."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1881,17 +1832,17 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create a completed review task
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         # Run improve command without --queue (will attempt to run)
-        result = run_gza("improve", "1", "--no-docker", "--project", str(tmp_path))
+        result = run_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the improve task was created and run was attempted
         assert "Created improve task #" in result.stdout
@@ -1899,7 +1850,6 @@ class TestImproveCommand:
 
     def test_improve_with_model_flag(self, tmp_path: Path):
         """Improve command with --model sets the model on the created task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1907,12 +1857,12 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         result = run_gza("improve", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
@@ -1925,7 +1875,6 @@ class TestImproveCommand:
 
     def test_improve_with_provider_flag(self, tmp_path: Path):
         """Improve command with --provider sets the provider on the created task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1933,12 +1882,12 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
         result = run_gza("improve", str(impl_task.id), "--provider", "gemini", "--queue", "--project", str(tmp_path))
@@ -1957,8 +1906,9 @@ class TestImproveCommand:
         to the dropped review (because get_reviews_for_task orders by
         completed_at DESC with no status filter).
         """
-        from gza.db import SqliteTaskStore
         import time
+
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -1968,37 +1918,38 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Older, real, completed review.
         good_review = store.add("First review", task_type="review", depends_on=impl_task.id)
         good_review.status = "completed"
-        good_review.completed_at = datetime.now(timezone.utc)
+        good_review.completed_at = datetime.now(UTC)
         store.update(good_review)
 
         # Newer, dropped review (would sort first by completed_at DESC).
         time.sleep(0.01)
         bad_review = store.add("Accidental duplicate review", task_type="review", depends_on=impl_task.id)
         bad_review.status = "dropped"
-        bad_review.completed_at = datetime.now(timezone.utc)
+        bad_review.completed_at = datetime.now(UTC)
         store.update(bad_review)
 
-        result = run_gza("improve", "1", "--queue", "--project", str(tmp_path))
+        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert f"Review: #{good_review.id}" in result.stdout
         assert f"Review: #{bad_review.id}" not in result.stdout
 
         # Confirm the improve task's dependency points at the good review.
-        improve_task = store.get(4)
+        improve_task = next(task for task in store.get_all() if task.task_type == "improve")
         assert improve_task is not None
         assert improve_task.depends_on == good_review.id
 
     def test_improve_skips_failed_review(self, tmp_path: Path):
         """Auto-pick must also ignore failed reviews — same reasoning as dropped."""
-        from gza.db import SqliteTaskStore
         import time
+
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -2008,21 +1959,21 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         good_review = store.add("Good review", task_type="review", depends_on=impl_task.id)
         good_review.status = "completed"
-        good_review.completed_at = datetime.now(timezone.utc)
+        good_review.completed_at = datetime.now(UTC)
         store.update(good_review)
 
         time.sleep(0.01)
         failed_review = store.add("Failed review", task_type="review", depends_on=impl_task.id)
         failed_review.status = "failed"
-        failed_review.completed_at = datetime.now(timezone.utc)
+        failed_review.completed_at = datetime.now(UTC)
         store.update(failed_review)
 
-        result = run_gza("improve", "1", "--queue", "--project", str(tmp_path))
+        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert f"Review: #{good_review.id}" in result.stdout
@@ -2039,15 +1990,15 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         dropped_review = store.add("Dropped review", task_type="review", depends_on=impl_task.id)
         dropped_review.status = "dropped"
-        dropped_review.completed_at = datetime.now(timezone.utc)
+        dropped_review.completed_at = datetime.now(UTC)
         store.update(dropped_review)
 
-        result = run_gza("improve", "1", "--queue", "--project", str(tmp_path))
+        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no usable review" in result.stdout
@@ -2055,8 +2006,9 @@ class TestImproveCommand:
 
     def test_improve_review_id_flag_picks_explicit_review(self, tmp_path: Path):
         """--review-id overrides auto-pick and uses the specified review."""
-        from gza.db import SqliteTaskStore
         import time
+
+        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -2066,24 +2018,24 @@ class TestImproveCommand:
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         older_review = store.add("Older review", task_type="review", depends_on=impl_task.id)
         older_review.status = "completed"
-        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.completed_at = datetime.now(UTC)
         store.update(older_review)
 
         time.sleep(0.01)
         newer_review = store.add("Newer review", task_type="review", depends_on=impl_task.id)
         newer_review.status = "completed"
-        newer_review.completed_at = datetime.now(timezone.utc)
+        newer_review.completed_at = datetime.now(UTC)
         store.update(newer_review)
 
         # Without --review-id, auto-pick would choose the newer one.
         # With --review-id, we force the older one.
         result = run_gza(
-            "improve", "1",
+            "improve", str(impl_task.id),
             "--review-id", str(older_review.id),
             "--queue",
             "--project", str(tmp_path),
@@ -2092,7 +2044,7 @@ class TestImproveCommand:
         assert result.returncode == 0, result.stdout
         assert f"Review: #{older_review.id}" in result.stdout
 
-        improve_task = store.get(4)
+        improve_task = next(task for task in store.get_all() if task.task_type == "improve")
         assert improve_task is not None
         assert improve_task.depends_on == older_review.id
 
@@ -2107,18 +2059,18 @@ class TestImproveCommand:
 
         impl_a = store.add("Feature A", task_type="implement")
         impl_a.status = "completed"
-        impl_a.completed_at = datetime.now(timezone.utc)
+        impl_a.completed_at = datetime.now(UTC)
         store.update(impl_a)
 
         impl_b = store.add("Feature B", task_type="implement")
         impl_b.status = "completed"
-        impl_b.completed_at = datetime.now(timezone.utc)
+        impl_b.completed_at = datetime.now(UTC)
         store.update(impl_b)
 
         # Review belongs to impl_b, not impl_a.
         review_of_b = store.add("Review B", task_type="review", depends_on=impl_b.id)
         review_of_b.status = "completed"
-        review_of_b.completed_at = datetime.now(timezone.utc)
+        review_of_b.completed_at = datetime.now(UTC)
         store.update(review_of_b)
 
         result = run_gza(
@@ -2142,7 +2094,7 @@ class TestImproveCommand:
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         result = run_gza(
@@ -2166,7 +2118,7 @@ class TestImproveCommand:
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         result = run_gza(
@@ -2198,7 +2150,7 @@ class TestReviewCommand:
         impl_task = store.add("Add user authentication", task_type="implement", group="auth-feature")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-user-authentication"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Run review command with --queue to only create (not run)
@@ -2219,7 +2171,6 @@ class TestReviewCommand:
 
     def test_review_fails_on_non_implementation_task(self, tmp_path: Path):
         """Review command fails if task is not an implementation/improve/review task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2227,18 +2178,17 @@ class TestReviewCommand:
         # Create a plan task
         plan_task = store.add("Plan authentication system", task_type="plan")
         plan_task.status = "completed"
-        plan_task.completed_at = datetime.now(timezone.utc)
+        plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
         # Run review command
-        result = run_gza("review", "1", "--project", str(tmp_path))
+        result = run_gza("review", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is a plan task, not an implementation, improve, or review task" in result.stdout
 
     def test_review_accepts_improve_task_and_targets_implementation(self, tmp_path: Path):
         """Review command accepts improve tasks and reviews the base implementation."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2247,7 +2197,7 @@ class TestReviewCommand:
         impl_task = store.add("Implement auth", task_type="implement", group="auth")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-implement-auth"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create completed improve task based on implementation
@@ -2259,7 +2209,7 @@ class TestReviewCommand:
             group="auth",
         )
         improve_task.status = "completed"
-        improve_task.completed_at = datetime.now(timezone.utc)
+        improve_task.completed_at = datetime.now(UTC)
         store.update(improve_task)
 
         result = run_gza("review", str(improve_task.id), "--queue", "--project", str(tmp_path))
@@ -2277,7 +2227,6 @@ class TestReviewCommand:
 
     def test_review_accepts_review_task_id_and_targets_implementation(self, tmp_path: Path):
         """Review command accepts a review task ID and creates a new review on the base implementation."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2286,14 +2235,14 @@ class TestReviewCommand:
         impl_task = store.add("Implement feature", task_type="implement", group="feat")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-implement-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create a completed review task for the implementation
         assert impl_task.id is not None
         existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
         existing_review.status = "completed"
-        existing_review.completed_at = datetime.now(timezone.utc)
+        existing_review.completed_at = datetime.now(UTC)
         store.update(existing_review)
 
         # Run review command with the existing review task ID
@@ -2311,7 +2260,6 @@ class TestReviewCommand:
 
     def test_review_fails_on_non_completed_task(self, tmp_path: Path):
         """Review command fails if implementation is not completed."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2321,7 +2269,7 @@ class TestReviewCommand:
         # Leave status as 'pending'
 
         # Run review command
-        result = run_gza("review", "1", "--project", str(tmp_path))
+        result = run_gza("review", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is pending. Can only review completed tasks" in result.stdout
@@ -2337,7 +2285,6 @@ class TestReviewCommand:
 
     def test_review_inherits_based_on_from_implementation(self, tmp_path: Path):
         """Review task inherits based_on from implementation to find plan."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2345,14 +2292,14 @@ class TestReviewCommand:
         # Create a plan task
         plan_task = store.add("Plan feature", task_type="plan")
         plan_task.status = "completed"
-        plan_task.completed_at = datetime.now(timezone.utc)
+        plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
         # Create implementation based on plan
         impl_task = store.add("Implement feature", task_type="implement", based_on=plan_task.id)
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-implement-feature"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Run review command with --queue to only create (not run)
@@ -2370,7 +2317,6 @@ class TestReviewCommand:
 
     def test_review_runs_by_default(self, tmp_path: Path):
         """Review command runs the review task immediately by default."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2378,7 +2324,7 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add user authentication", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Run review command without --queue (will attempt to run immediately)
@@ -2397,7 +2343,6 @@ class TestReviewCommand:
 
     def test_review_with_queue_flag(self, tmp_path: Path):
         """Review command with --queue adds task to queue without executing."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2405,7 +2350,7 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add user authentication", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Run review command with --queue flag
@@ -2424,9 +2369,8 @@ class TestReviewCommand:
 
     def test_review_with_open_flag_no_editor(self, tmp_path: Path, monkeypatch):
         """Review command with --open warns when $EDITOR is not set."""
-        import os
-        from unittest.mock import patch, MagicMock
-        from gza.db import SqliteTaskStore
+        from unittest.mock import MagicMock, patch
+
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2434,7 +2378,7 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Unset EDITOR environment variable
@@ -2460,7 +2404,7 @@ class TestReviewCommand:
             review_dir.mkdir(parents=True, exist_ok=True)
 
             # Run review command with --open flag (runs by default)
-            result = run_gza("review", "1", "--open", "--no-docker", "--project", str(tmp_path))
+            result = run_gza("review", str(impl_task.id), "--open", "--no-docker", "--project", str(tmp_path))
 
             # Check that warning about missing EDITOR is shown
             # Note: This might not appear in output if the task doesn't complete successfully in test
@@ -2469,7 +2413,6 @@ class TestReviewCommand:
 
     def test_review_open_flag_with_queue_does_not_run(self, tmp_path: Path):
         """--open flag with --queue creates task but does not run it."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2477,11 +2420,11 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Run review command with --open and --queue (should create task but not run)
-        result = run_gza("review", "1", "--open", "--queue", "--project", str(tmp_path))
+        result = run_gza("review", str(impl_task.id), "--open", "--queue", "--project", str(tmp_path))
 
         # Should succeed but not run the task
         assert result.returncode == 0
@@ -2490,7 +2433,6 @@ class TestReviewCommand:
 
     def test_review_prevents_duplicate_pending_review(self, tmp_path: Path):
         """Review command warns and exits if a pending review already exists."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2498,7 +2440,7 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create an existing pending review task
@@ -2507,7 +2449,7 @@ class TestReviewCommand:
         # Leave status as 'pending' (default)
 
         # Attempt to create another review
-        result = run_gza("review", "1", "--project", str(tmp_path))
+        result = run_gza("review", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Warning: A review task already exists" in result.stdout
@@ -2520,7 +2462,6 @@ class TestReviewCommand:
 
     def test_review_prevents_duplicate_in_progress_review(self, tmp_path: Path):
         """Review command warns and exits if an in_progress review already exists."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2528,7 +2469,7 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create an existing in_progress review task
@@ -2538,7 +2479,7 @@ class TestReviewCommand:
         store.update(existing_review)
 
         # Attempt to create another review
-        result = run_gza("review", "1", "--project", str(tmp_path))
+        result = run_gza("review", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Warning: A review task already exists" in result.stdout
@@ -2551,7 +2492,6 @@ class TestReviewCommand:
 
     def test_review_allows_new_review_after_completed_review(self, tmp_path: Path):
         """Review command allows creating a new review if existing review is completed."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2559,18 +2499,18 @@ class TestReviewCommand:
         # Create a completed implementation task
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         # Create an existing completed review task
         assert impl_task.id is not None
         existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
         existing_review.status = "completed"
-        existing_review.completed_at = datetime.now(timezone.utc)
+        existing_review.completed_at = datetime.now(UTC)
         store.update(existing_review)
 
         # Create another review with --queue (should succeed after improvements)
-        result = run_gza("review", "1", "--queue", "--project", str(tmp_path))
+        result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created review task" in result.stdout
@@ -2588,15 +2528,15 @@ class TestReviewCommand:
         """
         import argparse
         from unittest.mock import MagicMock, patch
-        from gza.cli import cmd_review, DuplicateReviewError
-        from gza.db import SqliteTaskStore
+
+        from gza.cli import cmd_review
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         assert impl_task.id is not None
@@ -2647,7 +2587,6 @@ class TestReviewCommand:
 
     def test_review_with_model_flag(self, tmp_path: Path):
         """Review command with --model sets the model on the created review task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2655,7 +2594,7 @@ class TestReviewCommand:
         impl_task = store.add("Add user authentication", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-user-authentication"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         result = run_gza("review", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
@@ -2668,7 +2607,6 @@ class TestReviewCommand:
 
     def test_review_with_provider_flag(self, tmp_path: Path):
         """Review command with --provider sets the provider on the created review task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2676,7 +2614,7 @@ class TestReviewCommand:
         impl_task = store.add("Add user authentication", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-user-authentication"
-        impl_task.completed_at = datetime.now(timezone.utc)
+        impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
         result = run_gza("review", str(impl_task.id), "--provider", "gemini", "--queue", "--project", str(tmp_path))
@@ -2693,17 +2631,16 @@ class TestIterateCommand:
 
     def _make_completed_impl(self, store, prompt: str = "Implement feature") -> object:
         """Create and return a completed implement task."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         impl = store.add(prompt, task_type="implement")
         impl.status = "completed"
-        impl.branch = f"test-project/20260101-impl"
-        impl.completed_at = datetime.now(timezone.utc)
+        impl.branch = "test-project/20260101-impl"
+        impl.completed_at = datetime.now(UTC)
         store.update(impl)
         return impl
 
     def test_cycle_dry_run(self, tmp_path: Path):
         """gza iterate --dry-run prints preview and exits 0."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2716,7 +2653,6 @@ class TestIterateCommand:
 
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
         """gza iterate rejects tasks that are not implement type."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2730,7 +2666,6 @@ class TestIterateCommand:
 
     def test_cycle_rejects_incomplete_task(self, tmp_path: Path):
         """gza iterate rejects implementation tasks that are not completed."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2744,7 +2679,6 @@ class TestIterateCommand:
 
     def test_cycle_start_and_close_in_db(self, tmp_path: Path):
         """start_cycle + close_cycle flow creates correct DB records."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2768,7 +2702,6 @@ class TestIterateCommand:
 
     def test_cycle_blocked_on_active_cycle_without_continue(self, tmp_path: Path):
         """gza iterate errors if an active cycle exists without --continue."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2784,7 +2717,6 @@ class TestIterateCommand:
 
     def test_cycle_continue_dry_run_shows_resume_message(self, tmp_path: Path):
         """gza iterate --continue --dry-run shows 'resume' message, not 'start' message."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2810,9 +2742,9 @@ class TestIterateCommand:
         is effective. (run_gza spawns a subprocess where in-process patches have no effect.)
         """
         import argparse
-        from gza.db import SqliteTaskStore
+        from unittest.mock import MagicMock, patch
+
         from gza.cli import cmd_iterate
-        from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2828,7 +2760,7 @@ class TestIterateCommand:
         # return 0 (success), so get_review_verdict will read output_content and return APPROVED.
         fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
         fake_review.status = "completed"
-        fake_review.completed_at = datetime.now(timezone.utc)
+        fake_review.completed_at = datetime.now(UTC)
         fake_review.output_content = "**Verdict: APPROVED**"
         store.update(fake_review)
 
@@ -2866,7 +2798,6 @@ class TestIterateCommand:
 
     def test_cycle_continue_no_active_cycle_returns_error(self, tmp_path: Path):
         """gza iterate --continue with no active cycle returns non-zero exit code and error message."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2891,9 +2822,9 @@ class TestIterateCommand:
         exhausts max_iterations, and returns exit code 2 (maxed_out).
         """
         import argparse
-        from gza.db import SqliteTaskStore
+        from unittest.mock import MagicMock, patch
+
         from gza.cli import cmd_iterate
-        from unittest.mock import patch, MagicMock
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2909,7 +2840,7 @@ class TestIterateCommand:
         # Fake review task: always returns CHANGES_REQUESTED verdict so the loop runs to completion
         fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
         fake_review.status = "completed"
-        fake_review.completed_at = datetime.now(timezone.utc)
+        fake_review.completed_at = datetime.now(UTC)
         fake_review.output_content = "**Verdict: CHANGES_REQUESTED**"
         store.update(fake_review)
 
@@ -2959,7 +2890,6 @@ class TestIterateCommand:
 
     def test_cycle_alias_still_works(self, tmp_path: Path):
         """'gza cycle' backward-compat alias routes to the same handler as 'gza iterate'."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3011,14 +2941,15 @@ class TestMarkCompletedCommand:
         task.status = "failed"
         store.update(task)
 
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no branch" in result.stdout
 
     def test_mark_completed_default_force_for_non_code_tasks(self, tmp_path: Path):
         """Non-code task types default to status-only completion."""
-        from gza.db import SqliteTaskStore
 
         setup_db_with_tasks(tmp_path, [
             {"prompt": "Review task", "status": "failed", "task_type": "review"},
@@ -3044,7 +2975,9 @@ class TestMarkCompletedCommand:
             {"prompt": "Task without branch", "status": "failed", "task_type": "review"},
         ])
 
-        result = run_gza("mark-completed", "1", "--verify-git", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("mark-completed", str(task.id), "--verify-git", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no branch" in result.stdout
@@ -3064,7 +2997,7 @@ class TestMarkCompletedCommand:
         task.branch = "gza/1-test-task"
         store.update(task)
 
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Warning" in result.stdout
@@ -3080,7 +3013,7 @@ class TestMarkCompletedCommand:
         task.branch = "gza/1-nonexistent-branch"
         store.update(task)
 
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "does not exist" in result.stdout
@@ -3168,7 +3101,7 @@ class TestMarkCompletedCommand:
         task.branch = "gza/1-failed-branch"
         store.update(task)
 
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Warning" not in result.stdout
@@ -3209,7 +3142,7 @@ class TestMarkCompletedCommand:
         pid_path = workers_path / "w-20260301-120000.pid"
         assert pid_path.exists()
 
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -3221,14 +3154,15 @@ class TestMarkCompletedCommand:
 
     def test_mark_completed_no_worker_is_graceful(self, tmp_path: Path):
         """mark-completed succeeds when no worker exists for the task."""
-        from gza.db import SqliteTaskStore
 
         setup_db_with_tasks(tmp_path, [
             {"prompt": "Review task no worker", "status": "failed", "task_type": "review"},
         ])
 
         # No workers directory / no registry entry — should still succeed
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "status-only" in result.stdout
@@ -3266,7 +3200,9 @@ class TestMarkCompletedCommand:
         )
         registry.register(worker)
 
-        result = run_gza("mark-completed", "1", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Worker that was already failed should remain failed (not touched)
@@ -3347,8 +3283,10 @@ class TestSetStatusCommand:
             {"prompt": "A task", "status": "in_progress"},
         ])
 
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
         result = run_gza(
-            "set-status", "1", "completed", "--reason", "Ignored reason", "--project", str(tmp_path)
+            "set-status", str(task.id), "completed", "--reason", "Ignored reason", "--project", str(tmp_path)
         )
 
         assert result.returncode == 0
@@ -3360,7 +3298,9 @@ class TestSetStatusCommand:
             {"prompt": "A task", "status": "pending"},
         ])
 
-        result = run_gza("set-status", "1", "bogus", "--project", str(tmp_path))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        result = run_gza("set-status", str(task.id), "bogus", "--project", str(tmp_path))
 
         assert result.returncode != 0
 
@@ -3409,7 +3349,7 @@ class TestSetStatusCommand:
         # Add a dropped task (it has no branch, no unmerged state)
         task = store.add("Dropped task", task_type="implement")
         task.status = "dropped"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # gza advance should report no eligible tasks — the dropped task is not actionable
@@ -3446,7 +3386,7 @@ class TestSetStatusCommand:
 
         prereq = store.add("Dropped prereq")
         prereq.status = "dropped"
-        prereq.completed_at = datetime.now(timezone.utc)
+        prereq.completed_at = datetime.now(UTC)
         store.update(prereq)
 
         store.add("Dependent task", depends_on=prereq.id)
@@ -3467,7 +3407,7 @@ class TestSetStatusCommand:
 
         task = store.add("Task to be dropped")
         task.status = "dropped"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -3811,7 +3751,6 @@ class TestAddCommandWithChaining:
 
     def test_add_with_based_on(self, tmp_path: Path):
         """Add command can create tasks with based_on reference."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3843,8 +3782,7 @@ class TestAddCommandWithChaining:
         assert "Added task" in result.stdout
 
         # Verify spec was set
-        from gza.db import SqliteTaskStore
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Implement feature"), None)
@@ -3866,7 +3804,6 @@ class TestAddCommandWithModelAndProvider:
 
     def test_add_with_model_flag(self, tmp_path: Path):
         """Add command with --model flag stores model override."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         result = run_gza("add", "--model", "claude-3-5-haiku-latest", "Test task with model", "--project", str(tmp_path))
@@ -3875,7 +3812,7 @@ class TestAddCommandWithModelAndProvider:
         assert "Added task" in result.stdout
 
         # Verify model was set
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Test task with model"), None)
@@ -3884,7 +3821,6 @@ class TestAddCommandWithModelAndProvider:
 
     def test_add_with_provider_flag(self, tmp_path: Path):
         """Add command with --provider flag stores provider override."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         result = run_gza("add", "--provider", "gemini", "Test task with provider", "--project", str(tmp_path))
@@ -3893,7 +3829,7 @@ class TestAddCommandWithModelAndProvider:
         assert "Added task" in result.stdout
 
         # Verify provider was set
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Test task with provider"), None)
@@ -3903,7 +3839,6 @@ class TestAddCommandWithModelAndProvider:
 
     def test_add_with_both_model_and_provider(self, tmp_path: Path):
         """Add command with both --model and --provider flags works."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         result = run_gza(
@@ -3918,7 +3853,7 @@ class TestAddCommandWithModelAndProvider:
         assert "Added task" in result.stdout
 
         # Verify both were set
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Test task with both"), None)
@@ -3933,7 +3868,6 @@ class TestAddCommandWithNoLearnings:
 
     def test_add_with_no_learnings_flag(self, tmp_path: Path):
         """Add command with --no-learnings flag sets skip_learnings on task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         result = run_gza("add", "--no-learnings", "One-off experimental task", "--project", str(tmp_path))
@@ -3942,7 +3876,7 @@ class TestAddCommandWithNoLearnings:
         assert "Added task" in result.stdout
 
         # Verify skip_learnings was set
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "One-off experimental task"), None)
@@ -3951,14 +3885,13 @@ class TestAddCommandWithNoLearnings:
 
     def test_add_without_no_learnings_flag_defaults_false(self, tmp_path: Path):
         """Add command without --no-learnings flag defaults skip_learnings to False."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         result = run_gza("add", "Normal task with learnings", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Normal task with learnings"), None)
@@ -3971,7 +3904,6 @@ class TestEditCommandWithModelAndProvider:
 
     def test_edit_with_model_flag(self, tmp_path: Path):
         """Edit command can set model override."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3993,7 +3925,6 @@ class TestEditCommandWithModelAndProvider:
 
     def test_edit_with_provider_flag(self, tmp_path: Path):
         """Edit command can set provider override."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4020,7 +3951,6 @@ class TestEditCommandWithNoLearnings:
 
     def test_edit_with_no_learnings_flag(self, tmp_path: Path):
         """Edit command with --no-learnings sets skip_learnings on task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4245,7 +4175,6 @@ class TestBuildPromptWithSpec:
     def test_build_prompt_includes_spec_content(self, tmp_path: Path):
         """build_prompt includes spec file content when task has spec."""
         from gza.config import Config
-        from gza.db import SqliteTaskStore, Task
         from gza.runner import build_prompt
 
         # Setup config
@@ -4276,7 +4205,6 @@ class TestBuildPromptWithSpec:
     def test_build_prompt_without_spec(self, tmp_path: Path):
         """build_prompt works correctly when task has no spec."""
         from gza.config import Config
-        from gza.db import SqliteTaskStore, Task
         from gza.runner import build_prompt
 
         # Setup config
@@ -4302,8 +4230,8 @@ class TestGetTaskOutput:
 
     def test_prefers_db_content(self, tmp_path: Path):
         """_get_task_output should prefer output_content from DB."""
-        from gza.runner import _get_task_output
         from gza.db import Task
+        from gza.runner import _get_task_output
 
         task = Task(
             id=1,
@@ -4315,8 +4243,8 @@ class TestGetTaskOutput:
 
     def test_falls_back_to_file(self, tmp_path: Path):
         """_get_task_output should fall back to file when no DB content."""
-        from gza.runner import _get_task_output
         from gza.db import Task
+        from gza.runner import _get_task_output
 
         # Create report file
         report_dir = tmp_path / ".gza" / "plans"
@@ -4335,8 +4263,8 @@ class TestGetTaskOutput:
 
     def test_prefers_db_over_file(self, tmp_path: Path):
         """_get_task_output should prefer DB when both exist."""
-        from gza.runner import _get_task_output
         from gza.db import Task
+        from gza.runner import _get_task_output
 
         # Create report file
         report_dir = tmp_path / ".gza" / "plans"
@@ -4355,8 +4283,8 @@ class TestGetTaskOutput:
 
     def test_returns_none_when_no_content(self, tmp_path: Path):
         """_get_task_output should return None when no content available."""
-        from gza.runner import _get_task_output
         from gza.db import Task
+        from gza.runner import _get_task_output
 
         task = Task(
             id=4,
@@ -4372,7 +4300,6 @@ class TestGetReviewVerdict:
 
     def _setup(self, tmp_path: Path):
         from gza.cli import get_review_verdict
-        from gza.db import SqliteTaskStore
         from gza.config import Config
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4451,7 +4378,6 @@ class TestClearReviewState:
 
     def test_clear_review_state_sets_review_cleared_at(self, tmp_path: Path):
         """clear_review_state sets review_cleared_at on the task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4468,7 +4394,6 @@ class TestClearReviewState:
 
     def test_clear_review_state_updates_timestamp_on_re_clear(self, tmp_path: Path):
         """Calling clear_review_state twice updates the timestamp."""
-        from gza.db import SqliteTaskStore
         import time
 
         setup_config(tmp_path)

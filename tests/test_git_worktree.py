@@ -1,7 +1,7 @@
 """Tests for Git worktree operations with upstream tracking."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from gza.git import Git, GitError
 

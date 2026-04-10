@@ -4,12 +4,9 @@ import re
 from pathlib import Path
 from unittest.mock import Mock
 
-import pytest
-
-from gza.prompts import PromptBuilder
 from gza.config import Config
 from gza.db import SqliteTaskStore
-
+from gza.prompts import PromptBuilder
 
 REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
@@ -554,10 +551,10 @@ class TestReviewDiffThresholdConfig:
     def test_review_thresholds_have_defaults(self, tmp_path: Path):
         """review threshold fields use defaults when omitted."""
         from gza.config import (
-            Config,
+            DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
             DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
             DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
-            DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
+            Config,
         )
 
         config_file = tmp_path / "gza.yaml"

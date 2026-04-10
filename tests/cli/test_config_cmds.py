@@ -3,14 +3,13 @@
 
 import json
 import os
-import re
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import make_store, run_gza, setup_config
 
 
 class TestConfigRequirements:
@@ -233,8 +232,9 @@ class TestConfigEnvVars:
 
     def test_docker_volumes_tilde_expansion(self, tmp_path: Path):
         """Docker volumes should expand tilde in source paths."""
-        from gza.config import Config
         from pathlib import Path as PathLib
+
+        from gza.config import Config
 
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
@@ -367,7 +367,6 @@ class TestLocalConfigOverrides:
 
     def test_config_command_shows_effective_values_with_sources(self, tmp_path: Path):
         """gza config --json should include effective values and source attribution."""
-        import json
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
@@ -395,7 +394,6 @@ class TestLocalConfigOverrides:
 
     def test_config_command_projects_source_for_branch_strategy_preset(self, tmp_path: Path):
         """gza config should attribute normalized branch_strategy fields to configured source."""
-        import json
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
@@ -417,7 +415,6 @@ class TestLocalConfigOverrides:
 
     def test_config_command_includes_task_providers_with_sources(self, tmp_path: Path):
         """gza config --json should project task_providers values and source attribution."""
-        import json
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
@@ -493,8 +490,8 @@ class TestCleanCommand:
     def test_clean_dry_run(self, tmp_path: Path):
         """Clean command dry run works."""
         from gza.config import Config
-        from gza.workers import WorkerRegistry
         from gza.git import Git
+        from gza.workers import WorkerRegistry
 
         # Initialize git repo (needed for worktree cleanup)
         git = Git(tmp_path)
@@ -516,7 +513,7 @@ class TestCleanCommand:
             "pid": 99999,  # Non-existent PID
             "task_id": None,
             "task_slug": None,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(UTC).isoformat(),
             "status": "running",
             "log_file": None,
             "worktree": None,
@@ -533,7 +530,6 @@ class TestCleanCommand:
         # Set modification time to 60 days ago
         import time
         old_time = time.time() - (60 * 24 * 60 * 60)
-        import os
         os.utime(old_log, (old_time, old_time))
 
         result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
@@ -560,7 +556,6 @@ class TestCleanCommand:
 
         # Set modification time for old log to 60 days ago
         import time
-        import os
         old_time = time.time() - (60 * 24 * 60 * 60)
         os.utime(old_log, (old_time, old_time))
 
@@ -574,7 +569,7 @@ class TestCleanCommand:
     def test_clean_workers(self, tmp_path: Path):
         """Clean command cleans stale worker metadata and startup logs."""
         from gza.config import Config
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
@@ -587,7 +582,7 @@ class TestCleanCommand:
             pid=99999,  # Non-existent PID
             task_id=None,
             task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
             status="running",
             log_file=None,
             worktree=None,
@@ -613,11 +608,11 @@ class TestCleanCommand:
 
     def test_clean_keep_unmerged_logs(self, tmp_path: Path):
         """Clean command with --keep-unmerged keeps logs for unmerged tasks."""
+        import time
+
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.git import Git
-        import time
-        import os
 
         # Initialize git repo
         git = Git(tmp_path)
@@ -638,7 +633,7 @@ class TestCleanCommand:
         unmerged_task.slug = "20200101-unmerged"
         unmerged_task.branch = "feature/unmerged"
         unmerged_task.has_commits = True
-        unmerged_task.completed_at = datetime.now(timezone.utc)
+        unmerged_task.completed_at = datetime.now(UTC)
         store.update(unmerged_task)
 
         # Create branch for unmerged task
@@ -696,7 +691,7 @@ class TestCleanCommand:
         task = store.add("Recent feature", task_type="implement")
         task.slug = "20260301-recent-feature"
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Create a worktree directory tracked by git
@@ -736,7 +731,7 @@ class TestCleanCommand:
         task = store.add("Old feature", task_type="implement")
         task.slug = "20250101-old-feature"
         task.status = "completed"
-        task.completed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        task.completed_at = datetime(2025, 1, 1, tzinfo=UTC)
         store.update(task)
 
         # Create a worktree directory tracked by git
@@ -836,8 +831,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_archive_default_behavior(self, tmp_path: Path):
         """Clean --archive archives files older than 30 days by default."""
-        import time
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
 
@@ -854,7 +848,7 @@ class TestCleanArchiveCommand:
         old_worker.write_text("old worker content")
 
         # Set mtime to 35 days ago
-        old_time = (datetime.now(timezone.utc) - timedelta(days=35)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=35)).timestamp()
         old_log.touch()
         old_worker.touch()
         old_log.chmod(0o644)
@@ -870,7 +864,7 @@ class TestCleanArchiveCommand:
         recent_log.write_text("recent log content")
         recent_worker.write_text("recent worker content")
 
-        recent_time = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+        recent_time = (datetime.now(UTC) - timedelta(days=10)).timestamp()
         recent_log.touch()
         recent_worker.touch()
         os.utime(recent_log, (recent_time, recent_time))
@@ -897,8 +891,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_with_custom_days(self, tmp_path: Path):
         """Clean command respects custom --days value."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -909,7 +902,7 @@ class TestCleanArchiveCommand:
         log_file = logs_dir / "log.txt"
         log_file.write_text("content")
 
-        old_time = (datetime.now(timezone.utc) - timedelta(days=8)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=8)).timestamp()
         os.utime(log_file, (old_time, old_time))
 
         # Run with --archive --days 7 (should archive 8-day-old file)
@@ -924,8 +917,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_dry_run_mode(self, tmp_path: Path):
         """Clean command with --dry-run shows what would be archived without archiving."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -936,7 +928,7 @@ class TestCleanArchiveCommand:
         old_log = logs_dir / "old_log.txt"
         old_log.write_text("old content")
 
-        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
         os.utime(old_log, (old_time, old_time))
 
         # Run with --archive --dry-run
@@ -980,8 +972,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_mixed_old_and_new_files(self, tmp_path: Path):
         """Clean command correctly handles mixed old and new files."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -992,12 +983,12 @@ class TestCleanArchiveCommand:
         for i in range(3):
             old_file = logs_dir / f"old_{i}.txt"
             old_file.write_text(f"old content {i}")
-            old_time = (datetime.now(timezone.utc) - timedelta(days=35 + i)).timestamp()
+            old_time = (datetime.now(UTC) - timedelta(days=35 + i)).timestamp()
             os.utime(old_file, (old_time, old_time))
 
             new_file = logs_dir / f"new_{i}.txt"
             new_file.write_text(f"new content {i}")
-            new_time = (datetime.now(timezone.utc) - timedelta(days=5 + i)).timestamp()
+            new_time = (datetime.now(UTC) - timedelta(days=5 + i)).timestamp()
             os.utime(new_file, (new_time, new_time))
 
         result = run_gza("clean", "--archive", "--project", str(tmp_path))
@@ -1014,8 +1005,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_only_files_not_directories(self, tmp_path: Path):
         """Clean command only archives files, not directories."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1027,7 +1017,7 @@ class TestCleanArchiveCommand:
         old_subdir.mkdir()
 
         # Set directory mtime to old
-        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
         os.utime(old_subdir, (old_time, old_time))
 
         result = run_gza("clean", "--archive", "--project", str(tmp_path))
@@ -1039,8 +1029,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_second_run_is_noop(self, tmp_path: Path):
         """Second run of clean should be a no-op (only checks source dirs)."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1050,7 +1039,7 @@ class TestCleanArchiveCommand:
         # Create old file
         old_log = logs_dir / "old_log.txt"
         old_log.write_text("old content")
-        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
         os.utime(old_log, (old_time, old_time))
 
         # First run - archives the file
@@ -1065,8 +1054,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_purge_mode(self, tmp_path: Path):
         """Clean with --purge deletes archived files older than N days."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1082,14 +1070,14 @@ class TestCleanArchiveCommand:
         old_archived_log.write_text("old archived content")
         old_archived_worker.write_text("old archived content")
 
-        very_old_time = (datetime.now(timezone.utc) - timedelta(days=400)).timestamp()
+        very_old_time = (datetime.now(UTC) - timedelta(days=400)).timestamp()
         os.utime(old_archived_log, (very_old_time, very_old_time))
         os.utime(old_archived_worker, (very_old_time, very_old_time))
 
         # Create recent archived files (100 days old)
         recent_archived_log = archives_logs_dir / "recent_archived.txt"
         recent_archived_log.write_text("recent archived content")
-        recent_time = (datetime.now(timezone.utc) - timedelta(days=100)).timestamp()
+        recent_time = (datetime.now(UTC) - timedelta(days=100)).timestamp()
         os.utime(recent_archived_log, (recent_time, recent_time))
 
         # Run purge with default days (365)
@@ -1109,8 +1097,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_purge_with_custom_days(self, tmp_path: Path):
         """Clean --purge respects custom --days value."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1121,7 +1108,7 @@ class TestCleanArchiveCommand:
         # Create archived file 200 days old
         archived_log = archives_logs_dir / "archived.txt"
         archived_log.write_text("archived content")
-        old_time = (datetime.now(timezone.utc) - timedelta(days=200)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=200)).timestamp()
         os.utime(archived_log, (old_time, old_time))
 
         # Run purge with --days 180 (should delete 200-day-old file)
@@ -1133,8 +1120,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_purge_dry_run(self, tmp_path: Path):
         """Clean --purge --dry-run shows what would be deleted without deleting."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1145,7 +1131,7 @@ class TestCleanArchiveCommand:
         # Create old archived file
         old_archived = archives_logs_dir / "old_archived.txt"
         old_archived.write_text("old archived content")
-        old_time = (datetime.now(timezone.utc) - timedelta(days=400)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=400)).timestamp()
         os.utime(old_archived, (old_time, old_time))
 
         # Run purge with --dry-run
@@ -1160,8 +1146,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_purge_second_run_is_noop(self, tmp_path: Path):
         """Second run of clean --purge should be a no-op (only checks archives dir)."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1172,7 +1157,7 @@ class TestCleanArchiveCommand:
         # Create old archived file
         old_archived = archives_logs_dir / "old_archived.txt"
         old_archived.write_text("old archived content")
-        old_time = (datetime.now(timezone.utc) - timedelta(days=400)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=400)).timestamp()
         os.utime(old_archived, (old_time, old_time))
 
         # First purge run - deletes the file
@@ -1187,8 +1172,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_deletes_old_backups(self, tmp_path: Path):
         """Clean command deletes old backup files from .gza/backups/."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1198,13 +1182,13 @@ class TestCleanArchiveCommand:
         # Create an old backup file (35 days old)
         old_backup = backups_dir / "gza-2026011400.db"
         old_backup.write_bytes(b"old backup data")
-        old_time = (datetime.now(timezone.utc) - timedelta(days=35)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=35)).timestamp()
         os.utime(old_backup, (old_time, old_time))
 
         # Create a recent backup file (1 day old)
         recent_backup = backups_dir / "gza-2026021900.db"
         recent_backup.write_bytes(b"recent backup data")
-        recent_time = (datetime.now(timezone.utc) - timedelta(days=1)).timestamp()
+        recent_time = (datetime.now(UTC) - timedelta(days=1)).timestamp()
         os.utime(recent_backup, (recent_time, recent_time))
 
         result = run_gza("clean", "--archive", "--project", str(tmp_path))
@@ -1219,8 +1203,7 @@ class TestCleanArchiveCommand:
 
     def test_clean_dry_run_shows_backups(self, tmp_path: Path):
         """Clean --dry-run shows old backup files that would be deleted."""
-        import os
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         setup_config(tmp_path)
 
@@ -1229,7 +1212,7 @@ class TestCleanArchiveCommand:
 
         old_backup = backups_dir / "gza-2026010100.db"
         old_backup.write_bytes(b"old backup")
-        old_time = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
+        old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
         os.utime(old_backup, (old_time, old_time))
 
         result = run_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
@@ -1270,7 +1253,7 @@ class TestStatsReviewsCommand:
 
     def test_stats_reviews_with_reviewed_impl(self, tmp_path: Path):
         """gza stats reviews shows cycle stats for a reviewed implementation task."""
-        from gza.db import SqliteTaskStore, TaskStats
+        from gza.db import TaskStats
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1292,7 +1275,7 @@ class TestStatsReviewsCommand:
 
     def test_stats_reviews_unreviewed_impl(self, tmp_path: Path):
         """gza stats reviews shows impl count but no cycle stats for unreviewed impls."""
-        from gza.db import SqliteTaskStore, TaskStats
+        from gza.db import TaskStats
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1310,7 +1293,7 @@ class TestStatsReviewsCommand:
 
     def test_stats_reviews_cycle_distribution(self, tmp_path: Path):
         """gza stats reviews shows cycle distribution for reviewed impls."""
-        from gza.db import SqliteTaskStore, TaskStats
+        from gza.db import TaskStats
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1342,7 +1325,7 @@ class TestStatsReviewsCommand:
 
     def test_stats_reviews_default_14_day_range(self, tmp_path: Path):
         """gza stats reviews with no date flags uses a 14-day range ending today."""
-        from datetime import date, timedelta
+        from datetime import date
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -1395,7 +1378,6 @@ class TestSyncReportCommand:
 
     def test_sync_report_updates_db_from_disk_for_plan(self, tmp_path: Path):
         """sync-report copies disk content into DB output_content for plan tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1403,7 +1385,7 @@ class TestSyncReportCommand:
         task = store.add("Plan something", task_type="plan")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Old plan content in DB"
         task.report_file = ".gza/plans/20260101-plan-something.md"
         store.update(task)
@@ -1422,7 +1404,6 @@ class TestSyncReportCommand:
 
     def test_sync_report_updates_db_from_disk_for_review(self, tmp_path: Path):
         """sync-report copies disk content into DB output_content for review tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1430,7 +1411,7 @@ class TestSyncReportCommand:
         task = store.add("Review feature", task_type="review")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Old review content"
         task.report_file = ".gza/reviews/20260101-review-feature.md"
         store.update(task)
@@ -1449,7 +1430,6 @@ class TestSyncReportCommand:
 
     def test_sync_report_updates_db_from_disk_for_explore(self, tmp_path: Path):
         """sync-report copies disk content into DB output_content for explore tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1457,7 +1437,7 @@ class TestSyncReportCommand:
         task = store.add("Explore codebase", task_type="explore")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Old exploration content"
         task.report_file = ".gza/explorations/20260101-explore-codebase.md"
         store.update(task)
@@ -1476,7 +1456,6 @@ class TestSyncReportCommand:
 
     def test_sync_report_noop_when_already_in_sync(self, tmp_path: Path):
         """sync-report is a no-op when disk content matches DB output_content."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1484,7 +1463,7 @@ class TestSyncReportCommand:
         task = store.add("Plan task", task_type="plan")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Identical content"
         task.report_file = ".gza/plans/20260101-plan-task.md"
         store.update(task)
@@ -1504,7 +1483,6 @@ class TestSyncReportCommand:
 
     def test_sync_report_error_no_report_file(self, tmp_path: Path):
         """sync-report returns error when task has no report_file."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1552,7 +1530,6 @@ class TestLearningsCommand:
 
     def test_learnings_update_generates_file(self, tmp_path: Path):
         """gza learnings update writes .gza/learnings.md from completed tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)

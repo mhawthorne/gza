@@ -5,7 +5,7 @@ import argparse
 import io
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +15,13 @@ from gza.cli import _determine_advance_action, cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, setup_git_repo_with_task_branch, LOG_FIXTURES_DIR
+from .conftest import (
+    make_store,
+    run_gza,
+    setup_config,
+    setup_db_with_tasks,
+    setup_git_repo_with_task_branch,
+)
 
 
 class TestMergeCommand:
@@ -74,9 +80,9 @@ class TestMergeCommand:
 
     def test_merge_rebase_with_remote(self, tmp_path: Path):
         """Merge command accepts --rebase --remote together."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -102,7 +108,7 @@ class TestMergeCommand:
         # Create a task with a branch
         task = store.add("Test rebase with remote")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/test-remote-rebase"
         store.update(task)
 
@@ -139,9 +145,9 @@ class TestMergeCommand:
 
     def test_squash_merge_creates_commit(self, tmp_path: Path):
         """Squash merge creates a commit, not just staged changes."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -164,7 +170,7 @@ class TestMergeCommand:
         # Create a task with a branch
         task = store.add("Add feature X")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/test-squash"
         store.update(task)
 
@@ -200,9 +206,9 @@ class TestMergeCommand:
 
     def test_squash_merge_commit_message_includes_task_info(self, tmp_path: Path):
         """Squash merge commit message includes task information."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -223,7 +229,7 @@ class TestMergeCommand:
         task = store.add(task_prompt)
         task.slug = "20260401-impl-auth-jwt"
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/auth"
         store.update(task)
 
@@ -249,9 +255,9 @@ class TestMergeCommand:
 
     def test_branch_shows_as_merged_after_squash(self, tmp_path: Path):
         """Branch shows as merged in 'gza unmerged' after squash merge completes."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -270,7 +276,7 @@ class TestMergeCommand:
         # Create a task with a branch
         task = store.add("Add cool feature")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/cool"
         store.update(task)
 
@@ -298,9 +304,10 @@ class TestMergeCommand:
 
     def test_mark_only_preserves_branch_and_marks_merged(self, tmp_path: Path):
         """--mark-only flag sets merge_status without deleting the branch."""
+        from datetime import datetime
+
         from gza.db import SqliteTaskStore
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
@@ -323,7 +330,7 @@ class TestMergeCommand:
         # Create a task with a branch
         task = store.add("Test mark-only")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/mark-only"
         store.update(task)
 
@@ -355,9 +362,9 @@ class TestMergeCommand:
 
     def test_mark_only_rejects_conflicting_flags(self, tmp_path: Path):
         """--mark-only flag rejects conflicting flags."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -376,7 +383,7 @@ class TestMergeCommand:
         # Create a task with a branch
         task = store.add("Test conflicting flags")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/test"
         store.update(task)
 
@@ -404,7 +411,6 @@ class TestMergeCommand:
 
     def test_mark_only_requires_completed_task(self, tmp_path: Path):
         """--mark-only flag requires task to be completed."""
-        from gza.db import SqliteTaskStore
         from gza.git import Git
 
         setup_config(tmp_path)
@@ -440,9 +446,9 @@ class TestMergeCommand:
 
     def test_merge_accepts_multiple_task_ids(self, tmp_path: Path):
         """Merge command accepts multiple task IDs."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -461,7 +467,7 @@ class TestMergeCommand:
         # Create first task with a branch
         task1 = store.add("Test merge task 1")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         task1.branch = "feature/test-1"
         store.update(task1)
 
@@ -475,7 +481,7 @@ class TestMergeCommand:
         # Create second task with a branch
         task2 = store.add("Test merge task 2")
         task2.status = "completed"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         task2.branch = "feature/test-2"
         store.update(task2)
 
@@ -497,9 +503,9 @@ class TestMergeCommand:
 
     def test_merge_stops_on_first_failure(self, tmp_path: Path):
         """Merge command stops on first failure and reports which tasks were merged."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -518,7 +524,7 @@ class TestMergeCommand:
         # Create first task with a branch (will succeed)
         task1 = store.add("Test merge task 1")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         task1.branch = "feature/test-1"
         store.update(task1)
 
@@ -531,13 +537,13 @@ class TestMergeCommand:
         # Create second task that will fail (no branch)
         task2 = store.add("Test merge task 2 - no branch")
         task2.status = "completed"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         store.update(task2)
 
         # Create third task with a branch (won't be processed)
         task3 = store.add("Test merge task 3")
         task3.status = "completed"
-        task3.completed_at = datetime.now(timezone.utc)
+        task3.completed_at = datetime.now(UTC)
         task3.branch = "feature/test-3"
         store.update(task3)
 
@@ -566,9 +572,9 @@ class TestMergeCommand:
 
     def test_merge_multiple_with_squash(self, tmp_path: Path):
         """Merge command with --squash flag works with multiple tasks."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -587,7 +593,7 @@ class TestMergeCommand:
         # Create first task with a branch
         task1 = store.add("Test squash merge 1")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         task1.branch = "feature/squash-1"
         store.update(task1)
 
@@ -600,7 +606,7 @@ class TestMergeCommand:
         # Create second task with a branch
         task2 = store.add("Test squash merge 2")
         task2.status = "completed"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         task2.branch = "feature/squash-2"
         store.update(task2)
 
@@ -641,9 +647,9 @@ class TestMergeCommand:
 
     def test_merge_all_flag_merges_all_unmerged_tasks(self, tmp_path: Path):
         """--all flag finds and merges all unmerged done tasks."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -660,7 +666,7 @@ class TestMergeCommand:
         # Create two completed tasks with branches and commits
         task1 = store.add("Unmerged task 1")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         task1.branch = "feature/all-1"
         task1.has_commits = True
         store.update(task1)
@@ -673,7 +679,7 @@ class TestMergeCommand:
 
         task2 = store.add("Unmerged task 2")
         task2.status = "completed"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         task2.branch = "feature/all-2"
         task2.has_commits = True
         store.update(task2)
@@ -691,9 +697,9 @@ class TestMergeCommand:
 
     def test_merge_all_flag_no_unmerged_tasks(self, tmp_path: Path):
         """--all flag reports no tasks when all branches are already merged."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -710,7 +716,7 @@ class TestMergeCommand:
         # Create a completed task whose branch is already merged
         task = store.add("Already merged task")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/already-merged"
         task.has_commits = True
         store.update(task)
@@ -729,9 +735,9 @@ class TestMergeCommand:
 
     def test_merge_all_flag_skips_tasks_without_commits(self, tmp_path: Path):
         """--all flag skips tasks that have no commits (has_commits=False or None)."""
-        from gza.db import SqliteTaskStore
+        from datetime import datetime
+
         from gza.git import Git
-        from datetime import datetime, timezone
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -748,7 +754,7 @@ class TestMergeCommand:
         # Task with has_commits=False should be skipped
         task_no_commits = store.add("Task with no commits")
         task_no_commits.status = "completed"
-        task_no_commits.completed_at = datetime.now(timezone.utc)
+        task_no_commits.completed_at = datetime.now(UTC)
         task_no_commits.branch = "feature/no-commits"
         task_no_commits.has_commits = False
         store.update(task_no_commits)
@@ -1030,8 +1036,8 @@ class TestDiffCommand:
 
     def test_diff_with_task_id(self, tmp_path: Path):
         """Diff command resolves task ID to branch diff."""
-        from gza.git import Git
         from gza.db import SqliteTaskStore
+        from gza.git import Git
 
         setup_config(tmp_path)
 
@@ -1097,8 +1103,8 @@ class TestDiffCommand:
 
     def test_diff_with_task_id_no_branch(self, tmp_path: Path):
         """Diff command shows error when task has no branch."""
-        from gza.git import Git
         from gza.db import SqliteTaskStore
+        from gza.git import Git
 
         setup_config(tmp_path)
 
@@ -1151,11 +1157,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_uses_effective_codex_provider(self, tmp_path):
         """Auto-resolve uses effective provider selection (codex override)."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="claude")
         task = SimpleNamespace(task_type="implement", provider="codex", provider_is_explicit=True, model=None)
@@ -1178,11 +1185,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_uses_effective_gemini_provider(self, tmp_path):
         """Auto-resolve supports gemini provider selection from effective config."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="gemini")
         task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
@@ -1204,10 +1212,11 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_fails_fast_when_skill_missing(self, tmp_path, capsys, monkeypatch):
         """Auto-resolve fails before provider run when runtime skill is missing and auto-install fails."""
-        from gza.cli import invoke_provider_resolve
-        from gza.config import Config
         from types import SimpleNamespace
         from unittest.mock import patch
+
+        from gza.cli import invoke_provider_resolve
+        from gza.config import Config
 
         codex_home = tmp_path / "codex-home"
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -1226,11 +1235,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_uses_current_config_after_provider_switch(self, tmp_path):
         """Auto-resolve uses current config provider when task provider is non-explicit stale state."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
         task = SimpleNamespace(task_type="implement", provider="claude", provider_is_explicit=False, model=None)
@@ -1250,11 +1260,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_honors_use_docker_override(self, tmp_path):
         """Auto-resolve should respect config.use_docker when launching provider."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="codex", use_docker=False)
         task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
@@ -1274,12 +1285,13 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_creates_internal_task_record(self, tmp_path):
         """Auto-resolve should persist an internal task so history/auditing can find it."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
         store = SqliteTaskStore(config.db_path)
@@ -1311,11 +1323,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_marks_internal_task_failed_on_exception(self, tmp_path):
         """Provider exceptions should mark the tracking internal task as failed."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.db import SqliteTaskStore
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
         store = SqliteTaskStore(config.db_path)
@@ -1345,12 +1358,13 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_marks_internal_task_failed_if_rebase_still_in_progress(self, tmp_path):
         """Auto-resolve should fail when git still reports active rebase markers."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import Mock, patch
 
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
         store = SqliteTaskStore(config.db_path)
@@ -1382,12 +1396,13 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_marks_internal_task_failed_on_nonzero_exit(self, tmp_path):
         """Non-zero provider exits should fail resolve even without an exception."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import Mock, patch
 
         config = Config(project_dir=tmp_path, project_name="test", provider="codex")
         store = SqliteTaskStore(config.db_path)
@@ -1431,8 +1446,9 @@ class TestRebaseHelpers:
 
     def test_ensure_skill_installs_when_missing(self, tmp_path):
         """ensure_skill auto-installs from bundled package when skill is absent."""
-        from gza.cli import ensure_skill
         from unittest.mock import patch
+
+        from gza.cli import ensure_skill
 
         with patch("gza.cli._resolve_runtime_skill_dir") as mock_resolve, \
              patch("gza.skills_utils.copy_skill") as mock_copy:
@@ -1452,8 +1468,9 @@ class TestRebaseHelpers:
 
     def test_ensure_skill_returns_false_when_install_fails(self, tmp_path):
         """ensure_skill returns False when copy_skill fails."""
-        from gza.cli import ensure_skill
         from unittest.mock import patch
+
+        from gza.cli import ensure_skill
 
         with patch("gza.cli._resolve_runtime_skill_dir") as mock_resolve, \
              patch("gza.skills_utils.copy_skill", return_value=(False, "copy failed: error")):
@@ -1474,11 +1491,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_worktree_uses_auto_without_continue(self, tmp_path):
         """When worktree_path is provided the provider is called with /gza-rebase --auto (no --continue)."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="claude")
         task = SimpleNamespace(task_type="implement", provider=None, provider_is_explicit=False, model=None)
@@ -1499,11 +1517,12 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_worktree_runs_provider_in_worktree(self, tmp_path):
         """When worktree_path is provided the provider runs in that directory."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         worktree = tmp_path / "wt"
         worktree.mkdir()
@@ -1525,12 +1544,13 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_worktree_fails_if_rebase_still_in_progress(self, tmp_path):
         """Worktree path: returns False when _is_rebase_in_progress reports True."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="claude")
         store = SqliteTaskStore(config.db_path)
@@ -1560,12 +1580,13 @@ class TestRebaseHelpers:
 
     def test_invoke_provider_resolve_worktree_records_auto_command_in_output(self, tmp_path):
         """Worktree path: internal task output_content contains /gza-rebase --auto."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
         from gza.cli import invoke_provider_resolve
         from gza.config import Config
         from gza.db import SqliteTaskStore
         from gza.providers.base import RunResult
-        from types import SimpleNamespace
-        from unittest.mock import patch, Mock
 
         config = Config(project_dir=tmp_path, project_name="test", provider="claude")
         store = SqliteTaskStore(config.db_path)
@@ -1658,9 +1679,7 @@ class TestMergeStatusTracking:
 
     def test_merge_sets_merge_status_merged(self, tmp_path: Path):
         """Successful merge sets merge_status='merged' on the task."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1670,7 +1689,7 @@ class TestMergeStatusTracking:
         # Create a task with merge_status='unmerged'
         task = store.add("Add feature")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/test"
         task.has_commits = True
         task.merge_status = "unmerged"
@@ -1694,9 +1713,7 @@ class TestMergeStatusTracking:
 
     def test_squash_merge_sets_merge_status_merged(self, tmp_path: Path):
         """Squash merge also sets merge_status='merged'."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1705,7 +1722,7 @@ class TestMergeStatusTracking:
 
         task = store.add("Add feature squash")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/squash"
         task.has_commits = True
         task.merge_status = "unmerged"
@@ -1726,9 +1743,7 @@ class TestMergeStatusTracking:
 
     def test_mark_only_sets_merge_status_merged(self, tmp_path: Path):
         """--mark-only flag sets merge_status='merged' in the database."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1737,7 +1752,7 @@ class TestMergeStatusTracking:
 
         task = store.add("Mark only test")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feature/mark-only-status"
         task.has_commits = True
         task.merge_status = "unmerged"
@@ -1758,9 +1773,7 @@ class TestMergeStatusTracking:
 
     def test_cmd_unmerged_uses_db_query(self, tmp_path: Path):
         """gza unmerged uses merge_status='unmerged' DB query instead of git detection."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1770,7 +1783,7 @@ class TestMergeStatusTracking:
         # Task with merge_status='unmerged' (branch exists)
         task1 = store.add("Unmerged task")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         task1.branch = "feature/unmerged-task"
         task1.has_commits = True
         task1.merge_status = "unmerged"
@@ -1785,7 +1798,7 @@ class TestMergeStatusTracking:
         # Task with merge_status='merged'
         task2 = store.add("Merged task")
         task2.status = "completed"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         task2.branch = "feature/merged-task"
         task2.has_commits = True
         task2.merge_status = "merged"
@@ -1794,7 +1807,7 @@ class TestMergeStatusTracking:
         # Task with merge_status=None
         task3 = store.add("No merge status")
         task3.status = "completed"
-        task3.completed_at = datetime.now(timezone.utc)
+        task3.completed_at = datetime.now(UTC)
         task3.has_commits = False
         store.update(task3)
 
@@ -1806,15 +1819,14 @@ class TestMergeStatusTracking:
 
     def test_cmd_history_shows_merged_label(self, tmp_path: Path):
         """gza history shows [merged] label for tasks with merge_status='merged'."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Merged feature task")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.has_commits = True
         task.merge_status = "merged"
         store.update(task)
@@ -1826,15 +1838,14 @@ class TestMergeStatusTracking:
 
     def test_cmd_history_shows_unmerged_label_for_unmerged(self, tmp_path: Path):
         """gza history shows 'unmerged' text label for tasks with merge_status='unmerged'."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Unmerged feature")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.has_commits = True
         task.merge_status = "unmerged"
         store.update(task)
@@ -1847,15 +1858,14 @@ class TestMergeStatusTracking:
 
     def test_cmd_history_no_merge_label_without_merge_status(self, tmp_path: Path):
         """gza history shows no merge label for tasks without merge_status."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Regular completed task")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -1865,15 +1875,14 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_displays_merge_status(self, tmp_path: Path):
         """gza show displays Merge Status when merge_status is set."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Test show merge status")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.merge_status = "merged"
         store.update(task)
 
@@ -1883,15 +1892,14 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_no_merge_status_line_when_null(self, tmp_path: Path):
         """gza show does not display Merge Status when merge_status is None."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Test show no merge status")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
@@ -1900,7 +1908,6 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_displays_skip_learnings(self, tmp_path: Path):
         """gza show displays 'Skip Learnings: yes' when skip_learnings is True."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1913,7 +1920,6 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_no_skip_learnings_line_when_false(self, tmp_path: Path):
         """gza show does not display Skip Learnings when skip_learnings is False."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1926,7 +1932,6 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_warning_when_disk_report_newer(self, tmp_path: Path):
         """gza show displays a warning when the report file on disk is newer than task completion."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1935,7 +1940,7 @@ class TestMergeStatusTracking:
         task = store.add("Plan something", task_type="plan")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Original plan content"
         task.report_file = ".gza/plans/20260101-plan-something.md"
         store.update(task)
@@ -1954,7 +1959,6 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_no_warning_when_disk_not_newer(self, tmp_path: Path):
         """gza show does not show drift warning when disk report is not newer than completion."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1963,7 +1967,7 @@ class TestMergeStatusTracking:
         task = store.add("Plan task", task_type="plan")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Plan content"
         task.report_file = ".gza/plans/20260101-plan-task.md"
         store.update(task)
@@ -1981,7 +1985,6 @@ class TestMergeStatusTracking:
 
     def test_cmd_show_displays_disk_content_when_newer(self, tmp_path: Path):
         """gza show displays the disk version of the report when it is newer than DB content."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1989,7 +1992,7 @@ class TestMergeStatusTracking:
         task = store.add("Explore something", task_type="explore")
         assert task.id is not None
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.output_content = "Original DB content"
         task.report_file = ".gza/explorations/20260101-explore-something.md"
         store.update(task)
@@ -2035,7 +2038,7 @@ class TestAdvanceCommand:
         git._run("checkout", "main")
 
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2044,7 +2047,6 @@ class TestAdvanceCommand:
 
     def test_advance_no_eligible_tasks(self, tmp_path: Path):
         """advance command reports no tasks when none are eligible."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2058,7 +2060,6 @@ class TestAdvanceCommand:
 
     def test_advance_dry_run_shows_actions(self, tmp_path: Path):
         """advance --dry-run shows planned actions without executing."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2072,7 +2073,6 @@ class TestAdvanceCommand:
 
     def test_advance_merges_approved_task(self, tmp_path: Path):
         """advance merges a task whose review is APPROVED."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2087,7 +2087,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: APPROVED**\n\nLooks good!"
         store.update(review_task)
 
@@ -2102,8 +2102,6 @@ class TestAdvanceCommand:
 
     def test_advance_spawns_rebase_worker_on_conflicts(self, tmp_path: Path):
         """advance spawns a background rebase --resolve worker when conflicts are detected."""
-        from gza.db import SqliteTaskStore
-        from gza.git import Git
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2124,7 +2122,7 @@ class TestAdvanceCommand:
 
         task = store.add("Conflicting feature", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2142,7 +2140,6 @@ class TestAdvanceCommand:
 
     def test_advance_targets_current_branch_for_conflict_check_and_rebase(self, tmp_path: Path):
         """advance uses the current branch (not default) for conflict detection and rebase target."""
-        from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2167,7 +2164,7 @@ class TestAdvanceCommand:
 
         task = store.add("Conflicting on agent-sessions only", task_type="explore")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feat/target-mismatch"
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2194,7 +2191,6 @@ class TestAdvanceCommand:
 
     def test_advance_passes_current_branch_as_merge_target(self, tmp_path: Path):
         """advance passes current branch to _merge_single_task for merge actions."""
-        from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2210,7 +2206,7 @@ class TestAdvanceCommand:
         git._run("commit", "-m", f"Add feature for task {task.id}")
         git._run("checkout", "main")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2241,7 +2237,6 @@ class TestAdvanceCommand:
 
     def test_advance_merge_conflict_fallback_creates_rebase_and_cleans_state(self, tmp_path: Path):
         """A merge conflict during execution resets git state and falls back to rebase task creation."""
-        from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2258,7 +2253,7 @@ class TestAdvanceCommand:
         git._run("commit", "-m", f"Commit 2 for task {task.id}")
         git._run("checkout", "main")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2289,7 +2284,6 @@ class TestAdvanceCommand:
 
     def test_advance_merge_conflict_fallback_reset_failure_is_hard_error(self, tmp_path: Path):
         """When reset_hard_head fails, advance increments error_count and skips rebase task creation."""
-        from gza.db import SqliteTaskStore
         from gza.cli import cmd_advance
         from gza.git import GitError
         setup_config(tmp_path)
@@ -2304,7 +2298,7 @@ class TestAdvanceCommand:
         git._run("commit", "-m", f"Commit for task {task.id}")
         git._run("checkout", "main")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2330,10 +2324,9 @@ class TestAdvanceCommand:
                 with patch("gza.git.Git.can_merge", return_value=False):
                     with patch("gza.git.Git.reset_hard_head", side_effect=GitError("reset failed")):
                         with patch("gza.cli._spawn_background_worker", return_value=0) as mock_spawn:
-                            from rich.console import Console
                             with patch("gza.cli.git_ops.console") as mock_console:
                                 mock_console.print.side_effect = capture_print
-                                rc = cmd_advance(args)
+                                cmd_advance(args)
 
         # No rebase task should be created
         rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
@@ -2346,7 +2339,6 @@ class TestAdvanceCommand:
 
     def test_advance_skips_task_with_in_progress_rebase_child(self, tmp_path: Path):
         """advance skips a task when a rebase child is already in progress."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2365,7 +2357,7 @@ class TestAdvanceCommand:
 
         task = store.add("Conflicting feature", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2388,7 +2380,6 @@ class TestAdvanceCommand:
 
     def test_advance_needs_discussion_for_failed_rebase_child(self, tmp_path: Path):
         """advance returns needs_discussion when a rebase child has failed."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2407,7 +2398,7 @@ class TestAdvanceCommand:
 
         task = store.add("Conflicting feature", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2431,7 +2422,7 @@ class TestAdvanceCommand:
     def test_advance_merges_non_implement_task_without_review(self, tmp_path: Path):
         """advance merges a non-implement task (e.g. explore) directly, skipping review creation."""
         import argparse
-        from gza.db import SqliteTaskStore
+
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2447,7 +2438,7 @@ class TestAdvanceCommand:
         git._run("commit", "-m", f"Exploration for task {task.id}")
         git._run("checkout", "main")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2475,9 +2466,9 @@ class TestAdvanceCommand:
     def test_advance_creates_review_for_implement_without_review(self, tmp_path: Path):
         """advance creates a review task for a completed implement task with no review."""
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         from unittest.mock import patch
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2507,9 +2498,9 @@ class TestAdvanceCommand:
     def test_advance_creates_improve_for_changes_requested(self, tmp_path: Path):
         """advance creates an improve task when review is CHANGES_REQUESTED."""
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         from unittest.mock import patch
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2523,7 +2514,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix the tests."
         store.update(review_task)
 
@@ -2550,7 +2541,7 @@ class TestAdvanceCommand:
     def test_advance_orchestrates_implement_review_improve_merge_in_local_repo(self, tmp_path: Path):
         """advance orchestrates implement -> review -> improve -> merge in a local fixture repo."""
         import argparse
-        from gza.db import SqliteTaskStore
+
         from gza.cli import cmd_advance
 
         setup_config(tmp_path)
@@ -2635,7 +2626,6 @@ class TestAdvanceCommand:
 
     def test_advance_single_task_id(self, tmp_path: Path):
         """advance with a specific task ID only advances that task."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2646,7 +2636,7 @@ class TestAdvanceCommand:
         # Give task1 an approved review so it can merge
         review = store.add(f"Review #{task1.id}", task_type="review", depends_on=task1.id)
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
@@ -2670,7 +2660,7 @@ class TestAdvanceCommand:
         # Give the task an approved review so it can merge
         review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
@@ -2692,9 +2682,9 @@ class TestAdvanceCommand:
     def test_advance_max_limits_batch(self, tmp_path: Path):
         """advance --max N limits the number of tasks processed."""
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         from unittest.mock import patch
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2730,7 +2720,6 @@ class TestAdvanceCommand:
 
     def test_advance_spawns_worker_for_pending_review(self, tmp_path: Path):
         """advance spawns a worker for a pending review instead of skipping."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2738,7 +2727,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Create a pending review
-        review_task = store.add(
+        store.add(
             f"Review #{task.id}",
             task_type="review",
             depends_on=task.id,
@@ -2751,7 +2740,6 @@ class TestAdvanceCommand:
 
     def test_advance_waits_for_in_progress_review(self, tmp_path: Path):
         """advance skips a task whose review is in_progress."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2774,7 +2762,6 @@ class TestAdvanceCommand:
 
     def test_advance_task_not_found(self, tmp_path: Path):
         """advance with non-existent task ID returns error."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2787,7 +2774,6 @@ class TestAdvanceCommand:
 
     def test_advance_dry_run_does_not_modify_state(self, tmp_path: Path):
         """advance --dry-run does not modify task state or create tasks."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2797,7 +2783,7 @@ class TestAdvanceCommand:
         # Add approved review so action would be merge
         review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
@@ -2812,7 +2798,7 @@ class TestAdvanceCommand:
     def test_advance_task_with_no_branch_is_skipped(self, tmp_path: Path):
         """advance skips tasks that have no branch (no commits)."""
         import argparse
-        from gza.db import SqliteTaskStore
+
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2822,7 +2808,7 @@ class TestAdvanceCommand:
         # Create a task with no branch
         task = store.add("Implement feature", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.merge_status = "unmerged"
         task.branch = None
         store.update(task)
@@ -2845,7 +2831,7 @@ class TestAdvanceCommand:
     def test_advance_needs_discussion_verdict_skips(self, tmp_path: Path):
         """advance skips tasks whose review verdict needs manual attention."""
         import argparse
-        from gza.db import SqliteTaskStore
+
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2860,7 +2846,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "I have some thoughts but no verdict."
         store.update(review_task)
 
@@ -2882,7 +2868,7 @@ class TestAdvanceCommand:
     def test_advance_non_implement_task_skipped_in_create_review(self, tmp_path: Path):
         """advance skips creating a review for non-implement task types."""
         import argparse
-        from gza.db import SqliteTaskStore
+
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2898,7 +2884,7 @@ class TestAdvanceCommand:
         git._run("commit", "-m", f"Plan task {task.id}")
         git._run("checkout", "main")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -2922,7 +2908,7 @@ class TestAdvanceCommand:
     def test_advance_active_improve_already_exists_is_skipped(self, tmp_path: Path):
         """advance skips creating a new improve task when one is already active."""
         import argparse
-        from gza.db import SqliteTaskStore
+
         from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2937,7 +2923,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix the tests."
         store.update(review_task)
 
@@ -2969,7 +2955,6 @@ class TestAdvanceCommand:
 
     def test_advance_already_merged_task_returns_early(self, tmp_path: Path):
         """advance with a specific already-merged task ID exits with 0 early."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2987,9 +2972,9 @@ class TestAdvanceCommand:
     def test_advance_review_cleared_at_triggers_merge(self, tmp_path: Path):
         """advance merges when review_cleared_at marks prior review as addressed (no new review)."""
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         from unittest.mock import patch
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3003,7 +2988,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nFix things."
         store.update(review_task)
 
@@ -3011,7 +2996,7 @@ class TestAdvanceCommand:
         # (simulates an improve task having run after the review)
         import time
         time.sleep(0.01)  # ensure strictly after
-        task.review_cleared_at = datetime.now(timezone.utc)
+        task.review_cleared_at = datetime.now(UTC)
         store.update(task)
 
         args = argparse.Namespace(
@@ -3098,7 +3083,7 @@ class TestAdvanceCommand:
                 depends_on=task.id,
             )
             review_task.status = "completed"
-            review_task.completed_at = datetime.now(timezone.utc)
+            review_task.completed_at = datetime.now(UTC)
             review_task.output_content = "**Verdict: APPROVED**"
             store.update(review_task)
             merge_tasks.append(task)
@@ -3174,7 +3159,7 @@ class TestAdvanceCommand:
         )
 
         with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn_first_fails):
-            rc = cmd_advance(args)
+            cmd_advance(args)
 
         # With batch=1, the failed spawn still counts toward the limit,
         # so only 1 spawn attempt should be made (not 2)
@@ -3210,7 +3195,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nFix things."
         store.update(review_task)
 
@@ -3235,7 +3220,7 @@ class TestAdvanceCommand:
         store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
-        task = self._create_implement_task_with_branch(store, git, tmp_path)
+        self._create_implement_task_with_branch(store, git, tmp_path)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -3267,7 +3252,7 @@ class TestAdvanceCommand:
         # Add approved review so action would be merge
         review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
@@ -3321,7 +3306,7 @@ class TestAdvanceCommand:
         # Add approved review so action is merge
         review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
@@ -3351,10 +3336,10 @@ class TestAdvanceCommand:
         reorders so merge runs first.
         """
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
+        from datetime import datetime
         from unittest.mock import patch
-        from datetime import datetime, timezone
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3367,10 +3352,10 @@ class TestAdvanceCommand:
             f"Review #{task_merge.id}", task_type="review", depends_on=task_merge.id
         )
         approved_review.status = "completed"
-        approved_review.completed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        approved_review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
         approved_review.output_content = "**Verdict: APPROVED**\n\nLooks great."
         store.update(approved_review)
-        task_merge.completed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        task_merge.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
         store.update(task_merge)
 
         # task_spawn: pending review → 'run_review' action (spawns a worker).
@@ -3379,7 +3364,7 @@ class TestAdvanceCommand:
         task_spawn = self._create_implement_task_with_branch(store, git, tmp_path, "Feature spawn")
         store.add(f"Review #{task_spawn.id}", task_type="review", depends_on=task_spawn.id)
         # Leave review status as default 'pending' — this triggers run_review action.
-        task_spawn.completed_at = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        task_spawn.completed_at = datetime(2026, 2, 1, tzinfo=UTC)
         store.update(task_spawn)
 
         args = argparse.Namespace(
@@ -3514,13 +3499,13 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nFix things."
         store.update(review_task)
 
         # Mark review as cleared (simulates improve task having run)
         time.sleep(0.01)
-        task.review_cleared_at = datetime.now(timezone.utc)
+        task.review_cleared_at = datetime.now(UTC)
         store.update(task)
 
         args = argparse.Namespace(
@@ -3569,7 +3554,7 @@ class TestAdvanceCommand:
             same_branch=True,
         )
         improve.status = "completed"
-        improve.completed_at = datetime.now(timezone.utc)
+        improve.completed_at = datetime.now(UTC)
         store.update(improve)
         return improve
 
@@ -3590,7 +3575,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
         store.update(review_task)
 
@@ -3623,7 +3608,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
         store.update(review_task)
 
@@ -3642,8 +3627,8 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
-        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
 
         # Create a completed APPROVED review (completed first)
         review_task = store.add(
@@ -3679,8 +3664,8 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
-        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
 
         # Completed review, then completed rebase after it
         review_task = store.add(
@@ -3727,8 +3712,8 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
-        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
 
         # Create a completed rebase (completed first)
         rebase_task = store.add(
@@ -3771,7 +3756,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: APPROVED**\n\nLooks good."
         store.update(review_task)
 
@@ -3788,9 +3773,9 @@ class TestAdvanceCommand:
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
-        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
-        t2 = datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
+        t2 = datetime(2026, 1, 1, 12, 0, 2, tzinfo=UTC)
 
         # Old rebase (before review)
         old_rebase = store.add(
@@ -3844,7 +3829,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
         store.update(review_task)
         self._create_completed_improve(store, task, review_task)
@@ -3884,7 +3869,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
         store.update(review_task)
 
@@ -3918,7 +3903,7 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         review_task.status = "completed"
-        review_task.completed_at = datetime.now(timezone.utc)
+        review_task.completed_at = datetime.now(UTC)
         review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
         store.update(review_task)
         self._create_completed_improve(store, task, review_task)
@@ -3935,14 +3920,13 @@ class TestAdvanceCommand:
         task.status = "failed"
         task.failure_reason = failure_reason
         task.session_id = session_id
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = f"feat/task-{task.id}"
         store.update(task)
         return task
 
     def test_advance_resumes_max_steps_failed_task(self, tmp_path: Path):
         """advance creates a resume child task and spawns worker for MAX_STEPS failed task."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -3964,7 +3948,6 @@ class TestAdvanceCommand:
 
     def test_advance_resumes_max_turns_failed_task(self, tmp_path: Path):
         """advance creates a resume child task and spawns worker for MAX_TURNS failed task."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -3982,7 +3965,6 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
         """advance skips a failed task when chain depth >= max_resume_attempts."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -3994,7 +3976,7 @@ class TestAdvanceCommand:
         first_resume.failure_reason = "MAX_STEPS"
         first_resume.session_id = "sess-2"
         first_resume.based_on = original.id
-        first_resume.completed_at = datetime.now(timezone.utc)
+        first_resume.completed_at = datetime.now(UTC)
         store.update(first_resume)
 
         # Default max_resume_attempts=1; original is skipped (already has a child),
@@ -4013,7 +3995,6 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_with_existing_resume_child(self, tmp_path: Path):
         """advance skips a failed task that already has a pending/in_progress child."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4035,7 +4016,6 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_with_completed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child already completed."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4057,7 +4037,6 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4083,7 +4062,6 @@ class TestAdvanceCommand:
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4097,7 +4075,6 @@ class TestAdvanceCommand:
 
     def test_advance_dry_run_shows_resume_action(self, tmp_path: Path):
         """advance --dry-run shows resume action without executing."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4116,7 +4093,6 @@ class TestAdvanceCommand:
 
     def test_advance_specific_failed_task_id(self, tmp_path: Path):
         """advance with a specific failed resumable task ID works."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4133,7 +4109,6 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_without_session_id(self, tmp_path: Path):
         """advance skips failed tasks without session_id (not resumable)."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4148,7 +4123,6 @@ class TestAdvanceCommand:
 
     def test_advance_max_resume_attempts_flag_overrides_config(self, tmp_path: Path):
         """advance --max-resume-attempts N overrides the config value."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4160,7 +4134,7 @@ class TestAdvanceCommand:
         first_resume.failure_reason = "MAX_STEPS"
         first_resume.session_id = "sess-2"
         first_resume.based_on = original.id
-        first_resume.completed_at = datetime.now(timezone.utc)
+        first_resume.completed_at = datetime.now(UTC)
         store.update(first_resume)
 
         # With --max-resume-attempts 2, original is skipped (has child),
@@ -4256,7 +4230,7 @@ class TestAdvanceMergeSquashThreshold:
         git._run("checkout", "main")
 
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -4266,15 +4240,15 @@ class TestAdvanceMergeSquashThreshold:
     def test_advance_no_squash_when_threshold_zero(self, tmp_path: Path):
         """When merge_squash_threshold=0, always use regular merge regardless of commit count."""
         import argparse
-        from gza.db import SqliteTaskStore
+        from unittest.mock import patch
+
         from gza.cli import cmd_advance
-        from unittest.mock import patch, call
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 3 commits on branch, but threshold is 0 (disabled)
-        task = self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
+        self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -4299,15 +4273,15 @@ class TestAdvanceMergeSquashThreshold:
     def test_advance_squash_when_commits_meet_threshold(self, tmp_path: Path):
         """When commit_count >= merge_squash_threshold, use squash merge."""
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         from unittest.mock import patch
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 3 commits, threshold=2 → should squash
-        task = self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
+        self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -4331,15 +4305,15 @@ class TestAdvanceMergeSquashThreshold:
     def test_advance_no_squash_when_commits_below_threshold(self, tmp_path: Path):
         """When commit_count < merge_squash_threshold, use regular merge."""
         import argparse
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         from unittest.mock import patch
+
+        from gza.cli import cmd_advance
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 2 commits, threshold=3 → should NOT squash
-        task = self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=2)
+        self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=2)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -4362,13 +4336,12 @@ class TestAdvanceMergeSquashThreshold:
 
     def test_advance_squash_threshold_cli_override(self, tmp_path: Path):
         """--squash-threshold N overrides config.merge_squash_threshold: dry-run shows auto-squash."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 2 commits; passing --squash-threshold 2 on the CLI should trigger auto-squash
-        task = self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=2)
+        self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=2)
 
         result = run_gza("advance", "--dry-run", "--squash-threshold", "2", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -4376,13 +4349,12 @@ class TestAdvanceMergeSquashThreshold:
 
     def test_advance_dry_run_shows_squash_annotation(self, tmp_path: Path):
         """Dry-run output includes '(auto-squash, N commits)' when threshold is met."""
-        from gza.db import SqliteTaskStore
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         git = self._setup_git_repo(tmp_path)
         # 3 commits, threshold=2 in config → auto-squash annotation should appear
-        task = self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
+        self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
 
         # Write config with merge_squash_threshold=2
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 2\n")
@@ -4408,6 +4380,7 @@ class TestAdvanceMergeSquashThreshold:
     def test_invalid_type_raises_config_error(self, tmp_path: Path):
         """Non-integer merge_squash_threshold in yaml raises ConfigError, not bare ValueError."""
         import pytest
+
         from gza.config import Config, ConfigError
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: two\n")
         with pytest.raises(ConfigError):
@@ -4416,6 +4389,7 @@ class TestAdvanceMergeSquashThreshold:
     def test_negative_value_raises_config_error(self, tmp_path: Path):
         """Negative merge_squash_threshold in yaml raises ConfigError."""
         import pytest
+
         from gza.config import Config, ConfigError
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: -1\n")
         with pytest.raises(ConfigError):
@@ -4426,7 +4400,6 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_unimplemented_lists_completed_plan_and_explore_without_impl(self, tmp_path: Path):
         """advance --unimplemented lists completed plans/explores with no implement task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4435,8 +4408,8 @@ class TestAdvanceUnimplementedCommand:
         explore = store.add("Explore auth provider options", task_type="explore")
         plan.status = "completed"
         explore.status = "completed"
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
+        from datetime import datetime
+        now = datetime.now(UTC)
         plan.completed_at = now
         explore.completed_at = now
         store.update(plan)
@@ -4453,18 +4426,17 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_unimplemented_excludes_tasks_with_impl(self, tmp_path: Path):
         """advance --unimplemented excludes tasks that already have an implement task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         plan = store.add("A plan", task_type="plan")
         explore = store.add("An explore", task_type="explore")
         plan.status = "completed"
         explore.status = "completed"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         plan.completed_at = now
         explore.completed_at = now
         store.update(plan)
@@ -4480,8 +4452,7 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_unimplemented_guidance_distinguishes_plan_vs_explore(self, tmp_path: Path):
         """advance --unimplemented guidance is accurate for explores in list mode."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4490,7 +4461,7 @@ class TestAdvanceUnimplementedCommand:
         explore = store.add("Explore E", task_type="explore")
         plan.status = "completed"
         explore.status = "completed"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         plan.completed_at = now
         explore.completed_at = now
         store.update(plan)
@@ -4505,21 +4476,20 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_unimplemented_create_queues_implement_tasks(self, tmp_path: Path):
         """advance --unimplemented --create creates implement tasks for each listed task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         plan = store.add("Plan A", task_type="plan")
         plan.status = "completed"
-        plan.completed_at = datetime.now(timezone.utc)
+        plan.completed_at = datetime.now(UTC)
         store.update(plan)
 
         explore = store.add("Explore B", task_type="explore")
         explore.status = "completed"
-        explore.completed_at = datetime.now(timezone.utc)
+        explore.completed_at = datetime.now(UTC)
         store.update(explore)
 
         result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
@@ -4538,16 +4508,15 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_unimplemented_dry_run_no_create(self, tmp_path: Path):
         """advance --unimplemented --create --dry-run shows preview but creates nothing."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         plan = store.add("Plan C", task_type="plan")
         plan.status = "completed"
-        plan.completed_at = datetime.now(timezone.utc)
+        plan.completed_at = datetime.now(UTC)
         store.update(plan)
 
         result = run_gza("advance", "--unimplemented", "--create", "--dry-run", "--project", str(tmp_path))
@@ -4561,20 +4530,19 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_unimplemented_targeted_query_ignores_non_source_tasks(self, tmp_path: Path):
         """advance --unimplemented filters by implement based_on regardless of task noise."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         plan_with_impl = store.add("Plan with impl", task_type="plan")
         plan_with_impl.status = "completed"
-        plan_with_impl.completed_at = datetime.now(timezone.utc)
+        plan_with_impl.completed_at = datetime.now(UTC)
         store.update(plan_with_impl)
 
         explore_without_impl = store.add("Explore without impl", task_type="explore")
         explore_without_impl.status = "completed"
-        explore_without_impl.completed_at = datetime.now(timezone.utc)
+        explore_without_impl.completed_at = datetime.now(UTC)
         store.update(explore_without_impl)
 
         assert plan_with_impl.id is not None and explore_without_impl.id is not None
@@ -4594,8 +4562,7 @@ class TestAdvanceUnimplementedCommand:
 
     def test_advance_plans_alias_keeps_plan_only_behavior(self, tmp_path: Path):
         """legacy --plans remains supported and only targets plan tasks."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4604,8 +4571,8 @@ class TestAdvanceUnimplementedCommand:
         explore = store.add("Explore D", task_type="explore")
         plan.status = "completed"
         explore.status = "completed"
-        now = datetime.now(timezone.utc)
-        plan.completed_at = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
+        plan.completed_at = datetime.now(UTC)
         explore.completed_at = now
         store.update(plan)
         store.update(explore)
@@ -4634,16 +4601,16 @@ class TestAdvanceAutoPlans:
 
     def _create_completed_plan(self, store, prompt="Design the feature"):
         """Create a completed plan task (no branch)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         plan = store.add(prompt, task_type="plan")
         plan.status = "completed"
-        plan.completed_at = datetime.now(timezone.utc)
+        plan.completed_at = datetime.now(UTC)
         store.update(plan)
         return plan
 
     def _create_implement_task_with_branch(self, store, git, tmp_path, prompt="Implement feature", based_on=None):
         """Create a completed implement task with a real git branch."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         task = store.add(prompt, task_type="implement", based_on=based_on)
         branch = f"feat/task-{task.id}"
         git._run("checkout", "-b", branch)
@@ -4652,7 +4619,7 @@ class TestAdvanceAutoPlans:
         git._run("commit", "-m", f"Add feature for task {task.id}")
         git._run("checkout", "main")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = branch
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -4661,10 +4628,10 @@ class TestAdvanceAutoPlans:
 
     def test_advance_creates_implement_for_completed_plan(self, tmp_path: Path):
         """advance creates and starts an implement task for a completed plan with no implement child."""
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         import io
+        from unittest.mock import patch
+
+        from gza.cli import cmd_advance
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4712,9 +4679,9 @@ class TestAdvanceAutoPlans:
         When targeted by task_id, the skip message is shown. In batch mode
         the plan is simply excluded from the candidate list.
         """
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         import io
+
+        from gza.cli import cmd_advance
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4744,9 +4711,9 @@ class TestAdvanceAutoPlans:
 
     def test_advance_type_plan_filters_to_plans_only(self, tmp_path: Path):
         """--type plan only processes plan tasks, not implement tasks."""
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         import io
+
+        from gza.cli import cmd_advance
 
         # Disable review requirement so implement would normally merge
         (tmp_path / "gza.yaml").write_text(
@@ -4783,9 +4750,9 @@ class TestAdvanceAutoPlans:
 
     def test_advance_type_implement_filters_to_implements_only(self, tmp_path: Path):
         """--type implement only processes implement tasks, not plans."""
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
         import io
+
+        from gza.cli import cmd_advance
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\nadvance_requires_review: false\n"
@@ -4821,10 +4788,10 @@ class TestAdvanceAutoPlans:
 
     def test_advance_create_implement_respects_batch_limit(self, tmp_path: Path):
         """batch limit applies to plan->implement worker spawns."""
-        from gza.db import SqliteTaskStore
-        from gza.cli import cmd_advance
-        from unittest.mock import patch
         import io
+        from unittest.mock import patch
+
+        from gza.cli import cmd_advance
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4871,7 +4838,6 @@ class TestPrCommand:
         # Create empty database
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.db import SqliteTaskStore
         make_store(tmp_path)
 
         result = run_gza("pr", "999", "--project", str(tmp_path))
@@ -4892,7 +4858,6 @@ class TestPrCommand:
 
     def test_pr_task_no_branch(self, tmp_path: Path):
         """PR command rejects tasks without branches."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -4910,7 +4875,6 @@ class TestPrCommand:
 
     def test_pr_task_no_commits(self, tmp_path: Path):
         """PR command rejects tasks without commits."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -4928,7 +4892,6 @@ class TestPrCommand:
 
     def test_pr_task_marked_merged_shows_distinct_error(self, tmp_path: Path):
         """PR command shows a distinct error message for tasks marked merged via --mark-only."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
 
@@ -5068,7 +5031,6 @@ class TestRefreshCommand:
 
     def test_refresh_single_task_with_branch(self, tmp_path: Path):
         """gza refresh <id> updates diff stats for a single task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -5084,7 +5046,7 @@ class TestRefreshCommand:
 
         task = store.add("Test task", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feat/test-task"
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -5111,7 +5073,6 @@ class TestRefreshCommand:
 
     def test_refresh_single_task_no_branch(self, tmp_path: Path):
         """gza refresh <id> skips task without a branch."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -5120,7 +5081,7 @@ class TestRefreshCommand:
 
         task = store.add("No branch task", task_type="explore")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("refresh", str(task.id), "--project", str(tmp_path))
@@ -5129,7 +5090,6 @@ class TestRefreshCommand:
 
     def test_refresh_single_task_branch_missing(self, tmp_path: Path):
         """gza refresh <id> warns and skips when branch no longer exists."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -5138,7 +5098,7 @@ class TestRefreshCommand:
 
         task = store.add("Task with deleted branch", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         task.branch = "feat/deleted"
         task.merge_status = "unmerged"
         task.has_commits = True
@@ -5150,7 +5110,6 @@ class TestRefreshCommand:
 
     def test_refresh_all_unmerged(self, tmp_path: Path):
         """gza refresh (no args) refreshes all unmerged tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -5172,7 +5131,7 @@ class TestRefreshCommand:
 
         task1 = store.add("Task 1", task_type="implement")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         task1.branch = "feat/task-1"
         task1.merge_status = "unmerged"
         task1.has_commits = True
@@ -5180,7 +5139,7 @@ class TestRefreshCommand:
 
         task2 = store.add("Task 2", task_type="implement")
         task2.status = "completed"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         task2.branch = "feat/task-2"
         task2.merge_status = "unmerged"
         task2.has_commits = True

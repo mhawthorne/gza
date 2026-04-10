@@ -2,10 +2,9 @@
 
 import errno
 import os
-import subprocess
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 

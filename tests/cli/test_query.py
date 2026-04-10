@@ -3,13 +3,13 @@
 
 import argparse
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, setup_unmerged_env, LOG_FIXTURES_DIR
+from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, setup_unmerged_env
 
 
 class TestHistoryCommand:
@@ -234,7 +234,7 @@ class TestHistoryCommand:
         # Create a completed task
         completed_task = store.add("Completed task")
         completed_task.status = "completed"
-        completed_task.completed_at = datetime.now(timezone.utc)
+        completed_task.completed_at = datetime.now(UTC)
         store.update(completed_task)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -250,7 +250,6 @@ class TestHistoryCommand:
 
     def test_history_orphaned_shows_resume_suggestion(self, tmp_path: Path):
         """History command shows resume suggestion for orphaned tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -265,7 +264,6 @@ class TestHistoryCommand:
 
     def test_history_no_orphaned_when_status_filter_set(self, tmp_path: Path):
         """History command does not show orphaned tasks when --status filter is active."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -277,7 +275,7 @@ class TestHistoryCommand:
         # Create a completed task
         completed_task = store.add("Completed task")
         completed_task.status = "completed"
-        completed_task.completed_at = datetime.now(timezone.utc)
+        completed_task.completed_at = datetime.now(UTC)
         store.update(completed_task)
 
         result = run_gza("history", "--status", "completed", "--project", str(tmp_path))
@@ -289,7 +287,6 @@ class TestHistoryCommand:
 
     def test_history_incomplete_flag(self, tmp_path: Path):
         """--incomplete shows failed/unmerged tasks but not completed+merged ones."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -297,14 +294,14 @@ class TestHistoryCommand:
         # Failed task (should appear)
         failed = store.add("Failed task")
         failed.status = "failed"
-        failed.completed_at = datetime.now(timezone.utc)
+        failed.completed_at = datetime.now(UTC)
         store.update(failed)
 
         # Completed + merged (should NOT appear)
         merged = store.add("Merged task")
         merged.status = "completed"
         merged.merge_status = "merged"
-        merged.completed_at = datetime.now(timezone.utc)
+        merged.completed_at = datetime.now(UTC)
         store.update(merged)
 
         result = run_gza("history", "--incomplete", "--project", str(tmp_path))
@@ -315,12 +312,11 @@ class TestHistoryCommand:
 
     def test_history_lookback_days(self, tmp_path: Path):
         """--days excludes old tasks and includes recent ones."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         old = store.add("Old task")
         old.status = "completed"
@@ -340,19 +336,18 @@ class TestHistoryCommand:
 
     def test_history_lineage_depth(self, tmp_path: Path):
         """--lineage-depth shows a branch-rendered tree."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         parent = store.add("Parent task")
         parent.status = "completed"
-        parent.completed_at = datetime.now(timezone.utc)
+        parent.completed_at = datetime.now(UTC)
         store.update(parent)
 
         child = store.add("Child task", based_on=parent.id)
         child.status = "completed"
-        child.completed_at = datetime.now(timezone.utc)
+        child.completed_at = datetime.now(UTC)
         store.update(child)
 
         result = run_gza("history", "--lineage-depth", "1", "--project", str(tmp_path))
@@ -364,24 +359,23 @@ class TestHistoryCommand:
 
     def test_history_lineage_depth_two(self, tmp_path: Path):
         """--lineage-depth 2 renders all three levels of a grandparent→parent→child chain."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         grandparent = store.add("Grandparent task")
         grandparent.status = "completed"
-        grandparent.completed_at = datetime.now(timezone.utc)
+        grandparent.completed_at = datetime.now(UTC)
         store.update(grandparent)
 
         parent = store.add("Parent task", based_on=grandparent.id)
         parent.status = "completed"
-        parent.completed_at = datetime.now(timezone.utc)
+        parent.completed_at = datetime.now(UTC)
         store.update(parent)
 
         child = store.add("Child task", based_on=parent.id)
         child.status = "completed"
-        child.completed_at = datetime.now(timezone.utc)
+        child.completed_at = datetime.now(UTC)
         store.update(child)
 
         result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
@@ -394,14 +388,13 @@ class TestHistoryCommand:
 
     def test_history_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
         """Lineage rendering keeps ancestor-first order even when descendants are pending."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         root = store.add("Root done", task_type="implement")
         root.status = "completed"
-        root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        root.completed_at = datetime(2026, 3, 1, tzinfo=UTC)
         store.update(root)
 
         child = store.add("Child pend", task_type="implement", based_on=root.id)
@@ -419,12 +412,11 @@ class TestHistoryCommand:
 
     def test_history_incomplete_with_lookback(self, tmp_path: Path):
         """--incomplete combined with --days applies both filters."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # Recent + incomplete (should appear)
         recent_failed = store.add("Recent failed")
@@ -484,12 +476,11 @@ class TestHistoryCommand:
 
     def test_history_start_date(self, tmp_path: Path):
         """--start-date excludes tasks before the given date."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         old = store.add("Old task")
         old.status = "completed"
@@ -511,12 +502,11 @@ class TestHistoryCommand:
 
     def test_history_end_date(self, tmp_path: Path):
         """--end-date excludes tasks after the given date."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         old = store.add("Old task")
         old.status = "completed"
@@ -538,24 +528,23 @@ class TestHistoryCommand:
 
     def test_history_shows_text_status_labels(self, tmp_path: Path):
         """History command shows text labels instead of icons for status."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         completed = store.add("Completed task")
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
 
         failed = store.add("Failed task")
         failed.status = "failed"
-        failed.completed_at = datetime.now(timezone.utc)
+        failed.completed_at = datetime.now(UTC)
         store.update(failed)
 
         dropped = store.add("Dropped task")
         dropped.status = "dropped"
-        dropped.completed_at = datetime.now(timezone.utc)
+        dropped.completed_at = datetime.now(UTC)
         store.update(dropped)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -567,7 +556,6 @@ class TestHistoryCommand:
 
     def test_history_shows_failure_reason_including_unknown(self, tmp_path: Path):
         """History shows failure_reason for all failed tasks, including UNKNOWN."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -575,18 +563,18 @@ class TestHistoryCommand:
         failed_unknown = store.add("Failed unknown reason")
         failed_unknown.status = "failed"
         failed_unknown.failure_reason = "UNKNOWN"
-        failed_unknown.completed_at = datetime.now(timezone.utc)
+        failed_unknown.completed_at = datetime.now(UTC)
         store.update(failed_unknown)
 
         failed_known = store.add("Failed known reason")
         failed_known.status = "failed"
         failed_known.failure_reason = "MAX_STEPS"
-        failed_known.completed_at = datetime.now(timezone.utc)
+        failed_known.completed_at = datetime.now(UTC)
         store.update(failed_known)
 
         failed_none = store.add("Failed no reason")
         failed_none.status = "failed"
-        failed_none.completed_at = datetime.now(timezone.utc)
+        failed_none.completed_at = datetime.now(UTC)
         store.update(failed_none)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -598,20 +586,19 @@ class TestHistoryCommand:
 
     def test_history_shows_parent_task_id(self, tmp_path: Path):
         """History shows parent task ID when based_on or depends_on is set."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         parent = store.add("Parent task")
         parent.status = "completed"
-        parent.completed_at = datetime.now(timezone.utc)
+        parent.completed_at = datetime.now(UTC)
         store.update(parent)
         assert parent.id is not None
 
         child = store.add("Child task", based_on=parent.id)
         child.status = "completed"
-        child.completed_at = datetime.now(timezone.utc)
+        child.completed_at = datetime.now(UTC)
         store.update(child)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -621,19 +608,18 @@ class TestHistoryCommand:
 
     def test_history_shows_both_based_on_and_depends_on(self, tmp_path: Path):
         """History shows both based_on and depends_on when a task has both set."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         plan = store.add("Plan task")
         plan.status = "completed"
-        plan.completed_at = datetime.now(timezone.utc)
+        plan.completed_at = datetime.now(UTC)
         store.update(plan)
 
         blocker = store.add("Blocker task")
         blocker.status = "completed"
-        blocker.completed_at = datetime.now(timezone.utc)
+        blocker.completed_at = datetime.now(UTC)
         store.update(blocker)
 
         assert plan.id is not None
@@ -641,7 +627,7 @@ class TestHistoryCommand:
 
         child = store.add("Child task", based_on=plan.id, depends_on=blocker.id)
         child.status = "completed"
-        child.completed_at = datetime.now(timezone.utc)
+        child.completed_at = datetime.now(UTC)
         store.update(child)
 
         result = run_gza("history", "--project", str(tmp_path))
@@ -651,8 +637,7 @@ class TestHistoryCommand:
 
     def test_history_reconciles_in_progress_tasks(self, tmp_path: Path):
         """History command reconciles orphaned in_progress tasks to failed (WORKER_DIED)."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -660,7 +645,7 @@ class TestHistoryCommand:
         # Create a task and mark it in_progress with a non-existent PID so reconciliation triggers
         orphaned = store.add("Orphaned in_progress task")
         orphaned.status = "in_progress"
-        orphaned.started_at = datetime.now(timezone.utc)
+        orphaned.started_at = datetime.now(UTC)
         orphaned.running_pid = 999999999  # non-existent PID
         store.update(orphaned)
 
@@ -703,7 +688,6 @@ class TestNextCommand:
 
     def test_next_warns_about_orphaned_tasks(self, tmp_path: Path):
         """Next command warns about orphaned in-progress tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -725,7 +709,6 @@ class TestNextCommand:
 
     def test_next_warns_orphaned_when_no_pending(self, tmp_path: Path):
         """Next command shows orphaned warning even when there are no pending tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -769,7 +752,6 @@ class TestShowCommand:
 
     def test_show_displays_lineage_for_review_task(self, tmp_path: Path):
         """Show command displays lineage using implementation/review chain."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -789,7 +771,7 @@ class TestShowCommand:
     def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
         """Failed task output includes reason, limits, context, and next-step commands."""
         import json
-        from gza.db import SqliteTaskStore
+
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -870,7 +852,7 @@ class TestShowCommand:
     def test_show_failed_task_extracts_verify_failure_from_tool_error_entries(self, tmp_path: Path):
         """Failed-task diagnostics should detect verify failures in non-Claude tool_* entry shapes."""
         import json
-        from gza.db import SqliteTaskStore
+
 
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
@@ -910,8 +892,7 @@ class TestShowCommand:
 
     def test_show_indicates_worker_startup_failure(self, tmp_path: Path):
         """Show surfaces startup failure when worker failed before main log existed."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -946,7 +927,6 @@ class TestShowCommand:
 
     def test_show_completed_task_omits_failure_diagnostics(self, tmp_path: Path):
         """Completed task output should not include failed-task diagnostics block."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -962,7 +942,6 @@ class TestShowCommand:
 
     def test_show_plan_lineage_includes_downstream_implement(self, tmp_path: Path):
         """Show for a plan task includes downstream implement task in lineage."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -981,7 +960,6 @@ class TestShowCommand:
 
     def test_show_implement_lineage_includes_plan_and_review_improve_chain(self, tmp_path: Path):
         """Show for an implement task (based on a plan) includes plan, review, and improve."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1006,7 +984,6 @@ class TestShowCommand:
 
     def test_show_multi_level_dependency_lineage(self, tmp_path: Path):
         """Lineage traverses multi-level dependency chains (plan->impl->sub-impl)."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1028,14 +1005,13 @@ class TestShowCommand:
 
     def test_show_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
         """Show lineage keeps root first even when downstream tasks are still pending."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         root = store.add("Root task", task_type="implement")
         root.status = "completed"
-        root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        root.completed_at = datetime(2026, 3, 1, tzinfo=UTC)
         store.update(root)
 
         child = store.add("Child task", task_type="implement", based_on=root.id)
@@ -1052,7 +1028,6 @@ class TestShowCommand:
 
     def test_show_depended_on_by_field(self, tmp_path: Path):
         """Show displays 'Depended on by' listing tasks that reference the displayed task."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1078,7 +1053,6 @@ class TestShowCommand:
 
     def test_show_truncates_long_output(self, tmp_path: Path):
         """gza show truncates output >30 lines to 20 with a remainder hint."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1101,7 +1075,6 @@ class TestShowCommand:
 
     def test_show_full_flag_shows_complete_output(self, tmp_path: Path):
         """gza show --full bypasses truncation and displays all lines."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1121,7 +1094,6 @@ class TestShowCommand:
 
     def test_show_short_output_not_truncated(self, tmp_path: Path):
         """gza show does not truncate output with exactly 30 lines."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1145,7 +1117,6 @@ class TestGroupsCommand:
 
     def test_groups_with_tasks(self, tmp_path: Path):
         """Groups command shows all groups with task counts."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1155,7 +1126,7 @@ class TestGroupsCommand:
         store.add("Task 2", group="group-a")
         task3 = store.add("Task 3", group="group-b")
         task3.status = "completed"
-        task3.completed_at = datetime.now(timezone.utc)
+        task3.completed_at = datetime.now(UTC)
         store.update(task3)
 
         result = run_gza("groups", "--project", str(tmp_path))
@@ -1169,7 +1140,6 @@ class TestGroupsCommand:
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.db import SqliteTaskStore
         make_store(tmp_path)
 
         result = run_gza("groups", "--project", str(tmp_path))
@@ -1182,7 +1152,6 @@ class TestStatusCommand:
 
     def test_status_with_group(self, tmp_path: Path):
         """Group command shows tasks in a group."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1190,7 +1159,7 @@ class TestStatusCommand:
         # Create tasks in a group
         task1 = store.add("First task", group="test-group")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
         store.add("Second task", group="test-group", depends_on=task1.id)
 
@@ -1203,7 +1172,6 @@ class TestStatusCommand:
 
     def test_status_warns_about_orphaned_tasks_in_group(self, tmp_path: Path):
         """Group command warns about orphaned tasks belonging to the viewed group."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1211,7 +1179,7 @@ class TestStatusCommand:
         # Create a completed task and an orphaned in-progress task in the same group
         task1 = store.add("Completed task", group="my-group")
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
         orphaned_task = store.add("Orphaned in-progress task", group="my-group")
@@ -1226,7 +1194,6 @@ class TestStatusCommand:
 
     def test_status_no_orphaned_warning_for_other_groups(self, tmp_path: Path):
         """Group command does not show orphaned warning for tasks in other groups."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1250,8 +1217,7 @@ class TestPsCommand:
 
     def test_ps_shows_task_id(self, tmp_path: Path):
         """PS command should display task ID for running workers."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         # Setup config and database
         setup_config(tmp_path)
@@ -1270,7 +1236,7 @@ class TestPsCommand:
             pid=99999,  # Fake PID
             task_id=task.id,
             task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
             status="running",
             log_file=None,
             worktree=None,
@@ -1294,8 +1260,7 @@ class TestPsCommand:
         import json
         import os
 
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1311,7 +1276,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1332,15 +1297,15 @@ class TestPsCommand:
     def test_ps_prunes_dead_worker_for_terminal_task(self, tmp_path: Path):
         """ps/status should prune stale worker entries once their task is terminal."""
         import subprocess
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         task = store.add("Terminal task with dead worker")
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         proc = subprocess.Popen(["true"])
@@ -1356,7 +1321,7 @@ class TestPsCommand:
                 pid=dead_pid,
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1373,8 +1338,7 @@ class TestPsCommand:
         import os
 
         from gza.cli.query import _build_ps_rows
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1395,7 +1359,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1414,8 +1378,7 @@ class TestPsCommand:
         import os
 
         from gza.cli.query import _get_orphaned_tasks
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1436,7 +1399,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1451,8 +1414,7 @@ class TestPsCommand:
         import os
 
         from gza.cli.query import _build_ps_rows
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1473,7 +1435,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1491,7 +1453,6 @@ class TestPsCommand:
         """PS includes in-progress DB rows even when no worker exists."""
         import json
 
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1513,8 +1474,7 @@ class TestPsCommand:
         """PS table output renders start timestamps in UTC with clear formatting."""
         import os
 
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1545,8 +1505,7 @@ class TestPsCommand:
 
     def test_ps_quiet_shows_only_task_ids(self, tmp_path: Path):
         """PS quiet output should include task IDs (not worker IDs)."""
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1564,7 +1523,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1582,8 +1541,7 @@ class TestPsCommand:
         """PS flags stale worker + orphaned in-progress task in reconciled row."""
         import json
 
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1599,7 +1557,7 @@ class TestPsCommand:
                 pid=999999,
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1621,7 +1579,8 @@ class TestPsCommand:
     def test_ps_marks_startup_failure_for_failed_worker_without_main_log(self, tmp_path: Path):
         """PS marks startup failures in table and JSON output."""
         import json
-        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1633,7 +1592,7 @@ class TestPsCommand:
                 pid=99999,
                 task_id=None,
                 task_slug="startup-failed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="failed",
                 log_file=None,
                 worktree=None,
@@ -1656,7 +1615,7 @@ class TestPsCommand:
 
     def test_ps_default_includes_startup_failure_but_filters_other_terminal_rows(self, tmp_path: Path):
         """Default ps keeps startup failures visible while filtering other terminal rows."""
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1669,7 +1628,7 @@ class TestPsCommand:
                 pid=99998,
                 task_id=None,
                 task_slug="running-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1681,7 +1640,7 @@ class TestPsCommand:
                 pid=99997,
                 task_id=None,
                 task_slug="startup-failed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="failed",
                 log_file=None,
                 worktree=None,
@@ -1694,7 +1653,7 @@ class TestPsCommand:
                 pid=99996,
                 task_id=None,
                 task_slug="ordinary-failed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="failed",
                 log_file=None,
                 worktree=None,
@@ -1706,12 +1665,12 @@ class TestPsCommand:
                 pid=99995,
                 task_id=None,
                 task_slug="completed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="completed",
                 log_file=None,
                 worktree=None,
                 exit_code=0,
-                completed_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=datetime.now(UTC).isoformat(),
             )
         )
 
@@ -1729,7 +1688,7 @@ class TestPsCommand:
 
     def test_ps_all_flag_includes_completed_and_failed_rows(self, tmp_path: Path):
         """ps --all includes ordinary completed/failed rows that default ps filters out."""
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1742,7 +1701,7 @@ class TestPsCommand:
                 pid=99998,
                 task_id=None,
                 task_slug="running-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -1754,7 +1713,7 @@ class TestPsCommand:
                 pid=99996,
                 task_id=None,
                 task_slug="ordinary-failed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="failed",
                 log_file=None,
                 worktree=None,
@@ -1766,12 +1725,12 @@ class TestPsCommand:
                 pid=99995,
                 task_id=None,
                 task_slug="completed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="completed",
                 log_file=None,
                 worktree=None,
                 exit_code=0,
-                completed_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=datetime.now(UTC).isoformat(),
             )
         )
 
@@ -1800,7 +1759,8 @@ class TestPsCommand:
     def test_ps_all_json_includes_terminal_rows(self, tmp_path: Path):
         """ps --all --json includes completed/failed workers in JSON output."""
         import json as json_lib
-        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1813,12 +1773,12 @@ class TestPsCommand:
                 pid=99994,
                 task_id=None,
                 task_slug="json-completed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="completed",
                 log_file=None,
                 worktree=None,
                 exit_code=0,
-                completed_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=datetime.now(UTC).isoformat(),
             )
         )
 
@@ -1833,9 +1793,9 @@ class TestPsCommand:
     def test_print_ps_output_poll_adopts_first_seen_startup_failure(self, tmp_path: Path, capsys):
         """Poll path keeps startup-failed workers visible on first observation."""
         import argparse
+
         from gza.cli import _print_ps_output
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1849,7 +1809,7 @@ class TestPsCommand:
                 pid=99999,
                 task_id=None,
                 task_slug="startup-failed-worker",
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="failed",
                 log_file=None,
                 worktree=None,
@@ -1874,7 +1834,7 @@ class TestPsCommand:
         import json
         import os as _os
 
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1913,7 +1873,7 @@ class TestPsCommand:
         import json
         import os as _os
 
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         workers_dir = tmp_path / ".gza" / "workers"
@@ -1946,6 +1906,7 @@ class TestPsCommand:
     def test_ps_poll_default_interval(self, tmp_path: Path):
         """--poll without a value uses 5-second default interval."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -1977,6 +1938,7 @@ class TestPsCommand:
     def test_ps_poll_custom_interval(self, tmp_path: Path):
         """--poll N uses the specified interval."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -2004,6 +1966,7 @@ class TestPsCommand:
     def test_ps_poll_shows_timestamp_header(self, tmp_path: Path, capsys):
         """Poll mode prints the refresh interval and timestamp in the header."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -2028,6 +1991,7 @@ class TestPsCommand:
     def test_ps_no_poll_behaves_as_before(self, tmp_path: Path, capsys):
         """Without --poll the command runs once and exits immediately."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -2049,6 +2013,7 @@ class TestPsCommand:
     def test_ps_poll_negative_value_returns_error(self, tmp_path: Path, capsys):
         """Negative --poll value returns exit code 1 with an error message."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -2071,6 +2036,7 @@ class TestPsCommand:
     def test_ps_poll_zero_value_returns_error(self, tmp_path: Path, capsys):
         """Zero --poll value returns exit code 1 with an error message."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -2091,6 +2057,7 @@ class TestPsCommand:
     def test_ps_poll_no_ansi_codes_when_not_tty(self, tmp_path: Path, capsys):
         """ANSI escape codes are not emitted when stdout is not a TTY."""
         import argparse
+
         from gza.cli import cmd_ps
 
         setup_config(tmp_path)
@@ -2123,8 +2090,9 @@ class TestPsCommand:
         import json
         import os
         import unittest.mock as mock
+
         from gza.cli import cmd_ps
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
 
@@ -2137,7 +2105,7 @@ class TestPsCommand:
             pid=os.getpid(),
             task_id=None,
             task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
             status="running",
             log_file=None,
             worktree=None,
@@ -2209,8 +2177,8 @@ class TestPsCommand:
         import argparse
         import json
         import unittest.mock as mock
+
         from gza.cli import cmd_ps
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2311,9 +2279,9 @@ class TestPsCommand:
         import json
         import os
         import unittest.mock as mock
+
         from gza.cli import cmd_ps
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2334,7 +2302,7 @@ class TestPsCommand:
             pid=os.getpid(),
             task_id=task1.id,
             task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
             status="running",
             log_file=None,
             worktree=None,
@@ -2344,7 +2312,7 @@ class TestPsCommand:
             pid=os.getpid(),
             task_id=task2.id,
             task_slug=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
             status="running",
             log_file=None,
             worktree=None,
@@ -2410,9 +2378,9 @@ class TestPsCommand:
         import json
         import os
         import unittest.mock as mock
+
         from gza.cli import cmd_ps
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2429,7 +2397,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -2487,8 +2455,8 @@ class TestPsCommand:
         """STEPS column shows live DB row count for an in-progress task."""
         import json
         import os
-        from gza.db import SqliteTaskStore
-        from gza.workers import WorkerRegistry, WorkerMetadata
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2509,7 +2477,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(timezone.utc).isoformat(),
+                started_at=datetime.now(UTC).isoformat(),
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -2601,7 +2569,7 @@ class TestUnmergedReviewStatus:
 
         review = store.add("Review implementation", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.depends_on = task.id
         review.slug = "20260212-review-implementation"
         review.output_content = review_output
@@ -2631,7 +2599,7 @@ class TestUnmergedReviewStatus:
         # Create first review (changes requested)
         review1 = store.add("First review", task_type="review")
         review1.status = "completed"
-        review1.completed_at = datetime.now(timezone.utc)
+        review1.completed_at = datetime.now(UTC)
         review1.depends_on = task.id
         review1.slug = "20260212-first-review"
         review1.output_content = "Verdict: CHANGES_REQUESTED"
@@ -2643,7 +2611,7 @@ class TestUnmergedReviewStatus:
         # Create second review (approved)
         review2 = store.add("Second review", task_type="review")
         review2.status = "completed"
-        review2.completed_at = datetime.now(timezone.utc)
+        review2.completed_at = datetime.now(UTC)
         review2.depends_on = task.id
         review2.slug = "20260212-second-review"
         review2.output_content = "**Verdict: APPROVED**"
@@ -2662,7 +2630,7 @@ class TestUnmergedReviewStatus:
 
         older_review = store.add("Older review", task_type="review")
         older_review.status = "completed"
-        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.completed_at = datetime.now(UTC)
         older_review.depends_on = task.id
         older_review.slug = "20260212-older-review"
         older_review.output_content = "Verdict: CHANGES_REQUESTED"
@@ -2672,7 +2640,7 @@ class TestUnmergedReviewStatus:
 
         latest_review = store.add("Latest review", task_type="review")
         latest_review.status = "completed"
-        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.completed_at = datetime.now(UTC)
         latest_review.depends_on = task.id
         latest_review.slug = "20260212-latest-review"
         latest_review.output_content = None
@@ -2691,7 +2659,7 @@ class TestUnmergedReviewStatus:
 
         older_review = store.add("Older review", task_type="review")
         older_review.status = "completed"
-        older_review.completed_at = datetime.now(timezone.utc)
+        older_review.completed_at = datetime.now(UTC)
         older_review.depends_on = task.id
         older_review.slug = "20260212-older-review"
         older_review.output_content = "Verdict: CHANGES_REQUESTED"
@@ -2704,7 +2672,7 @@ class TestUnmergedReviewStatus:
         time.sleep(0.01)
         latest_review = store.add("Latest review", task_type="review")
         latest_review.status = "completed"
-        latest_review.completed_at = datetime.now(timezone.utc)
+        latest_review.completed_at = datetime.now(UTC)
         latest_review.depends_on = task.id
         latest_review.slug = "20260212-latest-review"
         latest_review.output_content = None
@@ -2727,7 +2695,7 @@ class TestUnmergedReviewStatus:
         # Simulate a retry-created review that lost depends_on but kept review slug.
         review = store.add("review simplify-mixer-by-removing-the-people-strategy", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.slug = "20260225-review-simplify-mixer-by-removing-the-people-strategy-2"
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
@@ -2745,7 +2713,7 @@ class TestUnmergedReviewStatus:
         # Create review task with changes requested
         review = store.add("Review implementation", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.depends_on = task.id
         review.slug = "20260212-review-implementation"
         review.output_content = "Verdict: CHANGES_REQUESTED"
@@ -2776,7 +2744,7 @@ class TestUnmergedReviewStatus:
         # Create first review (changes requested)
         review1 = store.add("Review", task_type="review")
         review1.status = "completed"
-        review1.completed_at = datetime.now(timezone.utc)
+        review1.completed_at = datetime.now(UTC)
         review1.depends_on = task.id
         review1.slug = "20260212-review"
         review1.output_content = "Verdict: CHANGES_REQUESTED"
@@ -2791,7 +2759,7 @@ class TestUnmergedReviewStatus:
         time.sleep(0.01)
         review2 = store.add("Second review", task_type="review")
         review2.status = "completed"
-        review2.completed_at = datetime.now(timezone.utc)
+        review2.completed_at = datetime.now(UTC)
         review2.depends_on = task.id
         review2.slug = "20260212-second-review"
         review2.output_content = "**Verdict: APPROVED**"
@@ -2812,7 +2780,7 @@ class TestUnmergedReviewStatus:
 
         review = store.add("Review", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.depends_on = impl.id
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
@@ -2820,7 +2788,7 @@ class TestUnmergedReviewStatus:
         time.sleep(0.01)
         improve = store.add("Address review feedback", task_type="improve")
         improve.status = "completed"
-        improve.completed_at = datetime.now(timezone.utc)
+        improve.completed_at = datetime.now(UTC)
         improve.based_on = impl.id
         improve.depends_on = review.id
         improve.branch = "feature/test"
@@ -2848,14 +2816,14 @@ class TestUnmergedReviewStatus:
 
         review = store.add("Review", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=timezone.utc)
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
         review.depends_on = impl.id
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
 
         improve = store.add("Improve", task_type="improve")
         improve.status = "completed"
-        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=timezone.utc)
+        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
         improve.based_on = impl.id
         improve.depends_on = review.id
         improve.branch = "feature/test"
@@ -2864,7 +2832,7 @@ class TestUnmergedReviewStatus:
 
         downstream_impl = store.add("Downstream implement noise", task_type="implement")
         downstream_impl.status = "completed"
-        downstream_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=timezone.utc)
+        downstream_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
         downstream_impl.based_on = impl.id
         downstream_impl.branch = "feature/test"
         downstream_impl.same_branch = True
@@ -2888,14 +2856,14 @@ class TestUnmergedReviewStatus:
 
         older_review = store.add("Older review", task_type="review")
         older_review.status = "completed"
-        older_review.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=timezone.utc)
+        older_review.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
         older_review.depends_on = impl.id
         older_review.output_content = "Verdict: APPROVED"
         store.update(older_review)
 
         latest_review = store.add("Latest review", task_type="review")
         latest_review.status = "completed"
-        latest_review.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=timezone.utc)
+        latest_review.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
         latest_review.depends_on = impl.id
         latest_review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(latest_review)
@@ -2952,7 +2920,7 @@ class TestUnmergedAllFlag:
         task2.has_commits = True
         task2.merge_status = "merged"
         task2.slug = "20260220-merged"
-        task2.completed_at = datetime.now(timezone.utc)
+        task2.completed_at = datetime.now(UTC)
         store.update(task2)
 
         # Without --all
@@ -2984,7 +2952,6 @@ class TestUnmergedAllFlag:
 
     def test_unmerged_shows_deleted_branch_if_merge_status_unmerged(self, tmp_path: Path):
         """Tasks with merge_status='unmerged' show even if branch is deleted."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3006,7 +2973,7 @@ class TestUnmergedAllFlag:
         task.has_commits = True
         task.merge_status = "unmerged"
         task.slug = "20260220-deleted-branch"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         result = run_gza("unmerged", "--project", str(tmp_path))
@@ -3144,7 +3111,6 @@ class TestUnmergedImprovedDisplay:
 
     def test_unmerged_excludes_failed_tasks(self, tmp_path: Path):
         """Failed tasks with merge_status='unmerged' are excluded from unmerged output."""
-        from gza.db import SqliteTaskStore
 
         # Use setup_unmerged_env for the completed task (creates config, git, store)
         store, completed_task, git = setup_unmerged_env(
@@ -3158,7 +3124,7 @@ class TestUnmergedImprovedDisplay:
         failed_task.status = "failed"
         failed_task.branch = "feature/failed"
         failed_task.merge_status = "unmerged"
-        failed_task.completed_at = datetime.now(timezone.utc)
+        failed_task.completed_at = datetime.now(UTC)
         store.update(failed_task)
 
         result = run_gza("unmerged", "--project", str(tmp_path))
@@ -3208,7 +3174,7 @@ class TestUnmergedImprovedDisplay:
 
         review = store.add("Review feature", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         review.depends_on = task.id
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
@@ -3236,12 +3202,12 @@ class TestUnmergedImprovedDisplay:
         )
 
         # Override completion time to a specific date
-        task.completed_at = datetime(2026, 2, 12, 10, 30, tzinfo=timezone.utc)
+        task.completed_at = datetime(2026, 2, 12, 10, 30, tzinfo=UTC)
         store.update(task)
 
         improve = store.add("Improve root task", task_type="improve")
         improve.status = "completed"
-        improve.completed_at = datetime.now(timezone.utc)
+        improve.completed_at = datetime.now(UTC)
         improve.branch = "feature/test"
         improve.based_on = task.id
         improve.merge_status = "unmerged"
@@ -3258,7 +3224,6 @@ class TestFailureReasonField:
 
     def test_failure_reason_persisted(self, tmp_path: Path):
         """failure_reason field is saved and loaded from the database."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3274,7 +3239,6 @@ class TestFailureReasonField:
 
     def test_failure_reason_defaults_to_none(self, tmp_path: Path):
         """failure_reason defaults to None for new tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3292,15 +3256,14 @@ class TestNextCommandWithDependencies:
 
     def test_next_skips_blocked_tasks(self, tmp_path: Path):
         """Next command skips tasks blocked by dependencies."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         # Create task chain
         task1 = store.add("First task")
-        task2 = store.add("Blocked task", depends_on=task1.id)
-        task3 = store.add("Independent task")
+        store.add("Blocked task", depends_on=task1.id)
+        store.add("Independent task")
 
         result = run_gza("next", "--project", str(tmp_path))
 
@@ -3310,14 +3273,13 @@ class TestNextCommandWithDependencies:
 
     def test_next_all_shows_blocked_tasks(self, tmp_path: Path):
         """Next --all command shows blocked tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         # Create task chain
         task1 = store.add("First task")
-        task2 = store.add("Blocked task", depends_on=task1.id)
+        store.add("Blocked task", depends_on=task1.id)
 
         result = run_gza("next", "--all", "--project", str(tmp_path))
 
@@ -3327,7 +3289,6 @@ class TestNextCommandWithDependencies:
 
     def test_next_shows_blocked_count(self, tmp_path: Path):
         """Next command shows count of blocked tasks."""
-        from gza.db import SqliteTaskStore
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3424,7 +3385,6 @@ class TestKillCommand:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         """If the process survives SIGTERM for 3 seconds, kill escalates to SIGKILL."""
-        import signal as _signal
 
         from gza.cli.query import cmd_kill
         from gza.db import SqliteTaskStore
@@ -3502,7 +3462,7 @@ class TestKillCommand:
         with patch("gza.cli.query.os.kill") as mock_kill:
             rc = cmd_kill(args)
 
-        captured = capsys.readouterr()
+        capsys.readouterr()
         assert rc == 0
         mock_kill.assert_called_once_with(44444, _signal.SIGKILL)
         refreshed = store.get(task.id)
@@ -3625,13 +3585,12 @@ class TestLineageCommand:
 
     def test_lineage_highlights_target_task(self, tmp_path: Path):
         """Lineage command highlights the requested task with an arrow marker."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         root = store.add("Design auth system", task_type="plan")
         root.status = "completed"
@@ -3654,13 +3613,12 @@ class TestLineageCommand:
 
     def test_lineage_shows_failed_task_with_reason(self, tmp_path: Path):
         """Lineage command shows failure_reason for failed tasks."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         task = store.add("Implement feature", task_type="implement")
         task.status = "failed"
@@ -3676,13 +3634,12 @@ class TestLineageCommand:
 
     def test_lineage_full_tree(self, tmp_path: Path):
         """Lineage command renders a multi-level tree with parent and children."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         root = store.add("Design auth system", task_type="plan")
         root.status = "completed"
@@ -3708,13 +3665,12 @@ class TestLineageCommand:
 
     def test_lineage_shows_stats_when_available(self, tmp_path: Path):
         """Lineage command shows duration and cost when available."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         task = store.add("Implement feature", task_type="implement")
         task.status = "completed"
@@ -3736,13 +3692,12 @@ class TestLineageCommand:
         the bracket label is suppressed (redundant).  A 'task'-typed child with
         depends_on has rel='depends' != type_str='task', so [depends] IS shown.
         """
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         impl = store.add("Implement feature", task_type="implement")
         impl.status = "completed"
@@ -3769,13 +3724,12 @@ class TestLineageCommand:
 
     def test_lineage_rel_label_brackets_are_rendered_literally(self, tmp_path: Path):
         """Relationship labels render as [rel] text, not as Rich markup tags."""
-        from gza.db import SqliteTaskStore
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         root = store.add("Root task", task_type="implement")
         root.status = "completed"
@@ -3829,8 +3783,9 @@ class TestPsSortKey:
 
     def test_none_task_id_sorts_last(self):
         """Worker-only rows (task_id=None) must sort after all tasks."""
-        from gza.cli.query import _ps_sort_key
         import sys
+
+        from gza.cli.query import _ps_sort_key
 
         row_with_task = self._make_row(task_id="gza-1")
         row_no_task = self._make_row(task_id=None)

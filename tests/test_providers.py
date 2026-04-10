@@ -6,37 +6,38 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from rich.console import Console
 
-from gza.config import Config, ClaudeConfig, ConfigError
+from gza.colors import TaskStreamColors, build_rich_theme
+from gza.config import ClaudeConfig, Config, ConfigError
 from gza.providers import (
-    get_provider,
     ClaudeProvider,
     CodexProvider,
-    GeminiProvider,
     DockerConfig,
+    GeminiProvider,
+    get_provider,
 )
 from gza.providers.base import (
-    build_docker_cmd,
     DOCKERFILE_TEMPLATE,
     GZA_SHIM_SETUP_COMMAND,
+    _extract_startup_log_line,
+    _format_command_for_log,
+    _get_image_created_time,
+    build_docker_cmd,
+    ensure_docker_image,
     is_docker_running,
     verify_docker_credentials,
-    ensure_docker_image,
-    _get_image_created_time,
-    _format_command_for_log,
-    _extract_startup_log_line,
 )
+from gza.providers.gemini import calculate_cost
 from gza.providers.output_formatter import (
     StreamOutputFormatter,
     format_runtime,
     format_token_count,
     truncate_text,
 )
-from gza.providers.gemini import calculate_cost, GEMINI_PRICING
 
 
 class TestGetProvider:
@@ -117,9 +118,10 @@ class TestDockerConfig:
 
     def test_claude_provider_uses_per_provider_image_tag(self, tmp_path):
         """ClaudeProvider should append '-claude' to docker_image for its image tag."""
-        from unittest.mock import patch, MagicMock
-        from gza.providers.claude import ClaudeProvider
+        from unittest.mock import MagicMock, patch
+
         from gza.config import Config
+        from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
         config = Config(project_dir=tmp_path, project_name="myproj", provider="claude", use_docker=True)
@@ -136,9 +138,10 @@ class TestDockerConfig:
 
     def test_codex_provider_uses_per_provider_image_tag(self, tmp_path):
         """CodexProvider should append '-codex' to docker_image for its image tag."""
-        from unittest.mock import patch, MagicMock
-        from gza.providers.codex import CodexProvider
+        from unittest.mock import MagicMock, patch
+
         from gza.config import Config
+        from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
         config = Config(project_dir=tmp_path, project_name="myproj", provider="codex", use_docker=True)
@@ -155,9 +158,10 @@ class TestDockerConfig:
 
     def test_gemini_provider_uses_per_provider_image_tag(self, tmp_path):
         """GeminiProvider should append '-gemini' to docker_image for its image tag."""
-        from unittest.mock import patch, MagicMock
-        from gza.providers.gemini import GeminiProvider
+        from unittest.mock import MagicMock, patch
+
         from gza.config import Config
+        from gza.providers.gemini import GeminiProvider
 
         provider = GeminiProvider()
         config = Config(project_dir=tmp_path, project_name="myproj", provider="gemini", use_docker=True)
@@ -263,8 +267,11 @@ class TestSharedStreamOutputFormatter:
     def test_step_header_is_colorized(self):
         """Step headers should include ANSI color sequences."""
         output = io.StringIO()
-        console = Console(file=output, force_terminal=True, color_system="truecolor")
-        formatter = StreamOutputFormatter(console=console)
+        console = Console(file=output, force_terminal=True, color_system="truecolor", theme=build_rich_theme())
+        formatter = StreamOutputFormatter(
+            console=console,
+            styles=TaskStreamColors(step_header="bold red"),
+        )
 
         formatter.print_step_header(2, 1500, 0.1234, 65)
 
@@ -295,7 +302,10 @@ class TestSharedStreamOutputFormatter:
             color_system="truecolor",
             theme=rich_theme,
         )
-        formatter = StreamOutputFormatter(console=console)
+        formatter = StreamOutputFormatter(
+            console=console,
+            styles=TaskStreamColors(step_header="bold blue"),
+        )
 
         formatter.print_step_header(2, 1500, 0.1234, 65)
 
@@ -321,7 +331,6 @@ class TestSharedStreamOutputFormatter:
         still go through the normal Rich path so the active theme's repr.*
         styles can apply to numbers/paths/URLs in those lines.
         """
-        from inspect import signature
 
         # The signature of ``print_step_header`` should be the only place in
         # StreamOutputFormatter that explicitly passes highlight=False — other
@@ -338,10 +347,11 @@ class TestSharedStreamOutputFormatter:
         """print_turn_header should produce the same output as print_step_header."""
         output1 = io.StringIO()
         output2 = io.StringIO()
-        console1 = Console(file=output1, force_terminal=True, color_system="truecolor")
-        console2 = Console(file=output2, force_terminal=True, color_system="truecolor")
-        formatter1 = StreamOutputFormatter(console=console1)
-        formatter2 = StreamOutputFormatter(console=console2)
+        console1 = Console(file=output1, force_terminal=True, color_system="truecolor", theme=build_rich_theme())
+        console2 = Console(file=output2, force_terminal=True, color_system="truecolor", theme=build_rich_theme())
+        styles = TaskStreamColors(step_header="bold red")
+        formatter1 = StreamOutputFormatter(console=console1, styles=styles)
+        formatter2 = StreamOutputFormatter(console=console2, styles=styles)
 
         formatter1.print_step_header(3, 1500, 0.05, 10)
         formatter2.print_turn_header(3, 1500, 0.05, 10)
@@ -354,8 +364,15 @@ class TestSharedStreamOutputFormatter:
     def test_key_event_lines_are_colorized(self):
         """Tool, assistant, and error lines should all be colorized."""
         output = io.StringIO()
-        console = Console(file=output, force_terminal=True, color_system="truecolor")
-        formatter = StreamOutputFormatter(console=console)
+        console = Console(file=output, force_terminal=True, color_system="truecolor", theme=build_rich_theme())
+        formatter = StreamOutputFormatter(
+            console=console,
+            styles=TaskStreamColors(
+                tool_use="bold yellow",
+                assistant_text="bold green",
+                error="bold red",
+            ),
+        )
 
         formatter.print_tool_event("Bash", "ls -la")
         formatter.print_agent_message("Working on it")
@@ -1184,6 +1201,7 @@ class TestClaudeErrorTypeExtraction:
     def test_extracts_max_turns_error_from_result(self, tmp_path):
         """Should set error_type='max_steps' when result has subtype error_max_turns."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1221,6 +1239,7 @@ class TestClaudeErrorTypeExtraction:
     def test_no_error_type_on_success(self, tmp_path):
         """Should not set error_type when result is successful."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1257,6 +1276,7 @@ class TestClaudeErrorTypeExtraction:
     def test_stores_computed_turn_count(self, tmp_path):
         """Should store num_turns_computed from unique assistant message IDs."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1299,6 +1319,7 @@ class TestClaudeErrorTypeExtraction:
     def test_computed_turn_count_deduplicates_same_message_id(self, tmp_path):
         """Should deduplicate repeated assistant message IDs in computed count."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1341,6 +1362,7 @@ class TestClaudeErrorTypeExtraction:
     def test_tool_use_before_next_message_boundary_dedupes_repeated_message_id(self, tmp_path):
         """Tool substeps should stay on the current step and dedupe repeated chunks by call id."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1422,6 +1444,7 @@ class TestClaudeErrorTypeExtraction:
     def test_stores_token_counts_from_usage(self, tmp_path):
         """Should accumulate input and output token counts from assistant messages."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1488,6 +1511,7 @@ class TestClaudeStepMapping:
     def test_maps_tool_use_and_tool_result_to_lifecycle_substeps(self, tmp_path):
         """Claude content items should map to tool_call/tool_output/tool_error types."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1554,6 +1578,7 @@ class TestClaudeStepMapping:
     def test_sets_zero_step_metrics_when_no_assistant_message(self, tmp_path):
         """Claude should persist explicit zero step metrics for runs with no step events."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1582,6 +1607,7 @@ class TestClaudeStepMapping:
     def test_captures_session_id_from_system_init_event(self, tmp_path):
         """Should capture session_id from system/init event early in stream."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1611,6 +1637,7 @@ class TestClaudeStepMapping:
     def test_on_session_id_callback_called_from_system_init(self, tmp_path):
         """on_session_id callback should be invoked as soon as system/init event is parsed."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1642,6 +1669,7 @@ class TestClaudeStepMapping:
     def test_on_session_id_callback_called_only_once(self, tmp_path):
         """on_session_id callback should only be called once even if session_id appears in both system and result events."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1672,6 +1700,7 @@ class TestClaudeStepMapping:
     def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
         """session_id should still be captured from result event when no system/init event is present."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1707,6 +1736,7 @@ class TestClaudeToolLogging:
     def test_logs_glob_pattern(self, tmp_path, capsys):
         """Should log Glob tool with pattern details."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1753,6 +1783,7 @@ class TestClaudeToolLogging:
     def test_logs_todowrite_summary(self, tmp_path, capsys):
         """Should log TodoWrite tool with todos summary."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1805,6 +1836,7 @@ class TestClaudeToolLogging:
     def test_logs_todowrite_empty_list(self, tmp_path, capsys):
         """Should log TodoWrite with empty todos list."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1851,6 +1883,7 @@ class TestClaudeToolLogging:
     def test_logs_file_path_tools(self, tmp_path, capsys):
         """Should still log file path for file-related tools."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1897,6 +1930,7 @@ class TestClaudeToolLogging:
     def test_logs_generic_tool_with_string_params(self, tmp_path, capsys):
         """Should log generic tools with their string parameters."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1942,6 +1976,7 @@ class TestClaudeToolLogging:
     def test_logs_generic_tool_truncates_long_strings(self, tmp_path, capsys):
         """Should truncate string parameters longer than 60 chars."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -1989,6 +2024,7 @@ class TestClaudeToolLogging:
     def test_logs_generic_tool_escapes_newlines(self, tmp_path, capsys):
         """Should escape newlines in string parameters."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2034,6 +2070,7 @@ class TestClaudeToolLogging:
     def test_logs_generic_tool_shows_list_length(self, tmp_path, capsys):
         """Should show list lengths for list parameters."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2079,6 +2116,7 @@ class TestClaudeToolLogging:
     def test_logs_generic_tool_shows_dict_indicator(self, tmp_path, capsys):
         """Should show {...} for dict parameters."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2124,6 +2162,7 @@ class TestClaudeToolLogging:
     def test_logs_generic_tool_with_no_params(self, tmp_path, capsys):
         """Should log tool name only when tool_input is empty."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2173,6 +2212,7 @@ class TestStepTimestampLogging:
     def test_logs_timestamp_to_log_file_on_new_step(self, tmp_path):
         """Should write a step timestamp line to the log file when a new step starts."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2210,6 +2250,7 @@ class TestStepTimestampLogging:
     def test_logs_timestamp_for_each_step(self, tmp_path):
         """Should write a timestamp line for each new step."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2253,6 +2294,7 @@ class TestStepTimestampLogging:
         """Timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
         import json
         import re
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2292,6 +2334,7 @@ class TestStepTimestampLogging:
     def test_no_duplicate_timestamps_for_same_message_id(self, tmp_path):
         """Should not log extra timestamps when the same message ID is repeated."""
         import json
+
         from gza.providers.claude import ClaudeProvider
 
         provider = ClaudeProvider()
@@ -2340,6 +2383,7 @@ class TestCodexStepTimestampLogging:
     def test_logs_timestamp_to_log_file_on_turn_start(self, tmp_path):
         """Should write a step timestamp line to the log file at turn.started."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -2372,6 +2416,7 @@ class TestCodexStepTimestampLogging:
     def test_logs_timestamp_for_each_turn(self, tmp_path):
         """Should write a timestamp line for each turn.started event."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -2411,6 +2456,7 @@ class TestCodexStepTimestampLogging:
         """Codex step timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
         import json
         import re
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -2441,6 +2487,7 @@ class TestCodexStepTimestampLogging:
     def test_uses_step_header_not_turn_header(self, tmp_path, capsys):
         """Codex live output should say Step N not Turn N."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -2475,6 +2522,7 @@ class TestGeminiStepHeaderAndTimestampLogging:
     def test_prints_step_header_on_new_assistant_message(self, tmp_path, capsys):
         """Should print a step header when a new assistant message step begins."""
         import json
+
         from gza.providers.gemini import GeminiProvider
 
         provider = GeminiProvider()
@@ -2505,6 +2553,7 @@ class TestGeminiStepHeaderAndTimestampLogging:
     def test_logs_timestamp_to_log_file_on_new_step(self, tmp_path):
         """Should write a step timestamp line to the log file when a new assistant step starts."""
         import json
+
         from gza.providers.gemini import GeminiProvider
 
         provider = GeminiProvider()
@@ -2535,6 +2584,7 @@ class TestGeminiStepHeaderAndTimestampLogging:
     def test_logs_timestamp_for_each_step(self, tmp_path):
         """Should write a timestamp line for each new assistant step."""
         import json
+
         from gza.providers.gemini import GeminiProvider
 
         provider = GeminiProvider()
@@ -2570,6 +2620,7 @@ class TestGeminiStepHeaderAndTimestampLogging:
         """Gemini step timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
         import json
         import re
+
         from gza.providers.gemini import GeminiProvider
 
         provider = GeminiProvider()
@@ -2601,6 +2652,7 @@ class TestGeminiStepHeaderAndTimestampLogging:
     def test_no_step_header_for_existing_step_text_update(self, tmp_path, capsys):
         """Should not print extra step header when existing step's text is updated."""
         import json
+
         from gza.providers.gemini import GeminiProvider
 
         provider = GeminiProvider()
@@ -3175,6 +3227,7 @@ class TestCodexOutputParsing:
     def test_parses_turn_events(self, tmp_path):
         """Should parse turn.started and turn.completed events."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3211,6 +3264,7 @@ class TestCodexOutputParsing:
     def test_parses_command_execution(self, tmp_path, capsys):
         """Should log command execution items."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3243,6 +3297,7 @@ class TestCodexOutputParsing:
     def test_parses_agent_messages(self, tmp_path, capsys):
         """Should log agent message items."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3275,6 +3330,7 @@ class TestCodexOutputParsing:
     def test_tracks_computed_turns_from_agent_messages(self, tmp_path):
         """Should track computed turn count based on agent_message items."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3316,6 +3372,7 @@ class TestCodexOutputParsing:
     def test_logs_tool_call_under_agent_message_step(self, tmp_path, capsys):
         """Tool calls should appear under the preceding agent_message step."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3355,6 +3412,7 @@ class TestCodexOutputParsing:
     def test_does_not_print_startup_non_json_line_twice(self, tmp_path, capsys):
         """Startup line should be shown once, not duplicated by parser fallback."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3384,6 +3442,7 @@ class TestCodexOutputParsing:
     def test_tracks_max_steps_exceeded(self, tmp_path):
         """Should track when max_steps is exceeded based on message-step count."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3417,6 +3476,7 @@ class TestCodexOutputParsing:
     def test_new_turn_tool_substep_does_not_attach_to_previous_step(self, tmp_path):
         """Tool items before the next message should attach to the new turn's step."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3460,6 +3520,7 @@ class TestCodexOutputParsing:
     def test_maps_command_execution_to_tool_call_and_output(self, tmp_path):
         """Codex command_execution should emit lifecycle substeps and deterministic legacy IDs."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3505,6 +3566,7 @@ class TestCodexOutputParsing:
     def test_uses_shared_formatter_for_turn_tool_message_and_error(self, tmp_path):
         """Codex parser should route key output lines through shared formatter."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3540,6 +3602,7 @@ class TestCodexOutputParsing:
     def test_parses_usage_from_non_turn_completed_event(self, tmp_path):
         """Should capture usage from completion events beyond turn.completed."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3573,6 +3636,7 @@ class TestCodexOutputParsing:
     def test_estimates_tokens_when_usage_missing(self, tmp_path):
         """Should estimate tokens/cost when no usage event is emitted."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3615,6 +3679,7 @@ class TestCodexOutputParsing:
     def test_on_session_id_callback_called_from_thread_started(self, tmp_path):
         """on_session_id callback should be invoked when thread.started event is parsed."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()
@@ -3647,6 +3712,7 @@ class TestCodexOutputParsing:
     def test_on_session_id_callback_called_only_once_for_codex(self, tmp_path):
         """on_session_id callback should only be called once even if thread.started appears twice."""
         import json
+
         from gza.providers.codex import CodexProvider
 
         provider = CodexProvider()

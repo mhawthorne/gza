@@ -2,7 +2,6 @@
 """Show all tasks downstream of a given task ID."""
 
 import argparse
-import os
 import sqlite3
 from pathlib import Path
 

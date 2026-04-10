@@ -321,7 +321,7 @@ class TestSkillContentValidation:
 
     def test_all_skills_have_valid_yaml_frontmatter(self):
         """All skills must have valid YAML frontmatter."""
-        from gza.skills_utils import get_skills_source_path, get_available_skills
+        from gza.skills_utils import get_available_skills, get_skills_source_path
 
         skills_path = get_skills_source_path()
         available_skills = get_available_skills()
@@ -358,7 +358,7 @@ class TestSkillContentValidation:
 
     def test_all_skills_have_required_fields(self):
         """All skills must have required frontmatter fields."""
-        from gza.skills_utils import get_skills_source_path, get_available_skills
+        from gza.skills_utils import get_available_skills, get_skills_source_path
 
         skills_path = get_skills_source_path()
         available_skills = get_available_skills()
@@ -391,7 +391,7 @@ class TestSkillContentValidation:
 
     def test_all_skills_have_valid_allowed_tools_format(self):
         """All skills must have properly formatted allowed-tools field."""
-        from gza.skills_utils import get_skills_source_path, get_available_skills
+        from gza.skills_utils import get_available_skills, get_skills_source_path
 
         skills_path = get_skills_source_path()
         available_skills = get_available_skills()
@@ -435,8 +435,9 @@ class TestSkillContentValidation:
 
     def test_all_skills_have_semantic_versions(self):
         """All skills must have semantic version numbers."""
-        from gza.skills_utils import get_skills_source_path, get_available_skills
         import re
+
+        from gza.skills_utils import get_available_skills, get_skills_source_path
 
         skills_path = get_skills_source_path()
         available_skills = get_available_skills()

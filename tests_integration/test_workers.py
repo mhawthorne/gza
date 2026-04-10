@@ -11,7 +11,6 @@ import sys
 
 import pytest
 
-
 # Mark all tests as integration tests
 pytestmark = pytest.mark.integration
 

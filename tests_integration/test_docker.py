@@ -14,7 +14,6 @@ import pytest
 from gza.config import Config
 from gza.providers import ClaudeProvider, CodexProvider, GeminiProvider
 
-
 # Skip all tests in this module unless explicitly running integration tests
 pytestmark = pytest.mark.integration
 

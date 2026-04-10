@@ -1,14 +1,10 @@
 """Tests for tmux-related CLI functionality: attach command and tmux spawn logic."""
 
 import argparse
-import os
-import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
-import pytest
-
-from .conftest import make_store, setup_config, setup_db_with_tasks
+from .conftest import make_store, setup_config
 
 
 def _make_args(project_dir: Path, **kwargs) -> argparse.Namespace:
@@ -203,10 +199,9 @@ class TestSpawnBackgroundWorkerTmux:
 
     def test_spawn_background_worker_uses_tmux_when_enabled(self, tmp_path: Path):
         """_spawn_background_worker calls tmux new-session when config.tmux.enabled is True."""
-        from gza.db import SqliteTaskStore
 
         config = self._make_config(tmp_path, tmux_enabled=True)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
@@ -239,10 +234,9 @@ class TestSpawnBackgroundWorkerTmux:
 
     def test_spawn_warns_on_remain_on_exit_failure(self, tmp_path: Path, capsys):
         """_spawn_background_worker warns when remain-on-exit set-option fails."""
-        from gza.db import SqliteTaskStore
 
         config = self._make_config(tmp_path, tmux_enabled=True)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
@@ -257,7 +251,7 @@ class TestSpawnBackgroundWorkerTmux:
             result = MagicMock(returncode=0)
             return result
 
-        with patch("gza.cli._common.subprocess.run", side_effect=side_effect_fn) as mock_run, \
+        with patch("gza.cli._common.subprocess.run", side_effect=side_effect_fn), \
              patch("gza.cli._common.get_tmux_session_pid", return_value=mock_pid_result), \
              patch("gza.cli._common.get_store") as mock_get_store, \
              patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
@@ -271,10 +265,9 @@ class TestSpawnBackgroundWorkerTmux:
 
     def test_spawn_background_worker_skips_tmux_when_disabled(self, tmp_path: Path):
         """_spawn_background_worker uses bare Popen when config.tmux.enabled is False."""
-        from gza.db import SqliteTaskStore
 
         config = self._make_config(tmp_path, tmux_enabled=False)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
@@ -301,10 +294,9 @@ class TestSpawnBackgroundWorkerTmux:
 
     def test_spawn_kills_existing_tmux_session(self, tmp_path: Path):
         """_spawn_background_worker calls tmux kill-session before tmux new-session (M4)."""
-        from gza.db import SqliteTaskStore
 
         config = self._make_config(tmp_path, tmux_enabled=True)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
@@ -331,10 +323,9 @@ class TestSpawnBackgroundWorkerTmux:
 
     def test_spawn_warns_when_tmux_unavailable(self, tmp_path: Path, capsys):
         """_spawn_background_worker prints a warning and falls back when tmux is not found (S2)."""
-        from gza.db import SqliteTaskStore
 
         config = self._make_config(tmp_path, tmux_enabled=True)
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
@@ -403,7 +394,6 @@ class TestClaudeProviderTmuxMode:
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
         provider = ClaudeProvider()
-        captured_run: list = []
 
         fake_result = MagicMock()
         fake_result.returncode = 0
@@ -529,7 +519,6 @@ class TestClaudeProviderTmuxMode:
 
     def test_spawn_passes_prompt_file_to_proxy(self, tmp_path: Path):
         """_spawn_background_worker writes task prompt to temp file and passes --prompt-file (M1)."""
-        from gza.db import SqliteTaskStore
 
         config_content = "project_name: test\ntmux:\n  enabled: true\n"
         (tmp_path / "gza.yaml").write_text(config_content)
@@ -537,7 +526,7 @@ class TestClaudeProviderTmuxMode:
         from gza.config import Config
         config = Config.load(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("Implement hello world feature")
         store.update(task)
@@ -573,14 +562,13 @@ class TestClaudeProviderTmuxMode:
     def test_tmux_session_set_on_config_in_worker_mode(self, tmp_path: Path):
         """_run_as_worker propagates args.tmux_session to config.tmux.session_name (M3)."""
         from gza.config import Config
-        from gza.db import SqliteTaskStore
 
         config_content = "project_name: test\n"
         (tmp_path / "gza.yaml").write_text(config_content)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
         config = Config.load(tmp_path)
 
-        db_path = tmp_path / ".gza" / "gza.db"
+        tmp_path / ".gza" / "gza.db"
         store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)

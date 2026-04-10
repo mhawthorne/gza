@@ -1,8 +1,7 @@
 """Tests for GitHub wrapper functionality."""
 
 import json
-import subprocess
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -413,7 +412,7 @@ class TestPRNumberCaching:
 
     def test_pr_number_stored_after_creation(self, tmp_path):
         """PR number is cached in task after gza pr command."""
-        from gza.db import SqliteTaskStore, Task
+        from gza.db import SqliteTaskStore
 
         # Create a task with a branch
         db_path = tmp_path / ".gza" / "gza.db"

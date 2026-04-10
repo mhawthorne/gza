@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from gza.db import SqliteTaskStore
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,7 +39,7 @@ def make_client(tmp_path: Path):
 
 class TestGzaClientConstruction:
     def test_import_from_module(self):
-        from gza.api.v0 import GzaClient, Task, IncompleteSnapshot
+        from gza.api.v0 import GzaClient, IncompleteSnapshot, Task
         assert GzaClient is not None
         assert Task is not None
         assert IncompleteSnapshot is not None
@@ -113,8 +112,8 @@ class TestGetLineage:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
-        review = store.add("Review feature", task_type="review", depends_on=impl.id)
-        improve = store.add("Improve feature", task_type="improve", based_on=impl.id)
+        store.add("Review feature", task_type="review", depends_on=impl.id)
+        store.add("Improve feature", task_type="improve", based_on=impl.id)
         client = make_client(tmp_path)
         lineage = client.get_lineage(impl.id)
         ids = [t.id for t in lineage]
@@ -149,7 +148,7 @@ class TestGetLineage:
 
         root = store.add("Root feature", task_type="implement")
         root.status = "completed"
-        root.completed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        root.completed_at = datetime(2026, 3, 1, tzinfo=UTC)
         store.update(root)
 
         child = store.add("Child feature", task_type="implement", based_on=root.id)
@@ -250,7 +249,7 @@ class TestGetIncomplete:
         store = make_store(tmp_path)
         task = store.add("Completed task")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
         client = make_client(tmp_path)
         snap = client.get_incomplete()
@@ -319,7 +318,7 @@ class TestGetPending:
         pending = store.add("Pending task")
         done = store.add("Completed task")
         done.status = "completed"
-        done.completed_at = datetime.now(timezone.utc)
+        done.completed_at = datetime.now(UTC)
         store.update(done)
         client = make_client(tmp_path)
         result = client.get_pending()
@@ -366,7 +365,7 @@ class TestGetHistory:
         for i in range(15):
             task = store.add(f"Task {i}")
             task.status = "completed"
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = datetime.now(UTC)
             store.update(task)
         client = make_client(tmp_path)
         history = client.get_history()
@@ -377,11 +376,11 @@ class TestGetHistory:
         store = make_store(tmp_path)
         completed = store.add("Completed task")
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
         failed = store.add("Failed task")
         failed.status = "failed"
-        failed.completed_at = datetime.now(timezone.utc)
+        failed.completed_at = datetime.now(UTC)
         store.update(failed)
         client = make_client(tmp_path)
         result = client.get_history(status="completed")
@@ -395,7 +394,7 @@ class TestGetHistory:
         store = make_store(tmp_path)
         failed = store.add("Failed task")
         failed.status = "failed"
-        failed.completed_at = datetime.now(timezone.utc)
+        failed.completed_at = datetime.now(UTC)
         store.update(failed)
         client = make_client(tmp_path)
         result = client.get_history(status="failed")
@@ -407,11 +406,11 @@ class TestGetHistory:
         store = make_store(tmp_path)
         impl = store.add("Implement task", task_type="implement")
         impl.status = "completed"
-        impl.completed_at = datetime.now(timezone.utc)
+        impl.completed_at = datetime.now(UTC)
         store.update(impl)
         review = store.add("Review task", task_type="review")
         review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
+        review.completed_at = datetime.now(UTC)
         store.update(review)
         client = make_client(tmp_path)
         result = client.get_history(task_type="implement")
@@ -426,7 +425,7 @@ class TestGetHistory:
         for i in range(15):
             task = store.add(f"Task {i}")
             task.status = "completed"
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = datetime.now(UTC)
             store.update(task)
         client = make_client(tmp_path)
         result = client.get_history(limit=None)
@@ -438,7 +437,7 @@ class TestGetHistory:
         pending = store.add("Pending task")
         completed = store.add("Completed task")
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
         client = make_client(tmp_path)
         result = client.get_history()
@@ -452,12 +451,12 @@ class TestGetHistory:
 
         internal = store.add("Internal task", task_type="internal")
         internal.status = "completed"
-        internal.completed_at = datetime.now(timezone.utc)
+        internal.completed_at = datetime.now(UTC)
         store.update(internal)
 
         completed = store.add("Completed task", task_type="implement")
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
 
         client = make_client(tmp_path)
@@ -473,12 +472,12 @@ class TestGetHistory:
 
         internal = store.add("Internal task", task_type="internal")
         internal.status = "completed"
-        internal.completed_at = datetime.now(timezone.utc)
+        internal.completed_at = datetime.now(UTC)
         store.update(internal)
 
         completed = store.add("Completed task", task_type="implement")
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
 
         client = make_client(tmp_path)
@@ -500,11 +499,11 @@ class TestGetRecentCompleted:
         store = make_store(tmp_path)
         completed = store.add("Completed task")
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
         failed = store.add("Failed task")
         failed.status = "failed"
-        failed.completed_at = datetime.now(timezone.utc)
+        failed.completed_at = datetime.now(UTC)
         store.update(failed)
         client = make_client(tmp_path)
         result = client.get_recent_completed()
@@ -518,7 +517,7 @@ class TestGetRecentCompleted:
         for i in range(20):
             task = store.add(f"Task {i}")
             task.status = "completed"
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = datetime.now(UTC)
             store.update(task)
         client = make_client(tmp_path)
         result = client.get_recent_completed()
@@ -530,7 +529,7 @@ class TestGetRecentCompleted:
         for i in range(10):
             task = store.add(f"Task {i}")
             task.status = "completed"
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = datetime.now(UTC)
             store.update(task)
         client = make_client(tmp_path)
         result = client.get_recent_completed(limit=3)

@@ -42,6 +42,7 @@ class TestWorktreeEnvironment:
     def test_learnings_file_available_in_worktree(self, tmp_path: Path):
         """Agent should be able to read .gza/learnings.md in its worktree."""
         from unittest.mock import Mock
+
         from gza.config import Config
         from gza.git import Git
         from gza.runner import _copy_learnings_to_worktree

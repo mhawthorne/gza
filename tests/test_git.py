@@ -1,8 +1,7 @@
 """Comprehensive tests for Git operations."""
 
-import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 

@@ -900,7 +900,7 @@ def main() -> int:
     )
     improve_parser.add_argument(
         "--review-id",
-        type=int,
+        type=str,
         metavar="ID",
         help="Explicit review task ID to base the improve on (overrides auto-pick of most recent completed review)",
     )

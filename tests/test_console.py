@@ -1,11 +1,11 @@
 """Tests for console output helpers."""
 
 from io import StringIO
-from unittest.mock import patch
 
 from rich.console import Console
 
 from gza.console import (
+    _recommend_next_steps,
     error_message,
     format_duration,
     get_terminal_width,
@@ -16,7 +16,6 @@ from gza.console import (
     truncate,
     warning_message,
 )
-from gza.console import _recommend_next_steps
 from gza.db import Task, TaskStats
 
 

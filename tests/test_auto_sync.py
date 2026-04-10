@@ -1,9 +1,8 @@
 """Tests for auto-sync of edited plan files."""
 
-import os
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gza.db import Task
@@ -25,7 +24,7 @@ def test_get_task_output_returns_file_when_newer_than_completed_at():
             task_type="plan",
             report_file=".gza/plans/20260209-test.md",
             output_content="original plan content",
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
 
         # Write initial file content
@@ -63,7 +62,7 @@ def test_get_task_output_returns_db_when_file_not_modified():
             task_type="plan",
             report_file=".gza/plans/20260209-test.md",
             output_content="db plan content",
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
 
         # Should return DB content (file hasn't been modified after completion)
@@ -86,7 +85,7 @@ def test_get_task_output_returns_file_when_no_db_content():
             task_type="plan",
             report_file=".gza/plans/20260209-test.md",
             output_content=None,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
 
         # Write file content
@@ -110,7 +109,7 @@ def test_get_task_output_returns_none_when_no_content():
             task_type="plan",
             output_content=None,
             report_file=None,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
 
         # Should return None

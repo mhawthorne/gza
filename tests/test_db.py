@@ -1,12 +1,21 @@
 """Tests for database operations and task chaining."""
 
-import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gza.db import SCHEMA_VERSION, ManualMigrationRequired, SqliteTaskStore, StepRef, Task, check_migration_status, preview_v25_migration, resolve_task_id, run_v25_migration
+from gza.db import (
+    SCHEMA_VERSION,
+    ManualMigrationRequired,
+    SqliteTaskStore,
+    StepRef,
+    Task,
+    check_migration_status,
+    preview_v25_migration,
+    resolve_task_id,
+    run_v25_migration,
+)
 
 
 class TestTaskChaining:
@@ -73,7 +82,7 @@ class TestTaskChaining:
 
         # Complete task1
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
         # Now task2 should be available
@@ -103,7 +112,7 @@ class TestTaskChaining:
 
         store.mark_in_progress(in_progress)
         completed.status = "completed"
-        completed.completed_at = datetime.now(timezone.utc)
+        completed.completed_at = datetime.now(UTC)
         store.update(completed)
         store.update(pending)
 
@@ -135,7 +144,7 @@ class TestTaskChaining:
 
         # Complete task1
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
         # task2 should no longer be blocked
@@ -149,9 +158,9 @@ class TestTaskChaining:
 
         # Create some blocked and unblocked tasks
         task1 = store.add("First task")
-        task2 = store.add("Second task", depends_on=task1.id)
-        task3 = store.add("Third task", depends_on=task1.id)
-        task4 = store.add("Independent task")
+        store.add("Second task", depends_on=task1.id)
+        store.add("Third task", depends_on=task1.id)
+        store.add("Independent task")
 
         # Should have 2 blocked tasks
         count = store.count_blocked_tasks()
@@ -159,7 +168,7 @@ class TestTaskChaining:
 
         # Complete task1
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
         # Should have 0 blocked tasks
@@ -173,13 +182,13 @@ class TestTaskChaining:
 
         # Create tasks in different groups
         task1 = store.add("Task 1", group="group-a")
-        task2 = store.add("Task 2", group="group-a")
-        task3 = store.add("Task 3", group="group-b")
-        task4 = store.add("Task 4")  # No group
+        store.add("Task 2", group="group-a")
+        store.add("Task 3", group="group-b")
+        store.add("Task 4")  # No group
 
         # Mark one as completed
         task1.status = "completed"
-        task1.completed_at = datetime.now(timezone.utc)
+        task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
         groups = store.get_groups()
@@ -198,7 +207,7 @@ class TestTaskChaining:
         # Create tasks in a group
         task1 = store.add("First", group="test-group")
         task2 = store.add("Second", group="test-group")
-        task3 = store.add("Third", group="other-group")
+        store.add("Third", group="other-group")
 
         tasks = store.get_by_group("test-group")
         assert len(tasks) == 2
@@ -238,7 +247,7 @@ class TestTaskChaining:
         # Mark completed with branch
         task.status = "completed"
         task.branch = "test-project/test-branch"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         # Retrieve and verify
@@ -404,7 +413,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         """)
 
         # Insert a test task
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
             ("Old task", "plan", now),
@@ -517,7 +526,7 @@ class TestTaskResume:
         """)
 
         # Insert a test task
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
             ("Old task", "failed", now),
@@ -665,7 +674,7 @@ class TestNumTurnsFields:
     def test_migration_v7_to_v8_adds_columns(self, tmp_path: Path):
         """Test that migration from v7 to v8 adds num_turns_reported and num_turns_computed."""
         import sqlite3
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         db_path = tmp_path / "test.db"
 
@@ -705,7 +714,7 @@ class TestNumTurnsFields:
             )
         """)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at, num_turns) VALUES (?, ?, ?, ?)",
             ("Old task with turns", "completed", now, 15),
@@ -851,7 +860,7 @@ class TestTokenCountFields:
     def test_migration_v8_to_v9_adds_token_columns(self, tmp_path: Path):
         """Test that migration from v8 to v9 adds input_tokens and output_tokens columns."""
         import sqlite3
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         db_path = tmp_path / "test.db"
 
@@ -893,7 +902,7 @@ class TestTokenCountFields:
             )
         """)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at, cost_usd) VALUES (?, ?, ?, ?)",
             ("Old task", "completed", now, 0.05),
@@ -980,9 +989,9 @@ class TestGetReviewsForTask:
         # Complete them in reverse order: review3 first (oldest completed_at),
         # review1 last (newest completed_at). This is opposite of creation order
         # so we can confirm the sort is by completed_at, not created_at.
-        t1 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
-        t2 = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
-        t3 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        t2 = datetime(2026, 1, 1, 11, 0, 0, tzinfo=UTC)
+        t3 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
         review3.completed_at = t1  # completed first (oldest)
         review3.status = "completed"
@@ -1014,7 +1023,7 @@ class TestGetReviewsForTask:
         incomplete_review = store.add("In-progress review", task_type="review", depends_on=impl_task.id)
 
         # Complete only the first review
-        completed_review.completed_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        completed_review.completed_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
         completed_review.status = "completed"
         store.update(completed_review)
         # incomplete_review has completed_at = NULL
@@ -1048,7 +1057,7 @@ class TestGetReviewsForTask:
         review = store.add("Review", task_type="review", depends_on=impl_task.id)
 
         # Create an improve task that also depends on the implementation
-        improve = store.add("Improve", task_type="improve", depends_on=impl_task.id)
+        store.add("Improve", task_type="improve", depends_on=impl_task.id)
 
         reviews = store.get_reviews_for_task(impl_task.id)
 
@@ -1267,7 +1276,7 @@ class TestMergeStatus:
             )
         """)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
             ("Old task", "completed", now),
@@ -1307,8 +1316,8 @@ class TestMergeStatus:
         task = store.add(prompt="Test task")
         task.merge_status = "merged"
         task.status = "completed"
-        from datetime import datetime, timezone
-        task.completed_at = datetime.now(timezone.utc)
+        from datetime import datetime
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         retrieved = store.get(task.id)
@@ -1321,8 +1330,9 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_provides_default_for_implement_with_based_on(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt provides a default prompt for implement tasks with based_on."""
-        from gza.db import edit_prompt
         import subprocess
+
+        from gza.db import edit_prompt
 
         # Mock subprocess.run to capture what would be written to the editor
         editor_content = []
@@ -1330,7 +1340,7 @@ class TestEditPromptDefaultContent:
         def mock_run(cmd):
             # Read the temporary file that was passed to the editor
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 editor_content.append(f.read())
             # Return success
             class Result:
@@ -1344,7 +1354,7 @@ class TestEditPromptDefaultContent:
         # We need to also write back to the file so it doesn't return None
         def mock_run_with_write(cmd):
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 content = f.read()
                 editor_content.append(content)
             # Verify the default prompt is present
@@ -1371,14 +1381,15 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt includes the slug in the default prompt when provided."""
-        from gza.db import edit_prompt
         import subprocess
+
+        from gza.db import edit_prompt
 
         editor_content = []
 
         def mock_run_with_write(cmd):
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 content = f.read()
                 editor_content.append(content)
             class Result:
@@ -1400,14 +1411,15 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
-        from gza.db import edit_prompt
         import subprocess
+
+        from gza.db import edit_prompt
 
         editor_content = []
 
         def mock_run(cmd):
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 content = f.read()
                 editor_content.append(content)
             # Don't write anything back (simulate empty editor)
@@ -1432,14 +1444,15 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_no_default_for_implement_without_based_on(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for implement tasks without based_on."""
-        from gza.db import edit_prompt
         import subprocess
+
+        from gza.db import edit_prompt
 
         editor_content = []
 
         def mock_run(cmd):
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 content = f.read()
                 editor_content.append(content)
             class Result:
@@ -1461,15 +1474,16 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_preserves_custom_initial_content(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not override custom initial_content."""
-        from gza.db import edit_prompt
         import subprocess
+
+        from gza.db import edit_prompt
 
         editor_content = []
         custom_content = "Custom implementation task"
 
         def mock_run(cmd):
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 content = f.read()
                 editor_content.append(content)
             class Result:
@@ -1493,8 +1507,9 @@ class TestEditPromptDefaultContent:
 
     def test_add_task_interactive_includes_slug_from_based_on(self, tmp_path: Path, monkeypatch):
         """Test that add_task_interactive looks up the slug from the based_on task."""
-        from gza.db import add_task_interactive, SqliteTaskStore
         import subprocess
+
+        from gza.db import SqliteTaskStore, add_task_interactive
 
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -1508,7 +1523,7 @@ class TestEditPromptDefaultContent:
 
         def mock_run(cmd):
             temp_file = cmd[1]
-            with open(temp_file, 'r') as f:
+            with open(temp_file) as f:
                 content = f.read()
                 editor_content.append(content)
             class Result:
@@ -1677,7 +1692,7 @@ class TestFailureReasonTracking:
         task = store.add(prompt="Test task")
         task.failure_reason = "MAX_TURNS"
         task.status = "failed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         retrieved = store.get(task.id)
@@ -1731,7 +1746,7 @@ class TestFailureReasonTracking:
             )
         """)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
             ("Failed task", "failed", now),
@@ -1864,7 +1879,7 @@ class TestDiffStats:
     def test_migration_v11_to_v12_adds_diff_columns(self, tmp_path: Path):
         """Migration from v11 to v12 adds diff stat columns."""
         import sqlite3
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         db_path = tmp_path / "test.db"
 
@@ -1909,7 +1924,7 @@ class TestDiffStats:
                 failure_reason TEXT
             )
         """)
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
             ("Existing task", "completed", now),
@@ -1992,7 +2007,7 @@ class TestReviewClearedAt:
                 diff_lines_removed INTEGER
             )
         """)
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
             ("Existing task", "completed", now),
@@ -2071,7 +2086,7 @@ class TestConvenienceFunctions:
 
     def test_get_task_returns_dict(self, tmp_path: Path, monkeypatch):
         """get_task returns a dict with all task fields."""
-        from gza.db import get_task, TaskStats
+        from gza.db import get_task
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
@@ -2095,8 +2110,8 @@ class TestConvenienceFunctions:
     def test_get_task_all_fields_json_serializable(self, tmp_path: Path, monkeypatch):
         """get_task result is fully JSON-serializable."""
         import json
-        from gza.db import get_task, TaskStats
-        from datetime import datetime, timezone
+
+        from gza.db import TaskStats, get_task
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
@@ -2229,7 +2244,7 @@ class TestConvenienceFunctions:
 
     def test_get_baseline_stats_returns_averages(self, tmp_path: Path, monkeypatch):
         """get_baseline_stats returns avg_turns, avg_duration, avg_cost."""
-        from gza.db import get_baseline_stats, TaskStats
+        from gza.db import TaskStats, get_baseline_stats
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
@@ -2265,8 +2280,9 @@ class TestConvenienceFunctions:
 
     def test_get_baseline_stats_respects_limit(self, tmp_path: Path, monkeypatch):
         """get_baseline_stats only includes the last N tasks."""
-        from gza.db import get_baseline_stats, TaskStats
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime
+
+        from gza.db import get_baseline_stats
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
@@ -2275,7 +2291,7 @@ class TestConvenienceFunctions:
         # Add 5 completed tasks with differing costs
         for i in range(5):
             task = store.add(prompt=f"Task {i}")
-            task.completed_at = datetime(2026, 1, i + 1, tzinfo=timezone.utc)
+            task.completed_at = datetime(2026, 1, i + 1, tzinfo=UTC)
             task.status = "completed"
             task.cost_usd = float(i + 1)  # 1.0, 2.0, 3.0, 4.0, 5.0
             task.num_turns_reported = i + 1
@@ -2305,7 +2321,7 @@ class TestConvenienceFunctions:
 
     def test_get_task_datetime_fields_serialized_as_iso_strings(self, tmp_path: Path, monkeypatch):
         """get_task returns datetime fields as ISO-format strings, not datetime objects."""
-        from gza.db import get_task, TaskStats
+        from gza.db import TaskStats, get_task
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
@@ -2504,7 +2520,7 @@ class TestStepColumnsMigration:
     def test_migration_v14_to_v15_adds_step_columns_and_backfills(self, tmp_path: Path):
         """v14 databases should gain step columns and copy turn values into them."""
         import sqlite3
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
@@ -2554,7 +2570,7 @@ class TestStepColumnsMigration:
             )
             """
         )
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO tasks (prompt, status, created_at, num_turns_reported, num_turns_computed) VALUES (?, ?, ?, ?, ?)",
             ("Legacy task", "completed", now, 4, 3),
@@ -2881,7 +2897,7 @@ class TestRunStepPersistence:
             )
             """
         )
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute("INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)", ("legacy", "pending", now))
         conn.commit()
         conn.close()
@@ -2917,7 +2933,7 @@ class TestCycleOrchestratorSchema:
     def test_migration_v17_to_v18_creates_cycle_tables(self, tmp_path: Path):
         """Migration from v17 to v18 creates task_cycles and task_cycle_iterations tables."""
         import sqlite3
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         db_path = tmp_path / "test.db"
 
@@ -2972,7 +2988,7 @@ class TestCycleOrchestratorSchema:
             )
         """)
         conn.execute("INSERT INTO tasks (id, prompt, status, created_at) VALUES (1, 'Test', 'completed', ?)",
-                     (datetime.now(timezone.utc).isoformat(),))
+                     (datetime.now(UTC).isoformat(),))
         conn.commit()
         conn.close()
 
@@ -2980,7 +2996,7 @@ class TestCycleOrchestratorSchema:
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
         run_v25_migration(db_path, "gza")
-        store = SqliteTaskStore(db_path)
+        SqliteTaskStore(db_path)
 
         # Verify schema version updated
         conn = sqlite3.connect(db_path)
@@ -3032,6 +3048,7 @@ class TestCycleOrchestratorSchema:
     def test_migration_v18_to_v19_adds_indexes(self, tmp_path: Path):
         """Migration v18->v19 adds idx_tasks_type_based_on and the unique constraint."""
         import sqlite3
+
         from gza.db import SqliteTaskStore
 
         db_path = tmp_path / "test.db"
@@ -3068,7 +3085,7 @@ class TestCycleOrchestratorSchema:
         with pytest.raises(ManualMigrationRequired):
             SqliteTaskStore(db_path)
         run_v25_migration(db_path, "gza")
-        store = SqliteTaskStore(db_path)
+        SqliteTaskStore(db_path)
 
         conn = sqlite3.connect(db_path)
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
@@ -3153,14 +3170,14 @@ class TestCycleStoreAPIs:
         cycle = store.start_cycle(impl.id)
         it = store.append_cycle_iteration(cycle.id, iteration_index=0)
 
-        from datetime import datetime, timezone
+        from datetime import datetime
         store.update_cycle_iteration(
             it.id,
             review_task_id=review.id,
             review_verdict="CHANGES_REQUESTED",
             improve_task_id=improve.id,
             state="improve_completed",
-            ended_at=datetime.now(timezone.utc),
+            ended_at=datetime.now(UTC),
         )
 
         iters = store.get_cycle_iterations(cycle.id)
@@ -3368,7 +3385,7 @@ class TestGetHistorySinceParam:
 
     def test_since_excludes_old_tasks(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # Old task (10 days ago)
         old = store.add("old task")
@@ -3390,7 +3407,7 @@ class TestGetHistorySinceParam:
 
     def test_since_includes_tasks_exactly_at_cutoff(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cutoff = now - timedelta(days=5)
 
         task = store.add("boundary task")
@@ -3405,7 +3422,7 @@ class TestGetHistorySinceParam:
 
     def test_since_none_returns_all(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         for i in range(3):
             t = store.add(f"task {i}")
@@ -3422,7 +3439,7 @@ class TestGetHistoryInternalFiltering:
 
     def test_excludes_internal_tasks_by_default(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         impl = store.add("Implement task", task_type="implement")
         impl.status = "completed"
@@ -3441,7 +3458,7 @@ class TestGetHistoryInternalFiltering:
 
     def test_includes_internal_tasks_when_task_type_requested(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         internal = store.add("Internal task", task_type="internal")
         internal.status = "completed"
@@ -3459,7 +3476,7 @@ class TestGetHistoryUnmergedStatus:
 
     def test_unmerged_status_matches_merge_status_and_legacy_status(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # Task with current merge_status='unmerged'
         t1 = store.add("Current unmerged", task_type="implement")
@@ -3484,7 +3501,7 @@ class TestGetHistoryUnmergedStatus:
 
     def test_unmerged_status_excludes_merged_tasks(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         merged = store.add("Merged task", task_type="implement")
         merged.status = "completed"
@@ -3641,7 +3658,7 @@ class TestGetHistoryOrderByBase36Boundary:
         assert task_10.id == f"{prefix}-10", f"expected {prefix}-10, got {task_10.id}"
 
         # Complete both with the SAME completed_at so created_at is the tie-breaker
-        same_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        same_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         task_z.completed_at = same_time
         task_z.status = "completed"
         store.update(task_z)
@@ -3687,6 +3704,7 @@ class TestMigrationV19ToV20:
     def test_migration_converts_task_type_to_implement(self, tmp_path: Path):
         """Migration v19->v20 updates existing rows with task_type='task' to 'implement'."""
         import sqlite3
+
         from gza.db import SCHEMA_VERSION
 
         db_path = tmp_path / "test.db"
@@ -3809,6 +3827,7 @@ class TestMigrationV21ToV22:
     def test_migration_converts_learn_task_type_to_internal(self, tmp_path: Path):
         """Migration v21->v22 updates existing rows with task_type='learn' to 'internal'."""
         import sqlite3
+
         from gza.db import SCHEMA_VERSION
 
         db_path = tmp_path / "test.db"

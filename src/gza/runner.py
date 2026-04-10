@@ -24,7 +24,12 @@ from .config import (
     BranchStrategy,
     Config,
 )
-from .console import console, error_message, info_line, next_steps, stats_line, success_message, task_footer, task_header
+from .console import (
+    console,
+    error_message,
+    task_footer,
+    task_header,
+)
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_id_numeric_key
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError

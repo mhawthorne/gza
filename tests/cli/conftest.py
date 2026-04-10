@@ -1,7 +1,7 @@
 """Shared fixtures and helpers for CLI tests."""
 
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gza.db import SqliteTaskStore
@@ -66,7 +66,7 @@ def setup_db_with_tasks(tmp_path: Path, tasks: list[dict], project_name: str = "
         task = store.add(task_data["prompt"], task_type=task_data.get("task_type", "implement"))
         task.status = task_data.get("status", "pending")
         if task.status in ("completed", "failed"):
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = datetime.now(UTC)
         store.update(task)
 
 
@@ -99,7 +99,7 @@ def setup_git_repo_with_task_branch(
     task = store.add(task_prompt)
     task.status = status
     if status in ("completed", "failed"):
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
     task.branch = branch_name
     store.update(task)
 
@@ -151,7 +151,7 @@ def setup_unmerged_env(
     task = store.add(task_prompt, task_type=task_type)
     task.status = status
     if status in ("completed", "failed", "dropped"):
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
     task.branch = branch
     task.has_commits = has_commits
     task.merge_status = merge_status

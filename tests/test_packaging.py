@@ -1,7 +1,7 @@
 """Packaging configuration regression tests."""
 
-from pathlib import Path
 import tomllib
+from pathlib import Path
 
 
 def test_hatch_vcs_does_not_write_source_version_file() -> None:

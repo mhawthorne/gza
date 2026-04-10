@@ -1,44 +1,43 @@
 """Tests for runner module."""
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git
-from gza.providers import RunResult, ClaudeProvider
+from gza.providers import ClaudeProvider, RunResult
 from gza.runner import (
-    build_prompt,
-    get_task_output_paths,
-    SUMMARY_DIR,
-    REVIEW_IMPROVE_LINEAGE_LIMIT,
-    WIP_DIR,
     BACKUP_DIR,
-    _build_context_from_chain,
+    REVIEW_IMPROVE_LINEAGE_LIMIT,
+    SUMMARY_DIR,
+    WIP_DIR,
     _build_code_task_commit_subject,
+    _build_context_from_chain,
     _build_review_improve_lineage_context,
-    _copy_learnings_to_worktree,
-    _extract_review_verdict,
-    backup_database,
-    _compute_slug_override,
     _complete_code_task,
+    _compute_slug_override,
+    _copy_learnings_to_worktree,
     _create_and_run_review_task,
+    _extract_review_verdict,
+    _extract_slug_suffix,
     _resolve_code_task_branch_name,
+    _restore_wip_changes,
     _run_non_code_task,
+    _run_result_to_stats,
     _save_wip_changes,
     _select_worktree_base_ref,
     _setup_code_task_worktree,
-    _restore_wip_changes,
-    _squash_wip_commits,
-    _run_result_to_stats,
-    _extract_slug_suffix,
     _slug_exists,
+    _squash_wip_commits,
+    backup_database,
+    build_prompt,
     generate_slug,
-    post_review_to_pr,
+    get_task_output_paths,
     run,
     write_log_entry,
 )
@@ -538,7 +537,7 @@ class TestReviewContextFromChain:
 
     def test_review_context_excludes_equal_timestamp_later_improve(self, tmp_path: Path):
         """Equal-timestamp improves created after the review are excluded."""
-        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=timezone.utc)
+        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=UTC)
         # IDs as project-prefixed base36 strings: 40="14", 50="1e", 60="1o", 100="2s"
         impl_task = Task(id="gza-2s", prompt="Implement", task_type="implement", status="completed")
         review_task = Task(
@@ -587,7 +586,7 @@ class TestReviewContextFromChain:
         Lexicographic comparison would incorrectly put ``"gza-10"`` first because
         ``"1" < "z"``.
         """
-        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=timezone.utc)
+        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=UTC)
         # IDs: review="gza-10" (36), older_improve="gza-z" (35), later_improve="gza-11" (37)
         impl_task = Task(id="gza-1k", prompt="Implement", task_type="implement", status="completed")
         review_task = Task(
@@ -3689,7 +3688,7 @@ class TestTaskClaimSafety:
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Done task", task_type="implement")
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
 
         config = self._make_config(tmp_path, db_path)
@@ -4707,7 +4706,6 @@ class TestSelectiveStaging:
 
     def test_selective_staging_only_stages_new_changes(self, tmp_path: Path):
         """Test that only files changed during the provider run get staged."""
-        from gza.git import Git
 
         # Pre-existing status (before provider run)
         pre_status = {("M", "pre_existing.txt")}
@@ -4755,7 +4753,6 @@ class TestExceptionHandlerMarkFailed:
 
     def test_git_error_in_run_inner_marks_failed(self, tmp_path: Path):
         """Test that GitError during post-run finalization marks the task as failed."""
-        from gza.git import GitError
 
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)

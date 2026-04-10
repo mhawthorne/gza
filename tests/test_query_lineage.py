@@ -3,8 +3,7 @@
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
-
+from gza.db import Task
 from gza.query import (
     _lineage_child_sort_key,
     build_lineage,
@@ -17,7 +16,6 @@ from gza.query import (
     resolve_lineage_root,
     task_time_for_lineage,
 )
-from gza.db import Task
 
 
 def _make_task(**kwargs) -> Task:
@@ -507,7 +505,6 @@ class TestLineageChildSortKey:
         fallback), causing ``TypeError: '<' not supported between instances of
         'str' and 'int'`` when Python compared the two tuple elements.
         """
-        from datetime import datetime
 
         parent = _make_task(id="gza-1", task_type="implement")
         child_with_id = _make_task(id="gza-3f", task_type="review", depends_on="gza-1")

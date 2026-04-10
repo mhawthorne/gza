@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .conftest import run_gza, setup_config, setup_db_with_tasks, LOG_FIXTURES_DIR
+from .conftest import run_gza, setup_config
 
 
 class TestHelpOutput:

@@ -7,11 +7,10 @@ import pytest
 from gza.db import SqliteTaskStore
 from gza.importer import (
     ImportTask,
-    ValidationError,
+    find_duplicate,
+    import_tasks,
     parse_import_file,
     validate_import,
-    import_tasks,
-    find_duplicate,
 )
 
 
@@ -439,7 +438,7 @@ class TestGetNextPendingWithDependencies:
     def test_skips_blocked_task(self, store: SqliteTaskStore):
         """get_next_pending skips tasks with incomplete dependencies."""
         task1 = store.add("First task")
-        task2 = store.add("Second task", depends_on=task1.id)
+        store.add("Second task", depends_on=task1.id)
 
         # Task 1 is pending, task 2 depends on it
         next_task = store.get_next_pending()
@@ -464,7 +463,7 @@ class TestGetNextPendingWithDependencies:
         task1.status = "in_progress"
         store.update(task1)
 
-        task2 = store.add("Second task", depends_on=task1.id)
+        store.add("Second task", depends_on=task1.id)
 
         # Task 1 is in_progress (not completed), task 2 is blocked
         next_task = store.get_next_pending()

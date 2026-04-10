@@ -3,19 +3,17 @@
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.learnings import (
-    CategorizedLearnings,
-    DEFAULT_TOPIC,
     LearningsResult,
     _build_summarization_prompt,
     _extract_learnings_from_output,
     _flatten_categorized,
-    regenerate_learnings,
     maybe_auto_regenerate_learnings,
+    regenerate_learnings,
 )
 
 
@@ -364,8 +362,9 @@ def test_internal_task_not_in_get_recent_completed(tmp_path: Path):
 def test_skip_learnings_prevents_auto_regeneration_call(tmp_path: Path):
     """Completing an internal task (skip_learnings=True) must not trigger maybe_auto_regenerate_learnings."""
     from unittest.mock import Mock
-    from gza.runner import _run_non_code_task
+
     from gza.providers.base import RunResult
+    from gza.runner import _run_non_code_task
 
     store = _new_store(tmp_path)
     config = Mock(spec=Config)

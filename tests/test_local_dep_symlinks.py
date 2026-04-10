@@ -1,9 +1,7 @@
 """Tests for _create_local_dep_symlinks in runner.py."""
 
 from pathlib import Path
-from unittest.mock import Mock, patch
-
-import pytest
+from unittest.mock import Mock
 
 from gza.runner import _create_local_dep_symlinks
 
@@ -261,8 +259,9 @@ class TestDockerSkip:
         Instead, we verify the guard is structurally present at both call sites via regex on the
         module source.
         """
-        import re
         import inspect
+        import re
+
         import gza.runner as runner_mod
 
         source = inspect.getsource(runner_mod)

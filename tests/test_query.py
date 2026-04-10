@@ -1,6 +1,6 @@
 """Tests for the gza.query module (history filtering and lineage)."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,7 +8,6 @@ import pytest
 from gza.db import SqliteTaskStore, Task
 from gza.query import (
     HistoryFilter,
-    TaskLineageNode,
     get_task_lineage,
     is_lineage_complete,
     query_history,
@@ -84,7 +83,7 @@ class TestQueryHistory:
         task.status = "completed"
         task.merge_status = merge_status
         task.has_commits = has_commits
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         task.completed_at = now - timedelta(days=days_ago)
         task.created_at = now - timedelta(days=days_ago)
         store.update(task)
@@ -98,7 +97,7 @@ class TestQueryHistory:
     ) -> Task:
         task = store.add(prompt, task_type="task")
         task.status = "failed"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         task.completed_at = now - timedelta(days=days_ago)
         task.created_at = now - timedelta(days=days_ago)
         store.update(task)
@@ -106,7 +105,7 @@ class TestQueryHistory:
 
     def test_incomplete_filters_failed(self, tmp_path: Path):
         store = self._make_store(tmp_path)
-        failed = self._add_failed(store, "failed task")
+        self._add_failed(store, "failed task")
         self._add_completed(store, "merged task", merge_status="merged")
 
         f = HistoryFilter(incomplete=True, limit=None)
@@ -204,7 +203,7 @@ class TestGetTaskLineage:
     ) -> Task:
         task = store.add(prompt, task_type="task", based_on=based_on)
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
         return task
 
@@ -261,7 +260,7 @@ class TestQueryHistoryWithLineage:
     ) -> Task:
         task = store.add(prompt, task_type="task", based_on=based_on)
         task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        task.completed_at = datetime.now(UTC)
         store.update(task)
         return task
 
