@@ -33,6 +33,7 @@ from ._common import (
     _spawn_background_workers,
     get_review_verdict,
     get_store,
+    resolve_id,
 )
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
@@ -75,7 +76,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Check if specific task IDs were provided
     if hasattr(args, 'task_ids') and args.task_ids:
-        # Validate all task IDs first
+        # Resolve and validate all task IDs first
+        args.task_ids = [resolve_id(config, tid) for tid in args.task_ids]
         for task_id in args.task_ids:
             task = store.get(task_id)
             if not task:
@@ -216,9 +218,10 @@ def cmd_implement(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    plan_task = store.get(args.plan_task_id)
+    plan_task_id = resolve_id(config, args.plan_task_id)
+    plan_task = store.get(plan_task_id)
     if not plan_task:
-        print(f"Error: Task #{args.plan_task_id} not found")
+        print(f"Error: Task #{plan_task_id} not found")
         return 1
     if plan_task.task_type != "plan":
         print(f"Error: Task #{plan_task.id} is a {plan_task.task_type} task. Expected a completed plan task.")
@@ -236,7 +239,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
             prompt = f"Implement plan from task #{plan_task.id}"
 
     group = args.group if hasattr(args, 'group') and args.group else None
-    depends_on = args.depends_on if hasattr(args, 'depends_on') and args.depends_on else None
+    depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
@@ -301,8 +304,8 @@ def cmd_add(args: argparse.Namespace) -> int:
 
     # Get optional parameters
     group = args.group if hasattr(args, 'group') and args.group else None
-    depends_on = args.depends_on if hasattr(args, 'depends_on') and args.depends_on else None
-    based_on = args.based_on if hasattr(args, 'based_on') and args.based_on else None
+    depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
+    based_on = resolve_id(config, args.based_on) if hasattr(args, 'based_on') and args.based_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     spec = args.spec if hasattr(args, 'spec') and args.spec else None
@@ -418,9 +421,10 @@ def cmd_edit(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     if task.status != "pending":
@@ -443,24 +447,26 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     # Handle --based-on flag (lineage/parent relationship)
     if hasattr(args, 'based_on_flag') and args.based_on_flag is not None:
-        parent_task = store.get(args.based_on_flag)
+        based_on_id = resolve_id(config, args.based_on_flag)
+        parent_task = store.get(based_on_id)
         if not parent_task:
-            print(f"Error: Task #{args.based_on_flag} not found")
+            print(f"Error: Task #{based_on_id} not found")
             return 1
-        task.based_on = args.based_on_flag
+        task.based_on = based_on_id
         store.update(task)
-        print(f"✓ Set task #{task.id} based_on task #{args.based_on_flag}")
+        print(f"✓ Set task #{task.id} based_on task #{based_on_id}")
         return 0
 
     # Handle --depends-on flag (execution blocking dependency)
     if hasattr(args, 'depends_on_flag') and args.depends_on_flag is not None:
-        dep_task = store.get(args.depends_on_flag)
+        depends_on_id = resolve_id(config, args.depends_on_flag)
+        dep_task = store.get(depends_on_id)
         if not dep_task:
-            print(f"Error: Task #{args.depends_on_flag} not found")
+            print(f"Error: Task #{depends_on_id} not found")
             return 1
-        task.depends_on = args.depends_on_flag
+        task.depends_on = depends_on_id
         store.update(task)
-        print(f"✓ Set task #{task.id} to depend on task #{args.depends_on_flag}")
+        print(f"✓ Set task #{task.id} to depend on task #{depends_on_id}")
         return 0
 
     # Handle --review flag
@@ -574,9 +580,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
     store = get_store(config)
 
     # Get the original task
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     # Validate status
@@ -594,13 +601,13 @@ def cmd_retry(args: argparse.Namespace) -> int:
         create_review=task.create_review,
         same_branch=task.same_branch,
         task_type_hint=task.task_type_hint,
-        based_on=args.task_id,  # Track retry lineage
+        based_on=task_id,  # Track retry lineage
         model=task.model,
         provider=task.provider if task.provider_is_explicit else None,
         provider_is_explicit=task.provider_is_explicit,
     )
 
-    print(f"✓ Created task #{new_task.id} (retry of #{args.task_id})")
+    print(f"✓ Created task #{new_task.id} (retry of #{task_id})")
 
     # Handle background mode - spawn worker to run the new task
     if args.background:
@@ -631,13 +638,14 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     if task.status == "completed":
-        print(f"Error: Task #{args.task_id} is already completed")
+        print(f"Error: Task #{task_id} is already completed")
         return 1
 
     if args.verify_git and args.force:
@@ -648,18 +656,18 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
     # Warn if task wasn't failed (but still proceed)
     if task.status != "failed":
-        print(f"Warning: Task #{args.task_id} is not in failed status (current status: {task.status}), proceeding anyway")
+        print(f"Warning: Task #{task_id} is not in failed status (current status: {task.status}), proceeding anyway")
 
     if mode == "force":
         old_status = task.status
         store.mark_completed(task, branch=task.branch if task.branch else None)
-        _cleanup_worker_registry(config, args.task_id)
-        print(f"✓ Task #{args.task_id} status changed: {old_status} → completed (status-only)")
+        _cleanup_worker_registry(config, task_id)
+        print(f"✓ Task #{task_id} status changed: {old_status} → completed (status-only)")
         return 0
 
     # verify-git mode: validate branch and commit state
     if not task.branch:
-        print(f"Error: Task #{args.task_id} has no branch set. Use --force for status-only completion.")
+        print(f"Error: Task #{task_id} has no branch set. Use --force for status-only completion.")
         return 1
 
     git = Git(config.project_dir)
@@ -672,13 +680,13 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
         store.mark_completed(task, branch=task.branch, has_commits=False)
-        _cleanup_worker_registry(config, args.task_id)
-        print(f"✓ Task #{args.task_id} marked as completed")
+        _cleanup_worker_registry(config, task_id)
+        print(f"✓ Task #{task_id} marked as completed")
         return 0
 
     store.mark_completed(task, branch=task.branch, has_commits=True)
-    _cleanup_worker_registry(config, args.task_id)
-    print(f"✓ Task #{args.task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
+    _cleanup_worker_registry(config, task_id)
+    print(f"✓ Task #{task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
 
@@ -691,9 +699,10 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     old_status = task.status
@@ -710,13 +719,13 @@ def cmd_set_status(args: argparse.Namespace) -> int:
         task.failure_reason = None
 
     store.update(task)
-    _cleanup_worker_registry(config, args.task_id)
+    _cleanup_worker_registry(config, task_id)
 
-    print(f"Task #{args.task_id} status: {old_status} → {args.status}")
+    print(f"Task #{task_id} status: {old_status} → {args.status}")
     return 0
 
 
-def _cleanup_worker_registry(config: "Config", task_id: int) -> None:
+def _cleanup_worker_registry(config: "Config", task_id: str) -> None:
     """Mark any running worker for a task as completed in the worker registry.
 
     Looks up the most recent worker associated with the task and calls
@@ -732,7 +741,7 @@ def _cleanup_worker_registry(config: "Config", task_id: int) -> None:
 
 
 def _resolve_impl_task(
-    store: SqliteTaskStore, task_id: int
+    store: SqliteTaskStore, task_id: str
 ) -> tuple[DbTask, None] | tuple[None, str]:
     """Walk up the lineage chain to find the root implement task.
 
@@ -791,7 +800,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    impl_task, err = _resolve_impl_task(store, args.task_id)
+    impl_task, err = _resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
         print(f"Error: {err}")
         return 1
@@ -898,7 +907,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     store = get_store(config)
 
     # Resolve target implementation from provided task (accepts implement, improve, or review)
-    impl_task, err = _resolve_impl_task(store, args.task_id)
+    impl_task, err = _resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
         print(f"Error: {err}")
         return 1
@@ -966,9 +975,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
     # it manages the full review/improve cycle lifecycle and requires the root impl task.
-    impl_task = store.get(args.impl_task_id)
+    impl_task_id = resolve_id(config, args.impl_task_id)
+    impl_task = store.get(impl_task_id)
     if not impl_task:
-        print(f"Error: Task #{args.impl_task_id} not found")
+        print(f"Error: Task #{impl_task_id} not found")
         return 1
     if impl_task.task_type != "implement":
         print(f"Error: Task #{impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
@@ -1023,7 +1033,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         iteration = 0
 
     # Summary rows collected as we run: (iteration, review_id, verdict, improve_id)
-    summary_rows: list[tuple[int, int | None, str | None, int | None]] = []
+    summary_rows: list[tuple[int, str | None, str | None, str | None]] = []
 
     final_status = "blocked"
     # "unknown" is a safe fallback init value; in practice every code path
@@ -1181,9 +1191,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     if task.status not in ("failed", "in_progress"):
@@ -1196,15 +1207,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
         registry = WorkerRegistry(config.workers_path)
         running_worker = _running_worker_id_for_task(registry, task.id)
         if running_worker is not None:
-            print(f"Error: Task #{args.task_id} is still running (worker {running_worker})")
+            print(f"Error: Task #{task_id} is still running (worker {running_worker})")
             print("Use 'gza cancel' to stop it first, or wait for it to finish")
             return 1
-        print(f"Note: Task #{args.task_id} appears orphaned (in_progress but no live worker), resuming...")
+        print(f"Note: Task #{task_id} appears orphaned (in_progress but no live worker), resuming...")
     elif task.status == "failed" and task.failure_reason == "WORKER_DIED":
-        print(f"Note: Task #{args.task_id} appears orphaned (worker died), resuming...")
+        print(f"Note: Task #{task_id} appears orphaned (worker died), resuming...")
 
     if not task.session_id:
-        print(f"Error: Task #{args.task_id} has no session ID (cannot resume)")
+        print(f"Error: Task #{task_id} has no session ID (cannot resume)")
         print("Use 'gza retry' to start fresh instead")
         return 1
 
@@ -1213,7 +1224,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     new_task = _create_resume_task(store, task)
     assert new_task.id is not None
 
-    print(f"✓ Created task #{new_task.id} (resume of #{args.task_id})")
+    print(f"✓ Created task #{new_task.id} (resume of #{task_id})")
 
     # Handle background mode
     if args.background:

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from .conftest import setup_config, setup_db_with_tasks
+from .conftest import make_store, setup_config, setup_db_with_tasks
 
 
 def _make_args(project_dir: Path, **kwargs) -> argparse.Namespace:
@@ -21,35 +21,34 @@ def _make_args(project_dir: Path, **kwargs) -> argparse.Namespace:
 class TestCmdAttach:
     """Tests for cmd_attach CLI command."""
 
-    def _setup_running_worker(self, tmp_path: Path, task_id: int, tmux_session: str | None = None, provider: str | None = None) -> None:
+    def _setup_running_worker(self, tmp_path: Path, task_id: int = 1, tmux_session: str | None = None, provider: str | None = None) -> None:
         """Create a running worker JSON file in the workers directory."""
         import json
 
         setup_config(tmp_path)
+
+        # Create DB with the task first so we know the actual task ID
+        store = make_store(tmp_path)
+        task = store.add("test task")
+        if provider:
+            task.provider = provider
+        store.update(task)
+
+        actual_task_id = task.id
+
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
 
         worker_data = {
             "worker_id": "w-20260301-1",
-            "task_id": task_id,
+            "task_id": actual_task_id,
             "pid": 12345,
             "status": "running",
             "is_background": True,
-            "tmux_session": tmux_session or f"gza-{task_id}",
+            "tmux_session": tmux_session or f"gza-{actual_task_id}",
         }
         (workers_dir / "w-20260301-1.json").write_text(json.dumps(worker_data))
         (workers_dir / "w-20260301-1.pid").write_text("12345")
-
-        # Create DB with the task
-        from gza.db import SqliteTaskStore
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteTaskStore(db_path)
-        task = store.add("test task")
-        if provider:
-            task.provider = provider
-        store.update(task)
 
     def test_cmd_attach_finds_session_by_worker_id(self, tmp_path: Path, monkeypatch):
         """cmd_attach attaches to tmux session when looked up by worker ID."""
@@ -76,8 +75,7 @@ class TestCmdAttach:
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
 
         # Find actual task_id from DB
-        from gza.db import SqliteTaskStore
-        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        store = make_store(tmp_path)
         task = store.get_all()[0]
 
         args = _make_args(tmp_path, worker_id=str(task.id))
@@ -209,7 +207,7 @@ class TestSpawnBackgroundWorkerTmux:
 
         config = self._make_config(tmp_path, tmux_enabled=True)
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
 
@@ -245,7 +243,7 @@ class TestSpawnBackgroundWorkerTmux:
 
         config = self._make_config(tmp_path, tmux_enabled=True)
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
 
@@ -277,7 +275,7 @@ class TestSpawnBackgroundWorkerTmux:
 
         config = self._make_config(tmp_path, tmux_enabled=False)
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
 
@@ -307,7 +305,7 @@ class TestSpawnBackgroundWorkerTmux:
 
         config = self._make_config(tmp_path, tmux_enabled=True)
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
 
@@ -337,7 +335,7 @@ class TestSpawnBackgroundWorkerTmux:
 
         config = self._make_config(tmp_path, tmux_enabled=True)
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
 
@@ -540,7 +538,7 @@ class TestClaudeProviderTmuxMode:
         config = Config.load(tmp_path)
 
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("Implement hello world feature")
         store.update(task)
 
@@ -583,7 +581,7 @@ class TestClaudeProviderTmuxMode:
         config = Config.load(tmp_path)
 
         db_path = tmp_path / ".gza" / "gza.db"
-        store = SqliteTaskStore(db_path)
+        store = make_store(tmp_path)
         task = store.add("test task")
         store.update(task)
 

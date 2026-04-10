@@ -9,6 +9,30 @@ from gza.db import SqliteTaskStore
 LOG_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "logs"
 
 
+def make_store(tmp_path: Path) -> SqliteTaskStore:
+    """Create a SqliteTaskStore with the correct prefix from the project config.
+
+    Call setup_config() before this. Ensures the store prefix matches what the
+    CLI will use, so task IDs are consistent.
+    """
+    from gza.config import Config
+
+    db_path = tmp_path / ".gza" / "gza.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    config = Config.load(tmp_path)
+    return SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+
+def get_latest_task(store: SqliteTaskStore) -> "SqliteTaskStore":
+    """Get the most recently created task from the store.
+
+    Useful after a CLI command creates a new task (retry, review, improve)
+    when you need to inspect the result.
+    """
+    all_tasks = store.get_all()
+    return max(all_tasks, key=lambda t: t.created_at) if all_tasks else None
+
+
 def run_gza(*args: str, cwd: Path | None = None, stdin_input: str | None = None) -> subprocess.CompletedProcess:
     """Run gza command and return result."""
     return subprocess.run(
@@ -26,14 +50,17 @@ def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
     config_path.write_text(f"project_name: {project_name}\n")
 
 
-def setup_db_with_tasks(tmp_path: Path, tasks: list[dict]) -> None:
+def setup_db_with_tasks(tmp_path: Path, tasks: list[dict], project_name: str = "test-project") -> None:
     """Set up a SQLite database with the given tasks (also creates config)."""
     # Ensure config exists
-    setup_config(tmp_path)
+    setup_config(tmp_path, project_name=project_name)
 
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteTaskStore(db_path)
+    # Load the config to get the sanitized project_prefix, matching what the CLI uses.
+    from gza.config import Config
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(db_path, prefix=config.project_prefix)
 
     for task_data in tasks:
         task = store.add(task_data["prompt"], task_type=task_data.get("task_type", "implement"))
@@ -59,9 +86,7 @@ def setup_git_repo_with_task_branch(
     from gza.git import Git
 
     setup_config(tmp_path)
-    db_path = tmp_path / ".gza" / "gza.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteTaskStore(db_path)
+    store = make_store(tmp_path)
 
     git = Git(tmp_path)
     git._run("init", "-b", "main")
@@ -111,9 +136,7 @@ def setup_unmerged_env(
     from gza.git import Git
 
     setup_config(tmp_path)
-    db_path = tmp_path / ".gza" / "gza.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteTaskStore(db_path)
+    store = make_store(tmp_path)
 
     # Initialize git repo with initial commit
     git = Git(tmp_path)

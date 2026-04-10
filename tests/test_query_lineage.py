@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.query import (
+    _lineage_child_sort_key,
     build_lineage,
     build_lineage_tree,
     filter_lineage_tree,
@@ -390,34 +391,34 @@ class TestFilterLineageTree:
 class TestResolveLineageRoot:
     def test_returns_task_when_no_dependencies(self):
         store = MagicMock()
-        task = _make_task(id=1, task_type="implement", based_on=None, depends_on=None)
+        task = _make_task(id="gza-1", task_type="implement", based_on=None, depends_on=None)
         result = resolve_lineage_root(store, task)
         assert result == task
 
     def test_review_resolves_to_depends_on(self):
         store = MagicMock()
-        parent = _make_task(id=1, task_type="implement", based_on=None)
-        review = _make_task(id=2, task_type="review", depends_on=1)
+        parent = _make_task(id="gza-1", task_type="implement", based_on=None)
+        review = _make_task(id="gza-2", task_type="review", depends_on="gza-1")
         store.get.return_value = parent
         result = resolve_lineage_root(store, review)
         assert result == parent
 
     def test_improve_resolves_to_based_on(self):
         store = MagicMock()
-        parent = _make_task(id=1, task_type="implement", based_on=None)
-        improve = _make_task(id=2, task_type="improve", based_on=1)
+        parent = _make_task(id="gza-1", task_type="implement", based_on=None)
+        improve = _make_task(id="gza-2", task_type="improve", based_on="gza-1")
         store.get.return_value = parent
         result = resolve_lineage_root(store, improve)
         assert result == parent
 
     def test_walks_up_based_on_chain(self):
         store = MagicMock()
-        grandparent = _make_task(id=1, task_type="implement", based_on=None)
-        parent = _make_task(id=2, task_type="implement", based_on=1)
-        child = _make_task(id=3, task_type="implement", based_on=2)
+        grandparent = _make_task(id="gza-1", task_type="implement", based_on=None)
+        parent = _make_task(id="gza-2", task_type="implement", based_on="gza-1")
+        child = _make_task(id="gza-3", task_type="implement", based_on="gza-2")
 
         def mock_get(task_id):
-            return {1: grandparent, 2: parent, 3: child}.get(task_id)
+            return {"gza-1": grandparent, "gza-2": parent, "gza-3": child}.get(task_id)
 
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, child)
@@ -425,30 +426,30 @@ class TestResolveLineageRoot:
 
     def test_handles_cycle_in_based_on_chain(self):
         store = MagicMock()
-        task_a = _make_task(id=1, task_type="implement", based_on=2)
-        task_b = _make_task(id=2, task_type="implement", based_on=1)
+        task_a = _make_task(id="gza-1", task_type="implement", based_on="gza-2")
+        task_b = _make_task(id="gza-2", task_type="implement", based_on="gza-1")
 
         def mock_get(task_id):
-            return {1: task_a, 2: task_b}.get(task_id)
+            return {"gza-1": task_a, "gza-2": task_b}.get(task_id)
 
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, task_a)
-        assert result.id in (1, 2)
+        assert result.id in ("gza-1", "gza-2")
 
     def test_review_depends_on_not_found(self):
         store = MagicMock()
         store.get.return_value = None
-        review = _make_task(id=2, task_type="review", depends_on=999)
+        review = _make_task(id="gza-2", task_type="review", depends_on="gza-999")
         result = resolve_lineage_root(store, review)
         assert result == review
 
     def test_based_on_chain_stops_at_none(self):
         store = MagicMock()
-        parent = _make_task(id=1, task_type="implement", based_on=999)
-        child = _make_task(id=2, task_type="implement", based_on=1)
+        parent = _make_task(id="gza-1", task_type="implement", based_on="gza-999")
+        child = _make_task(id="gza-2", task_type="implement", based_on="gza-1")
 
         def mock_get(task_id):
-            if task_id == 1:
+            if task_id == "gza-1":
                 return parent
             return None
 
@@ -458,12 +459,72 @@ class TestResolveLineageRoot:
 
     def test_implement_depends_on_resolves_upstream_root(self):
         store = MagicMock()
-        root = _make_task(id=1, task_type="implement")
-        dependent = _make_task(id=2, task_type="implement", depends_on=1)
+        root = _make_task(id="gza-1", task_type="implement")
+        dependent = _make_task(id="gza-2", task_type="implement", depends_on="gza-1")
 
         def mock_get(task_id):
-            return {1: root, 2: dependent}.get(task_id)
+            return {"gza-1": root, "gza-2": dependent}.get(task_id)
 
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, dependent)
         assert result == root
+
+    def test_no_type_error_sorting_multiple_root_candidates(self):
+        """Sorting multiple root candidates with string IDs must not raise TypeError.
+
+        Regression: _root_order_key previously used ``10**9`` (int) as a sentinel
+        for None ids, producing a mixed ``str | int`` sort key that would TypeError
+        when compared against string task IDs.  After the fix, task_id_numeric_key
+        is used so all sort keys are ``tuple[datetime, int]``.
+        """
+        store = MagicMock()
+        root_a = _make_task(id="gza-1a", task_type="implement", based_on=None, depends_on=None)
+        root_b = _make_task(id="gza-2b", task_type="implement", based_on=None, depends_on=None)
+        # child depends on both roots — they both become root candidates
+        child = _make_task(id="gza-3c", task_type="improve", based_on="gza-1a", depends_on="gza-2b")
+
+        def mock_get(task_id):
+            return {"gza-1a": root_a, "gza-2b": root_b, "gza-3c": child}.get(task_id)
+
+        store.get.side_effect = mock_get
+
+        # Must not raise TypeError; result must be one of the valid root candidates
+        result = resolve_lineage_root(store, child)
+        assert result in (root_a, root_b)
+        assert result.id is not None
+
+
+# ---------------------------------------------------------------------------
+# _lineage_child_sort_key
+# ---------------------------------------------------------------------------
+
+
+class TestLineageChildSortKey:
+    def test_no_type_error_when_one_child_has_none_id(self):
+        """Sorting children where one has id=None must not raise TypeError.
+
+        Before the fix, child_id was ``str | int`` (string ID vs ``10**9``
+        fallback), causing ``TypeError: '<' not supported between instances of
+        'str' and 'int'`` when Python compared the two tuple elements.
+        """
+        from datetime import datetime
+
+        parent = _make_task(id="gza-1", task_type="implement")
+        child_with_id = _make_task(id="gza-3f", task_type="review", depends_on="gza-1")
+        child_no_id = _make_task(id=None, task_type="improve", based_on="gza-1")
+
+        # Must not raise TypeError
+        key_with_id = _lineage_child_sort_key(parent, child_with_id)
+        key_no_id = _lineage_child_sort_key(parent, child_no_id)
+
+        # Both keys must be comparable (no TypeError when sorted)
+        sorted_keys = sorted([key_with_id, key_no_id])
+        assert len(sorted_keys) == 2
+
+        # The third element must be int in both cases
+        assert isinstance(key_with_id[2], int)
+        assert isinstance(key_no_id[2], int)
+
+        # id=None maps to numeric key 0; "gza-3f" decodes to base36(3f)=141
+        assert key_no_id[2] == 0
+        assert key_with_id[2] == int("3f", 36)

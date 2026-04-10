@@ -5,6 +5,13 @@ import sys
 from pathlib import Path
 
 from ..config import Config, ConfigError
+from ..db import (
+    ManualMigrationRequired,
+    SqliteTaskStore,
+    check_migration_status,
+    preview_v25_migration,
+    run_v25_migration,
+)
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
 from ._common import (
     SortingHelpFormatter,
@@ -75,7 +82,7 @@ def main() -> int:
     work_parser.add_argument(
         "task_ids",
         nargs="*",
-        type=int,
+        type=str,
         help="Specific task ID(s) to run (optional, can specify multiple)",
     )
     add_common_args(work_parser)
@@ -215,7 +222,7 @@ def main() -> int:
     add_common_args(advance_parser)
     advance_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         nargs="?",
         metavar="task_id",
         help="Specific task ID to advance (omit to advance all eligible tasks)",
@@ -316,7 +323,7 @@ def main() -> int:
     refresh_group = refresh_parser.add_mutually_exclusive_group()
     refresh_group.add_argument(
         "task_id",
-        type=int,
+        type=str,
         nargs="?",
         metavar="task_id",
         help="Task ID to refresh (omit to refresh all unmerged tasks)",
@@ -332,7 +339,7 @@ def main() -> int:
     merge_parser = subparsers.add_parser("merge", help="Merge task branches into current branch")
     merge_parser.add_argument(
         "task_ids",
-        type=int,
+        type=str,
         nargs="*",
         metavar="task_id",
         help="Task ID(s) to merge",
@@ -378,7 +385,7 @@ def main() -> int:
     rebase_parser = subparsers.add_parser("rebase", help="Rebase a task's branch onto a target branch")
     rebase_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to rebase",
     )
     rebase_parser.add_argument(
@@ -433,7 +440,7 @@ def main() -> int:
     pr_parser = subparsers.add_parser("pr", help="Create GitHub PR from completed task")
     pr_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to create PR from",
     )
     pr_parser.add_argument(
@@ -656,13 +663,13 @@ def main() -> int:
     )
     add_parser.add_argument(
         "--based-on",
-        type=int,
+        type=str,
         metavar="ID",
         help="Set lineage/parent relationship (based_on field, used for branch inheritance and context)",
     )
     add_parser.add_argument(
         "--depends-on",
-        type=int,
+        type=str,
         metavar="ID",
         help="Set execution dependency (depends_on field, blocks task until dependency completes)",
     )
@@ -709,7 +716,7 @@ def main() -> int:
     edit_parser = subparsers.add_parser("edit", help="Edit a pending task's prompt or metadata")
     edit_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to edit",
     )
     edit_parser.add_argument(
@@ -721,14 +728,14 @@ def main() -> int:
     edit_parser.add_argument(
         "--based-on",
         dest="based_on_flag",
-        type=int,
+        type=str,
         metavar="ID",
         help="Set lineage/parent relationship (based_on field, used for branch inheritance and context)",
     )
     edit_parser.add_argument(
         "--depends-on",
         dest="depends_on_flag",
-        type=int,
+        type=str,
         metavar="ID",
         help="Set execution dependency (depends_on field, blocks task until dependency completes)",
     )
@@ -804,7 +811,7 @@ def main() -> int:
     delete_parser = subparsers.add_parser("delete", help="Delete a task")
     delete_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to delete",
     )
     delete_parser.add_argument(
@@ -823,7 +830,7 @@ def main() -> int:
     retry_parser = subparsers.add_parser("retry", help="Retry a failed or completed task")
     retry_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to retry",
     )
     retry_parser.add_argument(
@@ -853,7 +860,7 @@ def main() -> int:
     resume_parser = subparsers.add_parser("resume", help="Resume a failed task from where it left off")
     resume_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to resume",
     )
     resume_parser.add_argument(
@@ -883,7 +890,7 @@ def main() -> int:
     improve_parser = subparsers.add_parser("improve", help="Create an improve task based on implementation and review")
     improve_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     improve_parser.add_argument(
@@ -938,7 +945,7 @@ def main() -> int:
     )
     cycle_parser.add_argument(
         "impl_task_id",
-        type=int,
+        type=str,
         help="Implementation task ID to cycle",
     )
     cycle_parser.add_argument(
@@ -977,7 +984,7 @@ def main() -> int:
     )
     implement_parser.add_argument(
         "plan_task_id",
-        type=int,
+        type=str,
         help="Completed plan task ID to implement",
     )
     implement_parser.add_argument(
@@ -997,7 +1004,7 @@ def main() -> int:
     )
     implement_parser.add_argument(
         "--depends-on",
-        type=int,
+        type=str,
         metavar="ID",
         help="Set dependency on another task",
     )
@@ -1058,7 +1065,7 @@ def main() -> int:
     )
     review_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     review_parser.add_argument(
@@ -1109,7 +1116,7 @@ def main() -> int:
     )
     lineage_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to show lineage for",
     )
     add_common_args(lineage_parser)
@@ -1118,7 +1125,7 @@ def main() -> int:
     show_parser = subparsers.add_parser("show", help="Show details of a specific task")
     show_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to show",
     )
     show_parser.add_argument(
@@ -1159,7 +1166,7 @@ def main() -> int:
     )
     sync_report_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         nargs="?",
         default=None,
         help="Task ID to sync (optional if --all is used)",
@@ -1243,7 +1250,7 @@ def main() -> int:
     kill_parser.add_argument(
         "task_id",
         nargs="?",
-        type=int,
+        type=str,
         help="Task ID to kill (optional if --all is used)",
     )
     kill_parser.add_argument(
@@ -1265,7 +1272,7 @@ def main() -> int:
     )
     mark_completed_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to mark as completed",
     )
     mark_completed_mode_group = mark_completed_parser.add_mutually_exclusive_group()
@@ -1288,7 +1295,7 @@ def main() -> int:
     )
     set_status_parser.add_argument(
         "task_id",
-        type=int,
+        type=str,
         help="Task ID to update",
     )
     set_status_parser.add_argument(
@@ -1312,6 +1319,28 @@ def main() -> int:
     )
     _add_skills_install_args(skills_install_parser)
     add_common_args(skills_install_parser)
+
+    # migrate command
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Run pending manual database migrations (e.g. v25: INTEGER → TEXT IDs)",
+    )
+    migrate_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show migration status without running any migrations",
+    )
+    migrate_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what the migration would do without writing any changes",
+    )
+    add_common_args(migrate_parser)
 
     args = parser.parse_args()
 
@@ -1422,9 +1451,96 @@ def main() -> int:
             return cmd_learnings(args)
         elif args.command == "skills-install":
             return cmd_skills_install(args, default_targets=["all"])
+        elif args.command == "migrate":
+            return _cmd_migrate(args)
+    except ManualMigrationRequired as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("Run 'gza migrate' to upgrade the database.", file=sys.stderr)
+        return 1
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    return 0
+
+
+def _cmd_migrate(args: "argparse.Namespace") -> int:
+    """Handle the 'migrate' subcommand."""
+    try:
+        config = Config.load(args.project_dir)
+    except ConfigError as e:
+        print(f"Error loading config: {e}", file=sys.stderr)
+        return 1
+
+    status = check_migration_status(config.db_path)
+
+    if args.status:
+        current = status["current_version"]
+        target = status["target_version"]
+        pending_auto = status["pending_auto"]
+        pending_manual = status["pending_manual"]
+        print(f"Schema version: {current} / {target}")
+        if not pending_auto and not pending_manual:
+            print("Database is up-to-date.")
+        else:
+            if pending_auto:
+                print(f"Pending auto migrations: {', '.join(f'v{v}' for v in pending_auto)}")
+            if pending_manual:
+                print(f"Pending manual migrations: {', '.join(f'v{v}' for v in pending_manual)}")
+        return 0
+
+    pending_manual = status["pending_manual"]
+    if not pending_manual:
+        print("No pending manual migrations.")
+        return 0
+
+    if args.dry_run:
+        versions_str = ", ".join(f"v{v}" for v in pending_manual)
+        print(f"Dry-run: would apply migration(s): {versions_str}")
+        print(f"Database: {config.db_path}")
+        for version in pending_manual:
+            if version == 25:
+                preview = preview_v25_migration(config.db_path, config.project_prefix)
+                print("\nMigration v25 preview (INTEGER PK → TEXT base36 IDs):")
+                print(f"  Tasks to convert: {preview['task_count']}")
+                if preview["samples"]:
+                    print("  Sample ID conversions:")
+                    for old_id, new_id in preview["samples"]:
+                        print(f"    #{old_id} → {new_id}")
+                print(f"  First post-migration task ID: {preview['first_post_migration_id']}")
+        return 0
+
+    versions_str = ", ".join(f"v{v}" for v in pending_manual)
+    if not args.yes:
+        print(f"This will run manual migration(s): {versions_str}")
+        print(f"Database: {config.db_path}")
+        answer = input("Continue? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    # Trigger auto-migrations (up to v24) before applying manual ones.
+    # If the DB is at an older auto-migratable version, SqliteTaskStore.__init__
+    # will run the auto-migrations and then raise ManualMigrationRequired.
+    # We swallow that exception here since we are about to run the manual migration.
+    try:
+        SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+    except ManualMigrationRequired:
+        pass  # Expected — auto-migrations ran, now proceed with the manual migration
+
+    for version in pending_manual:
+        if version == 25:
+            print("Running migration v25 (INTEGER PK → TEXT base36 IDs)...")
+            try:
+                run_v25_migration(config.db_path, config.project_prefix)
+                backup_path = config.db_path.with_suffix(".backup.pre-v25.db")
+                print(f"Migration v25 complete. Backup at: {backup_path}")
+            except Exception as e:
+                print(f"Migration v25 failed: {e}", file=sys.stderr)
+                return 1
+        else:
+            print(f"Unknown manual migration v{version}", file=sys.stderr)
+            return 1
 
     return 0
 

@@ -32,7 +32,7 @@ from ..console import (
     shorten_prompt,
     truncate,
 )
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
 from ..git import Git
 from ..query import (
     TaskLineageNode,
@@ -54,6 +54,7 @@ from ._common import (
     get_review_verdict,
     get_store,
     pager_context,
+    resolve_id,
 )
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
@@ -138,7 +139,7 @@ def cmd_next(args: argparse.Namespace) -> int:
     fixed_cols = idx_width + 2 + id_width + 2 + type_width + 2
     prompt_width = max(20, terminal_width - fixed_cols)
 
-    def _print_task_row(i: int, task: DbTask, blocking_id: int | None = None) -> None:
+    def _print_task_row(i: int, task: DbTask, blocking_id: str | None = None) -> None:
         idx_str = str(i)
         id_str = f"#{task.id}"
         type_str = task.task_type or "implement"
@@ -757,7 +758,7 @@ def _print_ps_output(
         # This catches status transitions regardless of whether the task is
         # still in live_rows (e.g. worker exists but task completed in DB).
         for key, row in list(seen_tasks.items()):
-            if isinstance(key, int) and row["status"] in ("running", "in_progress"):
+            if isinstance(key, str) and row.get("task_id") is not None and row["status"] in ("running", "in_progress"):
                 task = store.get(key)
                 if task and task.status in ("completed", "failed"):
                     row["status"] = task.status
@@ -940,7 +941,22 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
     has_no_timestamp = sort_timestamp == ""
 
     raw_task_id = row.get("task_id")
-    task_id_sort = raw_task_id if isinstance(raw_task_id, int) else sys.maxsize
+    if isinstance(raw_task_id, str):
+        # Decode the base36 suffix for numeric ordering (handles "prefix-base36" format)
+        decoded = _task_id_numeric_key(raw_task_id)
+        if decoded != 0:
+            task_id_sort = decoded
+        else:
+            # Fallback for legacy worker metadata files with bare-integer task IDs
+            # (e.g. "123" stored without base36 prefix during rolling migration)
+            try:
+                task_id_sort = int(raw_task_id)
+            except (ValueError, TypeError):
+                task_id_sort = sys.maxsize
+    elif isinstance(raw_task_id, int):
+        task_id_sort = raw_task_id  # backward compat for any stale integer values
+    else:
+        task_id_sort = sys.maxsize  # worker-only rows (no task) sort last
     worker_id = row.get("worker_id", "")
     return (status_group, has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
 
@@ -1207,13 +1223,14 @@ def cmd_kill(args: argparse.Namespace) -> int:
         print("Error: Must specify task_id or use --all")
         return 1
 
-    maybe_task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    maybe_task = store.get(task_id)
     if maybe_task is None:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     if maybe_task.status != "in_progress":
-        print(f"Error: Task #{args.task_id} is not running (status: {maybe_task.status})")
+        print(f"Error: Task #{task_id} is not running (status: {maybe_task.status})")
         return 1
 
     return 0 if _kill_task(maybe_task, registry, store, force) else 1
@@ -1224,9 +1241,10 @@ def cmd_delete(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{args.task_id} not found")
+        print(f"Error: Task #{task_id} not found")
         return 1
 
     if task.status == "in_progress":
@@ -1243,8 +1261,8 @@ def cmd_delete(args: argparse.Namespace) -> int:
             print("Cancelled")
             return 0
 
-    if store.delete(args.task_id):
-        print(f"✓ Deleted task #{args.task_id}")
+    if store.delete(task_id):
+        print(f"✓ Deleted task #{task_id}")
         return 0
     else:
         print("Error: Failed to delete task")
@@ -1258,7 +1276,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task_id: int = args.task_id
+    task_id: str = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if task is None:
         console.print(f"[red]Error: Task #{task_id} not found[/red]")
@@ -1352,9 +1370,10 @@ def cmd_show(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    task = store.get(args.task_id)
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
     if not task:
-        console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
+        console.print(f"[red]Error: Task #{task_id} not found[/red]")
         return 1
 
     # --prompt: emit the fully built prompt as JSON and exit
@@ -1367,7 +1386,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             report_path = config.project_dir / task.report_file
             print(report_path)
             return 0
-        console.print(f"[red]Error: Task #{args.task_id} has no report file[/red]")
+        console.print(f"[red]Error: Task #{task_id} has no report file[/red]")
         return 1
 
     # --output: print only the raw output content and exit
@@ -1376,7 +1395,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         if output:
             print(output)
             return 0
-        console.print(f"[red]Error: Task #{args.task_id} has no output content[/red]")
+        console.print(f"[red]Error: Task #{task_id} has no output content[/red]")
         return 1
 
     with pager_context(getattr(args, 'page', False), config.project_dir):
@@ -1587,19 +1606,16 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
     target = args.worker_id
 
-    # Try as worker ID first, then as numeric task ID
+    # Try as worker ID first, then as task ID (string or numeric)
     worker = registry.get(target)
     if worker is None:
-        try:
-            task_id_int = int(target)
-        except ValueError:
-            task_id_int = None
-
-        if task_id_int is not None:
-            for w in registry.list_all(include_completed=False):
-                if w.task_id == task_id_int:
-                    worker = w
-                    break
+        # Try resolving as a task ID — WorkerMetadata.from_dict already
+        # normalises task_id to str | None, so no str() cast needed here.
+        resolved_target = resolve_id(config, target) if not target.startswith("w-") else None
+        for w in registry.list_all(include_completed=False):
+            if w.task_id == target or (resolved_target and w.task_id == resolved_target):
+                worker = w
+                break
 
     if worker is None or worker.status != "running":
         print(f"No running worker found for: {target}")

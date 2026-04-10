@@ -24,8 +24,8 @@ from .config import (
     BranchStrategy,
     Config,
 )
-from .console import console, error_message, task_footer, task_header
-from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
+from .console import console, error_message, info_line, next_steps, stats_line, success_message, task_footer, task_header
+from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_id_numeric_key
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
@@ -88,7 +88,7 @@ def extract_content_from_log(log_file: "Path") -> str | None:
 
 def _persist_run_steps_from_result(
     store: SqliteTaskStore,
-    run_id: int,
+    run_id: str,
     provider_name: str,
     result: RunResult,
 ) -> bool:
@@ -515,7 +515,7 @@ def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
     return f"{candidate}..."
 
 
-def _default_code_task_commit_subject(task_slug: str | None, task_db_id: int | None) -> str:
+def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | None) -> str:
     """Build deterministic fallback commit subject for code tasks."""
     if task_slug and task_slug.strip():
         return f"gza task {task_slug.strip()}"
@@ -549,12 +549,12 @@ def _build_code_task_commit_subject(task_prompt: str, worktree_summary_path: Pat
     return fallback
 
 
-def _is_improve_in_impl_chain(improve_task: Task, impl_task: Task, tasks_by_id: dict[int, Task]) -> bool:
+def _is_improve_in_impl_chain(improve_task: Task, impl_task: Task, tasks_by_id: dict[str, Task]) -> bool:
     """Return True when an improve task belongs to an implementation's improve chain."""
     if impl_task.id is None or improve_task.based_on is None:
         return False
     current_based_on = improve_task.based_on
-    seen: set[int] = set()
+    seen: set[str] = set()
     while True:
         if current_based_on == impl_task.id:
             return True
@@ -593,12 +593,11 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
             prior_improves.append(improve)
             continue
         if improve.created_at is None:
-            if review_task.id is not None and improve.id is not None and improve.id < review_task.id:
+            if review_task.id is not None and improve.id is not None and task_id_numeric_key(improve.id) < task_id_numeric_key(review_task.id):
                 prior_improves.append(improve)
             continue
 
-        review_id = review_task.id if review_task.id is not None else 0
-        if (improve.created_at, improve.id or 0) < (review_created_at, review_id):
+        if (improve.created_at, task_id_numeric_key(improve.id)) < (review_created_at, task_id_numeric_key(review_task.id)):
             prior_improves.append(improve)
 
     if not prior_improves:
@@ -608,7 +607,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     prior_improves.sort(
         key=lambda t: (
             t.completed_at or t.created_at or datetime.min.replace(tzinfo=UTC),
-            t.id or 0,
+            task_id_numeric_key(t.id),
         ),
         reverse=True,
     )
@@ -620,7 +619,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     # Build lineage chain (oldest first for readability)
     chronological = sorted(
         prior_improves,
-        key=lambda t: (t.created_at or datetime.min.replace(tzinfo=UTC), t.id or 0),
+        key=lambda t: (t.created_at or datetime.min.replace(tzinfo=UTC), task_id_numeric_key(t.id)),
     )
     chain_parts = []
     for improve in chronological:
@@ -865,7 +864,7 @@ def _build_context_from_chain(
     return "\n".join(context_parts) if context_parts else ""
 
 
-def _find_task_of_type_in_chain(task_id: int, task_type: str, store: SqliteTaskStore, visited: set[int] | None = None) -> Task | None:
+def _find_task_of_type_in_chain(task_id: str, task_type: str, store: SqliteTaskStore, visited: set[str] | None = None) -> Task | None:
     """Walk up the based_on chain to find a task of the given type."""
     if visited is None:
         visited = set()
@@ -1256,7 +1255,7 @@ def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
 
 def run(
     config: Config,
-    task_id: int | None = None,
+    task_id: str | None = None,
     resume: bool = False,
     open_after: bool = False,
     on_task_claimed: Callable[[Task], None] | None = None,
@@ -1467,8 +1466,8 @@ def _resolve_code_task_branch_name(
             source_task = store.get(task.depends_on)
 
         resolved_branch: str | None = None
-        visited_ids: list[int | None] = []
-        seen_ids: set[int | None] = set()
+        visited_ids: list[str | None] = []
+        seen_ids: set[str | None] = set()
         current = source_task
         while current is not None:
             if current.branch and git.branch_exists(current.branch):

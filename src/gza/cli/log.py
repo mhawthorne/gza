@@ -18,9 +18,9 @@ from ..colors import (
 )
 from ..config import Config
 from ..console import console, format_duration, truncate
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import _parse_iso, get_store, pager_context
+from ._common import _parse_iso, get_store, pager_context, resolve_id
 
 
 def _lc() -> str:
@@ -600,7 +600,7 @@ def _format_log_entry(entry: dict) -> str | None:
 def _task_run_sort_key(task: DbTask) -> tuple[datetime, int]:
     """Sort key for selecting latest task run attempt deterministically."""
     timestamp = task.started_at or task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC)
-    return (timestamp, task.id or -1)
+    return (timestamp, task_id_numeric_key(task.id))
 
 
 def _task_has_run_artifacts(task: DbTask) -> bool:
@@ -629,17 +629,17 @@ def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tu
     assert task.id is not None
 
     all_tasks = store.get_all()
-    by_parent: dict[int, list[DbTask]] = {}
+    by_parent: dict[str, list[DbTask]] = {}
     for candidate in all_tasks:
         if candidate.based_on is None:
             continue
         by_parent.setdefault(candidate.based_on, []).append(candidate)
 
-    by_id: dict[int, DbTask] = {t.id: t for t in all_tasks if t.id is not None}
+    by_id: dict[str, DbTask] = {t.id: t for t in all_tasks if t.id is not None}
 
     # Collect same-type ancestors up from queried task (retry/resume chain backtracking).
     related: list[DbTask] = []
-    ancestor_seen: set[int] = set()
+    ancestor_seen: set[str] = set()
     current = task
     while current.id is not None and current.id not in ancestor_seen:
         ancestor_seen.add(current.id)
@@ -654,7 +654,7 @@ def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tu
 
     # Collect same-type descendants only from the queried task forward.
     queue = [task.id]
-    seen: set[int] = set()
+    seen: set[str] = set()
     while queue:
         parent_id = queue.pop(0)
         if parent_id in seen:
@@ -668,7 +668,7 @@ def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tu
 
     # Deduplicate while preserving traversal order.
     deduped_related: list[DbTask] = []
-    related_seen: set[int] = set()
+    related_seen: set[str] = set()
     for candidate in related:
         if candidate.id is None:
             continue
@@ -761,7 +761,7 @@ def _resolve_worker_log_path(
     return None, False
 
 
-def _latest_worker_for_task(registry: WorkerRegistry, task_id: int) -> WorkerMetadata | None:
+def _latest_worker_for_task(registry: WorkerRegistry, task_id: str) -> WorkerMetadata | None:
     """Return most recent worker metadata for a task."""
     workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
     if not workers:
@@ -800,8 +800,13 @@ def _resolve_task_log_path(
     return None, False
 
 
-def _running_worker_id_for_task(registry: WorkerRegistry, task_id: int) -> str | None:
+def _running_worker_id_for_task(registry: WorkerRegistry, task_id: str) -> str | None:
     """Return a running worker ID for a task when available."""
+    # Note: legacy worker JSON files created before the INTEGER→TEXT PK migration
+    # may have task_id stored as a bare stringified integer (e.g. "123") rather than
+    # the canonical prefixed form (e.g. "gza-3f").  Such workers won't match here.
+    # This is acceptable since worker metadata is ephemeral and old JSON files are
+    # cleaned up after the worker process exits.
     workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]
     running = [w for w in workers if w.status == "running" and registry.is_running(w.worker_id)]
     if not running:
@@ -904,13 +909,9 @@ def cmd_log(args: argparse.Namespace) -> int:
             is_running = worker_id_for_follow is not None
 
     else:
-        # Default: look up by numeric task ID
-        try:
-            task_id = int(query)
-            requested_task = store.get(task_id)
-        except ValueError:
-            print(f"Error: '{query}' is not a valid task ID (must be numeric)")
-            return 1
+        # Default: look up by task ID
+        task_id: str = resolve_id(config, query)
+        requested_task = store.get(task_id)
         if not requested_task:
             print(f"Error: Task {query} not found")
             return 1
@@ -1074,7 +1075,7 @@ def _tail_log_file(
     args: argparse.Namespace,
     registry: WorkerRegistry,
     worker_id: str | None,
-    task_id: int | None = None,
+    task_id: str | None = None,
     store: SqliteTaskStore | None = None,
 ) -> int:
     """Tail a log file with optional follow mode."""

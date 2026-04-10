@@ -17,7 +17,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `project_prefix` | String | *(project_name)* | Short prefix for generated task slugs (1–12 chars, lowercase alphanumeric + hyphens). Defaults to `project_name`. Slugs become `YYYYMMDD-{project_prefix}-description`. |
+| `project_prefix` | String | *(project_name)* | Short prefix for task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs like `gza-1a2b`). Defaults to `project_name`. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
@@ -486,7 +486,7 @@ gza log <identifier> [options]
 
 | Option | Description |
 |--------|-------------|
-| `identifier` | Task ID (numeric), slug, or worker ID |
+| `identifier` | Task ID (e.g. `gza-1a2b`), slug, or worker ID |
 | `--slug`, `-s` | Interpret identifier as task slug (supports partial match) |
 | `--worker`, `-w` | Interpret identifier as worker ID |
 | `--steps` | Show compact step timeline |
@@ -497,7 +497,7 @@ gza log <identifier> [options]
 | `--raw` | Show raw JSON lines |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
-By default, the identifier is treated as a task ID (numeric).
+By default, the identifier is treated as a task ID (e.g. `gza-1a2b`; bare suffixes like `1a2b` are also accepted).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
 
 ### stats
@@ -583,7 +583,7 @@ gza attach <worker_id_or_task_id>
 
 | Option | Description |
 |--------|-------------|
-| `worker_id_or_task_id` | Worker ID (from `gza ps`) or numeric task ID |
+| `worker_id_or_task_id` | Worker ID (from `gza ps`) or task ID (e.g. `gza-1a2b`) |
 
 ### ps
 
@@ -983,6 +983,28 @@ gza refresh [task_id] [options]
 |--------|-------------|
 | `task_id` | Task ID to refresh (omit to refresh all unmerged tasks) |
 | `--include-failed` | Also refresh failed tasks that have branches |
+
+### migrate
+
+Run pending manual database migrations. Currently handles the v25 migration that converts INTEGER primary keys to project-prefixed base36 TEXT IDs (e.g. `gza-1a2b`).
+
+```bash
+gza migrate [--status] [--dry-run] [--yes/-y]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--status` | Show current schema version and list pending migrations without running anything |
+| `--dry-run` | Preview what the migration would change without writing any data |
+| `--yes`, `-y` | Skip the confirmation prompt and run migrations immediately |
+
+When run without flags, `gza migrate` prompts for confirmation before applying the migration. The migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup at `<db_path>.backup.pre-v25.db`. It is safe to re-run: calling it on an already-migrated database is a no-op.
+
+On successful migration, the backup path is printed to stdout so you can locate it for rollback if needed.
+
+Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`). After the v25 migration, the sequence is seeded at the previous maximum integer ID, so the first post-migration task gets `{prefix}-{base36(max_id + 1)}`.
+
+If a `ManualMigrationRequired` error appears when running any other command, run `gza migrate` to upgrade the database schema.
 
 ### set-status
 

@@ -78,7 +78,7 @@ class GzaClient:
     # Lineage queries                                                       #
     # ------------------------------------------------------------------ #
 
-    def get_lineage(self, task_id: int) -> list[Task]:
+    def get_lineage(self, task_id: str) -> list[Task]:
         """Return all tasks in the lineage tree containing task_id as a flat list.
 
         The result is deduplicated and returned in deterministic pre-order
@@ -110,7 +110,7 @@ class GzaClient:
         tree = _query.build_lineage_tree(self._store, root)
         return _query.flatten_lineage_tree(tree)
 
-    def get_lineage_root(self, task_id: int) -> Task:
+    def get_lineage_root(self, task_id: str) -> Task:
         """Resolve the root implementation task for any task in a chain.
 
         Parameters

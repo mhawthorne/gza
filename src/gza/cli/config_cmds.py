@@ -18,7 +18,7 @@ from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import get_store
+from ._common import get_store, resolve_id
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ def _cmd_stats_reviews(
             return t.created_at.astimezone().replace(tzinfo=None)
         return t.created_at
 
-    def find_root_impl(task_id: int, visited: set[int] | None = None) -> int | None:
+    def find_root_impl(task_id: str, visited: set[str] | None = None) -> str | None:
         """Walk up based_on/depends_on chains to find the root implement task."""
         if visited is None:
             visited = set()
@@ -141,8 +141,8 @@ def _cmd_stats_reviews(
     ]
 
     # Count reviews per root impl, tracking models
-    root_reviews: dict[int, list[datetime]] = defaultdict(list)
-    root_review_models: dict[int, list[str | None]] = defaultdict(list)
+    root_reviews: dict[str, list[datetime]] = defaultdict(list)
+    root_review_models: dict[str, list[str | None]] = defaultdict(list)
     for ri in ri_tasks:
         parent_id = ri.depends_on or ri.based_on
         if parent_id is None:
@@ -158,7 +158,7 @@ def _cmd_stats_reviews(
 
     # Find all root implement tasks in range
     root_impls_in_range: list[Task] = []
-    seen_roots: set[int] = set()
+    seen_roots: set[str] = set()
     for t in all_tasks:
         if t.task_type not in ("implement", "improve"):
             continue
@@ -1155,13 +1155,15 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         return 0
 
     # Single task mode
-    task = store.get(args.task_id)  # type: ignore[assignment]
-    if not task:
-        console.print(f"[red]Error: Task #{args.task_id} not found[/red]")
+    task_id = resolve_id(config, args.task_id)
+    found_task = store.get(task_id)
+    if not found_task:
+        console.print(f"[red]Error: Task #{task_id} not found[/red]")
         return 1
+    task = found_task
 
     if not task.report_file:
-        console.print(f"[red]Error: Task #{args.task_id} has no report file[/red]")
+        console.print(f"[red]Error: Task #{task_id} has no report file[/red]")
         return 1
 
     status = _sync_one_report(task, config, store, dry_run=dry_run)
@@ -1171,9 +1173,9 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Report file not found: {task.report_file}[/red]")
         return 1
     elif status == "unchanged":
-        console.print(f"[dim]Task #{args.task_id} already in sync — no changes needed.[/dim]")
+        console.print(f"[dim]Task #{task_id} already in sync — no changes needed.[/dim]")
     else:
-        console.print(f"{prefix}[green]Synced report for task #{args.task_id} from disk to DB.[/green]")
+        console.print(f"{prefix}[green]Synced report for task #{task_id} from disk to DB.[/green]")
     return 0
 
 

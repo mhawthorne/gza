@@ -12,7 +12,7 @@ class WorkerMetadata:
     """Minimal metadata for a worker process index."""
 
     worker_id: str
-    task_id: int | None
+    task_id: str | None
     pid: int
     # Legacy compatibility fields. New writes should avoid relying on these.
     task_slug: str | None = None
@@ -44,14 +44,13 @@ class WorkerMetadata:
             raise ValueError(f"Worker metadata has non-positive pid: {pid}")
 
         raw_task_id = data.get("task_id")
-        task_id: int | None
+        task_id: str | None
         if raw_task_id is None:
             task_id = None
         else:
-            try:
-                task_id = int(raw_task_id)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Worker metadata has invalid task_id: {raw_task_id!r}") from exc
+            # Legacy integer values become bare strings (e.g. "123"), not base36 IDs.
+            # Workers are ephemeral; callers resolve via resolve_task_id if needed.
+            task_id = str(raw_task_id)
 
         return WorkerMetadata(
             worker_id=str(data.get("worker_id", "")),

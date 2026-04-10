@@ -30,7 +30,7 @@ def _make_db(tmp_path: Path) -> Path:
     from gza.db import SqliteTaskStore
 
     # Constructing the store runs schema migrations and sets up all tables.
-    SqliteTaskStore(db_path)
+    SqliteTaskStore(db_path, prefix="testproject")
     return db_path
 
 
@@ -40,11 +40,11 @@ def _insert_review_task(
     output_content: str | None = None,
     log_file: str | None = None,
     cycle_id: int | None = None,
-) -> int:
+) -> str:
     """Insert a review task via SqliteTaskStore and patch optional fields."""
     from gza.db import SqliteTaskStore
 
-    store = SqliteTaskStore(db_path)
+    store = SqliteTaskStore(db_path, prefix="testproject")
     task = store.add(prompt="Test review", task_type="review")
     # Patch optional fields directly with raw SQL.
     conn = sqlite3.connect(db_path)
@@ -57,7 +57,7 @@ def _insert_review_task(
     return task.id
 
 
-def _get_output_content(db_path: Path, task_id: int) -> str | None:
+def _get_output_content(db_path: Path, task_id: str) -> str | None:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT output_content FROM tasks WHERE id = ?", (task_id,)).fetchone()

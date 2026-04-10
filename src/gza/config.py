@@ -17,9 +17,9 @@ LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
 logger = logging.getLogger(__name__)
 
 # Compiled regex for validating project_prefix values.
-# Requires first and last chars to be alphanumeric (prevents leading/trailing hyphens).
-# Single-character prefixes (just one alphanumeric) are also valid.
-_PREFIX_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+# Only lowercase alphanumeric — no hyphens, since the hyphen is the separator
+# between prefix and base36 suffix in task IDs (e.g., "gza-3f").
+_PREFIX_RE = re.compile(r'^[a-z0-9]+$')
 
 __all__ = [
     "APP_NAME",
@@ -351,15 +351,16 @@ class Config:
 
         # Default project_prefix to project_name if not explicitly set
         if not self.project_prefix:
-            # Sanitize: lowercase, replace non-alphanumeric chars with hyphens,
-            # strip leading/trailing hyphens, truncate to 12 chars
-            sanitized = re.sub(r'[^a-z0-9-]', '-', self.project_name.lower())
-            sanitized = sanitized.strip('-')
-            # Collapse multiple consecutive hyphens
-            sanitized = re.sub(r'-+', '-', sanitized)
-            # Truncate and strip any trailing hyphen produced by truncation
-            sanitized = sanitized[:12].rstrip('-')
-            self.project_prefix = sanitized or self.project_name[:12].lower()
+            # Sanitize: lowercase, strip non-alphanumeric chars, truncate to 12 chars.
+            # No hyphens — the hyphen is the separator between prefix and suffix in IDs.
+            sanitized = re.sub(r'[^a-z0-9]', '', self.project_name.lower())
+            if not sanitized:
+                raise ConfigError(
+                    f"'project_name' {self.project_name!r} produces an empty 'project_prefix' "
+                    "after stripping non-alphanumeric characters. "
+                    "Set 'project_prefix' explicitly in gza.yaml (e.g. project_prefix: myproject)."
+                )
+            self.project_prefix = sanitized[:12]
 
         # Set default branch strategy if not provided
         if self.branch_strategy is None:
@@ -573,8 +574,7 @@ class Config:
                 raise ConfigError("'project_prefix' must be between 1 and 12 characters")
             if not _PREFIX_RE.match(project_prefix_raw):
                 raise ConfigError(
-                    "'project_prefix' must contain only lowercase alphanumeric characters and hyphens, "
-                    "and must start with a letter or digit"
+                    "'project_prefix' must contain only lowercase alphanumeric characters (no hyphens)"
                 )
 
         # Support both new "defaults" section and old flat structure
@@ -1186,8 +1186,7 @@ class Config:
                 errors.append("'project_prefix' must be between 1 and 12 characters")
             elif not _PREFIX_RE.match(prefix_val):
                 errors.append(
-                    "'project_prefix' must contain only lowercase alphanumeric characters and hyphens, "
-                    "and must start with a letter or digit"
+                    "'project_prefix' must contain only lowercase alphanumeric characters (no hyphens)"
                 )
 
         if "tasks_file" in data and not isinstance(data["tasks_file"], str):

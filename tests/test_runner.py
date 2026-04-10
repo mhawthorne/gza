@@ -501,8 +501,8 @@ class TestReviewContextFromChain:
         impl_task.status = "completed"
         store.update(impl_task)
 
-        improve_ids: list[int] = []
-        parent_improve_id: int | None = None
+        improve_ids: list[str] = []
+        parent_improve_id: str | None = None
         for idx in range(REVIEW_IMPROVE_LINEAGE_LIMIT + 2):
             review = store.add(prompt=f"Review {idx}", task_type="review", depends_on=impl_task.id)
             review.status = "completed"
@@ -539,9 +539,10 @@ class TestReviewContextFromChain:
     def test_review_context_excludes_equal_timestamp_later_improve(self, tmp_path: Path):
         """Equal-timestamp improves created after the review are excluded."""
         created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=timezone.utc)
-        impl_task = Task(id=100, prompt="Implement", task_type="implement", status="completed")
+        # IDs as project-prefixed base36 strings: 40="14", 50="1e", 60="1o", 100="2s"
+        impl_task = Task(id="gza-2s", prompt="Implement", task_type="implement", status="completed")
         review_task = Task(
-            id=50,
+            id="gza-1e",
             prompt="Review current",
             task_type="review",
             depends_on=impl_task.id,
@@ -549,22 +550,22 @@ class TestReviewContextFromChain:
         )
 
         older_improve = Task(
-            id=40,
+            id="gza-14",
             prompt="Improve older",
             task_type="improve",
             status="completed",
             based_on=impl_task.id,
-            depends_on=10,
+            depends_on="gza-a",
             created_at=created_at,
             output_content="- older improve",
         )
         later_improve = Task(
-            id=60,
+            id="gza-1o",
             prompt="Improve later",
             task_type="improve",
             status="completed",
             based_on=impl_task.id,
-            depends_on=11,
+            depends_on="gza-b",
             created_at=created_at,
             output_content="- later improve",
         )
@@ -578,6 +579,59 @@ class TestReviewContextFromChain:
         assert "older improve" in context
         assert f"Improve #{later_improve.id}" not in context
         assert "later improve" not in context
+
+    def test_review_context_numeric_ordering_beats_lexicographic(self, tmp_path: Path):
+        """IDs with different base36 lengths sort numerically, not lexicographically.
+
+        ``"gza-z"`` (decimal 35) must sort *before* ``"gza-10"`` (decimal 36).
+        Lexicographic comparison would incorrectly put ``"gza-10"`` first because
+        ``"1" < "z"``.
+        """
+        created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=timezone.utc)
+        # IDs: review="gza-10" (36), older_improve="gza-z" (35), later_improve="gza-11" (37)
+        impl_task = Task(id="gza-1k", prompt="Implement", task_type="implement", status="completed")
+        review_task = Task(
+            id="gza-10",  # decimal 36
+            prompt="Review current",
+            task_type="review",
+            depends_on=impl_task.id,
+            created_at=created_at,
+        )
+
+        # gza-z (35) < gza-10 (36) numerically — should be included as prior improve
+        older_improve = Task(
+            id="gza-z",  # decimal 35
+            prompt="Improve older",
+            task_type="improve",
+            status="completed",
+            based_on=impl_task.id,
+            depends_on="gza-a",
+            created_at=created_at,
+            output_content="- older improve z",
+        )
+        # gza-11 (37) > gza-10 (36) numerically — should be excluded
+        later_improve = Task(
+            id="gza-11",  # decimal 37
+            prompt="Improve later",
+            task_type="improve",
+            status="completed",
+            based_on=impl_task.id,
+            depends_on="gza-b",
+            created_at=created_at,
+            output_content="- later improve 11",
+        )
+
+        store = Mock(spec=SqliteTaskStore)
+        store.get_all.return_value = [older_improve, later_improve]
+
+        context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
+
+        # gza-z (35) is before gza-10 (36) numerically — must be included
+        assert f"Improve #{older_improve.id}" in context
+        assert "older improve z" in context
+        # gza-11 (37) is after gza-10 (36) numerically — must be excluded
+        assert f"Improve #{later_improve.id}" not in context
+        assert "later improve 11" not in context
 
     def test_review_context_includes_tool_hints_when_prior_cycles_exist(self, tmp_path: Path):
         """Review context includes uv run gza show / cat hints when prior review/improve cycles exist."""
@@ -745,7 +799,7 @@ class TestReviewTaskSlugGeneration:
     def test_review_task_uses_implementation_slug(self, tmp_path: Path):
         """Test that auto-created review tasks derive slug from implementation task."""
         db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
+        store = SqliteTaskStore(db_path, prefix="testproject")
 
         # Create a completed implementation task with a task_id
         impl_task = store.add(
@@ -785,9 +839,9 @@ class TestReviewTaskSlugGeneration:
             _create_and_run_review_task(impl_task, config, store)
 
             # Get the review task that was created
-            review_task = store.get(2)
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
             assert review_task is not None
-            assert review_task.task_type == "review"
 
             # Verify the prompt uses the slug format
             assert review_task.prompt == "review add-docker-volumes"
@@ -798,7 +852,7 @@ class TestReviewTaskSlugGeneration:
     def test_review_task_handles_retry_suffix(self, tmp_path: Path):
         """Test that review task slug handles retry suffix in implementation task_id."""
         db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
+        store = SqliteTaskStore(db_path, prefix="testproject")
 
         # Create an implementation task with retry suffix
         impl_task = store.add(
@@ -828,7 +882,8 @@ class TestReviewTaskSlugGeneration:
         try:
             _create_and_run_review_task(impl_task, config, store)
 
-            review_task = store.get(2)
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
             assert review_task is not None
             # Should strip the retry suffix (-2) from the slug
             assert review_task.prompt == "review fix-authentication-bug"
@@ -839,7 +894,7 @@ class TestReviewTaskSlugGeneration:
     def test_review_task_fallback_without_task_id(self, tmp_path: Path):
         """Test that review task falls back gracefully if task_id is not set."""
         db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
+        store = SqliteTaskStore(db_path, prefix="testproject")
 
         # Create an implementation task without task_id
         impl_task = store.add(
@@ -869,10 +924,11 @@ class TestReviewTaskSlugGeneration:
         try:
             _create_and_run_review_task(impl_task, config, store)
 
-            review_task = store.get(2)
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
             assert review_task is not None
-            # Should use fallback format
-            assert "Review task #1" in review_task.prompt
+            # Should use fallback format (task ID is now a prefixed string)
+            assert f"Review task #{impl_task.id}" in review_task.prompt
         finally:
             gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review
@@ -884,7 +940,7 @@ class TestReviewTaskSlugGeneration:
         _create_and_run_review_task itself. This test verifies the delegation.
         """
         db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
+        store = SqliteTaskStore(db_path, prefix="testproject")
 
         # Create a completed implementation task with a PR
         impl_task = store.add(
@@ -922,7 +978,10 @@ class TestReviewTaskSlugGeneration:
 
             # Verify run() was called with the review task id
             assert len(run_calls) == 1
-            assert run_calls[0] == 2  # The created review task
+            # The review task ID is a prefixed string (second task created)
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
+            assert run_calls[0] == review_task.id
         finally:
             gza.runner.run = original_run
 

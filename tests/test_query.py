@@ -244,7 +244,7 @@ class TestGetTaskLineage:
     def test_raises_for_unknown_task_id(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         with pytest.raises(KeyError, match="not found"):
-            get_task_lineage(store, 9999, depth=1)
+            get_task_lineage(store, "test-project-zzz", depth=1)
 
 
 class TestQueryHistoryWithLineage:
