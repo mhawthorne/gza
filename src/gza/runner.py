@@ -378,11 +378,26 @@ def _extract_slug_suffix(slug: str) -> str:
     return slug
 
 
+def _extract_task_id_suffix(task_id: str | None) -> str:
+    """Extract the suffix portion from a task id like ``prefix-suffix``."""
+    if not task_id:
+        return ""
+    prefix, sep, suffix = task_id.partition("-")
+    if sep and prefix and suffix:
+        return suffix
+    return task_id
+
+
 
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
     """Compute a slug_override for review/implement/improve tasks.
 
-    Uses a type prefix ('rev', 'impl', 'impr') followed by the root task's slug.
+    Uses ``{task_id_suffix}-{type_prefix}-{target_slug}`` where target is the
+    direct parent this task operates on:
+    - review -> depends_on
+    - improve -> based_on
+    - implement -> based_on (fallback: depends_on)
+
     Returns None for other task types (slug is derived from prompt as usual).
     """
     prefix_map = {
@@ -394,15 +409,20 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     if prefix is None:
         return None
 
-    from . import query as _query
-    root = _query.resolve_lineage_root(store, task)
+    if task.task_type == "review":
+        anchor_id = task.depends_on
+    elif task.task_type == "improve":
+        anchor_id = task.based_on
+    else:  # implement
+        anchor_id = task.based_on or task.depends_on
 
-    if root.slug:
-        root_slug = _extract_slug_suffix(root.slug)
-    else:
-        root_slug = slugify(root.prompt)
+    anchor_task = store.get(anchor_id) if anchor_id is not None else None
+    target_slug = _extract_slug_suffix(anchor_task.slug) if anchor_task and anchor_task.slug else slugify(
+        anchor_task.prompt if anchor_task else task.prompt
+    )
+    task_id_suffix = _extract_task_id_suffix(task.id)
 
-    return f"{prefix}-{root_slug}"
+    return "-".join(part for part in (task_id_suffix, prefix, target_slug) if part)
 
 
 def _slug_exists(
