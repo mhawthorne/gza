@@ -1503,10 +1503,21 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                 preview = preview_v25_migration(config.db_path, config.project_prefix)
                 print("\nMigration v25 preview (INTEGER PK → TEXT base36 IDs):")
                 print(f"  Tasks to convert: {preview['task_count']}")
+                # Right-align old IDs so the → arrow lines up in both sample
+                # sections — width is computed across first + random so both
+                # blocks share the same column alignment.
+                all_old_ids = [old for old, _ in preview["samples"]] + [
+                    old for old, _ in preview["random_samples"]
+                ]
+                id_width = max((len(str(old)) for old in all_old_ids), default=0)
                 if preview["samples"]:
-                    print("  Sample ID conversions:")
+                    print(f"  Sample ID conversions (first {len(preview['samples'])}):")
                     for old_id, new_id in preview["samples"]:
-                        print(f"    #{old_id} → {new_id}")
+                        print(f"    #{old_id:>{id_width}} → {new_id}")
+                if preview["random_samples"]:
+                    print(f"  Sample ID conversions (random {len(preview['random_samples'])}):")
+                    for old_id, new_id in preview["random_samples"]:
+                        print(f"    #{old_id:>{id_width}} → {new_id}")
                 print(f"  First post-migration task ID: {preview['first_post_migration_id']}")
         return 0
 

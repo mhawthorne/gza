@@ -11,6 +11,7 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
+    _encode_base36,
     check_migration_status,
     preview_v25_migration,
     resolve_task_id,
@@ -300,7 +301,7 @@ class TestTaskChaining:
         store = SqliteTaskStore(db_path)
 
         # Verify migration worked
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.prompt == "Old task"
         assert task.group is None  # New field should be NULL
@@ -318,18 +319,18 @@ class TestTaskMethods:
 
     def test_is_explore(self):
         """Test is_explore method."""
-        task = Task(id="gza-1", prompt="Test", task_type="explore")
+        task = Task(id="gza-000001", prompt="Test", task_type="explore")
         assert task.is_explore() is True
 
-        task = Task(id="gza-1", prompt="Test", task_type="implement")
+        task = Task(id="gza-000001", prompt="Test", task_type="implement")
         assert task.is_explore() is False
 
     def test_is_blocked(self):
         """Test is_blocked method."""
-        task = Task(id="gza-1", prompt="Test", depends_on="gza-5")
+        task = Task(id="gza-000001", prompt="Test", depends_on="gza-000005")
         assert task.is_blocked() is True
 
-        task = Task(id="gza-1", prompt="Test", depends_on=None)
+        task = Task(id="gza-000001", prompt="Test", depends_on=None)
         assert task.is_blocked() is False
 
 
@@ -435,7 +436,7 @@ This plan outlines the implementation of a JWT-based authentication system.
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved (with NULL output_content)
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.output_content is None
 
@@ -548,7 +549,7 @@ class TestTaskResume:
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved (with NULL session_id)
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.session_id is None
 
@@ -736,7 +737,7 @@ class TestNumTurnsFields:
         assert version == SCHEMA_VERSION
 
         # Verify old task migrated: num_turns_reported populated from num_turns
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.num_turns_reported == 15
         assert task.num_turns_computed is None
@@ -924,7 +925,7 @@ class TestTokenCountFields:
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved with NULL token counts
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.input_tokens is None
         assert task.output_tokens is None
@@ -1298,7 +1299,7 @@ class TestMergeStatus:
         assert version == SCHEMA_VERSION
 
         # Verify old task can be retrieved with NULL merge_status
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.merge_status is None
 
@@ -1358,7 +1359,7 @@ class TestEditPromptDefaultContent:
                 content = f.read()
                 editor_content.append(content)
             # Verify the default prompt is present
-            assert "Implement plan from task #gza-16" in content
+            assert "Implement plan from task #gza-000016" in content
             # Return success without modifying the file
             class Result:
                 returncode = 0
@@ -1369,15 +1370,15 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content="",
             task_type="implement",
-            based_on="gza-16",
+            based_on="gza-000016",
         )
 
         # Verify the default prompt was included in the editor
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-16" in editor_content[0]
+        assert "Implement plan from task #gza-000016" in editor_content[0]
 
         # Verify the result includes the default
-        assert result == "Implement plan from task #gza-16"
+        assert result == "Implement plan from task #gza-000016"
 
     def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt includes the slug in the default prompt when provided."""
@@ -1401,13 +1402,13 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content="",
             task_type="implement",
-            based_on="gza-16",
+            based_on="gza-000016",
             based_on_slug="design-feature-x",
         )
 
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-16: design-feature-x" in editor_content[0]
-        assert result == "Implement plan from task #gza-16: design-feature-x"
+        assert "Implement plan from task #gza-000016: design-feature-x" in editor_content[0]
+        assert result == "Implement plan from task #gza-000016: design-feature-x"
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
@@ -1432,12 +1433,12 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content="",
             task_type="plan",  # Not implement
-            based_on="gza-16",
+            based_on="gza-000016",
         )
 
         # Verify no default prompt was added for plan type
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-16" not in editor_content[0]
+        assert "Implement plan from task #gza-000016" not in editor_content[0]
 
         # Verify empty result since editor was "empty"
         assert result is None
@@ -1495,7 +1496,7 @@ class TestEditPromptDefaultContent:
         result = edit_prompt(
             initial_content=custom_content,
             task_type="implement",
-            based_on="gza-16",
+            based_on="gza-000016",
         )
 
         # Verify custom content is present, not the default
@@ -1772,13 +1773,13 @@ class TestFailureReasonTracking:
         assert version == SCHEMA_VERSION
 
         # Verify existing failed task was backfilled with 'UNKNOWN'
-        failed_task = store.get("gza-1")
+        failed_task = store.get("gza-000001")
         assert failed_task is not None
         assert failed_task.status == "failed"
         assert failed_task.failure_reason == "UNKNOWN"
 
         # Verify pending task was NOT backfilled
-        pending_task = store.get("gza-2")
+        pending_task = store.get("gza-000002")
         assert pending_task is not None
         assert pending_task.status == "pending"
         assert pending_task.failure_reason is None
@@ -1946,7 +1947,7 @@ class TestDiffStats:
         assert version == SCHEMA_VERSION
 
         # Verify existing task has NULL diff stats
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.diff_files_changed is None
         assert task.diff_lines_added is None
@@ -2029,7 +2030,7 @@ class TestReviewClearedAt:
         assert version == SCHEMA_VERSION
 
         # Verify existing task can be retrieved with NULL review_cleared_at
-        task = store.get("gza-1")
+        task = store.get("gza-000001")
         assert task is not None
         assert task.review_cleared_at is None
 
@@ -2589,7 +2590,7 @@ class TestStepColumnsMigration:
         conn.close()
         assert version == SCHEMA_VERSION
 
-        migrated = store.get("gza-1")
+        migrated = store.get("gza-000001")
         assert migrated is not None
         assert migrated.num_steps_reported == 4
         assert migrated.num_steps_computed == 3
@@ -2909,7 +2910,7 @@ class TestRunStepPersistence:
 
         conn = sqlite3.connect(db_path)
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 'gza-1'").fetchone()[0]
+        value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 'gza-000001'").fetchone()[0]
         conn.close()
 
         assert version == SCHEMA_VERSION
@@ -3557,12 +3558,14 @@ class TestGetBasedOnChildren:
         assert ids == [c1.id, c2.id, c3.id]
 
     def test_chronological_order_across_base36_boundary(self, tmp_path: Path):
-        """Children spanning the single→two-char base36 boundary sort by creation order.
+        """Children spanning the seq=35→36 range sort by creation order.
 
-        seq=35 → '{prefix}-z', seq=36 → '{prefix}-10'. Lexicographically
-        '{prefix}-z' > '{prefix}-10' (since 'z' > '1'), so ORDER BY id ASC would place
-        the 36th child BEFORE the 35th. ORDER BY created_at ASC must be the primary
-        sort to preserve correct chronological order.
+        With fixed-width zero-padded base36 IDs (width 6), the historical
+        single→two-char boundary no longer produces lexicographic surprises:
+        seq=35 → '{prefix}-00000z' and seq=36 → '{prefix}-000010' sort in the
+        expected numeric order as plain strings.  This test remains as a
+        regression guard: if someone ever drops the padding, ordering here
+        would regress.
         """
         store = SqliteTaskStore(tmp_path / "test.db")
 
@@ -3570,18 +3573,18 @@ class TestGetBasedOnChildren:
         for _ in range(8):
             store.add("filler")
 
-        parent = store.add("parent")  # seq=9 → '{prefix}-9'
+        parent = store.add("parent")  # seq=9 → '{prefix}-000009'
         assert parent.id is not None
         prefix = parent.id.rsplit("-", 1)[0]
-        assert parent.id == f"{prefix}-9", f"expected seq-9 parent, got {parent.id}"
+        assert parent.id == f"{prefix}-000009", f"expected seq-9 parent, got {parent.id}"
 
-        # Create 27 children: seq 10('a')…35('z') then seq 36('10')
-        # These span the single-char/two-char base36 boundary at seq=36.
+        # Create 27 children: seq 10…36 — crosses the seq=35→36 range where
+        # unpadded encoding would flip from 'z' (1 char) to '10' (2 chars).
         children = [store.add(f"child {i}", based_on=parent.id) for i in range(27)]
 
-        # Verify the boundary task IDs are what we expect
-        assert children[25].id == f"{prefix}-z", f"expected {prefix}-z, got {children[25].id}"
-        assert children[26].id == f"{prefix}-10", f"expected {prefix}-10, got {children[26].id}"
+        # Verify the boundary task IDs are zero-padded to width 6
+        assert children[25].id == f"{prefix}-00000z", f"expected {prefix}-00000z, got {children[25].id}"
+        assert children[26].id == f"{prefix}-000010", f"expected {prefix}-000010, got {children[26].id}"
 
         result = store.get_based_on_children(parent.id)
         assert [t.id for t in result] == [t.id for t in children], (
@@ -3589,30 +3592,28 @@ class TestGetBasedOnChildren:
         )
 
     def test_identical_timestamps_do_not_invert_via_id_lexicographic_sort(self, tmp_path: Path):
-        """With identical created_at, tasks with shorter base36 IDs must not sort after longer ones.
+        """With identical created_at, ordering must not invert at the seq=35→36 range.
 
-        ID ``{prefix}-9`` (seq 9) and ``{prefix}-a`` (seq 10) have the same length, but
-        ID ``{prefix}-z`` (seq 35) and ``{prefix}-10`` (seq 36) span the single-to-two-char
-        base36 boundary.  With ``ORDER BY created_at ASC, id ASC`` the lexicographic ``id``
-        tie-breaker would put ``{prefix}-10`` (two chars) *before* ``{prefix}-z`` (one char)
-        because ``"1" < "z"``.  Since we removed ``id`` from the ORDER BY, the two tasks
-        are returned in SQLite row-insertion order (which is creation order).
+        With fixed-width padding, ``{prefix}-00000z`` < ``{prefix}-000010`` lexicographically,
+        matching numeric order — so string-sort tie-breakers would also produce
+        correct ordering.  This test retains the created_at-based tie-break path to
+        guard against regressions if padding is ever dropped.
         """
         store = SqliteTaskStore(tmp_path / "test.db")
 
-        # Advance sequence so the next two tasks land at seq=35 ('z') and seq=36 ('10')
+        # Advance sequence so the next two tasks land at seq=35 and seq=36
         for _ in range(34):
             store.add("filler")
 
-        parent = store.add("parent")  # seq=35 → '{prefix}-z'
+        parent = store.add("parent")  # seq=35 → '{prefix}-00000z'
         assert parent.id is not None
         prefix = parent.id.rsplit("-", 1)[0]
 
-        earlier = store.add("earlier child", based_on=parent.id)  # seq=36 → '{prefix}-10'
-        later = store.add("later child", based_on=parent.id)      # seq=37 → '{prefix}-11'
+        earlier = store.add("earlier child", based_on=parent.id)  # seq=36 → '{prefix}-000010'
+        later = store.add("later child", based_on=parent.id)      # seq=37 → '{prefix}-000011'
 
-        assert earlier.id == f"{prefix}-10", f"expected {prefix}-10, got {earlier.id}"
-        assert later.id == f"{prefix}-11", f"expected {prefix}-11, got {later.id}"
+        assert earlier.id == f"{prefix}-000010", f"expected {prefix}-000010, got {earlier.id}"
+        assert later.id == f"{prefix}-000011", f"expected {prefix}-000011, got {later.id}"
 
         # Force identical created_at on both children — this triggers the tie-breaker scenario
         shared_ts = earlier.created_at
@@ -3621,7 +3622,7 @@ class TestGetBasedOnChildren:
 
         result = store.get_based_on_children(parent.id)
         result_ids = [t.id for t in result]
-        # Insertion order: earlier ({prefix}-10) before later ({prefix}-11)
+        # Insertion order: earlier ({prefix}-000010) before later ({prefix}-000011)
         assert result_ids == [earlier.id, later.id], (
             f"expected [{earlier.id}, {later.id}] but got {result_ids} — "
             "id ASC lexicographic tie-break may have incorrectly sorted the results"
@@ -3631,17 +3632,20 @@ class TestGetBasedOnChildren:
 class TestGetHistoryOrderByBase36Boundary:
     """Regression tests for get_history ORDER BY correctness with TEXT IDs.
 
-    With INTEGER PKs, ORDER BY id DESC gave chronological order. With TEXT IDs
-    (base36), lexicographic ORDER BY id DESC breaks at boundaries (e.g. 'z' > '10'
-    even though seq 36 > seq 35). The fix uses created_at DESC as the tie-breaker.
+    With INTEGER PKs, ORDER BY id DESC gave chronological order.  With
+    fixed-width zero-padded TEXT IDs (e.g. ``gza-00000z`` vs ``gza-000010``),
+    lexicographic order matches numeric order, so ORDER BY id DESC is correct
+    again.  We still prefer created_at DESC as the primary sort so this test
+    guards against regressions if padding is ever dropped.
     """
 
     def test_history_orders_by_created_at_when_completed_at_tied(self, tmp_path: Path):
         """get_history uses created_at DESC as tie-breaker when completed_at values match.
 
-        '{prefix}-10' (decimal 36) must sort AFTER '{prefix}-z' (decimal 35) in
-        descending order, because it was created later. With buggy ORDER BY id DESC,
-        'gza-z' > 'gza-10' lexicographically, so task_z would incorrectly come first.
+        ``{prefix}-000010`` (decimal 36) must sort AFTER ``{prefix}-00000z`` (decimal 35)
+        in descending order, because it was created later.  With fixed-width padding,
+        ``000010`` > ``00000z`` lexicographically too, so both ordering strategies
+        agree — but this test ensures created_at remains authoritative.
         """
         store = SqliteTaskStore(tmp_path / "test.db")
 
@@ -3649,13 +3653,13 @@ class TestGetHistoryOrderByBase36Boundary:
         for _ in range(34):
             store.add("filler")
 
-        task_z = store.add("task at boundary z")   # seq=35 → '{prefix}-z'
-        task_10 = store.add("task at boundary 10") # seq=36 → '{prefix}-10'
+        task_z = store.add("task at boundary z")   # seq=35 → '{prefix}-00000z'
+        task_10 = store.add("task at boundary 10") # seq=36 → '{prefix}-000010'
 
         assert task_z.id is not None and task_10.id is not None
         prefix = task_z.id.rsplit("-", 1)[0]
-        assert task_z.id == f"{prefix}-z", f"expected {prefix}-z, got {task_z.id}"
-        assert task_10.id == f"{prefix}-10", f"expected {prefix}-10, got {task_10.id}"
+        assert task_z.id == f"{prefix}-00000z", f"expected {prefix}-00000z, got {task_z.id}"
+        assert task_10.id == f"{prefix}-000010", f"expected {prefix}-000010, got {task_10.id}"
 
         # Complete both with the SAME completed_at so created_at is the tie-breaker
         same_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -3918,29 +3922,32 @@ class TestResolveTaskId:
     @pytest.mark.parametrize(
         "arg, expected",
         [
-            # Full prefixed ID — returned as-is regardless of content
+            # Full prefixed ID — returned as-is regardless of content or suffix width.
+            # These are the only cases where the suffix passes through unchanged; the
+            # caller is trusted to have supplied a canonical ID.
             ("gza-3f", "gza-3f"),
-            ("gza-1", "gza-1"),
+            ("gza-000001", "gza-000001"),
             ("gza-z", "gza-z"),
             ("gza-10", "gza-10"),
-            # Bare decimal integer → legacy pre-migration ID → base36 conversion
-            # base36(42) = "16" (1*36 + 6 = 42)
-            ("42", "gza-16"),
-            # base36(1) = "1"
-            ("1", "gza-1"),
-            # Bare base36 suffix — prepend prefix (only when the string contains a
-            # non-digit character; all-digit strings are treated as legacy decimal integers)
-            ("3f", "gza-3f"),
-            ("z", "gza-z"),
-            # "10" is all-digit → decimal 10 → base36("10") = "a", NOT the suffix "10"
-            ("10", "gza-a"),
+            # Bare decimal integer → legacy pre-migration ID → base36 conversion → pad
+            # base36(42) = "16" (1*36 + 6 = 42) → padded to "000016"
+            ("42", "gza-000016"),
+            # base36(1) = "1" → padded to "000001"
+            ("1", "gza-000001"),
+            # Bare base36 suffix — left-padded to canonical width and prefixed.
+            # Only strings that contain at least one non-digit character go through
+            # the bare-suffix path; all-digit strings are treated as legacy decimal.
+            ("3f", "gza-00003f"),
+            ("z", "gza-00000z"),
+            # "10" is all-digit → decimal 10 → base36(10) = "a" → padded to "00000a"
+            ("10", "gza-00000a"),
             # All-alpha suffix is NOT treated as decimal — goes to bare-suffix path
-            ("abc", "gza-abc"),
-            # "0" — isdigit() is True but int("0") > 0 is False → bare-suffix path
-            ("0", "gza-0"),
+            ("abc", "gza-000abc"),
+            # "0" — isdigit() is True but int("0") > 0 is False → bare-suffix path → pad
+            ("0", "gza-000000"),
             # Whitespace padding — stripped before processing
-            ("  42  ", "gza-16"),
-            (" 3f ", "gza-3f"),
+            ("  42  ", "gza-000016"),
+            (" 3f ", "gza-00003f"),
             (" gza-3f ", "gza-3f"),
         ],
     )
@@ -3957,15 +3964,16 @@ class TestResolveTaskId:
 
     def test_custom_prefix(self) -> None:
         """resolve_task_id uses the supplied prefix, not a hard-coded one."""
-        assert resolve_task_id("3f", "myapp") == "myapp-3f"
-        assert resolve_task_id("42", "myapp") == "myapp-16"
+        assert resolve_task_id("3f", "myapp") == "myapp-00003f"
+        assert resolve_task_id("42", "myapp") == "myapp-000016"
         assert resolve_task_id("myapp-3f", "myapp") == "myapp-3f"
 
     def test_bare_decimal_base36_encoding(self) -> None:
-        """Decimal integers are converted to base36, not kept as decimal strings."""
-        # 35 → 'z', 36 → '10' in base36 — exercises the boundary
-        assert resolve_task_id("35", self.PREFIX) == "gza-z"
-        assert resolve_task_id("36", self.PREFIX) == "gza-10"
+        """Decimal integers are converted to base36 and zero-padded to canonical width."""
+        # 35 → 'z' → '00000z', 36 → '10' → '000010' — exercises the boundary where
+        # the encoding advances from 1 to 2 chars before padding fills the rest.
+        assert resolve_task_id("35", self.PREFIX) == "gza-00000z"
+        assert resolve_task_id("36", self.PREFIX) == "gza-000010"
 
 
 def _make_v24_db(db_path: "Path") -> None:
@@ -4083,13 +4091,52 @@ class TestMigrationUtilityFunctions:
         preview = preview_v25_migration(db_path, "gza")
 
         assert preview["task_count"] == 3
-        # base36(1)="1", base36(2)="2", base36(3)="3"
-        assert ("gza-1", "gza-1") not in preview["samples"]  # samples are (old_int, new_str)
-        assert preview["samples"][0] == (1, "gza-1")
-        assert preview["samples"][1] == (2, "gza-2")
-        assert preview["samples"][2] == (3, "gza-3")
-        # First post-migration ID = base36(3+1) = "4"
-        assert preview["first_post_migration_id"] == "gza-4"
+        # base36 encodings are zero-padded to width 6 for fixed-width sort order.
+        # Samples are (old_int, new_str) tuples — assert structure, not just strings.
+        assert ("gza-000001", "gza-000001") not in preview["samples"]
+        assert preview["samples"][0] == (1, "gza-000001")
+        assert preview["samples"][1] == (2, "gza-000002")
+        assert preview["samples"][2] == (3, "gza-000003")
+        # Only 3 tasks, all consumed by the first-samples path → no random tail to sample
+        assert preview["random_samples"] == []
+        # First post-migration ID = base36(3+1) = "4" → padded "000004"
+        assert preview["first_post_migration_id"] == "gza-000004"
+
+    def test_preview_v25_migration_includes_random_tail_samples(self, tmp_path: Path) -> None:
+        """preview_v25_migration returns up to N random samples from IDs beyond the first N."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        # Insert 50 tasks so there's a meaningful tail beyond the first 10
+        conn = sqlite3.connect(db_path)
+        for i in range(50):
+            conn.execute(
+                "INSERT INTO tasks (prompt, created_at) VALUES (?, ?)",
+                (f"Task {i + 1}", "2024-01-01T00:00:00+00:00"),
+            )
+        conn.commit()
+        conn.close()
+
+        preview = preview_v25_migration(db_path, "gza", sample_limit=10, random_sample_limit=10)
+
+        assert preview["task_count"] == 50
+        assert len(preview["samples"]) == 10
+        # First samples are sequential from id=1
+        assert preview["samples"][0] == (1, "gza-000001")
+        assert preview["samples"][9] == (10, "gza-00000a")
+
+        # Random samples: exactly 10, all drawn from IDs > 10, all well-formed
+        assert len(preview["random_samples"]) == 10
+        for old_id, new_id in preview["random_samples"]:
+            assert old_id > 10, f"random sample id {old_id} should be > first_limit (10)"
+            assert old_id <= 50
+            assert new_id == f"gza-{_encode_base36(old_id)}"
+        # No overlap between first and random samples
+        first_ids = {old for old, _ in preview["samples"]}
+        random_ids = {old for old, _ in preview["random_samples"]}
+        assert first_ids.isdisjoint(random_ids)
 
     def test_preview_v25_migration_on_already_migrated_db(self, tmp_path: Path) -> None:
         """preview_v25_migration on an already-v25 DB returns empty samples."""
@@ -4101,6 +4148,7 @@ class TestMigrationUtilityFunctions:
 
         # Already migrated: no integer IDs to convert
         assert preview["samples"] == []
+        assert preview["random_samples"] == []
         assert preview["first_post_migration_id"] == ""
 
     def test_run_v25_migration_idempotent(self, tmp_path: Path) -> None:
@@ -4137,10 +4185,10 @@ class TestMigrationUtilityFunctions:
         run_v25_migration(db_path, "gza")
         store = SqliteTaskStore(db_path)
 
-        parent = store.get("gza-1")
-        child = store.get("gza-2")
+        parent = store.get("gza-000001")
+        child = store.get("gza-000002")
         assert parent is not None
         assert child is not None
-        # FK columns must be base36-converted, not the old integer strings
-        assert child.based_on == "gza-1"
-        assert child.depends_on == "gza-1"
+        # FK columns must be base36-converted AND zero-padded to canonical width
+        assert child.based_on == "gza-000001"
+        assert child.depends_on == "gza-000001"
