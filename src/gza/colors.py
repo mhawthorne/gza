@@ -354,7 +354,7 @@ _THEME_MINIMAL = Theme(
         "success": green_success,
         "error": red_error,
         "warning": yellow_warning,
-        "heading": bold_cyan_heading,
+        # "heading": bold_cyan_heading,
         # "task_type": magenta_tool,
     },
     advance={

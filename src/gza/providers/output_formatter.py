@@ -50,7 +50,13 @@ class StreamOutputFormatter:
         *,
         blank_line_before: bool = False,
     ) -> None:
-        """Print a standardized, colorized step header line."""
+        """Print a standardized, colorized step header line.
+
+        Rich's auto-highlighter is disabled for this line so the whole header
+        renders in a single ``step_header`` color. Otherwise the Rich theme's
+        ``repr.number`` / ``repr.str`` rules would recolor the digits and
+        currency fragments, producing a partially colored header.
+        """
         if blank_line_before:
             self.console.print()
         token_str = format_token_count(total_tokens)
@@ -58,6 +64,7 @@ class StreamOutputFormatter:
         self.console.print(
             f"| Step {step_num} | {token_str} | ${cost_usd:.2f} | {runtime_str} |",
             style=self.styles.step_header,
+            highlight=False,
         )
 
     def print_turn_header(

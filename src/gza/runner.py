@@ -12,8 +12,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import gza.colors as _colors
+
 from .branch_naming import generate_branch_name
-from .colors import UNMERGED_COLORS_DICT
 from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
@@ -23,7 +24,7 @@ from .config import (
     BranchStrategy,
     Config,
 )
-from .console import console, error_message, info_line, next_steps, stats_line, success_message, task_header
+from .console import console, error_message, task_footer, task_header
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
@@ -265,10 +266,6 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
             dest.close()
     finally:
         source.close()
-
-
-# format_duration logic is now in console.stats_line
-# stats_line function is now imported from console module
 
 
 def load_dotenv(project_dir: Path) -> None:
@@ -1389,7 +1386,8 @@ def run(
     console.print(f"Verifying {provider.name} credentials...")
     if not provider.verify_credentials(task_config):
         return 1
-    console.print("[green]Credentials verified ✓[/green]")
+    rc = _colors.RUNNER_COLORS
+    console.print(f"[{rc.success}]Credentials verified ✓[/{rc.success}]")
 
     # Setup git on the main repo (for worktree operations)
     git = Git(config.project_dir)
@@ -1419,7 +1417,12 @@ def run(
             explicit_type=task.task_type_hint,
         )
 
-    task_header(task.prompt, task.slug or "", task.task_type)
+    task_header(
+        task.prompt,
+        str(task.id) if task.id is not None else "",
+        task.task_type,
+        slug=task.slug,
+    )
 
     return _run_inner(task, task_config, config, store, provider, git, resume=resume, open_after=open_after)
 
@@ -1436,7 +1439,7 @@ def _resolve_code_task_branch_name(
     if resume and task.branch:
         # Resume uses the existing branch from the failed task
         branch_name = task.branch
-        console.print(f"    Resuming on existing branch: [blue]{branch_name}[/blue]")
+        console.print(f"Resuming on existing branch: [blue]{branch_name}[/blue]")
         return branch_name
 
     if resume:
@@ -1451,7 +1454,7 @@ def _resolve_code_task_branch_name(
             default_type=config.branch_strategy.default_type,
             explicit_type=task.task_type_hint,
         )
-        console.print(f"    Resuming on branch: [blue]{branch_name}[/blue]")
+        console.print(f"Resuming on branch: [blue]{branch_name}[/blue]")
         return branch_name
 
     if task.same_branch:
@@ -1473,10 +1476,10 @@ def _resolve_code_task_branch_name(
                 if visited_ids:
                     via = " -> ".join(f"#{i}" for i in visited_ids)
                     console.print(
-                        f"    Using branch from task #{current.id} (via {via}): [blue]{resolved_branch}[/blue]"
+                        f"Using branch from task #{current.id} (via {via}): [blue]{resolved_branch}[/blue]"
                     )
                 else:
-                    console.print(f"    Using existing branch from task #{current.id}: [blue]{resolved_branch}[/blue]")
+                    console.print(f"Using existing branch from task #{current.id}: [blue]{resolved_branch}[/blue]")
                 break
             seen_ids.add(current.id)
             visited_ids.append(current.id)
@@ -1624,14 +1627,13 @@ def _complete_code_task(
             if commits_ahead == 0:
                 # No uncommitted changes and no commits on branch - real failure
                 # Note: No need to save WIP here since there are no changes
-                error_message("No changes made")
-                stats_line(stats, has_commits=False)
-                console.print(f"Task ID: {task.id}")
-                next_steps([
-                    (f"gza retry {task.id}", "retry from scratch"),
-                    (f"gza resume {task.id}", "resume from where it left off"),
-                ])
                 failure_reason = extract_failure_reason(log_file)
+                task_footer(
+                    task,
+                    stats,
+                    status="No changes made",
+                    branch=branch_name,
+                )
                 write_log_entry(
                     log_file,
                     {
@@ -1772,28 +1774,14 @@ def _complete_code_task(
         worktree_git.push_force_with_lease(branch_name)
 
     console.print("")
-    success_message("Done")
-    stats_line(stats, has_commits=True)
-    console.print(f"Task ID: {task.id}")
-    console.print(f"Branch: [blue]{branch_name}[/blue]")
-    next_steps([
-        (f"gza merge {task.id}", "merge branch for task"),
-        (f"gza pr {task.id}", "create a PR"),
-    ])
-    if auto_learnings:
-        info_line(
-            "Learnings",
-            f"updated from {auto_learnings.tasks_used} tasks "
-            f"({auto_learnings.path.relative_to(config.project_dir)}) "
-            f"+{auto_learnings.added_count}/-{auto_learnings.removed_count}/={auto_learnings.retained_count} "
-            f"churn {auto_learnings.churn_percent:.1f}%"
-        )
-    console.print("")
-    console.print("To review changes:")
-    console.print(f"  [cyan]git diff {default_branch}...{branch_name} --[/cyan]")
-    console.print("")
-    console.print("To merge:")
-    console.print(f"  [cyan]gza merge {task.id}[/cyan]  [dim]# or: git merge --squash {branch_name}[/dim]")
+    task_footer(
+        task,
+        stats,
+        status="Done",
+        branch=branch_name,
+        learnings=auto_learnings,
+        store=store,
+    )
 
     # Auto-create and run review task if requested
     if task.create_review:
@@ -1947,13 +1935,13 @@ def _run_inner(
         if result.error_type in ("max_turns", "max_steps"):
             # Save WIP changes before marking failed
             _save_wip_changes(task, worktree_git, config, branch_name)
-            error_message(f"Task failed: max steps of {task_config.max_steps} exceeded")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: max steps of {task_config.max_steps} exceeded",
+                branch=branch_name,
+                store=store,
+            )
             # Check log for agent-written marker; prefer MAX_STEPS for provider-detected over-budget failures.
             detected = extract_failure_reason(log_file)
             failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
@@ -1964,13 +1952,13 @@ def _run_inner(
         elif exit_code == 124:
             # Save WIP changes before marking failed
             _save_wip_changes(task, worktree_git, config, branch_name)
-            error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: {provider.name} timed out after {config.timeout_minutes} minutes",
+                branch=branch_name,
+                store=store,
+            )
             detected = extract_failure_reason(log_file)
             failure_reason = detected if detected != "UNKNOWN" else "TIMEOUT"
             write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
@@ -1980,13 +1968,13 @@ def _run_inner(
         elif exit_code != 0:
             # Save WIP changes before marking failed
             _save_wip_changes(task, worktree_git, config, branch_name)
-            error_message(f"Task failed: {provider.name} exited with code {exit_code}")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: {provider.name} exited with code {exit_code}",
+                branch=branch_name,
+                store=store,
+            )
             failure_reason = extract_failure_reason(log_file)
             write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (exit_code={exit_code})", "exit_code": exit_code, "failure_reason": failure_reason})
             write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
@@ -2042,7 +2030,7 @@ def _run_non_code_task(
         open_after: If True, open the report file in $EDITOR after completion
     """
     if resume and task.session_id:
-        console.print(f"    Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
+        console.print(f"Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
 
     # Setup logging
     config.log_path.mkdir(parents=True, exist_ok=True)
@@ -2060,14 +2048,6 @@ def _run_non_code_task(
     assert report_path is not None, f"Non-code task type '{task.task_type}' must have a report path"
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    task_type_display_map = {
-        "explore": "Exploration",
-        "plan": "Plan",
-        "review": "Review",
-        "internal": "Internal",
-        "learn": "Internal",
-    }
-    task_type_display = task_type_display_map.get(task.task_type, "Report")
     report_file_relative = str(report_path.relative_to(config.project_dir))
 
     # Create worktree in /tmp for Docker compatibility on macOS
@@ -2185,14 +2165,13 @@ def _run_non_code_task(
 
         # Handle failures - check error_type first, then exit codes
         if result.error_type in ("max_turns", "max_steps"):
-            error_message(f"Task failed: max steps of {config.max_steps} exceeded")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            console.print(f"Worktree preserved for inspection: {worktree_path}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: max steps of {config.max_steps} exceeded",
+                worktree=worktree_path,
+                store=store,
+            )
             detected = extract_failure_reason(log_file)
             failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
             write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": failure_reason})
@@ -2200,28 +2179,26 @@ def _run_non_code_task(
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
         elif exit_code == 124:
-            error_message(f"Task failed: {provider.name} timed out after {config.timeout_minutes} minutes")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            console.print(f"Worktree preserved for inspection: {worktree_path}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: {provider.name} timed out after {config.timeout_minutes} minutes",
+                worktree=worktree_path,
+                store=store,
+            )
             failure_reason = extract_failure_reason(log_file)
             write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
             write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
         elif exit_code != 0:
-            error_message(f"Task failed: {provider.name} exited with code {exit_code}")
-            stats_line(stats, has_commits=False)
-            console.print(f"Task ID: {task.id}")
-            console.print(f"Worktree preserved for inspection: {worktree_path}")
-            next_steps([
-                (f"gza retry {task.id}", "retry from scratch"),
-                (f"gza resume {task.id}", "resume from where it left off"),
-            ])
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: {provider.name} exited with code {exit_code}",
+                worktree=worktree_path,
+                store=store,
+            )
             failure_reason = extract_failure_reason(log_file)
             write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (exit_code={exit_code})", "exit_code": exit_code, "failure_reason": failure_reason})
             write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
@@ -2263,15 +2240,20 @@ def _run_non_code_task(
                 failure_message = (
                     f"Outcome: failed (missing report artifact: expected {expected_relative}{mismatch_note})"
                 )
-                error_message("Task failed: expected report artifact was not created")
                 console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
-                console.print(f"Worktree preserved for inspection: {worktree_path}")
                 if stale_candidates:
                     console.print(
                         "Detected report files with other names in worktree "
                         f"(possible stale resume session state): {', '.join(str(p) for p in stale_candidates)}"
                     )
                 console.print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
+                task_footer(
+                    task,
+                    stats,
+                    status="Failed: expected report artifact was not created",
+                    worktree=worktree_path,
+                    store=store,
+                )
                 write_log_entry(
                     log_file,
                     {
@@ -2347,37 +2329,20 @@ def _run_non_code_task(
             if impl_task:
                 post_review_to_pr(task, impl_task, store, config.project_dir, required=False)
 
-        console.print("")
-        success_message(f"{task_type_display} Complete")
-        stats_line(stats, has_commits=False)
-        console.print(f"Task ID: {task.id}")
-        console.print(f"Report: {report_file_relative}")
+        verdict: str | None = None
         if task.task_type == "review":
             verdict = _extract_review_verdict(output_content)
-            if verdict:
-                _verdict_key = {"APPROVED": "review_approved", "CHANGES_REQUESTED": "review_changes", "NEEDS_DISCUSSION": "review_discussion"}.get(verdict)
-                verdict_color = UNMERGED_COLORS_DICT.get(_verdict_key, "white") if _verdict_key else "white"
-                console.print(f"Verdict: [{verdict_color}]{verdict}[/{verdict_color}]")
+
         console.print("")
-
-        if task.task_type == "explore":
-            console.print("To implement based on this exploration, add a task with:")
-            console.print(f"  [cyan]gza add --based-on {task.id}[/cyan]")
-        elif task.task_type == "plan":
-            console.print("To implement this plan, run:")
-            console.print(f"  [cyan]gza implement {task.id}[/cyan]")
-        elif task.task_type == "review" and task.depends_on:
-            console.print("To address review feedback, run:")
-            console.print(f"  [cyan]gza improve {task.depends_on}[/cyan]")
-
-        if auto_learnings:
-            info_line(
-                "Learnings",
-                f"updated from {auto_learnings.tasks_used} tasks "
-                f"({auto_learnings.path.relative_to(config.project_dir)}) "
-                f"+{auto_learnings.added_count}/-{auto_learnings.removed_count}/={auto_learnings.retained_count} "
-                f"churn {auto_learnings.churn_percent:.1f}%"
-            )
+        task_footer(
+            task,
+            stats,
+            status="Done",
+            report=report_file_relative,
+            verdict=verdict,
+            learnings=auto_learnings,
+            store=store,
+        )
 
         # Open review file in $EDITOR if requested
         if open_after and task.task_type == "review" and report_path.exists():

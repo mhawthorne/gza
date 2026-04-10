@@ -273,6 +273,67 @@ class TestSharedStreamOutputFormatter:
         assert "| Step 2 | 1k tokens | $0.12 | 1m 5s |" in plain
         assert "\x1b[" in rendered
 
+    def test_step_header_disables_auto_highlighter(self):
+        """Step headers must not be recolored by Rich's repr.* highlighter.
+
+        Regression: ``repr.number`` / ``repr.str`` rules in the active Rich
+        theme used to apply to digits and currency fragments mid-line, leaving
+        the header partially recolored. ``highlight=False`` on the step-header
+        print suppresses the auto-highlighter for this line only; other
+        formatter output (agent messages, tool events) still runs through it.
+        """
+        from rich.theme import Theme as RichTheme
+
+        # Rich theme with a loud, distinctive color on ``repr.number``. If the
+        # auto-highlighter runs, the digits in the step header will be emitted
+        # in this color and it'll show up in the rendered ANSI bytes.
+        rich_theme = RichTheme({"repr.number": "bright_red"})
+        output = io.StringIO()
+        console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            theme=rich_theme,
+        )
+        formatter = StreamOutputFormatter(console=console)
+
+        formatter.print_step_header(2, 1500, 0.1234, 65)
+
+        rendered = output.getvalue()
+
+        # bright_red = ANSI 91 (or a truecolor equivalent for bright red).
+        # The cleanest signal is that the step header line renders as a single
+        # contiguous style run — i.e. no style switches between characters of
+        # "| Step 2 | 1k tokens | $0.12 | 1m 5s |". Grab the style runs and
+        # confirm only one distinct non-reset style appears.
+        style_runs = re.findall(r"\x1b\[[0-9;]*m", rendered)
+        non_reset_runs = {run for run in style_runs if run not in ("\x1b[0m",)}
+        assert len(non_reset_runs) == 1, (
+            f"step header should render in a single style run, got {non_reset_runs!r} "
+            f"in {rendered!r}"
+        )
+
+    def test_non_header_lines_still_use_highlighter(self):
+        """Only step headers disable the highlighter; other lines keep it.
+
+        This guards against someone copy-pasting ``highlight=False`` onto every
+        formatter method. Agent messages, tool events, errors, and todos should
+        still go through the normal Rich path so the active theme's repr.*
+        styles can apply to numbers/paths/URLs in those lines.
+        """
+        from inspect import signature
+
+        # The signature of ``print_step_header`` should be the only place in
+        # StreamOutputFormatter that explicitly passes highlight=False — other
+        # methods rely on Console's default behavior.
+        import gza.providers.output_formatter as mod
+        src = Path(mod.__file__).read_text()
+        # There should be exactly one ``highlight=False`` in the formatter.
+        assert src.count("highlight=False") == 1, (
+            "Expected exactly one highlight=False (in print_step_header); "
+            "other formatter methods should retain the auto-highlighter."
+        )
+
     def test_turn_header_is_alias_for_step_header(self):
         """print_turn_header should produce the same output as print_step_header."""
         output1 = io.StringIO()
