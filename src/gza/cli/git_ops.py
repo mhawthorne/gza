@@ -62,7 +62,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         task_id = resolve_id(config, args.task_id)
         task = store.get(task_id)
         if task is None:
-            console.print(f"[red]Error: Task #{task_id} not found[/red]")
+            console.print(f"[red]Error: Task {task_id} not found[/red]")
             return 1
         tasks_to_refresh = [task]
     else:
@@ -79,11 +79,11 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     skipped = 0
     for task in tasks_to_refresh:
         if not task.branch:
-            console.print(f"[dim]#{task.id}: no branch, skipping[/dim]")
+            console.print(f"[dim]{task.id}: no branch, skipping[/dim]")
             skipped += 1
             continue
         if not git.branch_exists(task.branch):
-            console.print(f"[dim]#{task.id} {task.branch}: branch no longer exists, skipping[/dim]")
+            console.print(f"[dim]{task.id} {task.branch}: branch no longer exists, skipping[/dim]")
             skipped += 1
             continue
         revision_range = f"{default_branch}...{task.branch}"
@@ -91,7 +91,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         files_changed, lines_added, lines_removed = parse_diff_numstat(numstat_output)
         assert task.id is not None
         store.update_diff_stats(task.id, files_changed, lines_added, lines_removed)
-        console.print(f"#{task.id} {task.branch}: +{lines_added} -{lines_removed} in {files_changed} files")
+        console.print(f"{task.id} {task.branch}: +{lines_added} -{lines_removed} in {files_changed} files")
         refreshed += 1
 
     print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
@@ -110,16 +110,16 @@ def _merge_single_task(
     # Get the task
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     # Validate task state
     if task.status not in ("completed", "unmerged"):
-        print(f"Error: Task #{task.id} is not completed or unmerged (status: {task.status})")
+        print(f"Error: Task {task.id} is not completed or unmerged (status: {task.status})")
         return 1
 
     if not task.branch:
-        print(f"Error: Task #{task.id} has no branch")
+        print(f"Error: Task {task.id} has no branch")
         return 1
 
     # Handle --mark-only flag
@@ -130,7 +130,7 @@ def _merge_single_task(
             return 1
 
         store.set_merge_status(task.id, "merged")
-        print(f"✓ Marked task #{task.id} as merged (branch '{task.branch}' preserved)")
+        print(f"✓ Marked task {task.id} as merged (branch '{task.branch}' preserved)")
         return 0
 
     # Check if branch already merged
@@ -315,7 +315,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     # Merge each task in sequence
     for task_id in task_ids:
         if use_all:
-            print(f"Merging task #{task_id}...")
+            print(f"Merging task {task_id}...")
         result = _merge_single_task(task_id, config, store, git, args, current_branch)
 
         if result != 0:
@@ -329,12 +329,12 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     # Report results
     if merged_tasks:
-        print(f"\n✓ Successfully merged {len(merged_tasks)} task(s): {', '.join(f'#{tid}' for tid in merged_tasks)}")
+        print(f"\n✓ Successfully merged {len(merged_tasks)} task(s): {', '.join(str(tid) for tid in merged_tasks)}")
 
     if failed_task_id is not None:
         remaining = [tid for tid in task_ids if tid not in merged_tasks and tid != failed_task_id]
         if remaining:
-            print(f"⚠ Stopped at task #{failed_task_id}. Remaining tasks not processed: {', '.join(f'#{tid}' for tid in remaining)}")
+            print(f"⚠ Stopped at task {failed_task_id}. Remaining tasks not processed: {', '.join(str(tid) for tid in remaining)}")
         return 1
 
     return 0
@@ -465,7 +465,7 @@ def invoke_provider_resolve(
     provider = get_provider(resolve_config)
     store = get_store(config)
     task_id_label = getattr(task, "id", None)
-    task_ref = f"#{task_id_label}" if task_id_label is not None else "<unknown>"
+    task_ref = f"{task_id_label}" if task_id_label is not None else "<unknown>"
 
     if worktree_path is not None:
         # New worktree-based flow: fresh rebase, no --continue needed.
@@ -533,10 +533,10 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         store = get_store(config)
         task = store.get(task_id)
         if not task:
-            print(f"Error: Task #{task_id} not found")
+            print(f"Error: Task {task_id} not found")
             return 1
         if not task.branch:
-            print(f"Error: Task #{task_id} has no branch")
+            print(f"Error: Task {task_id} has no branch")
             return 1
         git = Git(config.project_dir)
         target = getattr(args, 'onto', None) or git.default_branch()
@@ -552,16 +552,16 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     # Get the task
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     # Validate task state
     if task.status not in ("completed", "unmerged", "running"):
-        print(f"Error: Task #{task.id} is not completed, unmerged, or running (status: {task.status})")
+        print(f"Error: Task {task.id} is not completed, unmerged, or running (status: {task.status})")
         return 1
 
     if not task.branch:
-        print(f"Error: Task #{task.id} has no branch")
+        print(f"Error: Task {task.id} has no branch")
         return 1
 
     # Check if branch exists
@@ -587,7 +587,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     # --force and --resolve are accepted for backward compatibility but are now no-ops:
     # worktrees are always force-cleaned and auto-resolve is always the fallback.
     worktree_path = config.worktree_path / str(task.id)
-    print(f"Rebasing task #{task.id}...")
+    print(f"Rebasing task {task.id}...")
     try:
         # Remove any existing worktree for this branch (may be at a different path).
         stale_path = cleanup_worktree_for_branch(git, task.branch, force=True)
@@ -670,7 +670,7 @@ def cmd_checkout(args: argparse.Namespace) -> int:
         task = store.get(resolved_task_id)
         if task is not None:
             if not task.branch:
-                print(f"Error: Task #{task.id} has no branch")
+                print(f"Error: Task {task.id} has no branch")
                 return 1
             branch = task.branch
         else:
@@ -730,7 +730,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
             # as cmd_checkout does, since the heuristic is intentionally permissive.
             pass
         elif not task.branch:
-            print(f"Error: Task #{task_id} has no branch")
+            print(f"Error: Task {task_id} has no branch")
             return 1
         else:
             # Replace task ID with branch diff range
@@ -841,7 +841,7 @@ def _generate_pr_content(
     except Exception as exc:
         _mark_internal_task_failed_if_nonterminal()
         print(
-            f"Warning: PR description internal task #{internal_task_id} failed: {exc}",
+            f"Warning: PR description internal task {internal_task_id} failed: {exc}",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
@@ -850,7 +850,7 @@ def _generate_pr_content(
     if exit_code != 0 or completed_task is None or completed_task.status != "completed":
         _mark_internal_task_failed_if_nonterminal()
         print(
-            f"Warning: PR description internal task #{internal_task_id} did not complete successfully",
+            f"Warning: PR description internal task {internal_task_id} did not complete successfully",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
@@ -858,7 +858,7 @@ def _generate_pr_content(
     response = (completed_task.output_content or "").strip()
     if not response:
         print(
-            f"Warning: PR description internal task #{internal_task_id} produced no output",
+            f"Warning: PR description internal task {internal_task_id} produced no output",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
@@ -867,7 +867,7 @@ def _generate_pr_content(
     has_body = any(line.strip() == "BODY:" for line in response.splitlines())
     if not (has_title and has_body):
         print(
-            f"Warning: PR description internal task #{internal_task_id} produced malformed output",
+            f"Warning: PR description internal task {internal_task_id} produced malformed output",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
@@ -941,25 +941,25 @@ def cmd_pr(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     # Validate task state
     if task.status not in ("completed", "unmerged"):
-        print(f"Error: Task #{task.id} is not completed (status: {task.status})")
+        print(f"Error: Task {task.id} is not completed (status: {task.status})")
         return 1
 
     if not task.branch:
-        print(f"Error: Task #{task.id} has no branch")
+        print(f"Error: Task {task.id} has no branch")
         return 1
 
     if not task.has_commits:
-        print(f"Error: Task #{task.id} has no commits")
+        print(f"Error: Task {task.id} has no commits")
         return 1
 
     # Check merge_status before requiring gh (local DB check, no external dependencies)
     if task.merge_status == "merged":
-        print(f"Error: Task #{task.id} is already marked as merged")
+        print(f"Error: Task {task.id} is already marked as merged")
         return 1
 
     # Check gh CLI is available (after task validation so tests can run without gh)
@@ -1094,12 +1094,12 @@ def _determine_advance_action(
             if child.status == "in_progress" or child.status == "pending":
                 return {
                     'type': 'skip',
-                    'description': f'SKIP: rebase #{child.id} already in progress',
+                    'description': f'SKIP: rebase {child.id} already in progress',
                 }
             if child.status == "failed":
                 return {
                     'type': 'needs_discussion',
-                    'description': f'SKIP: rebase #{child.id} failed, needs manual resolution',
+                    'description': f'SKIP: rebase {child.id} failed, needs manual resolution',
                 }
         return {
             'type': 'needs_rebase',
@@ -1132,11 +1132,11 @@ def _determine_advance_action(
                     if active_review.status == 'pending':
                         return {
                             'type': 'run_review',
-                            'description': f'Run pending review #{active_review.id} (post-rebase)',
+                            'description': f'Run pending review {active_review.id} (post-rebase)',
                         }
                     return {
                         'type': 'wait_review',
-                        'description': f'SKIP: review #{active_review.id} in progress (post-rebase)',
+                        'description': f'SKIP: review {active_review.id} in progress (post-rebase)',
                     }
                 return {
                     'type': 'create_review',
@@ -1163,12 +1163,12 @@ def _determine_advance_action(
                 if active_review.status == 'pending':
                     return {
                         'type': 'run_review',
-                        'description': f'Spawn worker for pending review #{active_review.id}',
+                        'description': f'Spawn worker for pending review {active_review.id}',
                         'review_task': active_review,
                     }
                 return {
                     'type': 'wait_review',
-                    'description': f'SKIP: review #{active_review.id} is in_progress',
+                    'description': f'SKIP: review {active_review.id} is in_progress',
                     'review_task': active_review,
                 }
 
@@ -1190,13 +1190,13 @@ def _determine_advance_action(
             if latest_review.status == 'pending':
                 return {
                     'type': 'run_review',
-                    'description': f'Spawn worker for pending review #{latest_review.id}',
+                    'description': f'Spawn worker for pending review {latest_review.id}',
                     'review_task': latest_review,
                 }
             if latest_review.status == 'in_progress':
                 return {
                     'type': 'wait_review',
-                    'description': f'SKIP: review #{latest_review.id} is in_progress',
+                    'description': f'SKIP: review {latest_review.id} is in_progress',
                     'review_task': latest_review,
                 }
 
@@ -1222,13 +1222,13 @@ def _determine_advance_action(
                 if active_improve_running:
                     return {
                         'type': 'wait_improve',
-                        'description': f'SKIP: improve task #{active_improve_running[0].id} is in_progress',
+                        'description': f'SKIP: improve task {active_improve_running[0].id} is in_progress',
                     }
                 active_improve_pending = [t for t in existing_improve if t.status == 'pending']
                 if active_improve_pending:
                     return {
                         'type': 'run_improve',
-                        'description': f'Spawn worker for pending improve #{active_improve_pending[0].id}',
+                        'description': f'Spawn worker for pending improve {active_improve_pending[0].id}',
                         'improve_task': active_improve_pending[0],
                     }
                 return {
@@ -1286,8 +1286,8 @@ def _unimplemented_implement_prompt(task: DbTask) -> str:
     assert task.id is not None
     slug = _get_base_task_slug(task)
     if task.task_type == "plan":
-        return f"Implement plan from task #{task.id}: {slug}" if slug else f"Implement plan from task #{task.id}"
-    return f"Implement findings from task #{task.id}: {slug}" if slug else f"Implement findings from task #{task.id}"
+        return f"Implement plan from task {task.id}: {slug}" if slug else f"Implement plan from task {task.id}"
+    return f"Implement findings from task {task.id}: {slug}" if slug else f"Implement findings from task {task.id}"
 
 
 def _cmd_advance_unimplemented(
@@ -1322,9 +1322,9 @@ def _cmd_advance_unimplemented(
     print()
     for task in pending_tasks:
         assert task.id is not None
-        prefix_len = len(f"  #{task.id}  [{task.task_type}] ")
+        prefix_len = len(f"  {task.id}  [{task.task_type}] ")
         prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
-        print(f"  #{task.id}  [{task.task_type}] {prompt_display}")
+        print(f"  {task.id}  [{task.task_type}] {prompt_display}")
         print(f"       → gza implement {task.id}")
     print()
 
@@ -1339,7 +1339,7 @@ def _cmd_advance_unimplemented(
     for task in pending_tasks:
         assert task.id is not None
         if dry_run:
-            print(f"[dry-run] Would create implement task for {task.task_type} #{task.id}")
+            print(f"[dry-run] Would create implement task for {task.task_type} {task.id}")
             continue
         prompt_text = _unimplemented_implement_prompt(task)
         impl_task = store.add(
@@ -1348,7 +1348,7 @@ def _cmd_advance_unimplemented(
             based_on=task.id,
             group=task.group,
         )
-        print(f"✓ Created implement task #{impl_task.id} for {task.task_type} #{task.id}")
+        print(f"✓ Created implement task {impl_task.id} for {task.task_type} {task.id}")
         created_count += 1
 
     if not dry_run:
@@ -1448,7 +1448,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if task_id is not None:
         task = store.get(task_id)
         if not task:
-            print(f"Error: Task #{task_id} not found")
+            print(f"Error: Task {task_id} not found")
             return 1
         if task.status == 'failed':
             # Allow a specific failed task if it's resumable
@@ -1458,16 +1458,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 and not no_resume_failed
             )
             if not is_resumable:
-                print(f"Error: Task #{task_id} is not completed (status: {task.status})")
+                print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
             tasks = []
             failed_tasks: list[DbTask] = [task]
         else:
             if task.status != 'completed':
-                print(f"Error: Task #{task_id} is not completed (status: {task.status})")
+                print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
             if task.merge_status == 'merged':
-                print(f"Task #{task_id} is already merged")
+                print(f"Task {task_id} is already merged")
                 return 0
             tasks = [task]
             failed_tasks = []
@@ -1556,7 +1556,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
                 for task, action in plan:
                     prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-                    console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -1566,7 +1566,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if plan:
                 for task, action in plan:
                     prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-                    console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -1575,7 +1575,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print(f"Would advance {len(plan)} task(s):\n")
         for task, action in plan:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-            console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
             if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
                 commit_count = git.count_commits_ahead(task.branch, target_branch)
@@ -1594,7 +1594,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     print(f"Would start {len(pending_tasks)} new pending task(s):\n")
                     for pt in pending_tasks:
                         prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
-                        console.print(f"  [{_c_tid}]#{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                         console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                         print()
                 else:
@@ -1607,7 +1607,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print(f"Will advance {len(actionable_plan)} task(s):\n")
         for task, action in plan:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-            console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
             print()
@@ -1623,7 +1623,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
                 for pt in new_pending_tasks:
                     prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
-                    console.print(f"  [{_c_tid}]#{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                     print()
 
@@ -1652,7 +1652,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         action_type = action['type']
 
         if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
-            console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
             skip_count += 1
@@ -1663,13 +1663,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Worker-spawning actions: check batch limit before proceeding
         if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
             if batch_limit is not None and workers_started >= batch_limit:
-                console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
                 print()
                 skip_count += 1
                 continue
 
-        console.print(f"  [{_c_tid}]#{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+        console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
@@ -1717,7 +1717,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
                     assert rebase_task.id is not None
                     console.print(
-                        f"      [{_c_ok}]✓ Created rebase task #{rebase_task.id} "
+                        f"      [{_c_ok}]✓ Created rebase task {rebase_task.id} "
                         f"(target: {target_branch})[/{_c_ok}]"
                     )
                     worker_args = argparse.Namespace(
@@ -1741,14 +1741,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 review_task = _create_review_task(store, task)
             except DuplicateReviewError as e:
                 review_task = e.active_review
-                console.print(f"      [{_c_warn}]SKIP: review #{review_task.id} is already {review_task.status}[/{_c_warn}]")
+                console.print(f"      [{_c_warn}]SKIP: review {review_task.id} is already {review_task.status}[/{_c_warn}]")
                 skip_count += 1
                 continue
             except ValueError as e:
                 console.print(f"      [{_c_warn}]SKIP: {e}[/{_c_warn}]")
                 skip_count += 1
                 continue
-            console.print(f"      [{_c_ok}]✓ Created review task #{review_task.id}[/{_c_ok}]")
+            console.print(f"      [{_c_ok}]✓ Created review task {review_task.id}[/{_c_ok}]")
 
             # Spawn background worker to run the review
             assert review_task.id is not None
@@ -1776,10 +1776,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started review worker for #{review_task.id}[/{_c_ok}]")
+                console.print(f"      [{_c_ok}]✓ Started review worker for {review_task.id}[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [{_c_err}]✗ Failed to start review worker for #{review_task.id}[/{_c_err}]")
+                console.print(f"      [{_c_err}]✗ Failed to start review worker for {review_task.id}[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'improve':
@@ -1796,7 +1796,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 same_branch=True,
                 group=task.group,
             )
-            console.print(f"      [{_c_ok}]✓ Created improve task #{improve_task.id}[/{_c_ok}]")
+            console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
 
             # Spawn background worker to run the improve task
             assert improve_task.id is not None
@@ -1824,17 +1824,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started improve worker for #{improve_task.id}[/{_c_ok}]")
+                console.print(f"      [{_c_ok}]✓ Started improve worker for {improve_task.id}[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [{_c_err}]✗ Failed to start improve worker for #{improve_task.id}[/{_c_err}]")
+                console.print(f"      [{_c_err}]✗ Failed to start improve worker for {improve_task.id}[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'resume':
             # Create a resume task and spawn a background worker for it
             resume_task = _create_resume_task(store, task)
             assert resume_task.id is not None
-            console.print(f"      [{_c_ok}]✓ Created resume task #{resume_task.id}[/{_c_ok}]")
+            console.print(f"      [{_c_ok}]✓ Created resume task {resume_task.id}[/{_c_ok}]")
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
                 max_turns=None,
@@ -1857,7 +1857,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 based_on=task.id,
                 group=task.group,
             )
-            console.print(f"      [{_c_ok}]✓ Created implement task #{impl_task.id}[/{_c_ok}]")
+            console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")
 
             assert impl_task.id is not None
             worker_args = argparse.Namespace(
@@ -1876,12 +1876,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif action_type == 'needs_rebase':
             assert task.id is not None
             if not task.branch:
-                console.print(f"      [{_c_err}]✗ Cannot rebase: task #{task.id} has no branch[/{_c_err}]")
+                console.print(f"      [{_c_err}]✗ Cannot rebase: task {task.id} has no branch[/{_c_err}]")
                 error_count += 1
                 continue
             rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
             assert rebase_task.id is not None
-            console.print(f"      [{_c_ok}]✓ Created rebase task #{rebase_task.id}[/{_c_ok}]")
+            console.print(f"      [{_c_ok}]✓ Created rebase task {rebase_task.id}[/{_c_ok}]")
 
             worker_args = argparse.Namespace(
                 no_docker=getattr(args, 'no_docker', False),
@@ -1940,7 +1940,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if desc.startswith('SKIP: '):
                 desc = desc[len('SKIP: '):]
             _color = _advance_action_color(aaction['type'])
-            console.print(f"  [{_c_tid}]#{atask.id}[/{_c_tid}]  [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]{atask.id}[/{_c_tid}]  [{pink}]{prompt_display}[/{pink}]")
             console.print(f"       [{_color}]→ {desc}[/{_color}]")
 
     return 0 if error_count == 0 else 1

@@ -141,13 +141,13 @@ def main() -> int:
     if new_output_content is not None:
         old_content = row["output_content"]
         if args.dry_run:
-            print(f"Would update tasks #{args.task_id}: output_content {old_content!r:.80} -> {new_output_content!r:.80}")
+            print(f"Would update tasks {args.task_id}: output_content {old_content!r:.80} -> {new_output_content!r:.80}")
         else:
             conn.execute(
                 "UPDATE tasks SET output_content = ? WHERE id = ?",
                 (new_output_content, args.task_id),
             )
-            print(f"Updated tasks #{args.task_id}: output_content backfilled ({len(new_output_content)} chars)")
+            print(f"Updated tasks {args.task_id}: output_content backfilled ({len(new_output_content)} chars)")
 
     # Update cycle_iterations if this review belongs to a cycle
     cycle_id = row["cycle_id"]
@@ -172,7 +172,7 @@ def main() -> int:
         print(f"Task {args.task_id} is not part of a cycle (no cycle_iterations to update)")
 
     # Show current state for verification
-    print(f"\nVerdict for review task #{args.task_id}: {verdict}")
+    print(f"\nVerdict for review task {args.task_id}: {verdict}")
     print("Note: gza show/advance also extract the verdict dynamically from output_content.")
 
     if not args.dry_run:

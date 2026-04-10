@@ -428,7 +428,7 @@ class TestPromptBuilderImproveTask:
     def test_improve_task_prompt_format(self):
         """Test the exact format of improve task prompt."""
         result = PromptBuilder().improve_task_prompt(task_id=5, review_id=7)
-        assert result == "Improve implementation of task #5 based on review #7"
+        assert result == "Improve implementation of task 5 based on review 7"
 
 
 class TestPromptBuilderReviewTask:
@@ -438,7 +438,7 @@ class TestPromptBuilderReviewTask:
         """Test that review task prompt references the implementation task ID."""
         result = PromptBuilder().review_task_prompt(impl_task_id=15)
         assert "15" in result
-        assert result.startswith("Review task #15")
+        assert result.startswith("Review task 15")
 
     def test_review_task_prompt_with_impl_prompt(self):
         """Test that review task prompt includes implementation prompt excerpt."""
@@ -462,12 +462,12 @@ class TestPromptBuilderReviewTask:
         """Test that review task prompt works without implementation prompt."""
         result = PromptBuilder().review_task_prompt(impl_task_id=5, impl_prompt=None)
         assert "5" in result
-        assert ":" not in result.split("task #5")[1] if "task #5" in result else True
+        assert ":" not in result.split("task 5")[1] if "task 5" in result else True
 
     def test_review_task_prompt_format_without_impl_prompt(self):
         """Test the format when no impl prompt is given includes self-contained diff guidance."""
         result = PromptBuilder().review_task_prompt(impl_task_id=3)
-        assert result.startswith("Review task #3")
+        assert result.startswith("Review task 3")
         assert "changed-files list" in result
         assert "inline diff/context" in result
         assert "git discovery commands" in result

@@ -63,6 +63,7 @@ pink: str = "#ff99cc"
 
 blue_neon: str = "#00ffff"
 blue_bright: str = "#00ccff"
+blue_light: str = "#88ccff"
 blue: str = "blue"
 
 pink_neon: str = "#ffaaff"
@@ -370,14 +371,15 @@ _THEME_MINIMAL = Theme(
         "review_approved": green_success,
     },
     task_stream={
-        "step_header": blue_bright,
+        "step_header": blue_light,
     },
     rich={
-        "repr.number": purple,
+        "repr.number": orange,
         "repr.path": orange,
-        "repr.filename": blue_bright,
-        "repr.str": white_bright,
-        "repr.url": pink_neon,
+        "repr.filename": orange,
+        "repr.str": purple,
+        "repr.url": purple,
+        "repr.call": purple,
     },
 )
 

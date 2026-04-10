@@ -115,7 +115,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
         return
 
     for task in store.get_in_progress():
-        task_label = f"#{task.id}" if task.id is not None else "<unknown>"
+        task_label = f"{task.id}" if task.id is not None else "<unknown>"
         try:
             is_dead = False
             if task.running_pid is None:
@@ -158,7 +158,7 @@ def prune_terminal_dead_workers(config: Config) -> None:
 
     terminal_statuses = {"completed", "failed", "dropped", "unmerged"}
     for worker in registry.list_all(include_completed=True):
-        task_label = f"#{worker.task_id}" if worker.task_id is not None else "<unknown>"
+        task_label = f"{worker.task_id}" if worker.task_id is not None else "<unknown>"
         try:
             if worker.task_id is None:
                 # Only prune stale workers (registered as running but PID is dead).
@@ -300,17 +300,17 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
         if not task:
-            print(f"Error: Task #{explicit_task_id} not found")
+            print(f"Error: Task {explicit_task_id} not found")
             return 1
 
         if task.status != "pending":
-            print(f"Error: Task #{explicit_task_id} is not pending (status: {task.status})")
+            print(f"Error: Task {explicit_task_id} is not pending (status: {task.status})")
             return 1
 
         # Check if task is blocked
         is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
         if is_blocked:
-            print(f"Error: Task #{explicit_task_id} is blocked by task #{blocking_id} ({blocking_status})")
+            print(f"Error: Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})")
             return 1
         selected_task = task
     else:
@@ -440,10 +440,10 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         registry.register(worker_metadata)
 
         if quiet:
-            print(f"Started worker {worker_id} (PID {pid}) for task #{selected_task.id}")
+            print(f"Started worker {worker_id} (PID {pid}) for task {selected_task.id}")
         else:
             print(f"Started worker {worker_id} (PID {pid})")
-            print(f"  Task: #{selected_task.id}")
+            print(f"  Task: {selected_task.id}")
             if selected_task.prompt:
                 prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
                 print(f"  Prompt: {prompt_display}")
@@ -588,7 +588,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
     # Get the new resume task
     task = store.get(new_task_id)
     if not task:
-        print(f"Error: Task #{new_task_id} not found")
+        print(f"Error: Task {new_task_id} not found")
         return 1
 
     # Build command for worker subprocess
@@ -626,10 +626,10 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         registry.register(worker)
 
         if quiet:
-            print(f"Started worker {worker_id} (PID {proc.pid}) for task #{task.id} (resuming)")
+            print(f"Started worker {worker_id} (PID {proc.pid}) for task {task.id} (resuming)")
         else:
             print(f"Started worker {worker_id} (PID {proc.pid})")
-            print(f"  Task: #{task.id} (resuming)")
+            print(f"  Task: {task.id} (resuming)")
             if task.prompt:
                 prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
                 print(f"  Prompt: {prompt_display}")
@@ -812,8 +812,8 @@ def _create_improve_task(
     if existing:
         existing_task = existing[0]
         raise ValueError(
-            f"An improve task already exists for implementation #{impl_task.id} "
-            f"and review #{review_task.id}: #{existing_task.id} (status: {existing_task.status})"
+            f"An improve task already exists for implementation {impl_task.id} "
+            f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
         )
 
     prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
@@ -907,7 +907,7 @@ def _format_lineage(
         if task.id is None:
             return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{_annotation(task)}"
         return (
-            f"[{_task_id_color}]#{task.id}[/{_task_id_color}]"
+            f"[{_task_id_color}]{task.id}[/{_task_id_color}]"
             f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]"
             f"{_annotation(task)}"
         )

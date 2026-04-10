@@ -1359,7 +1359,7 @@ class TestEditPromptDefaultContent:
                 content = f.read()
                 editor_content.append(content)
             # Verify the default prompt is present
-            assert "Implement plan from task #gza-000016" in content
+            assert "Implement plan from task gza-000016" in content
             # Return success without modifying the file
             class Result:
                 returncode = 0
@@ -1375,10 +1375,10 @@ class TestEditPromptDefaultContent:
 
         # Verify the default prompt was included in the editor
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-000016" in editor_content[0]
+        assert "Implement plan from task gza-000016" in editor_content[0]
 
         # Verify the result includes the default
-        assert result == "Implement plan from task #gza-000016"
+        assert result == "Implement plan from task gza-000016"
 
     def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt includes the slug in the default prompt when provided."""
@@ -1407,8 +1407,8 @@ class TestEditPromptDefaultContent:
         )
 
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-000016: design-feature-x" in editor_content[0]
-        assert result == "Implement plan from task #gza-000016: design-feature-x"
+        assert "Implement plan from task gza-000016: design-feature-x" in editor_content[0]
+        assert result == "Implement plan from task gza-000016: design-feature-x"
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
@@ -1438,7 +1438,7 @@ class TestEditPromptDefaultContent:
 
         # Verify no default prompt was added for plan type
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-000016" not in editor_content[0]
+        assert "Implement plan from task gza-000016" not in editor_content[0]
 
         # Verify empty result since editor was "empty"
         assert result is None
@@ -1536,7 +1536,7 @@ class TestEditPromptDefaultContent:
         add_task_interactive(store, task_type="implement", based_on=plan_task.id)
 
         assert len(editor_content) == 1
-        assert "Implement plan from task #" in editor_content[0]
+        assert "Implement plan from task " in editor_content[0]
         assert "design-feature-x" in editor_content[0]
 
 

@@ -38,7 +38,7 @@ class TestDuplicateReviewError:
     def test_message_contains_id_and_status(self):
         task = _task(id=7, status="pending")
         err = DuplicateReviewError(task)
-        assert "#7" in str(err)
+        assert "7" in str(err)
         assert "pending" in str(err)
 
     def test_is_value_error(self):
@@ -70,23 +70,23 @@ class TestBuildAutoReviewPrompt:
     def test_fallback_when_no_task_id(self):
         task = _task(id=5, slug=None, prompt="build the thing")
         result = build_auto_review_prompt(task)
-        assert result == "Review task #5: build the thing"
+        assert result == "Review task 5: build the thing"
 
     def test_fallback_when_task_id_has_no_dash(self):
         task = _task(id=5, slug="nodash", prompt="build the thing")
         result = build_auto_review_prompt(task)
-        assert result == "Review task #5: build the thing"
+        assert result == "Review task 5: build the thing"
 
     def test_fallback_includes_truncated_prompt(self):
         long_prompt = "x" * 200
         task = _task(id=3, slug=None, prompt=long_prompt)
         result = build_auto_review_prompt(task)
-        assert result == f"Review task #3: {'x' * 100}"
+        assert result == f"Review task 3: {'x' * 100}"
 
     def test_fallback_without_prompt(self):
         task = _task(id=3, slug=None, prompt=None)
         result = build_auto_review_prompt(task)
-        assert result == "Review task #3"
+        assert result == "Review task 3"
 
 
 # ---------------------------------------------------------------------------

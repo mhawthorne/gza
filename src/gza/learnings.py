@@ -165,7 +165,7 @@ def _build_summarization_prompt(
         if len(prompt_text) > 300:
             prompt_text = prompt_text[:300] + "... [truncated]"
         task_sections.append(
-            f"### Task #{task.id} ({task.task_type})\n"
+            f"### Task {task.id} ({task.task_type})\n"
             f"**Prompt**: {prompt_text}\n\n"
             f"**Output**:\n{output}"
         )
