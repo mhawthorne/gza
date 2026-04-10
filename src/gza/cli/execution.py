@@ -796,22 +796,63 @@ def cmd_improve(args: argparse.Namespace) -> int:
         print(f"Error: {err}")
         return 1
     assert impl_task is not None
-
-    # Find the most recent review task for this implementation
     assert impl_task.id is not None
-    review_tasks = store.get_reviews_for_task(impl_task.id)
 
-    if not review_tasks:
-        print(f"Error: Task #{impl_task.id} has no review. Run a review first:")
-        print(f"  gza add --type review --depends-on {impl_task.id}")
-        return 1
+    review_id_override = getattr(args, "review_id", None)
+    if review_id_override is not None:
+        review_task = store.get(review_id_override)
+        if review_task is None:
+            print(f"Error: Review task #{review_id_override} not found.")
+            return 1
+        if review_task.task_type != "review":
+            print(
+                f"Error: Task #{review_id_override} is a {review_task.task_type} task, not a review."
+            )
+            return 1
+        if review_task.depends_on != impl_task.id:
+            print(
+                f"Error: Review #{review_id_override} reviews task #{review_task.depends_on}, "
+                f"not implementation #{impl_task.id}."
+            )
+            return 1
+        if review_task.status != "completed":
+            print(
+                f"Warning: Review #{review_task.id} is {review_task.status}. "
+                "The improve task will be blocked until it completes."
+            )
+    else:
+        # Auto-pick the most recent usable review. Dropped/failed reviews are
+        # terminal bad states — they cannot produce a usable report, and binding
+        # an improve task to one creates an unrunnable dependency. Pending and
+        # in_progress reviews are still eligible since they may yet complete.
+        review_tasks = store.get_reviews_for_task(impl_task.id)
+        usable_reviews = [
+            r for r in review_tasks if r.status not in ("dropped", "failed")
+        ]
 
-    # Already sorted by created_at DESC
-    review_task = review_tasks[0]
+        if not usable_reviews:
+            if review_tasks:
+                statuses = ", ".join(
+                    f"#{r.id} ({r.status})" for r in review_tasks
+                )
+                print(
+                    f"Error: Task #{impl_task.id} has no usable review "
+                    f"(all existing reviews are dropped or failed: {statuses})."
+                )
+                print("Run a new review, or pass --review-id <id> to pick a specific one.")
+            else:
+                print(f"Error: Task #{impl_task.id} has no review. Run a review first:")
+                print(f"  gza add --type review --depends-on {impl_task.id}")
+            return 1
 
-    # Warn if the review is not completed
-    if review_task.status != "completed":
-        print(f"Warning: Review #{review_task.id} is {review_task.status}. The improve task will be blocked until it completes.")
+        review_task = usable_reviews[0]
+
+        # Warn if the selected review is not yet completed (pending/in_progress).
+        if review_task.status != "completed":
+            print(
+                f"Warning: Review #{review_task.id} is {review_task.status}. "
+                "The improve task will be blocked until it completes."
+            )
 
     # Create improve task (using shared helper)
     try:

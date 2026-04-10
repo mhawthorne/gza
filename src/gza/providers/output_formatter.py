@@ -2,20 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from rich.console import Console
 from rich.markup import escape as rich_escape
 
-from ..colors import TaskOutputColors
-
-
-@dataclass(frozen=True)
-class OutputStyles(TaskOutputColors):
-    """Color and style definitions for provider stream output.
-
-    Inherits all color fields from :class:`gza.colors.TaskOutputColors`.
-    """
+from ..colors import TaskStreamColors
 
 
 def format_runtime(seconds: int) -> str:
@@ -46,9 +36,10 @@ def truncate_text(text: str, max_length: int) -> str:
 class StreamOutputFormatter:
     """Shared formatter for provider event lines and step headers."""
 
-    def __init__(self, console: Console | None = None, styles: OutputStyles | None = None):
-        self.console = console or Console()
-        self.styles = styles or OutputStyles()
+    def __init__(self, console: Console | None = None, styles: TaskStreamColors | None = None):
+        from ..colors import TASK_STREAM_COLORS, build_rich_theme
+        self.styles = styles or TASK_STREAM_COLORS
+        self.console = console or Console(theme=build_rich_theme())
 
     def print_step_header(
         self,

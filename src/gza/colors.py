@@ -140,7 +140,7 @@ class StatusColors:
 
 
 @dataclass(frozen=True)
-class TaskOutputColors:
+class TaskStreamColors:
     """Colors for live provider stream output (agent task log)."""
 
     step_header: str = default_color
@@ -291,13 +291,17 @@ class Theme:
     base: dict[str, str] = field(default_factory=dict)
     task: dict[str, str] = field(default_factory=dict)
     status: dict[str, str] = field(default_factory=dict)
-    task_output: dict[str, str] = field(default_factory=dict)
+    task_stream: dict[str, str] = field(default_factory=dict)
     show: dict[str, str] = field(default_factory=dict)
     unmerged: dict[str, str] = field(default_factory=dict)
     lineage: dict[str, str] = field(default_factory=dict)
     next_colors: dict[str, str] = field(default_factory=dict)
     runner: dict[str, str] = field(default_factory=dict)
     advance: dict[str, str] = field(default_factory=dict)
+    # Rich style-name overrides (e.g. "repr.number", "repr.path"). Applied to
+    # Consoles built via :func:`build_rich_theme`, currently only the provider
+    # stream console. Keys match Rich's own style names exactly.
+    rich: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def uniform(cls, name: str, color: str) -> Theme:
@@ -308,7 +312,7 @@ class Theme:
             base=af(color, BaseColors),
             task=af(color, TaskColors),
             status=af(color, StatusColors),
-            task_output=af(color, TaskOutputColors),
+            task_stream=af(color, TaskStreamColors),
             show=af(color, ShowColors),
             unmerged=af(color, UnmergedColors),
             lineage=af(color, LineageColors),
@@ -365,6 +369,16 @@ _THEME_MINIMAL = Theme(
         "review_none": yellow_warning,
         "review_approved": green_success,
     },
+    task_stream={
+        "step_header": blue_bright,
+    },
+    rich={
+        "repr.number": purple,
+        "repr.path": orange,
+        "repr.filename": blue_bright,
+        "repr.str": white_bright,
+        "repr.url": pink_neon,
+    },
 )
 
 _THEME_SELECTIVE_NEON = Theme(
@@ -373,7 +387,7 @@ _THEME_SELECTIVE_NEON = Theme(
         "task_id": blue_neon,
         "heading": pink_neon,
     },
-    task_output={
+    task_stream={
         "step_header": blue_neon,
         "error": bold_red_error,
     },
@@ -450,18 +464,19 @@ def _build_themed_instances(
 
     task_c = _apply_domain_theme(TaskColors(), theme.task if theme else _no, base_ov, color_overrides)
     status_c = _apply_domain_theme(StatusColors(), theme.status if theme else _no, base_ov, color_overrides)
-    work_c = _apply_domain_theme(TaskOutputColors(), theme.task_output if theme else _no, base_ov, color_overrides)
+    stream_c = _apply_domain_theme(TaskStreamColors(), theme.task_stream if theme else _no, base_ov, color_overrides)
     show_c = _apply_domain_theme(ShowColors(), theme.show if theme else _no, base_ov, color_overrides)
     unmerged_c = _apply_domain_theme(UnmergedColors(), theme.unmerged if theme else _no, base_ov, color_overrides)
     lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
     next_c = _apply_domain_theme(NextColors(), theme.next_colors if theme else _no, base_ov, color_overrides)
     runner_c = _apply_domain_theme(RunnerColors(), theme.runner if theme else _no, base_ov, color_overrides)
     advance_c = _apply_domain_theme(AdvanceColors(), theme.advance if theme else _no, base_ov, color_overrides)
+    rich_styles = dict(theme.rich) if theme else {}
 
     return {
         "TASK_COLORS": task_c,
         "STATUS_COLORS": status_c,
-        "TASK_OUTPUT_COLORS": work_c,
+        "TASK_STREAM_COLORS": stream_c,
         "SHOW_COLORS": show_c,
         "UNMERGED_COLORS": unmerged_c,
         "LINEAGE_COLORS": lineage_c,
@@ -470,7 +485,7 @@ def _build_themed_instances(
         "ADVANCE_COLORS": advance_c,
         "TASK_COLORS_DICT": dataclasses.asdict(task_c),
         "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
-        "TASK_OUTPUT_COLORS_DICT": dataclasses.asdict(work_c),
+        "TASK_STREAM_COLORS_DICT": dataclasses.asdict(stream_c),
         "SHOW_COLORS_DICT": dataclasses.asdict(show_c),
         "UNMERGED_COLORS_DICT": dataclasses.asdict(unmerged_c),
         "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
@@ -494,6 +509,7 @@ def _build_themed_instances(
             "stale": status_c.stale,
             "unknown": status_c.unknown,
         },
+        "RICH_STYLES_DICT": rich_styles,
     }
 
 
@@ -516,7 +532,7 @@ def set_theme(
     dataclasses cannot be mutated), so code using ``import gza.colors as c``
     and ``c.TASK_COLORS`` is preferred for those.
     """
-    global TASK_COLORS, STATUS_COLORS, TASK_OUTPUT_COLORS, SHOW_COLORS
+    global TASK_COLORS, STATUS_COLORS, TASK_STREAM_COLORS, SHOW_COLORS
     global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, RUNNER_COLORS, ADVANCE_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
@@ -524,7 +540,7 @@ def set_theme(
     # Frozen dataclass singletons — must replace the module-level name.
     TASK_COLORS = inst["TASK_COLORS"]
     STATUS_COLORS = inst["STATUS_COLORS"]
-    TASK_OUTPUT_COLORS = inst["TASK_OUTPUT_COLORS"]
+    TASK_STREAM_COLORS = inst["TASK_STREAM_COLORS"]
     SHOW_COLORS = inst["SHOW_COLORS"]
     UNMERGED_COLORS = inst["UNMERGED_COLORS"]
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
@@ -534,10 +550,10 @@ def set_theme(
 
     # Dict singletons — update in place so ``from`` imports see new values.
     for name in (
-        "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "TASK_OUTPUT_COLORS_DICT",
+        "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "TASK_STREAM_COLORS_DICT",
         "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
         "NEXT_COLORS_DICT", "RUNNER_COLORS_DICT", "ADVANCE_COLORS_DICT",
-        "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS",
+        "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS", "RICH_STYLES_DICT",
     ):
         target = globals()[name]
         target.clear()
@@ -552,7 +568,7 @@ def set_theme(
 
 TASK_COLORS: TaskColors = TaskColors()
 STATUS_COLORS: StatusColors = StatusColors()
-TASK_OUTPUT_COLORS: TaskOutputColors = TaskOutputColors()
+TASK_STREAM_COLORS: TaskStreamColors = TaskStreamColors()
 SHOW_COLORS: ShowColors = ShowColors()
 UNMERGED_COLORS: UnmergedColors = UnmergedColors()
 LINEAGE_COLORS: LineageColors = LineageColors()
@@ -566,7 +582,7 @@ ADVANCE_COLORS: AdvanceColors = AdvanceColors()
 
 TASK_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_COLORS)
 STATUS_COLORS_DICT: dict[str, str] = dataclasses.asdict(STATUS_COLORS)
-TASK_OUTPUT_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_OUTPUT_COLORS)
+TASK_STREAM_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_STREAM_COLORS)
 SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
 LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
@@ -594,5 +610,24 @@ PS_STATUS_COLORS: dict[str, str] = {
     "stale": STATUS_COLORS.stale,
     "unknown": STATUS_COLORS.unknown,
 }
+
+# Rich style-name overrides for Consoles built via :func:`build_rich_theme`.
+# Populated from the active theme's ``rich`` dict by :func:`set_theme`. Keys
+# are Rich style names (e.g. ``repr.number``, ``repr.path``); values are Rich
+# color strings. Empty = fall through to Rich's built-in defaults.
+RICH_STYLES_DICT: dict[str, str] = {}
+
+
+def build_rich_theme() -> Any:
+    """Return a ``rich.theme.Theme`` built from :data:`RICH_STYLES_DICT`.
+
+    Returns ``None`` when the active gza theme has no ``rich`` overrides so
+    callers can pass the result directly to ``Console(theme=...)`` without
+    special-casing the empty dict.
+    """
+    if not RICH_STYLES_DICT:
+        return None
+    from rich.theme import Theme as RichTheme
+    return RichTheme(dict(RICH_STYLES_DICT))
 
 
