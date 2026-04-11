@@ -1552,29 +1552,6 @@ def _cmd_show_output(
             for command in next_step_commands:
                 console.print(f"[{c['value']}]  - {command}[/{c['value']}]")
 
-    # Show cycle state for implement tasks (Phase 4)
-    if task.task_type == "implement" and task.id is not None:
-        cycles = store.get_cycles_for_impl(task.id)
-        if cycles:
-            latest_cycle = cycles[0]
-            _cycle_status_map = {"active": "in_progress", "approved": "completed", "maxed_out": "stale", "blocked": "failed"}
-            _sc = _colors.STATUS_COLORS
-            cycle_color = getattr(_sc, _cycle_status_map.get(latest_cycle.status, ""), c["value"]) or c["value"]
-            console.print(
-                f"[{c['label']}]Latest Cycle:[/{c['label']}] "
-                f"[{cycle_color}]#{latest_cycle.id} {latest_cycle.status}[/{cycle_color}]"
-                + (f" ({latest_cycle.stop_reason})" if latest_cycle.stop_reason else "")
-            )
-            iters = store.get_cycle_iterations(latest_cycle.id)
-            if iters:
-                for it in iters:
-                    verdict_str = it.review_verdict or "-"
-                    imp_str = f"  improve {it.improve_task_id}" if it.improve_task_id else ""
-                    console.print(
-                        f"[{c['value']}]  iter {it.iteration_index + 1}: "
-                        f"review {it.review_task_id} [{verdict_str}]{imp_str}[/{c['value']}]"
-                    )
-
     # Display output content using precedence logic (disk version when newer)
     output = _get_task_output(task, config.project_dir)
     if output:

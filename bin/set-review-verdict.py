@@ -14,12 +14,9 @@ Usage:
     # Dry-run (show what would happen):
     python bin/set-review-verdict.py 409 --dry-run
 
-The verdict is stored on cycle_iterations (if the review belongs to a cycle)
-and is also used dynamically by `gza show` / `gza advance` via output_content parsing.
-This script handles both cases:
-  1. If the review task belongs to a cycle, updates cycle_iterations.review_verdict.
-  2. If the verdict in output_content doesn't match the expected format, patches it
-     so the regex-based extractors can find it.
+The verdict is extracted dynamically by `gza show` / `gza advance` from
+output_content. This script's job is to patch output_content so the
+regex-based extractors can find the verdict reliably.
 """
 
 import argparse
@@ -82,7 +79,7 @@ def main() -> int:
     conn.row_factory = sqlite3.Row
 
     row = conn.execute(
-        "SELECT id, task_type, output_content, cycle_id, cycle_iteration_index, log_file FROM tasks WHERE id = ?",
+        "SELECT id, task_type, output_content, log_file FROM tasks WHERE id = ?",
         (resolved_task_id,),
     ).fetchone()
     if not row:
@@ -145,31 +142,9 @@ def main() -> int:
         else:
             conn.execute(
                 "UPDATE tasks SET output_content = ? WHERE id = ?",
-                (new_output_content, args.task_id),
+                (new_output_content, resolved_task_id),
             )
             print(f"Updated tasks {args.task_id}: output_content backfilled ({len(new_output_content)} chars)")
-
-    # Update cycle_iterations if this review belongs to a cycle
-    cycle_id = row["cycle_id"]
-    if cycle_id is not None:
-        iter_row = conn.execute(
-            "SELECT id, review_verdict FROM cycle_iterations WHERE review_task_id = ?",
-            (args.task_id,),
-        ).fetchone()
-        if iter_row:
-            old = iter_row["review_verdict"]
-            if args.dry_run:
-                print(f"Would update cycle_iterations #{iter_row['id']}: review_verdict {old!r} -> {verdict!r}")
-            else:
-                conn.execute(
-                    "UPDATE cycle_iterations SET review_verdict = ? WHERE id = ?",
-                    (verdict, iter_row["id"]),
-                )
-                print(f"Updated cycle_iterations #{iter_row['id']}: review_verdict {old!r} -> {verdict!r}")
-        else:
-            print(f"No cycle_iteration row found for review task {args.task_id}")
-    else:
-        print(f"Task {args.task_id} is not part of a cycle (no cycle_iterations to update)")
 
     # Show current state for verification
     print(f"\nVerdict for review task {args.task_id}: {verdict}")

@@ -2721,7 +2721,7 @@ class TestReviewCommand:
 
 
 class TestIterateCommand:
-    """Tests for 'gza iterate' command (formerly 'gza cycle')."""
+    """Tests for 'gza iterate' command."""
 
     def _make_completed_impl(self, store, prompt: str = "Implement feature") -> object:
         """Create and return a completed implement task."""
@@ -2771,70 +2771,19 @@ class TestIterateCommand:
         assert result.returncode != 0
         assert "pending" in result.stdout or "pending" in result.stderr
 
-    def test_cycle_start_and_close_in_db(self, tmp_path: Path):
-        """start_cycle + close_cycle flow creates correct DB records."""
-
+    def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-
-        cycle = store.start_cycle(impl.id, max_iterations=2)
-        it = store.append_cycle_iteration(cycle.id, 0)
-        store.update_cycle_iteration(it.id, state="terminal", review_verdict="APPROVED")
-        store.close_cycle(cycle.id, status="approved", stop_reason="approved")
-
-        cycles = store.get_cycles_for_impl(impl.id)
-        assert len(cycles) == 1
-        assert cycles[0].status == "approved"
-        assert cycles[0].stop_reason == "approved"
-
-        iterations = store.get_cycle_iterations(cycle.id)
-        assert len(iterations) == 1
-        assert iterations[0].review_verdict == "APPROVED"
-
-    def test_cycle_blocked_on_active_cycle_without_continue(self, tmp_path: Path):
-        """gza iterate errors if an active cycle exists without --continue."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = self._make_completed_impl(store)
-        # Pre-create an active cycle
-        store.start_cycle(impl.id, max_iterations=3)
-
-        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
-
+        result = run_gza("iterate", "testproject-1", "--continue", "--project", str(tmp_path))
         assert result.returncode != 0
-        assert "active cycle" in result.stdout.lower() or "already has an active cycle" in result.stdout.lower()
+        assert "unrecognized arguments: --continue" in (result.stderr or result.stdout)
 
-    def test_cycle_continue_dry_run_shows_resume_message(self, tmp_path: Path):
-        """gza iterate --continue --dry-run shows 'resume' message, not 'start' message."""
-
+    def test_cycle_alias_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
-        store = make_store(tmp_path)
+        result = run_gza("cycle", "testproject-1", "--project", str(tmp_path))
+        assert result.returncode != 0
+        assert "invalid choice" in (result.stderr or result.stdout)
 
-        impl = self._make_completed_impl(store)
-        cycle = store.start_cycle(impl.id, max_iterations=3)
-
-        result = run_gza("iterate", str(impl.id), "--continue", "--dry-run", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Must say "resume", not "start", when --continue is given
-        assert "resume" in result.stdout.lower()
-        assert "No active cycle" not in result.stdout
-        # The active cycle should still be there (dry-run doesn't mutate state)
-        active = store.get_active_cycle_for_impl(impl.id)
-        assert active is not None
-        assert active.id == cycle.id
-
-    def test_cycle_continue_resumes_existing_active_cycle(self, tmp_path: Path):
-        """--continue resumes at next iteration and APPROVED verdict closes cycle correctly.
-
-        This is a unit test that calls cmd_iterate() directly so that unittest.mock.patch
-        is effective. (run_gza spawns a subprocess where in-process patches have no effect.)
-        """
+    def test_reuses_latest_changes_requested_review_for_first_iteration(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
 
@@ -2842,80 +2791,57 @@ class TestIterateCommand:
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
-
         impl = self._make_completed_impl(store)
-        cycle = store.start_cycle(impl.id, max_iterations=3)
-        # Simulate one completed iteration already recorded so resume starts at index 1
-        it = store.append_cycle_iteration(cycle.id, 0)
-        store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
 
-        # Create a completed review task in the store with an APPROVED verdict in output_content.
-        # _create_review_task will be patched to return this pre-seeded task, and run() will
-        # return 0 (success), so get_review_verdict will read output_content and return APPROVED.
-        fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
-        fake_review.status = "completed"
-        fake_review.completed_at = datetime.now(UTC)
-        fake_review.output_content = "**Verdict: APPROVED**"
-        store.update(fake_review)
+        latest_review = store.add("Review", task_type="review", depends_on=impl.id)
+        latest_review.status = "completed"
+        latest_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        latest_review.completed_at = datetime.now(UTC)
+        store.update(latest_review)
 
+        improve = store.add("Improve", task_type="improve")
         args = argparse.Namespace(
             impl_task_id=impl.id,
-            max_iterations=3,
+            max_iterations=1,
             dry_run=False,
-            continue_cycle=True,
             project_dir=tmp_path,
             no_docker=True,
         )
-
-        mock_config = MagicMock()
-        mock_config.project_dir = tmp_path
-        mock_config.use_docker = False
-        mock_config.project_prefix = "testproject"
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
 
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
-             patch("gza.cli._create_review_task", return_value=fake_review), \
-             patch("gza.cli.run", return_value=0):
+             patch("gza.cli._run_foreground", return_value=0), \
+             patch("gza.cli._create_improve_task", return_value=improve) as create_improve, \
+             patch("gza.cli._create_review_task") as create_review:
             result = cmd_iterate(args)
 
-        # The cycle should complete as approved
+        assert result == 2
+        create_improve.assert_called_once()
+        create_review.assert_not_called()
+
+    def test_latest_review_approved_exits_zero(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(impl_task_id=impl.id, max_iterations=3, dry_run=False, project_dir=tmp_path, no_docker=True)
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), patch("gza.cli.get_store", return_value=store):
+            result = cmd_iterate(args)
         assert result == 0
-        # Verify iteration records: seeded index=0 plus new index=1 from the resumed run
-        iterations = store.get_cycle_iterations(cycle.id)
-        assert len(iterations) == 2
-        assert iterations[0].iteration_index == 0
-        assert iterations[1].iteration_index == 1
-        # Verify the cycle was closed with approved status
-        cycles = store.get_cycles_for_impl(impl.id)
-        assert len(cycles) == 1
-        assert cycles[0].status == "approved"
-        assert cycles[0].stop_reason == "approved"
 
-    def test_cycle_continue_no_active_cycle_returns_error(self, tmp_path: Path):
-        """gza iterate --continue with no active cycle returns non-zero exit code and error message."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = self._make_completed_impl(store)
-        # No active cycle exists for this implementation
-
-        result = run_gza("iterate", str(impl.id), "--continue", "--project", str(tmp_path))
-
-        assert result.returncode != 0
-        assert "No active cycle" in result.stdout or "No active cycle" in result.stderr
-
-    def test_cycle_continue_respects_original_max_iterations(self, tmp_path: Path):
-        """gza cycle --continue uses cycle.max_iterations, not the CLI --max-iterations default.
-
-        Seeded state: max_iterations=5, 3 completed iterations (indices 0, 1, 2).
-        CLI args: max_iterations=3 (should be IGNORED when --continue is given).
-
-        With the bug (CLI default max_iterations=3): iteration starts at 3,
-        `while 3 < 3` is immediately False → loop body never runs → still 3 records.
-        With the fix (cycle.max_iterations=5): loop runs iterations 3 and 4,
-        exhausts max_iterations, and returns exit code 2 (maxed_out).
-        """
+    def test_latest_review_needs_discussion_blocks(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
 
@@ -2923,78 +2849,98 @@ class TestIterateCommand:
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
-
         impl = self._make_completed_impl(store)
-        # Start cycle with max_iterations=5 (higher than the CLI default of 3)
-        cycle = store.start_cycle(impl.id, max_iterations=5)
-        # Simulate 3 completed iterations (indices 0, 1, 2)
-        for i in range(3):
-            it = store.append_cycle_iteration(cycle.id, i)
-            store.update_cycle_iteration(it.id, state="improve_completed", review_verdict="CHANGES_REQUESTED")
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: NEEDS_DISCUSSION**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
 
-        # Fake review task: always returns CHANGES_REQUESTED verdict so the loop runs to completion
-        fake_review = store.add("Review impl", task_type="review", depends_on=impl.id)
-        fake_review.status = "completed"
-        fake_review.completed_at = datetime.now(UTC)
-        fake_review.output_content = "**Verdict: CHANGES_REQUESTED**"
-        store.update(fake_review)
-
-        # Fake improve task for the improve phase
-        fake_improve = store.add("Improve impl", task_type="improve", depends_on=impl.id)
-        store.update(fake_improve)
-
-        # CLI args: max_iterations=3 (should be IGNORED in favour of cycle.max_iterations=5)
-        args = argparse.Namespace(
-            impl_task_id=impl.id,
-            max_iterations=3,
-            dry_run=False,
-            continue_cycle=True,
-            project_dir=tmp_path,
-            no_docker=True,
-        )
-
-        mock_config = MagicMock()
-        mock_config.project_dir = tmp_path
-        mock_config.use_docker = False
-        mock_config.project_prefix = "testproject"
-
-        with patch("gza.cli.Config.load", return_value=mock_config), \
-             patch("gza.cli.get_store", return_value=store), \
-             patch("gza.cli._create_review_task", return_value=fake_review), \
-             patch("gza.cli._create_improve_task", return_value=fake_improve), \
-             patch("gza.cli.run", return_value=0):
+        args = argparse.Namespace(impl_task_id=impl.id, max_iterations=3, dry_run=False, project_dir=tmp_path, no_docker=True)
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), patch("gza.cli.get_store", return_value=store):
             result = cmd_iterate(args)
+        assert result == 3
 
-        # With the fix, the loop runs iterations 3 and 4, exhausts max_iterations=5,
-        # and exits with code 2 (maxed_out). With the CLI-default bug it would never
-        # enter the loop and would return 3 (blocked/unknown stop reason).
-        assert result == 2, f"Expected exit code 2 (maxed_out), got {result}"
+    def test_latest_review_without_verdict_blocks(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
 
-        # Verify exactly 2 new iterations were appended (indices 3 and 4)
-        all_iterations = store.get_cycle_iterations(cycle.id)
-        assert len(all_iterations) == 5, (
-            f"Expected 5 iteration records (3 seeded + 2 new), got {len(all_iterations)}"
-        )
-        new_indices = sorted(it.iteration_index for it in all_iterations if it.iteration_index >= 3)
-        assert new_indices == [3, 4], f"Expected new iteration indices [3, 4], got {new_indices}"
-
-        # Verify the cycle was closed with maxed_out status
-        cycles = store.get_cycles_for_impl(impl.id)
-        assert len(cycles) == 1
-        assert cycles[0].status == "maxed_out"
-        assert cycles[0].stop_reason == "max_iterations"
-
-    def test_cycle_alias_still_works(self, tmp_path: Path):
-        """'gza cycle' backward-compat alias routes to the same handler as 'gza iterate'."""
+        from gza.cli import cmd_iterate
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "No verdict section"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
 
-        result = run_gza("cycle", str(impl.id), "--dry-run", "--project", str(tmp_path))
+        args = argparse.Namespace(impl_task_id=impl.id, max_iterations=3, dry_run=False, project_dir=tmp_path, no_docker=True)
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), patch("gza.cli.get_store", return_value=store):
+            result = cmd_iterate(args)
+        assert result == 3
 
-        assert result.returncode == 0
-        assert "dry-run" in result.stdout.lower()
+    def test_changes_requested_with_existing_improve_starts_fresh_review(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        store.add("Existing improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+
+        fresh_review = store.add("Fresh review", task_type="review", depends_on=impl.id)
+        fresh_review.status = "pending"
+        fresh_review.output_content = "**Verdict: APPROVED**"
+        fresh_review.completed_at = None
+        store.update(fresh_review)
+
+        args = argparse.Namespace(impl_task_id=impl.id, max_iterations=2, dry_run=False, project_dir=tmp_path, no_docker=True)
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._create_review_task", return_value=fresh_review) as create_review, \
+             patch("gza.cli._run_foreground", return_value=0), \
+             patch("gza.cli._create_improve_task") as create_improve:
+            result = cmd_iterate(args)
+        assert result == 0
+        create_review.assert_called_once()
+        create_improve.assert_not_called()
+
+    def test_no_reviews_starts_with_fresh_review(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review")
+        review.status = "pending"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = None
+        store.update(review)
+
+        args = argparse.Namespace(impl_task_id=impl.id, max_iterations=1, dry_run=False, project_dir=tmp_path, no_docker=True)
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._create_review_task", return_value=review) as create_review, \
+             patch("gza.cli._run_foreground", return_value=0):
+            result = cmd_iterate(args)
+        assert result == 0
+        create_review.assert_called_once()
 
 
 class TestMarkCompletedCommand:

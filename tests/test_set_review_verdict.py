@@ -37,7 +37,6 @@ def _insert_review_task(
     *,
     output_content: str | None = None,
     log_file: str | None = None,
-    cycle_id: int | None = None,
 ) -> str:
     """Insert a review task via SqliteTaskStore and patch optional fields."""
     from gza.db import SqliteTaskStore
@@ -47,8 +46,8 @@ def _insert_review_task(
     # Patch optional fields directly with raw SQL.
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "UPDATE tasks SET output_content = ?, log_file = ?, cycle_id = ? WHERE id = ?",
-        (output_content, log_file, cycle_id, task.id),
+        "UPDATE tasks SET output_content = ?, log_file = ? WHERE id = ?",
+        (output_content, log_file, task.id),
     )
     conn.commit()
     conn.close()

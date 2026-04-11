@@ -951,7 +951,7 @@ gza advance [task_id] [options]
 
 ### iterate
 
-Run an automated review/improve cycle for an implementation task. Alias: `cycle`.
+Run an automated review/improve loop for an implementation task.
 
 ```bash
 gza iterate <impl_task_id> [options]
@@ -962,7 +962,6 @@ gza iterate <impl_task_id> [options]
 | `impl_task_id` | Full prefixed implementation task ID to cycle (e.g. `gza-1234`) |
 | `--max-iterations N` | Maximum review/improve iterations (default: 3) |
 | `--dry-run` | Preview what would happen without executing |
-| `--continue` | Resume an existing active cycle |
 | `--no-docker` | Run Claude directly instead of in Docker |
 
 ### learnings

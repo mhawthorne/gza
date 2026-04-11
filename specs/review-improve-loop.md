@@ -1,6 +1,6 @@
 # Review-Improve Loop
 
-> **Implementation note:** The actual implementation uses a `TaskCycle` / `TaskCycleIteration` pattern with separate review and improve tasks tracked in `task_cycles` and `task_cycle_iterations` tables, rather than the single-task `_run_with_auto_review()` approach described below. The CLI entry points are `gza iterate <impl_id>` and `gza advance`. See `src/gza/db.py` (TaskCycle, TaskCycleIteration dataclasses) and `src/gza/cli/execution.py` for the actual implementation. The `max_review_cycles` config and `cycle_id`/`cycle_role` fields on Task are implemented as described.
+> **Implementation note (updated 2026-04-11):** `gza iterate` now runs as a pure loop without `TaskCycle` / `TaskCycleIteration` DB bookkeeping. There are no `task_cycles` / `task_cycle_iterations` tables and no `cycle_*` task columns. Iteration state is derived from the task lineage (reviews/improves) and the per-invocation `--max-iterations` value.
 
 ## Overview
 
