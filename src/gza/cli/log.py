@@ -804,7 +804,7 @@ def _running_worker_id_for_task(registry: WorkerRegistry, task_id: str) -> str |
     """Return a running worker ID for a task when available."""
     # Note: legacy worker JSON files created before the INTEGER→TEXT PK migration
     # may have task_id stored as a bare stringified integer (e.g. "123") rather than
-    # the canonical prefixed form (e.g. "gza-3f").  Such workers won't match here.
+    # the canonical prefixed form (e.g. "gza-123"). Such workers won't match here.
     # This is acceptable since worker metadata is ephemeral and old JSON files are
     # cleaned up after the worker process exits.
     workers = [w for w in registry.list_all(include_completed=True) if w.task_id == task_id]

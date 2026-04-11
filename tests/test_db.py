@@ -19,6 +19,8 @@ from gza.db import (
     run_v25_migration,
     run_v26_migration,
 )
+from gza.review_tasks import build_auto_review_prompt
+from gza.runner import _compute_slug_override
 
 
 class TestTaskChaining:
@@ -1361,7 +1363,7 @@ class TestEditPromptDefaultContent:
                 content = f.read()
                 editor_content.append(content)
             # Verify the default prompt is present
-            assert "Implement plan from task #gza-16" in content
+            assert "Implement plan from task gza-16" in content
             # Return success without modifying the file
             class Result:
                 returncode = 0
@@ -1377,10 +1379,10 @@ class TestEditPromptDefaultContent:
 
         # Verify the default prompt was included in the editor
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-16" in editor_content[0]
+        assert "Implement plan from task gza-16" in editor_content[0]
 
         # Verify the result includes the default
-        assert result == "Implement plan from task #gza-16"
+        assert result == "Implement plan from task gza-16"
 
     def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt includes the slug in the default prompt when provided."""
@@ -1409,8 +1411,8 @@ class TestEditPromptDefaultContent:
         )
 
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-16: design-feature-x" in editor_content[0]
-        assert result == "Implement plan from task #gza-16: design-feature-x"
+        assert "Implement plan from task gza-16: design-feature-x" in editor_content[0]
+        assert result == "Implement plan from task gza-16: design-feature-x"
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
@@ -1440,7 +1442,7 @@ class TestEditPromptDefaultContent:
 
         # Verify no default prompt was added for plan type
         assert len(editor_content) == 1
-        assert "Implement plan from task #gza-16" not in editor_content[0]
+        assert "Implement plan from task gza-16" not in editor_content[0]
 
         # Verify empty result since editor was "empty"
         assert result is None
@@ -1472,7 +1474,7 @@ class TestEditPromptDefaultContent:
 
         # Verify no default prompt was added
         assert len(editor_content) == 1
-        assert "Implement plan from task #" not in editor_content[0]
+        assert "Implement plan from task gza-" not in editor_content[0]
         assert result is None
 
     def test_edit_prompt_preserves_custom_initial_content(self, tmp_path: Path, monkeypatch):
@@ -3896,12 +3898,11 @@ class TestResolveTaskId:
         "arg, expected",
         [
             # Full prefixed IDs are returned as-is.
-            ("gza-3f", "gza-3f"),
+            ("gza-1", "gza-1"),
             ("gza-000001", "gza-000001"),
-            ("gza-z", "gza-z"),
             ("gza-10", "gza-10"),
             # Whitespace padding — stripped before processing
-            (" gza-3f ", "gza-3f"),
+            (" gza-10 ", "gza-10"),
         ],
     )
     def test_resolve(self, arg: str, expected: str) -> None:
@@ -3915,6 +3916,11 @@ class TestResolveTaskId:
         with pytest.raises(ValueError, match="Invalid task ID"):
             resolve_task_id("   ", self.PREFIX)
 
+    def test_error_message_uses_decimal_example(self) -> None:
+        with pytest.raises(ValueError) as exc:
+            resolve_task_id("gza-abc", self.PREFIX)
+        assert "gza-1234" in str(exc.value)
+
     @pytest.mark.parametrize(
         "arg",
         [
@@ -3924,6 +3930,8 @@ class TestResolveTaskId:
             "abc",
             "feature/add-branch",
             "gza-",
+            "gza-3f",
+            "gza-z",
             "-000001",
             "GZA-000001",
             "gza_000001",
@@ -4184,6 +4192,112 @@ class TestMigrationUtilityFunctions:
         assert child is not None
         assert child.based_on == "gza-1"
         assert child.depends_on == "gza-1"
+
+    def test_run_v26_migration_rewrites_slug_lineage_segments(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, task_id, created_at) VALUES (?, ?, ?, ?)",
+            (10, "add feature", "20260410-00000a-impl-add-feature", "2024-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+        run_v26_migration(db_path)
+
+        store = SqliteTaskStore(db_path, prefix="gza")
+        impl_task = store.get("gza-10")
+        assert impl_task is not None
+        assert impl_task.slug == "20260410-10-impl-add-feature"
+
+        prompt = build_auto_review_prompt(
+            impl_task,
+            known_task_id_suffixes={"10"},
+        )
+        assert prompt == "review add-feature"
+
+        review_task = store.add("review task", task_type="review", depends_on=impl_task.id)
+        slug_override = _compute_slug_override(review_task, store)
+        assert slug_override is not None
+        assert "00000a" not in slug_override
+        assert slug_override.endswith("rev-10-impl-add-feature")
+
+    def test_run_v26_migration_preserves_semantic_slug_prefixes(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, task_id, created_at) VALUES (?, ?, ?, ?)",
+            (10, "semantic slug", "20260410-10-impl-rollout", "2024-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+
+        # Seed a legacy v25-style suffix token that can collide with semantic slug text.
+        # Old migration logic rewrote any leading "<token>-impl-..." segment globally.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (?, ?, ?)",
+            ("aux-10", "legacy token holder", "2024-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        run_v26_migration(db_path)
+
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.get("gza-10")
+        assert task is not None
+        assert task.slug == "20260410-10-impl-rollout"
+
+    def test_run_v26_migration_preserves_monotonic_project_sequences(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (?, ?, ?)",
+            (1, "first", "2024-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (?, ?, ?)",
+            (2, "second", "2024-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE project_sequences SET next_seq = 50 WHERE prefix = 'gza'")
+        conn.commit()
+        conn.close()
+
+        run_v26_migration(db_path)
+
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT next_seq FROM project_sequences WHERE prefix = 'gza'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 50
+
+        store = SqliteTaskStore(db_path, prefix="gza")
+        created = store.add("post-migration task")
+        assert created.id == "gza-51"
 
     def test_run_v26_migration_idempotent_on_v26_db(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"

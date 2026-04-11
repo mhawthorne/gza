@@ -586,8 +586,8 @@ class TestLogCommand:
         assert "[S1.1] tool_call Bash ls -la" in result.stdout
         assert "[Step S2] Listed files." in result.stdout
 
-    def test_log_by_task_id_not_found(self, tmp_path: Path):
-        """Log command by task ID handles nonexistent task."""
+    def test_log_by_task_id_invalid_format(self, tmp_path: Path):
+        """Log command rejects non-decimal full-ID formats."""
         setup_config(tmp_path)
 
         # Create empty database
@@ -598,7 +598,7 @@ class TestLogCommand:
         result = run_gza("log", "testproject-zzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "not found" in result.stdout
+        assert "Invalid task ID" in result.stdout or "Invalid task ID" in result.stderr
 
     def test_log_by_task_id_nonexistent(self, tmp_path: Path):
         """Log command by task ID reports not found for nonexistent ID."""
@@ -608,7 +608,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("log", "testproject-zzzzzz", "--project", str(tmp_path))
+        result = run_gza("log", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -1009,7 +1009,7 @@ class TestLogCommand:
         """Log command defaults to task ID lookup without any flag."""
         setup_config(tmp_path)
 
-        result = run_gza("log", "testproject-zzz", "--project", str(tmp_path))
+        result = run_gza("log", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout

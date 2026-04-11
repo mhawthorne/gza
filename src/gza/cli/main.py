@@ -135,7 +135,7 @@ def main() -> int:
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task's tmux session")
     attach_parser.add_argument(
         "worker_id",
-        help="Worker ID (e.g. w-20260301-1) or full prefixed task ID (e.g. gza-1a2b) to attach to",
+        help="Worker ID (e.g. w-20260301-1) or full prefixed task ID (e.g. gza-1234) to attach to",
     )
     add_common_args(attach_parser)
 

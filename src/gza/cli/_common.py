@@ -56,13 +56,13 @@ def resolve_id(config: Config, arg: str) -> str:
 
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
-_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[a-z0-9]+$")
+_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
 
 
 def _looks_like_task_id(arg: str) -> bool:
     """Return True if *arg* looks like a task ID rather than a branch name.
 
-    Matches only full prefixed IDs, e.g. ``"gza-3f"``.
+    Matches only full prefixed decimal IDs, e.g. ``"gza-1234"``.
     """
     return bool(_TASK_ID_RE.match(arg))
 

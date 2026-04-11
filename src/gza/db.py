@@ -39,15 +39,12 @@ KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "TIMEOUT", "W
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
-# Base-36 alphabet (digits 0-9 then lowercase a-z)
+# Legacy base36 alphabet used only by v25 migration helpers.
 _B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-# Fixed width for the base36 sequence suffix in task IDs.  6 chars covers
-# 36^6 = 2,176,782,336 values per project prefix — effectively unbounded for
-# any real project.  Fixed width means string sort order matches numeric order
-# without custom collation, so ``gza-000002`` sorts before ``gza-000010``.
+# Legacy fixed width used only for v25 migration helper encoding.
 _TASK_ID_SEQ_WIDTH = 6
-_FULL_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[a-z0-9]+$")
+_FULL_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
 
 
 class InvalidTaskIdError(ValueError):
@@ -67,6 +64,11 @@ def _encode_v25_base36(n: int) -> str:
         result.append(chars[n % 36])
         n //= 36
     return "".join(reversed(result)).zfill(width)
+
+
+def _decode_base36(s: str) -> int:
+    """Decode a base-36 string to an integer."""
+    return int(s, 36)
 
 
 def task_id_numeric_key(task_id: str | None) -> int:
@@ -3147,21 +3149,126 @@ def run_v26_migration(db_path: Path) -> None:
             WHERE id IN (SELECT old_id FROM _v26_task_id_map)
         """)
 
-        # Heal project_sequences if it drifted from decoded task IDs.
-        for prefix, max_decoded in prefix_to_max.items():
-            desired_next_seq = max_decoded
-            cur = conn.execute(
-                "SELECT next_seq FROM project_sequences WHERE prefix = ?",
-                (prefix,),
+        # Rewrite slug-embedded lineage suffixes for derived review/implement/improve slugs.
+        # These segments intentionally encode task-id suffixes in the pattern:
+        # "<suffix>-{rev|impl|impr}-..."
+        suffix_map: dict[str, str] = {}
+        old_id_by_new_id: dict[str, str] = {}
+        cur = conn.execute("SELECT old_id, new_id FROM _v26_task_id_map")
+        for row in cur.fetchall():
+            old_id = str(row["old_id"])
+            new_id = str(row["new_id"])
+            old_suffix = old_id.rsplit("-", 1)[-1]
+            new_suffix = new_id.rsplit("-", 1)[-1]
+            suffix_map[old_suffix] = new_suffix
+            old_id_by_new_id[new_id] = old_id
+
+        task_links: dict[str, tuple[str | None, str | None]] = {}
+        cur = conn.execute("SELECT id, based_on, depends_on FROM tasks")
+        for row in cur.fetchall():
+            task_links[str(row["id"])] = (row["based_on"], row["depends_on"])
+
+        lineage_suffix_cache: dict[str, set[str]] = {}
+
+        def _collect_lineage_old_suffixes(task_id: str) -> set[str]:
+            cached = lineage_suffix_cache.get(task_id)
+            if cached is not None:
+                return cached
+
+            collected: set[str] = set()
+            pending = [task_id]
+            visited: set[str] = set()
+            while pending:
+                current_id = pending.pop()
+                if current_id in visited:
+                    continue
+                visited.add(current_id)
+
+                old_id = old_id_by_new_id.get(current_id)
+                if old_id and "-" in old_id:
+                    collected.add(old_id.rsplit("-", 1)[-1])
+
+                based_on, depends_on = task_links.get(current_id, (None, None))
+                if based_on:
+                    pending.append(based_on)
+                if depends_on:
+                    pending.append(depends_on)
+
+            lineage_suffix_cache[task_id] = collected
+            return collected
+
+        expected_marker_by_type = {"implement": "impl", "review": "rev", "improve": "impr"}
+
+        def _rewrite_slug_lineage_suffixes(
+            *,
+            task_id: str,
+            task_type: str,
+            slug: str | None,
+        ) -> str | None:
+            if slug is None:
+                return None
+
+            slug_body = slug
+            date_prefix = ""
+            m = re.match(r"^(\d{8}-)(.+)$", slug)
+            if m:
+                date_prefix = m.group(1)
+                slug_body = m.group(2)
+
+            tokens = slug_body.split("-")
+            if len(tokens) < 2:
+                return slug
+
+            old_task_id = old_id_by_new_id.get(task_id)
+            if not old_task_id or "-" not in old_task_id:
+                return slug
+            old_self_suffix = old_task_id.rsplit("-", 1)[-1]
+            expected_marker = expected_marker_by_type.get(task_type)
+            if expected_marker is None:
+                return slug
+            if tokens[0] != old_self_suffix or tokens[1] != expected_marker:
+                return slug
+
+            lineage_old_suffixes = _collect_lineage_old_suffixes(task_id)
+            changed = False
+            i = 0
+            while i + 1 < len(tokens):
+                marker = tokens[i + 1]
+                if marker not in {"rev", "impl", "impr"}:
+                    break
+                if tokens[i] not in lineage_old_suffixes:
+                    break
+                replacement = suffix_map.get(tokens[i])
+                if replacement is None:
+                    break
+                if replacement != tokens[i]:
+                    tokens[i] = replacement
+                    changed = True
+                i += 2
+
+            if not changed:
+                return slug
+            return f"{date_prefix}{'-'.join(tokens)}"
+
+        cur = conn.execute("SELECT id, task_type, slug FROM tasks WHERE slug IS NOT NULL")
+        for row in cur.fetchall():
+            new_slug = _rewrite_slug_lineage_suffixes(
+                task_id=str(row["id"]),
+                task_type=str(row["task_type"]),
+                slug=row["slug"],
             )
-            row = cur.fetchone()
-            existing = int(row["next_seq"]) if row is not None else None
-            if existing != desired_next_seq:
-                conn.execute(
-                    "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, ?) "
-                    "ON CONFLICT(prefix) DO UPDATE SET next_seq = excluded.next_seq",
-                    (prefix, desired_next_seq),
-                )
+            if new_slug != row["slug"]:
+                conn.execute("UPDATE tasks SET slug = ? WHERE id = ?", (new_slug, row["id"]))
+
+        # Heal project_sequences if it drifted from decoded task IDs.
+        # Never decrease next_seq: task IDs must be monotonic and never reused.
+        for prefix, max_decoded in prefix_to_max.items():
+            conn.execute(
+                "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, ?) "
+                "ON CONFLICT(prefix) DO UPDATE "
+                "SET next_seq = MAX(project_sequences.next_seq, excluded.next_seq)",
+                (prefix, max_decoded),
+            )
 
         conn.execute("UPDATE schema_version SET version = ?", (target_version,))
         conn.execute("COMMIT")
@@ -3182,7 +3289,7 @@ def run_v26_migration(db_path: Path) -> None:
 def resolve_task_id(arg: str, project_prefix: str) -> str:
     """Resolve a user-supplied task ID argument to a canonical string ID.
 
-    Accepts only full prefixed IDs: ``"{prefix}-{base36_suffix}"``.
+    Accepts only full prefixed IDs: ``"{prefix}-{decimal_suffix}"``.
     Prefix matching is intentionally not enforced here; syntactically valid IDs
     with a different prefix are resolved and may fail later as "not found".
 
@@ -3191,11 +3298,11 @@ def resolve_task_id(arg: str, project_prefix: str) -> str:
     arg = arg.strip()
     if not arg:
         raise InvalidTaskIdError(
-            f"Invalid task ID {arg!r}. Use a full prefixed task ID like '{project_prefix}-000001'."
+            f"Invalid task ID {arg!r}. Use a full prefixed task ID like '{project_prefix}-1234'."
         )
     if not _FULL_TASK_ID_RE.match(arg):
         raise InvalidTaskIdError(
-            f"Invalid task ID '{arg}'. Use a full prefixed task ID like '{project_prefix}-000001'."
+            f"Invalid task ID '{arg}'. Use a full prefixed task ID like '{project_prefix}-1234'."
         )
     return arg
 

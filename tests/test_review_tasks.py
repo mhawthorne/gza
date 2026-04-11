@@ -75,75 +75,75 @@ class TestBuildAutoReviewPrompt:
         assert result == "review security-rollout"
 
     def test_slug_strips_derived_implement_prefix(self):
-        task = _task(slug="20260410-0000ab-impl-add-authentication-system")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-add-authentication-system")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review add-authentication-system"
 
     def test_slug_strips_nested_derived_implement_prefixes(self):
-        task = _task(slug="20260410-b2-impl-a1-impl-add-feature")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"b2", "a1"})
+        task = _task(slug="20260410-12-impl-11-impl-add-feature")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"12", "11"})
         assert result == "review add-feature"
 
     def test_slug_preserves_semantic_impl_subject_add(self):
-        task = _task(slug="20260410-0000ab-impl-add-impl-support")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-add-impl-support")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review add-impl-support"
 
     def test_slug_preserves_semantic_impl_subject_api(self):
-        task = _task(slug="20260410-0000ab-impl-api-impl-migration")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-api-impl-migration")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review api-impl-migration"
 
     def test_slug_preserves_semantic_impl_subject_ui(self):
-        task = _task(slug="20260410-0000ab-impl-ui-impl-refresh")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-ui-impl-refresh")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review ui-impl-refresh"
 
     def test_slug_preserves_semantic_impl_subject_db(self):
-        task = _task(slug="20260410-0000ab-impl-db-impl-migration")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-db-impl-migration")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review db-impl-migration"
 
     def test_slug_preserves_semantic_impl_subject_api2(self):
-        task = _task(slug="20260410-0000ab-impl-api2-impl-refresh")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-api2-impl-refresh")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review api2-impl-refresh"
 
     def test_slug_preserves_semantic_impl_subject_v2(self):
-        task = _task(slug="20260410-0000ab-impl-v2-impl-rollout")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-v2-impl-rollout")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review v2-impl-rollout"
 
     def test_slug_preserves_digit_leading_semantic_subject_2fa(self):
-        task = _task(slug="20260410-0000ab-impl-2fa-impl-login")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-2fa-impl-login")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review 2fa-impl-login"
 
     def test_slug_preserves_digit_leading_semantic_subject_3d(self):
-        task = _task(slug="20260410-0000ab-impl-3d-impl-preview")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-3d-impl-preview")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review 3d-impl-preview"
 
     def test_slug_preserves_digit_leading_semantic_subject_2024(self):
-        task = _task(slug="20260410-0000ab-impl-2024-impl-rollout")
-        result = build_auto_review_prompt(task, known_task_id_suffixes={"0000ab"})
+        task = _task(slug="20260410-1234-impl-2024-impl-rollout")
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review 2024-impl-rollout"
 
     def test_project_prefix_stripped_after_derived_normalization(self):
-        task = _task(slug="20260410-0000ab-impl-myproj-add-feature")
+        task = _task(slug="20260410-1234-impl-myproj-add-feature")
         result = build_auto_review_prompt(
             task,
             project_prefix="myproj",
-            known_task_id_suffixes={"0000ab"},
+            known_task_id_suffixes={"1234"},
         )
         assert result == "review add-feature"
 
     def test_project_prefix_not_stripped_without_exact_prefix_token(self):
-        task = _task(slug="20260410-0000ab-impl-myproj2-add-feature")
+        task = _task(slug="20260410-1234-impl-myproj2-add-feature")
         result = build_auto_review_prompt(
             task,
             project_prefix="myproj",
-            known_task_id_suffixes={"0000ab"},
+            known_task_id_suffixes={"1234"},
         )
         assert result == "review myproj2-add-feature"
 
@@ -226,8 +226,8 @@ class TestCreateReviewTask:
         store = self._mock_store()
         store.get.return_value = None
         task = _task(
-            id="gza-0000ab",
-            slug="20260315-0000ab-impl-add-feature-1",
+            id="gza-1234",
+            slug="20260315-1234-impl-add-feature-1",
             group="mygroup",
             based_on=None,
         )
@@ -235,20 +235,20 @@ class TestCreateReviewTask:
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["prompt"] == "review add-feature"
         assert call_kwargs["task_type"] == "review"
-        assert call_kwargs["depends_on"] == "gza-0000ab"
+        assert call_kwargs["depends_on"] == "gza-1234"
         assert call_kwargs["group"] == "mygroup"
         assert call_kwargs["based_on"] is None
 
     def test_auto_prompt_mode_strips_nested_known_suffixes_from_lineage(self):
         store = self._mock_store()
-        parent = _task(id="gza-a1", slug="20260314-a1-impl-add-feature", based_on=None, depends_on=None)
+        parent = _task(id="gza-11", slug="20260314-11-impl-add-feature", based_on=None, depends_on=None)
         impl = _task(
-            id="gza-b2",
-            slug="20260315-b2-impl-a1-impl-add-feature",
-            based_on="gza-a1",
+            id="gza-12",
+            slug="20260315-12-impl-11-impl-add-feature",
+            based_on="gza-11",
             depends_on=None,
         )
-        store.get.side_effect = lambda task_id: parent if task_id == "gza-a1" else None
+        store.get.side_effect = lambda task_id: parent if task_id == "gza-11" else None
         create_review_task(store, impl, prompt_mode="auto")
         assert store.add.call_args[1]["prompt"] == "review add-feature"
 

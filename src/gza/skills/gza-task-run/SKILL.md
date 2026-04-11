@@ -14,7 +14,7 @@ Run a pending gza task directly in the current conversation, using the same prom
 
 ### Step 1: Get task ID
 
-The user should provide a full prefixed task ID (for example, `gza-1a2b`). Extract it from the input. If no task ID is provided, list pending tasks and ask:
+The user should provide a full prefixed task ID (for example, `gza-1234`). Extract it from the input. If no task ID is provided, list pending tasks and ask:
 
 ```bash
 uv run gza next

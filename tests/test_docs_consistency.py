@@ -53,11 +53,13 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `task_id` | Specific full prefixed task ID to advance",
         "| `impl_task_id` | Full prefixed implementation task ID to cycle",
         "| `task_id` | Full prefixed task ID to refresh",
-        "`task_id` must be a full prefixed task ID (for example `gza-1a2b`).",
+        "`task_id` must be a full prefixed task ID (for example `gza-1234`).",
     ]
 
     for snippet in required_snippets:
         assert snippet in config_content
+    assert "{prefix}-{base36}" not in config_content
+    assert "`gza-1a2b`" not in config_content
 
 
 def test_skills_docs_do_not_advertise_unsupported_gza_log_task_flag() -> None:
@@ -67,3 +69,30 @@ def test_skills_docs_do_not_advertise_unsupported_gza_log_task_flag() -> None:
 
     assert "gza log --task" not in skills_content
     assert "gza log gza-p --task" not in skills_content
+
+
+def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
+    """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
+    repo_root = Path(__file__).resolve().parents[1]
+    main_content = (repo_root / "src" / "gza" / "cli" / "main.py").read_text()
+    config_cmds_content = (repo_root / "src" / "gza" / "cli" / "config_cmds.py").read_text()
+
+    assert "gza-1234" in main_content
+    assert "gza-1a2b" not in main_content
+    assert "{prefix}-{decimal}" in config_cmds_content
+    assert "{prefix}-{base36}" not in config_cmds_content
+    assert "gza-1a2b" not in config_cmds_content
+
+    skill_names = [
+        "gza-plan-review",
+        "gza-task-run",
+        "gza-task-resume",
+        "gza-task-improve",
+        "gza-task-review",
+        "gza-task-info",
+        "gza-task-debug",
+    ]
+    for skill_name in skill_names:
+        content = (repo_root / "src" / "gza" / "skills" / skill_name / "SKILL.md").read_text()
+        assert "gza-1234" in content
+        assert "gza-1a2b" not in content

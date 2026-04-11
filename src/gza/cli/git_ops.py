@@ -750,7 +750,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     diff_args = args.diff_args if hasattr(args, 'diff_args') and args.diff_args else []
 
     if diff_args and not diff_args[0].startswith("-") and _looks_like_task_id(diff_args[0]):
-        # First argument is a full prefixed task ID ("prefix-base36").
+        # First argument is a full prefixed decimal task ID ("prefix-decimal").
         task_id: str = resolve_id(config, diff_args[0])
         task = store.get(task_id)
 

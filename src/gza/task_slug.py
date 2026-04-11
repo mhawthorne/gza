@@ -12,7 +12,7 @@ _DERIVED_IMPLEMENT_PREFIX_RE = re.compile(r"^([a-z0-9]+)-impl-(.+)$")
 def extract_task_id_suffix(task_id: object | None) -> str:
     """Extract the suffix from a task id in ``prefix-suffix`` format.
 
-    Task IDs look like ``gza-0000mp`` or ``gza-mp`` (variable-width). This
+    Task IDs look like ``gza-1234`` or ``gza-7`` (variable-width). This
     returns the portion after the first ``-``, or the full stripped id if
     there is no separator.
     """

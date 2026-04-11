@@ -617,9 +617,9 @@ class TestReviewContextFromChain:
 
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
-        assert f"Improve #{older_improve.id}" in context
+        assert f"Improve {older_improve.id}" in context
         assert "older improve 9" in context
-        assert f"Improve #{later_improve.id}" not in context
+        assert f"Improve {later_improve.id}" not in context
         assert "later improve 11" not in context
 
     def test_review_context_includes_tool_hints_when_prior_cycles_exist(self, tmp_path: Path):
@@ -890,7 +890,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         parent_impl.status = "completed"
-        parent_impl.slug = "20260409-000001-impl-add-feature"
+        parent_impl.slug = "20260409-1-impl-add-feature"
         store.update(parent_impl)
 
         impl_task = store.add(
@@ -899,7 +899,7 @@ class TestReviewTaskSlugGeneration:
             based_on=parent_impl.id,
         )
         impl_task.status = "completed"
-        impl_task.slug = "20260410-000002-impl-000001-impl-add-feature"
+        impl_task.slug = "20260410-2-impl-1-impl-add-feature"
         store.update(impl_task)
 
         config = Mock(spec=Config)

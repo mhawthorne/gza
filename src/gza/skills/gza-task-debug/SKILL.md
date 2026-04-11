@@ -14,7 +14,7 @@ Diagnose why a gza task failed by analyzing logs, detecting agent loops, compari
 
 ### Step 1: Get task ID
 
-The user should provide a full prefixed task ID (for example, `gza-1a2b`). Extract it from the input.
+The user should provide a full prefixed task ID (for example, `gza-1234`). Extract it from the input.
 
 ### Step 2: Query task from database
 
