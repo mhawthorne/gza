@@ -98,6 +98,21 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_default_branch(git: Git, current_branch: str, command: str) -> bool:
+    """Enforce that a command is being run from the repo's default branch.
+
+    Returns True if on default branch; prints an error and returns False otherwise.
+    """
+    default = git.default_branch()
+    if current_branch != default:
+        print(
+            f"Error: `gza {command}` must be run from the default branch "
+            f"'{default}' (currently on '{current_branch}')."
+        )
+        return False
+    return True
+
+
 def _merge_single_task(
     task_id: str,
     config: Config,
@@ -284,6 +299,19 @@ def cmd_merge(args: argparse.Namespace) -> int:
     # Get current branch once
     current_branch = git.current_branch()
     print(f"On branch {current_branch}")
+
+    # --mark-only is a DB-only escape hatch for users who merge manually;
+    # it does not run git operations so the default-branch rule does not apply.
+    if getattr(args, 'mark_only', False):
+        default = git.default_branch()
+        if current_branch != default:
+            print(
+                f"Note: --mark-only on non-default branch "
+                f"'{current_branch}' (default is '{default}')"
+            )
+    else:
+        if not _require_default_branch(git, current_branch, "merge"):
+            return 1
 
     # Determine the list of task IDs to merge
     task_ids = [resolve_id(config, tid) for tid in args.task_ids]
@@ -527,6 +555,11 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
     task_id = resolve_id(config, args.task_id)
+    git = Git(config.project_dir)
+
+    current_branch = git.current_branch()
+    if not _require_default_branch(git, current_branch, "rebase"):
+        return 1
 
     # Handle background mode - create a rebase task and run through the standard runner
     if getattr(args, 'background', False):
@@ -538,7 +571,6 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         if not task.branch:
             print(f"Error: Task {task_id} has no branch")
             return 1
-        git = Git(config.project_dir)
         target = getattr(args, 'onto', None) or git.default_branch()
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
@@ -547,7 +579,6 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         return _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
 
     store = get_store(config)
-    git = Git(config.project_dir)
 
     # Get the task
     task = store.get(task_id)
@@ -569,8 +600,6 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         print(f"Error: Branch '{task.branch}' does not exist")
         return 1
 
-    # Get current branch and determine rebase target
-    current_branch = git.current_branch()
     print(f"On branch {current_branch}")
 
     # Determine rebase target: use --onto if provided, else current branch

@@ -127,20 +127,39 @@ class TestMergeCommand:
         # Should either succeed or fail gracefully (not due to flag validation)
         assert "--remote requires --rebase" not in result.stdout
 
-    def test_merge_reports_current_vs_default_branch_when_already_merged_into_current(self, tmp_path: Path):
-        """Merge explains when current-branch merge state differs from default-branch state."""
+    def test_merge_requires_default_branch(self, tmp_path: Path):
+        """gza merge errors out when run from a non-default branch."""
         _store, git, task, _wt = setup_git_repo_with_task_branch(
-            tmp_path, "Current branch only merged", "feature/test-current-only-merged",
+            tmp_path, "Require default branch", "feature/test-require-default",
         )
 
         git._run("checkout", "-b", "integration")
-        git._run("merge", "--no-ff", "feature/test-current-only-merged", "-m", "Merge into integration")
 
         result = run_gza("merge", str(task.id), "--project", str(tmp_path), cwd=tmp_path)
 
         assert result.returncode == 1
-        assert "already merged into current branch 'integration'" in result.stdout
-        assert "still unmerged from default branch 'main'" in result.stdout
+        assert "`gza merge` must be run from the default branch 'main'" in result.stdout
+        assert "currently on 'integration'" in result.stdout
+
+    def test_mark_only_allowed_from_non_default_branch(self, tmp_path: Path):
+        """--mark-only bypasses the default-branch guard since it only updates the DB."""
+        store, git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Mark only from non-default", "feature/test-mark-only-non-default",
+        )
+
+        git._run("checkout", "-b", "integration")
+
+        result = run_gza(
+            "merge", str(task.id), "--mark-only", "--project", str(tmp_path), cwd=tmp_path,
+        )
+
+        assert result.returncode == 0
+        assert "Marked task" in result.stdout
+        assert "--mark-only on non-default branch 'integration'" in result.stdout
+        assert "default is 'main'" in result.stdout
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.merge_status == "merged"
 
 
     def test_squash_merge_creates_commit(self, tmp_path: Path):
