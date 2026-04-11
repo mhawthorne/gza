@@ -60,7 +60,7 @@ Based on the analysis, provide a prioritized list of specific, actionable sugges
 
 **For failed tasks:**
 - "Retry failed task gza-n — it failed due to a missing module, which may now be installed"
-- "Investigate task gza-p failure: check the log with `uv run gza log gza-p --task`"
+- "Investigate task gza-p failure: check the log with `uv run gza log gza-p`"
 
 **For pending tasks:**
 - "Run `uv run gza work` to start the next pending task: gza-v (implement CSV export)"

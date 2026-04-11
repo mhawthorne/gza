@@ -26,7 +26,7 @@ Run these commands with the provided task ID:
 
 ```bash
 uv run gza show <TASK_ID>
-uv run gza log --task <TASK_ID>
+uv run gza log <TASK_ID>
 uv run gza history --type plan --limit 10
 ```
 
@@ -99,7 +99,7 @@ Produce a concise report with:
 - Concrete next steps with owners and commands when possible
 - Reference existing gza commands to continue workflow:
   - `uv run gza show <TASK_ID>`
-  - `uv run gza log --task <TASK_ID>`
+  - `uv run gza log <TASK_ID>`
   - `uv run gza implement <TASK_ID> [--review] "..."`
   - `uv run gza add --type plan "..."` (for remediation planning)
 
@@ -113,7 +113,7 @@ Plan Review: Task <TASK_ID>
 Task Context
 - Type/Status: <type> / <status>
 - Prompt: <prompt>
-- Inspected with: gza show, gza log --task, gza history --type plan
+- Inspected with: gza show, gza log, gza history --type plan
 
 Quality Gate
 - Scope clarity: <Pass|Needs work|Fail> - <evidence>

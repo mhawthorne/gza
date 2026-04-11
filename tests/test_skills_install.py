@@ -299,6 +299,24 @@ class TestSkillContentValidation:
     @pytest.mark.parametrize(
         "skill_name",
         [
+            "gza-plan-review",
+            "gza-task-review",
+            "gza-summary",
+        ],
+    )
+    def test_skill_examples_do_not_use_unsupported_gza_log_task_flag(self, skill_name: str):
+        """Skill docs should not include invalid `gza log ... --task` guidance."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "gza log --task" not in content
+        assert "gza log gza-p --task" not in content
+
+    @pytest.mark.parametrize(
+        "skill_name",
+        [
             "gza-task-run",
             "gza-task-review",
             "gza-plan-review",

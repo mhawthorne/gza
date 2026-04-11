@@ -104,7 +104,7 @@ Use `/gza-summary` for a quick status overview: what completed recently, what's 
 - Runs `uv run gza history`, `uv run gza unmerged`, and `uv run gza next` to collect current state
 - Highlights failed tasks, unmerged branches, and blocked pending tasks
 - For plan/explore/review tasks, includes the report file path so you can open it directly
-- Suggests specific commands to run (e.g., `uv run gza work`, `git merge`, `uv run gza log gza-p --task`)
+- Suggests specific commands to run (e.g., `uv run gza work`, `git merge`, `uv run gza log gza-p`)
 
 **Output sections:**
 

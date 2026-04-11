@@ -86,7 +86,7 @@ Gather additional context about the task:
 
 ```bash
 uv run gza show <IMPL_TASK_ID>
-uv run gza log --task <IMPL_TASK_ID>
+uv run gza log <IMPL_TASK_ID>
 ```
 
 ### Step 4: Run the review

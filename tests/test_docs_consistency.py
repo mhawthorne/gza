@@ -29,18 +29,41 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
 
     required_snippets = [
         "| `task_id` | Specific full prefixed task ID(s) to run",
+        "| `--based-on ID` | Base on previous task by full prefixed task ID",
+        "| `--depends-on ID` | Set dependency on another task by full prefixed task ID",
+        "| `task_id` | Full prefixed task ID to edit",
+        "| `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID",
+        "| `--depends-on ID` | Set execution dependency using a full prefixed task ID",
         "| `task_id` | Full prefixed task ID to kill",
         "| `task_id` | Full prefixed task ID to mark as completed",
         "| `task_id` | Full prefixed task ID(s) to merge",
         "| `task_id_or_branch` | Full prefixed task ID or branch name to checkout",
         "| `task_id` | Full prefixed task ID to diff",
+        "| `task_id` | Full prefixed task ID for the completed task to open as a PR",
+        "| `task_id` | Full prefixed task ID to delete",
+        "| `task_id` | Full prefixed task ID to show",
+        "| `task_id` | Full prefixed task ID to resume",
+        "| `task_id` | Full prefixed task ID to retry",
+        "| `task_id` | Full prefixed task ID to rebase",
         "| `impl_task_id` | Full prefixed task ID (implement, improve, or review",
+        "| `--review-id ID` | Explicit full prefixed review task ID to base the improve on",
         "| `task_id` | Full prefixed task ID (implement, improve, or review",
         "| `plan_task_id` | Full prefixed completed plan task ID to implement",
+        "| `--depends-on ID` | Set dependency on another task by full prefixed task ID",
         "| `task_id` | Specific full prefixed task ID to advance",
         "| `impl_task_id` | Full prefixed implementation task ID to cycle",
         "| `task_id` | Full prefixed task ID to refresh",
+        "`task_id` must be a full prefixed task ID (for example `gza-1a2b`).",
     ]
 
     for snippet in required_snippets:
         assert snippet in config_content
+
+
+def test_skills_docs_do_not_advertise_unsupported_gza_log_task_flag() -> None:
+    """docs/skills.md examples should avoid invalid gza log --task invocations."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    skills_content = (docs_root / "skills.md").read_text()
+
+    assert "gza log --task" not in skills_content
+    assert "gza log gza-p --task" not in skills_content

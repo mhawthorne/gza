@@ -447,8 +447,8 @@ gza add [prompt] [options]
 | `--branch-type TYPE` | Set branch type hint for naming |
 | `--explore` | Create explore task (shorthand) |
 | `--group NAME` | Set task group |
-| `--based-on ID` | Base on previous task |
-| `--depends-on ID` | Set dependency on another task |
+| `--based-on ID` | Base on previous task by full prefixed task ID (e.g. `gza-1a2b`) |
+| `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1a2b`) |
 | `--review` | Auto-create review task on completion |
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
@@ -467,9 +467,10 @@ gza edit <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID to edit (e.g. `gza-1a2b`) |
 | `--group NAME` | Move task to group (empty `""` removes) |
-| `--based-on ID` | Set lineage/parent relationship (branch inheritance and context) |
-| `--depends-on ID` | Set execution dependency (blocks task until dependency completes) |
+| `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID (branch inheritance and context; e.g. `gza-1a2b`) |
+| `--depends-on ID` | Set execution dependency using a full prefixed task ID (blocks task until dependency completes; e.g. `gza-1a2b`) |
 | `--explore` | Convert to explore task |
 | `--task` | Convert to regular task |
 | `--review` | Enable automatic review task creation on completion |
@@ -527,6 +528,7 @@ gza pr <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID for the completed task to open as a PR (e.g. `gza-1a2b`) |
 | `--title TITLE` | Override auto-generated PR title |
 | `--draft` | Create as draft PR |
 
@@ -540,6 +542,7 @@ gza delete <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID to delete (e.g. `gza-1a2b`) |
 | `--yes`, `-y` | Skip confirmation prompt |
 | `--force`, `-f` | Deprecated alias for `--yes` |
 
@@ -649,6 +652,7 @@ gza show <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID to show (e.g. `gza-1a2b`) |
 | `--full` | Show full output without truncation |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--prompt`, `--output`, and `--path` modes |
 
@@ -662,6 +666,7 @@ gza resume <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID to resume (e.g. `gza-1a2b`) |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--background`, `-b` | Run worker in background |
 | `--queue`, `-q` | Add task to queue without executing immediately |
@@ -677,6 +682,7 @@ gza retry <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID to retry (e.g. `gza-1a2b`) |
 | `--no-docker` | Run Claude directly instead of in Docker (only with --background) |
 | `--background`, `-b` | Run worker in background |
 | `--queue`, `-q` | Add task to queue without executing immediately |
@@ -805,6 +811,7 @@ gza rebase <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
+| `task_id` | Full prefixed task ID to rebase (e.g. `gza-1a2b`) |
 | `--onto BRANCH` | Branch to rebase onto (defaults to current branch) |
 | `--remote` | Fetch from origin and rebase against remote target branch |
 | `--resolve` | Auto-resolve rebase conflicts using `/gza-rebase` in the active provider runtime |
@@ -849,6 +856,7 @@ gza improve <impl_task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `impl_task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1a2b`) |
+| `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1a2b`) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
@@ -905,7 +913,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `prompt` | Implementation prompt (defaults to plan-derived prompt) |
 | `--review` | Auto-create review task on completion |
 | `--group NAME` | Set task group |
-| `--depends-on ID` | Set dependency on another task |
+| `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1a2b`) |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
 | `--model MODEL` | Override model for this task |
@@ -1016,6 +1024,8 @@ Manually force a task's status.
 gza set-status <task_id> <status>
 ```
 
+`task_id` must be a full prefixed task ID (for example `gza-1a2b`).
+
 Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
 
 ### sync-report
@@ -1025,6 +1035,10 @@ Sync report file content from disk into the database `output_content` field. Use
 ```bash
 gza sync-report <task_id>
 ```
+
+`task_id` must be a full prefixed task ID (for example `gza-1a2b`).
+
+Examples use `gza-1a2b`, but validation is format-based (`{prefix}-{base36}`): widths/padding can vary.
 
 ---
 
