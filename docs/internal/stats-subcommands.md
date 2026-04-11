@@ -30,8 +30,8 @@ The three-way priority for determining the start date:
 ### Output
 
 - Summary header: implement task count, total reviews, reviewed fraction.
-- Weekly table: week range, impl count, review count, review %, median/P90/max cycles.
-- Cycle distribution: histogram of how many impls had 1, 2, 3, … review cycles.
+- Weekly table: week range, impl count, review count, review %, median/P90/max number of reviews per impl.
+- Reviews-per-implementation distribution: histogram of how many impls had 1, 2, 3, … reviews.
 - Per-model section: when `--issues` is passed, must-fix and suggestion counts parsed from review content.
 
 ### Notes

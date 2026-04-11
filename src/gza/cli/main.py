@@ -463,7 +463,7 @@ def main() -> int:
 
     # stats reviews subcommand
     stats_reviews_parser = stats_subs.add_parser(
-        "reviews", help="Show review/improve cycle stats per implementation task"
+        "reviews", help="Show review count stats per implementation task"
     )
     add_common_args(stats_reviews_parser)
     stats_reviews_parser.add_argument(
@@ -489,6 +489,12 @@ def main() -> int:
         dest="end_date",
         metavar="YYYY-MM-DD",
         help="Show only tasks on or before this date",
+    )
+    stats_reviews_parser.add_argument(
+        "--all",
+        dest="all_time",
+        action="store_true",
+        help="Show stats across all time (ignore --days/--start-date/--end-date)",
     )
 
     # validate command

@@ -11,6 +11,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import median
 
+from rich.table import Table
+
 from ..config import Config
 from ..console import console
 from ..db import SqliteTaskStore, Task
@@ -86,8 +88,9 @@ def _cmd_stats_reviews(
     start_date: date,
     end_date: date,
     show_issues: bool,
+    all_time: bool = False,
 ) -> int:
-    """Show review/improve cycle stats per implementation task."""
+    """Show review count stats per implementation task."""
     all_tasks = store.get_all()
     tasks_by_id = {t.id: t for t in all_tasks if t.id is not None}
 
@@ -135,6 +138,7 @@ def _cmd_stats_reviews(
     ri_tasks = [
         t for t in all_tasks
         if t.task_type in ("review", "improve")
+        and t.status == "completed"
         and (t.based_on is not None or t.depends_on is not None)
         and _task_dt(t) is not None
         and start_dt <= _task_dt(t) < end_dt  # type: ignore
@@ -156,7 +160,8 @@ def _cmd_stats_reviews(
                 root_reviews[root].append(dt)
                 root_review_models[root].append(ri.model)
 
-    # Find all root implement tasks in range
+    # Find all root implement tasks in range (only count completed ones —
+    # pending/failed impls can't meaningfully be "reviewed or not")
     root_impls_in_range: list[Task] = []
     seen_roots: set[str] = set()
     for t in all_tasks:
@@ -167,13 +172,23 @@ def _cmd_stats_reviews(
             continue
         root = find_root_impl(t.id)  # type: ignore
         if root is not None and root not in seen_roots:
-            seen_roots.add(root)
             root_impl = tasks_by_id.get(root)
-            if root_impl is not None:
+            if root_impl is not None and root_impl.status == "completed":
+                seen_roots.add(root)
                 root_impls_in_range.append(root_impl)
 
     total_impls = len(root_impls_in_range)
-    total_reviews = sum(len(dates) for dates in root_reviews.values())
+    total_improves = sum(
+        1
+        for t in all_tasks
+        if t.task_type == "improve"
+        and t.status == "completed"
+        and _task_dt(t) is not None
+        and start_dt <= _task_dt(t) < end_dt  # type: ignore
+    )
+    total_reviews = sum(
+        len(dates) for root_id, dates in root_reviews.items() if root_id in seen_roots
+    )
     reviewed_impls = {r for r in root_reviews if r in seen_roots}
     review_pct = (len(reviewed_impls) / total_impls * 100) if total_impls else 0
 
@@ -198,10 +213,12 @@ def _cmd_stats_reviews(
 
     sorted_weeks = sorted(week_data.keys(), key=week_sort_key)
 
-    print(f"\nReview cycle stats ({start_date} to {end_date})")
-    print(f"  Implement tasks: {total_impls}")
-    print(f"  Total reviews:   {total_reviews}")
-    print(f"  Reviewed:        {len(reviewed_impls)}/{total_impls} ({review_pct:.0f}%)")
+    header_range = "all time" if all_time else f"{start_date} to {end_date}"
+    print(f"\nReview stats ({header_range})")
+    print(f"Implement tasks: {total_impls}")
+    print(f"Improve tasks:   {total_improves}")
+    print(f"Review tasks:    {total_reviews}")
+    print(f"Reviewed:        {len(reviewed_impls)}/{total_impls} ({review_pct:.0f}%)")
 
     print(f"\n{'Week':<22} {'Impls':>5} {'Rvws':>5} {'Rv%':>5} {'Med':>5} {'P90':>5} {'Max':>5}")
     print("-" * 56)
@@ -237,15 +254,17 @@ def _cmd_stats_reviews(
         else:
             print(f"{'Total':<22} {total_row_impls:>5} {total_row_reviews:>5} {rv_pct:>4.0f}%     -     -     -")
 
-    # Cycle distribution
+    # Review count distribution
     if all_reviewed_cycles:
         dist = Counter(all_reviewed_cycles)
         total = len(all_reviewed_cycles)
-        print("\nCycle distribution (reviewed tasks only):")
+        print("\nReviews per implementation (reviewed tasks only):")
         for cnt in sorted(dist.keys()):
             pct = dist[cnt] / total * 100
             bar = "#" * dist[cnt]
-            print(f"  {cnt} cycles: {dist[cnt]:>3} ({pct:4.0f}%)  {bar}")
+            label = "review" if cnt == 1 else "reviews"
+            left = f"{cnt} {label}:"
+            print(f"  {left:<12}{dist[cnt]:>3} ({pct:3.0f}%)  {bar}")
 
     # Per-model review cycle stats
     model_cycles: dict[str, list[int]] = defaultdict(list)
@@ -259,12 +278,94 @@ def _cmd_stats_reviews(
     def _cycle_stats_str(vals: list[int]) -> str:
         return f"{int(median(vals))}/{_percentile(vals, 75)}/{_percentile(vals, 90)}/{max(vals)}"
 
+    def _model_breakdown_table(
+        title: str,
+        model_label: str,
+        data: dict[str, list[int]],
+    ) -> Table:
+        total = sum(len(v) for v in data.values())
+        table = Table(title=title, title_justify="left", title_style="bold")
+        table.add_column(model_label)
+        table.add_column("Impls", justify="right")
+        table.add_column("Pct", justify="right")
+        table.add_column("med/p75/p90/max", justify="right")
+        for model in sorted(data):
+            cycles_sorted = sorted(data[model])
+            n = len(cycles_sorted)
+            pct = (n / total * 100) if total else 0
+            table.add_row(
+                model,
+                str(n),
+                f"{pct:.0f}%",
+                _cycle_stats_str(cycles_sorted),
+            )
+        return table
+
     if model_cycles:
-        print(f"\n{'Review model':<35} {'Impls':>5}  {'med/p75/p90/max':>16}")
-        print("-" * 60)
-        for model in sorted(model_cycles):
-            cycles_sorted = sorted(model_cycles[model])
-            print(f"{model:<35} {len(cycles_sorted):>5}  {_cycle_stats_str(cycles_sorted):>16}")
+        console.print()
+        console.print(_model_breakdown_table("Review model", "Review model", model_cycles))
+
+    # Per-implementer-model review cycle stats
+    impl_model_cycles: dict[str, list[int]] = defaultdict(list)
+    for root_id in reviewed_impls:
+        root_impl = tasks_by_id.get(root_id)
+        if root_impl is None:
+            continue
+        impl_model = root_impl.model or "unknown"
+        impl_model_cycles[impl_model].append(len(root_reviews[root_id]))
+
+    if impl_model_cycles:
+        console.print()
+        console.print(
+            _model_breakdown_table("Implement model", "Implement model", impl_model_cycles)
+        )
+
+    # Per-pair (implement model × review model) cycle stats
+    pair_cycles: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for root_id in reviewed_impls:
+        root_impl = tasks_by_id.get(root_id)
+        if root_impl is None:
+            continue
+        impl_model = root_impl.model or "unknown"
+        rv_models = root_review_models.get(root_id, [])
+        rv_counts = Counter(m for m in rv_models if m)
+        rv_model = rv_counts.most_common(1)[0][0] if rv_counts else "unknown"
+        pair_cycles[(impl_model, rv_model)].append(len(root_reviews[root_id]))
+
+    if pair_cycles:
+        total_pairs = sum(len(v) for v in pair_cycles.values())
+        overall_median = median(all_reviewed_cycles) if all_reviewed_cycles else 0
+        pair_table = Table(
+            title="Implement → review pairs",
+            title_justify="left",
+            title_style="bold",
+        )
+        pair_table.add_column("Implement model")
+        pair_table.add_column("Review model")
+        pair_table.add_column("Impls", justify="right")
+        pair_table.add_column("Pct", justify="right")
+        pair_table.add_column("med/p75/p90/max", justify="right")
+        pair_table.add_column("vs med", justify="right")
+        sorted_pairs = sorted(
+            pair_cycles.items(),
+            key=lambda kv: (median(kv[1]), -len(kv[1])),
+        )
+        for (impl_m, rv_m), cycles in sorted_pairs:
+            cycles_sorted = sorted(cycles)
+            n = len(cycles_sorted)
+            pct = (n / total_pairs * 100) if total_pairs else 0
+            delta = median(cycles_sorted) - overall_median
+            delta_str = f"{delta:+.1f}" if delta else "0"
+            pair_table.add_row(
+                impl_m,
+                rv_m,
+                str(n),
+                f"{pct:.0f}%",
+                _cycle_stats_str(cycles_sorted),
+                delta_str,
+            )
+        console.print()
+        console.print(pair_table)
 
     # Per-model issue counts (--issues mode)
     if show_issues:
@@ -337,18 +438,25 @@ def cmd_stats(args: argparse.Namespace) -> int:
     # reviews subcommand
     if stats_subcommand == "reviews":
         today = date.today()
-        raw_end: str | None = getattr(args, 'end_date', None)
-        raw_start: str | None = getattr(args, 'start_date', None)
-        raw_days: int | None = getattr(args, 'days', None)
-        end_date_r = datetime.strptime(raw_end, "%Y-%m-%d").date() if raw_end else today
-        if raw_start:
-            start_date_r = datetime.strptime(raw_start, "%Y-%m-%d").date()
-        elif raw_days:
-            start_date_r = end_date_r - timedelta(days=raw_days)
+        all_time: bool = getattr(args, 'all_time', False)
+        if all_time:
+            start_date_r = date.min
+            end_date_r = today
         else:
-            start_date_r = end_date_r - timedelta(days=14)
+            raw_end: str | None = getattr(args, 'end_date', None)
+            raw_start: str | None = getattr(args, 'start_date', None)
+            raw_days: int | None = getattr(args, 'days', None)
+            end_date_r = datetime.strptime(raw_end, "%Y-%m-%d").date() if raw_end else today
+            if raw_start:
+                start_date_r = datetime.strptime(raw_start, "%Y-%m-%d").date()
+            elif raw_days:
+                start_date_r = end_date_r - timedelta(days=raw_days)
+            else:
+                start_date_r = end_date_r - timedelta(days=14)
         show_issues: bool = getattr(args, 'issues', False)
-        return _cmd_stats_reviews(config, store, start_date_r, end_date_r, show_issues)
+        return _cmd_stats_reviews(
+            config, store, start_date_r, end_date_r, show_issues, all_time=all_time
+        )
 
     return 0
 

@@ -1236,7 +1236,7 @@ class TestStatsReviewsCommand:
 
         assert result.returncode == 0
         assert "Implement tasks: 0" in result.stdout
-        assert "Total reviews:   0" in result.stdout
+        assert "Review tasks:    0" in result.stdout
 
     def test_stats_reviews_shows_table_header(self, tmp_path: Path):
         """gza stats reviews output includes the weekly table header."""
@@ -1270,7 +1270,7 @@ class TestStatsReviewsCommand:
 
         assert result.returncode == 0
         assert "Implement tasks: 1" in result.stdout
-        assert "Total reviews:   1" in result.stdout
+        assert "Review tasks:    1" in result.stdout
         assert "Reviewed:        1/1" in result.stdout
 
     def test_stats_reviews_unreviewed_impl(self, tmp_path: Path):
@@ -1288,7 +1288,7 @@ class TestStatsReviewsCommand:
 
         assert result.returncode == 0
         assert "Implement tasks: 1" in result.stdout
-        assert "Total reviews:   0" in result.stdout
+        assert "Review tasks:    0" in result.stdout
         assert "Reviewed:        0/1" in result.stdout
 
     def test_stats_reviews_cycle_distribution(self, tmp_path: Path):
@@ -1310,7 +1310,7 @@ class TestStatsReviewsCommand:
         result = run_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Cycle distribution" in result.stdout
+        assert "Reviews per implementation" in result.stdout
 
     def test_stats_reviews_days_filter(self, tmp_path: Path):
         """gza stats reviews --days 7 restricts to last 7 days."""
