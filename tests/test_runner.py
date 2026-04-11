@@ -24,7 +24,6 @@ from gza.runner import (
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
     _extract_review_verdict,
-    _extract_slug_suffix,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
     _run_non_code_task,
@@ -895,6 +894,46 @@ class TestReviewTaskSlugGeneration:
             gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review
 
+    def test_review_task_strips_nested_derived_implement_prefixes(self, tmp_path: Path):
+        """Auto-created reviews keep only semantic slug for nested derived implement slugs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="testproject")
+
+        impl_task = store.add(
+            prompt="Add feature",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.slug = "20260410-bb-impl-aa-impl-add-feature"
+        store.update(impl_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        def mock_run(config, task_id):
+            return 0
+
+        def mock_post_review_to_pr(*args, **kwargs):
+            pass
+
+        import gza.runner
+        original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
+        gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
+
+        try:
+            _create_and_run_review_task(impl_task, config, store)
+
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
+            assert review_task is not None
+            assert review_task.prompt == "review add-feature"
+        finally:
+            gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
+
     def test_review_task_fallback_without_task_id(self, tmp_path: Path):
         """Test that review task falls back gracefully if task_id is not set."""
         db_path = tmp_path / "test.db"
@@ -1109,19 +1148,6 @@ class TestReviewTaskSlugGeneration:
             assert run_calls == [review_task.id], "run() must be called exactly once with the pending review"
         finally:
             gza.runner.run = original_run
-
-
-class TestExtractSlugSuffix:
-    """Tests for _extract_slug_suffix helper."""
-
-    def test_strips_date_prefix(self):
-        assert _extract_slug_suffix("20260129-add-docker-volumes") == "add-docker-volumes"
-
-    def test_strips_date_prefix_and_retry_suffix(self):
-        assert _extract_slug_suffix("20260129-fix-auth-bug-2") == "fix-auth-bug"
-
-    def test_no_dash_returns_original(self):
-        assert _extract_slug_suffix("nodash") == "nodash"
 
 
 class TestGenerateSlugSlugOverride:

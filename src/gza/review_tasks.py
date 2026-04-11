@@ -1,11 +1,9 @@
 """Shared helpers for creating review tasks."""
-
-import re
 from typing import Literal
 
 from .db import SqliteTaskStore, Task
 from .prompts import PromptBuilder
-from .task_slug import get_base_task_slug
+from .task_slug import get_base_task_slug, strip_derived_implement_prefixes
 
 
 class DuplicateReviewError(ValueError):
@@ -37,7 +35,7 @@ def build_auto_review_prompt(impl_task: Task, project_prefix: str | None = None)
                 slug = slug[len(project_prefix) + 1:]
             # Derived implement slugs are now "<task_id_suffix>-impl-<semantic-slug>".
             # Auto-review prompts should keep only the semantic subject.
-            slug = re.sub(r"^[a-z0-9]+-impl-", "", slug)
+            slug = strip_derived_implement_prefixes(slug)
             return f"review {slug}"
 
     review_prompt = f"Review task #{impl_task.id}"

@@ -72,6 +72,11 @@ class TestBuildAutoReviewPrompt:
         result = build_auto_review_prompt(task)
         assert result == "review add-authentication-system"
 
+    def test_slug_strips_nested_derived_implement_prefixes(self):
+        task = _task(slug="20260410-bb-impl-aa-impl-add-feature")
+        result = build_auto_review_prompt(task)
+        assert result == "review add-feature"
+
     def test_fallback_when_no_task_id(self):
         task = _task(id=5, slug=None, prompt="build the thing")
         result = build_auto_review_prompt(task)

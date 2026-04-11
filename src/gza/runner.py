@@ -38,6 +38,7 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task
 from .review_verdict import parse_review_verdict
+from .task_slug import get_base_task_slug
 
 logger = logging.getLogger(__name__)
 
@@ -367,17 +368,6 @@ def generate_slug(
 
 
 
-def _extract_slug_suffix(slug: str) -> str:
-    """Extract the non-date portion from a slug (strips date prefix and retry suffix)."""
-    parts = slug.split('-', 1)
-    if len(parts) == 2:
-        suffix = parts[1]
-        # Remove retry suffix (-2, -3, etc.)
-        suffix = re.sub(r'-\d+$', '', suffix)
-        return suffix
-    return slug
-
-
 def _extract_task_id_suffix(task_id: str | None) -> str:
     """Extract the suffix portion from a task id like ``prefix-suffix``."""
     if not task_id:
@@ -417,7 +407,7 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
         anchor_id = task.based_on or task.depends_on
 
     anchor_task = store.get(anchor_id) if anchor_id is not None else None
-    target_slug = _extract_slug_suffix(anchor_task.slug) if anchor_task and anchor_task.slug else slugify(
+    target_slug = get_base_task_slug(anchor_task.slug) if anchor_task and anchor_task.slug else slugify(
         anchor_task.prompt if anchor_task else task.prompt
     )
     task_id_suffix = _extract_task_id_suffix(task.id)
