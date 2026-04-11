@@ -84,7 +84,7 @@ def main() -> int:
         "task_ids",
         nargs="*",
         type=str,
-        help="Specific full task ID(s) to run (optional, can specify multiple)",
+        help="Specific full prefixed task ID(s) to run (optional, can specify multiple)",
     )
     add_common_args(work_parser)
     work_parser.add_argument(
@@ -133,7 +133,7 @@ def main() -> int:
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task's tmux session")
     attach_parser.add_argument(
         "worker_id",
-        help="Worker ID (e.g. w-20260301-1) or full task ID (e.g. gza-000001) to attach to",
+        help="Worker ID (e.g. w-20260301-1) or full prefixed task ID (e.g. gza-000001) to attach to",
     )
     add_common_args(attach_parser)
 
@@ -226,7 +226,7 @@ def main() -> int:
         type=str,
         nargs="?",
         metavar="task_id",
-        help="Specific full task ID to advance (omit to advance all eligible tasks)",
+        help="Specific full prefixed task ID to advance (omit to advance all eligible tasks)",
     )
     advance_parser.add_argument(
         "--dry-run",
@@ -327,7 +327,7 @@ def main() -> int:
         type=str,
         nargs="?",
         metavar="task_id",
-        help="Full task ID to refresh (omit to refresh all unmerged tasks)",
+        help="Full prefixed task ID to refresh (omit to refresh all unmerged tasks)",
     )
     refresh_group.add_argument(
         "--include-failed",
@@ -343,7 +343,7 @@ def main() -> int:
         type=str,
         nargs="*",
         metavar="task_id",
-        help="Full task ID(s) to merge",
+        help="Full prefixed task ID(s) to merge",
     )
     merge_parser.add_argument(
         "--all",
@@ -387,7 +387,7 @@ def main() -> int:
     rebase_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to rebase",
+        help="Full prefixed task ID to rebase",
     )
     rebase_parser.add_argument(
         "--onto",
@@ -419,7 +419,7 @@ def main() -> int:
     checkout_parser = subparsers.add_parser("checkout", help="Checkout a task's branch, removing stale worktree if needed")
     checkout_parser.add_argument(
         "task_id_or_branch",
-        help="Full task ID or branch name to checkout",
+        help="Full prefixed task ID or branch name to checkout",
     )
     checkout_parser.add_argument(
         "--force", "-f",
@@ -442,7 +442,7 @@ def main() -> int:
     pr_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to create PR from",
+        help="Full prefixed task ID to create PR from",
     )
     pr_parser.add_argument(
         "--title",
@@ -573,7 +573,7 @@ def main() -> int:
     log_parser = subparsers.add_parser("log", help="Display log for a task or worker")
     log_parser.add_argument(
         "identifier",
-        help="Full task ID, slug, or worker ID",
+        help="Full prefixed task ID, slug, or worker ID",
     )
     log_parser.add_argument(
         "--slug", "-s",
@@ -718,7 +718,7 @@ def main() -> int:
     edit_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to edit",
+        help="Full prefixed task ID to edit",
     )
     edit_parser.add_argument(
         "--group",
@@ -813,7 +813,7 @@ def main() -> int:
     delete_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to delete",
+        help="Full prefixed task ID to delete",
     )
     delete_parser.add_argument(
         "--force", "-f",
@@ -832,7 +832,7 @@ def main() -> int:
     retry_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to retry",
+        help="Full prefixed task ID to retry",
     )
     retry_parser.add_argument(
         "--no-docker",
@@ -862,7 +862,7 @@ def main() -> int:
     resume_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to resume",
+        help="Full prefixed task ID to resume",
     )
     resume_parser.add_argument(
         "--no-docker",
@@ -892,7 +892,7 @@ def main() -> int:
     improve_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID (implement, improve, or review — auto-resolves to root implementation)",
+        help="Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     improve_parser.add_argument(
         "--review",
@@ -986,7 +986,7 @@ def main() -> int:
     implement_parser.add_argument(
         "plan_task_id",
         type=str,
-        help="Completed plan full task ID to implement",
+        help="Completed plan full prefixed task ID to implement",
     )
     implement_parser.add_argument(
         "prompt",
@@ -1067,7 +1067,7 @@ def main() -> int:
     review_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID (implement, improve, or review — auto-resolves to root implementation)",
+        help="Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation)",
     )
     review_parser.add_argument(
         "--queue", "-q",
@@ -1118,7 +1118,7 @@ def main() -> int:
     lineage_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to show lineage for",
+        help="Full prefixed task ID to show lineage for",
     )
     add_common_args(lineage_parser)
 
@@ -1127,7 +1127,7 @@ def main() -> int:
     show_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to show",
+        help="Full prefixed task ID to show",
     )
     show_parser.add_argument(
         "--full",
@@ -1170,7 +1170,7 @@ def main() -> int:
         type=str,
         nargs="?",
         default=None,
-        help="Full task ID to sync (optional if --all is used)",
+        help="Full prefixed task ID to sync (optional if --all is used)",
     )
     sync_report_parser.add_argument(
         "--all",
@@ -1252,7 +1252,7 @@ def main() -> int:
         "task_id",
         nargs="?",
         type=str,
-        help="Full task ID to kill (optional if --all is used)",
+        help="Full prefixed task ID to kill (optional if --all is used)",
     )
     kill_parser.add_argument(
         "--all",
@@ -1274,7 +1274,7 @@ def main() -> int:
     mark_completed_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to mark as completed",
+        help="Full prefixed task ID to mark as completed",
     )
     mark_completed_mode_group = mark_completed_parser.add_mutually_exclusive_group()
     mark_completed_mode_group.add_argument(
@@ -1297,7 +1297,7 @@ def main() -> int:
     set_status_parser.add_argument(
         "task_id",
         type=str,
-        help="Full task ID to update",
+        help="Full prefixed task ID to update",
     )
     set_status_parser.add_argument(
         "status",

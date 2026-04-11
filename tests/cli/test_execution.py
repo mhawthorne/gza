@@ -2104,6 +2104,43 @@ class TestImproveCommand:
         assert improve_task is not None
         assert improve_task.depends_on == older_review.id
 
+    def test_improve_review_id_flag_trims_whitespace_and_reports_canonical_id(self, tmp_path: Path):
+        """--review-id should be normalized via shared full-ID resolution."""
+        import time
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        selected_review = store.add("Selected review", task_type="review", depends_on=impl_task.id)
+        selected_review.status = "completed"
+        selected_review.completed_at = datetime.now(UTC)
+        store.update(selected_review)
+
+        time.sleep(0.01)
+        newer_review = store.add("Newer review", task_type="review", depends_on=impl_task.id)
+        newer_review.status = "completed"
+        newer_review.completed_at = datetime.now(UTC)
+        store.update(newer_review)
+
+        result = run_gza(
+            "improve", str(impl_task.id),
+            "--review-id", f"  {selected_review.id}\t",
+            "--queue",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 0, result.stdout
+        assert f"Review: {selected_review.id}" in result.stdout
+
+        improve_task = next(task for task in store.get_all() if task.task_type == "improve")
+        assert improve_task is not None
+        assert improve_task.depends_on == selected_review.id
+
     def test_improve_review_id_flag_rejects_review_of_different_impl(self, tmp_path: Path):
         """--review-id must belong to the same implementation task."""
         from gza.db import SqliteTaskStore
@@ -2163,13 +2200,10 @@ class TestImproveCommand:
         assert result.returncode == 1
         assert "not a review" in result.stdout
 
-    def test_improve_review_id_flag_rejects_nonexistent_review(self, tmp_path: Path):
-        """--review-id must refer to an existing task."""
-        from gza.db import SqliteTaskStore
-
+    @pytest.mark.parametrize("invalid_review_id", ["9999", "42"])
+    def test_improve_review_id_flag_rejects_shorthand_ids(self, tmp_path: Path, invalid_review_id: str):
+        """--review-id must require full prefixed task IDs (no numeric shorthand)."""
         setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
         store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
@@ -2179,13 +2213,13 @@ class TestImproveCommand:
 
         result = run_gza(
             "improve", str(impl_task.id),
-            "--review-id", "9999",
+            "--review-id", invalid_review_id,
             "--queue",
             "--project", str(tmp_path),
         )
 
         assert result.returncode == 1
-        assert "Review task 9999 not found" in result.stdout
+        assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
 
 class TestReviewCommand:

@@ -816,18 +816,19 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     review_id_override = getattr(args, "review_id", None)
     if review_id_override is not None:
-        review_task = store.get(review_id_override)
+        resolved_review_id = resolve_id(config, review_id_override)
+        review_task = store.get(resolved_review_id)
         if review_task is None:
-            print(f"Error: Review task {review_id_override} not found.")
+            print(f"Error: Review task {resolved_review_id} not found.")
             return 1
         if review_task.task_type != "review":
             print(
-                f"Error: Task {review_id_override} is a {review_task.task_type} task, not a review."
+                f"Error: Task {resolved_review_id} is a {review_task.task_type} task, not a review."
             )
             return 1
         if review_task.depends_on != impl_task.id:
             print(
-                f"Error: Review {review_id_override} reviews task {review_task.depends_on}, "
+                f"Error: Review {resolved_review_id} reviews task {review_task.depends_on}, "
                 f"not implementation {impl_task.id}."
             )
             return 1
