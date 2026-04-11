@@ -64,11 +64,7 @@ def build_auto_review_prompt(
     than "review myproj-add-feature").
     """
     if impl_task.slug:
-        parts = impl_task.slug.split("-", 1)
-        if len(parts) == 2:
-            slug = get_base_task_slug(impl_task.slug)
-        else:
-            slug = None
+        slug = get_base_task_slug(impl_task.slug) if "-" in impl_task.slug else None
         if slug:
             # Derived implement slugs are "<task_id_suffix>-impl-<semantic-slug>".
             # Normalize first, then optionally strip project_prefix from semantic tail.

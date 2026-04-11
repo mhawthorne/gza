@@ -408,6 +408,10 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
                 anchor_id,
             )
 
+    # get_base_task_slug strips the YYYYMMDD date prefix and any trailing
+    # "-N" revision suffix from the anchor task's slug. The returned override
+    # has no date prefix; generate_slug re-prepends today's date later, so
+    # passing a bare override keeps the final slug from gaining a double date.
     target_slug = (
         get_base_task_slug(anchor_task.slug)
         if anchor_task and anchor_task.slug
