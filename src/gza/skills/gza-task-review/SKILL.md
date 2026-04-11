@@ -12,7 +12,7 @@ Run an interactive code review for a specific gza task. Produces structured revi
 
 ## Inputs
 
-- Required: full prefixed task ID (for example, `gza-1a2b`)
+- Required: full prefixed task ID (for example, `gza-1234`)
 - Optional: `--pr` — also post the review as a PR comment
 
 If the user did not provide a task ID, ask for it before proceeding.

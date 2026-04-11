@@ -11,7 +11,9 @@ from ..db import (
     SqliteTaskStore,
     check_migration_status,
     preview_v25_migration,
+    preview_v26_migration,
     run_v25_migration,
+    run_v26_migration,
 )
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
 from ._common import (
@@ -133,7 +135,7 @@ def main() -> int:
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task's tmux session")
     attach_parser.add_argument(
         "worker_id",
-        help="Worker ID (e.g. w-20260301-1) or full prefixed task ID (e.g. gza-1a2b) to attach to",
+        help="Worker ID (e.g. w-20260301-1) or full prefixed task ID (e.g. gza-1234) to attach to",
     )
     add_common_args(attach_parser)
 
@@ -1330,7 +1332,7 @@ def main() -> int:
     # migrate command
     migrate_parser = subparsers.add_parser(
         "migrate",
-        help="Run pending manual database migrations (e.g. v25: INTEGER → TEXT IDs)",
+        help="Run pending manual database migrations (e.g. v25/v26 task ID migrations)",
     )
     migrate_parser.add_argument(
         "--status",
@@ -1508,27 +1510,68 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
         versions_str = ", ".join(f"v{v}" for v in pending_manual)
         print(f"Dry-run: would apply migration(s): {versions_str}")
         print(f"Database: {config.db_path}")
+        v25_task_count_cache: int | None = None
+        v25_samples_cache: list[tuple[int, str]] = []
+        v25_random_samples_cache: list[tuple[int, str]] = []
         for version in pending_manual:
             if version == 25:
-                preview = preview_v25_migration(config.db_path, config.project_prefix)
+                preview_v25_data = preview_v25_migration(config.db_path, config.project_prefix)
+                v25_task_count_cache = preview_v25_data["task_count"]
+                v25_samples_cache = preview_v25_data["samples"]
+                v25_random_samples_cache = preview_v25_data["random_samples"]
                 print("\nMigration v25 preview (INTEGER PK → TEXT base36 IDs):")
-                print(f"  Tasks to convert: {preview['task_count']}")
+                print(f"  Tasks to convert: {preview_v25_data['task_count']}")
                 # Right-align old IDs so the → arrow lines up in both sample
                 # sections — width is computed across first + random so both
                 # blocks share the same column alignment.
-                all_old_ids = [old for old, _ in preview["samples"]] + [
-                    old for old, _ in preview["random_samples"]
+                old_ids_v25 = [old for old, _ in preview_v25_data["samples"]] + [
+                    old for old, _ in preview_v25_data["random_samples"]
                 ]
-                id_width = max((len(str(old)) for old in all_old_ids), default=0)
-                if preview["samples"]:
-                    print(f"  Sample ID conversions (first {len(preview['samples'])}):")
-                    for old_id, new_id in preview["samples"]:
-                        print(f"    #{old_id:>{id_width}} → {new_id}")
-                if preview["random_samples"]:
-                    print(f"  Sample ID conversions (random {len(preview['random_samples'])}):")
-                    for old_id, new_id in preview["random_samples"]:
-                        print(f"    #{old_id:>{id_width}} → {new_id}")
-                print(f"  First post-migration task ID: {preview['first_post_migration_id']}")
+                id_width = max((len(str(old)) for old in old_ids_v25), default=0)
+                if preview_v25_data["samples"]:
+                    print(f"  Sample ID conversions (first {len(preview_v25_data['samples'])}):")
+                    for old_v25_id, new_id in preview_v25_data["samples"]:
+                        print(f"    #{old_v25_id:>{id_width}} → {new_id}")
+                if preview_v25_data["random_samples"]:
+                    print(f"  Sample ID conversions (random {len(preview_v25_data['random_samples'])}):")
+                    for old_v25_id, new_id in preview_v25_data["random_samples"]:
+                        print(f"    #{old_v25_id:>{id_width}} → {new_id}")
+                print(f"  First post-migration task ID: {preview_v25_data['first_post_migration_id']}")
+            elif version == 26:
+                preview_v26_data = preview_v26_migration(config.db_path)
+                task_count_v26: int = preview_v26_data["task_count"]
+                samples_v26: list[tuple[str, str]] = list(preview_v26_data["samples"])
+                random_samples_v26: list[tuple[str, str]] = list(preview_v26_data["random_samples"])
+                if (
+                    not samples_v26
+                    and not random_samples_v26
+                    and 25 in pending_manual
+                    and v25_task_count_cache is not None
+                ):
+                    # DB is pre-v25; synthesize v26 preview from v25 preview rows.
+                    task_count_v26 = v25_task_count_cache
+                    samples_v26 = [
+                        (old_v25, f"{config.project_prefix}-{old_int}")
+                        for old_int, old_v25 in v25_samples_cache
+                    ]
+                    random_samples_v26 = [
+                        (old_v25, f"{config.project_prefix}-{old_int}")
+                        for old_int, old_v25 in v25_random_samples_cache
+                    ]
+                print("\nMigration v26 preview (TEXT base36 IDs → TEXT decimal IDs):")
+                print(f"  Tasks to convert: {task_count_v26}")
+                old_ids_v26 = [old for old, _ in samples_v26] + [
+                    old for old, _ in random_samples_v26
+                ]
+                id_width = max((len(old) for old in old_ids_v26), default=0)
+                if samples_v26:
+                    print(f"  Sample ID conversions (first {len(samples_v26)}):")
+                    for old_v26_id, new_id in samples_v26:
+                        print(f"    {old_v26_id:>{id_width}} → {new_id}")
+                if random_samples_v26:
+                    print(f"  Sample ID conversions (random {len(random_samples_v26)}):")
+                    for old_v26_id, new_id in random_samples_v26:
+                        print(f"    {old_v26_id:>{id_width}} → {new_id}")
         return 0
 
     versions_str = ", ".join(f"v{v}" for v in pending_manual)
@@ -1558,6 +1601,15 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                 print(f"Migration v25 complete. Backup at: {backup_path}")
             except Exception as e:
                 print(f"Migration v25 failed: {e}", file=sys.stderr)
+                return 1
+        elif version == 26:
+            print("Running migration v26 (TEXT base36 IDs → TEXT decimal IDs)...")
+            try:
+                run_v26_migration(config.db_path)
+                backup_path = config.db_path.with_suffix(".backup.pre-v26.db")
+                print(f"Migration v26 complete. Backup at: {backup_path}")
+            except Exception as e:
+                print(f"Migration v26 failed: {e}", file=sys.stderr)
                 return 1
         else:
             print(f"Unknown manual migration v{version}", file=sys.stderr)

@@ -15,16 +15,18 @@ class TestLooksLikeTaskId:
     @pytest.mark.parametrize(
         "arg, expected",
         [
-            # Full prefixed task IDs — alphanumeric prefix + hyphen + base36 suffix
-            ("gza-3f", True),
+            # Full prefixed task IDs — alphanumeric prefix + hyphen + decimal suffix
             ("gza-1", True),
-            ("myapp-abc1", True),
+            ("gza-000001", True),
+            ("myapp-42", True),
             # Non-prefixed forms are rejected
             ("42", False),
             ("3f", False),
             ("a1", False),
             ("1a2b", False),
             ("abc", False),
+            ("gza-3f", False),
+            ("myapp-abc1", False),
             ("feature", False),
             # Branch names are rejected
             ("feature-add-logging", False),

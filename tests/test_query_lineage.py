@@ -389,34 +389,34 @@ class TestFilterLineageTree:
 class TestResolveLineageRoot:
     def test_returns_task_when_no_dependencies(self):
         store = MagicMock()
-        task = _make_task(id="gza-000001", task_type="implement", based_on=None, depends_on=None)
+        task = _make_task(id="gza-1", task_type="implement", based_on=None, depends_on=None)
         result = resolve_lineage_root(store, task)
         assert result == task
 
     def test_review_resolves_to_depends_on(self):
         store = MagicMock()
-        parent = _make_task(id="gza-000001", task_type="implement", based_on=None)
-        review = _make_task(id="gza-000002", task_type="review", depends_on="gza-000001")
+        parent = _make_task(id="gza-1", task_type="implement", based_on=None)
+        review = _make_task(id="gza-2", task_type="review", depends_on="gza-1")
         store.get.return_value = parent
         result = resolve_lineage_root(store, review)
         assert result == parent
 
     def test_improve_resolves_to_based_on(self):
         store = MagicMock()
-        parent = _make_task(id="gza-000001", task_type="implement", based_on=None)
-        improve = _make_task(id="gza-000002", task_type="improve", based_on="gza-000001")
+        parent = _make_task(id="gza-1", task_type="implement", based_on=None)
+        improve = _make_task(id="gza-2", task_type="improve", based_on="gza-1")
         store.get.return_value = parent
         result = resolve_lineage_root(store, improve)
         assert result == parent
 
     def test_walks_up_based_on_chain(self):
         store = MagicMock()
-        grandparent = _make_task(id="gza-000001", task_type="implement", based_on=None)
-        parent = _make_task(id="gza-000002", task_type="implement", based_on="gza-000001")
-        child = _make_task(id="gza-000003", task_type="implement", based_on="gza-000002")
+        grandparent = _make_task(id="gza-1", task_type="implement", based_on=None)
+        parent = _make_task(id="gza-2", task_type="implement", based_on="gza-1")
+        child = _make_task(id="gza-3", task_type="implement", based_on="gza-2")
 
         def mock_get(task_id):
-            return {"gza-000001": grandparent, "gza-000002": parent, "gza-000003": child}.get(task_id)
+            return {"gza-1": grandparent, "gza-2": parent, "gza-3": child}.get(task_id)
 
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, child)
@@ -424,30 +424,30 @@ class TestResolveLineageRoot:
 
     def test_handles_cycle_in_based_on_chain(self):
         store = MagicMock()
-        task_a = _make_task(id="gza-000001", task_type="implement", based_on="gza-000002")
-        task_b = _make_task(id="gza-000002", task_type="implement", based_on="gza-000001")
+        task_a = _make_task(id="gza-1", task_type="implement", based_on="gza-2")
+        task_b = _make_task(id="gza-2", task_type="implement", based_on="gza-1")
 
         def mock_get(task_id):
-            return {"gza-000001": task_a, "gza-000002": task_b}.get(task_id)
+            return {"gza-1": task_a, "gza-2": task_b}.get(task_id)
 
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, task_a)
-        assert result.id in ("gza-000001", "gza-000002")
+        assert result.id in ("gza-1", "gza-2")
 
     def test_review_depends_on_not_found(self):
         store = MagicMock()
         store.get.return_value = None
-        review = _make_task(id="gza-000002", task_type="review", depends_on="gza-000999")
+        review = _make_task(id="gza-2", task_type="review", depends_on="gza-999")
         result = resolve_lineage_root(store, review)
         assert result == review
 
     def test_based_on_chain_stops_at_none(self):
         store = MagicMock()
-        parent = _make_task(id="gza-000001", task_type="implement", based_on="gza-000999")
-        child = _make_task(id="gza-000002", task_type="implement", based_on="gza-000001")
+        parent = _make_task(id="gza-1", task_type="implement", based_on="gza-999")
+        child = _make_task(id="gza-2", task_type="implement", based_on="gza-1")
 
         def mock_get(task_id):
-            if task_id == "gza-000001":
+            if task_id == "gza-1":
                 return parent
             return None
 
@@ -457,11 +457,11 @@ class TestResolveLineageRoot:
 
     def test_implement_depends_on_resolves_upstream_root(self):
         store = MagicMock()
-        root = _make_task(id="gza-000001", task_type="implement")
-        dependent = _make_task(id="gza-000002", task_type="implement", depends_on="gza-000001")
+        root = _make_task(id="gza-1", task_type="implement")
+        dependent = _make_task(id="gza-2", task_type="implement", depends_on="gza-1")
 
         def mock_get(task_id):
-            return {"gza-000001": root, "gza-000002": dependent}.get(task_id)
+            return {"gza-1": root, "gza-2": dependent}.get(task_id)
 
         store.get.side_effect = mock_get
         result = resolve_lineage_root(store, dependent)
@@ -476,13 +476,13 @@ class TestResolveLineageRoot:
         is used so all sort keys are ``tuple[datetime, int]``.
         """
         store = MagicMock()
-        root_a = _make_task(id="gza-00001a", task_type="implement", based_on=None, depends_on=None)
-        root_b = _make_task(id="gza-00002b", task_type="implement", based_on=None, depends_on=None)
+        root_a = _make_task(id="gza-46", task_type="implement", based_on=None, depends_on=None)
+        root_b = _make_task(id="gza-83", task_type="implement", based_on=None, depends_on=None)
         # child depends on both roots — they both become root candidates
-        child = _make_task(id="gza-00003c", task_type="improve", based_on="gza-00001a", depends_on="gza-00002b")
+        child = _make_task(id="gza-120", task_type="improve", based_on="gza-46", depends_on="gza-83")
 
         def mock_get(task_id):
-            return {"gza-00001a": root_a, "gza-00002b": root_b, "gza-00003c": child}.get(task_id)
+            return {"gza-46": root_a, "gza-83": root_b, "gza-120": child}.get(task_id)
 
         store.get.side_effect = mock_get
 
@@ -506,9 +506,9 @@ class TestLineageChildSortKey:
         'str' and 'int'`` when Python compared the two tuple elements.
         """
 
-        parent = _make_task(id="gza-000001", task_type="implement")
-        child_with_id = _make_task(id="gza-00003f", task_type="review", depends_on="gza-000001")
-        child_no_id = _make_task(id=None, task_type="improve", based_on="gza-000001")
+        parent = _make_task(id="gza-1", task_type="implement")
+        child_with_id = _make_task(id="gza-141", task_type="review", depends_on="gza-1")
+        child_no_id = _make_task(id=None, task_type="improve", based_on="gza-1")
 
         # Must not raise TypeError
         key_with_id = _lineage_child_sort_key(parent, child_with_id)
@@ -522,6 +522,6 @@ class TestLineageChildSortKey:
         assert isinstance(key_with_id[2], int)
         assert isinstance(key_no_id[2], int)
 
-        # id=None maps to numeric key 0; "gza-00003f" decodes to base36(3f)=141
+        # id=None maps to numeric key 0; decimal suffix parses directly.
         assert key_no_id[2] == 0
-        assert key_with_id[2] == int("3f", 36)
+        assert key_with_id[2] == 141

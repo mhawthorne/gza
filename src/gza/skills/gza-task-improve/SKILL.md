@@ -14,7 +14,7 @@ Address review comments for a gza task directly in the current conversation. Thi
 
 ### Step 1: Get task ID and find the review
 
-The user should provide a full prefixed task ID (for example, `gza-1a2b`). If they provide a review task ID, resolve it to the implementation task. If no task ID is provided, ask the user.
+The user should provide a full prefixed task ID (for example, `gza-1234`). If they provide a review task ID, resolve it to the implementation task. If no task ID is provided, ask the user.
 
 Query the task and find its most recent review:
 

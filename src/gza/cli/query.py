@@ -945,13 +945,13 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
 
     raw_task_id = row.get("task_id")
     if isinstance(raw_task_id, str):
-        # Decode the base36 suffix for numeric ordering (handles "prefix-base36" format)
+        # Decode numeric suffix for ordering (handles "prefix-<decimal>" format)
         decoded = _task_id_numeric_key(raw_task_id)
         if decoded != 0:
             task_id_sort = decoded
         else:
             # Fallback for legacy worker metadata files with bare-integer task IDs
-            # (e.g. "123" stored without base36 prefix during rolling migration)
+            # (e.g. "123" stored without prefix during rolling migration)
             try:
                 task_id_sort = int(raw_task_id)
             except (ValueError, TypeError):

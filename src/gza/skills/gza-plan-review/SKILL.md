@@ -12,7 +12,7 @@ Run an interactive plan quality gate for a specific plan task before implementat
 
 ## Inputs
 
-- Required: full prefixed plan task ID (for example, `gza-1a2b`)
+- Required: full prefixed plan task ID (for example, `gza-1234`)
 
 If the user did not provide a task ID, ask for it before proceeding.
 

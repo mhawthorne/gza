@@ -576,7 +576,10 @@ class TestRetryCommand:
         result = run_gza("retry", str(original.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task {original.id} already has a successful retry ({retry.id})." in result.stdout
+        assert (
+            f"Error: Task {original.id} already has a successful retry ({retry.id})."
+            in result.stdout
+        )
 
     @pytest.mark.parametrize("wrapped_id", ["  {id}  ", "\t{id}\t"])
     def test_retry_duplicate_guard_uses_canonical_task_id(self, tmp_path: Path, wrapped_id: str):
@@ -3315,6 +3318,16 @@ class TestSetStatusCommand:
 
         assert result.returncode == 1
         assert "not found" in result.stdout
+
+    def test_set_status_rejects_base36_like_task_id(self, tmp_path: Path):
+        """set-status requires decimal task ID suffixes."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("set-status", "testproject-3f", "failed", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Invalid task ID" in result.stdout or "Invalid task ID" in result.stderr
+        assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
     @pytest.mark.parametrize("target_status,initial_status,completed_at_set", [
         pytest.param("failed", "in_progress", True, id="in_progress-to-failed"),

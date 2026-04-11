@@ -1170,7 +1170,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:  # custom
         print("\nCustom pattern variables:")
         print("  {project}  - Project name")
-        print("  {task_id}  - Full task ID ({prefix}-{base36}, e.g. gza-1a2b)")
+        print("  {task_id}  - Full task ID ({prefix}-{decimal}, e.g. gza-1234)")
         print("  {date}     - Date portion (YYYYMMDD)")
         print("  {slug}     - Slug portion")
         print("  {type}     - Inferred/default type (feature, fix, etc.)")

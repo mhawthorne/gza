@@ -538,11 +538,9 @@ class TestReviewContextFromChain:
     def test_review_context_excludes_equal_timestamp_later_improve(self, tmp_path: Path):
         """Equal-timestamp improves created after the review are excluded."""
         created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=UTC)
-        # IDs as project-prefixed base36 strings, zero-padded to width 6:
-        # 40="14"→"000014", 50="1e"→"00001e", 60="1o"→"00001o", 100="2s"→"00002s"
-        impl_task = Task(id="gza-00002s", prompt="Implement", task_type="implement", status="completed")
+        impl_task = Task(id="gza-100", prompt="Implement", task_type="implement", status="completed")
         review_task = Task(
-            id="gza-00001e",
+            id="gza-50",
             prompt="Review current",
             task_type="review",
             depends_on=impl_task.id,
@@ -550,22 +548,22 @@ class TestReviewContextFromChain:
         )
 
         older_improve = Task(
-            id="gza-000014",
+            id="gza-40",
             prompt="Improve older",
             task_type="improve",
             status="completed",
             based_on=impl_task.id,
-            depends_on="gza-00000a",
+            depends_on="gza-10",
             created_at=created_at,
             output_content="- older improve",
         )
         later_improve = Task(
-            id="gza-00001o",
+            id="gza-60",
             prompt="Improve later",
             task_type="improve",
             status="completed",
             based_on=impl_task.id,
-            depends_on="gza-00000b",
+            depends_on="gza-11",
             created_at=created_at,
             output_content="- later improve",
         )
@@ -581,46 +579,35 @@ class TestReviewContextFromChain:
         assert "later improve" not in context
 
     def test_review_context_numeric_ordering_beats_lexicographic(self, tmp_path: Path):
-        """IDs crossing the seq=35→36 base36 range sort numerically, not lexicographically.
-
-        Unpadded, ``"gza-z"`` (decimal 35) would sort *after* ``"gza-10"`` (decimal 36)
-        lexicographically because ``"1" < "z"`` — a historical bug that drove
-        ``task_id_numeric_key``.  With fixed-width zero-padded suffixes
-        (``gza-00000z`` vs ``gza-000010``) string sort also matches numeric order,
-        but this test keeps the numeric-ordering guarantee independently verified
-        so a future regression (e.g. padding removal) would be caught here.
-        """
+        """Variable-width decimal IDs sort numerically, not lexicographically."""
         created_at = datetime(2026, 2, 27, 5, 0, 0, tzinfo=UTC)
-        # IDs (padded to width 6):
-        #   review="gza-000010" (36), older_improve="gza-00000z" (35), later_improve="gza-000011" (37)
-        impl_task = Task(id="gza-00001k", prompt="Implement", task_type="implement", status="completed")
+        # review=10, older=9, later=11 should include only older.
+        impl_task = Task(id="gza-20", prompt="Implement", task_type="implement", status="completed")
         review_task = Task(
-            id="gza-000010",  # decimal 36
+            id="gza-10",
             prompt="Review current",
             task_type="review",
             depends_on=impl_task.id,
             created_at=created_at,
         )
 
-        # decimal 35 < decimal 36 — should be included as prior improve
         older_improve = Task(
-            id="gza-00000z",  # decimal 35
+            id="gza-9",
             prompt="Improve older",
             task_type="improve",
             status="completed",
             based_on=impl_task.id,
-            depends_on="gza-00000a",
+            depends_on="gza-8",
             created_at=created_at,
-            output_content="- older improve z",
+            output_content="- older improve 9",
         )
-        # decimal 37 > decimal 36 — should be excluded
         later_improve = Task(
-            id="gza-000011",  # decimal 37
+            id="gza-11",
             prompt="Improve later",
             task_type="improve",
             status="completed",
             based_on=impl_task.id,
-            depends_on="gza-00000b",
+            depends_on="gza-12",
             created_at=created_at,
             output_content="- later improve 11",
         )
@@ -630,10 +617,8 @@ class TestReviewContextFromChain:
 
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
-        # decimal 35 is before decimal 36 numerically — must be included
         assert f"Improve {older_improve.id}" in context
-        assert "older improve z" in context
-        # decimal 37 is after decimal 36 numerically — must be excluded
+        assert "older improve 9" in context
         assert f"Improve {later_improve.id}" not in context
         assert "later improve 11" not in context
 
@@ -905,7 +890,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         parent_impl.status = "completed"
-        parent_impl.slug = "20260409-000001-impl-add-feature"
+        parent_impl.slug = "20260409-1-impl-add-feature"
         store.update(parent_impl)
 
         impl_task = store.add(
@@ -914,7 +899,7 @@ class TestReviewTaskSlugGeneration:
             based_on=parent_impl.id,
         )
         impl_task.status = "completed"
-        impl_task.slug = "20260410-000002-impl-000001-impl-add-feature"
+        impl_task.slug = "20260410-2-impl-1-impl-add-feature"
         store.update(impl_task)
 
         config = Mock(spec=Config)
