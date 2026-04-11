@@ -1339,14 +1339,18 @@ class TestComputeSlugOverride:
         """Sibling reviews in one lineage derive different target slugs."""
         store = SqliteTaskStore(tmp_path / "test.db")
         root_impl = store.add(prompt="Remove shorthand and legacy task id resolution", task_type="implement")
-        root_impl.slug = "20260410-impl-remove-shorthand-and-legacy-task-id-resolution"
+        root_suffix = self._suffix(root_impl.id)
+        root_impl.slug = f"20260410-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution"
         store.update(root_impl)
         child_impl = store.add(
             prompt="Switch task ids to variable length decimal",
             task_type="implement",
             based_on=root_impl.id,
         )
-        child_impl.slug = "20260410-impl-switch-task-ids-to-variable-length-decimal"
+        child_suffix = self._suffix(child_impl.id)
+        child_impl.slug = (
+            f"20260410-{child_suffix}-impl-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution"
+        )
         store.update(child_impl)
 
         review_root = store.add(
@@ -1366,14 +1370,15 @@ class TestComputeSlugOverride:
         assert root_slug is not None
         assert child_slug is not None
         assert root_slug != child_slug
-        assert "rev-impl-remove-shorthand-and-legacy-task-id-resolution" in root_slug
-        assert "rev-impl-switch-task-ids-to-variable-length-decimal" in child_slug
+        assert f"rev-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution" in root_slug
+        assert f"rev-{child_suffix}-impl-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution" in child_slug
 
     def test_review_slug_override_includes_review_task_id_suffix(self, tmp_path: Path):
         """Review slug override embeds the review task's own id suffix."""
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(prompt="Add docker volumes", task_type="implement")
-        impl_task.slug = "20260129-impl-add-docker-volumes"
+        impl_suffix = self._suffix(impl_task.id)
+        impl_task.slug = f"20260129-{impl_suffix}-impl-add-docker-volumes"
         store.update(impl_task)
         review_task = store.add(
             prompt="Review implementation",
@@ -1382,7 +1387,7 @@ class TestComputeSlugOverride:
         )
 
         result = _compute_slug_override(review_task, store)
-        assert result == f"{self._suffix(review_task.id)}-rev-impl-add-docker-volumes"
+        assert result == f"{self._suffix(review_task.id)}-rev-{impl_suffix}-impl-add-docker-volumes"
 
     def test_implement_and_improve_use_based_on_with_implement_fallback(self, tmp_path: Path):
         """Implement/improve anchor to based_on; implement falls back to depends_on."""
@@ -1395,7 +1400,8 @@ class TestComputeSlugOverride:
             task_type="implement",
             based_on=plan_task.id,
         )
-        impl_task.slug = "20260129-impl-add-authentication-system"
+        impl_suffix = self._suffix(impl_task.id)
+        impl_task.slug = f"20260129-{impl_suffix}-impl-add-authentication-system"
         store.update(impl_task)
         impl_result = _compute_slug_override(impl_task, store)
         assert impl_result == f"{self._suffix(impl_task.id)}-impl-add-authentication-system"
@@ -1417,17 +1423,17 @@ class TestComputeSlugOverride:
             based_on=impl_task.id,
         )
         improve_result = _compute_slug_override(improve_task, store)
-        assert improve_result == f"{self._suffix(improve_task.id)}-impr-impl-add-authentication-system"
+        assert improve_result == f"{self._suffix(improve_task.id)}-impr-{impl_suffix}-impl-add-authentication-system"
 
     def test_variable_width_task_ids_are_supported(self):
         """Task id suffix extraction does not assume fixed-width ids."""
-        anchor = Task(id="gza-1", prompt="Switch task ids", task_type="implement", slug="20260410-impl-switch-task-ids")
+        anchor = Task(id="gza-1", prompt="Switch task ids", task_type="implement", slug="20260410-1-impl-switch-task-ids")
         review_task = Task(id="gza-mp", prompt="Review switch task ids", task_type="review", depends_on=anchor.id)
         store = Mock(spec=SqliteTaskStore)
         store.get.return_value = anchor
 
         result = _compute_slug_override(review_task, store)
-        assert result == "mp-rev-impl-switch-task-ids"
+        assert result == "mp-rev-1-impl-switch-task-ids"
 
     def test_plain_task_returns_none(self, tmp_path: Path):
         """Non-review/implement/improve tasks return None."""

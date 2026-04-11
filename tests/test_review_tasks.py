@@ -67,6 +67,11 @@ class TestBuildAutoReviewPrompt:
         result = build_auto_review_prompt(task)
         assert result == "review fix-bug"
 
+    def test_slug_strips_derived_implement_prefix(self):
+        task = _task(slug="20260410-0000ab-impl-add-authentication-system")
+        result = build_auto_review_prompt(task)
+        assert result == "review add-authentication-system"
+
     def test_fallback_when_no_task_id(self):
         task = _task(id=5, slug=None, prompt="build the thing")
         result = build_auto_review_prompt(task)
@@ -144,7 +149,7 @@ class TestCreateReviewTask:
 
     def test_auto_prompt_mode(self):
         store = self._mock_store()
-        task = _task(id=10, slug="20260315-add-feature-1", group="mygroup", based_on=5)
+        task = _task(id=10, slug="20260315-0000ab-impl-add-feature-1", group="mygroup", based_on=5)
         create_review_task(store, task, prompt_mode="auto")
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["prompt"] == "review add-feature"

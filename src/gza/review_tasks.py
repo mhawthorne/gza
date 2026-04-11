@@ -5,6 +5,7 @@ from typing import Literal
 
 from .db import SqliteTaskStore, Task
 from .prompts import PromptBuilder
+from .task_slug import get_base_task_slug
 
 
 class DuplicateReviewError(ValueError):
@@ -28,14 +29,15 @@ def build_auto_review_prompt(impl_task: Task, project_prefix: str | None = None)
     if impl_task.slug:
         parts = impl_task.slug.split("-", 1)
         if len(parts) == 2:
-            slug = re.sub(r"-\d+$", "", parts[1])
-            # Strip project_prefix if present at the start of the slug portion.
-            # Assumes project_prefix does not collide with common slug verb prefixes
-            # (e.g. project_prefix="add" would incorrectly strip from "add-feature").
-            # This is an acceptable trade-off given the 1–12 char prefix constraint
-            # and the expectation that prefixes are project identifiers, not verbs.
+            slug = get_base_task_slug(impl_task.slug)
+        else:
+            slug = None
+        if slug:
             if project_prefix and slug.startswith(f"{project_prefix}-"):
                 slug = slug[len(project_prefix) + 1:]
+            # Derived implement slugs are now "<task_id_suffix>-impl-<semantic-slug>".
+            # Auto-review prompts should keep only the semantic subject.
+            slug = re.sub(r"^[a-z0-9]+-impl-", "", slug)
             return f"review {slug}"
 
     review_prompt = f"Review task #{impl_task.id}"
