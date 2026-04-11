@@ -425,7 +425,7 @@ gza work [task_id...] [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Specific task ID(s) to run (can specify multiple) |
+| `task_id` | Specific full prefixed task ID(s) to run (for example `gza-1a2b`; can specify multiple) |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--count N`, `-c N` | Number of tasks to run before stopping |
 | `--background`, `-b` | Run worker in background |
@@ -486,7 +486,7 @@ gza log <identifier> [options]
 
 | Option | Description |
 |--------|-------------|
-| `identifier` | Task ID (e.g. `gza-1a2b`), slug, or worker ID |
+| `identifier` | Full prefixed task ID (e.g. `gza-1a2b`), slug, or worker ID |
 | `--slug`, `-s` | Interpret identifier as task slug (supports partial match) |
 | `--worker`, `-w` | Interpret identifier as worker ID |
 | `--steps` | Show compact step timeline |
@@ -583,7 +583,7 @@ gza attach <worker_id_or_task_id>
 
 | Option | Description |
 |--------|-------------|
-| `worker_id_or_task_id` | Worker ID (from `gza ps`) or task ID (e.g. `gza-1a2b`) |
+| `worker_id_or_task_id` | Worker ID (from `gza ps`) or full prefixed task ID (e.g. `gza-1a2b`) |
 
 ### ps
 
@@ -616,7 +616,7 @@ gza kill [task_id] [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Task ID to kill (optional if `--all` is used) |
+| `task_id` | Full prefixed task ID to kill (optional if `--all` is used; e.g. `gza-1a2b`) |
 | `--all` | Kill all running tasks |
 | `--force`, `-9` | Send SIGKILL immediately (skip SIGTERM) |
 
@@ -694,7 +694,7 @@ gza mark-completed <task_id> [--verify-git | --force]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Task ID to mark as completed |
+| `task_id` | Full prefixed task ID to mark as completed (e.g. `gza-1a2b`) |
 | `--verify-git` | Validate branch and commits before completion |
 | `--force` | Status-only completion (for non-code tasks or stale in_progress recovery) |
 
@@ -710,7 +710,7 @@ gza merge <task_id> [task_id...] [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Task ID(s) to merge (can specify multiple) |
+| `task_id` | Full prefixed task ID(s) to merge (e.g. `gza-1a2b`; can specify multiple) |
 | `--all` | Merge all unmerged done tasks (task_ids optional when used) |
 | `--squash` | Squash commits into a single commit |
 | `--rebase` | Rebase onto current branch instead of merging |
@@ -779,7 +779,7 @@ gza checkout <task_id_or_branch> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id_or_branch` | Task ID or branch name to checkout |
+| `task_id_or_branch` | Full prefixed task ID or branch name to checkout (e.g. `gza-1a2b` or `feat/auth`) |
 | `--force`, `-f` | Force removal of worktree even if it has uncommitted changes |
 
 ### diff
@@ -792,7 +792,7 @@ gza diff [task_id] [diff_args...]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Task ID to diff (optional, uses current branch if omitted) |
+| `task_id` | Full prefixed task ID to diff (e.g. `gza-1a2b`; optional, uses current branch if omitted) |
 | `diff_args` | Arguments passed to git diff (use `--` before options like `--stat`) |
 
 ### rebase
@@ -848,7 +848,7 @@ gza improve <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Task ID (implement, improve, or review — auto-resolves to root implementation) |
+| `impl_task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1a2b`) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
@@ -869,7 +869,7 @@ gza review <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Task ID (implement, improve, or review — auto-resolves to root implementation) |
+| `task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1a2b`) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
@@ -901,7 +901,7 @@ gza implement <plan_task_id> [prompt] [options]
 
 | Option | Description |
 |--------|-------------|
-| `plan_task_id` | Completed plan task ID to implement |
+| `plan_task_id` | Full prefixed completed plan task ID to implement (e.g. `gza-1a2b`) |
 | `prompt` | Implementation prompt (defaults to plan-derived prompt) |
 | `--review` | Auto-create review task on completion |
 | `--group NAME` | Set task group |
@@ -926,7 +926,7 @@ gza advance [task_id] [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Specific task ID to advance (omit to advance all eligible) |
+| `task_id` | Specific full prefixed task ID to advance (e.g. `gza-1a2b`; omit to advance all eligible) |
 | `--dry-run` | Preview actions without executing them |
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
@@ -951,7 +951,7 @@ gza iterate <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Implementation task ID to cycle |
+| `impl_task_id` | Full prefixed implementation task ID to cycle (e.g. `gza-1a2b`) |
 | `--max-iterations N` | Maximum review/improve iterations (default: 3) |
 | `--dry-run` | Preview what would happen without executing |
 | `--continue` | Resume an existing active cycle |
@@ -981,7 +981,7 @@ gza refresh [task_id] [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Task ID to refresh (omit to refresh all unmerged tasks) |
+| `task_id` | Full prefixed task ID to refresh (e.g. `gza-1a2b`; omit to refresh all unmerged tasks) |
 | `--include-failed` | Also refresh failed tasks that have branches |
 
 ### migrate
@@ -1003,6 +1003,8 @@ When run without flags, `gza migrate` prompts for confirmation before applying t
 On successful migration, the backup path is printed to stdout so you can locate it for rollback if needed.
 
 Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`). After the v25 migration, the sequence is seeded at the previous maximum integer ID, so the first post-migration task gets `{prefix}-{base36(max_id + 1)}`.
+
+Task ID validation is format-based (`{prefix}-{base36}`) and does not require the prefix to match your current `project_prefix`. A mismatched but valid full ID is accepted by parsing and then fails later as "not found" if it does not exist in the current project database.
 
 If a `ManualMigrationRequired` error appears when running any other command, run `gza migrate` to upgrade the database schema.
 

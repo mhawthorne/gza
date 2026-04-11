@@ -3045,6 +3045,8 @@ def resolve_task_id(arg: str, project_prefix: str) -> str:
     """Resolve a user-supplied task ID argument to a canonical string ID.
 
     Accepts only full prefixed IDs: ``"{prefix}-{base36_suffix}"``.
+    Prefix matching is intentionally not enforced here; syntactically valid IDs
+    with a different prefix are resolved and may fail later as "not found".
 
     The returned value is the string to pass to ``store.get()``.
     """
