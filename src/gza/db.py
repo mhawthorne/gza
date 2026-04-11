@@ -162,6 +162,8 @@ class Task:
     num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
+    attach_count: int | None = None  # Number of interactive attach sessions
+    attach_duration_seconds: float | None = None  # Total interactive attach wall time
     cost_usd: float | None = None
     input_tokens: int | None = None   # Total input tokens (including cache tokens)
     output_tokens: int | None = None  # Total output tokens
@@ -238,6 +240,12 @@ MIGRATION_V22_TO_V23 = "ALTER TABLE tasks ADD COLUMN running_pid INTEGER;"
 # Migration from v23 to v24
 MIGRATION_V23_TO_V24 = "ALTER TABLE tasks ADD COLUMN merged_at TEXT;"
 
+# Migration from v25 to v26
+MIGRATION_V25_TO_V26 = """
+ALTER TABLE tasks ADD COLUMN attach_count INTEGER;
+ALTER TABLE tasks ADD COLUMN attach_duration_seconds REAL;
+"""
+
 # Schema version for migrations
 SCHEMA_VERSION = 27
 
@@ -272,6 +280,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     num_turns INTEGER,  -- kept for backward compat; use num_turns_reported instead
     num_turns_reported INTEGER,
     num_turns_computed INTEGER,
+    attach_count INTEGER,
+    attach_duration_seconds REAL,
     cost_usd REAL,
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -728,6 +738,8 @@ class SqliteTaskStore:
             num_steps_computed=row["num_steps_computed"] if "num_steps_computed" in keys else None,
             num_turns_reported=row["num_turns_reported"] if "num_turns_reported" in keys else None,
             num_turns_computed=row["num_turns_computed"] if "num_turns_computed" in keys else None,
+            attach_count=row["attach_count"] if "attach_count" in keys else None,
+            attach_duration_seconds=row["attach_duration_seconds"] if "attach_duration_seconds" in keys else None,
             cost_usd=row["cost_usd"],
             input_tokens=row["input_tokens"] if "input_tokens" in keys else None,
             output_tokens=row["output_tokens"] if "output_tokens" in keys else None,
@@ -893,6 +905,8 @@ class SqliteTaskStore:
                     num_steps_computed = ?,
                     num_turns_reported = ?,
                     num_turns_computed = ?,
+                    attach_count = ?,
+                    attach_duration_seconds = ?,
                     cost_usd = ?,
                     input_tokens = ?,
                     output_tokens = ?,
@@ -936,6 +950,8 @@ class SqliteTaskStore:
                     task.num_steps_computed,
                     task.num_turns_reported,
                     task.num_turns_computed,
+                    task.attach_count,
+                    task.attach_duration_seconds,
                     task.cost_usd,
                     task.input_tokens,
                     task.output_tokens,
@@ -1813,6 +1829,14 @@ class SqliteTaskStore:
         task.running_pid = os.getpid()
         self.update(task)
 
+    def record_attach_session(self, task: Task, duration_seconds: float) -> None:
+        """Accumulate interactive attach metrics on a task."""
+        prior_count = task.attach_count or 0
+        prior_duration = task.attach_duration_seconds or 0.0
+        task.attach_count = prior_count + 1
+        task.attach_duration_seconds = prior_duration + max(0.0, duration_seconds)
+        self.update(task)
+
     def mark_completed(
         self,
         task: Task,
@@ -2225,6 +2249,8 @@ def _task_to_dict(task: "Task") -> dict:
         "num_steps_computed": task.num_steps_computed,
         "num_turns_reported": task.num_turns_reported,
         "num_turns_computed": task.num_turns_computed,
+        "attach_count": task.attach_count,
+        "attach_duration_seconds": task.attach_duration_seconds,
         "cost_usd": task.cost_usd,
         "input_tokens": task.input_tokens,
         "output_tokens": task.output_tokens,
@@ -2502,6 +2528,8 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 num_turns INTEGER,
                 num_turns_reported INTEGER,
                 num_turns_computed INTEGER,
+                attach_count INTEGER,
+                attach_duration_seconds REAL,
                 cost_usd REAL,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
@@ -2550,7 +2578,8 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     id, prompt, status, task_type, slug, branch, log_file, report_file,
                     based_on, has_commits, duration_seconds, num_steps_reported,
                     num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
-                    cost_usd, created_at, started_at, running_pid, completed_at,
+                    attach_count, attach_duration_seconds, cost_usd,
+                    created_at, started_at, running_pid, completed_at,
                     "group", depends_on, spec, create_review, same_branch, task_type_hint,
                     output_content, session_id, pr_number, model, provider, provider_is_explicit,
                     input_tokens, output_tokens, merge_status, merged_at, failure_reason,
@@ -2558,7 +2587,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     review_cleared_at, log_schema_version, cycle_id, cycle_iteration_index,
                     cycle_role
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
                 """,
                 (
@@ -2570,6 +2599,8 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     row["num_turns"] if "num_turns" in row.keys() else None,
                     row["num_turns_reported"] if "num_turns_reported" in row.keys() else None,
                     row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
+                    row["attach_count"] if "attach_count" in row.keys() else None,
+                    row["attach_duration_seconds"] if "attach_duration_seconds" in row.keys() else None,
                     row["cost_usd"], row["created_at"], row["started_at"],
                     row["running_pid"] if "running_pid" in row.keys() else None,
                     row["completed_at"],

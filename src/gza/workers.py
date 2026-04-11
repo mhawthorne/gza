@@ -23,6 +23,7 @@ class WorkerMetadata:
     startup_log_file: str | None = None
     is_background: bool = True
     exit_code: int | None = None
+    completion_reason: str | None = None
     completed_at: str | None = None
     tmux_session: str | None = None  # Tmux session name when running in tmux mode
 
@@ -64,6 +65,7 @@ class WorkerMetadata:
             startup_log_file=data.get("startup_log_file"),
             is_background=bool(data.get("is_background", True)),
             exit_code=data.get("exit_code"),
+            completion_reason=data.get("completion_reason"),
             completed_at=data.get("completed_at"),
             tmux_session=data.get("tmux_session"),
         )
@@ -147,11 +149,18 @@ class WorkerRegistry:
         except OSError:
             return False
 
-    def mark_completed(self, worker_id: str, exit_code: int, status: str = "completed") -> None:
+    def mark_completed(
+        self,
+        worker_id: str,
+        exit_code: int,
+        status: str = "completed",
+        completion_reason: str | None = None,
+    ) -> None:
         worker = self.get(worker_id)
         if worker:
             worker.status = status
             worker.exit_code = exit_code
+            worker.completion_reason = completion_reason
             worker.completed_at = datetime.now(UTC).isoformat()
             self.update(worker)
         pid_path = self._pid_path(worker_id)

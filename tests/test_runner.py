@@ -40,6 +40,7 @@ from gza.runner import (
     get_task_output_paths,
     run,
     write_log_entry,
+    write_worker_start_event,
 )
 
 
@@ -218,6 +219,35 @@ class TestBuildPrompt:
 
         assert "learnings.md" not in prompt
         assert "Complete this task: Implement feature X" in prompt
+
+
+class TestWorkerLifecycleLogging:
+    """Tests for worker lifecycle JSONL log events."""
+
+    def test_write_worker_start_event_logs_start_when_in_worker_mode(self, tmp_path: Path):
+        """write_worker_start_event should emit a start event with worker metadata."""
+        log_file = tmp_path / "worker.log"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GZA_WORKER_MODE": "1",
+                    "GZA_WORKER_ID": "w-20260411-1",
+                },
+                clear=False,
+            ),
+        ):
+            write_worker_start_event(log_file, resumed=True)
+
+        content = log_file.read_text().strip()
+        assert content
+        import json
+        event = json.loads(content)
+        assert event["type"] == "gza"
+        assert event["subtype"] == "worker_lifecycle"
+        assert event["event"] == "start"
+        assert event["worker_id"] == "w-20260411-1"
+        assert "resumed" in event["message"]
 
     def test_build_prompt_skips_learnings_when_skip_learnings_true(self, tmp_path: Path):
         """Test that build_prompt skips learnings reference when task.skip_learnings is True."""

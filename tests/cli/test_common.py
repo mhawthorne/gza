@@ -1,8 +1,8 @@
 """Tests for shared CLI utility functions in gza.cli._common."""
 
+from gza.cli._common import _looks_like_task_id, format_stats
+from gza.db import SqliteTaskStore
 import pytest
-
-from gza.cli._common import _looks_like_task_id
 
 
 class TestLooksLikeTaskId:
@@ -38,3 +38,29 @@ class TestLooksLikeTaskId:
         assert _looks_like_task_id(arg) == expected, (
             f"_looks_like_task_id({arg!r}) expected {expected}"
         )
+
+
+class TestFormatStats:
+    """Unit tests for compact task stats formatting."""
+
+    def test_format_stats_includes_attach_counts_and_seconds(self, tmp_path):
+        """Attach count and sub-minute attach duration are rendered in seconds."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task with attach stats")
+        task.attach_count = 2
+        task.attach_duration_seconds = 45.0
+        store.update(task)
+
+        stats = format_stats(task)
+        assert "2 attaches (45s)" in stats
+
+    def test_format_stats_includes_attach_duration_minutes_seconds(self, tmp_path):
+        """Attach duration >= 60s is rendered as XmYs."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task with long attach stats")
+        task.attach_count = 1
+        task.attach_duration_seconds = 125.0
+        store.update(task)
+
+        stats = format_stats(task)
+        assert "1 attach (2m5s)" in stats
