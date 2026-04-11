@@ -6,7 +6,7 @@ A straightforward workflow for quick fixes or small features.
 
 ```bash
 $ gza add "Fix the login button not responding on mobile devices"
-Created task #1: 20260108-fix-the-login-button
+Created task gza-1: 20260108-fix-the-login-button
 ```
 
 Or open your editor to write a longer prompt:
@@ -22,16 +22,16 @@ $ gza add
 $ gza next
 Pending tasks:
 
-  #1 20260108-fix-the-login-button
+  gza-1 20260108-fix-the-login-button
      Fix the login button not responding on mobile devices
 ```
 
 ## Run the task
 
 ```bash
-$ gza work 1
+$ gza work gza-1
 === Task: Fix the login button... ===
-    ID: #1 20260108-fix-the-login-button
+    ID: gza-1 20260108-fix-the-login-button
 ...
 === Done ===
 Stats: Runtime: 3m 42s | Turns: 12 | Cost: $0.08
@@ -43,9 +43,9 @@ Branch: feature/fix-the-login-button
 ## View the execution log
 
 ```bash
-$ gza log 1
+$ gza log gza-1
 
-Task #1: 20260108-fix-the-login-button
+Task gza-1: 20260108-fix-the-login-button
 Status: completed
 Duration: 3m 42s
 Turns: 12
@@ -60,7 +60,7 @@ Summary:
 For the full conversation:
 
 ```bash
-$ gza log 1 --steps
+$ gza log gza-1 --steps
 ```
 
 ## Check unmerged work
@@ -69,7 +69,7 @@ $ gza log 1 --steps
 $ gza unmerged
 Unmerged branches:
 
-  #1 20260108-fix-the-login-button
+  gza-1 20260108-fix-the-login-button
      Branch: feature/fix-the-login-button
      Commits: 2 ahead of main
      Files changed: 3
@@ -84,8 +84,8 @@ You have two options for getting your changes into main:
 For quick fixes or solo projects, merge directly:
 
 ```bash
-$ gza merge 1
-Merging task #1: 20260108-fix-the-login-button
+$ gza merge gza-1
+Merging task gza-1: 20260108-fix-the-login-button
   Branch: feature/fix-the-login-button → main
 
 Merged 2 commits into main.
@@ -94,7 +94,7 @@ Merged 2 commits into main.
 To squash commits into a single commit:
 
 ```bash
-$ gza merge 1 --squash
+$ gza merge gza-1 --squash
 ```
 
 ### Option B: Create a PR
@@ -102,8 +102,8 @@ $ gza merge 1 --squash
 For team projects or when you want code review, create a PR instead:
 
 ```bash
-$ gza pr 1
-Creating PR for task #1: 20260108-fix-the-login-button
+$ gza pr gza-1
+Creating PR for task gza-1: 20260108-fix-the-login-button
 
 PR created: https://github.com/myorg/myapp/pull/142
   Title: Fix the login button not responding on mobile devices
@@ -113,7 +113,7 @@ PR created: https://github.com/myorg/myapp/pull/142
 To create a draft PR with a custom title:
 
 ```bash
-$ gza pr 1 --draft --title "fix: mobile login button touch handling"
+$ gza pr gza-1 --draft --title "fix: mobile login button touch handling"
 ```
 
 Then merge via GitHub's UI when ready.

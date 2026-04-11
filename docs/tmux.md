@@ -71,11 +71,11 @@ Tmux attach works differently depending on the AI provider:
 Codex and Gemini run in headless mode and don't accept mid-run input. Attaching to these sessions is like a richer version of `gza log -f`. The session attaches with the `-r` (read-only) flag to prevent stray keystrokes from interfering.
 
 ```
-$ gza attach 43
-Attaching to task #43 (provider: codex)...
+$ gza attach gza-17
+Attaching to task gza-17 (provider: codex)...
 Note: Codex runs in headless mode. You can observe output but cannot
 interact. Use Ctrl-B D to detach.
-To intervene, stop this task (gza kill 43) and re-run with Claude.
+To intervene, stop this task (gza kill gza-17) and re-run with Claude.
 ```
 
 ## Configuration

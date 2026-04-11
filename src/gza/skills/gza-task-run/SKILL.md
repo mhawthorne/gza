@@ -14,7 +14,7 @@ Run a pending gza task directly in the current conversation, using the same prom
 
 ### Step 1: Get task ID
 
-The user should provide a task ID (numeric). Extract it from the input. If no task ID is provided, list pending tasks and ask:
+The user should provide a full prefixed task ID (for example, `gza-1a2b`). Extract it from the input. If no task ID is provided, list pending tasks and ask:
 
 ```bash
 uv run gza next
@@ -100,7 +100,7 @@ if p.exists():
 - **Same prompt as background**: `gza show --prompt` calls the same `build_prompt()` function that `gza run` uses. Identical instructions, context injection, and type-specific templates.
 - **No worktree**: Unlike background execution, this runs directly on the current working tree. Changes are made in-place.
 - **Branch management**: Create a new branch for the task work, just like background execution would.
-- **Editing prompts**: Use `gza edit <id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
+- **Editing prompts**: Use `gza edit <task_id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
 - **Proper status tracking**: Uses `mark-completed` to ensure correct `merge_status` so tasks appear in `gza unmerged` and work with `gza advance`.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.

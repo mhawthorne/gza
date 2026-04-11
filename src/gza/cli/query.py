@@ -920,7 +920,10 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
         console.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
-    console.print("   Run [cyan]gza work <id>[/cyan] to resume, or [cyan]gza mark-completed --force <id>[/cyan] to clear.")
+    console.print(
+        "   Run [cyan]gza work <full-task-id>[/cyan] to resume, or "
+        "[cyan]gza mark-completed --force <full-task-id>[/cyan] to clear."
+    )
 
 
 def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
@@ -1606,7 +1609,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
     target = args.worker_id
 
-    # Try as worker ID first, then as task ID (string or numeric)
+    # Try as worker ID first, then as task ID string.
     worker = registry.get(target)
     if worker is None:
         # Try resolving as a task ID — WorkerMetadata.from_dict already

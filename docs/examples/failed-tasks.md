@@ -14,8 +14,8 @@ Tasks can fail for several reasons:
 ## Check the failure
 
 ```bash
-$ gza show 5
-Task #5: 20260108-add-user-auth
+$ gza show gza-5
+Task gza-5: 20260108-add-user-auth
 Status: failed
 Duration: 10m 00s
 Turns: 50/50
@@ -27,7 +27,7 @@ Error: max turns of 50 exceeded
 View the conversation to understand what happened:
 
 ```bash
-$ gza log 5 --steps
+$ gza log gza-5 --steps
 ```
 
 ## Resume vs Retry
@@ -46,8 +46,8 @@ Resume continues the existing conversation. The AI picks up where it left off wi
 `gza resume` runs the new task immediately by default. Use `--queue` to add to queue without executing:
 
 ```bash
-$ gza resume 5
-=== Resuming Task #5: 20260108-add-user-auth ===
+$ gza resume gza-5
+=== Resuming Task gza-5: 20260108-add-user-auth ===
 ...
 === Done ===
 Stats: Runtime: 5m 23s | Turns: 15 | Cost: $0.34
@@ -56,13 +56,13 @@ Stats: Runtime: 5m 23s | Turns: 15 | Cost: $0.34
 Increase the turn limit if the original was too low:
 
 ```bash
-$ gza resume 5 --max-turns 100
+$ gza resume gza-5 --max-turns 100
 ```
 
 Add to queue without running immediately:
 
 ```bash
-$ gza resume 5 --queue
+$ gza resume gza-5 --queue
 ```
 
 ## Retry a task
@@ -72,9 +72,9 @@ Retry creates a fresh attempt. Use this when the AI went down a wrong path and y
 `gza retry` runs the new task immediately by default. Use `--queue` to add to queue without executing:
 
 ```bash
-$ gza retry 5
-Created task #6 (retry of #5)
-=== Task #6: 20260108-add-user-auth ===
+$ gza retry gza-5
+Created task gza-6 (retry of gza-5)
+=== Task gza-6: 20260108-add-user-auth ===
 ...
 === Done ===
 Stats: Runtime: 8m 12s | Turns: 32 | Cost: $0.67
@@ -88,11 +88,11 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 $ gza history --status failed
 Recent failed tasks:
 
-  #5 20260108-add-user-auth
+  gza-5 20260108-add-user-auth
      failed - max turns exceeded (50/50)
      10m ago
 
-  #3 20260107-refactor-api
+  gza-3 20260107-refactor-api
      failed - timeout after 10m
      2h ago
 ```
@@ -112,10 +112,10 @@ Recent failed tasks:
 
 3. **Use `--max-turns` for one-off increases:**
    ```bash
-   $ gza work 5 --max-turns 100
+   $ gza work gza-5 --max-turns 100
    ```
 
 4. **Check progress mid-task:**
    ```bash
-   $ gza log 5 --steps
+   $ gza log gza-5 --steps
    ```

@@ -592,10 +592,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
         return 1
 
     # Check if task already has a successful retry
-    children = store.get_based_on_children(args.task_id)
+    children = store.get_based_on_children(task_id)
     successful_retry = next((c for c in children if c.status == "completed"), None)
     if successful_retry:
-        print(f"Error: Task {args.task_id} already has a successful retry ({successful_retry.id}).")
+        print(f"Error: Task {task_id} already has a successful retry ({successful_retry.id}).")
         return 1
 
     # Create new task copying relevant fields

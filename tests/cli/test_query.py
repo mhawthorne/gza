@@ -726,6 +726,21 @@ class TestNextCommand:
         assert "orphaned" in result.stdout
         assert "Stuck orphaned task" in result.stdout
 
+    def test_next_orphaned_hint_requires_full_task_id(self, tmp_path: Path):
+        """Orphaned-task hint should tell users to pass full prefixed task IDs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        orphaned_task = store.add("Orphaned task")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "gza work <full-task-id>" in result.stdout
+        assert "gza mark-completed --force" in result.stdout
+        assert "<full-task-id>" in result.stdout
+
 
 class TestShowCommand:
     """Tests for 'gza show' command."""

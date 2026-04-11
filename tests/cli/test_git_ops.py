@@ -1078,7 +1078,7 @@ class TestDiffCommand:
         assert "modified" in result.stdout or "initial" in result.stdout
 
     def test_diff_with_task_id_not_found(self, tmp_path: Path):
-        """Diff command falls back to git when task ID-like arg is not found in DB.
+        """Diff falls back to git when a full prefixed task ID is not found in DB.
 
         This mirrors cmd_checkout behaviour: a _looks_like_task_id() match that
         doesn't resolve to a real task is passed through to git as a branch/ref.
@@ -1095,11 +1095,35 @@ class TestDiffCommand:
         # Create empty database
         setup_db_with_tasks(tmp_path, [])
 
-        # Run diff with non-existent task ID — falls back to git, which fails
-        # because "999" is not a valid git ref either.
-        result = run_gza("diff", "999", "--project", str(tmp_path))
+        # Run diff with non-existent full task ID — falls back to git, which fails
+        # because the ref is also invalid.
+        result = run_gza("diff", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode != 0
+
+    def test_diff_treats_bare_suffix_as_git_ref_not_task_id(self, tmp_path: Path):
+        """Bare suffixes should be treated as git refs, not implicit task IDs."""
+        from gza.git import Git
+
+        setup_config(tmp_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        store = make_store(tmp_path)
+        task = store.add("Task with branch")
+        task.branch = "feature/task-branch"
+        store.update(task)
+
+        result = run_gza("diff", "000001", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert f"{task.branch}" not in result.stdout
 
     def test_diff_with_task_id_no_branch(self, tmp_path: Path):
         """Diff command shows error when task has no branch."""

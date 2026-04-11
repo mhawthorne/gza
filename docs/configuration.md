@@ -172,7 +172,7 @@ branch_strategy:
 | Variable | Description |
 |----------|-------------|
 | `{project}` | Project name |
-| `{task_id}` | Full task ID (YYYYMMDD-slug) |
+| `{task_id}` | Full task ID (`{prefix}-{base36}`, for example `gza-1a2b`) |
 | `{date}` | Date portion (YYYYMMDD) |
 | `{slug}` | Slug portion |
 | `{type}` | Inferred or default type |
@@ -497,7 +497,7 @@ gza log <identifier> [options]
 | `--raw` | Show raw JSON lines |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
-By default, the identifier is treated as a task ID (e.g. `gza-1a2b`; bare suffixes like `1a2b` are also accepted).
+By default, the identifier is treated as a full task ID (for example `gza-1a2b`).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
 
 ### stats

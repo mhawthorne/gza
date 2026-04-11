@@ -92,9 +92,9 @@ Common flag combinations:
 - Implementation: `uv run gza add --type implement "what to build"`
 - Implementation with review: `uv run gza add --type implement --review "what to build"`
 - Grouped tasks: `uv run gza add --group auth --type implement "add login endpoint"`
-- Dependent task: `uv run gza add --depends-on 5 "build on task 5's foundation"`
-- Based-on task: `uv run gza add --type implement --based-on 5 "implement the approach from task #5"`
-- Based-on with default prompt: `uv run gza add --type implement --based-on 5` (opens editor with default: "Implement plan from task #5: <plan-task-slug>")
+- Dependent task: `uv run gza add --depends-on gza-5 "build on task gza-5's foundation"`
+- Based-on task: `uv run gza add --type implement --based-on gza-5 "implement the approach from task gza-5"`
+- Based-on with default prompt: `uv run gza add --type implement --based-on gza-5` (opens editor with default: "Implement plan from task gza-5: <plan-task-slug>")
 
 ### Step 5: Confirm success
 
@@ -132,15 +132,15 @@ uv run gza add --type implement --review "add JWT authentication to the API endp
 **Grouped workflow:**
 ```bash
 uv run gza add --group metrics --type plan "design metrics collection system"
-uv run gza add --group metrics --type implement --depends-on 12 "implement metrics collector"
-uv run gza add --group metrics --type implement --depends-on 13 "add metrics export to CSV/JSON"
+uv run gza add --group metrics --type implement --depends-on gza-c "implement metrics collector"
+uv run gza add --group metrics --type implement --depends-on gza-d "add metrics export to CSV/JSON"
 ```
 
 **Improve workflow (addressing review feedback):**
 ```bash
 # After a review requests changes, create an improve task
-uv run gza improve 29  # where 29 is the implementation task ID
-uv run gza improve 29 --review  # auto-create review after improvements
+uv run gza improve gza-t  # where gza-t is the implementation task ID
+uv run gza improve gza-t --review  # auto-create review after improvements
 ```
 
 ## Important notes

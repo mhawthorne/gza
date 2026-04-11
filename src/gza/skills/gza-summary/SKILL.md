@@ -55,20 +55,20 @@ Review the combined output and identify actionable items:
 Based on the analysis, provide a prioritized list of specific, actionable suggestions. Examples:
 
 **For unmerged branches:**
-- "Merge branch `20260115-add-authentication` — task #18 is complete and has 3 commits ready"
-- "Create a PR for task #22 (`20260118-fix-api-pagination`) before merging"
+- "Merge branch `20260115-add-authentication` — task gza-i is complete and has 3 commits ready"
+- "Create a PR for task gza-m (`20260118-fix-api-pagination`) before merging"
 
 **For failed tasks:**
-- "Retry failed task #23 — it failed due to a missing module, which may now be installed"
-- "Investigate task #25 failure: check the log with `uv run gza log 25 --task`"
+- "Retry failed task gza-n — it failed due to a missing module, which may now be installed"
+- "Investigate task gza-p failure: check the log with `uv run gza log gza-p --task`"
 
 **For pending tasks:**
-- "Run `uv run gza work` to start the next pending task: #31 (implement CSV export)"
-- "Task #28 depends on #27 which is still in_progress — wait before running"
+- "Run `uv run gza work` to start the next pending task: gza-v (implement CSV export)"
+- "Task gza-s depends on gza-r which is still in_progress — wait before running"
 
 **For infrastructure/ops tasks:**
-- "Apply terraform changes before running task #34 (requires infrastructure update)"
-- "Upload config files to S3 before running task #36"
+- "Apply terraform changes before running task gza-y (requires infrastructure update)"
+- "Upload config files to S3 before running task gza-10"
 - "Review and merge branch X before starting dependent task Y"
 
 **General workflow suggestions:**

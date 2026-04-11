@@ -578,6 +578,28 @@ class TestRetryCommand:
         assert result.returncode == 1
         assert f"Error: Task {original.id} already has a successful retry ({retry.id})." in result.stdout
 
+    @pytest.mark.parametrize("wrapped_id", ["  {id}  ", "\t{id}\t"])
+    def test_retry_duplicate_guard_uses_canonical_task_id(self, tmp_path: Path, wrapped_id: str):
+        """Retry duplicate checks should use the canonical resolved task ID."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original task")
+        original.status = "failed"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+
+        retry = store.add("Original task", based_on=original.id)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(UTC)
+        store.update(retry)
+
+        task_arg = wrapped_id.format(id=original.id)
+        result = run_gza("retry", task_arg, "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert f"Error: Task {original.id} already has a successful retry ({retry.id})." in result.stdout
+
 
 class TestResumeCommand:
     """Tests for 'gza resume' command."""

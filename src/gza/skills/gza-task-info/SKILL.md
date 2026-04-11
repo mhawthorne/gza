@@ -14,7 +14,7 @@ Gather comprehensive information about a specific gza task, including database d
 
 ### Step 1: Get task ID
 
-The user should provide a task ID (e.g., "18", "#42", or just "5"). Extract the numeric ID.
+The user should provide a full prefixed task ID (for example, `gza-1a2b`). Extract it from the input.
 
 ### Step 2: Query task from database
 
@@ -107,7 +107,7 @@ Create a clear, concise summary of the task state. Examples:
 
 **Completed task with commits:**
 ```
-Task #18: completed
+Task gza-i: completed
 Type: implement
 Branch: 20260115-add-authentication (3 commits, not yet merged)
 Duration: 245.3s (4:05)
@@ -117,7 +117,7 @@ Prompt: "Add JWT authentication to API endpoints"
 
 **Failed task:**
 ```
-Task #23: failed
+Task gza-n: failed
 Type: implement
 Duration: 89.2s (1:29)
 Cost: $0.15
@@ -127,16 +127,16 @@ Log shows: verify_command failed — mypy found 3 type errors in src/gza/db.py
 
 **Pending task with dependency:**
 ```
-Task #31: pending
+Task gza-v: pending
 Type: implement
-Depends on: Task #30 (still in_progress)
+Depends on: Task gza-u (still in_progress)
 Group: metrics-v2
 Prompt: "Implement CSV export for metrics data"
 ```
 
 **Completed task with report:**
 ```
-Task #15: completed (exploration)
+Task gza-f: completed (exploration)
 Duration: 156.7s (2:37)
 Cost: $0.28
 Report: Found 3 authentication patterns in codebase (see below)

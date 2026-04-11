@@ -14,7 +14,7 @@ Resume a failed or max-turns gza task directly in the current conversation, pick
 
 ### Step 1: Get task ID
 
-The user should provide a task ID (numeric). Extract it from the input. If no task ID is provided, list recent failed tasks:
+The user should provide a full prefixed task ID (for example, `gza-1a2b`). Extract it from the input. If no task ID is provided, list recent failed tasks:
 
 ```bash
 uv run python -c "
