@@ -63,9 +63,16 @@ class TestBuildAutoReviewPrompt:
         assert result == "review refactor-db"
 
     def test_slug_strips_only_trailing_number(self):
+        """Trailing ``-<digits>`` is treated as a revision suffix by design."""
         task = _task(slug="20260315-fix-bug-42")
         result = build_auto_review_prompt(task)
         assert result == "review fix-bug"
+
+    def test_slug_strips_trailing_year_like_suffix_as_revision(self):
+        """Even year-like suffixes are normalized as trailing revision numbers."""
+        task = _task(slug="20260315-security-rollout-2024")
+        result = build_auto_review_prompt(task)
+        assert result == "review security-rollout"
 
     def test_slug_strips_derived_implement_prefix(self):
         task = _task(slug="20260410-0000ab-impl-add-authentication-system")
@@ -126,6 +133,11 @@ class TestBuildAutoReviewPrompt:
         task = _task(slug="20260410-0000ab-impl-myproj-add-feature")
         result = build_auto_review_prompt(task, project_prefix="myproj")
         assert result == "review add-feature"
+
+    def test_project_prefix_not_stripped_without_exact_prefix_token(self):
+        task = _task(slug="20260410-0000ab-impl-myproj2-add-feature")
+        result = build_auto_review_prompt(task, project_prefix="myproj")
+        assert result == "review myproj2-add-feature"
 
     def test_fallback_when_no_task_id(self):
         task = _task(id=5, slug=None, prompt="build the thing")
