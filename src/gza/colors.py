@@ -66,6 +66,7 @@ blue_bright: str = "#00ccff"
 blue_light: str = "#88ccff"
 blue: str = "blue"
 
+pink_light: str = "#ff88cc"
 pink_neon: str = "#ffaaff"
 
 # Soft gray used for secondary/metadata text (task IDs, dates, labels).
@@ -371,7 +372,7 @@ _THEME_MINIMAL = Theme(
         "review_approved": green_success,
     },
     task_stream={
-        "step_header": blue_light,
+        "step_header": pink_light,
     },
     rich={
         "repr.number": orange,
