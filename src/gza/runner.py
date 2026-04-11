@@ -38,6 +38,7 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task
 from .review_verdict import parse_review_verdict
+from .task_slug import extract_task_id_suffix, get_base_task_slug
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +344,8 @@ def generate_slug(
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
         if slug_override is not None:
-            # slug_override already encodes full lineage context (e.g. "rev-myproj-add-feature")
+            # slug_override already encodes full lineage context
+            # (e.g. "0000mr-rev-myproj-add-feature")
             # so do not prepend project_prefix — it would double-embed the prefix for chained tasks
             base_id = f"{date_prefix}-{slug_override}"
         else:
@@ -367,22 +369,15 @@ def generate_slug(
 
 
 
-def _extract_slug_suffix(slug: str) -> str:
-    """Extract the non-date portion from a slug (strips date prefix and retry suffix)."""
-    parts = slug.split('-', 1)
-    if len(parts) == 2:
-        suffix = parts[1]
-        # Remove retry suffix (-2, -3, etc.)
-        suffix = re.sub(r'-\d+$', '', suffix)
-        return suffix
-    return slug
-
-
-
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
     """Compute a slug_override for review/implement/improve tasks.
 
-    Uses a type prefix ('rev', 'impl', 'impr') followed by the root task's slug.
+    Uses ``{task_id_suffix}-{type_prefix}-{target_slug}`` where target is the
+    direct parent this task operates on:
+    - review -> depends_on
+    - improve -> based_on
+    - implement -> based_on (fallback: depends_on)
+
     Returns None for other task types (slug is derived from prompt as usual).
     """
     prefix_map = {
@@ -394,15 +389,37 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     if prefix is None:
         return None
 
-    from . import query as _query
-    root = _query.resolve_lineage_root(store, task)
+    if task.task_type == "review":
+        anchor_id = task.depends_on
+    elif task.task_type == "improve":
+        anchor_id = task.based_on
+    else:  # implement
+        anchor_id = task.based_on or task.depends_on
 
-    if root.slug:
-        root_slug = _extract_slug_suffix(root.slug)
-    else:
-        root_slug = slugify(root.prompt)
+    anchor_task = None
+    if anchor_id is not None:
+        anchor_task = store.get(anchor_id)
+        if anchor_task is None:
+            logger.warning(
+                "Slug override anchor task missing for task #%s (%s): anchor_id=%s; "
+                "falling back to the child task prompt",
+                task.id,
+                task.task_type,
+                anchor_id,
+            )
 
-    return f"{prefix}-{root_slug}"
+    # get_base_task_slug strips the YYYYMMDD date prefix and any trailing
+    # "-N" revision suffix from the anchor task's slug. The returned override
+    # has no date prefix; generate_slug re-prepends today's date later, so
+    # passing a bare override keeps the final slug from gaining a double date.
+    target_slug = (
+        get_base_task_slug(anchor_task.slug)
+        if anchor_task and anchor_task.slug
+        else slugify(anchor_task.prompt if anchor_task else task.prompt)
+    )
+    task_id_suffix = extract_task_id_suffix(task.id)
+
+    return "-".join(part for part in (task_id_suffix, prefix, target_slug) if part)
 
 
 def _slug_exists(

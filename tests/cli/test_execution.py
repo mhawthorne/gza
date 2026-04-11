@@ -566,19 +566,19 @@ class TestRetryCommand:
         # Create original failed task
         original = store.add("Original task")
         original.status = "failed"
-        original.completed_at = datetime.now(timezone.utc)
+        original.completed_at = datetime.now(UTC)
         store.update(original)
 
         # Create a successful retry child
-        retry = store.add("Original task", based_on=1)
+        retry = store.add("Original task", based_on=original.id)
         retry.status = "completed"
-        retry.completed_at = datetime.now(timezone.utc)
+        retry.completed_at = datetime.now(UTC)
         store.update(retry)
 
-        result = run_gza("retry", "1", "--queue", "--project", str(tmp_path))
+        result = run_gza("retry", str(original.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "Error: Task #1 already has a successful retry (#2)." in result.stdout
+        assert f"Error: Task #{original.id} already has a successful retry (#{retry.id})." in result.stdout
 
 
 class TestResumeCommand:

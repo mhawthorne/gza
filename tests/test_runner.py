@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +25,6 @@ from gza.runner import (
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
     _extract_review_verdict,
-    _extract_slug_suffix,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
     _run_non_code_task,
@@ -895,6 +895,55 @@ class TestReviewTaskSlugGeneration:
             gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review
 
+    def test_review_task_strips_nested_derived_implement_prefixes(self, tmp_path: Path):
+        """Auto-created reviews keep only semantic slug for nested derived implement slugs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="testproject")
+
+        parent_impl = store.add(
+            prompt="Add feature",
+            task_type="implement",
+        )
+        parent_impl.status = "completed"
+        parent_impl.slug = "20260409-000001-impl-add-feature"
+        store.update(parent_impl)
+
+        impl_task = store.add(
+            prompt="Add feature",
+            task_type="implement",
+            based_on=parent_impl.id,
+        )
+        impl_task.status = "completed"
+        impl_task.slug = "20260410-000002-impl-000001-impl-add-feature"
+        store.update(impl_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+
+        def mock_run(config, task_id):
+            return 0
+
+        def mock_post_review_to_pr(*args, **kwargs):
+            pass
+
+        import gza.runner
+        original_run = gza.runner.run
+        original_post_review = gza.runner.post_review_to_pr
+        gza.runner.run = mock_run
+        gza.runner.post_review_to_pr = mock_post_review_to_pr
+
+        try:
+            _create_and_run_review_task(impl_task, config, store)
+
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
+            assert review_task is not None
+            assert review_task.prompt == "review add-feature"
+        finally:
+            gza.runner.run = original_run
+            gza.runner.post_review_to_pr = original_post_review
+
     def test_review_task_fallback_without_task_id(self, tmp_path: Path):
         """Test that review task falls back gracefully if task_id is not set."""
         db_path = tmp_path / "test.db"
@@ -1111,19 +1160,6 @@ class TestReviewTaskSlugGeneration:
             gza.runner.run = original_run
 
 
-class TestExtractSlugSuffix:
-    """Tests for _extract_slug_suffix helper."""
-
-    def test_strips_date_prefix(self):
-        assert _extract_slug_suffix("20260129-add-docker-volumes") == "add-docker-volumes"
-
-    def test_strips_date_prefix_and_retry_suffix(self):
-        assert _extract_slug_suffix("20260129-fix-auth-bug-2") == "fix-auth-bug"
-
-    def test_no_dash_returns_original(self):
-        assert _extract_slug_suffix("nodash") == "nodash"
-
-
 class TestGenerateSlugSlugOverride:
     """Tests for generate_slug with slug_override parameter."""
 
@@ -1176,6 +1212,11 @@ class TestGenerateSlugProjectPrefix:
         assert "add-auth-support" in slug
         # Should not have a double-dash from empty prefix
         assert "--" not in slug
+
+    def test_non_review_implement_improve_path_unchanged(self):
+        """Default path keeps YYYYMMDD-project_prefix-prompt format."""
+        slug = generate_slug("Normal task prompt", project_prefix="gza")
+        assert slug.endswith("-gza-normal-task-prompt") or "-gza-normal-task-prompt-" in slug
 
 
 class TestTaskIdExistsBranchStrategy:
@@ -1323,53 +1364,112 @@ class TestTaskIdExistsBranchStrategy:
 class TestComputeSlugOverride:
     """Tests for _compute_slug_override helper."""
 
-    def test_review_task_uses_rev_prefix(self, tmp_path: Path):
-        """Review tasks get 'rev-' prefix with root task's slug."""
+    @staticmethod
+    def _suffix(task_id: str | None) -> str:
+        assert task_id is not None
+        prefix, sep, suffix = task_id.partition("-")
+        assert sep and prefix and suffix
+        return suffix
+
+    def test_sibling_review_tasks_use_their_own_direct_targets(self, tmp_path: Path):
+        """Sibling reviews in one lineage derive different target slugs."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        root_impl = store.add(prompt="Remove shorthand and legacy task id resolution", task_type="implement")
+        root_suffix = self._suffix(root_impl.id)
+        root_impl.slug = f"20260410-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution"
+        store.update(root_impl)
+        child_impl = store.add(
+            prompt="Switch task ids to variable length decimal",
+            task_type="implement",
+            based_on=root_impl.id,
+        )
+        child_suffix = self._suffix(child_impl.id)
+        child_impl.slug = (
+            f"20260410-{child_suffix}-impl-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution"
+        )
+        store.update(child_impl)
+
+        review_root = store.add(
+            prompt="Review root implementation",
+            task_type="review",
+            depends_on=root_impl.id,
+        )
+        review_child = store.add(
+            prompt="Review child implementation",
+            task_type="review",
+            depends_on=child_impl.id,
+        )
+
+        root_slug = _compute_slug_override(review_root, store)
+        child_slug = _compute_slug_override(review_child, store)
+
+        assert root_slug is not None
+        assert child_slug is not None
+        assert root_slug != child_slug
+        assert f"rev-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution" in root_slug
+        assert f"rev-{child_suffix}-impl-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution" in child_slug
+
+    def test_review_slug_override_includes_review_task_id_suffix(self, tmp_path: Path):
+        """Review slug override embeds the review task's own id suffix."""
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(prompt="Add docker volumes", task_type="implement")
-        impl_task.slug = "20260129-add-docker-volumes"
+        impl_suffix = self._suffix(impl_task.id)
+        impl_task.slug = f"20260129-{impl_suffix}-impl-add-docker-volumes"
         store.update(impl_task)
-
         review_task = store.add(
-            prompt="review add-docker-volumes",
+            prompt="Review implementation",
             task_type="review",
             depends_on=impl_task.id,
         )
 
         result = _compute_slug_override(review_task, store)
-        assert result == "rev-add-docker-volumes"
+        assert result == f"{self._suffix(review_task.id)}-rev-{impl_suffix}-impl-add-docker-volumes"
 
-    def test_implement_task_uses_impl_prefix(self, tmp_path: Path):
-        """Implement tasks get 'impl-' prefix with root task's slug."""
+    def test_implement_and_improve_use_based_on_with_implement_fallback(self, tmp_path: Path):
+        """Implement/improve anchor to based_on; implement falls back to depends_on."""
         store = SqliteTaskStore(tmp_path / "test.db")
         plan_task = store.add(prompt="Add authentication system", task_type="plan")
         plan_task.slug = "20260129-add-authentication-system"
         store.update(plan_task)
-
         impl_task = store.add(
             prompt="Implement authentication",
             task_type="implement",
             based_on=plan_task.id,
         )
-
-        result = _compute_slug_override(impl_task, store)
-        assert result == "impl-add-authentication-system"
-
-    def test_improve_task_uses_impr_prefix(self, tmp_path: Path):
-        """Improve tasks get 'impr-' prefix with root task's slug."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        impl_task = store.add(prompt="Add docker volumes", task_type="implement")
-        impl_task.slug = "20260129-add-docker-volumes"
+        impl_suffix = self._suffix(impl_task.id)
+        impl_task.slug = f"20260129-{impl_suffix}-impl-add-authentication-system"
         store.update(impl_task)
+        impl_result = _compute_slug_override(impl_task, store)
+        assert impl_result == f"{self._suffix(impl_task.id)}-impl-add-authentication-system"
+
+        fallback_target = store.add(prompt="Fallback parent prompt", task_type="task")
+        fallback_target.slug = "20260410-fallback-parent-slug"
+        store.update(fallback_target)
+        impl_fallback = store.add(
+            prompt="Implement with fallback",
+            task_type="implement",
+            depends_on=fallback_target.id,
+        )
+        fallback_result = _compute_slug_override(impl_fallback, store)
+        assert fallback_result == f"{self._suffix(impl_fallback.id)}-impl-fallback-parent-slug"
 
         improve_task = store.add(
-            prompt="Fix the docker volume issues",
+            prompt="Fix auth edge cases",
             task_type="improve",
             based_on=impl_task.id,
         )
+        improve_result = _compute_slug_override(improve_task, store)
+        assert improve_result == f"{self._suffix(improve_task.id)}-impr-{impl_suffix}-impl-add-authentication-system"
 
-        result = _compute_slug_override(improve_task, store)
-        assert result == "impr-add-docker-volumes"
+    def test_variable_width_task_ids_are_supported(self):
+        """Task id suffix extraction does not assume fixed-width ids."""
+        anchor = Task(id="gza-1", prompt="Switch task ids", task_type="implement", slug="20260410-1-impl-switch-task-ids")
+        review_task = Task(id="gza-mp", prompt="Review switch task ids", task_type="review", depends_on=anchor.id)
+        store = Mock(spec=SqliteTaskStore)
+        store.get.return_value = anchor
+
+        result = _compute_slug_override(review_task, store)
+        assert result == "mp-rev-1-impl-switch-task-ids"
 
     def test_plain_task_returns_none(self, tmp_path: Path):
         """Non-review/implement/improve tasks return None."""
@@ -1385,12 +1485,11 @@ class TestComputeSlugOverride:
         result = _compute_slug_override(task, store)
         assert result is None
 
-    def test_fallback_to_prompt_when_root_has_no_task_id(self, tmp_path: Path):
-        """Falls back to slugifying root prompt when root has no task_id."""
+    def test_implement_falls_back_to_target_prompt_when_target_has_no_slug(self, tmp_path: Path):
+        """Falls back to slugifying direct target prompt when target has no slug."""
         store = SqliteTaskStore(tmp_path / "test.db")
         plan_task = store.add(prompt="Add authentication system", task_type="plan")
-        # No task_id set on plan_task
-
+        # plan_task.slug intentionally unset
         impl_task = store.add(
             prompt="Implement authentication",
             task_type="implement",
@@ -1398,57 +1497,24 @@ class TestComputeSlugOverride:
         )
 
         result = _compute_slug_override(impl_task, store)
-        assert result == "impl-add-authentication-system"
+        assert result == f"{self._suffix(impl_task.id)}-impl-add-authentication-system"
 
-    def test_review_task_with_retry_suffix_strips_it(self, tmp_path: Path):
-        """Root task_id retry suffix is stripped from slug."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        impl_task = store.add(prompt="Fix auth", task_type="implement")
-        impl_task.slug = "20260129-fix-auth-2"
-        store.update(impl_task)
-
-        review_task = store.add(
-            prompt="review fix-auth",
+    def test_missing_anchor_logs_warning_and_uses_child_prompt_fallback(self, caplog: pytest.LogCaptureFixture):
+        """Missing direct anchors emit a warning instead of silently falling back."""
+        store = Mock(spec=SqliteTaskStore)
+        store.get.return_value = None
+        review_task = Task(
+            id="gza-0000ab",
+            prompt="Review missing anchor behavior",
             task_type="review",
-            depends_on=impl_task.id,
+            depends_on="gza-unknown",
         )
 
-        result = _compute_slug_override(review_task, store)
-        assert result == "rev-fix-auth"
+        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+            result = _compute_slug_override(review_task, store)
 
-    def test_no_double_prefix_when_root_slug_contains_project_prefix(self, tmp_path: Path):
-        """Review task slug must not double-embed the project prefix.
-
-        Root slug:   20260409-myproj-add-feature
-        Override:    rev-myproj-add-feature   (from _compute_slug_override)
-        generate_slug with project_prefix="myproj" and slug_override set must
-        NOT prepend the prefix again, yielding 20260409-rev-myproj-add-feature,
-        NOT 20260409-myproj-rev-myproj-add-feature.
-        """
-        store = SqliteTaskStore(tmp_path / "test.db")
-        impl_task = store.add(prompt="Add feature", task_type="implement")
-        impl_task.slug = "20260409-myproj-add-feature"
-        store.update(impl_task)
-
-        review_task = store.add(
-            prompt="review myproj-add-feature",
-            task_type="review",
-            depends_on=impl_task.id,
-        )
-
-        slug_override = _compute_slug_override(review_task, store)
-        assert slug_override == "rev-myproj-add-feature"
-
-        final_slug = generate_slug(
-            review_task.prompt,
-            project_prefix="myproj",
-            slug_override=slug_override,
-        )
-        # Prefix "myproj" should appear exactly once in the result
-        assert final_slug.count("myproj") == 1, (
-            f"Expected 'myproj' exactly once in slug, got: {final_slug}"
-        )
-        assert "rev-myproj-add-feature" in final_slug
+        assert result == "0000ab-rev-review-missing-anchor-behavior"
+        assert "Slug override anchor task missing for task #gza-0000ab (review): anchor_id=gza-unknown" in caplog.text
 
 
 class TestReviewNextSteps:
