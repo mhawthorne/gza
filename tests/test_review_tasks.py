@@ -107,6 +107,21 @@ class TestBuildAutoReviewPrompt:
         result = build_auto_review_prompt(task)
         assert result == "review v2-impl-rollout"
 
+    def test_slug_preserves_digit_leading_semantic_subject_2fa(self):
+        task = _task(slug="20260410-0000ab-impl-2fa-impl-login")
+        result = build_auto_review_prompt(task)
+        assert result == "review 2fa-impl-login"
+
+    def test_slug_preserves_digit_leading_semantic_subject_3d(self):
+        task = _task(slug="20260410-0000ab-impl-3d-impl-preview")
+        result = build_auto_review_prompt(task)
+        assert result == "review 3d-impl-preview"
+
+    def test_slug_preserves_digit_leading_semantic_subject_2024(self):
+        task = _task(slug="20260410-0000ab-impl-2024-impl-rollout")
+        result = build_auto_review_prompt(task)
+        assert result == "review 2024-impl-rollout"
+
     def test_project_prefix_stripped_after_derived_normalization(self):
         task = _task(slug="20260410-0000ab-impl-myproj-add-feature")
         result = build_auto_review_prompt(task, project_prefix="myproj")

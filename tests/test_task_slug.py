@@ -68,3 +68,21 @@ def test_strip_derived_implement_prefixes_preserves_semantic_digit_subject_v2() 
     """Digit-bearing semantic subjects like ``v2-impl-*`` are preserved."""
     slug = "0000ab-impl-v2-impl-rollout"
     assert strip_derived_implement_prefixes(slug) == "v2-impl-rollout"
+
+
+def test_strip_derived_implement_prefixes_preserves_digit_leading_semantic_2fa() -> None:
+    """Digit-leading semantic subjects like ``2fa-impl-*`` are preserved."""
+    slug = "0000ab-impl-2fa-impl-login"
+    assert strip_derived_implement_prefixes(slug) == "2fa-impl-login"
+
+
+def test_strip_derived_implement_prefixes_preserves_digit_leading_semantic_3d() -> None:
+    """Digit-leading semantic subjects like ``3d-impl-*`` are preserved."""
+    slug = "0000ab-impl-3d-impl-preview"
+    assert strip_derived_implement_prefixes(slug) == "3d-impl-preview"
+
+
+def test_strip_derived_implement_prefixes_preserves_digit_leading_semantic_2024() -> None:
+    """Digit-leading semantic subjects like ``2024-impl-*`` are preserved."""
+    slug = "0000ab-impl-2024-impl-rollout"
+    assert strip_derived_implement_prefixes(slug) == "2024-impl-rollout"
