@@ -69,6 +69,11 @@ def _encode_v25_base36(n: int) -> str:
     return "".join(reversed(result)).zfill(width)
 
 
+def _decode_base36(s: str) -> int:
+    """Decode a base-36 string to an integer."""
+    return int(s, 36)
+
+
 def task_id_numeric_key(task_id: str | None) -> int:
     """Return an integer sort key for a task ID that preserves creation order.
 

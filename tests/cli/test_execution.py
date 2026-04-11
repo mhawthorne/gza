@@ -577,7 +577,7 @@ class TestRetryCommand:
 
         assert result.returncode == 1
         assert (
-            f"Error: Task #{original.id} already has a successful retry (#{retry.id})."
+            f"Error: Task {original.id} already has a successful retry ({retry.id})."
             in result.stdout
         )
 

@@ -751,7 +751,7 @@ class TestShowCommand:
             {"prompt": "A detailed task prompt", "status": "pending"},
         ])
 
-        result = run_gza("show", "testproject-000001", "--project", str(tmp_path))
+        result = run_gza("show", "testproject-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task " in result.stdout
@@ -2519,7 +2519,7 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "testproject-000001", "--force", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-1", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
@@ -2543,7 +2543,7 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "testproject-000001", "--yes", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-1", "--yes", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
@@ -2558,7 +2558,7 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "testproject-000001", "-y", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-1", "-y", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
@@ -3584,7 +3584,7 @@ class TestLineageCommand:
             {"prompt": "Design auth system", "status": "completed", "task_type": "plan"},
         ])
 
-        result = run_gza("lineage", "testproject-000001", "--project", str(tmp_path))
+        result = run_gza("lineage", "testproject-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Design auth system" in result.stdout

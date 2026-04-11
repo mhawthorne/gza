@@ -4883,7 +4883,7 @@ class TestPrCommand:
             {"prompt": "Pending task", "status": "pending"},
         ])
 
-        result = run_gza("pr", "testproject-000001", "--project", str(tmp_path))
+        result = run_gza("pr", "testproject-1", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not completed" in result.stdout
