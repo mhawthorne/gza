@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "KNOWN_FAILURE_REASONS",
+    "InvalidTaskIdError",
     "ManualMigrationRequired",
     "Task",
     "TaskStats",
@@ -44,6 +45,11 @@ _B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 # any real project.  Fixed width means string sort order matches numeric order
 # without custom collation, so ``gza-000002`` sorts before ``gza-000010``.
 _TASK_ID_SEQ_WIDTH = 6
+_FULL_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[a-z0-9]+$")
+
+
+class InvalidTaskIdError(ValueError):
+    """Raised when a user-supplied task ID is not a full prefixed ID."""
 
 
 def _encode_base36(n: int, width: int = _TASK_ID_SEQ_WIDTH) -> str:
@@ -3038,36 +3044,22 @@ CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)
 def resolve_task_id(arg: str, project_prefix: str) -> str:
     """Resolve a user-supplied task ID argument to a canonical string ID.
 
-    Handles three forms:
-    - Full prefixed ID: ``"gza-3f"`` → ``"gza-3f"`` (returned as-is)
-    - Bare decimal integer: ``"42"`` → ``"{prefix}-{base36(42)}"``
-      Decimal integers are treated as legacy pre-migration integer IDs and
-      converted to their base36 equivalent, so users with muscle memory of old
-      integer IDs can still find their tasks after the v25 migration.
-    - Bare base36 suffix: ``"3f"`` → ``"{prefix}-3f"``
+    Accepts only full prefixed IDs: ``"{prefix}-{base36_suffix}"``.
+    Prefix matching is intentionally not enforced here; syntactically valid IDs
+    with a different prefix are resolved and may fail later as "not found".
 
     The returned value is the string to pass to ``store.get()``.
-
-    Note: any hyphenated string (e.g. ``"feature-branch"``) is treated as a
-    full prefixed ID and returned unchanged.  The caller is responsible for
-    handling the resulting ``store.get()`` returning ``None``; the "not found"
-    error message is more actionable than a format-validation error here.
     """
     arg = arg.strip()
     if not arg:
-        raise ValueError("Empty task ID")
-    # Full prefixed ID already (contains a hyphen) — returned as-is.
-    # Callers handle store.get() returning None for unrecognised IDs.
-    if "-" in arg:
-        return arg
-    # Bare decimal integer → interpret as legacy pre-migration integer ID
-    if arg.isdigit() and int(arg) > 0:
-        return f"{project_prefix}-{_encode_base36(int(arg))}"
-    # Bare base36 suffix — pad to canonical width and prepend project prefix.
-    # Inputs shorter than the canonical width are left-padded so users can
-    # type ``gza show hi`` and find ``gza-0000hi``.  Inputs already at (or
-    # beyond) the canonical width pass through unchanged.
-    return f"{project_prefix}-{arg.zfill(_TASK_ID_SEQ_WIDTH)}"
+        raise InvalidTaskIdError(
+            f"Invalid task ID {arg!r}. Use a full prefixed task ID like '{project_prefix}-000001'."
+        )
+    if not _FULL_TASK_ID_RE.match(arg):
+        raise InvalidTaskIdError(
+            f"Invalid task ID '{arg}'. Use a full prefixed task ID like '{project_prefix}-000001'."
+        )
+    return arg
 
 
 class _MigrationPreview(TypedDict):

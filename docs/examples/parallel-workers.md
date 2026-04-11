@@ -27,10 +27,10 @@ Each worker atomically claims a pending task—no conflicts or duplicate work.
 
 ```bash
 $ gza ps
-TASK ID    TYPE       STATUS         STARTED                  STEPS   DURATION   TASK
-#101       implement  running        2026-01-08 16:00:01 UTC  12      1m 23s     20260108-add-user-avatar-upload
-#102       implement  running        2026-01-08 16:00:02 UTC  11      1m 22s     20260108-implement-email-notifications
-#103       implement  failed(startup) 2026-01-08 16:00:03 UTC -       8s         20260108-add-dark-mode-toggle
+TASK ID    TYPE       STATUS           STARTED                  STEPS   DURATION   TASK
+gza-2t     implement  running          2026-01-08 16:00:01 UTC  12      1m 23s     20260108-add-user-avatar-upload
+gza-2u     implement  running          2026-01-08 16:00:02 UTC  11      1m 22s     20260108-implement-email-notifications
+gza-2v     implement  failed(startup)  2026-01-08 16:00:03 UTC  -       8s         20260108-add-dark-mode-toggle
 ```
 
 Default output includes running tasks and startup failures. Include all completed/failed rows:
@@ -48,18 +48,18 @@ $ gza log -w w-20260108-160001 -f
 ## Kill a single task
 
 ```bash
-$ gza kill 101
-Killed: #101 (pid 55555)
+$ gza kill gza-2t
+Killed: gza-2t (pid 55555)
 ```
 
 ## Kill all running tasks
 
 ```bash
 $ gza kill --all
-Killed: #101 (pid 55555)
-Killed: #102 (pid 55556)
-Killed: #103 (pid 55557)
-Killed: #104 (pid 55558)
+Killed: gza-2t (pid 55555)
+Killed: gza-2u (pid 55556)
+Killed: gza-2v (pid 55557)
+Killed: gza-2w (pid 55558)
 ```
 
 Force kill if tasks are unresponsive:

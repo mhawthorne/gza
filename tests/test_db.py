@@ -3910,44 +3910,19 @@ class TestMigrationV21ToV22:
 
 
 class TestResolveTaskId:
-    """Unit tests for resolve_task_id() — the core backward-compat resolution function.
-
-    Covers all three input forms (full prefixed, bare decimal, bare base36 suffix)
-    plus edge cases: zero, all-alpha suffix, empty string, whitespace padding, and
-    a custom prefix.
-    """
+    """Unit tests for strict full-ID task resolution."""
 
     PREFIX = "gza"
 
     @pytest.mark.parametrize(
         "arg, expected",
         [
-            # Full prefixed ID — returned as-is regardless of content or suffix width.
-            # These are the only cases where the suffix passes through unchanged; the
-            # caller is trusted to have supplied a canonical ID.
+            # Full prefixed IDs are returned as-is.
             ("gza-3f", "gza-3f"),
             ("gza-000001", "gza-000001"),
             ("gza-z", "gza-z"),
             ("gza-10", "gza-10"),
-            # Bare decimal integer → legacy pre-migration ID → base36 conversion → pad
-            # base36(42) = "16" (1*36 + 6 = 42) → padded to "000016"
-            ("42", "gza-000016"),
-            # base36(1) = "1" → padded to "000001"
-            ("1", "gza-000001"),
-            # Bare base36 suffix — left-padded to canonical width and prefixed.
-            # Only strings that contain at least one non-digit character go through
-            # the bare-suffix path; all-digit strings are treated as legacy decimal.
-            ("3f", "gza-00003f"),
-            ("z", "gza-00000z"),
-            # "10" is all-digit → decimal 10 → base36(10) = "a" → padded to "00000a"
-            ("10", "gza-00000a"),
-            # All-alpha suffix is NOT treated as decimal — goes to bare-suffix path
-            ("abc", "gza-000abc"),
-            # "0" — isdigit() is True but int("0") > 0 is False → bare-suffix path → pad
-            ("0", "gza-000000"),
             # Whitespace padding — stripped before processing
-            ("  42  ", "gza-000016"),
-            (" 3f ", "gza-00003f"),
             (" gza-3f ", "gza-3f"),
         ],
     )
@@ -3955,25 +3930,34 @@ class TestResolveTaskId:
         assert resolve_task_id(arg, self.PREFIX) == expected
 
     def test_empty_string_raises_value_error(self) -> None:
-        with pytest.raises(ValueError, match="Empty task ID"):
+        with pytest.raises(ValueError, match="Invalid task ID"):
             resolve_task_id("", self.PREFIX)
 
     def test_whitespace_only_raises_value_error(self) -> None:
-        with pytest.raises(ValueError, match="Empty task ID"):
+        with pytest.raises(ValueError, match="Invalid task ID"):
             resolve_task_id("   ", self.PREFIX)
 
-    def test_custom_prefix(self) -> None:
-        """resolve_task_id uses the supplied prefix, not a hard-coded one."""
-        assert resolve_task_id("3f", "myapp") == "myapp-00003f"
-        assert resolve_task_id("42", "myapp") == "myapp-000016"
-        assert resolve_task_id("myapp-3f", "myapp") == "myapp-3f"
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "3f",
+            "42",
+            "0",
+            "abc",
+            "feature/add-branch",
+            "gza-",
+            "-000001",
+            "GZA-000001",
+            "gza_000001",
+        ],
+    )
+    def test_rejects_non_full_or_invalid_ids(self, arg: str) -> None:
+        with pytest.raises(ValueError, match="Use a full prefixed task ID"):
+            resolve_task_id(arg, self.PREFIX)
 
-    def test_bare_decimal_base36_encoding(self) -> None:
-        """Decimal integers are converted to base36 and zero-padded to canonical width."""
-        # 35 → 'z' → '00000z', 36 → '10' → '000010' — exercises the boundary where
-        # the encoding advances from 1 to 2 chars before padding fills the rest.
-        assert resolve_task_id("35", self.PREFIX) == "gza-00000z"
-        assert resolve_task_id("36", self.PREFIX) == "gza-000010"
+    def test_uses_project_prefix(self) -> None:
+        assert resolve_task_id("myapp-000001", "myapp") == "myapp-000001"
+        assert resolve_task_id("other-000001", "myapp") == "other-000001"
 
 
 def _make_v24_db(db_path: "Path") -> None:

@@ -67,7 +67,7 @@ class TestCmdAttach:
         assert "gza-1" in call_args[1]
 
     def test_cmd_attach_finds_session_by_task_id(self, tmp_path: Path):
-        """cmd_attach attaches to tmux session when looked up by numeric task ID."""
+        """cmd_attach attaches to tmux session when looked up by full prefixed task ID."""
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
 
         # Find actual task_id from DB

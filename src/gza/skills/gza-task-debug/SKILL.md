@@ -14,7 +14,7 @@ Diagnose why a gza task failed by analyzing logs, detecting agent loops, compari
 
 ### Step 1: Get task ID
 
-The user should provide a task ID (e.g., "18", "#42", or just "5"). Extract the numeric ID.
+The user should provide a full prefixed task ID (for example, `gza-1a2b`). Extract it from the input.
 
 ### Step 2: Query task from database
 
@@ -167,7 +167,7 @@ Output a structured diagnosis with these sections:
 
 | Field | Value |
 |-------|-------|
-| ID | #<id> |
+| ID | <full-task-id> |
 | Status | <status> |
 | Prompt | <prompt> |
 | Turns | <num_turns> |

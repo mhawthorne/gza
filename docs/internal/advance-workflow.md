@@ -194,19 +194,19 @@ Rebase tasks need git identity for `git rebase --continue`. The Docker container
 ```
 Will advance N task(s):
 
-  #42 Implement feature X
+  gza-2a Implement feature X
       → Merge (review APPROVED)
 
-  #45 Fix caching bug
+  gza-2d Fix caching bug
       → Create review (required before merge)
 
-  #38 Refactor API
-      → SKIP: rebase #51 already in progress
+  gza-26 Refactor API
+      → SKIP: rebase gza-33 already in progress
 
 Advanced: 1 merged, 1 review started, 1 skipped
 
 ⚠ Tasks needing attention:
-  #39 Update deps — SKIP: max review cycles (3) reached, needs manual intervention
+  gza-27 Update deps — SKIP: max review cycles (3) reached, needs manual intervention
 ```
 
 ## Idempotency

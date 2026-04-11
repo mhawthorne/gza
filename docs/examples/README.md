@@ -27,7 +27,7 @@ Practical examples showing common workflows with Gza.
 
 ## Quick Reference
 
-> **Note:** Commands that take `<task_id>` accept numeric task IDs (e.g., `1`, `42`), not slugs.
+> **Note:** Commands that take `<task_id>` require full prefixed task IDs (for example, `gza-1a2b`), not slugs.
 
 | Task | Command |
 |------|---------|

@@ -285,15 +285,60 @@ class TestSkillContentValidation:
         assert "uv run gza history --type plan --limit 10" in content
         assert "--last 10" not in content
 
-    def test_gza_plan_review_documents_hash_id_normalization(self):
-        """gza-plan-review should explicitly normalize #<id> input before command execution."""
+    def test_gza_plan_review_requires_full_prefixed_task_id(self):
+        """gza-plan-review should require full prefixed IDs instead of numeric shorthand."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-plan-review" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "supports `42` or `#42`" in content
-        assert "strip the leading `#`" in content
+        assert "full prefixed plan task ID" in content
+        assert "supports `42` or `#42`" not in content
+        assert "strip the leading `#`" not in content
+
+    @pytest.mark.parametrize(
+        "skill_name",
+        [
+            "gza-plan-review",
+            "gza-task-review",
+            "gza-summary",
+        ],
+    )
+    def test_skill_examples_do_not_use_unsupported_gza_log_task_flag(self, skill_name: str):
+        """Skill docs should not include invalid `gza log ... --task` guidance."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "gza log --task" not in content
+        assert "gza log gza-p --task" not in content
+
+    @pytest.mark.parametrize(
+        "skill_name",
+        [
+            "gza-task-run",
+            "gza-task-review",
+            "gza-plan-review",
+            "gza-task-resume",
+            "gza-task-improve",
+            "gza-task-info",
+            "gza-task-debug",
+        ],
+    )
+    def test_task_id_sensitive_skills_avoid_numeric_or_shorthand_guidance(self, skill_name: str):
+        """Task-ID-sensitive skills should require full prefixed task IDs."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        lowered = content.lower()
+        assert "full prefixed" in lowered and "task id" in lowered
+        assert "task id (numeric)" not in lowered
+        assert "actual numeric task id" not in lowered
+        assert "supports `42`" not in content
+        assert "#42" not in content
 
     def test_all_skills_use_uppercase_skill_md(self):
         """All skills must use SKILL.md (uppercase) naming convention."""

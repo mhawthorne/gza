@@ -12,12 +12,12 @@ Run an interactive code review for a specific gza task. Produces structured revi
 
 ## Inputs
 
-- Required: task ID (supports `42` or `#42`)
+- Required: full prefixed task ID (for example, `gza-1a2b`)
 - Optional: `--pr` — also post the review as a PR comment
 
 If the user did not provide a task ID, ask for it before proceeding.
 
-Normalize task IDs: strip leading `#` if present.
+Use the full prefixed task ID as provided.
 
 ## Process
 
@@ -64,7 +64,7 @@ print(json.dumps({
 "
 ```
 
-Replace `<TASK_ID>` with the actual numeric task ID.
+Replace `<TASK_ID>` with the actual full prefixed task ID.
 
 If the task is not found, stop and tell the user.
 
@@ -86,7 +86,7 @@ Gather additional context about the task:
 
 ```bash
 uv run gza show <IMPL_TASK_ID>
-uv run gza log --task <IMPL_TASK_ID>
+uv run gza log <IMPL_TASK_ID>
 ```
 
 ### Step 4: Run the review

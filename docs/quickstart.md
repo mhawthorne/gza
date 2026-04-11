@@ -85,7 +85,7 @@ echo ".gza/" >> .gitignore
 ```bash
 # Add a task
 gza add "Fix the login button not responding on mobile devices"
-# Created task #1: 20260108-fix-the-login-button (implement)
+# Created task gza-1: 20260108-fix-the-login-button (implement)
 
 # Run it
 gza work
@@ -95,11 +95,11 @@ Gza creates a git branch, runs the AI agent in Docker, and commits the changes. 
 
 ```bash
 # See what was done
-gza log 1
+gza log gza-1
 
 # Check the branch
 gza unmerged
-#   #1 20260108-fix-the-login-button
+#   gza-1 20260108-fix-the-login-button
 #      Branch: my-app/20260108-fix-the-login-button
 #      +42 -8 across 3 files
 ```
@@ -109,15 +109,15 @@ gza unmerged
 For a quick fix, merge directly:
 
 ```bash
-gza merge 1 --squash
+gza merge gza-1 --squash
 ```
 
 For anything nontrivial, run a review first:
 
 ```bash
 # AI reviews the implementation
-gza review 1
-# Created review task #2 — runs immediately
+gza review gza-1
+# Created review task gza-2 — runs immediately
 
 # Read the review
 cat .gza/reviews/20260108-review-fix-the-login-button.md
@@ -128,20 +128,20 @@ If the review requests changes, improve and re-review:
 ```bash
 # Address review feedback (continues on the same branch)
 # You can pass the implement, improve, or review task ID — gza auto-resolves to the root implementation.
-gza improve 1
+gza improve gza-1
 
 # Review again
-gza review 1
+gza review gza-1
 ```
 
 When you're satisfied, merge or create a PR:
 
 ```bash
 # Merge locally
-gza merge 1 --squash
+gza merge gza-1 --squash
 
 # Or create a GitHub PR
-gza pr 1
+gza pr gza-1
 ```
 
 ## 6. Scaling up
@@ -185,7 +185,7 @@ gza advance --auto --batch 3
 For a single implementation, run review/improve iterations until approved:
 
 ```bash
-gza iterate 1 --max-iterations 3
+gza iterate gza-1 --max-iterations 3
 ```
 
 ## Next steps

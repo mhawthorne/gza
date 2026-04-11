@@ -12,13 +12,11 @@ Run an interactive plan quality gate for a specific plan task before implementat
 
 ## Inputs
 
-- Required: plan task ID (supports `42` or `#42`)
+- Required: full prefixed plan task ID (for example, `gza-1a2b`)
 
 If the user did not provide a task ID, ask for it before proceeding.
 
-Normalize task IDs before running commands:
-- If input starts with `#`, strip the leading `#` (for example, `#42` -> `42`)
-- Use the normalized numeric value for all `gza` commands
+Use the full prefixed task ID for all `gza` commands.
 
 ## Process
 
@@ -28,7 +26,7 @@ Run these commands with the provided task ID:
 
 ```bash
 uv run gza show <TASK_ID>
-uv run gza log --task <TASK_ID>
+uv run gza log <TASK_ID>
 uv run gza history --type plan --limit 10
 ```
 
@@ -101,7 +99,7 @@ Produce a concise report with:
 - Concrete next steps with owners and commands when possible
 - Reference existing gza commands to continue workflow:
   - `uv run gza show <TASK_ID>`
-  - `uv run gza log --task <TASK_ID>`
+  - `uv run gza log <TASK_ID>`
   - `uv run gza implement <TASK_ID> [--review] "..."`
   - `uv run gza add --type plan "..."` (for remediation planning)
 
@@ -110,12 +108,12 @@ Produce a concise report with:
 Use this structure:
 
 ```text
-Plan Review: Task #<TASK_ID>
+Plan Review: Task <TASK_ID>
 
 Task Context
 - Type/Status: <type> / <status>
 - Prompt: <prompt>
-- Inspected with: gza show, gza log --task, gza history --type plan
+- Inspected with: gza show, gza log, gza history --type plan
 
 Quality Gate
 - Scope clarity: <Pass|Needs work|Fail> - <evidence>

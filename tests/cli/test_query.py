@@ -726,6 +726,21 @@ class TestNextCommand:
         assert "orphaned" in result.stdout
         assert "Stuck orphaned task" in result.stdout
 
+    def test_next_orphaned_hint_requires_full_task_id(self, tmp_path: Path):
+        """Orphaned-task hint should tell users to pass full prefixed task IDs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        orphaned_task = store.add("Orphaned task")
+        store.mark_in_progress(orphaned_task)
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "gza work <full-task-id>" in result.stdout
+        assert "gza mark-completed --force" in result.stdout
+        assert "<full-task-id>" in result.stdout
+
 
 class TestShowCommand:
     """Tests for 'gza show' command."""
@@ -736,7 +751,7 @@ class TestShowCommand:
             {"prompt": "A detailed task prompt", "status": "pending"},
         ])
 
-        result = run_gza("show", "1", "--project", str(tmp_path))
+        result = run_gza("show", "testproject-000001", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task " in result.stdout
@@ -747,7 +762,7 @@ class TestShowCommand:
         """Show command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("show", "999", "--project", str(tmp_path))
+        result = run_gza("show", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -936,7 +951,7 @@ class TestShowCommand:
         task.status = "completed"
         store.update(task)
 
-        result = run_gza("show", "1", "--project", str(tmp_path))
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason:" not in result.stdout
@@ -2504,7 +2519,7 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "1", "--force", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-000001", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
@@ -2517,7 +2532,7 @@ class TestDeleteCommand:
         """Delete command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("delete", "999", "--force", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-999999", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -2528,7 +2543,7 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "1", "--yes", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-000001", "--yes", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
@@ -2543,7 +2558,7 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "1", "-y", "--project", str(tmp_path))
+        result = run_gza("delete", "testproject-000001", "-y", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
@@ -3336,7 +3351,7 @@ class TestKillCommand:
 
         setup_config(tmp_path)
 
-        args = argparse.Namespace(project_dir=tmp_path, task_id="99999", all=False, force=False)
+        args = argparse.Namespace(project_dir=tmp_path, task_id="testproject-99999", all=False, force=False)
         rc = cmd_kill(args)
 
         captured = capsys.readouterr()
@@ -3569,7 +3584,7 @@ class TestLineageCommand:
             {"prompt": "Design auth system", "status": "completed", "task_type": "plan"},
         ])
 
-        result = run_gza("lineage", "1", "--project", str(tmp_path))
+        result = run_gza("lineage", "testproject-000001", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Design auth system" in result.stdout
@@ -3580,7 +3595,7 @@ class TestLineageCommand:
         """Lineage command returns error for missing task ID."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("lineage", "999", "--project", str(tmp_path))
+        result = run_gza("lineage", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower() or "not found" in result.stderr.lower()

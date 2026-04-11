@@ -7,10 +7,10 @@ How to handle branches that have fallen behind main.
 If main has new commits since your task branch was created, you may need to rebase before merging:
 
 ```bash
-$ gza merge 3
+$ gza merge gza-3
 Error: Branch 'feature/add-user-auth' has conflicts with main.
 Rebase the branch first:
-  gza rebase 3
+  gza rebase gza-3
 ```
 
 ## Check for conflicts
@@ -19,7 +19,7 @@ Rebase the branch first:
 $ gza unmerged
 Unmerged branches:
 
-  #3 20260108-add-user-auth
+  gza-3 20260108-add-user-auth
      Branch: feature/add-user-auth
      Commits: 3 ahead, 5 behind main
      Status: needs rebase
@@ -28,7 +28,7 @@ Unmerged branches:
 ## Rebase onto main
 
 ```bash
-$ gza rebase 3
+$ gza rebase gza-3
 Rebasing feature/add-user-auth onto main...
 Successfully rebased. 3 commits applied.
 ```
@@ -40,15 +40,15 @@ If there are no conflicts, the rebase completes automatically.
 If the rebase encounters conflicts:
 
 ```bash
-$ gza rebase 3
+$ gza rebase gza-3
 Rebasing feature/add-user-auth onto main...
 CONFLICT in src/auth/login.py
 
 Rebase paused. Resolve conflicts and run:
-  gza rebase 3 --continue
+  gza rebase gza-3 --continue
 
 Or abort with:
-  gza rebase 3 --abort
+  gza rebase gza-3 --abort
 ```
 
 You can also use the `/gza-rebase` skill in your active runtime (Claude, Codex, or Gemini) for interactive conflict resolution.
@@ -63,7 +63,7 @@ uv run gza skills-install --target codex gza-rebase --project .
 If you're working with a team and main has been updated on the remote:
 
 ```bash
-$ gza rebase 3 --remote
+$ gza rebase gza-3 --remote
 Fetching origin...
 Rebasing feature/add-user-auth onto origin/main...
 Successfully rebased.
@@ -76,14 +76,14 @@ The `--remote` flag fetches the latest from origin before rebasing.
 Once rebased, you can merge normally:
 
 ```bash
-$ gza merge 3 --squash
+$ gza merge gza-3 --squash
 Merged: feature/add-user-auth → main (squashed)
 ```
 
 Or create a PR:
 
 ```bash
-$ gza pr 3
+$ gza pr gza-3
 PR created: https://github.com/myorg/myapp/pull/145
 ```
 
@@ -95,16 +95,16 @@ If you have several tasks that need rebasing:
 $ gza unmerged
 Unmerged branches:
 
-  #3 20260108-add-user-auth (needs rebase)
-  #4 20260108-add-dark-mode (needs rebase)
-  #5 20260108-fix-typo (up to date)
+  gza-3 20260108-add-user-auth (needs rebase)
+  gza-4 20260108-add-dark-mode (needs rebase)
+  gza-5 20260108-fix-typo (up to date)
 
 # Rebase each one
-$ gza rebase 3
-$ gza rebase 4
+$ gza rebase gza-3
+$ gza rebase gza-4
 
 # Then merge all at once
-$ gza merge 3 4 5 --squash
+$ gza merge gza-3 gza-4 gza-5 --squash
 ```
 
 ## Tips

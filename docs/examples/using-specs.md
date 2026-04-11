@@ -74,21 +74,21 @@ For larger features, use a spec to guide the planning phase:
 $ gza add --type plan --spec specs/user-preferences.md \
   "Design the implementation approach for user preferences"
 
-Created task #1: 20260108-design-the-implementation (plan)
+Created task gza-1: 20260108-design-the-implementation (plan)
 
 # Run the plan
-$ gza work 1
+$ gza work gza-1
 
 # Review the plan in .gza/plans/
 $ cat .gza/plans/20260108-design-the-implementation.md
 
 # Create implementation based on the plan (use task ID, not slug)
 # The plan already has the spec context, so no need to pass --spec again
-$ gza add --type implement --based-on 1 \
+$ gza add --type implement --based-on gza-1 \
   "Implement user preferences per the plan"
 
-Created task #2: 20260108-implement-user-preferences (implement)
-Based on: #1
+Created task gza-2: 20260108-implement-user-preferences (implement)
+Based on: gza-1
 ```
 
 ## Bulk import with shared spec
@@ -137,10 +137,10 @@ All tasks include spec: specs/user-preferences.md
 ## Viewing a task's spec
 
 ```bash
-$ gza show 2
-Task #2: 20260108-implement-user-preferences
+$ gza show gza-2
+Task gza-2: 20260108-implement-user-preferences
 Status: pending
 Spec: specs/user-preferences.md
-Based on: #1
+Based on: gza-1
 ...
 ```

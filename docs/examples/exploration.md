@@ -7,7 +7,7 @@ Use exploration tasks for research, investigation, and codebase analysis.
 ```bash
 $ gza add --explore "Investigate why the test suite is slow. Profile the tests and identify the top 5 slowest tests and what makes them slow."
 
-Created task #1: 20260108-investigate-why-the-test (explore)
+Created task gza-1: 20260108-investigate-why-the-test (explore)
 ```
 
 The `--explore` flag is shorthand for `--type explore`.
@@ -15,9 +15,9 @@ The `--explore` flag is shorthand for `--type explore`.
 ## Run it
 
 ```bash
-$ gza work 1
+$ gza work gza-1
 === Task: Investigate why the test suite is slow... ===
-    ID: #1 20260108-investigate-why-the-test
+    ID: gza-1 20260108-investigate-why-the-test
     Type: explore
 ...
 === Done ===

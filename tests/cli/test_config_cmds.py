@@ -1497,7 +1497,7 @@ class TestSyncReportCommand:
         setup_config(tmp_path)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("sync-report", "999", "--project", str(tmp_path))
+        result = run_gza("sync-report", "testproject-999999", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "not found" in result.stdout
 

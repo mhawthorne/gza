@@ -115,7 +115,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "error_max_turns" in result.stdout
@@ -135,7 +135,7 @@ class TestLogCommand:
         task.log_file = ".gza/logs/nonexistent.log"
         store.update(task)
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
@@ -163,7 +163,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         # Should show formatted entries instead of failing
         assert result.returncode == 0
@@ -190,7 +190,7 @@ class TestLogCommand:
         ]
         inferred_log.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recovered via inferred path" in result.stdout
@@ -427,7 +427,7 @@ class TestLogCommand:
         ]
         (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Entry text should render" in result.stdout
@@ -514,7 +514,7 @@ class TestLogCommand:
         ]))
 
         result = subprocess.run(
-            ["uv", "run", "gza", "log", "1", "--follow", "--project", str(tmp_path)],
+            ["uv", "run", "gza", "log", str(task.id), "--follow", "--project", str(tmp_path)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -537,7 +537,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
-        result = run_gza("log", "1", "--steps", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--steps", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1]" in result.stdout
@@ -558,7 +558,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
-        result = run_gza("log", "1", "--steps-verbose", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1]" in result.stdout
@@ -579,7 +579,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "legacy_turn_only_codex.jsonl").read_text())
 
-        result = run_gza("log", "1", "--turns", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--turns", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1] Pre-message tool activity" in result.stdout
@@ -595,7 +595,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("log", "test-project-zzz", "--project", str(tmp_path))
+        result = run_gza("log", "testproject-zzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -608,7 +608,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("log", "not-a-real-id", "--project", str(tmp_path))
+        result = run_gza("log", "testproject-zzzzzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -996,7 +996,7 @@ class TestLogCommand:
         log_file = log_dir / "test-startup-error.log"
         log_file.write_text("exec /usr/local/bin/docker-entrypoint.sh: argument list too long")
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         # Should detect startup failure and display the error
         assert result.returncode == 1
@@ -1009,7 +1009,7 @@ class TestLogCommand:
         """Log command defaults to task ID lookup without any flag."""
         setup_config(tmp_path)
 
-        result = run_gza("log", "test-project-zzz", "--project", str(tmp_path))
+        result = run_gza("log", "testproject-zzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -1072,7 +1072,7 @@ class TestFormatLogEntry:
         ]
         (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", "1", "--project", str(tmp_path))
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Branch: feat/test" in result.stdout

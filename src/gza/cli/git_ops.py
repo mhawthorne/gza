@@ -750,13 +750,13 @@ def cmd_diff(args: argparse.Namespace) -> int:
     diff_args = args.diff_args if hasattr(args, 'diff_args') and args.diff_args else []
 
     if diff_args and not diff_args[0].startswith("-") and _looks_like_task_id(diff_args[0]):
-        # First argument looks like a task ID (bare integer, base36, or prefixed)
+        # First argument is a full prefixed task ID ("prefix-base36").
         task_id: str = resolve_id(config, diff_args[0])
         task = store.get(task_id)
 
         if not task:
             # Not found as a task ID — fall back to treating arg as a branch/ref, same
-            # as cmd_checkout does, since the heuristic is intentionally permissive.
+            # as cmd_checkout does.
             pass
         elif not task.branch:
             print(f"Error: Task {task_id} has no branch")

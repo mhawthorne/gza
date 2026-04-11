@@ -107,28 +107,28 @@ class TestCliPageFlag:
     def test_show_page_flag_is_recognized(self, tmp_path: Path) -> None:
         """gza show --page should not error with 'unrecognized argument'."""
         _setup_config(tmp_path)
-        result = _run_gza("show", "99999", "--page", "--project", str(tmp_path))
-        # Flag is known, so argparse won't complain; we get a task-not-found error instead
+        result = _run_gza("show", "testproject-99999", "--page", "--project", str(tmp_path))
+        # Flag is known, so argparse won't complain; we get a task lookup failure instead.
         assert "unrecognized" not in result.stderr.lower()
-        assert result.returncode != 0  # task 99999 doesn't exist
+        assert result.returncode != 0
 
     def test_show_page_not_active_without_flag(self, tmp_path: Path) -> None:
         """gza show without --page should not produce argparse errors."""
         _setup_config(tmp_path)
-        result = _run_gza("show", "99999", "--project", str(tmp_path))
+        result = _run_gza("show", "testproject-99999", "--project", str(tmp_path))
         assert "unrecognized" not in result.stderr.lower()
 
     def test_log_page_flag_is_recognized(self, tmp_path: Path) -> None:
         """gza log --page should not error with 'unrecognized argument'."""
         _setup_config(tmp_path)
-        result = _run_gza("log", "99999", "--page", "--project", str(tmp_path))
+        result = _run_gza("log", "testproject-99999", "--page", "--project", str(tmp_path))
         assert "unrecognized" not in result.stderr.lower()
-        assert result.returncode != 0  # task 99999 doesn't exist
+        assert result.returncode != 0
 
     def test_log_page_not_active_without_flag(self, tmp_path: Path) -> None:
         """gza log without --page should not produce argparse errors."""
         _setup_config(tmp_path)
-        result = _run_gza("log", "99999", "--project", str(tmp_path))
+        result = _run_gza("log", "testproject-99999", "--project", str(tmp_path))
         assert "unrecognized" not in result.stderr.lower()
 
     def test_show_help_mentions_page(self, tmp_path: Path) -> None:

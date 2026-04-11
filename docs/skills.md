@@ -36,7 +36,7 @@ Use `/gza-task-add` when you want to add a task to the gza queue during a Claude
 
 ```bash
 uv run gza add --type implement --review "add JWT authentication to src/api/routes.py"
-# Created task #42 (implement)
+# Created task gza-16 (implement)
 ```
 
 ---
@@ -76,7 +76,7 @@ Use `/gza-task-info` to inspect any task by ID. Pulls data from the database, gi
 **Example summary:**
 
 ```
-Task #18: completed
+Task gza-i: completed
 Type: implement
 Branch: 20260115-add-authentication (3 commits, not yet merged to main)
 Duration: 245.3s (4:05)
@@ -104,7 +104,7 @@ Use `/gza-summary` for a quick status overview: what completed recently, what's 
 - Runs `uv run gza history`, `uv run gza unmerged`, and `uv run gza next` to collect current state
 - Highlights failed tasks, unmerged branches, and blocked pending tasks
 - For plan/explore/review tasks, includes the report file path so you can open it directly
-- Suggests specific commands to run (e.g., `uv run gza work`, `git merge`, `uv run gza log 25 --task`)
+- Suggests specific commands to run (e.g., `uv run gza work`, `git merge`, `uv run gza log gza-p`)
 
 **Output sections:**
 
