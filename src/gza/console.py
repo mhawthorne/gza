@@ -33,8 +33,12 @@ __all__ = [
     "MAX_PR_BODY_LENGTH",
 ]
 
-# Shared console instance for all output
-console = Console()
+# Shared console instance for all output. ``highlight=False`` disables Rich's
+# default ReprHighlighter so numbers, paths, strings etc. aren't implicitly
+# bolded/colored — every style in this module is explicit via markup. The
+# provider stream console is separate and keeps highlighting enabled because
+# it renders arbitrary provider output we don't control.
+console = Console(highlight=False)
 
 # Display truncation constants
 MAX_PROMPT_DISPLAY_SHORT = 50
@@ -148,7 +152,7 @@ def task_header(prompt: str, task_id: str, task_type: str, slug: str | None = No
     console.print(f"[{rc.label}]Task:[/{rc.label}] [{rc.heading}]{prompt_display}[/{rc.heading}]")
     console.print(f"[{rc.label}]ID:[/{rc.label}] [{rc.task_id}]{task_id}[/{rc.task_id}]")
     if slug:
-        console.print(f"[{rc.label}]Slug:[/{rc.label}] [{rc.task_id}]{slug}[/{rc.task_id}]")
+        console.print(f"[{rc.label}]Slug:[/{rc.label}] [{rc.slug}]{slug}[/{rc.slug}]")
     console.print(f"[{rc.label}]Type:[/{rc.label}] [{rc.task_type}]{task_type}[/{rc.task_type}]")
     console.print(separator)
 
@@ -298,7 +302,7 @@ def task_footer(
     if task.id is not None:
         console.print(f"[{rc.label}]ID:[/{rc.label}] [{rc.task_id}]{task.id}[/{rc.task_id}]")
     if task.slug:
-        console.print(f"[{rc.label}]Slug:[/{rc.label}] [{rc.task_id}]{task.slug}[/{rc.task_id}]")
+        console.print(f"[{rc.label}]Slug:[/{rc.label}] [{rc.slug}]{task.slug}[/{rc.slug}]")
     console.print(f"[{rc.label}]Type:[/{rc.label}] [{rc.task_type}]{task.task_type}[/{rc.task_type}]")
 
     if stats is not None:

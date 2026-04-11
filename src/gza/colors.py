@@ -59,14 +59,13 @@ from typing import Any
 white_bright: str = "bright_white"
 white: str = "white"
 
-pink: str = "#ff99cc"
-
+blue: str = "blue"
 blue_neon: str = "#00ffff"
 blue_bright: str = "#00ccff"
 blue_light: str = "#88ccff"
-blue: str = "blue"
 
-pink_light: str = "#ff88cc"
+pink: str = "#ff99cc"
+pink_light: str = "#ffaacc"
 pink_neon: str = "#ffaaff"
 
 # Soft gray used for secondary/metadata text (task IDs, dates, labels).
@@ -226,6 +225,7 @@ class RunnerColors:
     heading: str = default_color
     task_id: str = default_color
     task_type: str = default_color
+    slug: str = default_color
     next_cmd: str = default_color
     next_comment: str = default_color
     estimated: str = default_color
@@ -356,6 +356,7 @@ _THEME_MINIMAL = Theme(
         "success": green_success,
         "error": red_error,
         "warning": yellow_warning,
+        "slug": gray_secondary,
         # "heading": bold_cyan_heading,
         # "task_type": magenta_tool,
     },
@@ -372,7 +373,7 @@ _THEME_MINIMAL = Theme(
         "review_approved": green_success,
     },
     task_stream={
-        "step_header": pink_light,
+        "step_header": f"{pink_light} bold",
     },
     rich={
         "repr.number": orange,
