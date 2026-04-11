@@ -12,17 +12,18 @@ _DERIVED_IMPLEMENT_PREFIX_RE = re.compile(r"^([a-z0-9]+)-impl-(.+)$")
 def _looks_like_task_id_suffix(token: str) -> bool:
     """Return True for task-id-like suffix tokens used in derived implement slugs.
 
-    Derived prefixes are generated from task id suffixes. In practice these are
-    fixed-width base36 values (often containing digits) and can also be short
-    variable-width values in tests (e.g. ``aa``, ``mp``). Restricting removal to
-    these shapes avoids stripping semantic slug segments such as
+    Derived prefixes are generated from task id suffixes. We treat only
+    digit-bearing tokens as task-id-like to avoid stripping semantic two-letter
+    subjects such as ``ui-impl-refresh`` or ``db-impl-migration``.
+    This intentionally favors preserving semantic tails over aggressively
+    stripping ambiguous alpha-only segments.
+
+    Restricting removal to these shapes avoids stripping semantic slug segments such as
     ``add-impl-support``.
     """
     if not token:
         return False
-    if any(ch.isdigit() for ch in token):
-        return True
-    return len(token) <= 2
+    return any(ch.isdigit() for ch in token)
 
 
 def get_task_slug(slug: str | None) -> str | None:

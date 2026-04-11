@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -904,7 +905,7 @@ class TestReviewTaskSlugGeneration:
             task_type="implement",
         )
         impl_task.status = "completed"
-        impl_task.slug = "20260410-bb-impl-aa-impl-add-feature"
+        impl_task.slug = "20260410-b2-impl-a1-impl-add-feature"
         store.update(impl_task)
 
         config = Mock(spec=Config)
@@ -1488,6 +1489,23 @@ class TestComputeSlugOverride:
 
         result = _compute_slug_override(impl_task, store)
         assert result == f"{self._suffix(impl_task.id)}-impl-add-authentication-system"
+
+    def test_missing_anchor_logs_warning_and_uses_child_prompt_fallback(self, caplog: pytest.LogCaptureFixture):
+        """Missing direct anchors emit a warning instead of silently falling back."""
+        store = Mock(spec=SqliteTaskStore)
+        store.get.return_value = None
+        review_task = Task(
+            id="gza-0000ab",
+            prompt="Review missing anchor behavior",
+            task_type="review",
+            depends_on="gza-unknown",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+            result = _compute_slug_override(review_task, store)
+
+        assert result == "0000ab-rev-review-missing-anchor-behavior"
+        assert "Slug override anchor task missing for task #gza-0000ab (review): anchor_id=gza-unknown" in caplog.text
 
 
 class TestReviewNextSteps:

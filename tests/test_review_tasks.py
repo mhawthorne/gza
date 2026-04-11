@@ -73,7 +73,7 @@ class TestBuildAutoReviewPrompt:
         assert result == "review add-authentication-system"
 
     def test_slug_strips_nested_derived_implement_prefixes(self):
-        task = _task(slug="20260410-bb-impl-aa-impl-add-feature")
+        task = _task(slug="20260410-b2-impl-a1-impl-add-feature")
         result = build_auto_review_prompt(task)
         assert result == "review add-feature"
 
@@ -86,6 +86,16 @@ class TestBuildAutoReviewPrompt:
         task = _task(slug="20260410-0000ab-impl-api-impl-migration")
         result = build_auto_review_prompt(task)
         assert result == "review api-impl-migration"
+
+    def test_slug_preserves_semantic_impl_subject_ui(self):
+        task = _task(slug="20260410-0000ab-impl-ui-impl-refresh")
+        result = build_auto_review_prompt(task)
+        assert result == "review ui-impl-refresh"
+
+    def test_slug_preserves_semantic_impl_subject_db(self):
+        task = _task(slug="20260410-0000ab-impl-db-impl-migration")
+        result = build_auto_review_prompt(task)
+        assert result == "review db-impl-migration"
 
     def test_project_prefix_stripped_after_derived_normalization(self):
         task = _task(slug="20260410-0000ab-impl-myproj-add-feature")

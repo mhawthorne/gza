@@ -406,9 +406,22 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
     else:  # implement
         anchor_id = task.based_on or task.depends_on
 
-    anchor_task = store.get(anchor_id) if anchor_id is not None else None
-    target_slug = get_base_task_slug(anchor_task.slug) if anchor_task and anchor_task.slug else slugify(
-        anchor_task.prompt if anchor_task else task.prompt
+    anchor_task = None
+    if anchor_id is not None:
+        anchor_task = store.get(anchor_id)
+        if anchor_task is None:
+            logger.warning(
+                "Slug override anchor task missing for task #%s (%s): anchor_id=%s; "
+                "falling back to the child task prompt",
+                task.id,
+                task.task_type,
+                anchor_id,
+            )
+
+    target_slug = (
+        get_base_task_slug(anchor_task.slug)
+        if anchor_task and anchor_task.slug
+        else slugify(anchor_task.prompt if anchor_task else task.prompt)
     )
     task_id_suffix = _extract_task_id_suffix(task.id)
 
