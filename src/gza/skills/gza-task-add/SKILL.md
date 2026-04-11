@@ -56,6 +56,35 @@ Execute the command with appropriate flags:
 uv run gza add [FLAGS] "prompt text"
 ```
 
+**Important: there is no `--prompt` flag.** `gza add` takes the prompt as a positional argument or via `--prompt-file FILE`. If you pass `--prompt "text"`, argparse prefix-matches it to `--prompt-file` and tries to open your text as a filename — you will get `[Errno 63] File name too long`.
+
+**Passing multi-line prompts:**
+
+```bash
+uv run gza add --type implement "$(cat <<'EOF'
+First paragraph of the prompt.
+
+## Background
+More detail with `backticks` and **markdown**.
+
+## Acceptance
+- Bullet one
+- Bullet two
+EOF
+)"
+```
+
+The `<<'EOF'` quotes prevent variable/command expansion inside the prompt body. Use this heredoc-into-positional form for any prompt that spans more than one line.
+
+**When to use `--prompt-file` instead:**
+
+- Prompts so long or quote-heavy that escaping inside a heredoc is painful
+- Reusable prompt templates checked into a file
+
+```bash
+uv run gza add --type implement --prompt-file /tmp/prompt.md
+```
+
 Common flag combinations:
 - Basic task: `uv run gza add "description"`
 - Exploration: `uv run gza add --type explore "what to investigate"`
