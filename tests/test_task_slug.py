@@ -37,52 +37,77 @@ def test_strip_derived_implement_prefixes_preserves_non_derived_slug() -> None:
 def test_strip_derived_implement_prefixes_preserves_semantic_impl_token() -> None:
     """Only task-id-derived prefixes are removed; semantic ``*-impl-*`` remains."""
     slug = "0000ab-impl-add-impl-support"
-    assert strip_derived_implement_prefixes(slug) == "add-impl-support"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "add-impl-support"
 
 
 def test_strip_derived_implement_prefixes_preserves_semantic_impl_token_api() -> None:
     """Semantic subjects like ``api-impl-*`` are not stripped as derived prefixes."""
     slug = "0000ab-impl-api-impl-migration"
-    assert strip_derived_implement_prefixes(slug) == "api-impl-migration"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "api-impl-migration"
 
 
 def test_strip_derived_implement_prefixes_preserves_semantic_impl_token_ui() -> None:
     """Two-letter semantic subjects like ``ui-impl-*`` are preserved."""
     slug = "0000ab-impl-ui-impl-refresh"
-    assert strip_derived_implement_prefixes(slug) == "ui-impl-refresh"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "ui-impl-refresh"
 
 
 def test_strip_derived_implement_prefixes_preserves_semantic_impl_token_db() -> None:
     """Two-letter semantic subjects like ``db-impl-*`` are preserved."""
     slug = "0000ab-impl-db-impl-migration"
-    assert strip_derived_implement_prefixes(slug) == "db-impl-migration"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "db-impl-migration"
 
 
 def test_strip_derived_implement_prefixes_preserves_semantic_digit_subject_api2() -> None:
     """Digit-bearing semantic subjects like ``api2-impl-*`` are preserved."""
     slug = "0000ab-impl-api2-impl-refresh"
-    assert strip_derived_implement_prefixes(slug) == "api2-impl-refresh"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "api2-impl-refresh"
 
 
 def test_strip_derived_implement_prefixes_preserves_semantic_digit_subject_v2() -> None:
     """Digit-bearing semantic subjects like ``v2-impl-*`` are preserved."""
     slug = "0000ab-impl-v2-impl-rollout"
-    assert strip_derived_implement_prefixes(slug) == "v2-impl-rollout"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "v2-impl-rollout"
 
 
 def test_strip_derived_implement_prefixes_preserves_digit_leading_semantic_2fa() -> None:
     """Digit-leading semantic subjects like ``2fa-impl-*`` are preserved."""
     slug = "0000ab-impl-2fa-impl-login"
-    assert strip_derived_implement_prefixes(slug) == "2fa-impl-login"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "2fa-impl-login"
 
 
 def test_strip_derived_implement_prefixes_preserves_digit_leading_semantic_3d() -> None:
     """Digit-leading semantic subjects like ``3d-impl-*`` are preserved."""
     slug = "0000ab-impl-3d-impl-preview"
-    assert strip_derived_implement_prefixes(slug) == "3d-impl-preview"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "3d-impl-preview"
 
 
 def test_strip_derived_implement_prefixes_preserves_digit_leading_semantic_2024() -> None:
     """Digit-leading semantic subjects like ``2024-impl-*`` are preserved."""
     slug = "0000ab-impl-2024-impl-rollout"
-    assert strip_derived_implement_prefixes(slug) == "2024-impl-rollout"
+    assert strip_derived_implement_prefixes(slug, {"0000ab"}) == "2024-impl-rollout"
+
+
+def test_strip_derived_implement_prefixes_requires_known_suffix_set() -> None:
+    """Without an explicit known suffix, derived prefixes are not stripped.
+
+    The fallback heuristic was removed so callers must pass the lineage set.
+    """
+    slug = "0000ab-impl-add-feature"
+    assert strip_derived_implement_prefixes(slug) == "0000ab-impl-add-feature"
+    assert strip_derived_implement_prefixes(slug, set()) == "0000ab-impl-add-feature"
+
+
+def test_strip_derived_implement_prefixes_variable_width_single_char_suffix() -> None:
+    """Variable-width non-leading-zero suffixes like ``mp`` or ``1`` strip correctly."""
+    assert (
+        strip_derived_implement_prefixes("mp-impl-add-feature", {"mp"}) == "add-feature"
+    )
+    assert (
+        strip_derived_implement_prefixes("1-impl-rollout-change", {"1"})
+        == "rollout-change"
+    )
+    assert (
+        strip_derived_implement_prefixes("1-impl-mp-impl-nested", {"1", "mp"})
+        == "nested"
+    )

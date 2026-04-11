@@ -1,10 +1,15 @@
 """Shared helpers for creating review tasks."""
+
 from collections.abc import Iterable
 from typing import Literal
 
 from .db import SqliteTaskStore, Task
 from .prompts import PromptBuilder
-from .task_slug import get_base_task_slug, strip_derived_implement_prefixes
+from .task_slug import (
+    extract_task_id_suffix,
+    get_base_task_slug,
+    strip_derived_implement_prefixes,
+)
 
 
 class DuplicateReviewError(ValueError):
@@ -15,19 +20,6 @@ class DuplicateReviewError(ValueError):
         super().__init__(
             f"An active review task already exists: #{active_review.id} ({active_review.status})"
         )
-
-
-def _extract_task_id_suffix(task_id: object | None) -> str:
-    """Extract the suffix from a task id in ``prefix-suffix`` format."""
-    if task_id is None:
-        return ""
-    task_id_str = str(task_id).strip()
-    if not task_id_str:
-        return ""
-    prefix, sep, suffix = task_id_str.partition("-")
-    if sep and prefix and suffix:
-        return suffix
-    return task_id_str
 
 
 def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) -> set[str]:
@@ -41,7 +33,7 @@ def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) 
     current = impl_task
     seen: set[str] = set()
     while current:
-        suffix = _extract_task_id_suffix(current.id)
+        suffix = extract_task_id_suffix(current.id)
         if suffix:
             known.add(suffix)
         if current.id is not None:

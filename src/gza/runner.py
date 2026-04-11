@@ -38,7 +38,7 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task
 from .review_verdict import parse_review_verdict
-from .task_slug import get_base_task_slug
+from .task_slug import extract_task_id_suffix, get_base_task_slug
 
 logger = logging.getLogger(__name__)
 
@@ -369,17 +369,6 @@ def generate_slug(
 
 
 
-def _extract_task_id_suffix(task_id: str | None) -> str:
-    """Extract the suffix portion from a task id like ``prefix-suffix``."""
-    if not task_id:
-        return ""
-    prefix, sep, suffix = task_id.partition("-")
-    if sep and prefix and suffix:
-        return suffix
-    return task_id
-
-
-
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
     """Compute a slug_override for review/implement/improve tasks.
 
@@ -424,7 +413,7 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
         if anchor_task and anchor_task.slug
         else slugify(anchor_task.prompt if anchor_task else task.prompt)
     )
-    task_id_suffix = _extract_task_id_suffix(task.id)
+    task_id_suffix = extract_task_id_suffix(task.id)
 
     return "-".join(part for part in (task_id_suffix, prefix, target_slug) if part)
 
