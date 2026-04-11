@@ -18,7 +18,7 @@ class DuplicateReviewError(ValueError):
     def __init__(self, active_review: Task) -> None:
         self.active_review = active_review
         super().__init__(
-            f"An active review task already exists: #{active_review.id} ({active_review.status})"
+            f"An active review task already exists: {active_review.id} ({active_review.status})"
         )
 
 
@@ -78,7 +78,7 @@ def build_auto_review_prompt(
                 slug = slug[len(project_prefix) + 1:]
             return f"review {slug}"
 
-    review_prompt = f"Review task #{impl_task.id}"
+    review_prompt = f"Review task {impl_task.id}"
     if impl_task.prompt:
         review_prompt += f": {impl_task.prompt[:100]}"
     return review_prompt
@@ -99,12 +99,12 @@ def create_review_task(
     """
     if impl_task.task_type != "implement":
         raise ValueError(
-            f"Task #{impl_task.id} is a {impl_task.task_type} task. "
+            f"Task {impl_task.id} is a {impl_task.task_type} task. "
             "Expected an implementation task."
         )
     if impl_task.status != "completed":
         raise ValueError(
-            f"Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks."
+            f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks."
         )
     if impl_task.id is None:
         raise ValueError("Cannot create review for task without an ID.")

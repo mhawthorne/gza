@@ -25,7 +25,7 @@ def test_build_task_commit_message_uses_canonical_trailers() -> None:
         task_slug="20260401-impl-api-retries",
         review_task_id=77,
     )
-    assert "\n\nTask #42\nSlug: 20260401-impl-api-retries\nGza-Review: #77" in message
+    assert "\n\nTask 42\nSlug: 20260401-impl-api-retries\nGza-Review: 77" in message
 
 
 def test_build_task_commit_message_respects_72_char_subject_with_prefix() -> None:

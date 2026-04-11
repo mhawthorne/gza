@@ -401,8 +401,8 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(review3, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"Improve #{improve1.id} (review #{review1.id})" in context
-        assert f"Improve #{improve2.id} (review #{review2.id})" in context
+        assert f"Improve {improve1.id} (review {review1.id})" in context
+        assert f"Improve {improve2.id} (review {review2.id})" in context
         assert "Fix flaky tests Tighten input validation Keep this concise" in context
         assert "What was accomplished Reduced retry loops Added guardrails" in context
 
@@ -440,7 +440,7 @@ class TestReviewContextFromChain:
 
         # Most recent improves are included in both the lineage chain and detail bullets.
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
-            assert f"Improve #{improve_id}" in context
+            assert f"Improve {improve_id}" in context
 
         # Older improve IDs appear in the lineage chain line but their summaries are omitted.
         omitted_count = len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT
@@ -486,8 +486,8 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"Improve #{improve_a.id} (review #{review1.id})" in context
-        assert f"Improve #{improve_b.id} (review #{review2.id})" in context
+        assert f"Improve {improve_a.id} (review {review1.id})" in context
+        assert f"Improve {improve_b.id} (review {review2.id})" in context
         assert "Direct improve" in context
         assert "Retry improve" in context
 
@@ -528,7 +528,7 @@ class TestReviewContextFromChain:
         assert "2 older omitted" in context
 
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
-            assert f"Improve #{improve_id}" in context
+            assert f"Improve {improve_id}" in context
 
         # Older improve IDs appear in the lineage chain but their summaries are omitted.
         omitted_count = len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT
@@ -575,9 +575,9 @@ class TestReviewContextFromChain:
 
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
-        assert f"Improve #{older_improve.id}" in context
+        assert f"Improve {older_improve.id}" in context
         assert "older improve" in context
-        assert f"Improve #{later_improve.id}" not in context
+        assert f"Improve {later_improve.id}" not in context
         assert "later improve" not in context
 
     def test_review_context_numeric_ordering_beats_lexicographic(self, tmp_path: Path):
@@ -631,10 +631,10 @@ class TestReviewContextFromChain:
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
         # decimal 35 is before decimal 36 numerically — must be included
-        assert f"Improve #{older_improve.id}" in context
+        assert f"Improve {older_improve.id}" in context
         assert "older improve z" in context
         # decimal 37 is after decimal 36 numerically — must be excluded
-        assert f"Improve #{later_improve.id}" not in context
+        assert f"Improve {later_improve.id}" not in context
         assert "later improve 11" not in context
 
     def test_review_context_includes_tool_hints_when_prior_cycles_exist(self, tmp_path: Path):
@@ -708,10 +708,10 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         # Lineage chain shows review and improve IDs in order
-        assert f"Review #{review1.id}" in context
-        assert f"Improve #{improve1.id}" in context
-        assert f"Review #{review2.id}" in context
-        assert f"Improve #{improve2.id}" in context
+        assert f"Review {review1.id}" in context
+        assert f"Improve {improve1.id}" in context
+        assert f"Review {review2.id}" in context
+        assert f"Improve {improve2.id}" in context
         assert "Lineage:" in context
         assert "2 prior review/improve cycle" in context
 
@@ -981,7 +981,7 @@ class TestReviewTaskSlugGeneration:
             review_task = [t for t in all_tasks if t.task_type == "review"][0]
             assert review_task is not None
             # Should use fallback format (task ID is now a prefixed string)
-            assert f"Review task #{impl_task.id}" in review_task.prompt
+            assert f"Review task {impl_task.id}" in review_task.prompt
         finally:
             gza.runner.run = original_run
             gza.runner.post_review_to_pr = original_post_review
@@ -2798,7 +2798,7 @@ class TestResumeVerificationPrompt:
         assert "git log" in prompt.lower()
         assert "todo list" in prompt.lower()
         assert "continue from the actual state" in prompt.lower()
-        assert f"Current task DB id: #{review_task.id}" in prompt
+        assert f"Current task DB id: {review_task.id}" in prompt
         assert f"Current task slug: {review_task.slug}" in prompt
         assert f".gza/reviews/{review_task.slug}.md" in prompt
 
@@ -2880,7 +2880,7 @@ class TestResumeVerificationPrompt:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert f"Current task DB id: #{resumed_review.id}" in prompt
+        assert f"Current task DB id: {resumed_review.id}" in prompt
         assert f"Current task slug: {resumed_review.slug}" in prompt
         assert f".gza/reviews/{resumed_review.slug}.md" in prompt
         assert f".gza/reviews/{failed_review.slug}.md" not in prompt
@@ -4008,7 +4008,7 @@ class TestSameBranchLineageWalk:
         # Should use impl_task branch, logging the "via" chain
         assert "test/20260301-implement-feature" in output
         assert "via" in output
-        assert f"#{killed_task.id}" in output
+        assert f"{killed_task.id}" in output
 
     def test_same_branch_walks_chain_when_immediate_branch_does_not_exist(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """When the immediate source task has a branch field but that branch no longer exists,
@@ -4472,8 +4472,8 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         commit_message = worktree_git.commit.call_args.args[0]
         assert commit_message.startswith("Use task summary for commit subject Include task metadata trailers")
-        assert f"\n\nTask #{task.id}\nSlug: {task.slug}\n" in commit_message
-        assert f"Gza-Review: #{review_task.id}" in commit_message
+        assert f"\n\nTask {task.id}\nSlug: {task.slug}\n" in commit_message
+        assert f"Gza-Review: {review_task.id}" in commit_message
 
     def test_build_code_task_commit_subject_falls_back_to_word_boundary_prompt(self, tmp_path: Path):
         """Without summary file, fallback should use word-boundary truncation of task prompt."""

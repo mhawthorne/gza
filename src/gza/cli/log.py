@@ -898,7 +898,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
         if requested_task.id != task.id and task.id is not None:
             resolution_note = (
-                f"Resolved to latest run attempt: task #{task.id} "
+                f"Resolved to latest run attempt: task {task.id} "
                 "(latest same-type retry/resume in based_on chain)"
             )
 
@@ -919,7 +919,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
         if requested_task.id != task.id and task.id is not None:
             resolution_note = (
-                f"Resolved to latest run attempt: task #{task.id} "
+                f"Resolved to latest run attempt: task {task.id} "
                 "(latest same-type retry/resume in based_on chain)"
             )
 

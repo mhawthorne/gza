@@ -262,6 +262,7 @@ class CodexProvider(Provider):
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt,
             model=config.model, max_steps=config.max_steps,
+            chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
         )
@@ -309,6 +310,7 @@ class CodexProvider(Provider):
             cmd, log_file, config.timeout_minutes, cwd=work_dir,
             stdin_input=prompt, model=config.model,
             max_steps=config.max_steps,
+            chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
         )
@@ -322,6 +324,7 @@ class CodexProvider(Provider):
         stdin_input: str | None = None,
         model: str = "",
         max_steps: int = 50,
+        chat_text_display_length: int = 0,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
@@ -504,7 +507,7 @@ class CodexProvider(Provider):
                             )
                         # Truncate to 80 chars
                         command = truncate_text(command, 80)
-                        formatter.print_tool_event("Bash", command, prefix="  ")
+                        formatter.print_tool_event("Bash", command)
 
                     elif item_type == "agent_message":
                         data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
@@ -549,10 +552,13 @@ class CodexProvider(Provider):
 
                         text = raw_text.strip()
                         if text:
-                            first_line = text.split("\n")[0]
-                            formatter.print_agent_message(
-                                truncate_text(first_line, 80), prefix="  "
-                            )
+                            if chat_text_display_length == 0:
+                                formatter.print_agent_message(text)
+                            else:
+                                first_line = text.split("\n")[0]
+                                formatter.print_agent_message(
+                                    truncate_text(first_line, chat_text_display_length)
+                                )
 
                     elif item_type == "reasoning":
                         # Optional: show reasoning (currently skipped)

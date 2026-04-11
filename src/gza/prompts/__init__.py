@@ -176,7 +176,7 @@ class PromptBuilder:
 
         prompt += (
             "\n\nResume output contract (current run):\n"
-            f"- Current task DB id: #{task_id if task_id is not None else '?'}\n"
+            f"- Current task DB id: {task_id if task_id is not None else '?'}\n"
             f"- Current task slug: {task_slug or '(unset)'}\n"
             f"- Required report path for this run: {report_path}\n"
             "- Write output to this exact report path before finishing.\n"
@@ -214,7 +214,7 @@ class PromptBuilder:
         Returns:
             Prompt string for an improve task.
         """
-        return f"Improve implementation of task #{task_id} based on review #{review_id}"
+        return f"Improve implementation of task {task_id} based on review {review_id}"
 
     def review_task_prompt(
         self, impl_task_id: str, impl_prompt: str | None = None
@@ -228,7 +228,7 @@ class PromptBuilder:
         Returns:
             Prompt string for a review task.
         """
-        prompt = f"Review task #{impl_task_id}"
+        prompt = f"Review task {impl_task_id}"
         if impl_prompt:
             prompt += f": {impl_prompt[:100]}"
         prompt += (

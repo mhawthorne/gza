@@ -606,7 +606,7 @@ class TestHistoryCommand:
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"← #{parent.id}" in result.stdout
+        assert f"← {parent.id}" in result.stdout
 
     def test_history_shows_both_based_on_and_depends_on(self, tmp_path: Path):
         """History shows both based_on and depends_on when a task has both set."""
@@ -635,7 +635,7 @@ class TestHistoryCommand:
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"← #{plan.id} (dep #{blocker.id})" in result.stdout
+        assert f"← {plan.id} (dep {blocker.id})" in result.stdout
 
     def test_history_reconciles_in_progress_tasks(self, tmp_path: Path):
         """History command reconciles orphaned in_progress tasks to failed (WORKER_DIED)."""
@@ -739,7 +739,7 @@ class TestShowCommand:
         result = run_gza("show", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Task #" in result.stdout
+        assert "Task " in result.stdout
         assert "A detailed task prompt" in result.stdout
         assert "Status: pending" in result.stdout
 
@@ -767,8 +767,8 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
-        assert f"#{impl.id}" in result.stdout
-        assert f"#{review.id}" in result.stdout
+        assert f"{impl.id}" in result.stdout
+        assert f"{review.id}" in result.stdout
 
     def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
         """Failed task output includes reason, limits, context, and next-step commands."""
@@ -957,8 +957,8 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
-        assert f"#{plan.id}" in result.stdout
-        assert f"#{impl.id}" in result.stdout
+        assert f"{plan.id}" in result.stdout
+        assert f"{impl.id}" in result.stdout
 
     def test_show_implement_lineage_includes_plan_and_review_improve_chain(self, tmp_path: Path):
         """Show for an implement task (based on a plan) includes plan, review, and improve."""
@@ -979,10 +979,10 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
-        assert f"#{plan.id}" in result.stdout
-        assert f"#{impl.id}" in result.stdout
-        assert f"#{review.id}" in result.stdout
-        assert f"#{improve.id}" in result.stdout
+        assert f"{plan.id}" in result.stdout
+        assert f"{impl.id}" in result.stdout
+        assert f"{review.id}" in result.stdout
+        assert f"{improve.id}" in result.stdout
 
     def test_show_multi_level_dependency_lineage(self, tmp_path: Path):
         """Lineage traverses multi-level dependency chains (plan->impl->sub-impl)."""
@@ -1001,9 +1001,9 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
-        assert f"#{plan.id}" in result.stdout
-        assert f"#{impl1.id}" in result.stdout
-        assert f"#{impl2.id}" in result.stdout
+        assert f"{plan.id}" in result.stdout
+        assert f"{impl1.id}" in result.stdout
+        assert f"{impl2.id}" in result.stdout
 
     def test_show_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
         """Show lineage keeps root first even when downstream tasks are still pending."""
@@ -1023,9 +1023,9 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
-        root_idx = result.stdout.index(f"#{root.id}")
-        child_idx = result.stdout.index(f"#{child.id}")
-        grandchild_idx = result.stdout.index(f"#{grandchild.id}")
+        root_idx = result.stdout.index(f"{root.id}")
+        child_idx = result.stdout.index(f"{child.id}")
+        grandchild_idx = result.stdout.index(f"{grandchild.id}")
         assert root_idx < child_idx < grandchild_idx
 
     def test_show_depended_on_by_field(self, tmp_path: Path):
@@ -1045,13 +1045,13 @@ class TestShowCommand:
         result_plan = run_gza("show", str(plan.id), "--project", str(tmp_path))
         assert result_plan.returncode == 0
         assert "Depended on by:" in result_plan.stdout
-        assert f"#{impl.id}[implement]" in result_plan.stdout
+        assert f"{impl.id}[implement]" in result_plan.stdout
 
         # Show the impl: it should list review as "Depended on by"
         result_impl = run_gza("show", str(impl.id), "--project", str(tmp_path))
         assert result_impl.returncode == 0
         assert "Depended on by:" in result_impl.stdout
-        assert f"#{review.id}[review]" in result_impl.stdout
+        assert f"{review.id}[review]" in result_impl.stdout
 
     def test_show_truncates_long_output(self, tmp_path: Path):
         """gza show truncates output >30 lines to 20 with a remainder hint."""
@@ -1252,7 +1252,7 @@ class TestPsCommand:
         assert result.returncode == 0
         assert "TASK ID" in result.stdout, "Header should contain 'TASK ID' column"
         assert "STARTED" in result.stdout, "Header should contain 'STARTED' column"
-        assert f"#{task.id}" in result.stdout, f"Output should contain task ID #{task.id}"
+        assert f"{task.id}" in result.stdout, f"Output should contain task ID {task.id}"
 
         # Cleanup
         registry.remove("w-test-ps")
@@ -1449,7 +1449,7 @@ class TestPsCommand:
         assert rows[0]["task_id"] == task.id
         assert rows[0]["task"] == task.slug
         assert rows[0]["task"] != ""
-        assert not rows[0]["task"].startswith("task #")
+        assert not rows[0]["task"].startswith("task ")
 
     def test_ps_includes_db_only_in_progress_and_flags_orphaned(self, tmp_path: Path):
         """PS includes in-progress DB rows even when no worker exists."""
@@ -2804,9 +2804,9 @@ class TestUnmergedReviewStatus:
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "lineage:" in result.stdout
-        assert f"#{impl.id}" in result.stdout
-        assert f"#{review.id}" in result.stdout
-        assert f"#{improve.id}" in result.stdout
+        assert f"{impl.id}" in result.stdout
+        assert f"{review.id}" in result.stdout
+        assert f"{improve.id}" in result.stdout
         assert "[implement]" in result.stdout
         assert "[review]" in result.stdout
         assert "[improve]" in result.stdout
@@ -2843,10 +2843,10 @@ class TestUnmergedReviewStatus:
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "lineage:" in result.stdout
-        assert f"#{impl.id}" in result.stdout
-        assert f"#{review.id}" in result.stdout
-        assert f"#{improve.id}" in result.stdout
-        assert f"#{downstream_impl.id}" not in result.stdout
+        assert f"{impl.id}" in result.stdout
+        assert f"{review.id}" in result.stdout
+        assert f"{improve.id}" in result.stdout
+        assert f"{downstream_impl.id}" not in result.stdout
         assert "| completed |" in result.stdout
         assert "changes_requested" in result.stdout
         # The "← latest" annotation may wrap across lines at narrow terminal widths
@@ -2874,8 +2874,8 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
         # Normalize output since "← latest" may wrap across lines at narrow terminal widths
         normalized = " ".join(result.stdout.split())
-        older_idx = normalized.index(f"#{older_review.id}")
-        latest_idx = normalized.index(f"#{latest_review.id}")
+        older_idx = normalized.index(f"{older_review.id}")
+        latest_idx = normalized.index(f"{latest_review.id}")
         marker_idx = normalized.index("latest")
         assert marker_idx > latest_idx
         assert not (older_idx < marker_idx < latest_idx)
@@ -3373,7 +3373,7 @@ class TestKillCommand:
 
         captured = capsys.readouterr()
         assert rc == 0
-        assert "Task #" in captured.out and "killed" in captured.out
+        assert "Task " in captured.out and "killed" in captured.out
         # Confirm SIGTERM was sent
         import signal
         mock_kill.assert_any_call(12345, signal.SIGTERM)

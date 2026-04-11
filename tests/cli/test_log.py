@@ -366,7 +366,7 @@ class TestLogCommand:
 
         assert result.returncode == 0
         assert "Resolved to latest run attempt" in result.stdout
-        assert f"task #{retry.id}" in result.stdout
+        assert f"task {retry.id}" in result.stdout
         assert "retry chain output" in result.stdout
         assert "review output" not in result.stdout
         assert "improve output" not in result.stdout

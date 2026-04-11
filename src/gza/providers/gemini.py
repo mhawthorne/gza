@@ -332,12 +332,12 @@ class GeminiProvider(Provider):
                             # Display text to console (configurable length, 0 = unlimited)
                             if chat_text_display_length == 0:
                                 # Show full text
-                                formatter.print_agent_message(content, prefix="  ")
+                                formatter.print_agent_message(content)
                             else:
                                 # Truncate to first line and max length
                                 first_line = content.split("\n")[0]
                                 formatter.print_agent_message(
-                                    truncate_text(first_line, chat_text_display_length), prefix="  "
+                                    truncate_text(first_line, chat_text_display_length)
                                 )
 
                 elif event_type == "tool_use":
@@ -361,9 +361,9 @@ class GeminiProvider(Provider):
                     # Extract file path for file-related tools
                     file_path = tool_input.get("file_path") or tool_input.get("path")
                     if file_path:
-                        formatter.print_tool_event(tool_name, file_path, prefix="  ")
+                        formatter.print_tool_event(tool_name, file_path)
                     else:
-                        formatter.print_tool_event(tool_name, prefix="  ")
+                        formatter.print_tool_event(tool_name)
 
                 elif event_type in {"tool_output", "tool_error", "tool_retry"}:
                     current_step = data.get("_current_step_event")

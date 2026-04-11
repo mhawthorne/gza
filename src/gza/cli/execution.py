@@ -81,17 +81,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         for task_id in args.task_ids:
             task = store.get(task_id)
             if not task:
-                print(f"Error: Task #{task_id} not found")
+                print(f"Error: Task {task_id} not found")
                 return 1
 
             if task.status != "pending":
-                print(f"Error: Task #{task_id} is not pending (status: {task.status})")
+                print(f"Error: Task {task_id} is not pending (status: {task.status})")
                 return 1
 
             # Check if task is blocked by a dependency
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                print(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+                print(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
                 return 1
 
         task_id_for_registration = args.task_ids[0]
@@ -142,7 +142,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         return result
                     else:
                         # We completed some tasks before failure
-                        print(f"\nCompleted {tasks_completed} task(s) before task #{task_id} failed")
+                        print(f"\nCompleted {tasks_completed} task(s) before task {task_id} failed")
                         registry.mark_completed(worker_id, exit_code=result, status="failed")
                         return result
                 tasks_completed += 1
@@ -221,22 +221,22 @@ def cmd_implement(args: argparse.Namespace) -> int:
     plan_task_id = resolve_id(config, args.plan_task_id)
     plan_task = store.get(plan_task_id)
     if not plan_task:
-        print(f"Error: Task #{plan_task_id} not found")
+        print(f"Error: Task {plan_task_id} not found")
         return 1
     if plan_task.task_type != "plan":
-        print(f"Error: Task #{plan_task.id} is a {plan_task.task_type} task. Expected a completed plan task.")
+        print(f"Error: Task {plan_task.id} is a {plan_task.task_type} task. Expected a completed plan task.")
         return 1
     if plan_task.status != "completed":
-        print(f"Error: Task #{plan_task.id} is {plan_task.status}. Plan task must be completed.")
+        print(f"Error: Task {plan_task.id} is {plan_task.status}. Plan task must be completed.")
         return 1
 
     prompt = args.prompt
     if not prompt:
         slug = _get_base_task_slug(plan_task)
         if slug:
-            prompt = f"Implement plan from task #{plan_task.id}: {slug}"
+            prompt = f"Implement plan from task {plan_task.id}: {slug}"
         else:
-            prompt = f"Implement plan from task #{plan_task.id}"
+            prompt = f"Implement plan from task {plan_task.id}"
 
     group = args.group if hasattr(args, 'group') and args.group else None
     depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
@@ -261,8 +261,8 @@ def cmd_implement(args: argparse.Namespace) -> int:
         skip_learnings=skip_learnings,
     )
 
-    print(f"✓ Created implement task #{impl_task.id}")
-    print(f"  Based on: plan #{plan_task.id}")
+    print(f"✓ Created implement task {impl_task.id}")
+    print(f"  Based on: plan {plan_task.id}")
 
     # Handle background mode - spawn worker to run the implement task
     if hasattr(args, 'background') and args.background:
@@ -276,7 +276,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         return 0
 
     # Default: run the implement task immediately
-    print(f"\nRunning implement task #{impl_task.id}...")
+    print(f"\nRunning implement task {impl_task.id}...")
     return _run_foreground(config, task_id=impl_task.id)
 
 
@@ -330,14 +330,14 @@ def cmd_add(args: argparse.Namespace) -> int:
     if based_on:
         dep_task = store.get(based_on)
         if not dep_task:
-            print(f"Error: Task #{based_on} not found")
+            print(f"Error: Task {based_on} not found")
             return 1
 
     # Validation: --depends-on must reference an existing task
     if depends_on:
         dep_task = store.get(depends_on)
         if not dep_task:
-            print(f"Error: Task #{depends_on} not found")
+            print(f"Error: Task {depends_on} not found")
             return 1
 
     # Handle --prompt-file argument
@@ -373,7 +373,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
-        print(f"✓ Added task #{task.id}")
+        print(f"✓ Added task {task.id}")
         return 0
 
     if args.edit or not args.prompt:
@@ -394,7 +394,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         if not new_task:
             return 1
-        print(f"✓ Added task #{new_task.id}")
+        print(f"✓ Added task {new_task.id}")
         return 0
     else:
         # Inline prompt
@@ -412,7 +412,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
-        print(f"✓ Added task #{task.id}")
+        print(f"✓ Added task {task.id}")
         return 0
 
 
@@ -424,7 +424,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     if task.status != "pending":
@@ -437,12 +437,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
         if args.group_flag == "":
             task.group = None
             store.update(task)
-            print(f"✓ Removed task #{task.id} from group")
+            print(f"✓ Removed task {task.id} from group")
             return 0
         else:
             task.group = args.group_flag
             store.update(task)
-            print(f"✓ Moved task #{task.id} to group '{args.group_flag}'")
+            print(f"✓ Moved task {task.id} to group '{args.group_flag}'")
             return 0
 
     # Handle --based-on flag (lineage/parent relationship)
@@ -450,11 +450,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
         based_on_id = resolve_id(config, args.based_on_flag)
         parent_task = store.get(based_on_id)
         if not parent_task:
-            print(f"Error: Task #{based_on_id} not found")
+            print(f"Error: Task {based_on_id} not found")
             return 1
         task.based_on = based_on_id
         store.update(task)
-        print(f"✓ Set task #{task.id} based_on task #{based_on_id}")
+        print(f"✓ Set task {task.id} based_on task {based_on_id}")
         return 0
 
     # Handle --depends-on flag (execution blocking dependency)
@@ -462,25 +462,25 @@ def cmd_edit(args: argparse.Namespace) -> int:
         depends_on_id = resolve_id(config, args.depends_on_flag)
         dep_task = store.get(depends_on_id)
         if not dep_task:
-            print(f"Error: Task #{depends_on_id} not found")
+            print(f"Error: Task {depends_on_id} not found")
             return 1
         task.depends_on = depends_on_id
         store.update(task)
-        print(f"✓ Set task #{task.id} to depend on task #{depends_on_id}")
+        print(f"✓ Set task {task.id} to depend on task {depends_on_id}")
         return 0
 
     # Handle --review flag
     if hasattr(args, 'review') and args.review:
         task.create_review = True
         store.update(task)
-        print(f"✓ Enabled automatic review task creation for task #{task.id}")
+        print(f"✓ Enabled automatic review task creation for task {task.id}")
         return 0
 
     # Handle --model flag
     if hasattr(args, 'model') and args.model is not None:
         task.model = args.model
         store.update(task)
-        print(f"✓ Set model override to '{args.model}' for task #{task.id}")
+        print(f"✓ Set model override to '{args.model}' for task {task.id}")
         return 0
 
     # Handle --provider flag
@@ -488,14 +488,14 @@ def cmd_edit(args: argparse.Namespace) -> int:
         task.provider = args.provider
         task.provider_is_explicit = True
         store.update(task)
-        print(f"✓ Set provider override to '{args.provider}' for task #{task.id}")
+        print(f"✓ Set provider override to '{args.provider}' for task {task.id}")
         return 0
 
     # Handle --no-learnings flag
     if hasattr(args, 'skip_learnings') and args.skip_learnings:
         task.skip_learnings = True
         store.update(task)
-        print(f"✓ Set skip_learnings for task #{task.id}")
+        print(f"✓ Set skip_learnings for task {task.id}")
         return 0
 
     if args.explore and args.task:
@@ -506,11 +506,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if args.explore or args.task:
         new_type = "explore" if args.explore else "implement"
         if task.task_type == new_type:
-            print(f"Task #{task.id} is already a {new_type}")
+            print(f"Task {task.id} is already a {new_type}")
             return 0
         task.task_type = new_type
         store.update(task)
-        print(f"✓ Converted task #{task.id} to {new_type}")
+        print(f"✓ Converted task {task.id} to {new_type}")
         return 0
 
     # Handle non-interactive prompt editing
@@ -537,7 +537,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
         task.prompt = new_prompt
         store.update(task)
-        print(f"✓ Updated task #{task.id}")
+        print(f"✓ Updated task {task.id}")
         return 0
 
     if hasattr(args, 'prompt') and args.prompt is not None:
@@ -557,11 +557,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
         task.prompt = new_prompt
         store.update(task)
-        print(f"✓ Updated task #{task.id}")
+        print(f"✓ Updated task {task.id}")
         return 0
 
     if edit_task_interactive(store, task):
-        print(f"✓ Updated task #{task.id}")
+        print(f"✓ Updated task {task.id}")
         return 0
     return 1
 
@@ -583,7 +583,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     # Validate status
@@ -595,7 +595,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     children = store.get_based_on_children(args.task_id)
     successful_retry = next((c for c in children if c.status == "completed"), None)
     if successful_retry:
-        print(f"Error: Task #{args.task_id} already has a successful retry (#{successful_retry.id}).")
+        print(f"Error: Task {args.task_id} already has a successful retry ({successful_retry.id}).")
         return 1
 
     # Create new task copying relevant fields
@@ -614,7 +614,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         provider_is_explicit=task.provider_is_explicit,
     )
 
-    print(f"✓ Created task #{new_task.id} (retry of #{task_id})")
+    print(f"✓ Created task {new_task.id} (retry of {task_id})")
 
     # Handle background mode - spawn worker to run the new task
     if args.background:
@@ -629,7 +629,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         return 0
 
     # Default: run the new task immediately
-    print(f"\nRunning task #{new_task.id}...")
+    print(f"\nRunning task {new_task.id}...")
     return _run_foreground(config, task_id=new_task.id)
 
 
@@ -648,11 +648,11 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     if task.status == "completed":
-        print(f"Error: Task #{task_id} is already completed")
+        print(f"Error: Task {task_id} is already completed")
         return 1
 
     if args.verify_git and args.force:
@@ -663,18 +663,18 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
     # Warn if task wasn't failed (but still proceed)
     if task.status != "failed":
-        print(f"Warning: Task #{task_id} is not in failed status (current status: {task.status}), proceeding anyway")
+        print(f"Warning: Task {task_id} is not in failed status (current status: {task.status}), proceeding anyway")
 
     if mode == "force":
         old_status = task.status
         store.mark_completed(task, branch=task.branch if task.branch else None)
         _cleanup_worker_registry(config, task_id)
-        print(f"✓ Task #{task_id} status changed: {old_status} → completed (status-only)")
+        print(f"✓ Task {task_id} status changed: {old_status} → completed (status-only)")
         return 0
 
     # verify-git mode: validate branch and commit state
     if not task.branch:
-        print(f"Error: Task #{task_id} has no branch set. Use --force for status-only completion.")
+        print(f"Error: Task {task_id} has no branch set. Use --force for status-only completion.")
         return 1
 
     git = Git(config.project_dir)
@@ -688,12 +688,12 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
         store.mark_completed(task, branch=task.branch, has_commits=False)
         _cleanup_worker_registry(config, task_id)
-        print(f"✓ Task #{task_id} marked as completed")
+        print(f"✓ Task {task_id} marked as completed")
         return 0
 
     store.mark_completed(task, branch=task.branch, has_commits=True)
     _cleanup_worker_registry(config, task_id)
-    print(f"✓ Task #{task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
+    print(f"✓ Task {task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
     return 0
 
@@ -709,7 +709,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     old_status = task.status
@@ -728,7 +728,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     store.update(task)
     _cleanup_worker_registry(config, task_id)
 
-    print(f"Task #{task_id} status: {old_status} → {args.status}")
+    print(f"Task {task_id} status: {old_status} → {args.status}")
     return 0
 
 
@@ -758,39 +758,39 @@ def _resolve_impl_task(
     """
     task = store.get(task_id)
     if not task:
-        return None, f"Task #{task_id} not found"
+        return None, f"Task {task_id} not found"
 
     if task.task_type == "implement":
         return task, None
 
     if task.task_type == "improve":
         if not task.based_on:
-            return None, f"Improve task #{task.id} has no based_on implementation task"
+            return None, f"Improve task {task.id} has no based_on implementation task"
         parent = store.get(task.based_on)
         if parent is None:
-            return None, f"Improve task #{task.id} points to task #{task.based_on}, which was not found"
+            return None, f"Improve task {task.id} points to task {task.based_on}, which was not found"
         if parent.task_type != "implement":
             return None, (
-                f"Improve task #{task.id} points to task #{task.based_on}, "
+                f"Improve task {task.id} points to task {task.based_on}, "
                 "which is not an implementation task"
             )
         return parent, None
 
     if task.task_type == "review":
         if not task.depends_on:
-            return None, f"Review task #{task.id} has no depends_on implementation task"
+            return None, f"Review task {task.id} has no depends_on implementation task"
         parent = store.get(task.depends_on)
         if parent is None:
-            return None, f"Review task #{task.id} points to task #{task.depends_on}, which was not found"
+            return None, f"Review task {task.id} points to task {task.depends_on}, which was not found"
         if parent.task_type != "implement":
             return None, (
-                f"Review task #{task.id} points to task #{task.depends_on}, "
+                f"Review task {task.id} points to task {task.depends_on}, "
                 "which is not an implementation task"
             )
         return parent, None
 
     return None, (
-        f"Task #{task_id} is a {task.task_type} task, not an implementation, improve, or review task"
+        f"Task {task_id} is a {task.task_type} task, not an implementation, improve, or review task"
     )
 
 
@@ -818,22 +818,22 @@ def cmd_improve(args: argparse.Namespace) -> int:
     if review_id_override is not None:
         review_task = store.get(review_id_override)
         if review_task is None:
-            print(f"Error: Review task #{review_id_override} not found.")
+            print(f"Error: Review task {review_id_override} not found.")
             return 1
         if review_task.task_type != "review":
             print(
-                f"Error: Task #{review_id_override} is a {review_task.task_type} task, not a review."
+                f"Error: Task {review_id_override} is a {review_task.task_type} task, not a review."
             )
             return 1
         if review_task.depends_on != impl_task.id:
             print(
-                f"Error: Review #{review_id_override} reviews task #{review_task.depends_on}, "
-                f"not implementation #{impl_task.id}."
+                f"Error: Review {review_id_override} reviews task {review_task.depends_on}, "
+                f"not implementation {impl_task.id}."
             )
             return 1
         if review_task.status != "completed":
             print(
-                f"Warning: Review #{review_task.id} is {review_task.status}. "
+                f"Warning: Review {review_task.id} is {review_task.status}. "
                 "The improve task will be blocked until it completes."
             )
     else:
@@ -849,15 +849,15 @@ def cmd_improve(args: argparse.Namespace) -> int:
         if not usable_reviews:
             if review_tasks:
                 statuses = ", ".join(
-                    f"#{r.id} ({r.status})" for r in review_tasks
+                    f"{r.id} ({r.status})" for r in review_tasks
                 )
                 print(
-                    f"Error: Task #{impl_task.id} has no usable review "
+                    f"Error: Task {impl_task.id} has no usable review "
                     f"(all existing reviews are dropped or failed: {statuses})."
                 )
                 print("Run a new review, or pass --review-id <id> to pick a specific one.")
             else:
-                print(f"Error: Task #{impl_task.id} has no review. Run a review first:")
+                print(f"Error: Task {impl_task.id} has no review. Run a review first:")
                 print(f"  gza add --type review --depends-on {impl_task.id}")
             return 1
 
@@ -866,7 +866,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         # Warn if the selected review is not yet completed (pending/in_progress).
         if review_task.status != "completed":
             print(
-                f"Warning: Review #{review_task.id} is {review_task.status}. "
+                f"Warning: Review {review_task.id} is {review_task.status}. "
                 "The improve task will be blocked until it completes."
             )
 
@@ -884,9 +884,9 @@ def cmd_improve(args: argparse.Namespace) -> int:
         print(f"Error: {e}")
         return 1
 
-    print(f"✓ Created improve task #{improve_task.id}")
-    print(f"  Based on: implementation #{impl_task.id}")
-    print(f"  Review: #{review_task.id}")
+    print(f"✓ Created improve task {improve_task.id}")
+    print(f"  Based on: implementation {impl_task.id}")
+    print(f"  Review: {review_task.id}")
     print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
 
     # Handle background mode - spawn worker to run the improve task
@@ -901,7 +901,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         return 0
 
     # Default: run the improve task immediately
-    print(f"\nRunning improve task #{improve_task.id}...")
+    print(f"\nRunning improve task {improve_task.id}...")
     return _run_foreground(config, task_id=improve_task.id)
 
 
@@ -922,7 +922,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     # Check if task is completed
     if impl_task.status != "completed":
-        print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only review completed tasks.")
+        print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only review completed tasks.")
         return 1
 
     # Create review task (using shared helper)
@@ -932,16 +932,16 @@ def cmd_review(args: argparse.Namespace) -> int:
         review_task = _create_review_task(store, impl_task, model=model, provider=provider)
     except DuplicateReviewError as e:
         review = e.active_review
-        print(f"Warning: A review task already exists for implementation #{impl_task.id}")
-        print(f"  Existing review: #{review.id} (status: {review.status})")
+        print(f"Warning: A review task already exists for implementation {impl_task.id}")
+        print(f"  Existing review: {review.id} (status: {review.status})")
         print(f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
         return 1
     except ValueError as e:
         print(f"Error: {e}")
         return 1
 
-    print(f"✓ Created review task #{review_task.id}")
-    print(f"  Implementation: #{impl_task.id}")
+    print(f"✓ Created review task {review_task.id}")
+    print(f"  Implementation: {impl_task.id}")
     if impl_task.group:
         print(f"  Group: {impl_task.group}")
 
@@ -958,7 +958,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     # Default: run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
-    print(f"\nRunning review task #{review_task.id}...")
+    print(f"\nRunning review task {review_task.id}...")
     open_after = hasattr(args, 'open') and args.open
     return _run_foreground(config, task_id=review_task.id, open_after=open_after)
 
@@ -985,13 +985,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     impl_task_id = resolve_id(config, args.impl_task_id)
     impl_task = store.get(impl_task_id)
     if not impl_task:
-        print(f"Error: Task #{impl_task_id} not found")
+        print(f"Error: Task {impl_task_id} not found")
         return 1
     if impl_task.task_type != "implement":
-        print(f"Error: Task #{impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
+        print(f"Error: Task {impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
         return 1
     if impl_task.status != "completed":
-        print(f"Error: Task #{impl_task.id} is {impl_task.status}. Can only cycle completed tasks.")
+        print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only cycle completed tasks.")
         return 1
 
     assert impl_task.id is not None
@@ -1001,14 +1001,14 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if continue_existing:
         existing = store.get_active_cycle_for_impl(impl_task.id)
         if not existing:
-            print(f"Error: No active cycle found for implementation #{impl_task.id}")
+            print(f"Error: No active cycle found for implementation {impl_task.id}")
             return 1
         cycle = existing
         # Honor the original cycle's max_iterations, not the CLI arg
         max_iterations = cycle.max_iterations
 
         if dry_run:
-            print(f"[dry-run] Would resume iteration #{cycle.id} for implementation #{impl_task.id}")
+            print(f"[dry-run] Would resume iteration #{cycle.id} for implementation {impl_task.id}")
             return 0
 
         # Determine next iteration index by inspecting existing iteration records
@@ -1024,10 +1024,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         else:
             iteration = 0
 
-        print(f"Resuming iteration #{cycle.id} for implementation #{impl_task.id} from iteration {iteration + 1}...")
+        print(f"Resuming iteration #{cycle.id} for implementation {impl_task.id} from iteration {iteration + 1}...")
     else:
         if dry_run:
-            print(f"[dry-run] Would start iteration for implementation #{impl_task.id} (max {max_iterations} iterations)")
+            print(f"[dry-run] Would start iteration for implementation {impl_task.id} (max {max_iterations} iterations)")
             return 0
 
         # Start a new cycle (raises ValueError if one already exists)
@@ -1036,7 +1036,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         except ValueError as e:
             print(f"Error: {e}")
             return 1
-        print(f"Starting iteration #{cycle.id} for implementation #{impl_task.id} (max {max_iterations} iterations)...")
+        print(f"Starting iteration #{cycle.id} for implementation {impl_task.id} (max {max_iterations} iterations)...")
         iteration = 0
 
     # Summary rows collected as we run: (iteration, review_id, verdict, improve_id)
@@ -1075,10 +1075,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         assert review_task.id is not None
         store.update_cycle_iteration(iter_record.id, review_task_id=review_task.id)
 
-        print(f"  Running review #{review_task.id}...")
+        print(f"  Running review {review_task.id}...")
         rc = _run_foreground(config, task_id=review_task.id)
         if rc != 0:
-            print(f"  Review #{review_task.id} failed (exit code {rc})")
+            print(f"  Review {review_task.id} failed (exit code {rc})")
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "review_failed"
@@ -1094,7 +1094,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if verdict:
             store.update_cycle_iteration(iter_record.id, review_verdict=verdict)
 
-        print(f"  Review #{review_task.id}: verdict={verdict or '(none)'}")
+        print(f"  Review {review_task.id}: verdict={verdict or '(none)'}")
 
         if verdict == "APPROVED":
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
@@ -1142,10 +1142,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         assert improve_task.id is not None
         store.update_cycle_iteration(iter_record.id, improve_task_id=improve_task.id, state="improve_created")
 
-        print(f"  Running improve #{improve_task.id}...")
+        print(f"  Running improve {improve_task.id}...")
         rc = _run_foreground(config, task_id=improve_task.id)
         if rc != 0:
-            print(f"  Improve #{improve_task.id} failed (exit code {rc})")
+            print(f"  Improve {improve_task.id} failed (exit code {rc})")
             store.update_cycle_iteration(iter_record.id, state="terminal", ended_at=datetime.now(UTC))
             final_status = "blocked"
             final_stop_reason = "improve_failed"
@@ -1169,9 +1169,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     print(f"{'-' * 6} {'-' * 8} {'-' * 22} {'-' * 8}")
     for (iter_idx, rev_id, verdict, imp_id) in summary_rows:
         iter_str = str(iter_idx + 1)
-        rev_str = f"#{rev_id}" if rev_id else "-"
+        rev_str = f"{rev_id}" if rev_id else "-"
         verdict_str = verdict or "(none)"
-        imp_str = f"#{imp_id}" if imp_id else "-"
+        imp_str = f"{imp_id}" if imp_id else "-"
         print(f"{iter_str:<6} {rev_str:>8} {verdict_str:<22} {imp_str:>8}")
     print()
 
@@ -1201,7 +1201,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     if task.status not in ("failed", "in_progress"):
@@ -1214,15 +1214,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
         registry = WorkerRegistry(config.workers_path)
         running_worker = _running_worker_id_for_task(registry, task.id)
         if running_worker is not None:
-            print(f"Error: Task #{task_id} is still running (worker {running_worker})")
+            print(f"Error: Task {task_id} is still running (worker {running_worker})")
             print("Use 'gza cancel' to stop it first, or wait for it to finish")
             return 1
-        print(f"Note: Task #{task_id} appears orphaned (in_progress but no live worker), resuming...")
+        print(f"Note: Task {task_id} appears orphaned (in_progress but no live worker), resuming...")
     elif task.status == "failed" and task.failure_reason == "WORKER_DIED":
-        print(f"Note: Task #{task_id} appears orphaned (worker died), resuming...")
+        print(f"Note: Task {task_id} appears orphaned (worker died), resuming...")
 
     if not task.session_id:
-        print(f"Error: Task #{task_id} has no session ID (cannot resume)")
+        print(f"Error: Task {task_id} has no session ID (cannot resume)")
         print("Use 'gza retry' to start fresh instead")
         return 1
 
@@ -1231,7 +1231,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     new_task = _create_resume_task(store, task)
     assert new_task.id is not None
 
-    print(f"✓ Created task #{new_task.id} (resume of #{task_id})")
+    print(f"✓ Created task {new_task.id} (resume of {task_id})")
 
     # Handle background mode
     if args.background:

@@ -49,7 +49,7 @@ def main():
 
     rows = get_downstream_tasks(args.task_id)
     if not rows:
-        print(f"No tasks found for task #{args.task_id}")
+        print(f"No tasks found for task {args.task_id}")
         return 1
 
     header = f"{'ID':>4}  {'Based':>5}  {'Deps':>5}  {'Status':<10}  {'Type':<12}  {'Started':<17}  {'Completed':<17}  {'Turns':>5}  {'Session ID':<40}"

@@ -542,7 +542,7 @@ def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | N
     if task_slug and task_slug.strip():
         return f"gza task {task_slug.strip()}"
     if task_db_id is not None:
-        return f"Task #{task_db_id}"
+        return f"Task {task_db_id}"
     return "gza task"
 
 
@@ -645,8 +645,8 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     )
     chain_parts = []
     for improve in chronological:
-        review_ref = f"Review #{improve.depends_on}" if improve.depends_on else "Review #?"
-        chain_parts.append(f"{review_ref} → Improve #{improve.id}")
+        review_ref = f"Review {improve.depends_on}" if improve.depends_on else "Review ?"
+        chain_parts.append(f"{review_ref} → Improve {improve.id}")
     lineage_chain = " → ".join(chain_parts)
 
     cycle_note = (
@@ -669,12 +669,12 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     ]
 
     for improve in included:
-        review_ref = f"review #{improve.depends_on}" if improve.depends_on else "review #?"
+        review_ref = f"review {improve.depends_on}" if improve.depends_on else "review ?"
         content = _get_task_output(improve, project_dir)
         summary = _compact_output_summary(content) if content else ""
         if not summary:
             summary = "No summary content available."
-        lines.append(f"- Improve #{improve.id} ({review_ref}): {summary}")
+        lines.append(f"- Improve {improve.id} ({review_ref}): {summary}")
 
     return "\n".join(lines)
 
@@ -881,7 +881,7 @@ def _build_context_from_chain(
             context_parts.append(f"This task is based on the findings in: {parent_task.report_file}")
             context_parts.append("Read and review that report for context before implementing.")
         elif parent_task:
-            context_parts.append(f"This task is a follow-up to task #{parent_task.id}: {parent_task.prompt[:100]}")
+            context_parts.append(f"This task is a follow-up to task {parent_task.id}: {parent_task.prompt[:100]}")
 
     return "\n".join(context_parts) if context_parts else ""
 
@@ -1118,27 +1118,27 @@ def post_review_to_pr(
 
     if not pr_number:
         if required:
-            print(f"Error: No PR found for task #{impl_task.id}")
+            print(f"Error: No PR found for task {impl_task.id}")
             if impl_task.branch:
                 print(f"Branch '{impl_task.branch}' has no associated PR")
             else:
                 print("Task has no branch")
             return
         else:
-            print(f"Info: No PR found for task #{impl_task.id}, skipping PR comment")
+            print(f"Info: No PR found for task {impl_task.id}, skipping PR comment")
             return
 
     # Get review content
     review_content = _get_task_output(review_task, project_dir)
     if not review_content:
-        print(f"Warning: Review task #{review_task.id} has no output content")
+        print(f"Warning: Review task {review_task.id} has no output content")
         return
 
     # Format as PR comment
     comment_body = f"""## 🤖 Automated Code Review
 
-**Review Task**: #{review_task.id}
-**Implementation Task**: #{impl_task.id}
+**Review Task**: {review_task.id}
+**Implementation Task**: {impl_task.id}
 
 ---
 
@@ -1172,14 +1172,14 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
         review_task = e.active_review
         if review_task.status == "in_progress":
             console.print(
-                f"\n[yellow]Review task #{review_task.id} is already in progress; skipping.[/yellow]"
+                f"\n[yellow]Review task {review_task.id} is already in progress; skipping.[/yellow]"
             )
             return 0
         console.print(
-            f"\n[yellow]Review task #{review_task.id} is already {review_task.status}; running it.[/yellow]"
+            f"\n[yellow]Review task {review_task.id} is already {review_task.status}; running it.[/yellow]"
         )
 
-    console.print(f"\n[bold cyan]=== Auto-created review task #{review_task.id} ===[/bold cyan]")
+    console.print(f"\n[bold cyan]=== Auto-created review task {review_task.id} ===[/bold cyan]")
     console.print("Running review task...")
 
     # Run the review task immediately
@@ -1305,7 +1305,7 @@ def run(
     if task_id:
         task = store.get(task_id)
         if not task:
-            error_message(f"Error: Task #{task_id} not found")
+            error_message(f"Error: Task {task_id} not found")
             return 1
 
         # Resume mode validation
@@ -1314,7 +1314,7 @@ def run(
                 error_message(f"Error: Can only resume failed tasks (task is {task.status})")
                 return 1
             if not task.session_id:
-                error_message(f"Error: Task #{task_id} has no session ID (cannot resume)")
+                error_message(f"Error: Task {task_id} has no session ID (cannot resume)")
                 console.print("Use 'gza retry' to start fresh instead")
                 return 1
             if task.status == "pending":
@@ -1323,7 +1323,7 @@ def run(
                 if claimed is None:
                     refreshed = store.get(task.id)
                     status = refreshed.status if refreshed else "unknown"
-                    error_message(f"Error: Task #{task_id} is no longer pending (status: {status})")
+                    error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
             else:
@@ -1337,13 +1337,13 @@ def run(
             # Check if task is blocked by dependencies
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                error_message(f"Error: Task #{task_id} is blocked by task #{blocking_id} ({blocking_status})")
+                error_message(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
                 return 1
             if task.status == "in_progress":
                 task.running_pid = os.getpid()
                 store.update(task)
             elif task.status != "pending":
-                error_message(f"Error: Task #{task_id} is no longer pending (status: {task.status})")
+                error_message(f"Error: Task {task_id} is no longer pending (status: {task.status})")
                 return 1
             else:
                 assert task.id is not None
@@ -1351,7 +1351,7 @@ def run(
                 if claimed is None:
                     refreshed = store.get(task.id)
                     status = refreshed.status if refreshed else "unknown"
-                    error_message(f"Error: Task #{task_id} is no longer pending (status: {status})")
+                    error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
     else:
@@ -1495,12 +1495,12 @@ def _resolve_code_task_branch_name(
             if current.branch and git.branch_exists(current.branch):
                 resolved_branch = current.branch
                 if visited_ids:
-                    via = " -> ".join(f"#{i}" for i in visited_ids)
+                    via = " -> ".join(str(i) for i in visited_ids)
                     console.print(
-                        f"Using branch from task #{current.id} (via {via}): [blue]{resolved_branch}[/blue]"
+                        f"Using branch from task {current.id} (via {via}): [blue]{resolved_branch}[/blue]"
                     )
                 else:
-                    console.print(f"Using existing branch from task #{current.id}: [blue]{resolved_branch}[/blue]")
+                    console.print(f"Using existing branch from task {current.id}: [blue]{resolved_branch}[/blue]")
                 break
             seen_ids.add(current.id)
             visited_ids.append(current.id)
@@ -1508,13 +1508,13 @@ def _resolve_code_task_branch_name(
             if current.based_on and current.based_on not in seen_ids:
                 current = store.get(current.based_on)
             elif current.based_on:
-                error_message(f"Error: Cycle detected in based_on chain for task #{task.id}")
+                error_message(f"Error: Cycle detected in based_on chain for task {task.id}")
                 return None
             else:
                 current = None
 
         if resolved_branch is None:
-            error_message(f"Error: Task #{task.id} has same_branch=True but no ancestor has a valid branch")
+            error_message(f"Error: Task {task.id} has same_branch=True but no ancestor has a valid branch")
             return None
         return resolved_branch
 
@@ -1877,7 +1877,7 @@ def _run_inner(
     store.update(task)
 
     # Write orchestration pre-run entries
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.slug}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
 
@@ -2061,7 +2061,7 @@ def _run_non_code_task(
     store.update(task)
 
     # Write orchestration pre-run entries
-    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: #{task.id} {task.slug}"})
+    write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
 
     # Setup report file based on task type

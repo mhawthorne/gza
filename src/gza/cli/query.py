@@ -141,17 +141,17 @@ def cmd_next(args: argparse.Namespace) -> int:
 
     def _print_task_row(i: int, task: DbTask, blocking_id: str | None = None) -> None:
         idx_str = str(i)
-        id_str = f"#{task.id}"
+        id_str = f"{task.id}"
         type_str = task.task_type or "implement"
         # Build visible type label with brackets, padded to fixed width
         type_visible = f"[{type_str}]"
         type_padded = f"{type_visible:<{type_width}}"
         first_line = task.prompt.split('\n')[0].strip()
         blocked_label = (
-            f" [{c['blocked']}](blocked by #{blocking_id})[/{c['blocked']}]"
+            f" [{c['blocked']}](blocked by {blocking_id})[/{c['blocked']}]"
             if blocking_id else ""
         )
-        blocked_raw_len = len(f" (blocked by #{blocking_id})") if blocking_id else 0
+        blocked_raw_len = len(f" (blocked by {blocking_id})") if blocking_id else 0
         avail = max(10, prompt_width - blocked_raw_len)
         prompt_display = truncate(first_line, avail)
         console.print(
@@ -248,13 +248,13 @@ def cmd_history(args: argparse.Namespace) -> int:
             if task.completed_at
             else ""
         )
-        # prefix: indent + "completed " (STATUS_WIDTH+1) + "#NNN " + "(YYYY-MM-DD HH:MM) "
-        task_id_len = len(str(task.id)) + 1  # "#NNN"
+        # prefix: indent + "completed " (STATUS_WIDTH+1) + ID " + "(YYYY-MM-DD HH:MM) "
+        task_id_len = len(str(task.id))
         date_len = 19 if task.completed_at else 0  # "(YYYY-MM-DD HH:MM) "
         prefix_len = len(indent) + STATUS_WIDTH + 1 + task_id_len + date_len
         prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
         console.print(
-            f"{indent}{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
+            f"{indent}{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
             f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
         )
         # Failed reason on its own line
@@ -266,11 +266,11 @@ def cmd_history(args: argparse.Namespace) -> int:
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
         tid = c['task_id']
         if task.based_on and task.depends_on:
-            parent_label = f" ← [{tid}]#{task.based_on}[/{tid}] (dep [{tid}]#{task.depends_on}[/{tid}])"
+            parent_label = f" ← [{tid}]{task.based_on}[/{tid}] (dep [{tid}]{task.depends_on}[/{tid}])"
         elif task.based_on:
-            parent_label = f" ← [{tid}]#{task.based_on}[/{tid}]"
+            parent_label = f" ← [{tid}]{task.based_on}[/{tid}]"
         elif task.depends_on:
-            parent_label = f" ← [{tid}]#{task.depends_on}[/{tid}]"
+            parent_label = f" ← [{tid}]{task.depends_on}[/{tid}]"
         else:
             parent_label = ""
         console.print(f"{indent}    {type_label}{merge_label}{parent_label}")
@@ -363,13 +363,13 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
             f"[{c['task_id']}](started {task.started_at.strftime('%Y-%m-%d %H:%M')})"
             f"[/{c['task_id']}]"
         )
-    # prefix: "⚠ orphaned  #NNN " + optional date
-    task_id_len = len(str(task.id)) + 1
+    # prefix: "⚠ orphaned  ID " + optional date
+    task_id_len = len(str(task.id))
     date_len = 28 if task.started_at else 0  # "(started YYYY-MM-DD HH:MM) "
     prefix_len = 2 + 9 + 1 + task_id_len + date_len
     prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
     console.print(
-        f"{status_icon} [{c['task_id']}]#{task.id}[/{c['task_id']}] {date_str}"
+        f"{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
         f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
     )
     type_label = f"\\[{task.task_type}]"
@@ -511,9 +511,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 review_status_color = UNMERGED_COLORS["review_changes"]
                 latest_review_id = latest_review.id if latest_review.id is not None else "?"
                 if latest_improve and latest_improve.id is not None:
-                    review_detail = f"last review #{latest_review_id} before latest improve #{latest_improve.id}"
+                    review_detail = f"last review {latest_review_id} before latest improve {latest_improve.id}"
                 else:
-                    review_detail = f"last review #{latest_review_id} before latest improve"
+                    review_detail = f"last review {latest_review_id} before latest improve"
             else:
                 review_classification = "reviewed"
                 review_status_color = UNMERGED_COLORS["review_approved"]
@@ -554,13 +554,13 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             suffix += f" [red]failed ({root_task.failure_reason})[/red]"
 
         # Header line: task ID, completion time, prompt
-        task_id_len = len(str(root_task.id)) + 1
+        task_id_len = len(str(root_task.id))
         date_len = 19 if root_task.completed_at else 0
-        prefix_len = 2 + task_id_len + date_len  # "⚡ #NNN (date) "
+        prefix_len = 2 + task_id_len + date_len  # "⚡ ID (date) "
         prompt_display = shorten_prompt(root_task.prompt, prompt_available_width(prefix=prefix_len))
         date_str = f"[{c['date']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]" if root_task.completed_at else ""
 
-        console.print(f"⚡ [{c['task_id']}]#{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
+        console.print(f"⚡ [{c['task_id']}]{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
 
         if lineage_str:
             console.print("lineage:")
@@ -694,7 +694,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if task.status == "pending":
             is_blocked, blocking_id, _ = store.is_task_blocked(task)
             if is_blocked:
-                blocked_info = f" (blocked by #{blocking_id})"
+                blocked_info = f" (blocked by {blocking_id})"
 
         # Date info for completed tasks
         date_info = ""
@@ -809,7 +809,7 @@ def _print_ps_output(
     console.print("[bold]" + "─" * 106 + "[/bold]", soft_wrap=True)
 
     for row in rows:
-        task_id_display = f"#{row['task_id']}" if row["task_id"] is not None else ""
+        task_id_display = f"{row['task_id']}" if row["task_id"] is not None else ""
         status = row['status']
         if status == "failed" and row.get("startup_failure"):
             status = "failed(startup)"
@@ -919,7 +919,7 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
         type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        console.print(f"   [cyan](#{task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
+        console.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
     console.print("   Run [cyan]gza work <id>[/cyan] to resume, or [cyan]gza mark-completed --force <id>[/cyan] to clear.")
 
 
@@ -1051,7 +1051,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         if worker.task_slug:
             task_display = worker.task_slug
         else:
-            task_display = f"task #{worker.task_id}" if worker.task_id is not None else ""
+            task_display = f"task {worker.task_id}" if worker.task_id is not None else ""
 
     flags = []
     if is_stale:
@@ -1156,23 +1156,23 @@ def _kill_task(
     elif task.running_pid is not None:
         pid = task.running_pid
     else:
-        print(f"Error: Task #{task.id} has no associated process to kill")
+        print(f"Error: Task {task.id} has no associated process to kill")
         return False
 
     if force:
         try:
             os.kill(pid, signal.SIGKILL)
-            print(f"✓ Sent SIGKILL to task #{task.id} (PID {pid})")
+            print(f"✓ Sent SIGKILL to task {task.id} (PID {pid})")
         except OSError as exc:
-            print(f"✗ Failed to kill task #{task.id}: {exc}")
+            print(f"✗ Failed to kill task {task.id}: {exc}")
             return False
     else:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError as exc:
-            print(f"✗ Failed to kill task #{task.id}: {exc}")
+            print(f"✗ Failed to kill task {task.id}: {exc}")
             return False
-        print(f"Sent SIGTERM to task #{task.id} (PID {pid}), waiting 3s...")
+        print(f"Sent SIGTERM to task {task.id} (PID {pid}), waiting 3s...")
         time.sleep(3)
         try:
             os.kill(pid, 0)
@@ -1198,7 +1198,7 @@ def _kill_task(
     if worker is not None:
         registry.mark_completed(worker.worker_id, exit_code=1, status="failed")
 
-    print(f"✓ Task #{task.id} killed")
+    print(f"✓ Task {task.id} killed")
     return True
 
 
@@ -1226,11 +1226,11 @@ def cmd_kill(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     maybe_task = store.get(task_id)
     if maybe_task is None:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     if maybe_task.status != "in_progress":
-        print(f"Error: Task #{task_id} is not running (status: {maybe_task.status})")
+        print(f"Error: Task {task_id} is not running (status: {maybe_task.status})")
         return 1
 
     return 0 if _kill_task(maybe_task, registry, store, force) else 1
@@ -1244,7 +1244,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task #{task_id} not found")
+        print(f"Error: Task {task_id} not found")
         return 1
 
     if task.status == "in_progress":
@@ -1256,13 +1256,13 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
     if not skip_confirmation:
         prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
-        confirm = input(f"Delete task #{task.id}: {prompt_display}? [y/N] ")
+        confirm = input(f"Delete task {task.id}: {prompt_display}? [y/N] ")
         if confirm.lower() != 'y':
             print("Cancelled")
             return 0
 
     if store.delete(task_id):
-        print(f"✓ Deleted task #{task_id}")
+        print(f"✓ Deleted task {task_id}")
         return 0
     else:
         print("Error: Failed to delete task")
@@ -1279,7 +1279,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     task_id: str = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if task is None:
-        console.print(f"[red]Error: Task #{task_id} not found[/red]")
+        console.print(f"[red]Error: Task {task_id} not found[/red]")
         return 1
 
     root = _resolve_lineage_root_task(store, task)
@@ -1311,7 +1311,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
 
         label = (
-            f"[{lc.task_id}]#{t.id}[/{lc.task_id}]"
+            f"[{lc.task_id}]{t.id}[/{lc.task_id}]"
             f" [{lc.type_label}]{rich_escape(type_str)}[/{lc.type_label}]"
             f" [{status_color}]{rich_escape(status)}[/{status_color}]"
             f"{rel_part}"
@@ -1373,7 +1373,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        console.print(f"[red]Error: Task #{task_id} not found[/red]")
+        console.print(f"[red]Error: Task {task_id} not found[/red]")
         return 1
 
     # --prompt: emit the fully built prompt as JSON and exit
@@ -1386,7 +1386,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             report_path = config.project_dir / task.report_file
             print(report_path)
             return 0
-        console.print(f"[red]Error: Task #{task_id} has no report file[/red]")
+        console.print(f"[red]Error: Task {task_id} has no report file[/red]")
         return 1
 
     # --output: print only the raw output content and exit
@@ -1395,7 +1395,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         if output:
             print(output)
             return 0
-        console.print(f"[red]Error: Task #{task_id} has no output content[/red]")
+        console.print(f"[red]Error: Task {task_id} has no output content[/red]")
         return 1
 
     with pager_context(getattr(args, 'page', False), config.project_dir):
@@ -1426,7 +1426,7 @@ def _cmd_show_output(
     }
     status_color = status_color_map.get(task.status, c["status_default"])
 
-    console.print(f"[{c['heading']}]Task #{task.id}[/{c['heading']}]")
+    console.print(f"[{c['heading']}]Task {task.id}[/{c['heading']}]")
     console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
     console.print(f"[{c['label']}]Status:[/{c['label']}] [{status_color}]{task.status}[/{status_color}]")
     if task.merge_status:
@@ -1435,16 +1435,16 @@ def _cmd_show_output(
     if task.slug:
         console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{task.slug}[/{c['value']}]")
     if task.based_on:
-        console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task #{task.based_on}[/{c['value']}]")
+        console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task {task.based_on}[/{c['value']}]")
     if task.depends_on:
-        console.print(f"[{c['label']}]Depends on:[/{c['label']}] [{c['value']}]task #{task.depends_on}[/{c['value']}]")
+        console.print(f"[{c['label']}]Depends on:[/{c['label']}] [{c['value']}]task {task.depends_on}[/{c['value']}]")
     if task.id is not None:
         depended_on_by = [
             t for t in store.get_all()
             if t.depends_on == task.id or t.based_on == task.id
         ]
         if depended_on_by:
-            dep_parts = [f"#{t.id}[{t.task_type}]" for t in depended_on_by if t.id is not None]
+            dep_parts = [f"{t.id}[{t.task_type}]" for t in depended_on_by if t.id is not None]
             console.print(f"[{c['label']}]Depended on by:[/{c['label']}] [{c['value']}]{', '.join(dep_parts)}[/{c['value']}]")
     if task.group:
         console.print(f"[{c['label']}]Group:[/{c['label']}] [{c['value']}]{task.group}[/{c['value']}]")
@@ -1566,10 +1566,10 @@ def _cmd_show_output(
             if iters:
                 for it in iters:
                     verdict_str = it.review_verdict or "-"
-                    imp_str = f"  improve #{it.improve_task_id}" if it.improve_task_id else ""
+                    imp_str = f"  improve {it.improve_task_id}" if it.improve_task_id else ""
                     console.print(
                         f"[{c['value']}]  iter {it.iteration_index + 1}: "
-                        f"review #{it.review_task_id} [{verdict_str}]{imp_str}[/{c['value']}]"
+                        f"review {it.review_task_id} [{verdict_str}]{imp_str}[/{c['value']}]"
                     )
 
     # Display output content using precedence logic (disk version when newer)
@@ -1669,7 +1669,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
             )
 
     if provider_name in _OBSERVE_ONLY_PROVIDERS:
-        print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
+        print(f"Attaching to task {worker.task_id} (provider: {provider_name})...")
         print(
             f"Note: {provider_name.title()} runs in headless mode. You can observe"
         )
@@ -1683,7 +1683,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         else:
             os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])
     else:
-        print(f"Attaching to task #{worker.task_id} (provider: {provider_name})...")
+        print(f"Attaching to task {worker.task_id} (provider: {provider_name})...")
         print("You have full interactive control. Ctrl-B D to detach.")
         print()
         if inside_tmux:

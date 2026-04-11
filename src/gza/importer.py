@@ -261,10 +261,10 @@ def import_tasks(
                     task=None,
                     local_index=i,
                     skipped=True,
-                    skip_reason=f"duplicate of #{duplicate.id}",
+                    skip_reason=f"duplicate of {duplicate.id}",
                 ))
                 prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt
-                messages.append(f"  - Skipped: {prompt_preview} (duplicate of #{duplicate.id})")
+                messages.append(f"  - Skipped: {prompt_preview} (duplicate of {duplicate.id})")
                 continue
 
         # Resolve depends_on from local index to actual ID
@@ -280,7 +280,7 @@ def import_tasks(
             prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt
             type_label = f"[{import_task.task_type}] " if import_task.task_type != "implement" else ""
             group_label = f" (group: {import_task.group})" if import_task.group else ""
-            dep_label = f" (depends on #{import_task.depends_on})" if import_task.depends_on else ""
+            dep_label = f" (depends on {import_task.depends_on})" if import_task.depends_on else ""
             review_label = " (review: true)" if import_task.review else ""
             messages.append(f"  {i}. {type_label}{prompt_preview}{group_label}{dep_label}{review_label}")
             results.append(ImportResult(task=None, local_index=i))
@@ -302,7 +302,7 @@ def import_tasks(
             results.append(ImportResult(task=task, local_index=i))
             prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt
             type_label = f", {import_task.task_type}" if import_task.task_type != "implement" else ""
-            dep_label = f", depends on #{depends_on_id}" if depends_on_id else ""
-            messages.append(f"  ✓ Created: {prompt_preview} (#{task.id}{type_label}{dep_label})")
+            dep_label = f", depends on {depends_on_id}" if depends_on_id else ""
+            messages.append(f"  ✓ Created: {prompt_preview} ({task.id}{type_label}{dep_label})")
 
     return results, messages

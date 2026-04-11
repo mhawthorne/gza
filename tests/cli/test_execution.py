@@ -350,8 +350,8 @@ class TestRetryCommand:
         result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Created task #" in result.stdout
-        assert f"retry of #{task.id}" in result.stdout
+        assert "Created task " in result.stdout
+        assert f"retry of {task.id}" in result.stdout
 
         # Verify new task was created with same prompt
         result = run_gza("next", "--project", str(tmp_path))
@@ -369,8 +369,8 @@ class TestRetryCommand:
         result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Created task #" in result.stdout
-        assert f"retry of #{task.id}" in result.stdout
+        assert "Created task " in result.stdout
+        assert f"retry of {task.id}" in result.stdout
 
     def test_retry_pending_task_fails(self, tmp_path: Path):
         """Retry command fails for pending tasks."""
@@ -490,7 +490,7 @@ class TestRetryCommand:
 
         # Verify the command completes successfully
         assert result.returncode == 0
-        assert "Created task #" in result.stdout
+        assert "Created task " in result.stdout
         assert "Started worker" in result.stdout
 
         # Verify new task was created
@@ -518,8 +518,8 @@ class TestRetryCommand:
         result = run_gza("retry", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the new task was created and run was attempted
-        assert "Created task #" in result.stdout
-        assert "Running task #" in result.stdout
+        assert "Created task " in result.stdout
+        assert "Running task " in result.stdout
 
         # Verify new task exists
         new_task = get_latest_task(store)
@@ -545,7 +545,7 @@ class TestRetryCommand:
 
         # Verify the new task was created but not run
         assert result.returncode == 0
-        assert "Created task #" in result.stdout
+        assert "Created task " in result.stdout
         assert "Running task" not in result.stdout
 
         # Verify new task is still pending
@@ -578,7 +578,7 @@ class TestRetryCommand:
         result = run_gza("retry", str(original.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task #{original.id} already has a successful retry (#{retry.id})." in result.stdout
+        assert f"Error: Task {original.id} already has a successful retry ({retry.id})." in result.stdout
 
 
 class TestResumeCommand:
@@ -607,7 +607,7 @@ class TestResumeCommand:
         # Verify the command completes successfully
         assert result.returncode == 0
         # Verify new task was created
-        assert "resume of #" in result.stdout
+        assert "resume of " in result.stdout
         assert "Started worker" in result.stdout
         assert "(resuming)" in result.stdout
 
@@ -671,7 +671,7 @@ class TestResumeCommand:
         result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the command creates a new task
-        assert "resume of #" in result.stdout
+        assert "resume of " in result.stdout
 
         # Verify original task stays failed and new task was created
         original = store.get(task.id)
@@ -701,7 +701,7 @@ class TestResumeCommand:
 
         # Verify the command creates a new task but does not run it
         assert result.returncode == 0
-        assert "resume of #" in result.stdout
+        assert "resume of " in result.stdout
         assert "Running" not in result.stdout
 
         # Verify new task is pending
@@ -733,7 +733,7 @@ class TestResumeCommand:
         result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify output
-        assert "resume of #" in result.stdout
+        assert "resume of " in result.stdout
 
         # Verify original task stays failed with stats preserved
         original = store.get(task.id)
@@ -776,7 +776,7 @@ class TestResumeCommand:
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout.lower()
-        assert "resume of #" in result.stdout
+        assert "resume of " in result.stdout
 
         # Verify original task is unchanged and new task was created
         original = store.get(task.id)
@@ -973,7 +973,7 @@ class TestWorkCommandMultiTask:
 
         # Should error about task status
         assert result.returncode != 0
-        assert f"Task #{task1.id} is not pending" in result.stdout or f"Task #{task1.id} is not pending" in result.stderr
+        assert f"Task {task1.id} is not pending" in result.stdout or f"Task {task1.id} is not pending" in result.stderr
 
     def test_work_worker_mode_rejects_completed_task(self, tmp_path: Path):
         """Worker-mode explicit execution should return non-zero for non-pending tasks."""
@@ -989,7 +989,7 @@ class TestWorkCommandMultiTask:
 
         result = run_gza("work", "--worker-mode", str(task.id), "--no-docker", "--project", str(tmp_path))
         assert result.returncode != 0
-        assert f"Task #{task.id}" in (result.stdout + result.stderr)
+        assert f"Task {task.id}" in (result.stdout + result.stderr)
 
     def test_work_warns_about_orphaned_tasks_before_starting(self, tmp_path: Path):
         """Work command warns about orphaned in-progress tasks before starting new work."""
@@ -1470,7 +1470,7 @@ class TestImplementCommand:
         )
 
         assert result.returncode == 0
-        assert "Created implement task #" in result.stdout
+        assert "Created implement task " in result.stdout
 
         impl_task = get_latest_task(store)
         assert impl_task is not None
@@ -1503,7 +1503,7 @@ class TestImplementCommand:
         result = run_gza("implement", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task #{task.id} is a implement task" in result.stdout
+        assert f"Error: Task {task.id} is a implement task" in result.stdout
 
     def test_implement_fails_for_incomplete_plan_task(self, tmp_path: Path):
         """Implement command requires the plan task to be completed."""
@@ -1516,7 +1516,7 @@ class TestImplementCommand:
         result = run_gza("implement", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task #{plan_task.id} is pending. Plan task must be completed." in result.stdout
+        assert f"Error: Task {plan_task.id} is pending. Plan task must be completed." in result.stdout
 
     def test_implement_derives_prompt_from_plan_slug_when_omitted(self, tmp_path: Path):
         """Implement command derives prompt from the plan task slug when prompt omitted."""
@@ -1533,12 +1533,12 @@ class TestImplementCommand:
         result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Created implement task #" in result.stdout
+        assert "Created implement task " in result.stdout
 
         impl_task = get_latest_task(store)
         assert impl_task is not None
         assert impl_task.id != plan_task.id
-        assert impl_task.prompt == f"Implement plan from task #{plan_task.id}: plan-auth-migration"
+        assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
         assert impl_task.based_on == plan_task.id
 
     def test_implement_derives_prompt_from_base_plan_slug_when_retry_suffix_present(self, tmp_path: Path):
@@ -1556,12 +1556,12 @@ class TestImplementCommand:
         result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Created implement task #" in result.stdout
+        assert "Created implement task " in result.stdout
 
         impl_task = get_latest_task(store)
         assert impl_task is not None
         assert impl_task.id != plan_task.id
-        assert impl_task.prompt == f"Implement plan from task #{plan_task.id}: plan-auth-migration"
+        assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
         assert impl_task.based_on == plan_task.id
 
 
@@ -1593,9 +1593,9 @@ class TestImproveCommand:
         assert result.returncode == 0
         all_tasks = store.get_all()
         improve_task = [t for t in all_tasks if t.task_type == "improve"][0]
-        assert f"Created improve task #{improve_task.id}" in result.stdout
-        assert f"Based on: implementation #{impl_task.id}" in result.stdout
-        assert f"Review: #{review_task.id}" in result.stdout
+        assert f"Created improve task {improve_task.id}" in result.stdout
+        assert f"Based on: implementation {impl_task.id}" in result.stdout
+        assert f"Review: {review_task.id}" in result.stdout
 
         # Verify the improve task was created with correct fields
         assert improve_task is not None
@@ -1693,7 +1693,7 @@ class TestImproveCommand:
 
         assert result.returncode == 0, result.stdout
         assert "Created improve task" in result.stdout
-        assert f"Based on: implementation #{impl_task.id}" in result.stdout
+        assert f"Based on: implementation {impl_task.id}" in result.stdout
 
     def test_improve_accepts_improve_task_id_and_resolves_impl(self, tmp_path: Path):
         """Improve command accepts an improve task ID and auto-resolves to the implement task."""
@@ -1732,7 +1732,7 @@ class TestImproveCommand:
 
         assert result.returncode == 0, result.stdout
         assert "Created improve task" in result.stdout
-        assert f"Based on: implementation #{impl_task.id}" in result.stdout
+        assert f"Based on: implementation {impl_task.id}" in result.stdout
 
     def test_improve_uses_most_recent_review(self, tmp_path: Path):
         """Improve command uses the most recent review when multiple exist."""
@@ -1766,7 +1766,7 @@ class TestImproveCommand:
         result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"Review: #{review_task2.id}" in result.stdout  # Should use the second (most recent) review
+        assert f"Review: {review_task2.id}" in result.stdout  # Should use the second (most recent) review
 
         # Verify the improve task depends on the most recent review
         all_tasks = store.get_all()
@@ -1805,10 +1805,10 @@ class TestImproveCommand:
 
         # Should succeed but warn about incomplete review
         assert result.returncode == 0
-        assert "Warning: Review #" in result.stdout
+        assert "Warning: Review " in result.stdout
         assert "is pending" in result.stdout
         assert "blocked until it completes" in result.stdout
-        assert "Created improve task #" in result.stdout
+        assert "Created improve task " in result.stdout
 
     def test_improve_prevents_duplicate(self, tmp_path: Path):
         """Improve command refuses to create a duplicate improve task."""
@@ -1842,7 +1842,7 @@ class TestImproveCommand:
 
         assert result.returncode == 1
         assert "improve task already exists" in result.stdout
-        assert f"#{existing_improve.id}" in result.stdout
+        assert f"{existing_improve.id}" in result.stdout
 
         # Verify no new task was created (still only 3 tasks)
         all_tasks = store.get_all()
@@ -1871,8 +1871,8 @@ class TestImproveCommand:
         result = run_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the improve task was created and run was attempted
-        assert "Created improve task #" in result.stdout
-        assert "Running improve task #" in result.stdout
+        assert "Created improve task " in result.stdout
+        assert "Running improve task " in result.stdout
 
     def test_improve_with_model_flag(self, tmp_path: Path):
         """Improve command with --model sets the model on the created task."""
@@ -1963,8 +1963,8 @@ class TestImproveCommand:
         result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
-        assert f"Review: #{good_review.id}" in result.stdout
-        assert f"Review: #{bad_review.id}" not in result.stdout
+        assert f"Review: {good_review.id}" in result.stdout
+        assert f"Review: {bad_review.id}" not in result.stdout
 
         # Confirm the improve task's dependency points at the good review.
         improve_task = next(task for task in store.get_all() if task.task_type == "improve")
@@ -2002,7 +2002,7 @@ class TestImproveCommand:
         result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
-        assert f"Review: #{good_review.id}" in result.stdout
+        assert f"Review: {good_review.id}" in result.stdout
 
     def test_improve_errors_when_all_reviews_are_dropped(self, tmp_path: Path):
         """When every review is dropped/failed, surface a clear error."""
@@ -2068,7 +2068,7 @@ class TestImproveCommand:
         )
 
         assert result.returncode == 0, result.stdout
-        assert f"Review: #{older_review.id}" in result.stdout
+        assert f"Review: {older_review.id}" in result.stdout
 
         improve_task = next(task for task in store.get_all() if task.task_type == "improve")
         assert improve_task is not None
@@ -2107,7 +2107,7 @@ class TestImproveCommand:
         )
 
         assert result.returncode == 1
-        assert f"reviews task #{impl_b.id}" in result.stdout
+        assert f"reviews task {impl_b.id}" in result.stdout
 
     def test_improve_review_id_flag_rejects_non_review_task(self, tmp_path: Path):
         """--review-id must point at a review task, not an implement/improve task."""
@@ -2155,7 +2155,7 @@ class TestImproveCommand:
         )
 
         assert result.returncode == 1
-        assert "Review task #9999 not found" in result.stdout
+        assert "Review task 9999 not found" in result.stdout
 
 
 class TestReviewCommand:
@@ -2183,8 +2183,8 @@ class TestReviewCommand:
         result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Created review task #" in result.stdout
-        assert f"Implementation: #{impl_task.id}" in result.stdout
+        assert "Created review task " in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
         assert "Group: auth-feature" in result.stdout
 
         # Verify the review task was created with correct fields
@@ -2243,8 +2243,8 @@ class TestReviewCommand:
         assert result.returncode == 0
         all_tasks = store.get_all()
         review_task = [t for t in all_tasks if t.task_type == "review"][0]
-        assert f"Created review task #{review_task.id}" in result.stdout
-        assert f"Implementation: #{impl_task.id}" in result.stdout
+        assert f"Created review task {review_task.id}" in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
 
         assert review_task is not None
         assert review_task.task_type == "review"
@@ -2275,8 +2275,8 @@ class TestReviewCommand:
         result = run_gza("review", str(existing_review.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
-        assert "Created review task #" in result.stdout
-        assert f"Implementation: #{impl_task.id}" in result.stdout
+        assert "Created review task " in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
 
         all_tasks = store.get_all()
         new_reviews = [t for t in all_tasks if t.task_type == "review" and t.id != existing_review.id]
@@ -2332,7 +2332,7 @@ class TestReviewCommand:
         result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Created review task #" in result.stdout
+        assert "Created review task " in result.stdout
 
         # Verify the review task inherited based_on
         all_tasks = store.get_all()
@@ -2357,8 +2357,8 @@ class TestReviewCommand:
         result = run_gza("review", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the review task was created and run attempted
-        assert "Created review task #" in result.stdout
-        assert "Running review task #" in result.stdout
+        assert "Created review task " in result.stdout
+        assert "Running review task " in result.stdout
 
         # Verify the review task exists
         all_tasks = store.get_all()
@@ -2384,7 +2384,7 @@ class TestReviewCommand:
 
         # Verify the review task was created but not run
         assert result.returncode == 0
-        assert "Created review task #" in result.stdout
+        assert "Created review task " in result.stdout
         assert "Running review task" not in result.stdout
 
         # Verify the review task is still pending
@@ -2454,7 +2454,7 @@ class TestReviewCommand:
 
         # Should succeed but not run the task
         assert result.returncode == 0
-        assert "Created review task #" in result.stdout
+        assert "Created review task " in result.stdout
         assert "Running review task" not in result.stdout
 
     def test_review_prevents_duplicate_pending_review(self, tmp_path: Path):
@@ -2479,7 +2479,7 @@ class TestReviewCommand:
 
         assert result.returncode == 1
         assert "Warning: A review task already exists" in result.stdout
-        assert f"#{existing_review.id}" in result.stdout
+        assert f"{existing_review.id}" in result.stdout
         assert "pending" in result.stdout
 
         # Verify no additional review task was created
@@ -2509,7 +2509,7 @@ class TestReviewCommand:
 
         assert result.returncode == 1
         assert "Warning: A review task already exists" in result.stdout
-        assert f"#{existing_review.id}" in result.stdout
+        assert f"{existing_review.id}" in result.stdout
         assert "in_progress" in result.stdout
 
         # Verify no additional review task was created
@@ -2604,7 +2604,7 @@ class TestReviewCommand:
         assert result == 1
         printed = output.getvalue()
         assert "Warning: A review task already exists" in printed
-        assert f"#{existing_review.id}" in printed
+        assert f"{existing_review.id}" in printed
         # get_reviews_for_task must be called exactly once (inside _create_review_task),
         # NOT a second time in the cmd_review error handler.
         assert len(call_count) == 1, (

@@ -40,11 +40,11 @@ def format_commit_subject(prompt: str, max_len: int = MAX_PR_TITLE_LENGTH, prefi
 
 def format_task_trailers(task_id: str, task_slug: str | None, review_task_id: str | None = None) -> str:
     """Build canonical trailer lines for task-linked commits."""
-    lines = [f"Task #{task_id}"]
+    lines = [f"Task {task_id}"]
     if task_slug:
         lines.append(f"Slug: {task_slug}")
     if review_task_id is not None:
-        lines.append(f"Gza-Review: #{review_task_id}")
+        lines.append(f"Gza-Review: {review_task_id}")
     return "\n".join(lines)
 
 

@@ -1421,7 +1421,7 @@ class SqliteTaskStore:
             existing = cur.fetchone()
             if existing:
                 raise ValueError(
-                    f"Task #{impl_task_id} already has an active cycle (#{existing['id']}). "
+                    f"Task {impl_task_id} already has an active cycle (#{existing['id']}). "
                     "Use --continue to resume it."
                 )
             cur = conn.execute(
@@ -2307,9 +2307,9 @@ def edit_prompt(
     # Build options section
     options = [f"# Type: {task_type}"]
     if based_on:
-        options.append(f"# Based on: #{based_on}")
+        options.append(f"# Based on: {based_on}")
     if depends_on:
-        options.append(f"# Depends on: #{depends_on}")
+        options.append(f"# Depends on: {depends_on}")
     if group:
         options.append(f"# Group: {group}")
     if spec:
@@ -2329,9 +2329,9 @@ def edit_prompt(
     # This makes the slug unique by including the task ID
     if not initial_content and task_type == "implement" and based_on:
         if based_on_slug:
-            initial_content = f"Implement plan from task #{based_on}: {based_on_slug}"
+            initial_content = f"Implement plan from task {based_on}: {based_on_slug}"
         else:
-            initial_content = f"Implement plan from task #{based_on}"
+            initial_content = f"Implement plan from task {based_on}"
 
     content = template + "\n" + initial_content
 

@@ -249,7 +249,7 @@ class TestMergeCommand:
         commit_message = log_result.stdout.strip()
 
         # Verify the commit message contains task information
-        assert f"Task #{task.id}" in commit_message, "Commit message should include task ID"
+        assert f"Task {task.id}" in commit_message, "Commit message should include task ID"
         assert f"Slug: {task.slug}" in commit_message, "Commit message should include task slug"
         assert "Squash merge" in commit_message, "Commit message should indicate squash merge"
 
@@ -350,7 +350,7 @@ class TestMergeCommand:
 
         # Verify success
         assert result.returncode == 0
-        assert f"Marked task #{task.id} as merged" in result.stdout
+        assert f"Marked task {task.id} as merged" in result.stdout
 
         # Verify branch was NOT deleted
         assert git.branch_exists("feature/mark-only")
@@ -498,8 +498,8 @@ class TestMergeCommand:
         # Verify the command succeeds
         assert result.returncode == 0
         assert "Successfully merged 2 task(s)" in result.stdout
-        assert f"#{task1.id}" in result.stdout
-        assert f"#{task2.id}" in result.stdout
+        assert f"{task1.id}" in result.stdout
+        assert f"{task2.id}" in result.stdout
 
     def test_merge_stops_on_first_failure(self, tmp_path: Path):
         """Merge command stops on first failure and reports which tasks were merged."""
@@ -561,13 +561,13 @@ class TestMergeCommand:
 
         # Verify task 1 was merged successfully
         assert "Successfully merged 1 task(s)" in result.stdout
-        assert f"#{task1.id}" in result.stdout
+        assert f"{task1.id}" in result.stdout
 
         # Verify it stopped at task 2
-        assert f"Stopped at task #{task2.id}" in result.stdout
+        assert f"Stopped at task {task2.id}" in result.stdout
 
         # Verify task 3 is listed as not processed
-        assert f"#{task3.id}" in result.stdout
+        assert f"{task3.id}" in result.stdout
         assert "Remaining tasks not processed" in result.stdout
 
     def test_merge_multiple_with_squash(self, tmp_path: Path):
@@ -902,7 +902,7 @@ class TestRebaseCommand:
         result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"Rebasing task #{task.id}..." in result.stdout
+        assert f"Rebasing task {task.id}..." in result.stdout
         # Output should end with a newline (after trailing whitespace is stripped per line,
         # the last non-empty content is followed by a blank line)
         assert result.stdout.endswith("\n")
@@ -1123,7 +1123,7 @@ class TestDiffCommand:
         result = run_gza("diff", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task #{task.id} has no branch" in result.stdout
+        assert f"Error: Task {task.id} has no branch" in result.stdout
 
     def test_diff_with_non_numeric_argument(self, tmp_path: Path):
         """Diff command passes non-numeric arguments through to git diff."""
@@ -2080,7 +2080,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Create a completed review task with APPROVED verdict
-        review_prompt = f"Review implementation #{task.id}"
+        review_prompt = f"Review implementation {task.id}"
         review_task = store.add(
             review_prompt,
             task_type="review",
@@ -2376,7 +2376,7 @@ class TestAdvanceCommand:
         config = Config.load(tmp_path)
         action = _determine_advance_action(config, store, git, task, "main")
         assert action['type'] == 'skip'
-        assert f"rebase #{rebase_child.id} already in progress" in action['description']
+        assert f"rebase {rebase_child.id} already in progress" in action['description']
 
     def test_advance_needs_discussion_for_failed_rebase_child(self, tmp_path: Path):
         """advance returns needs_discussion when a rebase child has failed."""
@@ -2417,7 +2417,7 @@ class TestAdvanceCommand:
         config = Config.load(tmp_path)
         action = _determine_advance_action(config, store, git, task, "main")
         assert action['type'] == 'needs_discussion'
-        assert f"rebase #{rebase_child.id} failed" in action['description']
+        assert f"rebase {rebase_child.id} failed" in action['description']
 
     def test_advance_merges_non_implement_task_without_review(self, tmp_path: Path):
         """advance merges a non-implement task (e.g. explore) directly, skipping review creation."""
@@ -2509,7 +2509,7 @@ class TestAdvanceCommand:
 
         # Create a review with CHANGES_REQUESTED
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -2634,7 +2634,7 @@ class TestAdvanceCommand:
         task2 = self._create_implement_task_with_branch(store, git, tmp_path, "Feature B")
 
         # Give task1 an approved review so it can merge
-        review = store.add(f"Review #{task1.id}", task_type="review", depends_on=task1.id)
+        review = store.add(f"Review {task1.id}", task_type="review", depends_on=task1.id)
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
@@ -2658,7 +2658,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path, "Feature via integer ID")
 
         # Give the task an approved review so it can merge
-        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
@@ -2728,7 +2728,7 @@ class TestAdvanceCommand:
 
         # Create a pending review
         store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -2748,7 +2748,7 @@ class TestAdvanceCommand:
 
         # Create an in_progress review
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -2781,7 +2781,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Add approved review so action would be merge
-        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
@@ -2841,7 +2841,7 @@ class TestAdvanceCommand:
 
         # Create a completed review with no recognizable verdict
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -2918,7 +2918,7 @@ class TestAdvanceCommand:
 
         # Create a review with CHANGES_REQUESTED
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -2929,7 +2929,7 @@ class TestAdvanceCommand:
 
         # Create an already-pending improve task
         existing_improve = store.add(
-            f"Improve #{task.id}",
+            f"Improve {task.id}",
             task_type="improve",
             depends_on=review_task.id,
             based_on=task.id,
@@ -2983,7 +2983,7 @@ class TestAdvanceCommand:
 
         # Create a completed review
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3029,7 +3029,7 @@ class TestAdvanceCommand:
         for i in range(3):
             task = self._create_implement_task_with_branch(store, git, tmp_path, f"Feature {i}")
             store.add(
-                f"Review #{task.id}",
+                f"Review {task.id}",
                 task_type="review",
                 depends_on=task.id,
             )
@@ -3061,7 +3061,7 @@ class TestAdvanceCommand:
         assert len(spawn_calls) == 2
         # The third task should show a batch limit message
         assert "batch limit reached" in output
-        assert f"#{tasks[2].id}" in output
+        assert f"{tasks[2].id}" in output
 
     def test_advance_batch_merge_does_not_count_toward_limit(self, tmp_path: Path):
         """advance --batch B: merge actions don't count toward the worker limit."""
@@ -3078,7 +3078,7 @@ class TestAdvanceCommand:
         for i in range(2):
             task = self._create_implement_task_with_branch(store, git, tmp_path, f"Merge {i}")
             review_task = store.add(
-                f"Review #{task.id}",
+                f"Review {task.id}",
                 task_type="review",
                 depends_on=task.id,
             )
@@ -3093,7 +3093,7 @@ class TestAdvanceCommand:
         for i in range(2):
             task = self._create_implement_task_with_branch(store, git, tmp_path, f"Worker {i}")
             store.add(
-                f"Review #{task.id}",
+                f"Review {task.id}",
                 task_type="review",
                 depends_on=task.id,
             )
@@ -3136,7 +3136,7 @@ class TestAdvanceCommand:
         for i in range(2):
             task = self._create_implement_task_with_branch(store, git, tmp_path, f"Feature {i}")
             store.add(
-                f"Review #{task.id}",
+                f"Review {task.id}",
                 task_type="review",
                 depends_on=task.id,
             )
@@ -3190,7 +3190,7 @@ class TestAdvanceCommand:
 
         # Create a CHANGES_REQUESTED review so advance will try to spawn an improve worker
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3250,7 +3250,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Add approved review so action would be merge
-        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
@@ -3304,7 +3304,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Add approved review so action is merge
-        review = store.add(f"Review #{task.id}", task_type="review", depends_on=task.id)
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = "**Verdict: APPROVED**"
@@ -3349,7 +3349,7 @@ class TestAdvanceCommand:
         # Given an EARLIER completed_at so it appears second in DB order (DESC).
         task_merge = self._create_implement_task_with_branch(store, git, tmp_path, "Feature merge")
         approved_review = store.add(
-            f"Review #{task_merge.id}", task_type="review", depends_on=task_merge.id
+            f"Review {task_merge.id}", task_type="review", depends_on=task_merge.id
         )
         approved_review.status = "completed"
         approved_review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
@@ -3362,7 +3362,7 @@ class TestAdvanceCommand:
         # Given a LATER completed_at so it appears first in DB order (DESC).
         # Without the sort, this causes spawn to execute before merge.
         task_spawn = self._create_implement_task_with_branch(store, git, tmp_path, "Feature spawn")
-        store.add(f"Review #{task_spawn.id}", task_type="review", depends_on=task_spawn.id)
+        store.add(f"Review {task_spawn.id}", task_type="review", depends_on=task_spawn.id)
         # Leave review status as default 'pending' — this triggers run_review action.
         task_spawn.completed_at = datetime(2026, 2, 1, tzinfo=UTC)
         store.update(task_spawn)
@@ -3494,7 +3494,7 @@ class TestAdvanceCommand:
 
         # Create a completed review
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3547,7 +3547,7 @@ class TestAdvanceCommand:
     def _create_completed_improve(self, store, impl_task, review_task):
         """Create a completed improve task for the given impl and review tasks."""
         improve = store.add(
-            f"Improve #{impl_task.id}",
+            f"Improve {impl_task.id}",
             task_type="improve",
             depends_on=review_task.id,
             based_on=impl_task.id,
@@ -3570,7 +3570,7 @@ class TestAdvanceCommand:
 
         # Create a CHANGES_REQUESTED review
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3603,7 +3603,7 @@ class TestAdvanceCommand:
 
         # Create a CHANGES_REQUESTED review
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3632,7 +3632,7 @@ class TestAdvanceCommand:
 
         # Create a completed APPROVED review (completed first)
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3643,7 +3643,7 @@ class TestAdvanceCommand:
 
         # Create a completed rebase (completed AFTER the review)
         rebase_task = store.add(
-            f"Rebase #{task.id}",
+            f"Rebase {task.id}",
             task_type="rebase",
             based_on=task.id,
         )
@@ -3669,7 +3669,7 @@ class TestAdvanceCommand:
 
         # Completed review, then completed rebase after it
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3679,7 +3679,7 @@ class TestAdvanceCommand:
         store.update(review_task)
 
         rebase_task = store.add(
-            f"Rebase #{task.id}",
+            f"Rebase {task.id}",
             task_type="rebase",
             based_on=task.id,
         )
@@ -3694,7 +3694,7 @@ class TestAdvanceCommand:
 
         # Simulate the review being created (pending)
         new_review = store.add(
-            f"Review #{task.id} (post-rebase)",
+            f"Review {task.id} (post-rebase)",
             task_type="review",
             depends_on=task.id,
         )
@@ -3717,7 +3717,7 @@ class TestAdvanceCommand:
 
         # Create a completed rebase (completed first)
         rebase_task = store.add(
-            f"Rebase #{task.id}",
+            f"Rebase {task.id}",
             task_type="rebase",
             based_on=task.id,
         )
@@ -3727,7 +3727,7 @@ class TestAdvanceCommand:
 
         # Create a completed APPROVED review (completed AFTER the rebase)
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3751,7 +3751,7 @@ class TestAdvanceCommand:
 
         # Create a completed APPROVED review (no rebase at all)
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3779,7 +3779,7 @@ class TestAdvanceCommand:
 
         # Old rebase (before review)
         old_rebase = store.add(
-            f"Old rebase #{task.id}",
+            f"Old rebase {task.id}",
             task_type="rebase",
             based_on=task.id,
         )
@@ -3789,7 +3789,7 @@ class TestAdvanceCommand:
 
         # Review (after old rebase)
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3800,7 +3800,7 @@ class TestAdvanceCommand:
 
         # New rebase (after review) — this is the one that should invalidate
         new_rebase = store.add(
-            f"New rebase #{task.id}",
+            f"New rebase {task.id}",
             task_type="rebase",
             based_on=task.id,
         )
@@ -3824,7 +3824,7 @@ class TestAdvanceCommand:
 
         # Create a CHANGES_REQUESTED review and 1 completed improve (= max_review_cycles=1)
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3851,7 +3851,7 @@ class TestAdvanceCommand:
 
         assert rc == 0
         assert "Needs attention" in output
-        assert f"#{task.id}" in output
+        assert f"{task.id}" in output
         assert "max review cycles" in output
 
     def test_advance_max_review_cycles_cli_override(self, tmp_path: Path):
@@ -3864,7 +3864,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -3898,7 +3898,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         review_task = store.add(
-            f"Review #{task.id}",
+            f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
         )
@@ -4057,7 +4057,7 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         # The original should NOT appear in the plan — only the child should
         # (and the child should be skipped due to max resume attempts)
-        assert f"#{original.id}" not in result.stdout
+        assert f"{original.id}" not in result.stdout
         assert "SKIP: max resume attempts" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
@@ -4503,8 +4503,8 @@ class TestAdvanceUnimplementedCommand:
         by_based_on = {t.based_on: t for t in impl_tasks}
         assert plan.id in by_based_on
         assert explore.id in by_based_on
-        assert by_based_on[plan.id].prompt.startswith(f"Implement plan from task #{plan.id}")
-        assert by_based_on[explore.id].prompt.startswith(f"Implement findings from task #{explore.id}")
+        assert by_based_on[plan.id].prompt.startswith(f"Implement plan from task {plan.id}")
+        assert by_based_on[explore.id].prompt.startswith(f"Implement findings from task {explore.id}")
 
     def test_advance_unimplemented_dry_run_no_create(self, tmp_path: Path):
         """advance --unimplemented --create --dry-run shows preview but creates nothing."""
@@ -4671,7 +4671,7 @@ class TestAdvanceAutoPlans:
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 1
         assert impl_tasks[0].based_on == plan.id
-        assert impl_tasks[0].prompt == f"Implement plan from task #{plan.id}: design-auth-system"
+        assert impl_tasks[0].prompt == f"Implement plan from task {plan.id}: design-auth-system"
 
     def test_advance_skips_plan_with_existing_implement(self, tmp_path: Path):
         """advance skips a completed plan that already has an implement child.
@@ -5011,7 +5011,7 @@ class TestPrCommand:
         assert internal_tasks[0].failure_reason == "UNKNOWN"
 
         captured = capsys.readouterr()
-        assert f"internal task #{internal_tasks[0].id} failed" in captured.err
+        assert f"internal task {internal_tasks[0].id} failed" in captured.err
 
 
 class TestRefreshCommand:

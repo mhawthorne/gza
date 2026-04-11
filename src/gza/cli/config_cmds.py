@@ -292,7 +292,7 @@ def _cmd_stats_reviews(
             model = ri.model or "unknown"
             model_issues[model].append((must_fix, sugg))
         if unparsed:
-            ids = ", ".join(f"#{i}" for i in unparsed)
+            ids = ", ".join(str(i) for i in unparsed)
             print(f"\nwarning: could not parse issues from {len(unparsed)} review(s): {ids}", file=sys.stderr)
         if model_issues:
             def _stats_str(vals: list[int]) -> str:
@@ -703,7 +703,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                                         unmerged_task_ids.add(task.slug)
                             except Exception:
                                 logger.warning(
-                                    "Failed to check merge state for task #%s branch=%s during cleanup",
+                                    "Failed to check merge state for task %s branch=%s during cleanup",
                                     task.id,
                                     task.branch,
                                     exc_info=True,
@@ -1144,7 +1144,7 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         for task in tasks_with_reports:
             status = _sync_one_report(task, config, store, dry_run=dry_run)
             if status == "synced":
-                console.print(f"{prefix}[green]Synced #{task.id} ({task.report_file})[/green]")
+                console.print(f"{prefix}[green]Synced {task.id} ({task.report_file})[/green]")
                 synced += 1
             elif status == "unchanged":
                 unchanged += 1
@@ -1158,12 +1158,12 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     found_task = store.get(task_id)
     if not found_task:
-        console.print(f"[red]Error: Task #{task_id} not found[/red]")
+        console.print(f"[red]Error: Task {task_id} not found[/red]")
         return 1
     task = found_task
 
     if not task.report_file:
-        console.print(f"[red]Error: Task #{task_id} has no report file[/red]")
+        console.print(f"[red]Error: Task {task_id} has no report file[/red]")
         return 1
 
     status = _sync_one_report(task, config, store, dry_run=dry_run)
@@ -1173,9 +1173,9 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Report file not found: {task.report_file}[/red]")
         return 1
     elif status == "unchanged":
-        console.print(f"[dim]Task #{task_id} already in sync — no changes needed.[/dim]")
+        console.print(f"[dim]Task {task_id} already in sync — no changes needed.[/dim]")
     else:
-        console.print(f"{prefix}[green]Synced report for task #{task_id} from disk to DB.[/green]")
+        console.print(f"{prefix}[green]Synced report for task {task_id} from disk to DB.[/green]")
     return 0
 
 
