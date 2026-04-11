@@ -31,11 +31,16 @@ def build_auto_review_prompt(impl_task: Task, project_prefix: str | None = None)
         else:
             slug = None
         if slug:
+            # Derived implement slugs are "<task_id_suffix>-impl-<semantic-slug>".
+            # Normalize first, then optionally strip project_prefix from semantic tail.
+            normalized = strip_derived_implement_prefixes(slug)
+            if normalized is None:
+                slug = None
+            else:
+                slug = normalized
+        if slug:
             if project_prefix and slug.startswith(f"{project_prefix}-"):
                 slug = slug[len(project_prefix) + 1:]
-            # Derived implement slugs are now "<task_id_suffix>-impl-<semantic-slug>".
-            # Auto-review prompts should keep only the semantic subject.
-            slug = strip_derived_implement_prefixes(slug)
             return f"review {slug}"
 
     review_prompt = f"Review task #{impl_task.id}"

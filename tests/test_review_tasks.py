@@ -77,6 +77,21 @@ class TestBuildAutoReviewPrompt:
         result = build_auto_review_prompt(task)
         assert result == "review add-feature"
 
+    def test_slug_preserves_semantic_impl_subject_add(self):
+        task = _task(slug="20260410-0000ab-impl-add-impl-support")
+        result = build_auto_review_prompt(task)
+        assert result == "review add-impl-support"
+
+    def test_slug_preserves_semantic_impl_subject_api(self):
+        task = _task(slug="20260410-0000ab-impl-api-impl-migration")
+        result = build_auto_review_prompt(task)
+        assert result == "review api-impl-migration"
+
+    def test_project_prefix_stripped_after_derived_normalization(self):
+        task = _task(slug="20260410-0000ab-impl-myproj-add-feature")
+        result = build_auto_review_prompt(task, project_prefix="myproj")
+        assert result == "review add-feature"
+
     def test_fallback_when_no_task_id(self):
         task = _task(id=5, slug=None, prompt="build the thing")
         result = build_auto_review_prompt(task)

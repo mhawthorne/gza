@@ -32,3 +32,15 @@ def test_strip_derived_implement_prefixes_strips_nested_chain() -> None:
 def test_strip_derived_implement_prefixes_preserves_non_derived_slug() -> None:
     """Slugs without a derived implement prefix are returned unchanged."""
     assert strip_derived_implement_prefixes("add-feature") == "add-feature"
+
+
+def test_strip_derived_implement_prefixes_preserves_semantic_impl_token() -> None:
+    """Only task-id-derived prefixes are removed; semantic ``*-impl-*`` remains."""
+    slug = "0000ab-impl-add-impl-support"
+    assert strip_derived_implement_prefixes(slug) == "add-impl-support"
+
+
+def test_strip_derived_implement_prefixes_preserves_semantic_impl_token_api() -> None:
+    """Semantic subjects like ``api-impl-*`` are not stripped as derived prefixes."""
+    slug = "0000ab-impl-api-impl-migration"
+    assert strip_derived_implement_prefixes(slug) == "api-impl-migration"
