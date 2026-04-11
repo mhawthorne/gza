@@ -344,7 +344,8 @@ def generate_slug(
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
         if slug_override is not None:
-            # slug_override already encodes full lineage context (e.g. "rev-myproj-add-feature")
+            # slug_override already encodes full lineage context
+            # (e.g. "0000mr-rev-myproj-add-feature")
             # so do not prepend project_prefix — it would double-embed the prefix for chained tasks
             base_id = f"{date_prefix}-{slug_override}"
         else:

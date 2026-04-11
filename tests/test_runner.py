@@ -900,12 +900,21 @@ class TestReviewTaskSlugGeneration:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="testproject")
 
-        impl_task = store.add(
+        parent_impl = store.add(
             prompt="Add feature",
             task_type="implement",
         )
+        parent_impl.status = "completed"
+        parent_impl.slug = "20260409-000001-impl-add-feature"
+        store.update(parent_impl)
+
+        impl_task = store.add(
+            prompt="Add feature",
+            task_type="implement",
+            based_on=parent_impl.id,
+        )
         impl_task.status = "completed"
-        impl_task.slug = "20260410-b2-impl-a1-impl-add-feature"
+        impl_task.slug = "20260410-000002-impl-000001-impl-add-feature"
         store.update(impl_task)
 
         config = Mock(spec=Config)

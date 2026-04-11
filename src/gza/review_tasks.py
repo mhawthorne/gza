@@ -1,4 +1,5 @@
 """Shared helpers for creating review tasks."""
+from collections.abc import Iterable
 from typing import Literal
 
 from .db import SqliteTaskStore, Task
@@ -16,7 +17,53 @@ class DuplicateReviewError(ValueError):
         )
 
 
-def build_auto_review_prompt(impl_task: Task, project_prefix: str | None = None) -> str:
+def _extract_task_id_suffix(task_id: object | None) -> str:
+    """Extract the suffix from a task id in ``prefix-suffix`` format."""
+    if task_id is None:
+        return ""
+    task_id_str = str(task_id).strip()
+    if not task_id_str:
+        return ""
+    prefix, sep, suffix = task_id_str.partition("-")
+    if sep and prefix and suffix:
+        return suffix
+    return task_id_str
+
+
+def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) -> set[str]:
+    """Collect task-id suffixes from an implementation task lineage.
+
+    Includes the implementation task itself and ancestors reachable via
+    ``based_on`` / ``depends_on``. This allows exact derived-prefix stripping
+    without over-matching semantic ``*-impl-*`` slug segments.
+    """
+    known: set[str] = set()
+    current = impl_task
+    seen: set[str] = set()
+    while current:
+        suffix = _extract_task_id_suffix(current.id)
+        if suffix:
+            known.add(suffix)
+        if current.id is not None:
+            current_id = str(current.id)
+            if current_id in seen:
+                break
+            seen.add(current_id)
+        parent_id = current.based_on or current.depends_on
+        if parent_id is None:
+            break
+        parent = store.get(parent_id)
+        if parent is None:
+            break
+        current = parent
+    return known
+
+
+def build_auto_review_prompt(
+    impl_task: Task,
+    project_prefix: str | None = None,
+    known_task_id_suffixes: Iterable[str] | None = None,
+) -> str:
     """Build prompt text for runner auto-created reviews.
 
     Preserves the historical slug-first prompt semantics used by runner auto-review.
@@ -33,7 +80,7 @@ def build_auto_review_prompt(impl_task: Task, project_prefix: str | None = None)
         if slug:
             # Derived implement slugs are "<task_id_suffix>-impl-<semantic-slug>".
             # Normalize first, then optionally strip project_prefix from semantic tail.
-            normalized = strip_derived_implement_prefixes(slug)
+            normalized = strip_derived_implement_prefixes(slug, set(known_task_id_suffixes or ()))
             if normalized is None:
                 slug = None
             else:
@@ -80,7 +127,12 @@ def create_review_task(
         raise DuplicateReviewError(active_reviews[0])
 
     if prompt_mode == "auto":
-        review_prompt = build_auto_review_prompt(impl_task, project_prefix=project_prefix)
+        known_suffixes = _known_derived_suffixes_for_review(store, impl_task)
+        review_prompt = build_auto_review_prompt(
+            impl_task,
+            project_prefix=project_prefix,
+            known_task_id_suffixes=known_suffixes,
+        )
     else:
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
 

@@ -74,7 +74,7 @@ class TestBuildAutoReviewPrompt:
 
     def test_slug_strips_nested_derived_implement_prefixes(self):
         task = _task(slug="20260410-b2-impl-a1-impl-add-feature")
-        result = build_auto_review_prompt(task)
+        result = build_auto_review_prompt(task, known_task_id_suffixes={"b2", "a1"})
         assert result == "review add-feature"
 
     def test_slug_preserves_semantic_impl_subject_add(self):
@@ -96,6 +96,16 @@ class TestBuildAutoReviewPrompt:
         task = _task(slug="20260410-0000ab-impl-db-impl-migration")
         result = build_auto_review_prompt(task)
         assert result == "review db-impl-migration"
+
+    def test_slug_preserves_semantic_impl_subject_api2(self):
+        task = _task(slug="20260410-0000ab-impl-api2-impl-refresh")
+        result = build_auto_review_prompt(task)
+        assert result == "review api2-impl-refresh"
+
+    def test_slug_preserves_semantic_impl_subject_v2(self):
+        task = _task(slug="20260410-0000ab-impl-v2-impl-rollout")
+        result = build_auto_review_prompt(task)
+        assert result == "review v2-impl-rollout"
 
     def test_project_prefix_stripped_after_derived_normalization(self):
         task = _task(slug="20260410-0000ab-impl-myproj-add-feature")
@@ -187,6 +197,19 @@ class TestCreateReviewTask:
         assert call_kwargs["depends_on"] == 10
         assert call_kwargs["group"] == "mygroup"
         assert call_kwargs["based_on"] == 5
+
+    def test_auto_prompt_mode_strips_nested_known_suffixes_from_lineage(self):
+        store = self._mock_store()
+        parent = _task(id="gza-a1", slug="20260314-a1-impl-add-feature", based_on=None, depends_on=None)
+        impl = _task(
+            id="gza-b2",
+            slug="20260315-b2-impl-a1-impl-add-feature",
+            based_on="gza-a1",
+            depends_on=None,
+        )
+        store.get.side_effect = lambda task_id: parent if task_id == "gza-a1" else None
+        create_review_task(store, impl, prompt_mode="auto")
+        assert store.add.call_args[1]["prompt"] == "review add-feature"
 
     @patch("gza.review_tasks.PromptBuilder")
     def test_cli_prompt_mode(self, MockPromptBuilder):

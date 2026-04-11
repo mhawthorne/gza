@@ -26,7 +26,7 @@ def test_slug_helpers_return_none_for_missing_task_id() -> None:
 def test_strip_derived_implement_prefixes_strips_nested_chain() -> None:
     """Nested derived implement prefixes are removed until semantic slug remains."""
     slug = "b2-impl-a1-impl-add-feature"
-    assert strip_derived_implement_prefixes(slug) == "add-feature"
+    assert strip_derived_implement_prefixes(slug, {"b2", "a1"}) == "add-feature"
 
 
 def test_strip_derived_implement_prefixes_preserves_non_derived_slug() -> None:
@@ -56,3 +56,15 @@ def test_strip_derived_implement_prefixes_preserves_semantic_impl_token_db() -> 
     """Two-letter semantic subjects like ``db-impl-*`` are preserved."""
     slug = "0000ab-impl-db-impl-migration"
     assert strip_derived_implement_prefixes(slug) == "db-impl-migration"
+
+
+def test_strip_derived_implement_prefixes_preserves_semantic_digit_subject_api2() -> None:
+    """Digit-bearing semantic subjects like ``api2-impl-*`` are preserved."""
+    slug = "0000ab-impl-api2-impl-refresh"
+    assert strip_derived_implement_prefixes(slug) == "api2-impl-refresh"
+
+
+def test_strip_derived_implement_prefixes_preserves_semantic_digit_subject_v2() -> None:
+    """Digit-bearing semantic subjects like ``v2-impl-*`` are preserved."""
+    slug = "0000ab-impl-v2-impl-rollout"
+    assert strip_derived_implement_prefixes(slug) == "v2-impl-rollout"

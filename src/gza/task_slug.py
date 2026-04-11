@@ -12,18 +12,15 @@ _DERIVED_IMPLEMENT_PREFIX_RE = re.compile(r"^([a-z0-9]+)-impl-(.+)$")
 def _looks_like_task_id_suffix(token: str) -> bool:
     """Return True for task-id-like suffix tokens used in derived implement slugs.
 
-    Derived prefixes are generated from task id suffixes. We treat only
-    digit-bearing tokens as task-id-like to avoid stripping semantic two-letter
-    subjects such as ``ui-impl-refresh`` or ``db-impl-migration``.
-    This intentionally favors preserving semantic tails over aggressively
-    stripping ambiguous alpha-only segments.
-
-    Restricting removal to these shapes avoids stripping semantic slug segments such as
-    ``add-impl-support``.
+    Default detection is intentionally conservative: task-id suffixes generated
+    by this project currently start with digits due zero-padding, while semantic
+    subjects often start with letters (for example ``api2`` or ``v2``).
+    Callers can provide known suffixes for exact matching when stronger context
+    is available.
     """
     if not token:
         return False
-    return any(ch.isdigit() for ch in token)
+    return token.isalnum() and token[0].isdigit()
 
 
 def get_task_slug(slug: str | None) -> str | None:
@@ -54,16 +51,20 @@ def get_base_task_slug(slug: str | None) -> str | None:
     return _TRAILING_REVISION_SUFFIX_RE.sub("", extracted)
 
 
-def strip_derived_implement_prefixes(slug: str | None) -> str | None:
+def strip_derived_implement_prefixes(
+    slug: str | None,
+    known_task_id_suffixes: set[str] | None = None,
+) -> str | None:
     """Remove one or more leading ``<task_id_suffix>-impl-`` segments from a slug."""
     if slug is None:
         return None
+    known_suffixes = known_task_id_suffixes or set()
     normalized = slug
     while True:
         match = _DERIVED_IMPLEMENT_PREFIX_RE.match(normalized)
         if not match:
             return normalized
         prefix, remainder = match.groups()
-        if not _looks_like_task_id_suffix(prefix):
+        if prefix not in known_suffixes and not _looks_like_task_id_suffix(prefix):
             return normalized
         normalized = remainder
