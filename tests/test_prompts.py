@@ -239,6 +239,27 @@ class TestPromptBuilderBuild:
             in content
         )
 
+    def test_code_review_interactive_skill_requires_authoritative_diff_handoff(self):
+        """Test interactive review skill explicitly hands authoritative diff context to subagent."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-code-review-interactive"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert (
+            "Pass the authoritative diff context (`## Implementation diff context`) and the PR number (if `--pr` was used and a PR was found) to the subagent."
+            in content
+        )
+        assert (
+            "Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent."
+            not in content
+        )
+
     def test_review_contract_parity_between_template_and_interactive_scaffold(self):
         """Test canonical review contract clauses are present across review entrypoints."""
         root = Path(__file__).resolve().parents[1]

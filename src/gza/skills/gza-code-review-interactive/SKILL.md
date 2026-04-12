@@ -114,7 +114,7 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent.
+Pass the authoritative diff context (`## Implementation diff context`) and the PR number (if `--pr` was used and a PR was found) to the subagent.
 
 ### Step 5: Report back
 
