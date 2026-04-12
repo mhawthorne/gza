@@ -917,6 +917,18 @@ class TestQueueCommand:
         assert "Internal pending" not in result.stdout
         assert "Blocked pending" not in result.stdout
 
+    def test_queue_shows_no_runnable_tasks_when_only_non_pickable_pending_exist(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Internal blocker", task_type="internal")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No runnable tasks" in result.stdout
+
 
 class TestShowCommand:
     """Tests for 'gza show' command."""

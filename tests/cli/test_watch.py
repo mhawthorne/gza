@@ -254,6 +254,45 @@ def test_watch_cycle_skips_merge_off_default_branch(tmp_path: Path, capsys) -> N
     assert " MERGE " not in log_path.read_text()
 
 
+def test_watch_cycle_uses_default_branch_for_advance_planning_off_default_branch(tmp_path: Path) -> None:
+    """Advance planning in watch should target default branch even when run elsewhere."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-plan-target"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    git = MagicMock()
+    git.current_branch.return_value = "feature/local"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "skip"}) as determine_action,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert determine_action.call_count == 1
+    assert determine_action.call_args.args[4] == "main"
+
+
 def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Path) -> None:
     """Watch merge execution should honor merge_squash_threshold auto-squash."""
     (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 2\n")
@@ -673,6 +712,52 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
     assert any(f"START  {rebase_task.id} rebase" in line for line in lines)
     assert not any(" REBASE " in line for line in lines)
+
+
+def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_path: Path) -> None:
+    """Off-default watch should still create rebases against the default branch."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/rebase-off-default"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "feature/local"
+    git.default_branch.return_value = "main"
+
+    rebase_task = MagicMock()
+    rebase_task.id = "test-rebase-off-default"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "needs_rebase"}),
+        patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert create_rebase.call_count == 1
+    assert create_rebase.call_args.args[3] == "main"
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == rebase_task.id
 
 
 @pytest.mark.parametrize(

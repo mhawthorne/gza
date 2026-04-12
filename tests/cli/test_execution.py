@@ -4573,16 +4573,43 @@ class TestAddCommandWithChaining:
         assert "Error: Spec file not found: nonexistent.md" in result.stdout
 
     def test_add_with_next_marks_task_urgent(self, tmp_path: Path):
-        """`gza add --next` creates a pending task in the urgent lane."""
+        """`gza add --next` should bump the new task to the front of urgent pickup."""
         setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Older urgent", urgent=True)
+        store.add("Newer urgent", urgent=True)
 
         result = run_gza("add", "--next", "Urgent follow-up", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        store = make_store(tmp_path)
         task = next((t for t in store.get_pending() if t.prompt == "Urgent follow-up"), None)
         assert task is not None
         assert task.urgent is True
+        pickup = store.get_pending_pickup()
+        assert pickup[0].prompt == "Urgent follow-up"
+
+    def test_add_with_next_and_prompt_file_bumps_to_front_of_urgent_pickup(self, tmp_path: Path):
+        """`gza add --next --prompt-file` should get the same bump semantics as queue bump."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Older urgent", urgent=True)
+
+        prompt_file = tmp_path / "urgent_prompt.txt"
+        prompt_file.write_text("Urgent from file")
+
+        result = run_gza(
+            "add",
+            "--next",
+            "--prompt-file",
+            str(prompt_file),
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        pickup = store.get_pending_pickup()
+        assert pickup[0].prompt == "Urgent from file"
+        assert pickup[0].urgent is True
 
 
 class TestAddCommandWithModelAndProvider:

@@ -242,7 +242,8 @@ def _run_cycle(
     merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store)
     if merge_candidates:
         git = Git(config.project_dir)
-        target_branch = git.current_branch()
+        current_branch = git.current_branch()
+        target_branch = git.default_branch()
         action_plan: list[tuple[DbTask, dict]] = []
         for task in merge_candidates:
             action_plan.append(
@@ -264,7 +265,7 @@ def _run_cycle(
         if has_merge_action:
             can_merge = _run_with_optional_stdout_suppressed(
                 quiet,
-                lambda: _require_default_branch(git, target_branch, "merge"),
+                lambda: _require_default_branch(git, current_branch, "merge"),
             )
 
         for task, action in action_plan:
@@ -287,7 +288,7 @@ def _run_cycle(
                 merge_args = _build_auto_merge_args(config, git, task, target_branch)
                 rc = _run_with_optional_stdout_suppressed(
                     quiet,
-                    lambda: _merge_single_task(str(task.id), config, store, git, merge_args, target_branch),
+                    lambda: _merge_single_task(str(task.id), config, store, git, merge_args, current_branch),
                 )
                 if rc == 0:
                     log.emit("MERGE", f"{task.id} -> {target_branch}")
@@ -665,7 +666,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     pending = store.get_pending_pickup()
     if not pending:
-        print("No pending tasks")
+        print("No runnable tasks")
         return 0
 
     for index, task in enumerate(pending, start=1):

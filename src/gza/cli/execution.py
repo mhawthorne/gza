@@ -380,8 +380,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             skip_learnings=skip_learnings,
         )
         if mark_next:
-            task.urgent = True
-            store.update(task)
+            assert task.id is not None
+            store.set_urgent(task.id, True)
         print(f"✓ Added task {task.id}")
         return 0
 
@@ -404,8 +404,8 @@ def cmd_add(args: argparse.Namespace) -> int:
         if not new_task:
             return 1
         if mark_next:
-            new_task.urgent = True
-            store.update(new_task)
+            assert new_task.id is not None
+            store.set_urgent(new_task.id, True)
         print(f"✓ Added task {new_task.id}")
         return 0
     else:
@@ -425,8 +425,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             skip_learnings=skip_learnings,
         )
         if mark_next:
-            task.urgent = True
-            store.update(task)
+            assert task.id is not None
+            store.set_urgent(task.id, True)
         print(f"✓ Added task {task.id}")
         return 0
 
