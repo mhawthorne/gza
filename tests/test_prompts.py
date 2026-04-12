@@ -290,6 +290,24 @@ class TestPromptBuilderBuild:
         _assert_summary_checklist_contract(task_review_skill_content)
         assert "## Task Prompt Alignment" not in task_review_skill_content
 
+    def test_task_review_skill_does_not_provide_second_ask_source(self):
+        """Task-review scaffold should hand off only canonical ask context to subagents."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-task-review"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert (
+            "Review the diff against the provided ask context (`## Original plan:` or `## Original request:`)."
+            in content
+        )
+        assert "- Task prompt: `<impl_prompt>`" not in content
+
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
         db_path = tmp_path / "test.db"

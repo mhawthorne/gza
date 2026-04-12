@@ -109,7 +109,6 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 **Task context:**
 - Task ID: `<IMPL_TASK_ID>`
 - Task type: `<impl_task_type>`
-- Task prompt: `<impl_prompt>`
 - Branch: `<impl_branch>`
 - Group: `<impl_group>`
 
@@ -176,7 +175,7 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the branch name, authoritative diff context, and PR number (if `--pr` was used) to the subagent.
+Pass the branch name, authoritative diff context, and the canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available) to the subagent, plus PR number if `--pr` was used.
 
 ### Step 6: Save the review to the task database (optional)
 

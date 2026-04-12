@@ -7,9 +7,10 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 1. **Host runner** queries the main database via `store.get()`
 2. **Host runner** calls `build_prompt()` which includes:
    - Spec file content (if the implementation task has a `spec` field)
-   - Ask context from exactly one source:
-     - `## Original plan:` when a linked plan exists
-     - `## Original request:` fallback when no linked plan exists
+  - Ask context from exactly one source when available:
+    - `## Original plan:` when a linked plan exists
+    - `## Original request:` fallback when no linked plan exists
+    - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
    - Improve-lineage context when applicable
    - Explicit blocker markers when linked review/plan output exists but cannot be loaded on the current machine
