@@ -1,8 +1,10 @@
 """Tests for `gza watch` scheduler behavior."""
 
 import argparse
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -319,7 +321,14 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._create_review_task", return_value=review) as create_review,
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            return_value=SimpleNamespace(
+                status="created",
+                review_task=review,
+                message=f"✓ Created review task {review.id}",
+            ),
+        ) as create_review,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -586,7 +595,7 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value=action),
-        patch("gza.cli.watch._create_review_task") as create_review,
+        patch("gza.cli.watch._prepare_create_review_action") as create_review,
         patch("gza.cli.watch._create_rebase_task") as create_rebase,
     ):
         result = _run_cycle(
@@ -636,7 +645,14 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "create_review"}),
-        patch("gza.cli.watch._create_review_task", return_value=review) as create_review,
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            return_value=SimpleNamespace(
+                status="created",
+                review_task=review,
+                message=f"✓ Created review task {review.id}",
+            ),
+        ) as create_review,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -798,3 +814,147 @@ def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
 
     assert rc == 0
     assert run_cycle.call_count == 2
+
+
+def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`watch --quiet` should suppress helper stdout while still writing watch.log events."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    plan = store.add("Plan follow-up", task_type="plan")
+    assert impl.id is not None
+    assert plan.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+    )
+
+    def fake_spawn_iterate(_args, _config, impl_task, *, quiet=False):
+        if not quiet:
+            print("Started iterate worker noisy output")
+        impl_task.status = "in_progress"
+        store.update(impl_task)
+        return 0
+
+    def fake_spawn_worker(_args, _config, task_id=None, quiet=False):
+        if not quiet:
+            print("Started worker noisy output")
+        assert task_id is not None
+        task = store.get(task_id)
+        assert task is not None
+        task.status = "in_progress"
+        store.update(task)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=fake_spawn_iterate),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_worker),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "Started worker noisy output" not in stdout
+    assert "Started iterate worker noisy output" not in stdout
+    assert "Use 'gza ps' to view running workers" not in stdout
+
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f"START  {impl.id} implement" in log_text
+    assert f"START  {plan.id} plan" in log_text
+
+
+def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:
+    """Signal-triggered shutdown should interrupt poll waiting without sleeping the full interval."""
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=300,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+    )
+
+    handlers: dict[int, object] = {}
+
+    def fake_signal(sig, handler):
+        previous = handlers.get(sig, signal.SIG_DFL)
+        handlers[sig] = handler
+        return previous
+
+    sleep_calls: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 1:
+            handler = handlers[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+        patch("gza.cli.watch.time.sleep", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    assert sleep_calls
+    assert max(sleep_calls) < args.poll
+
+
+def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
+    """watch should log create_review validation failures instead of silently continuing."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-validation"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "create_review"}),
+        patch("gza.cli.git_ops._create_review_task", side_effect=ValueError("review blocked by validation")),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    text = log_path.read_text()
+    assert "SKIP" in text
+    assert "review blocked by validation" in text

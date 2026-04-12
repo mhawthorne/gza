@@ -460,9 +460,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         )
         registry.register(worker_metadata)
 
-        if quiet:
-            print(f"Started worker {worker_id} (PID {pid}) for task {selected_task.id}")
-        else:
+        if not quiet:
             print(f"Started worker {worker_id} (PID {pid})")
             print(f"  Task: {selected_task.id}")
             if selected_task.prompt:
@@ -669,9 +667,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         )
         registry.register(worker)
 
-        if quiet:
-            print(f"Started worker {worker_id} (PID {proc.pid}) for task {task.id} (resuming)")
-        else:
+        if not quiet:
             print(f"Started worker {worker_id} (PID {proc.pid})")
             print(f"  Task: {task.id} (resuming)")
             if task.prompt:

@@ -988,6 +988,8 @@ def _spawn_background_iterate(
     args: argparse.Namespace,
     config: Config,
     impl_task: DbTask,
+    *,
+    quiet: bool = False,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     from ._common import _spawn_detached_worker_process
@@ -1022,11 +1024,12 @@ def _spawn_background_iterate(
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
-        print(f"Started iterate worker {worker_id} (PID {proc.pid})")
-        print(f"  Task: {impl_task.id}")
-        print()
-        print("Use 'gza ps' to view running workers")
-        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+        if not quiet:
+            print(f"Started iterate worker {worker_id} (PID {proc.pid})")
+            print(f"  Task: {impl_task.id}")
+            print()
+            print("Use 'gza ps' to view running workers")
+            print(f"Use 'gza log -w {worker_id} -f' to follow output")
         return 0
     except Exception as e:
         print(f"Error spawning background iterate worker: {e}")

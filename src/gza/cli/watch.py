@@ -4,6 +4,7 @@ import argparse
 import os
 import signal
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,10 +16,8 @@ from ..failure_policy import is_resumable_failure_reason
 from ..git import Git
 from ..workers import WorkerRegistry
 from ._common import (
-    DuplicateReviewError,
     _create_rebase_task,
     _create_resume_task,
-    _create_review_task,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     get_review_verdict,
@@ -31,6 +30,7 @@ from .git_ops import (
     _collect_advance_completed_tasks,
     _determine_advance_action,
     _merge_single_task,
+    _prepare_create_review_action,
     _require_default_branch,
     _unimplemented_implement_prompt,
 )
@@ -66,6 +66,17 @@ def _format_elapsed(started_at: str | None, completed_at: str | None) -> str | N
     if mins > 0:
         return f"{mins}m{secs:02d}s"
     return f"{secs}s"
+
+
+def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, quantum: float = 1.0) -> None:
+    """Sleep for up to `seconds`, exiting early if stop was requested."""
+    remaining = float(seconds)
+    while remaining > 0:
+        if stop_requested():
+            return
+        step = min(quantum, remaining)
+        time.sleep(step)
+        remaining -= step
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -206,6 +217,7 @@ def _run_cycle(
     max_iterations: int,
     dry_run: bool,
     log: _WatchLog,
+    quiet: bool = False,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
@@ -292,15 +304,19 @@ def _run_cycle(
                     slots -= 1
                     work_done = True
                     continue
-                try:
-                    review_task = _create_review_task(store, task)
-                except DuplicateReviewError as exc:
-                    review_task = exc.active_review
-                except ValueError:
+                create_result = _prepare_create_review_action(store, task)
+                if create_result.status == "skip":
+                    log.emit(
+                        "SKIP",
+                        create_result.message,
+                        dedupe_key=f"create-review-skip:{task.id}:{create_result.message}",
+                    )
                     continue
+                review_task = create_result.review_task
+                assert review_task is not None
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
+                rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=quiet)
                 if rc == 0:
                     log.emit("START", f"{review_task.id} review")
                     started_task_ids.add(str(review_task.id))
@@ -321,7 +337,7 @@ def _run_cycle(
                     continue
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=review_task_obj.id, quiet=True)
+                rc = _spawn_background_worker(worker_args, config, task_id=review_task_obj.id, quiet=quiet)
                 if rc == 0:
                     log.emit("START", f"{review_task_obj.id} review")
                     started_task_ids.add(str(review_task_obj.id))
@@ -352,7 +368,7 @@ def _run_cycle(
                 )
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
+                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=quiet)
                 if rc == 0:
                     log.emit("START", f"{improve_task.id} improve")
                     started_task_ids.add(str(improve_task.id))
@@ -373,7 +389,7 @@ def _run_cycle(
                     continue
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=improve_task_obj.id, quiet=True)
+                rc = _spawn_background_worker(worker_args, config, task_id=improve_task_obj.id, quiet=quiet)
                 if rc == 0:
                     log.emit("START", f"{improve_task_obj.id} improve")
                     started_task_ids.add(str(improve_task_obj.id))
@@ -403,7 +419,7 @@ def _run_cycle(
                     resume=False,
                     retry=False,
                 )
-                rc = _spawn_background_iterate(iterate_args, config, impl_task)
+                rc = _spawn_background_iterate(iterate_args, config, impl_task, quiet=quiet)
                 if rc == 0:
                     log.emit("START", f"{impl_task.id} implement")
                     started_task_ids.add(str(impl_task.id))
@@ -422,7 +438,7 @@ def _run_cycle(
                 rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
+                rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=quiet)
                 if rc == 0:
                     log.emit("START", f"{rebase_task.id} rebase")
                     started_task_ids.add(str(rebase_task.id))
@@ -460,7 +476,7 @@ def _run_cycle(
             resume_task = _create_resume_task(store, failed)
             assert resume_task.id is not None
             worker_args = argparse.Namespace(no_docker=False, max_turns=None)
-            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id, quiet=True)
+            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id, quiet=quiet)
             if rc != 0:
                 continue
             slots -= 1
@@ -494,7 +510,7 @@ def _run_cycle(
                     resume=False,
                     retry=False,
                 )
-                rc = _spawn_background_iterate(iterate_args, config, task)
+                rc = _spawn_background_iterate(iterate_args, config, task, quiet=quiet)
                 if rc != 0:
                     continue
                 slots -= 1
@@ -510,7 +526,7 @@ def _run_cycle(
                 work_done = True
                 continue
             worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-            rc = _spawn_background_worker(worker_args, config, task_id=task.id, quiet=True)
+            rc = _spawn_background_worker(worker_args, config, task_id=task.id, quiet=quiet)
             if rc != 0:
                 continue
             slots -= 1
@@ -579,6 +595,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 batch=batch,
                 max_iterations=max_iterations,
                 dry_run=dry_run,
+                quiet=quiet,
                 log=log,
             )
 
@@ -606,7 +623,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             if stop_requested:
                 break
-            time.sleep(poll)
+            _sleep_interruptibly(poll, lambda: stop_requested)
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)

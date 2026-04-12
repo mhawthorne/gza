@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -1459,6 +1460,38 @@ def _cmd_advance_unimplemented(
 _ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
 
 
+@dataclass
+class _CreateReviewActionResult:
+    status: str
+    review_task: DbTask | None
+    message: str
+
+
+def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _CreateReviewActionResult:
+    """Create or resolve the review task for an advance-style create_review action."""
+    try:
+        review_task = _create_review_task(store, task)
+    except DuplicateReviewError as exc:
+        review_task = exc.active_review
+        return _CreateReviewActionResult(
+            status="skip",
+            review_task=review_task,
+            message=f"SKIP: review {review_task.id} is already {review_task.status}",
+        )
+    except ValueError as exc:
+        return _CreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message=f"SKIP: {exc}",
+        )
+
+    return _CreateReviewActionResult(
+        status="created",
+        review_task=review_task,
+        message=f"✓ Created review task {review_task.id}",
+    )
+
+
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
     ac = _colors.ADVANCE_COLORS
@@ -1809,18 +1842,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     error_count += 1
 
         elif action_type == 'create_review':
-            try:
-                review_task = _create_review_task(store, task)
-            except DuplicateReviewError as e:
-                review_task = e.active_review
-                console.print(f"      [{_c_warn}]SKIP: review {review_task.id} is already {review_task.status}[/{_c_warn}]")
+            create_result = _prepare_create_review_action(store, task)
+            if create_result.status == "skip":
+                console.print(f"      [{_c_warn}]{create_result.message}[/{_c_warn}]")
                 skip_count += 1
                 continue
-            except ValueError as e:
-                console.print(f"      [{_c_warn}]SKIP: {e}[/{_c_warn}]")
-                skip_count += 1
-                continue
-            console.print(f"      [{_c_ok}]✓ Created review task {review_task.id}[/{_c_ok}]")
+            review_task = create_result.review_task
+            assert review_task is not None
+            console.print(f"      [{_c_ok}]{create_result.message}[/{_c_ok}]")
 
             # Spawn background worker to run the review
             assert review_task.id is not None
