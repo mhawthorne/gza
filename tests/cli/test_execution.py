@@ -112,7 +112,7 @@ class TestAddCommand:
 
         # Verify task was added with correct attributes
         store = make_store(tmp_path)
-        task = get_latest_task(store)
+        task = get_latest_task(store, task_type="implement", prompt="Implement feature X")
         assert task is not None
         assert task.prompt == "Implement feature X"
         assert task.task_type == "implement"
@@ -430,7 +430,7 @@ class TestRetryCommand:
         assert result.returncode == 0
 
         # Verify the new task has the same metadata
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.prompt == "Test task with metadata"
         assert new_task.task_type == "explore"
@@ -463,7 +463,7 @@ class TestRetryCommand:
         result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
         assert result.returncode == 0
 
-        retry_task = get_latest_task(store)
+        retry_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert retry_task is not None
         assert retry_task.id != task.id
         assert retry_task.provider is None
@@ -494,7 +494,7 @@ class TestRetryCommand:
         assert "Started worker" in result.stdout
 
         # Verify new task was created
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.prompt == "Failed task to retry"
@@ -522,7 +522,7 @@ class TestRetryCommand:
         assert "Running task " in result.stdout
 
         # Verify new task exists
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.prompt == "Failed task to retry"
@@ -549,7 +549,7 @@ class TestRetryCommand:
         assert "Running task" not in result.stdout
 
         # Verify new task is still pending
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.status == "pending"
@@ -638,7 +638,7 @@ class TestResumeCommand:
         original = store.get(task.id)
         assert original is not None
         assert original.status == "failed"
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.based_on == task.id
@@ -700,7 +700,7 @@ class TestResumeCommand:
         original = store.get(task.id)
         assert original is not None
         assert original.status == "failed"
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.based_on == task.id
@@ -728,7 +728,7 @@ class TestResumeCommand:
         assert "Running" not in result.stdout
 
         # Verify new task is pending
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.status == "pending"
@@ -768,7 +768,7 @@ class TestResumeCommand:
         assert original.log_file == ".gza/logs/20260101-implement-feature-x.log"
 
         # Verify new task has the right properties
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.prompt == "Implement feature X"
@@ -805,7 +805,7 @@ class TestResumeCommand:
         original = store.get(task.id)
         assert original is not None
         assert original.status == "in_progress"
-        new_task = get_latest_task(store)
+        new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
         assert new_task.based_on == task.id
@@ -1505,7 +1505,7 @@ class TestImplementCommand:
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
 
-        impl_task = get_latest_task(store)
+        impl_task = get_latest_task(store, based_on=plan_task.id, task_type="implement")
         assert impl_task is not None
         assert impl_task.id != plan_task.id
         assert impl_task.task_type == "implement"
@@ -1568,7 +1568,7 @@ class TestImplementCommand:
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
 
-        impl_task = get_latest_task(store)
+        impl_task = get_latest_task(store, based_on=plan_task.id, task_type="implement")
         assert impl_task is not None
         assert impl_task.id != plan_task.id
         assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
@@ -1591,7 +1591,7 @@ class TestImplementCommand:
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
 
-        impl_task = get_latest_task(store)
+        impl_task = get_latest_task(store, based_on=plan_task.id, task_type="implement")
         assert impl_task is not None
         assert impl_task.id != plan_task.id
         assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"

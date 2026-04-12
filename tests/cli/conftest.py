@@ -23,14 +23,29 @@ def make_store(tmp_path: Path) -> SqliteTaskStore:
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
 
 
-def get_latest_task(store: SqliteTaskStore) -> Task | None:
-    """Get the most recently created task from the store.
+def get_latest_task(
+    store: SqliteTaskStore,
+    *,
+    task_type: str | None = None,
+    based_on: str | None = None,
+    depends_on: str | None = None,
+    prompt: str | None = None,
+) -> Task | None:
+    """Get the most recently created task from the store, optionally filtered.
 
     Useful after a CLI command creates a new task (retry, review, improve)
     when you need to inspect the result.
     """
-    all_tasks = store.get_all()
-    return max(all_tasks, key=lambda t: task_id_numeric_key(t.id)) if all_tasks else None
+    tasks = store.get_all()
+    if task_type is not None:
+        tasks = [task for task in tasks if task.task_type == task_type]
+    if based_on is not None:
+        tasks = [task for task in tasks if task.based_on == based_on]
+    if depends_on is not None:
+        tasks = [task for task in tasks if task.depends_on == depends_on]
+    if prompt is not None:
+        tasks = [task for task in tasks if task.prompt == prompt]
+    return max(tasks, key=lambda t: task_id_numeric_key(t.id)) if tasks else None
 
 
 def run_gza(*args: str, cwd: Path | None = None, stdin_input: str | None = None) -> subprocess.CompletedProcess:

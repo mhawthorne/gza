@@ -89,19 +89,6 @@ def task_id_numeric_key(task_id: str | None) -> int:
         return 0
 
 
-def _parse_prefixed_decimal_task_id(task_id: str) -> tuple[str, int] | None:
-    """Parse ``{prefix}-{decimal_seq}`` IDs into ``(prefix, seq)``.
-
-    Returns ``None`` for invalid formats or non-decimal suffixes.
-    """
-    if "-" not in task_id:
-        return None
-    prefix, suffix = task_id.rsplit("-", 1)
-    if not prefix or not suffix.isdigit():
-        return None
-    return prefix, int(suffix)
-
-
 class ManualMigrationRequired(Exception):
     """Raised when the DB needs a manual schema migration (e.g. v25/v26).
 
@@ -910,10 +897,12 @@ class SqliteTaskStore:
         decimal suffix in task IDs. Gaps are allowed (e.g. deletions), so this
         returns the smallest existing sequence strictly greater than ``task_id``.
         """
-        parsed = _parse_prefixed_decimal_task_id(task_id)
-        if parsed is None:
+        try:
+            canonical_id = resolve_task_id(task_id, self._prefix)
+        except InvalidTaskIdError:
             return None
-        prefix, seq = parsed
+        prefix, suffix = canonical_id.rsplit("-", 1)
+        seq = int(suffix)
 
         with self._connect() as conn:
             cur = conn.execute(

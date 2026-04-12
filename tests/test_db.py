@@ -249,6 +249,8 @@ class TestTaskChaining:
         assert only.id is not None
 
         assert store.next_task_after("not-an-id") is None
+        assert store.next_task_after("GZA-1") is None
+        assert store.next_task_after("bad-prefix-1") is None
         assert store.next_task_after(only.id) is None
 
     def test_get_by_seq_looks_up_task_by_prefix_and_sequence(self, tmp_path: Path):
