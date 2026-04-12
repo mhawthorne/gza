@@ -69,6 +69,7 @@ from .git_ops import (
     cmd_sync,
 )
 from .log import cmd_log
+from .tv import cmd_tv
 from .query import (
     cmd_attach,
     cmd_delete,
@@ -85,7 +86,6 @@ from .query import (
     cmd_status,
     cmd_unmerged,
 )
-from .tv import cmd_tv
 from .watch import cmd_queue, cmd_watch
 
 
