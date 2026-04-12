@@ -1339,6 +1339,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # to avoid repeated DB queries in _determine_advance_action.
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
+    failed_tasks: list[DbTask] = []
     # Determine which tasks to advance
     if task_id is not None:
         task = store.get(task_id)
@@ -1362,9 +1363,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
             tasks = [task]
     else:
         tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, advance_type=advance_type)
-        # Also collect resumable failed tasks (unless disabled)
-        if not no_resume_failed:
-            tasks.extend(store.get_resumable_failed_tasks())
 
         # Apply failed-task filters after completed-task type filtering above.
         if advance_type == 'plan':
@@ -1372,7 +1370,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif advance_type == 'implement':
             tasks = [t for t in tasks if t.task_type == 'implement']
 
-    if not tasks and not new_mode:
+        # Collect resumable failed tasks separately so --max applies only
+        # to completed/unmerged candidates, preserving legacy behavior.
+        if not no_resume_failed:
+            failed_tasks = store.get_resumable_failed_tasks()
+            if advance_type == 'plan':
+                failed_tasks = []
+            elif advance_type == 'implement':
+                failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
+
+    if not tasks and not failed_tasks and not new_mode:
         print("No eligible tasks to advance")
         return 0
 
@@ -1403,6 +1410,19 @@ def cmd_advance(args: argparse.Namespace) -> int:
         ):
             continue
         plan.append((task, action))
+    for failed_task in failed_tasks:
+        action = _determine_advance_action(
+            config,
+            store,
+            git,
+            failed_task,
+            target_branch,
+            impl_based_on_ids=impl_based_on_ids,
+            max_resume_attempts=max_resume_attempts,
+        )
+        if action.get("type") == "skip" and action.get("description") == "SKIP: resume child already exists":
+            continue
+        plan.append((failed_task, action))
 
     # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
     # the rationale. The sort is stable, preserving DB order within each group.

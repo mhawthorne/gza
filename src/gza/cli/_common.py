@@ -713,6 +713,8 @@ def _spawn_background_iterate_worker(
 
     if getattr(args, "no_docker", False):
         inner_cmd.append("--no-docker")
+    if getattr(args, "force", False):
+        inner_cmd.append("--force")
     if resume:
         inner_cmd.append("--resume")
     if retry:

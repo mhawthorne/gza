@@ -2750,6 +2750,42 @@ class TestAdvanceCommand:
         # task1 is the oldest so it falls outside the --max 2 window.
         assert review_counts[0] == 0
 
+    def test_advance_max_still_resumes_failed_tasks(self, tmp_path: Path):
+        """advance --max should not suppress resumable failed-task handling."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        self._create_implement_task_with_branch(store, git, tmp_path, "Completed task in --max window")
+        failed_task = self._create_failed_task(store, session_id="sess-max-1", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--max", "1", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume (failed: MAX_STEPS" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+
+    def test_advance_dry_run_max_still_plans_failed_resume(self, tmp_path: Path):
+        """advance --dry-run --max should still include resumable failed tasks in the plan."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        self._create_implement_task_with_branch(store, git, tmp_path, "Completed task in --max window")
+        failed_task = self._create_failed_task(store, session_id="sess-max-2", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--max", "1", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance" in result.stdout
+        assert str(failed_task.id) in result.stdout
+        assert "Resume (failed: MAX_STEPS" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 0
+
     def test_advance_spawns_worker_for_pending_review(self, tmp_path: Path):
         """advance spawns a worker for a pending review instead of skipping."""
         setup_config(tmp_path)
