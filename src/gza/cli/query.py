@@ -930,22 +930,41 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
     )
 
 
-def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
+def _ps_sort_key(row: dict) -> tuple[int, bool, float, int, str]:
     """Sort ps rows by status group, then by start time, then stable identifiers.
 
-    Failed tasks surface at top for immediate attention, in_progress
-    in the middle, completed at the bottom."""
+    In-progress tasks sort first (ascending start time so longest-running is
+    top).  Failed tasks next, then completed, then everything else.
+    Non-in-progress groups sort by start time *descending* so the most
+    recently started task appears right after the running ones."""
     status = row.get("status", "")
-    # Failed=0 (top), in_progress=1 (middle), completed/other=2 (bottom)
-    if status == "failed":
+    # in_progress=0 (top), failed=1, completed=2, dropped/other=3 (bottom)
+    # pending tasks are not shown in ps output so not handled here.
+    if status == "in_progress":
         status_group = 0
-    elif status == "in_progress":
+    elif status == "failed":
         status_group = 1
-    else:
+    elif status == "completed":
         status_group = 2
+    else:
+        status_group = 3
 
     sort_timestamp = row["sort_timestamp"] or ""
     has_no_timestamp = sort_timestamp == ""
+
+    # Convert to numeric so we can negate for descending sort.
+    if sort_timestamp:
+        try:
+            ts_numeric = datetime.fromisoformat(sort_timestamp).timestamp()
+        except (ValueError, OSError):
+            ts_numeric = 0.0
+    else:
+        ts_numeric = 0.0
+
+    # In-progress: ascending (longest running first = earliest start).
+    # Everything else: descending (most recently started first).
+    if status_group != 0:
+        ts_numeric = -ts_numeric
 
     raw_task_id = row.get("task_id")
     if isinstance(raw_task_id, str):
@@ -965,7 +984,7 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
     else:
         task_id_sort = sys.maxsize  # worker-only rows (no task) sort last
     worker_id = row.get("worker_id", "")
-    return (status_group, has_no_timestamp, sort_timestamp, task_id_sort, worker_id)
+    return (status_group, has_no_timestamp, ts_numeric, task_id_sort, worker_id)
 
 
 def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | None) -> bool:

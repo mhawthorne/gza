@@ -3819,15 +3819,15 @@ class TestPsSortKey:
         assert key_with_task[3] < sys.maxsize
 
     def test_status_group_ordering(self):
-        """Failed rows sort before in_progress, in_progress before completed."""
+        """in_progress sorts before failed, failed before completed."""
         from gza.cli.query import _ps_sort_key
 
-        failed_row = self._make_row(task_id="gza-1", status="failed")
-        in_progress_row = self._make_row(task_id="gza-2", status="in_progress")
+        in_progress_row = self._make_row(task_id="gza-1", status="in_progress")
+        failed_row = self._make_row(task_id="gza-2", status="failed")
         completed_row = self._make_row(task_id="gza-3", status="completed")
 
-        assert _ps_sort_key(failed_row)[0] < _ps_sort_key(in_progress_row)[0]
-        assert _ps_sort_key(in_progress_row)[0] < _ps_sort_key(completed_row)[0]
+        assert _ps_sort_key(in_progress_row)[0] < _ps_sort_key(failed_row)[0]
+        assert _ps_sort_key(failed_row)[0] < _ps_sort_key(completed_row)[0]
 
     def test_integer_task_id_backward_compat(self):
         """Integer task_id values sort numerically (backward compat)."""
@@ -3836,3 +3836,23 @@ class TestPsSortKey:
         row_int = self._make_row(task_id=5)
         key = _ps_sort_key(row_int)
         assert key[3] == 5
+
+    def test_completed_sort_by_start_time_descending(self):
+        """Completed tasks sort most-recently-started first."""
+        from gza.cli.query import _ps_sort_key
+
+        early = self._make_row(task_id="gza-1", status="completed", sort_timestamp="2026-01-01T00:00:00")
+        late = self._make_row(task_id="gza-2", status="completed", sort_timestamp="2026-01-02T00:00:00")
+
+        sorted_rows = sorted([early, late], key=_ps_sort_key)
+        assert [r["task_id"] for r in sorted_rows] == ["gza-2", "gza-1"]
+
+    def test_in_progress_sort_by_start_time_ascending(self):
+        """In-progress tasks sort longest-running (earliest start) first."""
+        from gza.cli.query import _ps_sort_key
+
+        early = self._make_row(task_id="gza-1", status="in_progress", sort_timestamp="2026-01-01T00:00:00")
+        late = self._make_row(task_id="gza-2", status="in_progress", sort_timestamp="2026-01-02T00:00:00")
+
+        sorted_rows = sorted([early, late], key=_ps_sort_key)
+        assert [r["task_id"] for r in sorted_rows] == ["gza-1", "gza-2"]
