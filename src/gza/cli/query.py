@@ -36,7 +36,7 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
-from ..git import Git, GitError
+from ..git import Git, GitError, active_worktree_path_for_branch
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
     TaskLineageNode,
@@ -1485,17 +1485,9 @@ def _find_active_worktree_path_for_branch(config: Config, branch: str) -> tuple[
     """Return active worktree path and optional lookup error for a branch."""
     try:
         git = Git(config.project_dir)
-        worktrees = git.worktree_list()
+        return active_worktree_path_for_branch(git, branch), None
     except (GitError, OSError) as exc:
         return None, " ".join(str(exc).split())
-
-    for wt in worktrees:
-        wt_branch = wt.get("branch", "")
-        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
-            wt_path = wt.get("path")
-            if wt_path:
-                return Path(wt_path), None
-    return None, None
 
 
 def _cmd_show_output(

@@ -5,7 +5,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gza.git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
+from gza.git import (
+    Git,
+    GitError,
+    active_worktree_path_for_branch,
+    cleanup_worktree_for_branch,
+    parse_diff_numstat,
+)
 
 
 class TestGitInit:
@@ -646,6 +652,44 @@ branch refs/heads/feature
             assert len(result) == 2
             assert result[0]["path"] == "/path/to/main"
             assert result[1]["path"] == "/path/to/feature"
+
+    def test_worktree_list_preserves_prunable_field(self, tmp_path: Path):
+        """Parser keeps prunable metadata from porcelain output."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        porcelain_output = """worktree /path/to/stale
+HEAD abc123
+branch refs/heads/feature
+prunable gitdir file points to non-existent location
+"""
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=porcelain_output, stderr="")
+            result = git.worktree_list()
+
+            assert len(result) == 1
+            assert result[0]["path"] == "/path/to/stale"
+            assert result[0]["branch"] == "refs/heads/feature"
+            assert result[0]["prunable"] == "gitdir file points to non-existent location"
+
+    def test_active_worktree_path_for_branch_ignores_prunable_entry(self, tmp_path: Path):
+        """Active resolver should skip prunable registrations."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "worktree_list", return_value=[
+            {
+                "path": "/path/to/stale",
+                "branch": "refs/heads/feature/test",
+                "prunable": "gone",
+            }
+        ]):
+            result = active_worktree_path_for_branch(git, "feature/test")
+
+            assert result is None
 
 
 class TestRemoteOperations:

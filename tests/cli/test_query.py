@@ -1104,6 +1104,44 @@ class TestShowCommand:
         assert "Warning: Worktree lookup failed:" in output
         assert "simulated os error" in output
 
+    def test_show_omits_prunable_worktree_path_for_task_branch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Show command should not treat prunable worktrees as active paths."""
+        from gza.cli.query import cmd_show
+
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path,
+            task_prompt="Task with stale worktree registration",
+            branch_name="feature/prunable-worktree",
+            worktree_name=None,
+        )
+        assert task.id is not None
+        assert worktree_path is None
+
+        with patch("gza.cli.query.Git.worktree_list", return_value=[
+            {
+                "path": "/tmp/stale-worktree",
+                "branch": "refs/heads/feature/prunable-worktree",
+                "prunable": "gone",
+            }
+        ]):
+            args = argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=str(task.id),
+                prompt=False,
+                path=False,
+                output=False,
+                page=False,
+                full=False,
+            )
+            exit_code = cmd_show(args)
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "Branch: feature/prunable-worktree" in output
+        assert "Worktree:" not in output
+
     def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
         """Failed task output includes reason, limits, context, and next-step commands."""
         import json

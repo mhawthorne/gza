@@ -295,22 +295,35 @@ class Git:
         """List all worktrees.
 
         Returns:
-            List of dicts with 'path', 'head', 'branch' keys
+            List of dicts parsed from ``git worktree list --porcelain``.
+
+            Known keys include ``path``, ``head``, ``branch``, and optional
+            state flags like ``prunable``.
         """
         result = self._run("worktree", "list", "--porcelain")
         worktrees = []
-        current: dict[str, str] = {}
-        for line in result.stdout.strip().split("\n"):
+        current: dict[str, str | bool] = {}
+        for line in result.stdout.splitlines():
             if not line:
                 if current:
                     worktrees.append(current)
                     current = {}
-            elif line.startswith("worktree "):
-                current["path"] = line[9:]
-            elif line.startswith("HEAD "):
-                current["head"] = line[5:]
-            elif line.startswith("branch "):
-                current["branch"] = line[7:]
+                continue
+
+            key, sep, value = line.partition(" ")
+            if key == "worktree" and sep:
+                current["path"] = value
+            elif key == "HEAD" and sep:
+                current["head"] = value
+            elif key == "branch" and sep:
+                current["branch"] = value
+            elif key == "prunable":
+                # ``prunable`` can be a bare flag or include a reason.
+                current["prunable"] = value if sep else True
+            elif key in {"bare", "detached"}:
+                current[key] = True
+            elif key == "locked":
+                current["locked"] = value if sep else True
         if current:
             worktrees.append(current)
         return worktrees
@@ -653,14 +666,7 @@ def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) ->
     Raises:
         ValueError: If worktree has uncommitted changes and force=False
     """
-    worktrees = git.worktree_list()
-    worktree_path = None
-    for wt in worktrees:
-        wt_branch = wt.get("branch", "")
-        # Branch is stored as refs/heads/branch-name
-        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
-            worktree_path = Path(wt["path"])
-            break
+    worktree_path = active_worktree_path_for_branch(git, branch)
 
     if worktree_path:
         # Check if worktree has uncommitted changes
@@ -675,20 +681,48 @@ def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) ->
 
         # Remove the worktree
         git.worktree_remove(worktree_path, force=force)
-        remaining = git.worktree_list()
-        for wt in remaining:
-            wt_branch = wt.get("branch", "")
-            if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
-                git._run("worktree", "prune", "--expire", "now", check=False)
-                remaining = git.worktree_list()
-                break
 
-        for wt in remaining:
-            wt_branch = wt.get("branch", "")
-            if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
-                raise GitError(
-                    f"worktree for branch '{branch}' is still registered at '{wt['path']}' after removal"
-                )
+        registered_path = _registered_worktree_path_for_branch(git.worktree_list(), branch)
+        if registered_path is not None:
+            git._run("worktree", "prune", "--expire", "now", check=False)
+
+        still_active = active_worktree_path_for_branch(git, branch)
+        if still_active is not None:
+            raise GitError(
+                f"worktree for branch '{branch}' is still registered at '{still_active}' after removal"
+            )
         return worktree_path
 
+    return None
+
+
+def _branch_matches_worktree_ref(worktree_branch: str, branch: str) -> bool:
+    """Return whether a worktree branch value matches a local branch name."""
+    if not worktree_branch:
+        return False
+    return worktree_branch == branch or worktree_branch == f"refs/heads/{branch}"
+
+
+def _registered_worktree_path_for_branch(worktrees: list[dict], branch: str) -> Path | None:
+    """Return first registered worktree path for branch, including prunable entries."""
+    for wt in worktrees:
+        wt_branch = wt.get("branch", "")
+        if isinstance(wt_branch, str) and _branch_matches_worktree_ref(wt_branch, branch):
+            wt_path = wt.get("path")
+            if isinstance(wt_path, str) and wt_path:
+                return Path(wt_path)
+    return None
+
+
+def active_worktree_path_for_branch(git: "Git", branch: str) -> Path | None:
+    """Return active (non-prunable) worktree path for a branch, if any."""
+    for wt in git.worktree_list():
+        wt_branch = wt.get("branch", "")
+        if not isinstance(wt_branch, str) or not _branch_matches_worktree_ref(wt_branch, branch):
+            continue
+        if wt.get("prunable"):
+            continue
+        wt_path = wt.get("path")
+        if isinstance(wt_path, str) and wt_path:
+            return Path(wt_path)
     return None
