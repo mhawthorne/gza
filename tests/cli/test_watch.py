@@ -1753,3 +1753,121 @@ def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
     text = log_path.read_text()
     assert "SKIP" in text
     assert "review blocked by validation" in text
+
+
+def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Path) -> None:
+    """A run_review spawn failure must not let the same task be relaunched from step 3."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/run-review-fail"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Pending review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    action: dict[str, object] = {"type": "run_review", "review_task": review}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        # First call fails (run_review in step 1), second would be step 3
+        patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    # Spawn should only be attempted once (step 1), not retried in step 3
+    assert spawn_worker.call_count == 1
+    assert result.work_done is False
+
+    log_lines = log_path.read_text().splitlines()
+    review_id = str(review.id)
+    assert any("START_FAILED" in line and review_id in line for line in log_lines)
+    assert not any(f"START  {review_id}" in line for line in log_lines)
+
+
+def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Path) -> None:
+    """A run_improve spawn failure must not let the same task be relaunched from step 3."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/run-improve-fail"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.can_merge.return_value = True
+
+    action: dict[str, object] = {"type": "run_improve", "improve_task": improve}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch("gza.cli.git_ops.get_review_verdict", return_value="CHANGES_REQUESTED"),
+        # First call fails (run_improve in step 1), second would be step 3
+        patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    # Spawn should only be attempted once (step 1), not retried in step 3
+    assert spawn_worker.call_count == 1
+    assert result.work_done is False
+
+    log_lines = log_path.read_text().splitlines()
+    improve_id = str(improve.id)
+    assert any("START_FAILED" in line and improve_id in line for line in log_lines)
+    assert not any(f"START  {improve_id}" in line for line in log_lines)

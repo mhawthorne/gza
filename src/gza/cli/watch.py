@@ -404,6 +404,9 @@ def _run_cycle(
                     started_task_ids.add(review_task_id)
                     slots -= 1
                     work_done = True
+                else:
+                    log.emit("START_FAILED", f"{review_task_id} review")
+                    step1_handled_child_task_ids.add(review_task_id)
                 continue
 
             if action_type == "improve":
@@ -473,6 +476,9 @@ def _run_cycle(
                     started_task_ids.add(str(improve_task_obj.id))
                     slots -= 1
                     work_done = True
+                else:
+                    log.emit("START_FAILED", f"{improve_task_obj.id} improve")
+                    step1_handled_child_task_ids.add(str(improve_task_obj.id))
                 continue
 
             if action_type == "create_implement":
