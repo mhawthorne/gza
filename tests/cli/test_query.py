@@ -2865,7 +2865,7 @@ class TestUnmergedReviewStatus:
         assert "| completed |" in result.stdout
         assert "changes_requested" in result.stdout
         # The "← latest" annotation may wrap across lines at narrow terminal widths
-        assert "latest" in result.stdout
+        assert "latest" in " ".join(result.stdout.split())
 
     def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
         """The most recent review node is annotated with the latest marker."""

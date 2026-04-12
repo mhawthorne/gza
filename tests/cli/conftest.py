@@ -4,7 +4,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gza.db import SqliteTaskStore
+from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 
 LOG_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "logs"
 
@@ -23,14 +23,14 @@ def make_store(tmp_path: Path) -> SqliteTaskStore:
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
 
 
-def get_latest_task(store: SqliteTaskStore) -> "SqliteTaskStore":
+def get_latest_task(store: SqliteTaskStore) -> Task | None:
     """Get the most recently created task from the store.
 
     Useful after a CLI command creates a new task (retry, review, improve)
     when you need to inspect the result.
     """
     all_tasks = store.get_all()
-    return max(all_tasks, key=lambda t: t.created_at) if all_tasks else None
+    return max(all_tasks, key=lambda t: task_id_numeric_key(t.id)) if all_tasks else None
 
 
 def run_gza(*args: str, cwd: Path | None = None, stdin_input: str | None = None) -> subprocess.CompletedProcess:

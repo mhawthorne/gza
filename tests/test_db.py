@@ -220,6 +220,54 @@ class TestTaskChaining:
         assert tasks[0].id == task1.id
         assert tasks[1].id == task2.id
 
+    def test_next_task_after_follows_sequence_and_skips_gaps(self, tmp_path: Path):
+        """next_task_after finds the next existing sequence ID, not +1 arithmetic."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.add("First task")
+        second = store.add("Second task")
+        third = store.add("Third task")
+        assert first.id is not None
+        assert second.id is not None
+        assert third.id is not None
+
+        # Create a sequence gap; ordinal navigation should skip to the next existing row.
+        assert store.delete(second.id) is True
+
+        next_after_first = store.next_task_after(first.id)
+        assert next_after_first is not None
+        assert next_after_first.id == third.id
+        assert store.next_task_after(third.id) is None
+
+    def test_next_task_after_invalid_or_missing_task_id_returns_none(self, tmp_path: Path):
+        """next_task_after returns None for malformed IDs and no-successor IDs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        only = store.add("Only task")
+        assert only.id is not None
+
+        assert store.next_task_after("not-an-id") is None
+        assert store.next_task_after(only.id) is None
+
+    def test_get_by_seq_looks_up_task_by_prefix_and_sequence(self, tmp_path: Path):
+        """get_by_seq supports explicit ordinal lookups with optional prefix override."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        task = store.add("Task")
+        assert task.id is not None
+
+        by_seq = store.get_by_seq(1)
+        assert by_seq is not None
+        assert by_seq.id == task.id
+        by_seq_with_prefix = store.get_by_seq(1, prefix="gza")
+        assert by_seq_with_prefix is not None
+        assert by_seq_with_prefix.id == task.id
+        assert store.get_by_seq(999) is None
+        assert store.get_by_seq(0) is None
+
     def test_update_task_with_new_fields(self, tmp_path: Path):
         """Test updating a task with new fields."""
         db_path = tmp_path / "test.db"

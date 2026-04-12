@@ -89,6 +89,19 @@ def task_id_numeric_key(task_id: str | None) -> int:
         return 0
 
 
+def _parse_prefixed_decimal_task_id(task_id: str) -> tuple[str, int] | None:
+    """Parse ``{prefix}-{decimal_seq}`` IDs into ``(prefix, seq)``.
+
+    Returns ``None`` for invalid formats or non-decimal suffixes.
+    """
+    if "-" not in task_id:
+        return None
+    prefix, suffix = task_id.rsplit("-", 1)
+    if not prefix or not suffix.isdigit():
+        return None
+    return prefix, int(suffix)
+
+
 class ManualMigrationRequired(Exception):
     """Raised when the DB needs a manual schema migration (e.g. v25/v26).
 
@@ -876,6 +889,44 @@ class SqliteTaskStore:
         """Get a task by its string ID (e.g. 'gza-1234')."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            row = cur.fetchone()
+            return self._row_to_task(row) if row else None
+
+    def get_by_seq(self, seq_number: int, prefix: str | None = None) -> Task | None:
+        """Get task by ordinal sequence number within a project prefix.
+
+        This is equivalent to ``get(f"{prefix}-{seq_number}")`` and exists for
+        call sites that need explicit ordinal lookup without string formatting.
+        """
+        if seq_number < 1:
+            return None
+        task_prefix = prefix or self._prefix
+        return self.get(f"{task_prefix}-{seq_number}")
+
+    def next_task_after(self, task_id: str) -> Task | None:
+        """Return the next existing task by allocated sequence order.
+
+        Sequence order is defined by ``project_sequences`` allocation and the
+        decimal suffix in task IDs. Gaps are allowed (e.g. deletions), so this
+        returns the smallest existing sequence strictly greater than ``task_id``.
+        """
+        parsed = _parse_prefixed_decimal_task_id(task_id)
+        if parsed is None:
+            return None
+        prefix, seq = parsed
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE id LIKE (? || '-%')
+                  AND substr(id, length(?) + 2) GLOB '[0-9]*'
+                  AND CAST(substr(id, length(?) + 2) AS INTEGER) > ?
+                ORDER BY CAST(substr(id, length(?) + 2) AS INTEGER) ASC
+                LIMIT 1
+                """,
+                (prefix, prefix, prefix, seq, prefix),
+            )
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
