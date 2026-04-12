@@ -29,6 +29,7 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask
+from ..failure_policy import is_resumable_failure_reason
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
 from ..prompts import PromptBuilder
@@ -1549,7 +1550,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if task.status == 'failed':
             # Allow a specific failed task if it's resumable
             is_resumable = (
-                task.failure_reason in ('MAX_STEPS', 'MAX_TURNS')
+                is_resumable_failure_reason(task.failure_reason)
                 and task.session_id is not None
                 and not no_resume_failed
             )

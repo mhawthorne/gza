@@ -25,6 +25,7 @@ from ..console import (
     truncate,
 )
 from ..db import ManualMigrationRequired, SqliteTaskStore, Task as DbTask, resolve_task_id, task_id_numeric_key
+from ..failure_policy import is_resumable_failure_reason
 from ..prompts import PromptBuilder
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
@@ -1232,20 +1233,13 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
         return []
 
     steps = [f"gza log -t {task.id} --steps-verbose"]
-    if reason in {"MAX_STEPS", "MAX_TURNS"}:
-        if task.session_id:
-            steps.append(f"gza resume {task.id}")
-        steps.append(f"gza retry {task.id}")
-        return steps
-
     if reason == "PREREQUISITE_UNMERGED":
         blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
         if blocking_dep_id:
             steps.append(f"gza merge {blocking_dep_id}")
         steps.append(f"gza retry {task.id}")
         return steps
-
-    if reason == "TEST_FAILURE":
+    if is_resumable_failure_reason(reason):
         if task.session_id:
             steps.append(f"gza resume {task.id}")
         steps.append(f"gza retry {task.id}")

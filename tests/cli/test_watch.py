@@ -22,6 +22,13 @@ from gza.workers import WorkerMetadata
 from .conftest import make_store, setup_config
 
 
+def _task_count(store) -> int:
+    with store._connect() as conn:  # noqa: SLF001 - test helper
+        row = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()
+    assert row is not None
+    return int(row["c"])
+
+
 def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: Path) -> None:
     """Pending implement tasks use iterate workers, while plan tasks use plain workers."""
     setup_config(tmp_path)
@@ -529,6 +536,127 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     assert not any(" REBASE " in line for line in lines)
 
 
+@pytest.mark.parametrize(
+    ("action_type", "expected_fragment"),
+    [
+        ("create_review", "review"),
+        ("improve", "improve"),
+        ("create_implement", "implement"),
+        ("needs_rebase", "rebase"),
+    ],
+)
+def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_actions(
+    tmp_path: Path,
+    action_type: str,
+    expected_fragment: str,
+) -> None:
+    """Dry-run must never mutate task rows for task-creating advance actions."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    if action_type == "create_implement":
+        root = store.add("Plan feature", task_type="plan")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        store.update(root)
+        action: dict[str, object] = {"type": action_type}
+    else:
+        root = store.add("Implement feature", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        root.branch = "feature/dry-run-no-mutate"
+        store.update(root)
+        store.set_merge_status(root.id, "unmerged")
+        action = {"type": action_type}
+        if action_type == "improve":
+            review = store.add("Review feature", task_type="review", depends_on=root.id)
+            action["review_task"] = review
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    before_count = _task_count(store)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch("gza.cli.watch._create_review_task") as create_review,
+        patch("gza.cli.watch._create_rebase_task") as create_rebase,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert _task_count(store) == before_count
+    if action_type == "create_review":
+        assert create_review.call_count == 0
+    if action_type == "needs_rebase":
+        assert create_rebase.call_count == 0
+    log_lines = log_path.read_text().splitlines()
+    assert any("[dry-run]" in line and expected_fragment in line for line in log_lines)
+
+
+def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp_path: Path, capsys) -> None:
+    """Off default branch should only block merge actions, not worker-spawning actions."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/off-default-review"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = MagicMock()
+    review.id = "test-review-id"
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "feature/local"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._create_review_task", return_value=review) as create_review,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    output = capsys.readouterr().out
+    assert result.work_done is True
+    assert create_review.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == review.id
+    assert "must be run from the default branch" not in output
+    assert "merge actions skipped: not on default branch" not in log_path.read_text()
+
+
 def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_path: Path) -> None:
     """Review workers should log START; REVIEW is only for completed verdict transitions."""
     setup_config(tmp_path)
@@ -611,6 +739,7 @@ def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
     ):
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)

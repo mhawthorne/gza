@@ -11,6 +11,7 @@ from pathlib import Path
 from ..config import Config
 from ..console import truncate
 from ..db import SqliteTaskStore, Task as DbTask
+from ..failure_policy import is_resumable_failure_reason
 from ..git import Git
 from ..workers import WorkerRegistry
 from ._common import (
@@ -34,7 +35,6 @@ from .git_ops import (
     _unimplemented_implement_prompt,
 )
 
-RESUMABLE_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"}
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 
 
@@ -227,209 +227,207 @@ def _run_cycle(
     if merge_candidates:
         git = Git(config.project_dir)
         target_branch = git.current_branch()
-        if _require_default_branch(git, target_branch, "merge"):
-            action_plan: list[tuple[DbTask, dict]] = []
-            for task in merge_candidates:
-                action_plan.append(
-                    (
+        action_plan: list[tuple[DbTask, dict]] = []
+        for task in merge_candidates:
+            action_plan.append(
+                (
+                    task,
+                    _determine_advance_action(
+                        config,
+                        store,
+                        git,
                         task,
-                        _determine_advance_action(
-                            config,
-                            store,
-                            git,
-                            task,
-                            target_branch,
-                            impl_based_on_ids=impl_based_on_ids,
-                        ),
-                    )
+                        target_branch,
+                        impl_based_on_ids=impl_based_on_ids,
+                    ),
                 )
-            action_plan.sort(key=lambda item: _WATCH_ADVANCE_ACTION_ORDER.get(item[1].get("type", ""), 1))
-
-            for task, action in action_plan:
-                action_type = action.get("type")
-                if action_type in {"skip", "wait_review", "wait_improve", "needs_discussion", "max_cycles_reached"}:
-                    continue
-
-                if action_type == "merge":
-                    if dry_run:
-                        log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
-                        work_done = True
-                        continue
-                    merge_args = _build_auto_merge_args(config, git, task, target_branch)
-                    rc = _merge_single_task(str(task.id), config, store, git, merge_args, target_branch)
-                    if rc == 0:
-                        log.emit("MERGE", f"{task.id} -> {target_branch}")
-                        work_done = True
-                    continue
-
-                if action_type not in {
-                    "needs_rebase",
-                    "run_review",
-                    "run_improve",
-                    "create_review",
-                    "create_implement",
-                    "improve",
-                }:
-                    continue
-                if slots <= 0:
-                    continue
-
-                if action_type == "create_review":
-                    try:
-                        review_task = _create_review_task(store, task)
-                    except DuplicateReviewError as exc:
-                        review_task = exc.active_review
-                    except ValueError:
-                        continue
-
-                    if dry_run:
-                        log.emit("START", f"{review_task.id} review [dry-run]")
-                        started_task_ids.add(str(review_task.id))
-                        slots -= 1
-                        work_done = True
-                        continue
-
-                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                    rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
-                    if rc == 0:
-                        log.emit("START", f"{review_task.id} review")
-                        started_task_ids.add(str(review_task.id))
-                        slots -= 1
-                        work_done = True
-                    continue
-
-                if action_type == "run_review":
-                    review_task_obj = action.get("review_task")
-                    if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None:
-                        continue
-
-                    if dry_run:
-                        log.emit("START", f"{review_task_obj.id} review [dry-run]")
-                        started_task_ids.add(str(review_task_obj.id))
-                        slots -= 1
-                        work_done = True
-                        continue
-
-                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                    rc = _spawn_background_worker(worker_args, config, task_id=review_task_obj.id, quiet=True)
-                    if rc == 0:
-                        log.emit("START", f"{review_task_obj.id} review")
-                        started_task_ids.add(str(review_task_obj.id))
-                        slots -= 1
-                        work_done = True
-                    continue
-
-                if action_type == "improve":
-                    review_task_obj = action.get("review_task")
-                    if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None or task.id is None:
-                        continue
-
-                    from ..prompts import PromptBuilder
-
-                    improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task_obj.id)
-                    improve_task = store.add(
-                        prompt=improve_prompt,
-                        task_type="improve",
-                        depends_on=review_task_obj.id,
-                        based_on=task.id,
-                        same_branch=True,
-                        group=task.group,
-                    )
-
-                    if dry_run:
-                        log.emit("START", f"{improve_task.id} improve [dry-run]")
-                        started_task_ids.add(str(improve_task.id))
-                        slots -= 1
-                        work_done = True
-                        continue
-
-                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                    rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
-                    if rc == 0:
-                        log.emit("START", f"{improve_task.id} improve")
-                        started_task_ids.add(str(improve_task.id))
-                        slots -= 1
-                        work_done = True
-                    continue
-
-                if action_type == "run_improve":
-                    improve_task_obj = action.get("improve_task")
-                    if not isinstance(improve_task_obj, DbTask) or improve_task_obj.id is None:
-                        continue
-
-                    if dry_run:
-                        log.emit("START", f"{improve_task_obj.id} improve [dry-run]")
-                        started_task_ids.add(str(improve_task_obj.id))
-                        slots -= 1
-                        work_done = True
-                        continue
-
-                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                    rc = _spawn_background_worker(worker_args, config, task_id=improve_task_obj.id, quiet=True)
-                    if rc == 0:
-                        log.emit("START", f"{improve_task_obj.id} improve")
-                        started_task_ids.add(str(improve_task_obj.id))
-                        slots -= 1
-                        work_done = True
-                    continue
-
-                if action_type == "create_implement":
-                    if task.id is None:
-                        continue
-                    prompt_text = _unimplemented_implement_prompt(task)
-                    impl_task = store.add(
-                        prompt=prompt_text,
-                        task_type="implement",
-                        based_on=task.id,
-                        group=task.group,
-                    )
-
-                    if dry_run:
-                        log.emit("START", f"{impl_task.id} implement [dry-run]")
-                        started_task_ids.add(str(impl_task.id))
-                        slots -= 1
-                        work_done = True
-                        continue
-
-                    iterate_args = argparse.Namespace(
-                        max_iterations=max_iterations,
-                        no_docker=False,
-                        resume=False,
-                        retry=False,
-                    )
-                    rc = _spawn_background_iterate(iterate_args, config, impl_task)
-                    if rc == 0:
-                        log.emit("START", f"{impl_task.id} implement")
-                        started_task_ids.add(str(impl_task.id))
-                        slots -= 1
-                        work_done = True
-                    continue
-
-                if action_type == "needs_rebase":
-                    if task.id is None or not task.branch:
-                        continue
-                    rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
-
-                    if dry_run:
-                        log.emit("START", f"{rebase_task.id} rebase [dry-run]")
-                        started_task_ids.add(str(rebase_task.id))
-                        slots -= 1
-                        work_done = True
-                        continue
-
-                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                    rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
-                    if rc == 0:
-                        log.emit("START", f"{rebase_task.id} rebase")
-                        started_task_ids.add(str(rebase_task.id))
-                        slots -= 1
-                        work_done = True
-        else:
-            log.emit(
-                "SKIP",
-                "merge actions skipped: not on default branch",
-                dedupe_key="merge-not-default-branch",
             )
+        action_plan.sort(key=lambda item: _WATCH_ADVANCE_ACTION_ORDER.get(item[1].get("type", ""), 1))
+        has_merge_action = any(action.get("type") == "merge" for _, action in action_plan)
+        can_merge = True
+        if has_merge_action:
+            can_merge = _require_default_branch(git, target_branch, "merge")
+
+        for task, action in action_plan:
+            action_type = action.get("type")
+            if action_type in {"skip", "wait_review", "wait_improve", "needs_discussion", "max_cycles_reached"}:
+                continue
+
+            if action_type == "merge":
+                if not can_merge:
+                    log.emit(
+                        "SKIP",
+                        "merge actions skipped: not on default branch",
+                        dedupe_key="merge-not-default-branch",
+                    )
+                    continue
+                if dry_run:
+                    log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
+                    work_done = True
+                    continue
+                merge_args = _build_auto_merge_args(config, git, task, target_branch)
+                rc = _merge_single_task(str(task.id), config, store, git, merge_args, target_branch)
+                if rc == 0:
+                    log.emit("MERGE", f"{task.id} -> {target_branch}")
+                    work_done = True
+                continue
+
+            if action_type not in {
+                "needs_rebase",
+                "run_review",
+                "run_improve",
+                "create_review",
+                "create_implement",
+                "improve",
+            }:
+                continue
+            if slots <= 0:
+                continue
+
+            if action_type == "create_review":
+                if task.id is None:
+                    continue
+                if dry_run:
+                    log.emit("START", f"(new) review for {task.id} [dry-run]")
+                    slots -= 1
+                    work_done = True
+                    continue
+                try:
+                    review_task = _create_review_task(store, task)
+                except DuplicateReviewError as exc:
+                    review_task = exc.active_review
+                except ValueError:
+                    continue
+
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
+                if rc == 0:
+                    log.emit("START", f"{review_task.id} review")
+                    started_task_ids.add(str(review_task.id))
+                    slots -= 1
+                    work_done = True
+                continue
+
+            if action_type == "run_review":
+                review_task_obj = action.get("review_task")
+                if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None:
+                    continue
+
+                if dry_run:
+                    log.emit("START", f"{review_task_obj.id} review [dry-run]")
+                    started_task_ids.add(str(review_task_obj.id))
+                    slots -= 1
+                    work_done = True
+                    continue
+
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                rc = _spawn_background_worker(worker_args, config, task_id=review_task_obj.id, quiet=True)
+                if rc == 0:
+                    log.emit("START", f"{review_task_obj.id} review")
+                    started_task_ids.add(str(review_task_obj.id))
+                    slots -= 1
+                    work_done = True
+                continue
+
+            if action_type == "improve":
+                review_task_obj = action.get("review_task")
+                if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None or task.id is None:
+                    continue
+                if dry_run:
+                    log.emit("START", f"(new) improve for {task.id} [dry-run]")
+                    slots -= 1
+                    work_done = True
+                    continue
+
+                from ..prompts import PromptBuilder
+
+                improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task_obj.id)
+                improve_task = store.add(
+                    prompt=improve_prompt,
+                    task_type="improve",
+                    depends_on=review_task_obj.id,
+                    based_on=task.id,
+                    same_branch=True,
+                    group=task.group,
+                )
+
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
+                if rc == 0:
+                    log.emit("START", f"{improve_task.id} improve")
+                    started_task_ids.add(str(improve_task.id))
+                    slots -= 1
+                    work_done = True
+                continue
+
+            if action_type == "run_improve":
+                improve_task_obj = action.get("improve_task")
+                if not isinstance(improve_task_obj, DbTask) or improve_task_obj.id is None:
+                    continue
+
+                if dry_run:
+                    log.emit("START", f"{improve_task_obj.id} improve [dry-run]")
+                    started_task_ids.add(str(improve_task_obj.id))
+                    slots -= 1
+                    work_done = True
+                    continue
+
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                rc = _spawn_background_worker(worker_args, config, task_id=improve_task_obj.id, quiet=True)
+                if rc == 0:
+                    log.emit("START", f"{improve_task_obj.id} improve")
+                    started_task_ids.add(str(improve_task_obj.id))
+                    slots -= 1
+                    work_done = True
+                continue
+
+            if action_type == "create_implement":
+                if task.id is None:
+                    continue
+                if dry_run:
+                    log.emit("START", f"(new) implement for {task.id} [dry-run]")
+                    slots -= 1
+                    work_done = True
+                    continue
+                prompt_text = _unimplemented_implement_prompt(task)
+                impl_task = store.add(
+                    prompt=prompt_text,
+                    task_type="implement",
+                    based_on=task.id,
+                    group=task.group,
+                )
+
+                iterate_args = argparse.Namespace(
+                    max_iterations=max_iterations,
+                    no_docker=False,
+                    resume=False,
+                    retry=False,
+                )
+                rc = _spawn_background_iterate(iterate_args, config, impl_task)
+                if rc == 0:
+                    log.emit("START", f"{impl_task.id} implement")
+                    started_task_ids.add(str(impl_task.id))
+                    slots -= 1
+                    work_done = True
+                continue
+
+            if action_type == "needs_rebase":
+                if task.id is None or not task.branch:
+                    continue
+                if dry_run:
+                    log.emit("START", f"(new) rebase for {task.id} [dry-run]")
+                    slots -= 1
+                    work_done = True
+                    continue
+                rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
+
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
+                if rc == 0:
+                    log.emit("START", f"{rebase_task.id} rebase")
+                    started_task_ids.add(str(rebase_task.id))
+                    slots -= 1
+                    work_done = True
 
     # 2) Resume failed resumable tasks (consumes slots)
     if slots > 0:
@@ -437,7 +435,7 @@ def _run_cycle(
         for failed in failed_tasks:
             if slots <= 0:
                 break
-            if failed.failure_reason not in RESUMABLE_FAILURE_REASONS or not failed.session_id:
+            if not is_resumable_failure_reason(failed.failure_reason) or not failed.session_id:
                 continue
             assert failed.id is not None
             if store.get_based_on_children(failed.id):

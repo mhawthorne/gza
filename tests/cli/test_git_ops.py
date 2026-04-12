@@ -4238,6 +4238,22 @@ class TestAdvanceCommand:
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 1
 
+    def test_advance_specific_failed_task_id_test_failure_is_resumable(self, tmp_path: Path):
+        """advance treats TEST_FAILURE as resumable for explicit failed task IDs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="TEST_FAILURE")
+
+        result = run_gza("advance", str(failed_task.id), "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+
     def test_advance_skips_failed_task_without_session_id(self, tmp_path: Path):
         """advance skips failed tasks without session_id (not resumable)."""
         setup_config(tmp_path)
