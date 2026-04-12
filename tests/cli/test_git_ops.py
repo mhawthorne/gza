@@ -4978,6 +4978,30 @@ class TestAdvanceMergeSquashThreshold:
         with pytest.raises(ConfigError):
             Config.load(tmp_path)
 
+    def test_validate_rejects_negative_max_resume_attempts(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: -1\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'max_resume_attempts' must be non-negative" in errors
+
+    def test_validate_rejects_non_integer_max_resume_attempts(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: nope\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'max_resume_attempts' must be an integer" in errors
+
+    def test_validate_rejects_non_positive_max_review_cycles(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 0\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'max_review_cycles' must be positive" in errors
+
 class TestAdvanceUnimplementedCommand:
     """Tests for 'gza advance --unimplemented' command."""
 

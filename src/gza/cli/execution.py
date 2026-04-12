@@ -1091,7 +1091,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     # If the task is pending, run it first before entering the loop.
     if impl_task.status == "pending":
         if dry_run:
-            print(f"[dry-run] Would run pending implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
+            print(f"[dry-run] Would run pending implementation {impl_task.id} then iterate (max {max_iterations} actions)")
             return 0
 
         print(f"Running pending implementation {impl_task.id}...")
@@ -1112,7 +1112,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
                 return 1
             if dry_run:
-                print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
+                print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} actions)")
                 return 0
             run_start_task = _create_resume_task(store, impl_task)
             assert run_start_task.id is not None
@@ -1121,7 +1121,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         else:
             # --retry
             if dry_run:
-                print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
+                print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} actions)")
                 return 0
             run_start_task = store.add(
                 prompt=impl_task.prompt,
@@ -1157,7 +1157,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     assert impl_task.id is not None
 
     if dry_run:
-        print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
+        print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} actions)")
         return 0
 
     try:
@@ -1166,11 +1166,11 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"Error: failed to initialize git runtime for iterate: {exc}")
         return 1
-    print(f"Iterating implementation {impl_task.id} (max {max_iterations} iterations)...")
+    print(f"Iterating implementation {impl_task.id} (max {max_iterations} actions)...")
 
     summary_rows: list[tuple[int, str, str | None, str | None, str | None]] = []
     final_status = "maxed_out"
-    final_stop_reason = "max_iterations"
+    final_stop_reason = "max_actions"
     iteration = 0
     engine_config = argparse.Namespace(
         project_dir=config.project_dir,
@@ -1181,9 +1181,6 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     )
 
     while iteration < max_iterations:
-        orig_branch = impl_task.branch
-        if orig_branch is None:
-            impl_task.branch = "__iterate__"
         action = determine_next_action(
             engine_config,
             store,
@@ -1191,11 +1188,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             impl_task,
             target_branch,
             max_resume_attempts=_int_config(getattr(config, "max_resume_attempts", None), 3),
+            allow_branchless_implement_review=True,
         )
-        if orig_branch is None:
-            impl_task.branch = orig_branch
         action_type = action["type"]
-        print(f"\nIteration {iteration + 1}/{max_iterations}: {action_type}")
+        print(f"\nAction {iteration + 1}/{max_iterations}: {action_type}")
 
         if action_type == "merge":
             final_status = "approved"
@@ -1305,7 +1301,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     print(f"\n{'=' * 60}")
     print(f"Iterate complete: {final_status.upper()} ({final_stop_reason})")
     print(f"{'=' * 60}")
-    print(f"{'Iter':<6} {'Action':<16} {'Task':>8} {'Verdict':<22}")
+    print(f"{'Step':<6} {'Action':<16} {'Task':>8} {'Verdict':<22}")
     print(f"{'-' * 6} {'-' * 16} {'-' * 8} {'-' * 22}")
     for (iter_idx, action_name, action_task_id, row_verdict, _unused) in summary_rows:
         iter_str = str(iter_idx + 1)
@@ -1317,7 +1313,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if final_status == "approved":
         return 0
     if final_status == "maxed_out":
-        print(f"Max iterations ({max_iterations}) reached.")
+        print(f"Max actions ({max_iterations}) reached.")
         return 2
     if final_stop_reason in {"review_in_progress", "improve_in_progress"}:
         print(f"Iterate waiting: {final_stop_reason}. Existing task is already in progress.")

@@ -2836,7 +2836,42 @@ class TestIterateCommand:
         result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "max 5 iterations" in result.stdout
+        assert "max 5 actions" in result.stdout
+
+    def test_iterate_live_progress_uses_action_wording(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(impl_task_id=impl.id, max_iterations=1, dry_run=False, project_dir=tmp_path, no_docker=True)
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Iterating implementation" in output
+        assert "max 1 actions" in output
+        assert "Action 1/1: merge" in output
+        assert "Iteration 1/1" not in output
 
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
         """gza iterate rejects tasks that are not implement type."""
@@ -3089,6 +3124,105 @@ class TestIterateCommand:
             output,
         )
         assert "Totals: 1m30s wall | 10 steps | $1.00" in output
+
+    def test_branchless_completed_impl_does_not_enter_needs_rebase(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "completed"
+        impl.branch = None
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Action 1/1: merge" in output
+        assert "needs_rebase" not in output
+        assert "Cannot rebase" not in output
+
+    def test_pending_impl_that_completes_without_branch_does_not_enter_needs_rebase(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            if task is not None and task.id == impl.id:
+                task.status = "completed"
+                task.branch = None
+                task.completed_at = datetime.now(UTC)
+                store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Running pending implementation" in output
+        assert "Action 1/1: merge" in output
+        assert "needs_rebase" not in output
+        assert "Cannot rebase" not in output
 
     def test_pending_impl_dry_run(self, tmp_path: Path):
         """gza iterate --dry-run on a pending task shows it would run the impl first."""
