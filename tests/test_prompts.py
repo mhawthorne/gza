@@ -240,12 +240,12 @@ class TestPromptBuilderBuild:
         )
 
     def test_review_contract_parity_between_template_and_interactive_scaffold(self):
-        """Test canonical review contract clauses are present in both review entrypoints."""
+        """Test canonical review contract clauses are present across review entrypoints."""
         root = Path(__file__).resolve().parents[1]
         template_content = (
             root / "src" / "gza" / "prompts" / "templates" / "review.txt"
         ).read_text()
-        skill_content = (
+        interactive_skill_content = (
             root
             / "src"
             / "gza"
@@ -253,11 +253,21 @@ class TestPromptBuilderBuild:
             / "gza-code-review-interactive"
             / "SKILL.md"
         ).read_text()
+        task_review_skill_content = (
+            root / "src" / "gza" / "skills" / "gza-task-review" / "SKILL.md"
+        ).read_text()
 
         _assert_contains_all_clauses(template_content, REVIEW_CONTRACT_PARITY_CLAUSES)
-        _assert_contains_all_clauses(skill_content, REVIEW_CONTRACT_PARITY_CLAUSES)
+        _assert_contains_all_clauses(
+            interactive_skill_content, REVIEW_CONTRACT_PARITY_CLAUSES
+        )
+        _assert_contains_all_clauses(
+            task_review_skill_content, REVIEW_CONTRACT_PARITY_CLAUSES
+        )
         _assert_summary_checklist_contract(template_content)
-        _assert_summary_checklist_contract(skill_content)
+        _assert_summary_checklist_contract(interactive_skill_content)
+        _assert_summary_checklist_contract(task_review_skill_content)
+        assert "## Task Prompt Alignment" not in task_review_skill_content
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
