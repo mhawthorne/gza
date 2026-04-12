@@ -1262,7 +1262,7 @@ def _advance_action_color(action_type: str) -> str:
     ac = _colors.ADVANCE_COLORS
     if action_type == 'merge':
         return ac.merge
-    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'):
+    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached'):
         return ac.error
     if action_type in ('skip', 'wait_review', 'wait_improve'):
         return ac.waiting
@@ -1411,7 +1411,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     # If the plan is empty or every item is a skip, there's nothing actionable
     # (unless --new is set, in which case we still want to start pending tasks).
-    if not plan or all(action['type'] in {'skip', 'max_resume_attempts'} for _, action in plan):
+    if not plan or all(action['type'] == 'skip' for _, action in plan):
         if not new_mode:
             print("No eligible tasks to advance")
             if plan:
@@ -1463,7 +1463,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         return 0
 
     # Show the plan and prompt for confirmation
-    actionable_plan = [item for item in plan if item[1]['type'] not in {'skip', 'max_resume_attempts'}]
+    actionable_plan = [item for item in plan if item[1]['type'] != 'skip']
     if actionable_plan:
         print(f"Will advance {len(actionable_plan)} task(s):\n")
         for task, action in plan:
@@ -1503,7 +1503,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     error_count = 0
     workers_started = 0
     # Track tasks skipped for actionable reasons (needs human attention)
-    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'})
+    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached'})
     attention_tasks: list[tuple[DbTask, dict]] = []
 
     def _worker_args() -> argparse.Namespace:
@@ -1518,7 +1518,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
         action_type = action['type']
 
-        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached', 'max_resume_attempts'):
+        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")

@@ -4546,6 +4546,66 @@ class TestIterateCommand:
         assert result == 0
         run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id)
 
+    def test_iterate_improve_duplicate_blocks_instead_of_raising(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        completed_review = store.add("Completed review", task_type="review", depends_on=impl.id)
+        completed_review.status = "completed"
+        completed_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        completed_review.completed_at = datetime.now(UTC)
+        store.update(completed_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                side_effect=[
+                    {
+                        "type": "improve",
+                        "description": "Create improve task",
+                        "review_task": completed_review,
+                    }
+                ],
+            ),
+            patch(
+                "gza.cli._create_improve_task",
+                side_effect=ValueError("An improve task already exists for implementation"),
+            ) as create_improve,
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        create_improve.assert_called_once()
+        run_foreground.assert_not_called()
+        assert "Error creating improve task" in output
+        assert "Iterate blocked: improve_failed." in output
+
     def test_iterate_run_review_auto_resumes_max_steps_failure(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

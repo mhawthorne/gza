@@ -360,7 +360,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="resume_max_attempts",
         matches=lambda ctx: ctx.is_resumable_failed_task and ctx.resume_chain_depth >= ctx.max_resume_attempts,
         action=lambda ctx: {
-            "type": "max_resume_attempts",
+            "type": "skip",
             "description": f"SKIP: max resume attempts ({ctx.max_resume_attempts}) reached",
         },
     ),

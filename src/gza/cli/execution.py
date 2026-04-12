@@ -1210,7 +1210,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             summary_rows.append((iteration, action_type, None, None, None))
             break
 
-        if action_type in {"needs_discussion", "max_cycles_reached", "skip", "max_resume_attempts"}:
+        if action_type in {"needs_discussion", "max_cycles_reached", "skip"}:
             final_status = "blocked"
             final_stop_reason = action_type
             summary_rows.append((iteration, action_type, None, None, None))
@@ -1279,7 +1279,14 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             print(f"  Running pending review {action_task.id}...")
         elif action_type == "improve":
             review_task = action["review_task"]
-            action_task = _create_improve_task(store, impl_task, review_task)
+            try:
+                action_task = _create_improve_task(store, impl_task, review_task)
+            except ValueError as e:
+                print(f"  Error creating improve task: {e}")
+                final_status = "blocked"
+                final_stop_reason = "improve_failed"
+                summary_rows.append((iteration, action_type, None, None, None))
+                break
             assert action_task.id is not None
             action_task_label = action_task.id
             print(f"  Running improve {action_task.id}...")

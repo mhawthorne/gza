@@ -130,3 +130,39 @@ def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path)
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
     assert action["type"] == "run_review"
     assert action["review_task"].id == pending.id
+
+
+def test_evaluate_returns_skip_when_resume_budget_exhausted(tmp_path: Path):
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+    config = Config.load(tmp_path)
+    db_path = tmp_path / ".gza" / "gza.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+    original = store.add("Implement", task_type="implement")
+    original.status = "failed"
+    original.failure_reason = "MAX_STEPS"
+    original.session_id = "sess-1"
+    original.completed_at = datetime.now(UTC)
+    original.branch = "feat/original"
+    store.update(original)
+
+    resumed = store.add("Implement resume", task_type="implement")
+    resumed.status = "failed"
+    resumed.failure_reason = "MAX_STEPS"
+    resumed.session_id = "sess-2"
+    resumed.based_on = original.id
+    resumed.completed_at = datetime.now(UTC)
+    resumed.branch = "feat/resume"
+    store.update(resumed)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True),
+        resumed,
+        "main",
+    )
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: max resume attempts (1) reached"

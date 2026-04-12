@@ -4141,6 +4141,28 @@ class TestAdvanceCommand:
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
 
+    def test_determine_advance_action_returns_skip_at_max_resume_attempts(self, tmp_path: Path):
+        """Action selection keeps max resume exhaustion on the skip contract."""
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-1", failure_reason="MAX_STEPS")
+        first_resume = store.add("Implement feature", task_type="implement")
+        first_resume.status = "failed"
+        first_resume.failure_reason = "MAX_STEPS"
+        first_resume.session_id = "sess-2"
+        first_resume.based_on = original.id
+        first_resume.completed_at = datetime.now(UTC)
+        first_resume.branch = f"feat/task-{first_resume.id}"
+        store.update(first_resume)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, first_resume, "main")
+
+        assert action["type"] == "skip"
+        assert action["description"] == "SKIP: max resume attempts (1) reached"
+
     def test_advance_skips_failed_task_with_existing_resume_child(self, tmp_path: Path):
         """advance skips a failed task that already has a pending/in_progress child."""
         setup_config(tmp_path)
@@ -4207,6 +4229,7 @@ class TestAdvanceCommand:
         # (and the child should be skipped due to max resume attempts)
         assert f"{original.id}" not in result.stdout
         assert "SKIP: max resume attempts" in result.stdout
+        assert "No eligible tasks to advance" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
