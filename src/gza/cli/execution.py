@@ -1303,6 +1303,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         _append_summary_row(
             summary_rows,
             iteration_index=iteration,
+            task_type="review",
+            task=latest_review,
+            verdict=latest_verdict,
+        )
+        _append_summary_row(
+            summary_rows,
+            iteration_index=iteration,
             task_type="improve",
             task=start_with_in_progress_improve,
             status="in_progress",
@@ -1317,6 +1324,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         and iteration < max_iterations
     ):
         print(f"\nIteration {iteration + 1}/{max_iterations} (starting from existing review {latest_review.id})")
+        _append_summary_row(
+            summary_rows,
+            iteration_index=iteration,
+            task_type="review",
+            task=latest_review,
+            verdict=latest_verdict,
+        )
         improve_task: DbTask | None = None
         if start_with_existing_improve is not None:
             improve_task = start_with_existing_improve
