@@ -752,7 +752,7 @@ def _print_ps_output(
             # while still avoiding unrelated completed history.
             if (
                 key in seen_tasks
-                or row["status"] in ("running", "in_progress")
+                or row["status"] == "in_progress"
                 or row.get("startup_failure", False)
             ):
                 seen_tasks[key] = row
@@ -762,7 +762,7 @@ def _print_ps_output(
         # This catches status transitions regardless of whether the task is
         # still in live_rows (e.g. worker exists but task completed in DB).
         for key, row in list(seen_tasks.items()):
-            if isinstance(key, str) and row.get("task_id") is not None and row["status"] in ("running", "in_progress"):
+            if isinstance(key, str) and row.get("task_id") is not None and row["status"] == "in_progress":
                 task = store.get(key)
                 if task and task.status in ("completed", "failed"):
                     row["status"] = task.status
@@ -788,7 +788,7 @@ def _print_ps_output(
         print()
 
     if not rows:
-        print("No running workers or in-progress tasks (use --poll to monitor)")
+        print("No in-progress tasks (use --poll to monitor)")
         return
 
     if hasattr(args, "quiet") and args.quiet:
@@ -933,13 +933,13 @@ def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
 def _ps_sort_key(row: dict) -> tuple[int, bool, str, int, str]:
     """Sort ps rows by status group, then by start time, then stable identifiers.
 
-    Failed tasks surface at top for immediate attention, in_progress/running
+    Failed tasks surface at top for immediate attention, in_progress
     in the middle, completed at the bottom."""
     status = row.get("status", "")
-    # Failed=0 (top), in_progress/running=1 (middle), completed/other=2 (bottom)
+    # Failed=0 (top), in_progress=1 (middle), completed/other=2 (bottom)
     if status == "failed":
         status_group = 0
-    elif status in ("running", "in_progress"):
+    elif status == "in_progress":
         status_group = 1
     else:
         status_group = 2
@@ -1018,7 +1018,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         # may have already completed/failed by the time the worker is gone.
         status = task.status if task and task.status else "in_progress"
     elif source == "worker" and worker is not None:
-        status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
+        status = worker.status if worker.status in ("failed", "completed", "stale") else "in_progress"
     elif worker is not None and task is not None:
         # Both worker and task exist.
         if task.status in ("completed", "failed"):
@@ -1026,9 +1026,9 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         elif not (task and task.running_pid):
             status = "stale"
         else:
-            status = "running"
+            status = "in_progress"
     elif worker is not None:
-        status = worker.status if worker.status in ("failed", "completed", "stale") else "running"
+        status = worker.status if worker.status in ("failed", "completed", "stale") else "in_progress"
 
     is_stale = worker is not None and worker.status == "stale"
     is_orphaned = (

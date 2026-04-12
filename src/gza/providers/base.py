@@ -526,6 +526,8 @@ class Provider(ABC):
 
         with open(log_file, "a") as log:
             stdin_target = subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL
+            env = os.environ.copy()
+            env.setdefault("RUST_BACKTRACE", "1")
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -533,6 +535,7 @@ class Provider(ABC):
                 stdin=stdin_target,
                 text=True,
                 cwd=cwd,
+                env=env,
             )
 
             # Write stdin if provided

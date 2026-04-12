@@ -1347,7 +1347,7 @@ class TestPsCommand:
 
         result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "No running workers or in-progress tasks" in result.stdout
+        assert "No in-progress tasks" in result.stdout
         assert registry.get("w-prune-on-ps") is None
 
     def test_ps_no_id_background_claim_reconciles_single_active_row(self, tmp_path: Path):
@@ -1387,7 +1387,7 @@ class TestPsCommand:
         assert len(rows) == 1
         assert rows[0]["source"] == "both"
         assert rows[0]["task_id"] == task.id
-        assert rows[0]["status"] == "running"
+        assert rows[0]["status"] == "in_progress"
         assert rows[0]["is_orphaned"] is False
 
     def test_no_orphan_warning_for_healthy_no_id_background_claim(self, tmp_path: Path):
@@ -2169,7 +2169,7 @@ class TestPsCommand:
 
         first_snapshot = json.loads(json_outputs[0])
         assert len(first_snapshot) == 1
-        assert first_snapshot[0]["status"] == "running"
+        assert first_snapshot[0]["status"] == "in_progress"
 
         # Second poll: completed worker remains visible (not filtered out).
         second_snapshot = json.loads(json_outputs[1])
@@ -2373,11 +2373,11 @@ class TestPsCommand:
         json_outputs = [o for o in captured_outputs if o.startswith("[")]
         assert len(json_outputs) >= 2, f"Expected at least 2 JSON snapshots, got {len(json_outputs)}"
 
-        # Poll 1: both tasks running
+        # Poll 1: both tasks in_progress
         snap1 = json.loads(json_outputs[0])
         assert len(snap1) == 2, f"Poll 1: expected 2 tasks, got {len(snap1)}: {snap1}"
         statuses1 = {r["status"] for r in snap1}
-        assert statuses1 == {"running"}, f"Poll 1: expected all running, got {statuses1}"
+        assert statuses1 == {"in_progress"}, f"Poll 1: expected all in_progress, got {statuses1}"
 
         # Poll 2: both tasks completed (DB is source of truth)
         snap2 = json.loads(json_outputs[1])
@@ -3819,15 +3819,15 @@ class TestPsSortKey:
         assert key_with_task[3] < sys.maxsize
 
     def test_status_group_ordering(self):
-        """Failed rows sort before running, running before completed."""
+        """Failed rows sort before in_progress, in_progress before completed."""
         from gza.cli.query import _ps_sort_key
 
         failed_row = self._make_row(task_id="gza-1", status="failed")
-        running_row = self._make_row(task_id="gza-2", status="running")
+        in_progress_row = self._make_row(task_id="gza-2", status="in_progress")
         completed_row = self._make_row(task_id="gza-3", status="completed")
 
-        assert _ps_sort_key(failed_row)[0] < _ps_sort_key(running_row)[0]
-        assert _ps_sort_key(running_row)[0] < _ps_sort_key(completed_row)[0]
+        assert _ps_sort_key(failed_row)[0] < _ps_sort_key(in_progress_row)[0]
+        assert _ps_sort_key(in_progress_row)[0] < _ps_sort_key(completed_row)[0]
 
     def test_integer_task_id_backward_compat(self):
         """Integer task_id values sort numerically (backward compat)."""
