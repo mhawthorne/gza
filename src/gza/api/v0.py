@@ -161,9 +161,11 @@ class GzaClient:
 
         Notes
         -----
-        Ordering is urgent-first, then FIFO by creation time within each lane.
+        This uses default worker pickup semantics: internal tasks and
+        dependency-blocked tasks are excluded. Ordering is urgent-first, then
+        FIFO by creation time within each lane.
         """
-        return self._store.get_pending(limit=limit)
+        return self._store.get_pending_pickup(limit=limit)
 
     def get_in_progress(self) -> list[Task]:
         """Return in-progress tasks, oldest-started first."""

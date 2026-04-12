@@ -927,7 +927,7 @@ Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocke
 
 ### queue
 
-Inspect and manage pending queue ordering.
+Inspect and manage runnable pending queue ordering.
 
 ```bash
 gza queue
@@ -939,7 +939,8 @@ gza queue unbump <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to bump/unbump (e.g. `gza-1234`) |
 
-Queue ordering is urgent-first, then FIFO within each lane.
+Queue pickup ordering is urgent-first, then FIFO within each lane.
+`gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
 
 ### implement
 

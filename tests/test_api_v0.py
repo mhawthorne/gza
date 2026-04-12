@@ -326,6 +326,24 @@ class TestGetPending:
         assert pending.id in ids
         assert done.id not in ids
 
+    def test_excludes_non_pickable_internal_and_blocked_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        runnable = store.add("Runnable pending")
+        assert runnable.id is not None
+
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Dependency blocker")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        client = make_client(tmp_path)
+        result = client.get_pending()
+        prompts = {t.prompt for t in result}
+
+        assert "Runnable pending" in prompts
+        assert "Internal pending" not in prompts
+        assert "Blocked pending" not in prompts
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_in_progress

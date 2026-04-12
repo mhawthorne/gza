@@ -859,6 +859,24 @@ class TestQueueCommand:
         assert refreshed is not None
         assert refreshed.urgent is False
 
+    def test_queue_excludes_non_pickable_internal_and_blocked_pending_tasks(self, tmp_path: Path):
+        """Queue pickup order output should only include runnable pending tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        runnable = store.add("Runnable")
+        assert runnable.id is not None
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Dependency blocker")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Runnable" in result.stdout
+        assert "Internal pending" not in result.stdout
+        assert "Blocked pending" not in result.stdout
+
 
 class TestShowCommand:
     """Tests for 'gza show' command."""

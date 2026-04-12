@@ -144,6 +144,24 @@ class TestTaskChaining:
         assert next_task.id == urgent.id
         assert next_task.id != normal.id
 
+    def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
+        """Pickup listing excludes internal and dependency-blocked pending tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        runnable = store.add("Runnable pending")
+        assert runnable.id is not None
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Dependency blocker")
+        blocked = store.add("Blocked pending", depends_on=blocker.id)
+
+        pickup = store.get_pending_pickup()
+        pickup_ids = {task.id for task in pickup}
+
+        assert runnable.id in pickup_ids
+        assert blocked.id not in pickup_ids
+        assert all(task.task_type != "internal" for task in pickup)
+
     def test_get_in_progress_returns_only_in_progress_tasks(self, tmp_path: Path):
         """Test get_in_progress returns only in-progress tasks."""
         db_path = tmp_path / "test.db"

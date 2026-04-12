@@ -379,7 +379,7 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="List pending tasks in pickup order and manage urgent bump flags",
+        help="List runnable pending tasks in pickup order and manage urgent bump flags",
     )
     add_common_args(queue_parser)
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")

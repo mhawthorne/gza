@@ -265,6 +265,103 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
     assert advance_merge_args.squash is True
 
 
+def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Quiet merge path should not print helper output and must emit MERGE log event."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-quiet-merge"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    def noisy_merge(*_args, **_kwargs):
+        print("Merging 'feature/watch-quiet-merge' into 'main'...")
+        print("✓ Successfully merged feature/watch-quiet-merge")
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._merge_single_task", side_effect=noisy_merge),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "Merging 'feature/watch-quiet-merge' into 'main'..." not in stdout
+    assert " MERGE " in log_path.read_text()
+    assert f"MERGE  {task.id} -> main" in log_path.read_text()
+
+
+def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Quiet branch guard should suppress helper output while keeping SKIP log event."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-quiet-default-guard"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    git = MagicMock()
+    git.current_branch.return_value = "feature/local"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "`gza merge` must be run from the default branch" not in stdout
+    assert merge_single.call_count == 0
+    assert "SKIP   merge actions skipped: not on default branch" in log_path.read_text()
+
+
 def test_watch_cycle_starts_pending_review_with_plain_worker(tmp_path: Path) -> None:
     """Watch should start pending non-implement tasks with plain workers."""
     setup_config(tmp_path)

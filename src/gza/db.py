@@ -1078,9 +1078,17 @@ class SqliteTaskStore:
         dependency is failed but a completed retry exists anywhere in the
         based_on chain.
         """
+        pending = self.get_pending_pickup(limit=1)
+        return pending[0] if pending else None
+
+    def get_pending_pickup(self, limit: int | None = None) -> list[Task]:
+        """Get runnable pending tasks in pickup order.
+
+        Pickup semantics match default worker selection: excludes internal and
+        dependency-blocked tasks. Ordering is urgent-first, then FIFO.
+        """
         with self._connect() as conn:
-            cur = conn.execute(
-                """
+            query = """
                 WITH RECURSIVE successful_ancestors(id) AS (
                     SELECT id FROM tasks WHERE status = 'completed'
                     UNION ALL
@@ -1096,11 +1104,13 @@ class SqliteTaskStore:
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
                 ORDER BY t.urgent DESC, t.created_at ASC
-                LIMIT 1
                 """
-            )
-            row = cur.fetchone()
-            return self._row_to_task(row) if row else None
+            params: tuple[int, ...] | tuple[()] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (limit,)
+            cur = conn.execute(query, params)
+            return [self._row_to_task(row) for row in cur.fetchall()]
 
     def try_mark_in_progress(self, task_id: str, pid: int) -> Task | None:
         """Compare-and-swap pending -> in_progress for a specific task.

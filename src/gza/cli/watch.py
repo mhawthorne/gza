@@ -1,6 +1,8 @@
 """Continuous watch loop and queue management commands."""
 
 import argparse
+import contextlib
+import io
 import os
 import signal
 import time
@@ -8,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 from ..config import Config
 from ..console import truncate
@@ -36,6 +39,7 @@ from .git_ops import (
 )
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
+T = TypeVar("T")
 
 
 def _short_prompt(prompt: str) -> str:
@@ -191,15 +195,14 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
 
 
 def _pending_runnable_tasks(store: SqliteTaskStore) -> list[DbTask]:
-    runnable: list[DbTask] = []
-    for task in store.get_pending():
-        if task.task_type == "internal":
-            continue
-        blocked, _, _ = store.is_task_blocked(task)
-        if blocked:
-            continue
-        runnable.append(task)
-    return runnable
+    return store.get_pending_pickup()
+
+
+def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
+    if not quiet:
+        return fn()
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn()
 
 
 @dataclass
@@ -258,7 +261,10 @@ def _run_cycle(
         has_merge_action = any(action.get("type") == "merge" for _, action in action_plan)
         can_merge = True
         if has_merge_action:
-            can_merge = _require_default_branch(git, target_branch, "merge")
+            can_merge = _run_with_optional_stdout_suppressed(
+                quiet,
+                lambda: _require_default_branch(git, target_branch, "merge"),
+            )
 
         for task, action in action_plan:
             action_type = action.get("type")
@@ -278,10 +284,19 @@ def _run_cycle(
                     work_done = True
                     continue
                 merge_args = _build_auto_merge_args(config, git, task, target_branch)
-                rc = _merge_single_task(str(task.id), config, store, git, merge_args, target_branch)
+                rc = _run_with_optional_stdout_suppressed(
+                    quiet,
+                    lambda: _merge_single_task(str(task.id), config, store, git, merge_args, target_branch),
+                )
                 if rc == 0:
                     log.emit("MERGE", f"{task.id} -> {target_branch}")
                     work_done = True
+                else:
+                    log.emit(
+                        "SKIP",
+                        f"{task.id}: merge failed",
+                        dedupe_key=f"merge-failed:{task.id}",
+                    )
                 continue
 
             if action_type not in {
@@ -654,7 +669,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"✓ Removed task {task_id} from urgent queue")
         return 0
 
-    pending = store.get_pending()
+    pending = store.get_pending_pickup()
     if not pending:
         print("No pending tasks")
         return 0
