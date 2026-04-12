@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
+from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -1234,14 +1236,17 @@ class SqliteTaskStore:
         - session_id IS NOT NULL
         """
         with self._connect() as conn:
+            resumable_reasons = tuple(sorted(RESUMABLE_FAILURE_REASONS))
+            placeholders = ",".join("?" for _ in resumable_reasons)
             cur = conn.execute(
-                """
+                f"""
                 SELECT * FROM tasks
                 WHERE status = 'failed'
-                AND failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')
+                AND failure_reason IN ({placeholders})
                 AND session_id IS NOT NULL
                 ORDER BY completed_at DESC, created_at DESC
-                """
+                """,
+                resumable_reasons,
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
@@ -1283,7 +1288,7 @@ class SqliteTaskStore:
                 if row is None:
                     break
                 based_on, status, failure_reason = row["based_on"], row["status"], row["failure_reason"]
-                if status == "failed" and failure_reason in ("MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"):
+                if status == "failed" and is_resumable_failure_reason(failure_reason):
                     depth += 1
                     current_id = based_on
                 else:

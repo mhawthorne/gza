@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from gza.db import SqliteTaskStore, Task as DbTask
+from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from gza.query import get_improves_for_root, get_reviews_for_root
+from gza.resume_policy import (
+    is_resumable_failed_task,
+    is_resumable_failure_reason as _is_resumable_failure_reason,
+)
 from gza.review_verdict import get_review_verdict
-
-RESUMABLE_FAILURE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"})
 
 WORKER_CONSUMING_ACTIONS = frozenset(
     {
@@ -75,16 +77,7 @@ class AdvanceRule:
 
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
     """Return True when a failure reason is auto-resumable by advance."""
-    return failure_reason in RESUMABLE_FAILURE_REASONS
-
-
-def is_resumable_failed_task(task: DbTask) -> bool:
-    """Return True when a task is failed and eligible for automatic resume."""
-    return (
-        task.status == "failed"
-        and task.session_id is not None
-        and is_resumable_failure_reason(task.failure_reason)
-    )
+    return _is_resumable_failure_reason(failure_reason)
 
 
 def _count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
@@ -97,6 +90,34 @@ def _task_id(task: DbTask | None) -> str:
     if task is None or task.id is None:
         return "unknown"
     return task.id
+
+
+def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
+    """Deterministic tie-breaker for active reviews of the same status."""
+    created_at = task.created_at or datetime.min
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone(UTC).replace(tzinfo=None)
+    return (created_at, task_id_numeric_key(task.id))
+
+
+def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
+    """Prefer in-progress review over pending siblings, then newest deterministically."""
+    in_progress = sorted(
+        (r for r in reviews if r.status == "in_progress"),
+        key=_review_priority_sort_key,
+        reverse=True,
+    )
+    if in_progress:
+        return in_progress[0]
+
+    pending = sorted(
+        (r for r in reviews if r.status == "pending"),
+        key=_review_priority_sort_key,
+        reverse=True,
+    )
+    if pending:
+        return pending[0]
+    return None
 
 
 def resolve_advance_context(
@@ -170,7 +191,7 @@ def resolve_advance_context(
         latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
 
     reviews = get_reviews_for_root(store, task)
-    active_review = next((r for r in reviews if r.status in ("pending", "in_progress")), None)
+    active_review = _select_active_review(reviews)
     completed_reviews = [r for r in reviews if r.status == "completed"]
     latest_completed_review = completed_reviews[0] if completed_reviews else None
 

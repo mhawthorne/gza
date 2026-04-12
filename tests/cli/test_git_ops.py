@@ -4298,15 +4298,19 @@ class TestAdvanceCommand:
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 1
 
-    def test_advance_mode_iterate_spawns_iterate_worker(self, tmp_path: Path):
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
-            "advance_mode: iterate\n"
-            "iterate_max_iterations: 7\n"
-        )
+    def test_advance_prefers_in_progress_review_over_pending_sibling(self, tmp_path: Path):
+        setup_config(tmp_path)
         store = make_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
         task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        pending_review = store.add(f"Review {task.id} pending", task_type="review", depends_on=task.id)
+        pending_review.status = "pending"
+        store.update(pending_review)
+
+        in_progress_review = store.add(f"Review {task.id} in-progress", task_type="review", depends_on=task.id)
+        in_progress_review.status = "in_progress"
+        store.update(in_progress_review)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -4327,16 +4331,46 @@ class TestAdvanceCommand:
             squash_threshold=None,
         )
 
-        with (
-            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
-            patch("gza.cli._spawn_background_worker") as spawn_worker,
-        ):
+        with patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker:
             rc = cmd_advance(args)
 
         assert rc == 0
         spawn_worker.assert_not_called()
-        spawn_iterate.assert_called_once()
-        assert spawn_iterate.call_args.kwargs["max_iterations"] == 7
+
+    def test_advance_runs_pending_review_when_no_in_progress_review_exists(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        pending_review = store.add(f"Review {task.id} pending", task_type="review", depends_on=task.id)
+        pending_review.status = "pending"
+        store.update(pending_review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=None,
+            new=False,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker:
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        spawn_worker.assert_called_once()
 
 
     def test_advance_new_batch_spawns_distinct_tasks(self, tmp_path: Path):
@@ -4388,104 +4422,6 @@ class TestAdvanceCommand:
         # Each of the 4 pending tasks should have been passed as an explicit task_id
         assert len(spawned_task_ids) == 4
         assert set(spawned_task_ids) == {t1.id, t2.id, t3.id, t4.id}
-
-    def test_advance_iterate_new_batch_needs_rebase_consumes_slot(self, tmp_path: Path):
-        """iterate mode accounts for needs_rebase as worker-consuming in --new --batch planning/execution."""
-        import io
-
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
-            "advance_mode: iterate\n"
-        )
-        store = make_store(tmp_path)
-        git = self._setup_git_repo(tmp_path)
-        task = self._create_implement_task_with_branch(store, git, tmp_path, "Conflict task")
-        pending = store.add("Pending task", task_type="implement")
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            dry_run=False,
-            auto=True,
-            max=None,
-            batch=1,
-            new=True,
-            no_docker=True,
-            plans=False,
-            unimplemented=False,
-            create=False,
-            no_resume_failed=False,
-            max_resume_attempts=None,
-            advance_type=None,
-            max_review_cycles=None,
-            squash_threshold=None,
-        )
-
-        with (
-            patch("gza.cli._determine_advance_action", return_value={"type": "needs_rebase", "description": "rebase"}),
-            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
-            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
-            patch("sys.stdout", new_callable=io.StringIO) as stdout,
-        ):
-            rc = cmd_advance(args)
-            output = stdout.getvalue()
-
-        assert rc == 0
-        assert pending.id not in output
-        assert "Will start 1 new pending task(s)" not in output
-        spawn_iterate.assert_called_once()
-        spawn_worker.assert_not_called()
-
-    def test_advance_iterate_new_batch_create_implement_consumes_slot(self, tmp_path: Path):
-        """iterate mode accounts for create_implement as worker-consuming in --new --batch planning/execution."""
-        import io
-
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
-            "advance_mode: iterate\n"
-        )
-        store = make_store(tmp_path)
-        self._setup_git_repo(tmp_path)
-
-        plan = store.add("Plan task", task_type="plan")
-        plan.status = "completed"
-        plan.completed_at = datetime.now(UTC)
-        store.update(plan)
-        pending = store.add("Pending task", task_type="implement")
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(plan.id),
-            dry_run=False,
-            auto=True,
-            max=None,
-            batch=1,
-            new=True,
-            no_docker=True,
-            plans=False,
-            unimplemented=False,
-            create=False,
-            no_resume_failed=False,
-            max_resume_attempts=None,
-            advance_type=None,
-            max_review_cycles=None,
-            squash_threshold=None,
-        )
-
-        with (
-            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
-            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
-            patch("sys.stdout", new_callable=io.StringIO) as stdout,
-        ):
-            rc = cmd_advance(args)
-            output = stdout.getvalue()
-
-        assert rc == 0
-        assert pending.id not in output
-        assert "Will start 1 new pending task(s)" not in output
-        spawn_iterate.assert_called_once()
-        spawn_worker.assert_not_called()
-
 
 class TestAdvanceMergeSquashThreshold:
     """Tests for merge_squash_threshold feature in gza advance."""
@@ -4654,9 +4590,7 @@ class TestAdvanceMergeSquashThreshold:
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 0
-        assert config.advance_mode == "work"
         assert config.max_resume_attempts == 3
-        assert config.iterate_max_iterations == 5
 
     def test_yaml_merge_squash_threshold_parsed(self, tmp_path: Path):
         """merge_squash_threshold is correctly parsed from gza.yaml."""
@@ -4664,16 +4598,6 @@ class TestAdvanceMergeSquashThreshold:
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 3\n")
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 3
-
-    def test_yaml_parses_advance_mode_and_iterate_max_iterations(self, tmp_path: Path):
-        from gza.config import Config
-
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nadvance_mode: iterate\niterate_max_iterations: 9\n"
-        )
-        config = Config.load(tmp_path)
-        assert config.advance_mode == "iterate"
-        assert config.iterate_max_iterations == 9
 
     def test_invalid_type_raises_config_error(self, tmp_path: Path):
         """Non-integer merge_squash_threshold in yaml raises ConfigError, not bare ValueError."""
