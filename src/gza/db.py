@@ -240,14 +240,14 @@ MIGRATION_V22_TO_V23 = "ALTER TABLE tasks ADD COLUMN running_pid INTEGER;"
 # Migration from v23 to v24
 MIGRATION_V23_TO_V24 = "ALTER TABLE tasks ADD COLUMN merged_at TEXT;"
 
-# Migration from v25 to v26
-MIGRATION_V25_TO_V26 = """
+# Migration from v27 to v28: add attach metrics columns
+MIGRATION_V27_TO_V28 = """
 ALTER TABLE tasks ADD COLUMN attach_count INTEGER;
 ALTER TABLE tasks ADD COLUMN attach_duration_seconds REAL;
 """
 
 # Schema version for migrations
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -635,6 +635,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (25, None),  # Manual migration: INTEGER PK → TEXT IDs
     (26, None),  # Manual migration: base36-text IDs → decimal-text IDs
     (27, None),  # Manual migration: remove TaskCycle bookkeeping tables/columns
+    (28, MIGRATION_V27_TO_V28),
 ]
 
 
