@@ -150,18 +150,18 @@ class TestBuildAutoReviewPrompt:
     def test_fallback_when_no_task_id(self):
         task = _task(id=5, slug=None, prompt="build the thing")
         result = build_auto_review_prompt(task)
-        assert result == "Review task 5: build the thing"
+        assert result == "Review task 5"
 
     def test_fallback_when_task_id_has_no_dash(self):
         task = _task(id=5, slug="nodash", prompt="build the thing")
         result = build_auto_review_prompt(task)
-        assert result == "Review task 5: build the thing"
+        assert result == "Review task 5"
 
-    def test_fallback_includes_truncated_prompt(self):
+    def test_fallback_does_not_include_impl_prompt_excerpt(self):
         long_prompt = "x" * 200
         task = _task(id=3, slug=None, prompt=long_prompt)
         result = build_auto_review_prompt(task)
-        assert result == f"Review task 3: {'x' * 100}"
+        assert result == "Review task 3"
 
     def test_fallback_without_prompt(self):
         task = _task(id=3, slug=None, prompt=None)

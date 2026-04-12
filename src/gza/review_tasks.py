@@ -78,10 +78,7 @@ def build_auto_review_prompt(
                 slug = slug[len(project_prefix) + 1:]
             return f"review {slug}"
 
-    review_prompt = f"Review task {impl_task.id}"
-    if impl_task.prompt:
-        review_prompt += f": {impl_task.prompt[:100]}"
-    return review_prompt
+    return f"Review task {impl_task.id}"
 
 
 def create_review_task(

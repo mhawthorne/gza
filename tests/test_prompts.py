@@ -9,8 +9,10 @@ from gza.db import SqliteTaskStore
 from gza.prompts import PromptBuilder
 
 REVIEW_CONTRACT_PARITY_CLAUSES = [
+    "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
     "Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
+    "Treat unexplained deviations from the provided plan or request as Must-Fix.",
     "Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.",
     "Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.",
     "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.",
@@ -18,10 +20,26 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
 ]
 
+REVIEW_SUMMARY_CHECKLIST_COUNT = 6
+REVIEW_SUMMARY_CHECKLIST_ITEMS = [
+    "Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?",
+    "Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?",
+    "Did I check for misleading output (contradictory UI/prompt/context signals)?",
+    "Was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence (plan decisions reflected in the diff, or request coverage) while calling out intentional deviations? If neither was provided, did I state \"No plan or request provided.\"?",
+    "Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?",
+    "If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?",
+]
+
 
 def _assert_contains_all_clauses(text: str, clauses: list[str]) -> None:
     for clause in clauses:
         assert clause in text
+
+
+def _assert_summary_checklist_contract(text: str) -> None:
+    assert f"exactly {REVIEW_SUMMARY_CHECKLIST_COUNT} bullets" in text
+    for item in REVIEW_SUMMARY_CHECKLIST_ITEMS:
+        assert item in text
 
 
 class TestPromptBuilderBuild:
@@ -182,9 +200,16 @@ class TestPromptBuilderBuild:
         assert "misleading output" in result
         assert "targeted regression tests" in result
         assert "config, CLI, or operator-facing behavior changed" in result
+        assert "## Original plan:" in result
+        assert "## Original request:" in result
+        assert "provided diff is authoritative" in result
+        assert "read unchanged source files" in result
+        assert "No plan or request provided." in result
+        assert "unexplained deviations from the provided plan or request" in result
         assert "Reserve Must-Fix for:" in result
+        _assert_summary_checklist_contract(result)
         checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
-        assert len(checklist_lines) == 5
+        assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT
         assert "Yes/No - ..." in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
@@ -201,30 +226,7 @@ class TestPromptBuilderBuild:
 
         assert "<Provide 3-5 bullets summarizing the review>" in content
         assert "<1-2 sentence overview of the changes>" not in content
-        assert (
-            "<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form"
-            in content
-        )
-        assert (
-            "<- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>"
-            in content
-        )
-        assert (
-            "<- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>"
-            in content
-        )
-        assert (
-            "<- Did I check for misleading output (contradictory UI/prompt/context signals)?>"
-            in content
-        )
-        assert (
-            "<- Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?>"
-            in content
-        )
-        assert (
-            "<- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>"
-            in content
-        )
+        _assert_summary_checklist_contract(content)
         assert (
             "<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
             in content
@@ -234,17 +236,48 @@ class TestPromptBuilderBuild:
             in content
         )
         assert (
+            "<Treat unexplained deviations from the provided plan or request as Must-Fix.>"
+            in content
+        )
+        assert (
             "<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>"
             in content
         )
 
+    def test_code_review_interactive_skill_requires_authoritative_diff_and_ask_handoff(
+        self,
+    ):
+        """Interactive review skill must hand off authoritative diff plus canonical ask context."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-code-review-interactive"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert (
+            "Pass the authoritative diff context (`## Implementation diff context`), canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available), and the PR number (if `--pr` was used and a PR was found) to the subagent."
+            in content
+        )
+        assert (
+            "Review the diff against the provided canonical ask context (`## Original plan:` or `## Original request:`) when present."
+            in content
+        )
+        assert (
+            "Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent."
+            not in content
+        )
+
     def test_review_contract_parity_between_template_and_interactive_scaffold(self):
-        """Test canonical blocking-discipline clauses are present in both review entrypoints."""
+        """Test canonical review contract clauses are present across review entrypoints."""
         root = Path(__file__).resolve().parents[1]
         template_content = (
             root / "src" / "gza" / "prompts" / "templates" / "review.txt"
         ).read_text()
-        skill_content = (
+        interactive_skill_content = (
             root
             / "src"
             / "gza"
@@ -252,9 +285,69 @@ class TestPromptBuilderBuild:
             / "gza-code-review-interactive"
             / "SKILL.md"
         ).read_text()
+        task_review_skill_content = (
+            root / "src" / "gza" / "skills" / "gza-task-review" / "SKILL.md"
+        ).read_text()
 
         _assert_contains_all_clauses(template_content, REVIEW_CONTRACT_PARITY_CLAUSES)
-        _assert_contains_all_clauses(skill_content, REVIEW_CONTRACT_PARITY_CLAUSES)
+        _assert_contains_all_clauses(
+            interactive_skill_content, REVIEW_CONTRACT_PARITY_CLAUSES
+        )
+        _assert_contains_all_clauses(
+            task_review_skill_content, REVIEW_CONTRACT_PARITY_CLAUSES
+        )
+        _assert_summary_checklist_contract(template_content)
+        _assert_summary_checklist_contract(interactive_skill_content)
+        _assert_summary_checklist_contract(task_review_skill_content)
+        assert "## Task Prompt Alignment" not in task_review_skill_content
+
+    def test_task_review_skill_does_not_provide_second_ask_source(self):
+        """Task-review scaffold should hand off only canonical ask context to subagents."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-task-review"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert (
+            "Review the diff against the provided ask context (`## Original plan:` or `## Original request:`)."
+            in content
+        )
+        assert "- Task prompt: `<impl_prompt>`" not in content
+
+    def test_task_review_skill_requires_parent_session_canonical_ask_capture(self):
+        """Task-review scaffold must define canonical ask capture and fallback behavior."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-task-review"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert "Capture one canonical ask section before spawning the reviewer:" in content
+        assert (
+            "If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged."
+            in content
+        )
+        assert (
+            "If linked ask content exists but is unavailable on this machine, pass an explicit unavailable-content marker section"
+            in content
+        )
+        assert (
+            "(plan task <TASK_ID> exists but content unavailable on this machine - flag as blocker)"
+            in content
+        )
+        assert (
+            "If no retrievable plan or request exists for this task, pass no ask section and let the reviewer state: `No plan or request provided.`"
+            in content
+        )
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
@@ -441,22 +534,20 @@ class TestPromptBuilderReviewTask:
         assert result.startswith("Review task 15")
 
     def test_review_task_prompt_with_impl_prompt(self):
-        """Test that review task prompt includes implementation prompt excerpt."""
+        """Test that review task prompt ignores implementation prompt text."""
         result = PromptBuilder().review_task_prompt(
             impl_task_id=15, impl_prompt="Add user authentication with JWT tokens"
         )
         assert "15" in result
-        assert "Add user authentication with JWT tokens" in result
+        assert "Add user authentication with JWT tokens" not in result
 
-    def test_review_task_prompt_truncates_long_impl_prompt(self):
-        """Test that long implementation prompts are truncated to 100 chars."""
+    def test_review_task_prompt_does_not_include_long_impl_prompt(self):
+        """Test that review task prompt does not embed long implementation prompts."""
         long_prompt = "x" * 200
         result = PromptBuilder().review_task_prompt(
             impl_task_id=1, impl_prompt=long_prompt
         )
-        # Should include at most 100 chars of the prompt
-        assert "x" * 100 in result
-        assert "x" * 101 not in result
+        assert "x" * 100 not in result
 
     def test_review_task_prompt_without_impl_prompt(self):
         """Test that review task prompt works without implementation prompt."""
@@ -470,7 +561,8 @@ class TestPromptBuilderReviewTask:
         assert result.startswith("Review task 3")
         assert "changed-files list" in result
         assert "inline diff/context" in result
-        assert "git discovery commands" in result
+        assert "provided diff is authoritative" in result
+        assert "read unchanged source files" in result
 
 
 class TestVerifyCommandConfig:

@@ -89,7 +89,24 @@ uv run gza show <IMPL_TASK_ID>
 uv run gza log <IMPL_TASK_ID>
 ```
 
-### Step 4: Run the review
+### Step 4: Capture review context in the parent session
+
+Capture one canonical ask section before spawning the reviewer:
+- If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged.
+- Otherwise, derive ask context from the linked task chain using the context gathered in Step 3.
+- If linked ask content exists but is unavailable on this machine, pass an explicit unavailable-content marker section (for example, `## Original plan:` followed by `(plan task <TASK_ID> exists but content unavailable on this machine - flag as blocker)`).
+- If no retrievable plan or request exists for this task, pass no ask section and let the reviewer state: `No plan or request provided.`
+
+### Step 5: Capture the committed diff
+
+If the caller already provided diff context, use that as-is and do not reconstruct it.
+Otherwise, collect the committed branch diff once in the parent session:
+```bash
+git diff main...<impl_branch>
+```
+Pass this diff to the subagent as `## Implementation diff context`.
+
+### Step 6: Run the review
 
 Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt:
 
@@ -100,7 +117,6 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 **Task context:**
 - Task ID: `<IMPL_TASK_ID>`
 - Task type: `<impl_task_type>`
-- Task prompt: `<impl_prompt>`
 - Branch: `<impl_branch>`
 - Group: `<impl_group>`
 
@@ -108,12 +124,11 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 
 **Step 2**: Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
 
-**Step 3**: Get the diff to review:
-```bash
-git diff main...<impl_branch>
-```
+**Step 3**: The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it. You may read unchanged source files when surrounding context is needed to judge correctness.
 
-**Step 4**: Review the diff against the task prompt. The task prompt describes what was requested — evaluate whether the implementation actually achieves it, not just whether the code is clean.
+**Step 3.5**: When you need to verify behavior that isn't visible in the diff (for example, whether a CLI command exists, how a called function works, or what a referenced method does), use Read, Grep, or Glob to check the current codebase. Do not guess.
+
+**Step 4**: Review the diff against the provided ask context (`## Original plan:` or `## Original request:`). Evaluate whether the implementation actually achieves that ask, not just whether the code is clean.
 
 **Step 5**: Write a structured review with these sections:
 
@@ -121,10 +136,11 @@ git diff main...<impl_branch>
 ## Summary
 
 <Provide 3-5 bullets summarizing the review>
-<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form and one short evidence clause each:>
+<Then answer this checklist with exactly 6 bullets in `Yes/No - ...` form and one short evidence clause each:>
 <- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>
 <- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>
 <- Did I check for misleading output (contradictory UI/prompt/context signals)?>
+<- Was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence (plan decisions reflected in the diff, or request coverage) while calling out intentional deviations? If neither was provided, did I state "No plan or request provided."?>
 <- Did I require targeted regression tests that match each failure mode (not generic "add tests")?>
 <- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>
 
@@ -133,17 +149,12 @@ git diff main...<impl_branch>
 <Use ### M1, ### M2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
 <Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat unexplained deviations from the provided plan or request as Must-Fix.>
 <Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
 <Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
 <Push style, cleanup, and non-risky refactors to Suggestions.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
-
-## Task Prompt Alignment
-
-<Evaluate whether the implementation fulfills the task prompt.>
-<Call out any requested behavior that is missing, partially implemented, or implemented differently than specified.>
-<Call out any unrequested changes that add scope or risk.>
 
 ## Suggestions
 
@@ -173,9 +184,9 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the branch name and PR number (if `--pr` was used) to the subagent.
+Pass the branch name, authoritative diff context, and the canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available) to the subagent, plus PR number if `--pr` was used.
 
-### Step 5: Save the review to the task database (optional)
+### Step 7: Save the review to the task database (optional)
 
 If the review found must-fix items (verdict is CHANGES_REQUESTED), ask the user if they want to record this as a review in the task database so `/gza-task-improve` can consume it:
 
@@ -205,7 +216,7 @@ print(f'Review saved as task #{created.id}')
 "
 ```
 
-### Step 6: Report back
+### Step 8: Report back
 
 After the subagent completes:
 - Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
@@ -215,7 +226,7 @@ After the subagent completes:
 
 ## Important notes
 
-- **Task prompt alignment is key** — unlike generic code review, this skill evaluates whether the implementation matches what the task asked for.
+- **Ask-adherence is mandatory** — use the Summary checklist item for `## Original plan:` or `## Original request:` to confirm the implementation matches the requested behavior, and treat unexplained deviations as must-fix blockers.
 - **Structured output matters** — the review format (M1, M2, S1, S2) must be compatible with `/gza-task-improve` so the improve workflow can consume it.
 - **Don't duplicate existing reviews** — if there's already a recent review, inform the user and ask before creating another one.
-- **Scope to branch files** — only review files in the diff between main and the implementation branch.
+- **Use authoritative diff context** — do not reconstruct or expand the diff in the reviewing subagent; only use provided diff context plus unchanged-source reads for verification.

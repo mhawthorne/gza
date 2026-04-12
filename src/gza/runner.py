@@ -820,6 +820,11 @@ def _build_context_from_chain(
                 if review_content:
                     context_parts.append("## Review feedback to address:\n")
                     context_parts.append(review_content)
+                else:
+                    context_parts.append(
+                        "## Review feedback to address:\n"
+                        f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
+                    )
 
         # Get the original plan (via based_on chain)
         if task.based_on:
@@ -831,6 +836,11 @@ def _build_context_from_chain(
                     if plan_content:
                         context_parts.append("\n## Original plan:\n")
                         context_parts.append(plan_content)
+                    else:
+                        context_parts.append(
+                            "\n## Original plan:\n"
+                            f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
+                        )
 
     # For implement tasks, include plan from based_on chain
     if task.task_type == "implement" and task.based_on:
@@ -853,6 +863,25 @@ def _build_context_from_chain(
                     if spec_path.exists():
                         spec_content = spec_path.read_text()
                         context_parts.append(f"## Specification\n\nThe following specification file ({impl_task.spec}) provides context for this implementation:\n\n{spec_content}")
+
+                # Inject ask context: plan output for plan-driven work, else full original request.
+                plan_task = None
+                if impl_task.based_on:
+                    plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
+
+                if plan_task:
+                    plan_content = _get_task_output(plan_task, project_dir)
+                    if plan_content:
+                        context_parts.append("\n## Original plan:\n")
+                        context_parts.append(plan_content)
+                    else:
+                        context_parts.append(
+                            "\n## Original plan:\n"
+                            f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
+                        )
+                elif impl_task.prompt:
+                    context_parts.append("\n## Original request:\n")
+                    context_parts.append(impl_task.prompt)
 
                 # Get diff if we have a branch (tiered strategy based on diff size)
                 if impl_task.branch and git:
@@ -880,15 +909,6 @@ def _build_context_from_chain(
                         )
                     except GitError:
                         pass  # Ignore git errors
-
-                # Find plan task from impl_task's chain
-                if impl_task.based_on:
-                    plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
-                    if plan_task:
-                        plan_content = _get_task_output(plan_task, project_dir)
-                        if plan_content:
-                            context_parts.append("\n## Original plan:\n")
-                            context_parts.append(plan_content)
 
                 improve_lineage_context = _build_review_improve_lineage_context(task, impl_task, store, project_dir)
                 if improve_lineage_context:

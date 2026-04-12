@@ -7,14 +7,19 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 1. **Host runner** queries the main database via `store.get()`
 2. **Host runner** calls `build_prompt()` which includes:
    - Spec file content (if the implementation task has a `spec` field)
-   - Git diff summary (changes from `main...{impl_branch}`)
-   - Original plan (walks up the `based_on` chain)
+  - Ask context from exactly one source when available:
+    - `## Original plan:` when a linked plan exists
+    - `## Original request:` fallback when no linked plan exists
+    - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
+   - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
+   - Improve-lineage context when applicable
+   - Explicit blocker markers when linked review/plan output exists but cannot be loaded on the current machine
 3. **Host runner** passes the complete prompt string to Docker/Claude
 4. **Claude** receives all context baked into the prompt
 
 Database lookups happen on the host before the worktree is even created. The worktree isolation doesn't affect prompt building.
 
-See `runner.py:260-291` for the review context building logic.
+Current review context logic lives in `_build_context_from_chain()` and `_build_review_diff_context()` in `src/gza/runner.py`.
 
 ## What the worktree contains
 

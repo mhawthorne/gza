@@ -278,6 +278,111 @@ class TestWorkerLifecycleLogging:
 class TestReviewContextFromChain:
     """Tests for self-contained review context generation."""
 
+    def test_review_context_includes_original_plan_when_available(self, tmp_path: Path):
+        """Plan-driven reviews include the original plan and exclude original request."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\nUse width 6 zero padding."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement task gza-1",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Original plan:" in context
+        assert "Use width 6 zero padding." in context
+        assert "## Original request:" not in context
+
+    def test_review_context_marks_unavailable_plan_as_blocker(self, tmp_path: Path):
+        """Plan-driven reviews surface explicit marker when plan exists but is unavailable."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement task gza-1",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        with patch("gza.runner._get_task_output", return_value=None):
+            context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Original plan:" in context
+        assert f"plan task {plan_task.id} exists but content unavailable" in context
+        assert "flag as blocker" in context
+        assert "## Original request:" not in context
+
+    def test_review_context_includes_full_original_request_for_prompt_driven_impl(self, tmp_path: Path):
+        """Prompt-driven reviews include full implementation prompt as original request."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        full_prompt = (
+            "Implement migration with exact fields: prefix, decimal-only sequence, and width="
+            "000006; include all edge cases and validation messages."
+        )
+        impl_task = store.add(prompt=full_prompt, task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Original request:" in context
+        assert full_prompt in context
+        assert "## Original plan:" not in context
+
+    def test_review_context_omits_ask_sections_when_no_plan_or_prompt(self, tmp_path: Path):
+        """If implementation has neither plan chain nor prompt, ask sections are omitted."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Temporary prompt", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.prompt = ""
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Original plan:" not in context
+        assert "## Original request:" not in context
+
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""
         db_path = tmp_path / "test.db"
@@ -729,6 +834,37 @@ class TestReviewContextFromChain:
         assert f"Improve {improve2.id}" in context
         assert "Lineage:" in context
         assert "2 prior review/improve cycle" in context
+
+    def test_improve_context_marks_unavailable_review_feedback(self, tmp_path: Path):
+        """Improve context marks review-feedback unavailability as a blocker."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        with patch("gza.runner._get_task_output", return_value=None):
+            context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Review feedback to address:" in context
+        assert f"review task {review_task.id} exists but content unavailable" in context
+        assert "flag as blocker" in context
 
     def test_first_review_has_no_tool_hints(self, tmp_path: Path):
         """First-time review (no prior cycles) does not include tool hints or lineage."""

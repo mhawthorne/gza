@@ -1,8 +1,8 @@
 ---
 name: gza-code-review-interactive
 description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
-allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
-version: 2.1.0
+allowed-tools: Bash(git:*), Bash(gh:*), Bash(uv run:*), Read, Agent, AskUserQuestion
+version: 2.3.0
 public: true
 ---
 
@@ -35,9 +35,25 @@ Requires being on a non-main branch with commits ahead of main. If not, stop and
 2. If no PR exists, stop and tell the user to create one first (do NOT create a PR automatically)
 3. Capture the PR number and URL
 
-### Step 3: Run the review
+### Step 3: Capture review context in the parent session
 
-Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt:
+Capture one canonical ask section before spawning the reviewer:
+- If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged.
+- Otherwise, try to resolve ask context from the branch's linked gza task chain (`uv run gza show <TASK_ID>` / `uv run gza log <TASK_ID>` is preferred once you identify the task for this branch).
+- If linked ask content exists but is unavailable on this machine, pass an explicit unavailable-content marker section (for example, `## Original plan:` followed by `(plan task <TASK_ID> exists but content unavailable on this machine - flag as blocker)`).
+- If no retrievable plan or request exists for this branch, pass no ask section and let the reviewer state: `No plan or request provided.`
+
+Then capture the committed diff:
+- If the caller already provided diff context, use that as-is and do not reconstruct it.
+Otherwise, collect the committed branch diff once in the parent session:
+```bash
+git diff main...HEAD
+```
+Pass this diff to the subagent as `## Implementation diff context`.
+
+### Step 4: Run the review
+
+Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt (include the captured diff context):
 
 ---
 
@@ -48,12 +64,11 @@ You are reviewing a pull request. Your job is to read the project review guideli
 **Step 2**: Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
 Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
 
-**Step 3**: Get the diff to review:
-```bash
-git diff main...HEAD
-```
+**Step 3**: The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it. You may read unchanged source files when surrounding context is needed to judge correctness.
 
 **Step 3.5**: When you need to verify behavior that isn't visible in the diff (e.g., whether a CLI command exists, how a called function works, what a referenced method does), use the Read, Grep, or Glob tools to check the current codebase. Do not guess or assume — verify.
+
+**Step 3.7**: Review the diff against the provided canonical ask context (`## Original plan:` or `## Original request:`) when present. If ask content is marked unavailable, call that out as a blocker. If neither ask section is provided, state `No plan or request provided.`
 
 **Step 4**: Write a structured review with these sections:
 
@@ -61,10 +76,11 @@ git diff main...HEAD
 ## Summary
 
 <Provide 3-5 bullets summarizing the review>
-<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form and one short evidence clause each:>
+<Then answer this checklist with exactly 6 bullets in `Yes/No - ...` form and one short evidence clause each:>
 <- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>
 <- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>
 <- Did I check for misleading output (contradictory UI/prompt/context signals)?>
+<- Was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence (plan decisions reflected in the diff, or request coverage) while calling out intentional deviations? If neither was provided, did I state "No plan or request provided."?>
 <- Did I require targeted regression tests that match each failure mode (not generic "add tests")?>
 <- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>
 
@@ -73,6 +89,7 @@ git diff main...HEAD
 <Use ### M1, ### M2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
 <Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat unexplained deviations from the provided plan or request as Must-Fix.>
 <Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
 <Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
@@ -107,7 +124,7 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the PR number (if `--pr` was used and a PR was found) or nothing to the subagent.
+Pass the authoritative diff context (`## Implementation diff context`), canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available), and the PR number (if `--pr` was used and a PR was found) to the subagent.
 
 ### Step 5: Report back
 
