@@ -196,8 +196,8 @@ class TestLogCommand:
         assert result.returncode == 0
         assert "Recovered via inferred path" in result.stdout
 
-    def test_log_by_task_id_resolves_to_latest_retry_resume_attempt(self, tmp_path: Path):
-        """Task lookup resolves deterministically to latest same-type based_on attempt."""
+    def test_log_by_task_id_shows_exact_task_log_not_latest_retry_resume_attempt(self, tmp_path: Path):
+        """Task lookup should show the requested task's own log, not a later based_on retry."""
         import json
 
         setup_config(tmp_path)
@@ -227,8 +227,10 @@ class TestLogCommand:
         result = run_gza("log", str(original.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Resolved to latest run attempt" in result.stdout
-        assert "Latest attempt output" in result.stdout
+        assert "Resolved to latest run attempt" not in result.stdout
+        assert "old run" in result.stdout
+        assert "Latest attempt output" not in result.stdout
+        assert "Status: failed" in result.stdout
 
     def test_log_by_task_id_non_root_query_stays_within_its_retry_chain(self, tmp_path: Path):
         """Querying a retry should not jump to a newer same-type sibling chain."""
@@ -321,8 +323,8 @@ class TestLogCommand:
         assert "retry A run" in result.stdout
         assert "Newest sibling output" not in result.stdout
 
-    def test_log_by_task_id_latest_attempt_ignores_mixed_type_lineage_nodes(self, tmp_path: Path):
-        """Latest-attempt resolution should only consider same-type retry/resume attempts."""
+    def test_log_by_task_id_does_not_resolve_across_lineage_nodes(self, tmp_path: Path):
+        """Task lookup should stay on the specified task, regardless of lineage node types."""
         import json
 
         setup_config(tmp_path)
@@ -366,48 +368,38 @@ class TestLogCommand:
         result = run_gza("log", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Resolved to latest run attempt" in result.stdout
-        assert f"task {retry.id}" in result.stdout
-        assert "retry chain output" in result.stdout
+        assert "Resolved to latest run attempt" not in result.stdout
+        assert "root run" in result.stdout
+        assert "retry chain output" not in result.stdout
         assert "review output" not in result.stdout
         assert "improve output" not in result.stdout
 
-    def test_resolve_latest_attempt_for_task_excludes_parallel_same_type_sibling_chains(self, tmp_path: Path):
-        """Resolver should stay within the queried task's direct same-type chain."""
-        from gza.cli import _resolve_latest_attempt_for_task
-
+    def test_log_task_lookup_does_not_fall_back_to_other_attempt_logs(self, tmp_path: Path):
+        """If the requested task log is missing, do not read logs from retries/resumes."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         root = store.add("Root task", task_type="implement")
         assert root.id is not None
-        root.started_at = datetime(2026, 2, 25, 12, 0, tzinfo=UTC)
         root.status = "failed"
+        root.log_file = ".gza/logs/root-missing.log"
         store.update(root)
 
-        chain_a = store.add("Chain A", based_on=root.id, task_type="implement")
-        assert chain_a.id is not None
-        chain_a.started_at = datetime(2026, 2, 26, 12, 0, tzinfo=UTC)
-        chain_a.status = "failed"
-        store.update(chain_a)
+        retry = store.add("Retry attempt", based_on=root.id, task_type="implement")
+        assert retry.id is not None
+        retry.status = "completed"
+        retry.log_file = ".gza/logs/retry-existing.log"
+        store.update(retry)
 
-        chain_a_resume = store.add("Chain A Resume", based_on=chain_a.id, task_type="implement")
-        assert chain_a_resume.id is not None
-        chain_a_resume.started_at = datetime(2026, 2, 26, 12, 10, tzinfo=UTC)
-        chain_a_resume.status = "completed"
-        store.update(chain_a_resume)
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "retry-existing.log").write_text(json.dumps({"type": "result", "result": "retry output"}))
 
-        sibling_chain = store.add("Sibling Chain", based_on=root.id, task_type="implement")
-        assert sibling_chain.id is not None
-        sibling_chain.started_at = datetime(2026, 2, 26, 12, 30, tzinfo=UTC)
-        sibling_chain.status = "completed"
-        store.update(sibling_chain)
+        result = run_gza("log", str(root.id), "--project", str(tmp_path))
 
-        selected, attempts = _resolve_latest_attempt_for_task(store, chain_a)
-
-        attempt_ids = [attempt.id for attempt in attempts]
-        assert selected.id == chain_a_resume.id
-        assert sibling_chain.id not in attempt_ids
+        assert result.returncode == 1
+        assert "Log file not found" in result.stdout
+        assert "retry output" not in result.stdout
 
     def test_log_default_mode_renders_entries_when_result_exists(self, tmp_path: Path):
         """Default formatted output should include entry rendering, not metadata-only output."""
