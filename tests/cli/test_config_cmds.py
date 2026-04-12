@@ -1446,10 +1446,11 @@ class TestStatsIterationsCommand:
         impl_with_recent_review = store.add("Implement old with recent review", task_type="implement")
         assert impl_with_recent_review.id is not None
         store.mark_completed(impl_with_recent_review, has_commits=False, stats=TaskStats(cost_usd=0.50))
+        old_activity_ts = (datetime.now(UTC) - timedelta(days=2)).isoformat()
         with store._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET created_at = ? WHERE id = ?",
-                ((datetime.now(UTC) - timedelta(days=2)).isoformat(), impl_with_recent_review.id),
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                (old_activity_ts, old_activity_ts, impl_with_recent_review.id),
             )
 
         recent_review = store.add("Recent review", task_type="review", depends_on=impl_with_recent_review.id)
@@ -1465,8 +1466,8 @@ class TestStatsIterationsCommand:
         store.mark_completed(impl_without_recent_activity, has_commits=False, stats=TaskStats(cost_usd=0.40))
         with store._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET created_at = ? WHERE id = ?",
-                ((datetime.now(UTC) - timedelta(days=2)).isoformat(), impl_without_recent_activity.id),
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                (old_activity_ts, old_activity_ts, impl_without_recent_activity.id),
             )
 
         result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
@@ -1475,6 +1476,109 @@ class TestStatsIterationsCommand:
         assert "Last 12 hours" in result.stdout
         assert impl_with_recent_review.id in result.stdout
         assert impl_without_recent_activity.id not in result.stdout
+
+    def test_stats_iterations_hours_includes_review_completed_in_window(self, tmp_path: Path):
+        """--hours should include rows when review completion is in-window despite older creation."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement old with overnight review", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.30))
+
+        review = store.add("Overnight review completion", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.05),
+        )
+
+        old_created = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        recent_completed = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with store._connect() as conn:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old_created, impl.id))
+            conn.execute(
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                (old_created, recent_completed, review.id),
+            )
+
+        result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert impl.id in result.stdout
+
+    def test_stats_iterations_hours_includes_improve_completed_in_window(self, tmp_path: Path):
+        """--hours should include rows when improve completion is in-window despite older creation."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement old with overnight improve", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.30))
+
+        review = store.add("Baseline review", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: CHANGES_REQUESTED",
+            stats=TaskStats(cost_usd=0.04),
+        )
+
+        improve = store.add("Overnight improve completion", task_type="improve", based_on=impl.id, depends_on=review.id)
+        assert improve.id is not None
+        store.mark_completed(improve, has_commits=False, stats=TaskStats(cost_usd=0.06))
+
+        old_created = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        recent_completed = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with store._connect() as conn:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old_created, impl.id))
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old_created, review.id))
+            conn.execute(
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                (old_created, recent_completed, improve.id),
+            )
+
+        result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert impl.id in result.stdout
+        assert "1 improves" in result.stdout
+
+    def test_stats_iterations_rejects_incompatible_time_window_flags(self, tmp_path: Path):
+        """--hours and --all should reject incompatible combinations."""
+        setup_config(tmp_path)
+
+        hours_result = run_gza(
+            "stats",
+            "iterations",
+            "--hours",
+            "12",
+            "--days",
+            "2",
+            "--project",
+            str(tmp_path),
+        )
+        assert hours_result.returncode == 1
+        assert "--hours cannot be combined" in hours_result.stderr
+
+        all_result = run_gza(
+            "stats",
+            "iterations",
+            "--all",
+            "--hours",
+            "12",
+            "--project",
+            str(tmp_path),
+        )
+        assert all_result.returncode == 1
+        assert "--all cannot be combined" in all_result.stderr
 
 
 class TestStatsCommand:

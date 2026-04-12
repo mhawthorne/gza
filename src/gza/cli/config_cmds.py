@@ -432,12 +432,24 @@ def _cmd_stats_iterations(
 ) -> int:
     """Show per-implementation review/improve iteration rollups."""
 
-    def _task_dt(task: Task) -> datetime | None:
-        if task.created_at is None:
+    def _normalize_dt(dt: datetime | None) -> datetime | None:
+        if dt is None:
             return None
-        if task.created_at.tzinfo is not None:
-            return task.created_at.astimezone().replace(tzinfo=None)
-        return task.created_at
+        if dt.tzinfo is not None:
+            return dt.astimezone().replace(tzinfo=None)
+        return dt
+
+    def _task_dt(task: Task) -> datetime | None:
+        return _normalize_dt(task.created_at)
+
+    def _activity_dt(task: Task) -> datetime | None:
+        # For operational windowing, completed work should be attributed by
+        # completion time; incomplete rows fall back to creation time.
+        if task.status == "completed":
+            completed_dt = _normalize_dt(task.completed_at)
+            if completed_dt is not None:
+                return completed_dt
+        return _task_dt(task)
 
     def _in_window(dt: datetime | None) -> bool:
         if dt is None:
@@ -480,9 +492,9 @@ def _cmd_stats_iterations(
         improves = store.get_improve_tasks_by_root(impl.id)
 
         if not (
-            _in_window(_task_dt(impl))
-            or any(_in_window(_task_dt(review)) for review in reviews)
-            or any(_in_window(_task_dt(improve)) for improve in improves)
+            _in_window(_activity_dt(impl))
+            or any(_in_window(_activity_dt(review)) for review in reviews)
+            or any(_in_window(_activity_dt(improve)) for improve in improves)
         ):
             continue
 
@@ -548,7 +560,7 @@ def _cmd_stats_iterations(
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    """Show review analytics. Use 'gza stats reviews' to see review analytics."""
+    """Show stats analytics subcommands for reviews and iterations."""
     stats_subcommand: str | None = getattr(args, 'stats_subcommand', None)
 
     if stats_subcommand is None:
@@ -598,6 +610,22 @@ def cmd_stats(args: argparse.Namespace) -> int:
             return 1
         if raw_hours_i is not None and raw_hours_i <= 0:
             print("Error: --hours must be >= 1", file=sys.stderr)
+            return 1
+        if all_time_i and any(
+            value is not None for value in (raw_hours_i, raw_days_i, raw_start_i, raw_end_i)
+        ):
+            print(
+                "Error: --all cannot be combined with --hours/--days/--start-date/--end-date",
+                file=sys.stderr,
+            )
+            return 1
+        if raw_hours_i is not None and any(
+            value is not None for value in (raw_days_i, raw_start_i, raw_end_i)
+        ):
+            print(
+                "Error: --hours cannot be combined with --days/--start-date/--end-date",
+                file=sys.stderr,
+            )
             return 1
 
         start_dt_i: datetime | None
