@@ -84,3 +84,49 @@ def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
 def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
     assert "needs_rebase" in WORKER_CONSUMING_ACTIONS
     assert "create_implement" in WORKER_CONSUMING_ACTIONS
+
+
+def test_evaluate_prefers_in_progress_review_over_pending_sibling(tmp_path: Path):
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/review-priority"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    pending = store.add(f"Review {task.id} pending", task_type="review", depends_on=task.id)
+    pending.status = "pending"
+    store.update(pending)
+
+    in_progress = store.add(f"Review {task.id} active", task_type="review", depends_on=task.id)
+    in_progress.status = "in_progress"
+    store.update(in_progress)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "wait_review"
+    assert action["review_task"].id == in_progress.id
+
+
+def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path):
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/review-pending"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    pending = store.add(f"Review {task.id} pending", task_type="review", depends_on=task.id)
+    pending.status = "pending"
+    store.update(pending)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "run_review"
+    assert action["review_task"].id == pending.id

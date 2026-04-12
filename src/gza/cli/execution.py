@@ -1001,7 +1001,7 @@ def _spawn_background_iterate(
         args,
         config,
         impl_task,
-        max_iterations=getattr(args, "max_iterations", config.iterate_max_iterations) or config.iterate_max_iterations,
+        max_iterations=getattr(args, "max_iterations", None) or 5,
         resume=getattr(args, "resume", False),
         retry=getattr(args, "retry", False),
     )
@@ -1018,9 +1018,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         return value if isinstance(value, int) else default
 
     max_iterations_arg = getattr(args, "max_iterations", None)
-    max_iterations = max_iterations_arg if max_iterations_arg is not None else _int_config(
-        getattr(config, "iterate_max_iterations", None), 5
-    )
+    max_iterations = max_iterations_arg if max_iterations_arg is not None else 5
     dry_run: bool = getattr(args, 'dry_run', False)
     use_resume: bool = getattr(args, 'resume', False)
     use_retry: bool = getattr(args, 'retry', False)

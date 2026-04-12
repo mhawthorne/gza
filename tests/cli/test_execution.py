@@ -2828,17 +2828,15 @@ class TestIterateCommand:
         assert result.returncode == 0
         assert "dry-run" in result.stdout.lower()
 
-    def test_cycle_uses_config_default_iterations_when_flag_omitted(self, tmp_path: Path):
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\niterate_max_iterations: 7\n"
-        )
+    def test_cycle_uses_default_iterations_when_flag_omitted(self, tmp_path: Path):
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
         result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "max 7 iterations" in result.stdout
+        assert "max 5 iterations" in result.stdout
 
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
         """gza iterate rejects tasks that are not implement type."""
@@ -4305,7 +4303,6 @@ class TestIterateCommand:
             use_docker=False,
             project_prefix="testproject",
             max_resume_attempts=3,
-            iterate_max_iterations=5,
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -4316,6 +4313,78 @@ class TestIterateCommand:
             if task.id == review.id and not resume:
                 task.status = "failed"
                 task.failure_reason = "MAX_STEPS"
+                task.session_id = "review-session"
+                store.update(task)
+                return 1
+            task.status = "completed"
+            task.output_content = "**Verdict: APPROVED**"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                side_effect=[{"type": "run_review", "description": "Run review", "review_task": review}],
+            ),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        assert run_fg.call_count == 2
+        assert run_fg.call_args_list[0].kwargs.get("resume", False) is False
+        assert run_fg.call_args_list[1].kwargs["resume"] is True
+        children = store.get_based_on_children(review.id)
+        assert len(children) == 1
+
+    def test_iterate_run_review_auto_resumes_test_failure_until_budget(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "pending"
+        review.session_id = "review-session"
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=3,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=2,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        failed_once = False
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            nonlocal failed_once
+            task = store.get(task_id)
+            assert task is not None
+            if not failed_once:
+                failed_once = True
+                task.status = "failed"
+                task.failure_reason = "TEST_FAILURE"
                 task.session_id = "review-session"
                 store.update(task)
                 return 1
@@ -4371,7 +4440,6 @@ class TestIterateCommand:
             use_docker=False,
             project_prefix="testproject",
             max_resume_attempts=3,
-            iterate_max_iterations=5,
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -4432,7 +4500,6 @@ class TestIterateCommand:
             use_docker=False,
             project_prefix="testproject",
             max_resume_attempts=3,
-            iterate_max_iterations=5,
         )
 
         with (
@@ -4472,7 +4539,6 @@ class TestIterateCommand:
             use_docker=False,
             project_prefix="testproject",
             max_resume_attempts=3,
-            iterate_max_iterations=5,
         )
         mock_git = MagicMock()
         mock_git.current_branch.side_effect = RuntimeError("branch boom")

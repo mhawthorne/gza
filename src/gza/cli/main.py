@@ -293,7 +293,7 @@ def main() -> int:
         "--no-resume-failed",
         action="store_true",
         dest="no_resume_failed",
-        help="Skip auto-resume of failed tasks (do not create resume tasks for MAX_STEPS/MAX_TURNS failures)",
+        help="Skip auto-resume of failed tasks (do not create resume tasks for MAX_STEPS/MAX_TURNS/TEST_FAILURE failures)",
     )
     advance_parser.add_argument(
         "--max-resume-attempts",
@@ -1115,7 +1115,7 @@ def main() -> int:
             default=None,
             dest="max_iterations",
             metavar="N",
-            help="Maximum iterate actions (default: iterate_max_iterations from gza.yaml, default 5)",
+            help="Maximum iterate actions (default: 5)",
         )
         iterate_parser.add_argument(
             "--dry-run",

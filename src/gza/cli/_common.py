@@ -27,6 +27,7 @@ from ..console import (
 from ..db import ManualMigrationRequired, SqliteTaskStore, Task as DbTask, resolve_task_id, task_id_numeric_key
 from ..failure_policy import is_resumable_failure_reason
 from ..prompts import PromptBuilder
+from ..resume_policy import is_resumable_failure
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
     create_review_task,
@@ -1065,7 +1066,7 @@ def run_with_resume(
     max_resume_attempts: int | None = None,
     on_resume: Callable[[DbTask, DbTask, int, int], None] | None = None,
 ) -> tuple[DbTask, int]:
-    """Execute a task and auto-resume MAX_STEPS/MAX_TURNS failures.
+    """Execute a task and auto-resume eligible failed tasks.
 
     Args:
         config: Loaded project configuration.
@@ -1103,10 +1104,10 @@ def run_with_resume(
         if rc == 0:
             return refreshed, 0
 
-        resumable_failure = (
-            refreshed.status == "failed"
-            and refreshed.failure_reason in {"MAX_STEPS", "MAX_TURNS"}
-            and refreshed.session_id is not None
+        resumable_failure = is_resumable_failure(
+            status=refreshed.status,
+            failure_reason=refreshed.failure_reason,
+            session_id=refreshed.session_id,
         )
         if not resumable_failure:
             return refreshed, rc

@@ -88,12 +88,7 @@ project_name: my-project
 
 # --- Advance/Iterate ---
 
-# Advance execution mode:
-# - work: advance performs one lifecycle action per task
-# - iterate: advance starts iterate workers per eligible task
-# advance_mode: work
-
-# Auto-resume budget for MAX_STEPS/MAX_TURNS failures (default: 3)
+# Auto-resume budget for MAX_STEPS/MAX_TURNS/TEST_FAILURE failures (default: 3)
 # max_resume_attempts: 3
 
 # Default iterate action budget when --max-iterations is omitted (default: 5)

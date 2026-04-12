@@ -42,7 +42,6 @@ from ._common import (
     _create_review_task,
     _get_pager,
     _looks_like_task_id,
-    _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     get_store,
@@ -1298,7 +1297,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
     create_mode: bool = getattr(args, 'create', False)
     no_resume_failed: bool = getattr(args, 'no_resume_failed', False)
     max_resume_attempts_override: int | None = getattr(args, 'max_resume_attempts', None)
-    advance_mode: str = config.advance_mode
     advance_type: str | None = getattr(args, 'advance_type', None)
 
     # Determine effective max_resume_attempts
@@ -1541,61 +1539,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
-
-        if advance_mode == "iterate" and action_type in WORKER_CONSUMING_ACTIONS:
-            iterate_target: DbTask | None = None
-            iterate_resume = False
-
-            if action_type == "create_implement":
-                prompt_text = _unimplemented_implement_prompt(task)
-                impl_task = store.add(
-                    prompt=prompt_text,
-                    task_type="implement",
-                    based_on=task.id,
-                    group=task.group,
-                )
-                assert impl_task.id is not None
-                console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")
-                iterate_target = impl_task
-            elif task.task_type == "implement":
-                iterate_target = task
-                iterate_resume = action_type == "resume"
-            else:
-                iterate_target = None
-
-            if iterate_target is None or iterate_target.id is None:
-                console.print(
-                    f"      [{_c_warn}]SKIP: iterate mode requires an implement task target[/{_c_warn}]"
-                )
-                skip_count += 1
-                print()
-                continue
-
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, "no_docker", False),
-            )
-            rc = _spawn_background_iterate_worker(
-                worker_args,
-                config,
-                iterate_target,
-                max_iterations=config.iterate_max_iterations,
-                resume=iterate_resume,
-                retry=False,
-                quiet=True,
-            )
-            workers_started += 1
-            if rc == 0:
-                console.print(
-                    f"      [{_c_ok}]✓ Started iterate worker for {iterate_target.id}[/{_c_ok}]"
-                )
-                success_count += 1
-            else:
-                console.print(
-                    f"      [{_c_err}]✗ Failed to start iterate worker for {iterate_target.id}[/{_c_err}]"
-                )
-                error_count += 1
-            print()
-            continue
 
         if action_type == 'merge':
             merge_args = _build_auto_merge_args(config, git, task, target_branch)
