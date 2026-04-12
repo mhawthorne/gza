@@ -375,13 +375,14 @@ class CodexProvider(Provider):
             base_input = _as_nonnegative_int(data.get("input_tokens"))
             base_output = _as_nonnegative_int(data.get("output_tokens"))
 
-            turn_start_input_chars = _as_nonnegative_int(data.get("turn_start_input_chars"))
-            turn_start_output_chars = _as_nonnegative_int(data.get("turn_start_output_chars"))
             approx_input_chars = _as_nonnegative_int(data.get("approx_input_chars"))
             approx_output_chars = _as_nonnegative_int(data.get("approx_output_chars"))
 
-            est_input = base_input + _estimate_tokens_from_chars(max(0, approx_input_chars - turn_start_input_chars))
-            est_output = base_output + _estimate_tokens_from_chars(max(0, approx_output_chars - turn_start_output_chars))
+            # Keep estimates cumulative until real usage arrives for the current turn.
+            # This avoids resetting displayed totals at turn boundaries when Codex
+            # has not emitted usage events yet.
+            est_input = base_input + _estimate_tokens_from_chars(approx_input_chars)
+            est_output = base_output + _estimate_tokens_from_chars(approx_output_chars)
             return est_input, est_output
 
         def _start_step(
@@ -439,8 +440,6 @@ class CodexProvider(Provider):
                     data["turn_count"] += 1
                     data["item_count_in_turn"] = 0
                     data["_current_step_event"] = None
-                    data["turn_start_input_chars"] = data.get("approx_input_chars", 0)
-                    data["turn_start_output_chars"] = data.get("approx_output_chars", 0)
                     _ensure_step_store(data)
                     legacy_turn_id = _current_turn_id(data)
                     if legacy_turn_id:
