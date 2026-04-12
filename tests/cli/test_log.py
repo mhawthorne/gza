@@ -6,10 +6,11 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from gza.cli import _build_step_timeline, _format_log_entry
+from gza.cli import _LiveLogPrinter, _build_step_timeline, _format_log_entry
 from gza.db import SqliteTaskStore
 
 from .conftest import LOG_FIXTURES_DIR, make_store, run_gza, setup_config
@@ -432,7 +433,7 @@ class TestLogCommand:
         assert result.returncode == 0
         assert "Entry text should render" in result.stdout
 
-    def test_log_follow_by_task_uses_running_worker_when_available(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_log_follow_by_task_uses_running_worker_when_available(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
         """-t -f should follow via live worker when a task is actively running."""
         import argparse
         import json
@@ -494,6 +495,67 @@ class TestLogCommand:
         assert rc == 0
         assert captured["worker_id"] == "w-20260227-010101"
         assert captured["task_id"] == str(task.id)
+        output = capsys.readouterr().out
+        assert "Task: Running task for follow" in output
+        assert "ID:" in output
+        assert "Status: in_progress" in output
+
+    def test_log_follow_raw_by_task_skips_header_even_when_running(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+        """-t -f --raw should not print the task header banner."""
+        import argparse
+
+        from gza.cli import cmd_log
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Running task raw follow")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.log_file = ".gza/logs/follow-raw.log"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-20260227-020202",
+            pid=os.getpid(),
+            task_id=task.id,
+            task_slug=task.slug,
+            started_at="2026-02-27T02:02:02+00:00",
+            status="running",
+            log_file=task.log_file,
+            worktree=None,
+            is_background=False,
+        )
+        registry.register(worker)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "follow-raw.log").write_text('{"type":"assistant","message":{"role":"assistant","content":"raw"}}\n')
+
+        def fake_tail(*_args: Any, **_kwargs: Any) -> int:
+            return 0
+
+        monkeypatch.setattr("gza.cli._tail_log_file", fake_tail)
+
+        args = argparse.Namespace(
+            identifier=str(task.id),
+            slug=False,
+            worker=False,
+            follow=True,
+            raw=True,
+            timeline_mode=None,
+            tail=None,
+            project_dir=tmp_path,
+        )
+
+        rc = cmd_log(args)
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Task: Running task raw follow" not in output
+        assert "ID:" not in output
 
     def test_log_follow_by_task_not_running_falls_back_to_static_output(self, tmp_path: Path):
         """-t -f should print persisted logs and exit when task is not actively running."""
@@ -522,6 +584,8 @@ class TestLogCommand:
 
         assert result.returncode == 0
         assert "persisted output" in result.stdout
+        assert "Task: Completed task with persisted log" in result.stdout
+        assert "ID:" in result.stdout
 
     def test_log_steps_compact_renders_step_labels(self, tmp_path: Path):
         """--steps renders compact step-first timeline anchors."""
@@ -1112,3 +1176,45 @@ class TestBuildStepTimeline:
         steps = _build_step_timeline(entries)
         assert len(steps) == 1
         assert steps[0]["message_text"] == "[gza:info] Task: #1 slug"
+
+
+def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_LiveLogPrinter should use StreamOutputFormatter() and route stream prints via formatter console."""
+    import gza.providers.output_formatter as output_formatter
+
+    formatter_kwargs: dict[str, Any] = {}
+    printed: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                printed.append(str(args[0]))
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            formatter_kwargs.update(kwargs)
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "result", "subtype": "warning", "result": "watch this"})
+
+    assert formatter_kwargs == {}
+    assert any("\\[result] warning:" in line for line in printed)

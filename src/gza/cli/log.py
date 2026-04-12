@@ -263,7 +263,8 @@ class _LiveLogPrinter:
 
     def __init__(self, *, live: bool = True) -> None:
         from ..providers.output_formatter import StreamOutputFormatter, truncate_text as _trunc
-        self._fmt = StreamOutputFormatter(console=console)
+        self._fmt = StreamOutputFormatter()
+        self._console = self._fmt.console
         self._trunc = _trunc
         self._live = live
         self._seen_msg_ids: set[str] = set()
@@ -295,7 +296,7 @@ class _LiveLogPrinter:
                 self._step_count += 1
 
                 if self._step_count > 1:
-                    console.print()
+                    self._console.print()
 
                 if self._live:
                     usage = message.get("usage", {})
@@ -312,7 +313,7 @@ class _LiveLogPrinter:
                         blank_line_before=False,
                     )
                 else:
-                    console.print(
+                    self._console.print(
                         f"| Step {self._step_count} |",
                         style=blue,
                     )
@@ -327,7 +328,7 @@ class _LiveLogPrinter:
                     if not isinstance(content, dict):
                         continue
                     if content.get("type") == "tool_use":
-                        console.print()
+                        self._console.print()
                         self._print_tool_use(content)
                     elif content.get("type") == "text":
                         text = content.get("text", "").strip()
@@ -348,16 +349,16 @@ class _LiveLogPrinter:
                         if is_error:
                             self._fmt.print_error(result)
                         else:
-                            console.print(rich_escape(result), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
+                            self._console.print(rich_escape(result), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
 
         elif entry_type == "gza":
             subtype = entry.get("subtype", "")
             message = entry.get("message", "")
             if message:
                 if subtype:
-                    console.print(f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
+                    self._console.print(f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
                 else:
-                    console.print(f"[{_lc()}]\\[gza][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
+                    self._console.print(f"[{_lc()}]\\[gza][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
 
         elif entry_type == "thread.started":
             thread_id = entry.get("thread_id", "")
@@ -369,7 +370,7 @@ class _LiveLogPrinter:
                 self._start_time = time.time()
             self._step_count += 1
             if self._step_count > 1:
-                console.print()
+                self._console.print()
             if self._live:
                 elapsed = int(time.time() - self._start_time)
                 total_tokens = self._total_input_tokens + self._total_output_tokens
@@ -378,7 +379,7 @@ class _LiveLogPrinter:
                     blank_line_before=False,
                 )
             else:
-                console.print(
+                self._console.print(
                     f"| Step {self._step_count} |",
                     style=blue,
                 )
@@ -393,7 +394,7 @@ class _LiveLogPrinter:
                     self._fmt.print_agent_message(text.strip())
             elif item.get("type") == "command_execution":
                 command = item.get("command", "")
-                console.print()
+                self._console.print()
                 self._fmt.print_tool_event("Bash", self._trunc(command, 80))
                 aggregated_output = item.get("aggregated_output", "")
                 exit_code = item.get("exit_code")
@@ -405,7 +406,7 @@ class _LiveLogPrinter:
                     if is_error:
                         self._fmt.print_error(output)
                     else:
-                        console.print(rich_escape(output), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
+                        self._console.print(rich_escape(output), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
 
         elif entry_type == "result":
             is_error = entry.get("is_error", False)
@@ -415,13 +416,13 @@ class _LiveLogPrinter:
                 self._fmt.print_error(f"[result] ERROR: {result_text}")
             elif subtype and subtype != "success":
                 if isinstance(result_text, str) and result_text.strip():
-                    console.print(f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text.strip())}", soft_wrap=True)
+                    self._console.print(f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text.strip())}", soft_wrap=True)
                 else:
-                    console.print(f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]", soft_wrap=True)
+                    self._console.print(f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]", soft_wrap=True)
             else:
                 # Success result
                 if isinstance(result_text, str) and result_text.strip():
-                    console.print(f"[green]\\[result][/green] {rich_escape(result_text.strip())}", soft_wrap=True)
+                    self._console.print(f"[green]\\[result][/green] {rich_escape(result_text.strip())}", soft_wrap=True)
 
     def _print_tool_use(self, content: dict) -> None:
         tool_name = content.get("name", "unknown")
@@ -853,6 +854,47 @@ def _load_log_file_entries(log_path: Path) -> tuple[dict | None, list[dict], str
     return log_data, entries, content
 
 
+def _print_log_header(
+    *,
+    task: DbTask | None,
+    worker: WorkerMetadata | None,
+    log_path: Path,
+    is_running: bool,
+    using_startup_log: bool,
+    resolution_note: str | None,
+) -> None:
+    """Print the static task/worker header banner for ``gza log``."""
+    _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
+    console.print(_sep, soft_wrap=True)
+    if task:
+        prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
+        console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
+        console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.slug or '')}", soft_wrap=True)
+        _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
+        _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
+        console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
+        if resolution_note:
+            console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
+        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+        if using_startup_log:
+            console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
+        if task.branch:
+            console.print(f"[{_lc()}]Branch:[/{_lc()}] {rich_escape(task.branch)}", soft_wrap=True)
+    elif worker:
+        console.print(f"[{_lc()}]Worker:[/{_lc()}] {rich_escape(worker.worker_id)}", soft_wrap=True)
+        _w_status = worker.status if worker.status else "unknown"
+        if is_running and _w_status != "running":
+            # Prefer live process state when worker metadata is stale.
+            _w_status = "running"
+        _w_color = PS_STATUS_COLORS.get(_w_status, "white")
+        console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
+        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+        if using_startup_log:
+            console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
+    console.print(_sep, soft_wrap=True)
+    console.print()
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     """Display the log for a task or worker."""
     config = Config.load(args.project_dir)
@@ -951,6 +993,16 @@ def cmd_log(args: argparse.Namespace) -> int:
     # Check for raw mode
     raw_mode = hasattr(args, 'raw') and args.raw
 
+    if follow and not raw_mode:
+        _print_log_header(
+            task=task,
+            worker=worker,
+            log_path=log_path,
+            is_running=is_running,
+            using_startup_log=using_startup_log,
+            resolution_note=resolution_note,
+        )
+
     if follow or raw_mode:
         # Live streaming mode - use the formatted streaming output
         return _tail_log_file(
@@ -987,35 +1039,16 @@ def cmd_log(args: argparse.Namespace) -> int:
             return 1
 
         # Display header
+        _print_log_header(
+            task=task,
+            worker=worker,
+            log_path=log_path,
+            is_running=is_running,
+            using_startup_log=using_startup_log,
+            resolution_note=resolution_note,
+        )
+
         _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
-        console.print(_sep, soft_wrap=True)
-        if task:
-            prompt_display = task.prompt[:100] if task.prompt else "(no prompt)"
-            console.print(f"[{pink}]Task: {rich_escape(prompt_display)}[/{pink}]", soft_wrap=True)
-            console.print(f"[{_lc()}]ID:[/{_lc()}] {task.id} | [{_lc()}]Slug:[/{_lc()}] {rich_escape(task.slug or '')}", soft_wrap=True)
-            _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
-            _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
-            console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
-            if resolution_note:
-                console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
-            console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
-            if using_startup_log:
-                console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
-            if task.branch:
-                console.print(f"[{_lc()}]Branch:[/{_lc()}] {rich_escape(task.branch)}", soft_wrap=True)
-        elif worker:
-            console.print(f"[{_lc()}]Worker:[/{_lc()}] {rich_escape(worker.worker_id)}", soft_wrap=True)
-            _w_status = worker.status if worker.status else "unknown"
-            if is_running and _w_status != "running":
-                # Prefer live process state when worker metadata is stale.
-                _w_status = "running"
-            _w_color = PS_STATUS_COLORS.get(_w_status, "white")
-            console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
-            console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
-            if using_startup_log:
-                console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
-        console.print(_sep, soft_wrap=True)
-        console.print()
 
         timeline_mode = getattr(args, "timeline_mode", None)
         if timeline_mode and entries:
