@@ -9,6 +9,7 @@ from gza.db import SqliteTaskStore
 from gza.prompts import PromptBuilder
 
 REVIEW_CONTRACT_PARITY_CLAUSES = [
+    "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
     "Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
     "Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.",
@@ -18,10 +19,26 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
 ]
 
+REVIEW_SUMMARY_CHECKLIST_COUNT = 6
+REVIEW_SUMMARY_CHECKLIST_ITEMS = [
+    "Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?",
+    "Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?",
+    "Did I check for misleading output (contradictory UI/prompt/context signals)?",
+    "Was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence (plan decisions reflected in the diff, or request coverage) while calling out intentional deviations? If neither was provided, did I state \"No plan or request provided.\"?",
+    "Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?",
+    "If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?",
+]
+
 
 def _assert_contains_all_clauses(text: str, clauses: list[str]) -> None:
     for clause in clauses:
         assert clause in text
+
+
+def _assert_summary_checklist_contract(text: str) -> None:
+    assert f"exactly {REVIEW_SUMMARY_CHECKLIST_COUNT} bullets" in text
+    for item in REVIEW_SUMMARY_CHECKLIST_ITEMS:
+        assert item in text
 
 
 class TestPromptBuilderBuild:
@@ -182,9 +199,16 @@ class TestPromptBuilderBuild:
         assert "misleading output" in result
         assert "targeted regression tests" in result
         assert "config, CLI, or operator-facing behavior changed" in result
+        assert "## Original plan:" in result
+        assert "## Original request:" in result
+        assert "provided diff is authoritative" in result
+        assert "read unchanged source files" in result
+        assert "No plan or request provided." in result
+        assert "unexplained deviations from the provided plan or request" in result
         assert "Reserve Must-Fix for:" in result
+        _assert_summary_checklist_contract(result)
         checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
-        assert len(checklist_lines) == 5
+        assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT
         assert "Yes/No - ..." in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
@@ -201,30 +225,7 @@ class TestPromptBuilderBuild:
 
         assert "<Provide 3-5 bullets summarizing the review>" in content
         assert "<1-2 sentence overview of the changes>" not in content
-        assert (
-            "<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form"
-            in content
-        )
-        assert (
-            "<- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>"
-            in content
-        )
-        assert (
-            "<- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>"
-            in content
-        )
-        assert (
-            "<- Did I check for misleading output (contradictory UI/prompt/context signals)?>"
-            in content
-        )
-        assert (
-            "<- Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?>"
-            in content
-        )
-        assert (
-            "<- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>"
-            in content
-        )
+        _assert_summary_checklist_contract(content)
         assert (
             "<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
             in content
@@ -239,7 +240,7 @@ class TestPromptBuilderBuild:
         )
 
     def test_review_contract_parity_between_template_and_interactive_scaffold(self):
-        """Test canonical blocking-discipline clauses are present in both review entrypoints."""
+        """Test canonical review contract clauses are present in both review entrypoints."""
         root = Path(__file__).resolve().parents[1]
         template_content = (
             root / "src" / "gza" / "prompts" / "templates" / "review.txt"
@@ -255,6 +256,8 @@ class TestPromptBuilderBuild:
 
         _assert_contains_all_clauses(template_content, REVIEW_CONTRACT_PARITY_CLAUSES)
         _assert_contains_all_clauses(skill_content, REVIEW_CONTRACT_PARITY_CLAUSES)
+        _assert_summary_checklist_contract(template_content)
+        _assert_summary_checklist_contract(skill_content)
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""
@@ -441,22 +444,20 @@ class TestPromptBuilderReviewTask:
         assert result.startswith("Review task 15")
 
     def test_review_task_prompt_with_impl_prompt(self):
-        """Test that review task prompt includes implementation prompt excerpt."""
+        """Test that review task prompt ignores implementation prompt text."""
         result = PromptBuilder().review_task_prompt(
             impl_task_id=15, impl_prompt="Add user authentication with JWT tokens"
         )
         assert "15" in result
-        assert "Add user authentication with JWT tokens" in result
+        assert "Add user authentication with JWT tokens" not in result
 
-    def test_review_task_prompt_truncates_long_impl_prompt(self):
-        """Test that long implementation prompts are truncated to 100 chars."""
+    def test_review_task_prompt_does_not_include_long_impl_prompt(self):
+        """Test that review task prompt does not embed long implementation prompts."""
         long_prompt = "x" * 200
         result = PromptBuilder().review_task_prompt(
             impl_task_id=1, impl_prompt=long_prompt
         )
-        # Should include at most 100 chars of the prompt
-        assert "x" * 100 in result
-        assert "x" * 101 not in result
+        assert "x" * 100 not in result
 
     def test_review_task_prompt_without_impl_prompt(self):
         """Test that review task prompt works without implementation prompt."""
@@ -470,7 +471,8 @@ class TestPromptBuilderReviewTask:
         assert result.startswith("Review task 3")
         assert "changed-files list" in result
         assert "inline diff/context" in result
-        assert "git discovery commands" in result
+        assert "provided diff is authoritative" in result
+        assert "read unchanged source files" in result
 
 
 class TestVerifyCommandConfig:

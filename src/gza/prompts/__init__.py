@@ -223,16 +223,17 @@ class PromptBuilder:
 
         Args:
             impl_task_id: The ID of the implementation task being reviewed.
-            impl_prompt: Optional prompt text of the implementation task for context.
+            impl_prompt: Unused legacy parameter retained for call-site compatibility.
 
         Returns:
             Prompt string for a review task.
         """
+        del impl_prompt  # legacy parameter kept for backward compatibility
         prompt = f"Review task {impl_task_id}"
-        if impl_prompt:
-            prompt += f": {impl_prompt[:100]}"
         prompt += (
             ". Review the provided changed-files list, diffstat, and inline diff/context"
-            " in the prompt. Do not rely on git discovery commands to reconstruct the diff."
+            " in the prompt. The provided diff is authoritative - do not use git commands"
+            " to reconstruct, re-derive, or expand it. You may read unchanged source files"
+            " when surrounding context is needed to judge correctness."
         )
         return prompt
