@@ -975,6 +975,26 @@ class TestShowCommand:
         assert "uv run pytest tests/ -q" in result.stdout
         assert "AssertionError" in result.stdout
 
+    def test_show_failed_task_prerequisite_unmerged_next_steps(self, tmp_path: Path):
+        """PREREQUISITE_UNMERGED should show merge+retry guidance."""
+        setup_config(tmp_path)
+
+        store = make_store(tmp_path)
+        dep = store.add("Upstream dependency")
+        task = store.add("Failed downstream", depends_on=dep.id)
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "PREREQUISITE_UNMERGED"
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
+        assert "Failure Summary: Dependency is not yet merged to main." in result.stdout
+        assert f"gza merge {dep.id}" in result.stdout
+        assert f"gza retry {task.id}" in result.stdout
+
     def test_show_indicates_worker_startup_failure(self, tmp_path: Path):
         """Show surfaces startup failure when worker failed before main log existed."""
         from gza.workers import WorkerMetadata, WorkerRegistry

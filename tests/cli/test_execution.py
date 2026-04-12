@@ -2837,8 +2837,8 @@ class TestIterateCommand:
 
         # The first call should be running the pending impl task
         assert run_foreground.call_count >= 1
-        first_call = run_foreground.call_args_list[0]
-        assert first_call == ((mock_config,), {"task_id": impl.id})
+        first_call_kwargs = run_foreground.call_args_list[0][1]
+        assert first_call_kwargs["task_id"] == impl.id
 
     def test_pending_impl_dry_run(self, tmp_path: Path):
         """gza iterate --dry-run on a pending task shows it would run the impl first."""
@@ -3110,7 +3110,7 @@ class TestIterateCommand:
              patch("gza.cli._create_improve_task") as create_improve:
             result = cmd_iterate(args)
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id)
+        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id, force=False)
         create_review.assert_not_called()
         create_improve.assert_not_called()
 
@@ -3137,7 +3137,7 @@ class TestIterateCommand:
             result = cmd_iterate(args)
 
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id)
+        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id, force=False)
         create_review.assert_not_called()
 
     def test_in_progress_review_is_reported_instead_of_creating_another(
@@ -3265,7 +3265,7 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 2
-        run_foreground.assert_called_once_with(mock_config, task_id=improve.id)
+        run_foreground.assert_called_once_with(mock_config, task_id=improve.id, force=False)
         create_improve.assert_not_called()
         create_review.assert_not_called()
         assert re.search(
@@ -3418,7 +3418,7 @@ class TestIterateCommand:
             result = cmd_iterate(args)
 
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=fresh_review.id)
+        run_foreground.assert_called_once_with(mock_config, task_id=fresh_review.id, force=False)
         create_review.assert_not_called()
         create_improve.assert_not_called()
 
@@ -4128,7 +4128,13 @@ class TestRunForeground:
             rc = _run_foreground(config, task_id=task.id)
 
         assert rc == 0
-        mock_run.assert_called_once_with(config, task_id=task.id, resume=False, open_after=False)
+        mock_run.assert_called_once_with(
+            config,
+            task_id=task.id,
+            resume=False,
+            open_after=False,
+            skip_precondition_check=False,
+        )
 
         # Worker should now be marked completed
         registry = WorkerRegistry(workers_path)
@@ -4176,7 +4182,13 @@ class TestRunForeground:
             rc = _run_foreground(config, task_id=task.id, resume=True, open_after=True)
 
         assert rc == 0
-        mock_run.assert_called_once_with(config, task_id=task.id, resume=True, open_after=True)
+        mock_run.assert_called_once_with(
+            config,
+            task_id=task.id,
+            resume=True,
+            open_after=True,
+            skip_precondition_check=False,
+        )
 
     def test_run_foreground_marks_failed_on_keyboard_interrupt(self, tmp_path: Path):
         """_run_foreground marks worker as failed when interrupted."""
@@ -4362,9 +4374,17 @@ class TestRunAsWorker:
         registry = self._register_current_worker(config, task_id=None, worker_id="w-worker-claim")
         args = argparse.Namespace(task_ids=[], resume=False)
 
-        def fake_run(_config, task_id=None, resume=False, open_after=False, on_task_claimed=None):
+        def fake_run(
+            _config,
+            task_id=None,
+            resume=False,
+            open_after=False,
+            skip_precondition_check=False,
+            on_task_claimed=None,
+        ):
             assert task_id is None
             assert resume is False
+            assert skip_precondition_check is False
             claimed = store.get(task.id)
             assert claimed is not None
             if on_task_claimed is not None:

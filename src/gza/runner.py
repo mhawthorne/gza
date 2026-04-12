@@ -1327,6 +1327,7 @@ def run(
     task_id: str | None = None,
     resume: bool = False,
     open_after: bool = False,
+    skip_precondition_check: bool = False,
     on_task_claimed: Callable[[Task], None] | None = None,
 ) -> int:
     """Run Gza on the next pending task or a specific task.
@@ -1339,6 +1340,7 @@ def run(
         task_id: Optional specific task ID to run. If None, runs next pending task.
         resume: If True, resume from previous session using stored session_id.
         open_after: If True, open the report file in $EDITOR after completion (for review tasks).
+        skip_precondition_check: If True, skip dependency merge precondition checks.
         on_task_claimed: Optional callback invoked after task ownership is established.
     """
     load_dotenv(config.project_dir)
@@ -1492,7 +1494,41 @@ def run(
         slug=task.slug,
     )
 
-    return _run_inner(task, task_config, config, store, provider, git, resume=resume, open_after=open_after)
+    return _run_inner(
+        task,
+        task_config,
+        config,
+        store,
+        provider,
+        git,
+        resume=resume,
+        open_after=open_after,
+        skip_precondition_check=skip_precondition_check,
+    )
+
+
+def _check_dependency_merge_precondition(
+    task: Task,
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    default_branch: str,
+) -> tuple[Task | None, str | None]:
+    """Return the first unmet direct dependency merge prerequisite, if any."""
+    if task.same_branch or not task.depends_on:
+        return (None, None)
+
+    dep = store.get(task.depends_on)
+    if dep is None or dep.status != "completed":
+        return (None, None)
+    if not dep.branch:
+        # Non-code dependencies may have no branch and are reachable via repo files.
+        return (None, None)
+
+    result = git._run("merge-base", "--is-ancestor", dep.branch, default_branch, check=False)
+    if result.returncode == 0:
+        return (None, None)
+    return (dep, default_branch)
 
 
 def _resolve_code_task_branch_name(
@@ -1867,6 +1903,7 @@ def _run_inner(
     git: "Git | None",
     resume: bool = False,
     open_after: bool = False,
+    skip_precondition_check: bool = False,
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
     # For explore, plan, review, and internal tasks, run without creating a branch.
@@ -1928,6 +1965,53 @@ def _run_inner(
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
+
+    if skip_precondition_check and task.depends_on and not task.same_branch:
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "info",
+                "message": (
+                    f"Skipped dependency merge precondition check (--force) "
+                    f"for depends_on task {task.depends_on}"
+                ),
+            },
+        )
+    else:
+        blocking_dep, target_branch = _check_dependency_merge_precondition(
+            task,
+            store,
+            git,
+            default_branch=default_branch,
+        )
+        if blocking_dep is not None:
+            assert blocking_dep.id is not None
+            dep_branch = blocking_dep.branch or "<none>"
+            failure_message = (
+                f"Dependency {blocking_dep.id} on branch '{dep_branch}' is not merged into "
+                f"'{target_branch}'. Failing without provider run."
+            )
+            error_message(f"Error: {failure_message}")
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "message": failure_message,
+                    "failure_reason": "PREREQUISITE_UNMERGED",
+                    "dependency_task_id": blocking_dep.id,
+                    "dependency_branch": dep_branch,
+                    "target_branch": target_branch,
+                },
+            )
+            store.mark_failed(
+                task,
+                log_file=str(log_file.relative_to(config.project_dir)),
+                branch=branch_name,
+                failure_reason="PREREQUISITE_UNMERGED",
+            )
+            return 0
 
     # Setup summary directory and path for task/implement types
     _, summary_path = get_task_output_paths(task, config.project_dir)

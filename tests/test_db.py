@@ -1694,6 +1694,16 @@ class TestFailureReasonTracking:
         result = extract_failure_reason(log_file)
         assert result == "MAX_STEPS"
 
+    def test_extract_failure_reason_detects_prerequisite_unmerged(self, tmp_path: Path):
+        """extract_failure_reason detects PREREQUISITE_UNMERGED marker."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Some output\n[GZA_FAILURE:PREREQUISITE_UNMERGED]\nEnd of output")
+
+        result = extract_failure_reason(log_file)
+        assert result == "PREREQUISITE_UNMERGED"
+
     def test_extract_failure_reason_returns_last_match(self, tmp_path: Path):
         """extract_failure_reason returns the last matching marker."""
         from gza.db import extract_failure_reason
@@ -1845,6 +1855,7 @@ class TestFailureReasonTracking:
 
         assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
+        assert "PREREQUISITE_UNMERGED" in KNOWN_FAILURE_REASONS
         assert "TEST_FAILURE" in KNOWN_FAILURE_REASONS
         assert "UNKNOWN" in KNOWN_FAILURE_REASONS
 

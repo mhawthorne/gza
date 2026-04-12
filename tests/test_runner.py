@@ -5235,6 +5235,175 @@ class TestLoadDotenv:
         assert os.environ["MY_TEST_KEY"] == "from_project"
 
 
+class TestDependencyMergePrecondition:
+    """Runner precondition tests for depends_on merged reachability."""
+
+    def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.project_prefix = "gza"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        return config
+
+    def _setup_dep_and_downstream(self, store: SqliteTaskStore, *, same_branch: bool = False) -> tuple[Task, Task]:
+        dep_task = store.add(prompt="Upstream task", task_type="implement")
+        dep_task.slug = "20260412-upstream-task"
+        dep_task.branch = "test/dep-branch"
+        store.mark_in_progress(dep_task)
+        store.mark_completed(dep_task, branch=dep_task.branch, log_file="logs/upstream.log", has_commits=True)
+
+        downstream = store.add(
+            prompt="Downstream task",
+            task_type="implement",
+            depends_on=dep_task.id,
+            based_on=dep_task.id if same_branch else None,
+            same_branch=same_branch,
+        )
+        downstream.slug = "20260412-downstream-task"
+        store.update(downstream)
+        return dep_task, downstream
+
+    def _run_with_merge_base(
+        self,
+        tmp_path: Path,
+        *,
+        merge_base_return_code: int,
+        same_branch: bool = False,
+        skip_precondition_check: bool = False,
+    ) -> tuple[int, Mock, SqliteTaskStore, Task]:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        _dep_task, downstream = self._setup_dep_and_downstream(store, same_branch=same_branch)
+        config = self._make_config(tmp_path, db_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=3.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.branch_exists.return_value = True
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / downstream.slug
+        mock_main_git.count_commits_ahead.return_value = 0
+
+        def git_run_side_effect(*args, **kwargs):
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return Mock(returncode=merge_base_return_code, stdout="", stderr="")
+            return Mock(returncode=0, stdout="", stderr="")
+
+        mock_main_git._run.side_effect = git_run_side_effect
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.side_effect = [set(), set()]
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+        mock_worktree_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+        ):
+            result = run(
+                config,
+                task_id=downstream.id,
+                skip_precondition_check=skip_precondition_check,
+            )
+
+        return result, mock_provider, store, downstream
+
+    def test_merged_dependency_allows_task_start(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=0,
+        )
+
+        assert result == 0
+        assert mock_provider.run.call_count == 1
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
+
+    def test_unmerged_dependency_fails_before_provider_run(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=1,
+        )
+
+        assert result == 0
+        assert mock_provider.run.call_count == 0
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
+
+        log_file = tmp_path / "logs" / f"{downstream.slug}.log"
+        assert log_file.exists()
+        log_text = log_file.read_text()
+        assert '"subtype": "outcome"' in log_text
+        assert '"failure_reason": "PREREQUISITE_UNMERGED"' in log_text
+        assert "test/dep-branch" in log_text
+
+    def test_same_branch_skips_unmerged_dependency_check(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=1,
+            same_branch=True,
+        )
+
+        assert result == 0
+        assert mock_provider.run.call_count == 1
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
+
+    def test_force_flag_skips_unmerged_dependency_check(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=1,
+            skip_precondition_check=True,
+        )
+
+        assert result == 0
+        assert mock_provider.run.call_count == 1
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
+
+        log_file = tmp_path / "logs" / f"{downstream.slug}.log"
+        assert log_file.exists()
+        assert "Skipped dependency merge precondition check (--force)" in log_file.read_text()
+
+
 class TestFindTaskOfTypeInChain:
     def test_finds_plan_via_depends_on_only(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

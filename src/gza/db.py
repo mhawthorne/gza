@@ -34,7 +34,16 @@ __all__ = [
 
 
 # Known failure reason categories
-KNOWN_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE", "TIMEOUT", "WORKER_DIED", "KILLED", "UNKNOWN"}
+KNOWN_FAILURE_REASONS = {
+    "MAX_STEPS",
+    "MAX_TURNS",
+    "PREREQUISITE_UNMERGED",
+    "TEST_FAILURE",
+    "TIMEOUT",
+    "WORKER_DIED",
+    "KILLED",
+    "UNKNOWN",
+}
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
