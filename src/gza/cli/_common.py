@@ -689,6 +689,59 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         return 1
 
 
+def _spawn_background_iterate_worker(
+    args: argparse.Namespace,
+    config: Config,
+    impl_task: DbTask,
+    *,
+    max_iterations: int,
+    resume: bool = False,
+    retry: bool = False,
+    quiet: bool = False,
+) -> int:
+    """Spawn the iterate loop as a detached background process."""
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = registry.generate_worker_id()
+
+    inner_cmd = [
+        sys.executable, "-m", "gza",
+        "iterate",
+        str(impl_task.id),
+        "--max-iterations", str(max_iterations),
+    ]
+
+    if getattr(args, "no_docker", False):
+        inner_cmd.append("--no-docker")
+    if resume:
+        inner_cmd.append("--resume")
+    if retry:
+        inner_cmd.append("--retry")
+
+    inner_cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    try:
+        proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            task_id=impl_task.id,
+            pid=proc.pid,
+            startup_log_file=startup_log_rel,
+        )
+        registry.register(worker)
+        if quiet:
+            print(f"Started iterate worker {worker_id} (PID {proc.pid}) for task {impl_task.id}")
+        else:
+            print(f"Started iterate worker {worker_id} (PID {proc.pid})")
+            print(f"  Task: {impl_task.id}")
+            print()
+            print("Use 'gza ps' to view running workers")
+            print(f"Use 'gza log -w {worker_id} -f' to follow output")
+        return 0
+    except Exception as e:
+        print(f"Error spawning background iterate worker: {e}")
+        return 1
+
+
 def _create_rebase_task(
     store: SqliteTaskStore,
     parent_task_id: str,
@@ -1013,6 +1066,72 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     new_task.branch = original_task.branch
     store.update(new_task)
     return new_task
+
+
+def run_with_resume(
+    config: Config,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    run_task: Callable[[DbTask, bool], int],
+    max_resume_attempts: int | None = None,
+    on_resume: Callable[[DbTask, DbTask, int, int], None] | None = None,
+) -> tuple[DbTask, int]:
+    """Execute a task and auto-resume MAX_STEPS/MAX_TURNS failures.
+
+    Args:
+        config: Loaded project configuration.
+        store: Task store for reloading state and creating resume tasks.
+        task: Task to execute.
+        run_task: Callback that executes a task and returns exit code.
+            Signature: ``run_task(task, resume)`` where ``resume`` indicates
+            whether this invocation is resuming an existing session.
+        max_resume_attempts: Maximum number of resume retries after the
+            initial run. Defaults to ``config.max_resume_attempts``.
+        on_resume: Optional callback invoked when a resume child is created.
+            Signature: ``on_resume(failed_task, resume_task, attempt, max_attempts)``.
+
+    Returns:
+        Tuple of ``(final_task, exit_code)``.
+    """
+    effective_limit = config.max_resume_attempts if max_resume_attempts is None else max_resume_attempts
+    if not isinstance(effective_limit, int):
+        effective_limit = 0
+    if effective_limit < 0:
+        effective_limit = 0
+
+    current_task = task
+    resume_attempt = 0
+    resume_mode = False
+
+    while True:
+        rc = run_task(current_task, resume_mode)
+
+        if current_task.id is not None:
+            refreshed = store.get(current_task.id) or current_task
+        else:
+            refreshed = current_task
+
+        if rc == 0:
+            return refreshed, 0
+
+        resumable_failure = (
+            refreshed.status == "failed"
+            and refreshed.failure_reason in {"MAX_STEPS", "MAX_TURNS"}
+            and refreshed.session_id is not None
+        )
+        if not resumable_failure:
+            return refreshed, rc
+
+        if resume_attempt >= effective_limit:
+            return refreshed, rc
+
+        resume_attempt += 1
+        resume_task = _create_resume_task(store, refreshed)
+        if on_resume is not None:
+            on_resume(refreshed, resume_task, resume_attempt, effective_limit)
+        current_task = resume_task
+        resume_mode = True
 
 
 def _resolve_task_log_path(config: Config, task: DbTask) -> Path | None:

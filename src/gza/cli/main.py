@@ -1112,10 +1112,10 @@ def main() -> int:
         iterate_parser.add_argument(
             "-i", "--max-iterations",
             type=int,
-            default=3,
+            default=None,
             dest="max_iterations",
             metavar="N",
-            help="Maximum code-write iterations; each iteration ends with a review (default: 3)",
+            help="Maximum iterate actions (default: iterate_max_iterations from gza.yaml, default 5)",
         )
         iterate_parser.add_argument(
             "--dry-run",
