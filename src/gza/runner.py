@@ -1513,22 +1513,31 @@ def _check_dependency_merge_precondition(
     git: Git,
     *,
     default_branch: str,
-) -> tuple[Task | None, str | None]:
-    """Return the first unmet direct dependency merge prerequisite, if any."""
+) -> tuple[Task | None, str | None, str | None]:
+    """Return unmet dependency merge prerequisite or a git operational error."""
     if task.same_branch or not task.depends_on:
-        return (None, None)
+        return (None, None, None)
 
-    dep = store.get(task.depends_on)
-    if dep is None or dep.status != "completed":
-        return (None, None)
+    dep = store.resolve_dependency_completion(task)
+    if dep is None:
+        return (None, None, None)
     if not dep.branch:
         # Non-code dependencies may have no branch and are reachable via repo files.
-        return (None, None)
+        return (None, None, None)
+    if not git.branch_exists(dep.branch):
+        # Branch may be deleted after merge; treat as reachable.
+        return (None, None, None)
 
     result = git._run("merge-base", "--is-ancestor", dep.branch, default_branch, check=False)
     if result.returncode == 0:
-        return (None, None)
-    return (dep, default_branch)
+        return (None, None, None)
+    if result.returncode == 1:
+        return (dep, default_branch, None)
+
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    detail = stderr or stdout or "git merge-base failed"
+    return (None, None, f"git merge-base --is-ancestor failed (exit {result.returncode}): {detail}")
 
 
 def _resolve_code_task_branch_name(
@@ -1979,12 +1988,30 @@ def _run_inner(
             },
         )
     else:
-        blocking_dep, target_branch = _check_dependency_merge_precondition(
+        blocking_dep, target_branch, precondition_error = _check_dependency_merge_precondition(
             task,
             store,
             git,
             default_branch=default_branch,
         )
+        if precondition_error is not None:
+            error_message(f"Git error: {precondition_error}")
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "message": precondition_error,
+                    "failure_reason": "GIT_ERROR",
+                },
+            )
+            store.mark_failed(
+                task,
+                log_file=str(log_file.relative_to(config.project_dir)),
+                branch=branch_name,
+                failure_reason="GIT_ERROR",
+            )
+            return 1
         if blocking_dep is not None:
             assert blocking_dep.id is not None
             dep_branch = blocking_dep.branch or "<none>"

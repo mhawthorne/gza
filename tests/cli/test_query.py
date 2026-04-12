@@ -2,6 +2,7 @@
 
 
 import argparse
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -994,6 +995,41 @@ class TestShowCommand:
         assert "Failure Summary: Dependency is not yet merged to main." in result.stdout
         assert f"gza merge {dep.id}" in result.stdout
         assert f"gza retry {task.id}" in result.stdout
+
+    def test_show_prerequisite_unmerged_prefers_resolved_dependency_from_log(self, tmp_path: Path):
+        """PREREQUISITE_UNMERGED next steps should use resolved dependency_task_id from outcome log."""
+        setup_config(tmp_path)
+
+        store = make_store(tmp_path)
+        direct_dep = store.add("Original failed dependency")
+        retry_dep = store.add("Completed retry dependency", based_on=direct_dep.id)
+        task = store.add("Failed downstream", depends_on=direct_dep.id)
+        assert task.id is not None
+        assert retry_dep.id is not None
+        task.status = "failed"
+        task.failure_reason = "PREREQUISITE_UNMERGED"
+        task.log_file = ".gza/logs/prereq-unmerged.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "prereq-unmerged.log").write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "failure_reason": "PREREQUISITE_UNMERGED",
+                    "dependency_task_id": retry_dep.id,
+                }
+            )
+            + "\n"
+        )
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"gza merge {retry_dep.id}" in result.stdout
+        assert f"gza merge {direct_dep.id}" not in result.stdout
 
     def test_show_indicates_worker_startup_failure(self, tmp_path: Path):
         """Show surfaces startup failure when worker failed before main log existed."""

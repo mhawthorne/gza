@@ -1617,7 +1617,7 @@ def _cmd_show_output(
                     f"[{c['value']}]{result_context}[/{c['value']}]"
                 )
 
-        next_step_commands = _failure_next_steps(task, reason)
+        next_step_commands = _failure_next_steps(task, reason, config=config)
         if next_step_commands:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:

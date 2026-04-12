@@ -2493,6 +2493,19 @@ class TestRetryChainDependencyResolution:
         is_blocked, _, _ = store.is_task_blocked(downstream)
         assert is_blocked is False
 
+    def test_resolve_dependency_completion_returns_completed_retry(self, tmp_path: Path):
+        """resolve_dependency_completion should resolve to completed retry descendant."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Original dep")
+        self._fail(store, dep)
+        retry = store.add("Retry dep", based_on=dep.id)
+        self._complete(store, retry)
+        downstream = store.add("Downstream", depends_on=dep.id)
+
+        resolved = store.resolve_dependency_completion(downstream)
+        assert resolved is not None
+        assert resolved.id == retry.id
+
     # --- get_next_pending ---
 
     def test_get_next_pending_skips_task_blocked_by_failed_dep(self, tmp_path: Path):

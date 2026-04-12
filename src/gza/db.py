@@ -1783,11 +1783,11 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
-    def _find_successful_retry(self, task_id: str) -> bool:
-        """Check if any completed task exists in the retry chain rooted at task_id.
+    def _find_successful_retry_task(self, task_id: str) -> Task | None:
+        """Return the first completed task in the retry chain rooted at task_id.
 
         Follows based_on links forward (task_id → retries → retries of retries)
-        and returns True if any task in that tree has status='completed'.
+        and returns the first status='completed' task encountered.
         No data is mutated; this is a read-only query-time check.
 
         NOTE: 'dropped' nodes in the retry chain are intentionally not treated as
@@ -1803,14 +1803,40 @@ class SqliteTaskStore:
             visited.add(current_id)
             with self._connect() as conn:
                 cur = conn.execute(
-                    "SELECT id, status FROM tasks WHERE based_on = ?",
+                    "SELECT id, status FROM tasks WHERE based_on = ? ORDER BY created_at ASC",
                     (current_id,),
                 )
                 for row in cur.fetchall():
                     if row["status"] == "completed":
-                        return True
+                        completed = self.get(row["id"])
+                        if completed is not None:
+                            return completed
                     queue.append(row["id"])
-        return False
+        return None
+
+    def resolve_dependency_completion(self, task: Task) -> Task | None:
+        """Resolve the completed task that satisfies task.depends_on.
+
+        Mirrors dependency-unblock semantics used by ``is_task_blocked()``:
+        - direct dependency completed => resolved to direct dependency
+        - direct dependency failed but has completed retry descendant => resolved
+          to the completed retry task
+        - otherwise unresolved
+        """
+        if task.depends_on is None:
+            return None
+
+        dep = self.get(task.depends_on)
+        if dep is None:
+            return None
+
+        if dep.status == "completed":
+            return dep
+
+        if dep.status == "failed" and dep.id is not None:
+            return self._find_successful_retry_task(dep.id)
+
+        return None
 
     def is_task_blocked(self, task: Task) -> tuple[bool, str | None, str | None]:
         """Check if a task is blocked by an incomplete dependency.
@@ -1829,10 +1855,7 @@ class SqliteTaskStore:
         if dep is None:
             return (False, None, None)
 
-        if dep.status == "completed":
-            return (False, None, None)
-
-        if dep.status == "failed" and dep.id is not None and self._find_successful_retry(dep.id):
+        if self.resolve_dependency_completion(task) is not None:
             return (False, None, None)
 
         return (True, dep.id, dep.status)

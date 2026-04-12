@@ -1201,7 +1201,32 @@ def _failure_summary(reason: str) -> str:
     return summaries.get(reason, f"Task failed: {reason}")
 
 
-def _failure_next_steps(task: DbTask, reason: str) -> list[str]:
+def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) -> str | None:
+    """Extract dependency_task_id from PREREQUISITE_UNMERGED outcome log entry."""
+    if config is None or not task.log_file:
+        return None
+    from .log import _load_log_file_entries
+
+    log_path = config.project_dir / task.log_file
+    if not log_path.exists():
+        return None
+    try:
+        entries = _load_log_file_entries(log_path)[1]
+    except OSError:
+        return None
+
+    for entry in reversed(entries):
+        if entry.get("type") != "gza" or entry.get("subtype") != "outcome":
+            continue
+        if entry.get("failure_reason") != "PREREQUISITE_UNMERGED":
+            continue
+        dep_id = entry.get("dependency_task_id")
+        if isinstance(dep_id, str) and dep_id:
+            return dep_id
+    return None
+
+
+def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = None) -> list[str]:
     """Return concrete next-step commands for a failed task."""
     if task.id is None:
         return []
@@ -1214,8 +1239,9 @@ def _failure_next_steps(task: DbTask, reason: str) -> list[str]:
         return steps
 
     if reason == "PREREQUISITE_UNMERGED":
-        if task.depends_on:
-            steps.append(f"gza merge {task.depends_on}")
+        blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
+        if blocking_dep_id:
+            steps.append(f"gza merge {blocking_dep_id}")
         steps.append(f"gza retry {task.id}")
         return steps
 

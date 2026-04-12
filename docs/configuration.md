@@ -430,6 +430,7 @@ gza work [task_id...] [options]
 | `--count N`, `-c N` | Number of tasks to run before stopping |
 | `--background`, `-b` | Run worker in background |
 | `--max-turns N` | Override max_turns setting for this run |
+| `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
 
 ### add
 
@@ -691,6 +692,7 @@ gza resume <task_id> [options]
 | `--background`, `-b` | Run worker in background |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
+| `--force` | Skip dependency merge precondition checks when starting the resumed task |
 
 ### retry
 
@@ -707,6 +709,7 @@ gza retry <task_id> [options]
 | `--background`, `-b` | Run worker in background |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
+| `--force` | Skip dependency merge precondition checks when starting the retry task |
 
 ### mark-completed
 
@@ -884,6 +887,7 @@ gza improve <impl_task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
+| `--force` | Skip dependency merge precondition checks when running the improve task |
 
 The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
 
@@ -906,6 +910,7 @@ gza review <task_id> [options]
 | `--open` | Open the review file in $EDITOR after completion |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
+| `--force` | Skip dependency merge precondition checks when running the review task |
 
 When a PR exists for the implementation task, the review is automatically posted as a PR comment.
 
@@ -943,6 +948,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
+| `--force` | Skip dependency merge precondition checks when running the implement task |
 
 ### advance
 
@@ -983,6 +989,7 @@ gza iterate <impl_task_id> [options]
 | `--max-iterations N` | Maximum review/improve iterations (default: 3) |
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
+| `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |
 
 ### learnings
 
@@ -1122,6 +1129,7 @@ Any state can be manually set to `dropped` via `gza set-status`.
 
 - Use `gza resume <task_id>` to continue from where the task left off (preserves conversation context)
 - Use `gza retry <task_id>` to start completely fresh
+- `PREREQUISITE_UNMERGED`: the resolved completed dependency branch is not reachable from the default branch (`main` in most repos). Merge the dependency (`gza merge <dependency_task_id>`) and then retry (`gza retry <task_id>`). Use `--force` only when you intentionally want to bypass this guard.
 
 **Dependencies:**
 

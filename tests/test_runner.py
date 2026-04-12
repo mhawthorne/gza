@@ -5282,6 +5282,29 @@ class TestDependencyMergePrecondition:
         store.update(downstream)
         return dep_task, downstream
 
+    def _setup_failed_dep_with_completed_retry(self, store: SqliteTaskStore) -> tuple[Task, Task, Task]:
+        """Create depends_on -> failed, plus a completed retry descendant."""
+        dep_task = store.add(prompt="Original upstream task", task_type="implement")
+        dep_task.slug = "20260412-upstream-failed"
+        dep_task.branch = "test/original-upstream-branch"
+        store.mark_in_progress(dep_task)
+        store.mark_failed(dep_task, branch=dep_task.branch, log_file="logs/upstream-failed.log", failure_reason="UNKNOWN")
+
+        retry_task = store.add(prompt="Retry upstream task", task_type="implement", based_on=dep_task.id)
+        retry_task.slug = "20260412-upstream-retry"
+        retry_task.branch = "test/retry-upstream-branch"
+        store.mark_in_progress(retry_task)
+        store.mark_completed(retry_task, branch=retry_task.branch, log_file="logs/upstream-retry.log", has_commits=True)
+
+        downstream = store.add(
+            prompt="Downstream task",
+            task_type="implement",
+            depends_on=dep_task.id,
+        )
+        downstream.slug = "20260412-downstream-task"
+        store.update(downstream)
+        return dep_task, retry_task, downstream
+
     def _run_with_merge_base(
         self,
         tmp_path: Path,
@@ -5289,10 +5312,17 @@ class TestDependencyMergePrecondition:
         merge_base_return_code: int,
         same_branch: bool = False,
         skip_precondition_check: bool = False,
+        branch_exists: bool = True,
+        merge_base_stdout: str = "",
+        merge_base_stderr: str = "",
+        setup_retry_chain: bool = False,
     ) -> tuple[int, Mock, SqliteTaskStore, Task]:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        _dep_task, downstream = self._setup_dep_and_downstream(store, same_branch=same_branch)
+        if setup_retry_chain:
+            _dep_task, _retry_task, downstream = self._setup_failed_dep_with_completed_retry(store)
+        else:
+            _dep_task, downstream = self._setup_dep_and_downstream(store, same_branch=same_branch)
         config = self._make_config(tmp_path, db_path)
 
         mock_provider = Mock()
@@ -5309,14 +5339,14 @@ class TestDependencyMergePrecondition:
 
         mock_main_git = Mock()
         mock_main_git.default_branch.return_value = "main"
-        mock_main_git.branch_exists.return_value = True
+        mock_main_git.branch_exists.return_value = branch_exists
         mock_main_git.worktree_list.return_value = []
         mock_main_git.worktree_add.return_value = config.worktree_path / downstream.slug
         mock_main_git.count_commits_ahead.return_value = 0
 
         def git_run_side_effect(*args, **kwargs):
             if args[:2] == ("merge-base", "--is-ancestor"):
-                return Mock(returncode=merge_base_return_code, stdout="", stderr="")
+                return Mock(returncode=merge_base_return_code, stdout=merge_base_stdout, stderr=merge_base_stderr)
             return Mock(returncode=0, stdout="", stderr="")
 
         mock_main_git._run.side_effect = git_run_side_effect
@@ -5373,6 +5403,28 @@ class TestDependencyMergePrecondition:
         assert '"failure_reason": "PREREQUISITE_UNMERGED"' in log_text
         assert "test/dep-branch" in log_text
 
+    def test_retry_chain_dependency_uses_completed_retry_for_precondition(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=1,
+            setup_retry_chain=True,
+        )
+
+        assert result == 0
+        assert mock_provider.run.call_count == 0
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
+
+        log_file = tmp_path / "logs" / f"{downstream.slug}.log"
+        assert log_file.exists()
+        log_text = log_file.read_text()
+        retry_task = next(t for t in store.get_all() if t.prompt == "Retry upstream task")
+        assert retry_task.id is not None
+        assert "test/retry-upstream-branch" in log_text
+        assert f'"dependency_task_id": "{retry_task.id}"' in log_text
+
     def test_same_branch_skips_unmerged_dependency_check(self, tmp_path: Path):
         result, mock_provider, store, downstream = self._run_with_merge_base(
             tmp_path,
@@ -5402,6 +5454,33 @@ class TestDependencyMergePrecondition:
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
         assert log_file.exists()
         assert "Skipped dependency merge precondition check (--force)" in log_file.read_text()
+
+    def test_missing_dependency_branch_is_treated_as_merged(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=1,
+            branch_exists=False,
+        )
+
+        assert result == 0
+        assert mock_provider.run.call_count == 1
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
+
+    def test_merge_base_operational_failure_is_not_rewritten_to_prerequisite_unmerged(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=128,
+            merge_base_stderr="fatal: Not a valid object name test/dep-branch",
+        )
+
+        assert result == 1
+        assert mock_provider.run.call_count == 0
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
 
 
 class TestFindTaskOfTypeInChain:

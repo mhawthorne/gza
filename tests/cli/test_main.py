@@ -4,9 +4,12 @@
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+from gza.config import Config
+from gza.db import SqliteTaskStore
 
 from .conftest import run_gza, setup_config
 
@@ -151,3 +154,50 @@ class TestCommandAliases:
 
         assert rc == 0
         cmd_iterate.assert_called_once()
+
+
+class TestWorkForceBackgroundDispatch:
+    """Command-level regression tests for work --force dispatch and propagation."""
+
+    def test_work_force_background_propagates_to_worker_command(self, tmp_path):
+        """`gza work --force --background` should propagate --force to worker subprocess args."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending task for background force run")
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "work",
+                    str(task.id),
+                    "--background",
+                    "--force",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        assert "--worker-mode" in captured_cmd
+        assert "--force" in captured_cmd
