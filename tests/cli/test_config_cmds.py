@@ -1363,6 +1363,120 @@ class TestStatsReviewsCommand:
         assert str(today) in result.stdout
 
 
+class TestStatsIterationsCommand:
+    """Tests for 'gza stats iterations' command."""
+
+    def test_stats_iterations_no_tasks(self, tmp_path: Path):
+        """gza stats iterations with no tasks shows an empty summary."""
+        setup_config(tmp_path)
+
+        result = run_gza("stats", "iterations", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Task" in result.stdout
+        assert "0 tasks" in result.stdout
+
+    def test_stats_iterations_rolls_up_reviews_improves_verdict_and_cost(self, tmp_path: Path):
+        """Iterations output should roll up child tasks and show latest review verdict/cost."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        review_1 = store.add("Review #1", task_type="review", depends_on=impl.id)
+        store.mark_completed(
+            review_1,
+            has_commits=False,
+            output_content="Verdict: CHANGES_REQUESTED",
+            stats=TaskStats(cost_usd=0.02),
+        )
+
+        improve_1 = store.add("Improve #1", task_type="improve", based_on=impl.id, depends_on=review_1.id)
+        store.mark_completed(improve_1, has_commits=False, stats=TaskStats(cost_usd=0.03))
+
+        review_2 = store.add("Review #2", task_type="review", depends_on=impl.id)
+        store.mark_completed(
+            review_2,
+            has_commits=False,
+            output_content="## Verdict\n\n**APPROVED**",
+            stats=TaskStats(cost_usd=0.04),
+        )
+
+        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert impl.id in result.stdout
+        assert "APPROVED" in result.stdout
+        assert "$   0.19" in result.stdout
+        assert "1 tasks  |  2 reviews  |  1 improves  |  1/1 approved  |  $0.19 total" in result.stdout
+
+    def test_stats_iterations_last_limits_to_recent_implementations(self, tmp_path: Path):
+        """--last N should keep only the N newest implementation rows."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_1 = store.add("Implement one", task_type="implement")
+        assert impl_1.id is not None
+        store.mark_completed(impl_1, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        impl_2 = store.add("Implement two", task_type="implement")
+        assert impl_2.id is not None
+        store.mark_completed(impl_2, has_commits=False, stats=TaskStats(cost_usd=0.20))
+
+        result = run_gza("stats", "iterations", "--all", "--last", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert impl_2.id in result.stdout
+        assert impl_1.id not in result.stdout
+        assert "1 tasks" in result.stdout
+
+    def test_stats_iterations_hours_filters_on_impl_or_child_activity(self, tmp_path: Path):
+        """--hours should include rows with recent review/improve activity even for older impls."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_with_recent_review = store.add("Implement old with recent review", task_type="implement")
+        assert impl_with_recent_review.id is not None
+        store.mark_completed(impl_with_recent_review, has_commits=False, stats=TaskStats(cost_usd=0.50))
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET created_at = ? WHERE id = ?",
+                ((datetime.now(UTC) - timedelta(days=2)).isoformat(), impl_with_recent_review.id),
+            )
+
+        recent_review = store.add("Recent review", task_type="review", depends_on=impl_with_recent_review.id)
+        store.mark_completed(
+            recent_review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.10),
+        )
+
+        impl_without_recent_activity = store.add("Implement old no activity", task_type="implement")
+        assert impl_without_recent_activity.id is not None
+        store.mark_completed(impl_without_recent_activity, has_commits=False, stats=TaskStats(cost_usd=0.40))
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET created_at = ? WHERE id = ?",
+                ((datetime.now(UTC) - timedelta(days=2)).isoformat(), impl_without_recent_activity.id),
+            )
+
+        result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Last 12 hours" in result.stdout
+        assert impl_with_recent_review.id in result.stdout
+        assert impl_without_recent_activity.id not in result.stdout
+
+
 class TestStatsCommand:
     """Tests for the 'gza stats' parent command."""
 
@@ -1374,6 +1488,7 @@ class TestStatsCommand:
 
         assert result.returncode == 0
         assert "reviews" in result.stdout
+        assert "iterations" in result.stdout
 
     def test_stats_cycles_subcommand_not_found(self, tmp_path: Path):
         """gza stats cycles exits non-zero since the subcommand was removed."""
