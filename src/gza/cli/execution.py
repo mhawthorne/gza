@@ -318,6 +318,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
     skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
+    mark_next = bool(getattr(args, "next", False))
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -378,6 +379,9 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
+        if mark_next:
+            task.urgent = True
+            store.update(task)
         print(f"✓ Added task {task.id}")
         return 0
 
@@ -399,6 +403,9 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         if not new_task:
             return 1
+        if mark_next:
+            new_task.urgent = True
+            store.update(new_task)
         print(f"✓ Added task {new_task.id}")
         return 0
     else:
@@ -417,6 +424,9 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
+        if mark_next:
+            task.urgent = True
+            store.update(task)
         print(f"✓ Added task {task.id}")
         return 0
 

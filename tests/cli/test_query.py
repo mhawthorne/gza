@@ -811,6 +811,55 @@ class TestNextCommand:
         assert "<full-task-id>" in result.stdout
 
 
+class TestQueueCommand:
+    """Tests for `gza queue` ordering and urgent-lane controls."""
+
+    def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        normal_1 = store.add("Normal 1")
+        normal_2 = store.add("Normal 2")
+        urgent = store.add("Urgent")
+        assert urgent.id is not None
+        store.set_urgent(urgent.id, True)
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert any("Urgent" in line and "[urgent]" in line for line in lines)
+        assert any("Normal 1" in line and "[normal]" in line for line in lines)
+        assert any("Normal 2" in line and "[normal]" in line for line in lines)
+        urgent_line = next(i for i, line in enumerate(lines) if "Urgent" in line)
+        normal_1_line = next(i for i, line in enumerate(lines) if "Normal 1" in line)
+        normal_2_line = next(i for i, line in enumerate(lines) if "Normal 2" in line)
+        assert urgent_line < normal_1_line < normal_2_line
+        assert str(normal_1.id) in lines[normal_1_line]
+        assert str(normal_2.id) in lines[normal_2_line]
+
+    def test_queue_bump_and_unbump(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Need soon")
+        assert task.id is not None
+        assert task.urgent is False
+
+        bump = run_gza("queue", "bump", task.id, "--project", str(tmp_path))
+        assert bump.returncode == 0
+        assert "Bumped task" in bump.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.urgent is True
+
+        unbump = run_gza("queue", "unbump", task.id, "--project", str(tmp_path))
+        assert unbump.returncode == 0
+        assert "Removed task" in unbump.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.urgent is False
+
+
 class TestShowCommand:
     """Tests for 'gza show' command."""
 

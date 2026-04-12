@@ -193,6 +193,7 @@ class Task:
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
+    urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
@@ -255,8 +256,13 @@ ALTER TABLE tasks ADD COLUMN attach_count INTEGER;
 ALTER TABLE tasks ADD COLUMN attach_duration_seconds REAL;
 """
 
+# Migration from v28 to v29: add queue urgency flag
+MIGRATION_V28_TO_V29 = """
+ALTER TABLE tasks ADD COLUMN urgent INTEGER DEFAULT 0;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -309,6 +315,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
+    urgent INTEGER DEFAULT 0,
     input_tokens INTEGER,
     output_tokens INTEGER,
     merge_status TEXT,
@@ -645,6 +652,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (26, None),  # Manual migration: base36-text IDs → decimal-text IDs
     (27, None),  # Manual migration: remove TaskCycle bookkeeping tables/columns
     (28, MIGRATION_V27_TO_V28),
+    (29, MIGRATION_V28_TO_V29),
 ]
 
 
@@ -769,6 +777,7 @@ class SqliteTaskStore:
             model=row["model"] if "model" in keys else None,
             provider=row["provider"] if "provider" in keys else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
+            urgent=bool(row["urgent"]) if "urgent" in keys and row["urgent"] is not None else False,
             merge_status=row["merge_status"] if "merge_status" in keys else None,
             merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in keys and row["merged_at"] else None,
             failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
@@ -862,6 +871,7 @@ class SqliteTaskStore:
         model: str | None = None,
         provider: str | None = None,
         provider_is_explicit: bool | None = None,
+        urgent: bool = False,
         skip_learnings: bool = False,
     ) -> Task:
         """Add a new task. Returns the created Task with its generated string ID."""
@@ -872,10 +882,27 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (new_id, prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if provider_is_explicit else 0, 1 if skip_learnings else 0),
+                (
+                    new_id,
+                    prompt,
+                    task_type,
+                    based_on,
+                    now,
+                    group,
+                    depends_on,
+                    spec,
+                    1 if create_review else 0,
+                    1 if same_branch else 0,
+                    task_type_hint,
+                    model,
+                    provider,
+                    1 if provider_is_explicit else 0,
+                    1 if urgent else 0,
+                    1 if skip_learnings else 0,
+                ),
             )
             result = self.get(new_id)
             assert result is not None
@@ -974,6 +1001,7 @@ class SqliteTaskStore:
                     model = ?,
                     provider = ?,
                     provider_is_explicit = ?,
+                    urgent = ?,
                     merge_status = ?,
                     merged_at = ?,
                     failure_reason = ?,
@@ -1019,6 +1047,7 @@ class SqliteTaskStore:
                     task.model,
                     task.provider,
                     1 if task.provider_is_explicit else 0,
+                    1 if task.urgent else 0,
                     task.merge_status,
                     task.merged_at.isoformat() if task.merged_at else None,
                     task.failure_reason,
@@ -1064,7 +1093,7 @@ class SqliteTaskStore:
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
-                ORDER BY t.created_at ASC
+                ORDER BY t.urgent DESC, t.created_at ASC
                 LIMIT 1
                 """
             )
@@ -1105,11 +1134,22 @@ class SqliteTaskStore:
     def get_pending(self, limit: int | None = None) -> list[Task]:
         """Get all pending tasks."""
         with self._connect() as conn:
-            query = "SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at ASC"
+            query = "SELECT * FROM tasks WHERE status = 'pending' ORDER BY urgent DESC, created_at ASC"
+            params: tuple[int, ...] | tuple[()] = ()
             if limit is not None:
-                query += f" LIMIT {limit}"
-            cur = conn.execute(query)
+                query += " LIMIT ?"
+                params = (limit,)
+            cur = conn.execute(query, params)
             return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def set_urgent(self, task_id: str, urgent: bool) -> bool:
+        """Set or clear a task's urgent queue flag. Returns True if task exists."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET urgent = ? WHERE id = ?",
+                (1 if urgent else 0, task_id),
+            )
+            return cur.rowcount > 0
 
     def get_in_progress(self) -> list[Task]:
         """Get all in-progress tasks, oldest first."""

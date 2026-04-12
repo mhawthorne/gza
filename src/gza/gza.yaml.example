@@ -86,6 +86,15 @@ project_name: my-project
 # Auto-update learnings every N completed tasks; set to 0 to disable (default: 5)
 # learnings_interval: 5
 
+# --- Watch loop ---
+
+# Continuous worker loop defaults (`gza watch`)
+# watch:
+#   batch: 5
+#   poll: 300
+#   max_idle: null
+#   max_iterations: 10
+
 # --- Claude-specific configuration ---
 # claude:
 #   # Fetch OAuth token from macOS Keychain for Docker (macOS only)

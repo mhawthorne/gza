@@ -4572,6 +4572,18 @@ class TestAddCommandWithChaining:
         assert result.returncode == 1
         assert "Error: Spec file not found: nonexistent.md" in result.stdout
 
+    def test_add_with_next_marks_task_urgent(self, tmp_path: Path):
+        """`gza add --next` creates a pending task in the urgent lane."""
+        setup_config(tmp_path)
+
+        result = run_gza("add", "--next", "Urgent follow-up", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        store = make_store(tmp_path)
+        task = next((t for t in store.get_pending() if t.prompt == "Urgent follow-up"), None)
+        assert task is not None
+        assert task.urgent is True
+
 
 class TestAddCommandWithModelAndProvider:
     """Tests for 'gza add' command with --model and --provider flags."""

@@ -152,12 +152,16 @@ class GzaClient:
         )
 
     def get_pending(self, limit: int | None = None) -> list[Task]:
-        """Return pending tasks, oldest first.
+        """Return pending tasks in pickup order.
 
         Parameters
         ----------
         limit:
             Maximum number of tasks to return. None means all.
+
+        Notes
+        -----
+        Ordering is urgent-first, then FIFO by creation time within each lane.
         """
         return self._store.get_pending(limit=limit)
 

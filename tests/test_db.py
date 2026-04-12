@@ -107,6 +107,43 @@ class TestTaskChaining:
 
         assert store.get_next_pending() is None
 
+    def test_pending_queue_orders_urgent_before_fifo(self, tmp_path: Path):
+        """Pending queue ordering is urgent-first, FIFO within each lane."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        normal_1 = store.add("Normal 1")
+        normal_2 = store.add("Normal 2")
+        urgent_1 = store.add("Urgent 1")
+        urgent_2 = store.add("Urgent 2")
+        assert urgent_1.id is not None
+        assert urgent_2.id is not None
+        store.set_urgent(urgent_1.id, True)
+        store.set_urgent(urgent_2.id, True)
+
+        pending = store.get_pending()
+        assert [task.id for task in pending] == [
+            urgent_1.id,
+            urgent_2.id,
+            normal_1.id,
+            normal_2.id,
+        ]
+
+    def test_get_next_pending_prefers_urgent(self, tmp_path: Path):
+        """get_next_pending picks urgent runnable tasks first."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        normal = store.add("Normal")
+        urgent = store.add("Urgent")
+        assert urgent.id is not None
+        store.set_urgent(urgent.id, True)
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == urgent.id
+        assert next_task.id != normal.id
+
     def test_get_in_progress_returns_only_in_progress_tasks(self, tmp_path: Path):
         """Test get_in_progress returns only in-progress tasks."""
         db_path = tmp_path / "test.db"
@@ -3710,7 +3747,7 @@ class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
     def test_check_migration_status_on_v24_db(self, tmp_path: Path) -> None:
-        """check_migration_status on a v24 DB reports pending_manual=[25, 26, 27] and pending_auto=[28]."""
+        """check_migration_status on a v24 DB reports pending manual/auto migration chains."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
 
@@ -3718,11 +3755,11 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28]
+        assert status["pending_auto"] == [28, 29]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
-        """After manual migrations, auto v28 is still pending until SqliteTaskStore runs."""
+        """After manual migrations, auto migrations remain pending until SqliteTaskStore runs."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
         _run_v25_v26_v27_migrations(db_path, "gza")
@@ -3730,10 +3767,10 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28]
+        assert status["pending_auto"] == [28, 29]
         assert status["pending_manual"] == []
 
-        # Constructing SqliteTaskStore triggers auto-migration to v28
+        # Constructing SqliteTaskStore triggers remaining auto-migrations.
         SqliteTaskStore(db_path, prefix="gza")
         status_after = check_migration_status(db_path)
         assert status_after["current_version"] == SCHEMA_VERSION
@@ -4047,7 +4084,7 @@ class TestMigrationUtilityFunctions:
         conn.close()
         assert version == 27
 
-        # SqliteTaskStore auto-migrates to v28
+        # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")
 
         conn = sqlite3.connect(db_path)
@@ -4055,9 +4092,10 @@ class TestMigrationUtilityFunctions:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 28
+        assert version == SCHEMA_VERSION
         assert "attach_count" in columns
         assert "attach_duration_seconds" in columns
+        assert "urgent" in columns
 
         # store.update() should succeed
         task = store.get("gza-1")
@@ -4122,9 +4160,10 @@ class TestMigrationUtilityFunctions:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 28
+        assert version == SCHEMA_VERSION
         assert "attach_count" in columns
         assert "attach_duration_seconds" in columns
+        assert "urgent" in columns
 
         task = store.add("test missing columns")
         store.record_attach_session(task, 10.0)
@@ -4207,9 +4246,9 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28]
+        assert status["pending_auto"] == [28, 29]
 
-        # SqliteTaskStore auto-migrates to v28
+        # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")
         child = store.get("gza-2")
         assert child is not None
