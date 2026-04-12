@@ -1481,21 +1481,21 @@ def cmd_show(args: argparse.Namespace) -> int:
         return _cmd_show_output(task, args, config, store)
 
 
-def _find_active_worktree_path_for_branch(config: Config, branch: str) -> Path | None:
-    """Return active worktree path for a branch, if one is currently registered."""
+def _find_active_worktree_path_for_branch(config: Config, branch: str) -> tuple[Path | None, str | None]:
+    """Return active worktree path and optional lookup error for a branch."""
     try:
         git = Git(config.project_dir)
         worktrees = git.worktree_list()
-    except (GitError, OSError):
-        return None
+    except (GitError, OSError) as exc:
+        return None, " ".join(str(exc).split())
 
     for wt in worktrees:
         wt_branch = wt.get("branch", "")
         if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
             wt_path = wt.get("path")
             if wt_path:
-                return Path(wt_path)
-    return None
+                return Path(wt_path), None
+    return None, None
 
 
 def _cmd_show_output(
@@ -1550,9 +1550,11 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Skip Learnings:[/{c['label']}] [green]yes[/green]")
     if task.branch:
         console.print(f"[{c['label']}]Branch:[/{c['label']}] [{c['branch']}]{task.branch}[/{c['branch']}]")
-        active_worktree_path = _find_active_worktree_path_for_branch(config, task.branch)
+        active_worktree_path, worktree_lookup_error = _find_active_worktree_path_for_branch(config, task.branch)
         if active_worktree_path:
             console.print(f"[{c['label']}]Worktree:[/{c['label']}] [{c['value']}]{active_worktree_path}[/{c['value']}]")
+        elif worktree_lookup_error:
+            console.print(f"[yellow]Warning: Worktree lookup failed: {rich_escape(worktree_lookup_error)}[/yellow]")
     if task.log_file:
         console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{task.log_file}[/{c['value']}]")
     if task.report_file:

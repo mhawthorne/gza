@@ -1041,6 +1041,69 @@ class TestShowCommand:
         assert "Branch: feature/no-worktree" in result.stdout
         assert "Worktree:" not in result.stdout
 
+    def test_show_warns_when_worktree_lookup_raises_git_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Show command emits a warning when worktree lookup fails with GitError."""
+        from gza.cli.query import cmd_show
+        from gza.git import GitError
+
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path,
+            task_prompt="Task with lookup failure",
+            branch_name="feature/worktree-lookup-giterror",
+            worktree_name=None,
+        )
+        assert task.id is not None
+        assert worktree_path is None
+
+        with patch("gza.cli.query.Git.worktree_list", side_effect=GitError("simulated worktree list failure")):
+            args = argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=str(task.id),
+                prompt=False,
+                path=False,
+                output=False,
+                page=False,
+                full=False,
+            )
+            exit_code = cmd_show(args)
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "Branch: feature/worktree-lookup-giterror" in output
+        assert "Warning: Worktree lookup failed:" in output
+        assert "simulated worktree list failure" in output
+
+    def test_show_warns_when_worktree_lookup_raises_os_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Show command emits a warning when worktree lookup fails with OSError."""
+        from gza.cli.query import cmd_show
+
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path,
+            task_prompt="Task with lookup os error",
+            branch_name="feature/worktree-lookup-oserror",
+            worktree_name=None,
+        )
+        assert task.id is not None
+        assert worktree_path is None
+
+        with patch("gza.cli.query.Git.worktree_list", side_effect=OSError("simulated os error")):
+            args = argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=str(task.id),
+                prompt=False,
+                path=False,
+                output=False,
+                page=False,
+                full=False,
+            )
+            exit_code = cmd_show(args)
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "Branch: feature/worktree-lookup-oserror" in output
+        assert "Warning: Worktree lookup failed:" in output
+        assert "simulated os error" in output
+
     def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
         """Failed task output includes reason, limits, context, and next-step commands."""
         import json
