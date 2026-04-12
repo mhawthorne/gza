@@ -977,7 +977,7 @@ gza advance [task_id] [options]
 
 ### iterate
 
-Run an automated review/improve loop for an implementation task.
+Run an automated implementation lifecycle loop (review/improve/resume/rebase).
 
 ```bash
 gza iterate <impl_task_id> [options]

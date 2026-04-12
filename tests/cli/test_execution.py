@@ -2945,7 +2945,7 @@ class TestIterateCommand:
         first_call_kwargs = run_foreground.call_args_list[0][1]
         assert first_call_kwargs["task_id"] == impl.id
 
-    def test_branchless_completed_impl_does_not_enter_needs_rebase(
+    def test_branchless_completed_impl_is_blocked_without_running_review_actions(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -2986,12 +2986,13 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        assert result == 0
-        assert "Action 1/1: merge" in output
+        assert result == 3
+        assert "Action 1/1: skip" in output
+        assert "Iterate blocked: skip. Manual review required." in output
         assert "needs_rebase" not in output
         assert "Cannot rebase" not in output
 
-    def test_pending_impl_that_completes_without_branch_does_not_enter_needs_rebase(
+    def test_pending_impl_that_completes_without_branch_is_blocked(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -3038,11 +3039,55 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        assert result == 0
+        assert result == 3
         assert "Running pending implementation" in output
-        assert "Action 1/1: merge" in output
+        assert "Action 1/1: skip" in output
+        assert "Iterate blocked: skip. Manual review required." in output
         assert "needs_rebase" not in output
         assert "Cannot rebase" not in output
+
+    def test_branchless_completed_impl_with_no_reviews_does_not_create_or_run_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "completed"
+        impl.branch = None
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._create_review_task") as create_review,
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        create_review.assert_not_called()
+        run_foreground.assert_not_called()
+        assert "Action 1/1: skip" in output
+        assert "Iterate blocked: skip. Manual review required." in output
 
     def test_pending_impl_dry_run(self, tmp_path: Path):
         """gza iterate --dry-run on a pending task shows it would run the impl first."""
@@ -3662,6 +3707,100 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         assert result == 0
         create_review.assert_called_once()
+
+    def test_iterate_create_review_duplicate_in_progress_waits_instead_of_running(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.review_tasks import DuplicateReviewError
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        active_review = store.add("Active review", task_type="review", depends_on=impl.id)
+        active_review.status = "in_progress"
+        store.update(active_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                side_effect=[{"type": "create_review", "description": "Create review"}],
+            ),
+            patch("gza.cli._create_review_task", side_effect=DuplicateReviewError(active_review)),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        run_foreground.assert_not_called()
+        assert "Waiting for review" in output
+        assert "Iterate waiting: review_in_progress. Existing task is already in progress." in output
+
+    def test_iterate_create_review_duplicate_pending_reuses_and_runs_once(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.review_tasks import DuplicateReviewError
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        pending_review = store.add("Pending review", task_type="review", depends_on=impl.id)
+        pending_review.status = "pending"
+        store.update(pending_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                side_effect=[{"type": "create_review", "description": "Create review"}],
+            ),
+            patch("gza.cli._create_review_task", side_effect=DuplicateReviewError(pending_review)),
+            patch("gza.cli._run_foreground", return_value=0) as run_foreground,
+            patch("gza.cli.get_review_verdict", return_value="APPROVED"),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id)
 
     def test_iterate_run_review_auto_resumes_max_steps_failure(self, tmp_path: Path):
         import argparse
