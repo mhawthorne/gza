@@ -1154,8 +1154,8 @@ def main() -> int:
     # iterate command
     iterate_parser = subparsers.add_parser(
         "iterate",
-        help="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for a task",
-        description="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for a task",
+        help="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for an implementation task",
+        description="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for an implementation task",
     )
     _add_iterate_args(iterate_parser)
 

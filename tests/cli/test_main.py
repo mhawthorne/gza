@@ -97,12 +97,15 @@ class TestHelpOutput:
         setup_config(tmp_path)
 
         result = run_gza("iterate", "--help", "--project", str(tmp_path))
+        normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
-        assert "implementation lifecycle loop" in result.stdout
-        assert "Maximum iterate actions (default: 5)" in result.stdout
-        assert "review/improve loop" not in result.stdout
-        assert "default: 3" not in result.stdout
+        assert "implementation lifecycle loop" in normalized_output
+        assert "for an implementation task" in normalized_output
+        assert "for a task" not in normalized_output
+        assert "Maximum iterate actions (default: 5)" in normalized_output
+        assert "review/improve loop" not in normalized_output
+        assert "default: 3" not in normalized_output
 
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""

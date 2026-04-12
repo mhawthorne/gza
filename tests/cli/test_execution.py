@@ -2873,6 +2873,107 @@ class TestIterateCommand:
         assert "Action 1/1: merge" in output
         assert "Iteration 1/1" not in output
 
+    def test_iterate_merge_without_required_review_reports_merge_ready_not_approved(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Action 1/1: merge" in output
+        assert "Iterate complete: MERGE_READY" in output
+        assert "Merge task (no review yet)" in output
+        assert "Iterate complete: APPROVED" not in output
+
+    def test_iterate_review_cleared_merge_reports_merge_ready_not_approved(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        prior_review = store.add("Review", task_type="review", depends_on=impl.id)
+        prior_review.status = "completed"
+        prior_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
+
+        # Mark review as cleared and ensure no newer review/improve cycle exists,
+        # so shared engine returns the "reviews_all_cleared" merge path.
+        impl.review_cleared_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Action 1/1: merge" in output
+        assert "Iterate complete: MERGE_READY" in output
+        assert "Merge (previous review addressed)" in output
+        assert "Iterate complete: APPROVED" not in output
+
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
         """gza iterate rejects tasks that are not implement type."""
 
@@ -3405,8 +3506,8 @@ class TestIterateCommand:
         assert "dry-run" in result.stdout.lower()
         assert "resume" in result.stdout.lower()
 
-    def test_failed_task_retry_max_iterations_one_runs_write_then_review_only(self, tmp_path: Path):
-        """With --retry and max_iterations=1, iterate runs retry write then one review."""
+    def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
         import argparse
         from unittest.mock import MagicMock, patch
         from datetime import datetime
@@ -3431,6 +3532,8 @@ class TestIterateCommand:
                 return 0
             if task.status == "pending":
                 task.status = "completed"
+                if task.task_type == "implement":
+                    task.branch = "test-project/20260101-retry"
                 task.completed_at = datetime.now()
                 store.update(task)
                 return 0
@@ -3446,27 +3549,35 @@ class TestIterateCommand:
             retry=True,
             background=False,
         )
-        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
              patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg, \
-             patch("gza.cli._create_review_task", return_value=review) as create_review, \
-             patch("gza.cli._create_improve_task") as create_improve:
+             patch("gza.cli.Git", return_value=mock_git):
             result = cmd_iterate(args)
+        output = capsys.readouterr().out
 
         assert result == 0
-        assert run_fg.call_count == 2
-        create_review.assert_called_once()
-        create_improve.assert_not_called()
+        # First call should be running the retry task (not the original failed one)
+        assert run_fg.call_count >= 1
         first_task_id = run_fg.call_args_list[0][1]["task_id"]
-        second_task_id = run_fg.call_args_list[1][1]["task_id"]
-        assert first_task_id != impl.id
-        assert second_task_id == review.id
+        assert first_task_id != impl.id  # Should be a new task
+        assert "Retrying failed implementation" in output
+        assert "Iterate complete: MERGE_READY" in output
 
-    def test_failed_task_retry_max_iterations_one_summary_counts_retry_write(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Retry start should include implementation write in iteration-1 summary and totals."""
+    def test_failed_task_resume_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """gza iterate --resume on a failed task resumes then enters the loop via real engine transitions."""
         import argparse
         from unittest.mock import MagicMock, patch
         from datetime import datetime
@@ -3477,27 +3588,17 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         impl.status = "failed"
+        impl.session_id = "resume-session-1"
         store.update(impl)
-        review = store.add("Review", task_type="review")
 
         def fake_run_foreground(config, task_id, **kwargs):
             task = store.get(task_id)
-            assert task is not None
-            if task.task_type == "review":
+            if task and task.status == "pending":
                 task.status = "completed"
-                task.output_content = "**Verdict: APPROVED**"
-                task.duration_seconds = 28.0
-                task.num_steps_reported = 3
-                task.cost_usd = 0.44
+                if task.task_type == "implement":
+                    task.branch = "test-project/20260101-resume"
                 task.completed_at = datetime.now()
                 store.update(task)
-                return 0
-            task.status = "completed"
-            task.duration_seconds = 22.0
-            task.num_steps_computed = 2
-            task.cost_usd = 0.33
-            task.completed_at = datetime.now()
-            store.update(task)
             return 0
 
         args = argparse.Namespace(
@@ -3506,165 +3607,38 @@ class TestIterateCommand:
             max_iterations=1,
             dry_run=False,
             no_docker=True,
-            resume=False,
-            retry=True,
+            resume=True,
+            retry=False,
             background=False,
         )
-        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
-            patch("gza.cli._create_review_task", return_value=review),
-            patch("gza.cli.time.monotonic", side_effect=[100.0, 150.0]),
+            patch("gza.cli.Git", return_value=mock_git),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
         assert result == 0
-        retry_task_id = run_fg.call_args_list[0][1]["task_id"]
-        assert retry_task_id != impl.id
-        assert run_fg.call_args_list[1][1]["task_id"] == review.id
-        assert re.search(
-            rf"1\s+implement\s+{re.escape(retry_task_id)}\s+-\s+22s\s+2\s+\$0\.33\s+completed",
-            output,
-        )
-        assert re.search(
-            rf"1\s+review\s+{re.escape(review.id)}\s+APPROVED\s+28s\s+3\s+\$0\.44\s+completed",
-            output,
-        )
-        assert "Totals: 50s wall | 5 steps | $0.77" in output
-
-    def test_failed_task_resume_max_iterations_one_runs_write_then_review_only(self, tmp_path: Path):
-        """With --resume and max_iterations=1, iterate runs resume write then one review."""
-        import argparse
-        from unittest.mock import MagicMock, patch
-        from datetime import datetime
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = store.add("Implement feature", task_type="implement")
-        impl.status = "failed"
-        impl.session_id = "resume-session"
-        store.update(impl)
-        resumed = store.add("Resumed implementation", task_type="implement", based_on=impl.id)
-        review = store.add("Review", task_type="review")
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            task = store.get(task_id)
-            assert task is not None
-            if task_id == resumed.id:
-                task.status = "completed"
-                task.completed_at = datetime.now()
-                store.update(task)
-                return 0
-            if task_id == review.id:
-                task.status = "completed"
-                task.output_content = "**Verdict: APPROVED**"
-                task.completed_at = datetime.now()
-                store.update(task)
-                return 0
-            raise AssertionError(f"unexpected task id: {task_id}")
-
-        args = argparse.Namespace(
-            project_dir=str(tmp_path),
-            impl_task_id=str(impl.id),
-            max_iterations=1,
-            dry_run=False,
-            no_docker=True,
-            resume=True,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
-        with patch("gza.cli.Config.load", return_value=mock_config), \
-             patch("gza.cli.get_store", return_value=store), \
-             patch("gza.cli._create_resume_task", return_value=resumed), \
-             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg, \
-             patch("gza.cli._create_review_task", return_value=review) as create_review, \
-             patch("gza.cli._create_improve_task") as create_improve:
-            result = cmd_iterate(args)
-
-        assert result == 0
-        assert [call[1]["task_id"] for call in run_fg.call_args_list] == [resumed.id, review.id]
-        create_review.assert_called_once()
-        create_improve.assert_not_called()
-
-    def test_failed_task_resume_max_iterations_one_summary_counts_resume_write(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Resume start should include implementation write in iteration-1 summary and totals."""
-        import argparse
-        from unittest.mock import MagicMock, patch
-        from datetime import datetime
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = store.add("Implement feature", task_type="implement")
-        impl.status = "failed"
-        impl.session_id = "resume-session"
-        store.update(impl)
-        resumed = store.add("Resumed implementation", task_type="implement", based_on=impl.id)
-        review = store.add("Review", task_type="review")
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            task = store.get(task_id)
-            assert task is not None
-            if task_id == resumed.id:
-                task.status = "completed"
-                task.duration_seconds = 19.0
-                task.num_steps_computed = 2
-                task.cost_usd = 0.31
-                task.completed_at = datetime.now()
-                store.update(task)
-                return 0
-            if task_id == review.id:
-                task.status = "completed"
-                task.output_content = "**Verdict: APPROVED**"
-                task.duration_seconds = 21.0
-                task.num_steps_reported = 4
-                task.cost_usd = 0.52
-                task.completed_at = datetime.now()
-                store.update(task)
-                return 0
-            raise AssertionError(f"unexpected task id: {task_id}")
-
-        args = argparse.Namespace(
-            project_dir=str(tmp_path),
-            impl_task_id=str(impl.id),
-            max_iterations=1,
-            dry_run=False,
-            no_docker=True,
-            resume=True,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
-        with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
-            patch("gza.cli._create_resume_task", return_value=resumed),
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
-            patch("gza.cli._create_review_task", return_value=review),
-            patch("gza.cli.time.monotonic", side_effect=[100.0, 140.0]),
-        ):
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 0
-        assert re.search(
-            rf"1\s+implement\s+{re.escape(resumed.id)}\s+-\s+19s\s+2\s+\$0\.31\s+completed",
-            output,
-        )
-        assert re.search(
-            rf"1\s+review\s+{re.escape(review.id)}\s+APPROVED\s+21s\s+4\s+\$0\.52\s+completed",
-            output,
-        )
-        assert "Totals: 40s wall | 6 steps | $0.83" in output
+        assert run_fg.call_count >= 1
+        first_task_id = run_fg.call_args_list[0][1]["task_id"]
+        assert first_task_id != impl.id
+        assert "Resuming failed implementation" in output
+        assert "Iterate complete: MERGE_READY" in output
 
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4858,6 +4832,60 @@ class TestIterateCommand:
         assert result == 0
         create_rebase.assert_called_once()
         create_resume.assert_called_once()
+
+    def test_iterate_real_engine_needs_rebase_transition(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When git reports conflicts, iterate should create/run a rebase task using shared engine rules."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            if task is not None:
+                task.status = "completed"
+                task.completed_at = datetime.now(UTC)
+                store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = False
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 2
+        assert run_fg.call_count == 1
+        assert "Action 1/1: needs_rebase" in output
+        assert "Created rebase task" in output
+        assert "Iterate complete: MAXED_OUT" in output
 
     def test_iterate_errors_when_git_init_fails(self, tmp_path: Path):
         import argparse

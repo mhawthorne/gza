@@ -6,6 +6,12 @@
 
 `gza advance` is the main orchestration command. It inspects all completed/unmerged tasks, determines the next action for each, and executes those actions (spawning workers, merging, etc.). It is designed to be idempotent and safe to run repeatedly.
 
+## Scope note (gza-956)
+
+The shared rule engine introduced for `advance` is also the decision source for `iterate` (`determine_next_action` in `src/gza/cli/advance_engine.py` wraps the same `evaluate_advance_rules()` chain). Keeping both commands on one rule evaluator is intentional to preserve the project learning: avoid diverging procedural forks between lifecycle commands.
+
+As a result, this change set includes iterate-facing contract alignment where needed (status wording, help text, and regressions) in the same patch as the engine migration, rather than splitting into a separate task with duplicated decision logic changes.
+
 ## Usage
 
 ```bash

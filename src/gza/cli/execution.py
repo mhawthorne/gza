@@ -16,6 +16,7 @@ from ..db import (
     Task as DbTask,
     add_task_interactive,
     edit_task_interactive,
+    task_id_numeric_key,
     validate_prompt,
 )
 from ..git import Git
@@ -1238,8 +1239,8 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             )
         )
 
-    def _task_sort_key(task: DbTask) -> tuple[datetime, str]:
-        return (task.created_at or datetime.min, task.id or "")
+    def _task_sort_key(task: DbTask) -> tuple[datetime, int]:
+        return (task.created_at or datetime.min, task_id_numeric_key(task.id))
 
     def _latest_with_status(tasks: list[DbTask], status: str) -> DbTask | None:
         matching = [task for task in tasks if task.status == status]
@@ -1290,12 +1291,26 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"\nAction {iteration + 1}/{max_iterations}: {action_type}")
 
         if action_type == "merge":
-            final_status = "approved"
-            final_stop_reason = "approved"
+            final_status = "merge_ready"
+            final_stop_reason = "merge_ready"
+            maybe_review_verdict: str | None = None
             maybe_review = action.get("review_task")
             if isinstance(maybe_review, DbTask):
-                maybe_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
-                _append_summary_row(summary_rows, iteration_index=iteration, task_type="review", task=maybe_review, verdict=maybe_verdict)
+                maybe_review_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="review",
+                    task=maybe_review,
+                    verdict=maybe_review_verdict,
+                )
+            if maybe_review_verdict == "APPROVED":
+                final_status = "approved"
+                final_stop_reason = "approved"
+            else:
+                merge_desc = action.get("description")
+                if isinstance(merge_desc, str) and merge_desc:
+                    final_stop_reason = merge_desc
             break
 
         if action_type in {"needs_discussion", "max_cycles_reached", "skip"}:
@@ -1543,7 +1558,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     print(f"Totals: {_format_compact_duration(iterate_wall_seconds)} wall | {total_steps} steps | ${total_cost:.2f}")
     print()
 
-    if final_status == "approved":
+    if final_status in {"approved", "merge_ready"}:
         return 0
     if final_status == "maxed_out":
         print(f"Max actions ({max_iterations}) reached.")
