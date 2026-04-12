@@ -927,23 +927,30 @@ def _build_context_from_chain(
 
 
 def _find_task_of_type_in_chain(task_id: str, task_type: str, store: SqliteTaskStore, visited: set[str] | None = None) -> Task | None:
-    """Walk up the based_on chain to find a task of the given type."""
+    """Walk lineage links to find a task of the given type."""
     if visited is None:
         visited = set()
+    stack = [task_id]
 
-    if task_id in visited:
-        return None  # Avoid cycles
-    visited.add(task_id)
+    while stack:
+        current_id = stack.pop()
+        if current_id in visited:
+            continue  # Avoid cycles
+        visited.add(current_id)
 
-    task = store.get(task_id)
-    if not task:
-        return None
+        task = store.get(current_id)
+        if not task:
+            continue
 
-    if task.task_type == task_type:
-        return task
+        if task.task_type == task_type:
+            return task
 
-    if task.based_on:
-        return _find_task_of_type_in_chain(task.based_on, task_type, store, visited)
+        # Transitional behavior: support historical plan links on either edge
+        # until all plan discovery callers/records are normalized.
+        if task.based_on:
+            stack.append(task.based_on)
+        if task.depends_on:
+            stack.append(task.depends_on)
 
     return None
 

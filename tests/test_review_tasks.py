@@ -237,7 +237,7 @@ class TestCreateReviewTask:
         assert call_kwargs["task_type"] == "review"
         assert call_kwargs["depends_on"] == "gza-1234"
         assert call_kwargs["group"] == "mygroup"
-        assert call_kwargs["based_on"] is None
+        assert call_kwargs["based_on"] == "gza-1234"
 
     def test_auto_prompt_mode_strips_nested_known_suffixes_from_lineage(self):
         store = self._mock_store()
@@ -277,3 +277,11 @@ class TestCreateReviewTask:
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["model"] is None
         assert call_kwargs["provider"] is None
+
+    def test_review_is_based_on_implementation_task_id(self):
+        store = self._mock_store()
+        task = _task(id="gza-12", based_on="gza-11")
+        create_review_task(store, task, prompt_mode="auto")
+        call_kwargs = store.add.call_args[1]
+        assert call_kwargs["depends_on"] == "gza-12"
+        assert call_kwargs["based_on"] == "gza-12"
