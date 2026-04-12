@@ -978,6 +978,10 @@ gza advance [task_id] [options]
 ### iterate
 
 Run an automated review/improve loop for an implementation task.
+Each iteration represents one code write that is followed by a review:
+iteration 1 is the current write awaiting review (usually the implementation write,
+but possibly a completed improve when restarting from newer unreviewed branch state), and
+later iterations are improve writes.
 
 ```bash
 gza iterate <impl_task_id> [options]
@@ -986,7 +990,7 @@ gza iterate <impl_task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `impl_task_id` | Full prefixed implementation task ID to iterate (e.g. `gza-1234`) |
-| `--max-iterations N` | Maximum review/improve iterations (default: 3) |
+| `--max-iterations N` | Maximum code-write iterations; each iteration ends with a review (default: 3) |
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |

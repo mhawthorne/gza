@@ -1035,7 +1035,7 @@ def main() -> int:
             default=3,
             dest="max_iterations",
             metavar="N",
-            help="Maximum review/improve iterations (default: 3)",
+            help="Maximum code-write iterations; each iteration ends with a review (default: 3)",
         )
         iterate_parser.add_argument(
             "--dry-run",
