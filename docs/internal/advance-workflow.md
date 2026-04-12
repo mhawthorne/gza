@@ -1,6 +1,6 @@
 # gza advance
 
-> **Status: Implemented** — This spec describes the current behavior of `gza advance` as of 2026-03-26.
+> **Status: Implemented** — This spec describes the current behavior of `gza advance` as of 2026-04-12.
 
 ## Overview
 
@@ -28,7 +28,7 @@ Advance collects tasks from two sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Resumable failed tasks**: Tasks with `status='failed'`, `failure_reason IN ('MAX_STEPS', 'MAX_TURNS')`, and `session_id IS NOT NULL`. Disabled with `--no-resume-failed`.
+2. **Resumable failed tasks**: Tasks with `status='failed'`, `failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')`, and `session_id IS NOT NULL`. Disabled with `--no-resume-failed`.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 
@@ -48,7 +48,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 
 ## Decision Tree
 
-For each task, `_determine_advance_action()` returns an action. The decision tree is evaluated top-to-bottom; first match wins.
+For each task, `evaluate_advance_rules()` returns an action from `src/gza/advance_engine.py`. The decision tree is evaluated by an ordered rule list; first match wins.
 
 ### 1. Plan tasks
 
@@ -119,7 +119,7 @@ Conflict detection uses the currently checked-out branch as the merge target (`t
 
 ### 8. Failed task resumption
 
-Failed tasks are evaluated separately from the main decision tree.
+Failed task resume rules run in the same ordered rule engine.
 
 | Condition | Action |
 |-----------|--------|
@@ -130,7 +130,7 @@ Failed tasks are evaluated separately from the main decision tree.
 
 ### Worker-spawning actions
 
-These actions create background workers and count toward the batch limit.
+These actions create background workers and count toward the batch limit. The source of truth is `WORKER_CONSUMING_ACTIONS` in `src/gza/advance_engine.py`.
 
 | Action | What it does |
 |--------|-------------|

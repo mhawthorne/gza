@@ -1165,16 +1165,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     try:
         git_runtime: Any = Git(config.project_dir)
         target_branch = git_runtime.current_branch()
-    except Exception:
-        class _NoopGit:
-            def current_branch(self) -> str:
-                return "main"
-
-            def can_merge(self, source_branch: str, target_branch: str) -> bool:
-                return True
-
-        git_runtime = _NoopGit()
-        target_branch = "main"
+    except Exception as exc:
+        print(f"Error: failed to initialize git runtime for iterate: {exc}")
+        return 1
     print(f"Iterating implementation {impl_task.id} (max {max_iterations} iterations)...")
 
     summary_rows: list[tuple[int, str, str | None, str | None, str | None]] = []

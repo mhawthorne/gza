@@ -2,6 +2,7 @@
 
 
 import argparse
+import io
 import os
 import re
 import signal as signal_mod
@@ -17,7 +18,14 @@ from gza.db import SqliteTaskStore
 from gza.query import build_lineage_tree
 from gza.workers import WorkerRegistry
 
-from .conftest import get_latest_task, make_store, run_gza, setup_config, setup_db_with_tasks
+from .conftest import (
+    get_latest_task,
+    make_store,
+    run_gza,
+    setup_config,
+    setup_db_with_tasks,
+    setup_git_repo_with_task_branch,
+)
 
 
 class TestAddCommand:
@@ -2786,6 +2794,18 @@ class TestReviewCommand:
 class TestIterateCommand:
     """Tests for 'gza iterate' command."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_iterate_git_runtime(self):
+        """Default iterate tests to a deterministic git runtime unless overridden."""
+        from unittest.mock import MagicMock, patch
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with patch("gza.cli.Git", return_value=mock_git):
+            yield
+
     def _make_completed_impl(self, store, prompt: str = "Implement feature") -> object:
         """Create and return a completed implement task."""
         from datetime import datetime
@@ -3156,6 +3176,7 @@ class TestIterateCommand:
         """--resume is only valid for failed tasks."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
+        setup_git_repo_with_task_branch(tmp_path, "seed", "feature/seed")
         impl = self._make_completed_impl(store)
 
         result = run_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
@@ -3525,10 +3546,14 @@ class TestIterateCommand:
             no_docker=True,
         )
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
 
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
-             patch("gza.cli._run_foreground", side_effect=fake_run_foreground), \
+             patch("gza.cli.Git", return_value=mock_git), \
+             patch("gza.cli._run_foreground", return_value=0), \
              patch("gza.cli._create_improve_task", return_value=improve) as create_improve, \
              patch("gza.cli._create_review_task", return_value=next_review) as create_review:
             result = cmd_iterate(args)
@@ -3554,7 +3579,14 @@ class TestIterateCommand:
 
         args = argparse.Namespace(impl_task_id=impl.id, max_iterations=3, dry_run=False, project_dir=tmp_path, no_docker=True)
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
-        with patch("gza.cli.Config.load", return_value=mock_config), patch("gza.cli.get_store", return_value=store):
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
             result = cmd_iterate(args)
         assert result == 0
 
@@ -4374,6 +4406,88 @@ class TestIterateCommand:
         assert result == 0
         create_rebase.assert_called_once()
         create_resume.assert_called_once()
+
+    def test_iterate_errors_when_git_init_fails(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+            iterate_max_iterations=5,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", side_effect=RuntimeError("git init boom")),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = cmd_iterate(args)
+            output = stdout.getvalue()
+
+        assert result == 1
+        assert "failed to initialize git runtime for iterate" in output
+
+    def test_iterate_errors_when_current_branch_fails(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+            iterate_max_iterations=5,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.side_effect = RuntimeError("branch boom")
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = cmd_iterate(args)
+            output = stdout.getvalue()
+
+        assert result == 1
+        assert "failed to initialize git runtime for iterate" in output
 
 
 class TestMarkCompletedCommand:

@@ -26,7 +26,6 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask
-from ..failure_policy import is_resumable_failure_reason
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
 from ..pickup import (
@@ -49,7 +48,7 @@ from ._common import (
     get_store,
     resolve_id,
 )
-from .advance_engine import determine_next_action
+from .advance_engine import WORKER_CONSUMING_ACTIONS, determine_next_action, is_resumable_failed_task
 
 logger = logging.getLogger(__name__)
 
@@ -1350,11 +1349,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             return 1
         if task.status == 'failed':
             # Allow a specific failed task if it's resumable
-            is_resumable = (
-                is_resumable_failure_reason(task.failure_reason)
-                and task.session_id is not None
-                and not no_resume_failed
-            )
+            is_resumable = is_resumable_failed_task(task) and not no_resume_failed
             if not is_resumable:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
@@ -1547,15 +1542,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
-        if advance_mode == "iterate" and action_type in {
-            "create_review",
-            "run_review",
-            "improve",
-            "run_improve",
-            "needs_rebase",
-            "resume",
-            "create_implement",
-        }:
+        if advance_mode == "iterate" and action_type in WORKER_CONSUMING_ACTIONS:
             iterate_target: DbTask | None = None
             iterate_resume = False
 
