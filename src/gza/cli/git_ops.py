@@ -42,7 +42,7 @@ from ._common import (
     get_store,
     resolve_id,
 )
-from .advance_engine import determine_next_action
+from .advance_engine import WORKER_CONSUMING_ACTIONS, determine_next_action, is_resumable_failed_task
 
 logger = logging.getLogger(__name__)
 
@@ -1245,11 +1245,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             return 1
         if task.status == 'failed':
             # Allow a specific failed task if it's resumable
-            is_resumable = (
-                task.failure_reason in ('MAX_STEPS', 'MAX_TURNS')
-                and task.session_id is not None
-                and not no_resume_failed
-            )
+            is_resumable = is_resumable_failed_task(task) and not no_resume_failed
             if not is_resumable:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
@@ -1366,8 +1362,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             console.print(f"      [{_color}]→ {description}[/{_color}]")
             print()
         if new_mode and batch_limit is not None:
-            worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'})
-            planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+            planned_workers = sum(1 for _, a in plan if a['type'] in WORKER_CONSUMING_ACTIONS)
             remaining = max(0, batch_limit - planned_workers)
             if remaining > 0:
                 pending_tasks = store.get_pending(limit=remaining)
@@ -1395,8 +1390,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     new_pending_tasks: list = []
     if new_mode and batch_limit is not None:
-        worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'improve', 'resume'})
-        planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+        planned_workers = sum(1 for _, a in plan if a['type'] in WORKER_CONSUMING_ACTIONS)
         remaining = max(0, batch_limit - planned_workers)
         if remaining > 0:
             new_pending_tasks = store.get_pending(limit=remaining)
@@ -1449,7 +1443,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
-        if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
+        if action_type in WORKER_CONSUMING_ACTIONS:
             if batch_limit is not None and workers_started >= batch_limit:
                 console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
@@ -1461,15 +1455,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
-        if advance_mode == "iterate" and action_type in {
-            "create_review",
-            "run_review",
-            "improve",
-            "run_improve",
-            "needs_rebase",
-            "resume",
-            "create_implement",
-        }:
+        if advance_mode == "iterate" and action_type in WORKER_CONSUMING_ACTIONS:
             iterate_target: DbTask | None = None
             iterate_resume = False
 

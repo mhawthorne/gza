@@ -30,7 +30,7 @@ from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
     create_review_task,
 )
-from ..review_verdict import parse_review_verdict
+from ..review_verdict import get_review_verdict as _get_review_verdict, parse_review_verdict
 from ..runner import run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -866,19 +866,7 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
     Returns:
         Verdict string ('APPROVED', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
     """
-    # First try output_content (cached in DB)
-    if review_task.output_content:
-        content = review_task.output_content
-    # Then try reading from report_file
-    elif review_task.report_file:
-        review_path = config.project_dir / review_task.report_file
-        if not review_path.exists():
-            return None
-        content = review_path.read_text()
-    else:
-        return None
-
-    return parse_review_verdict(content)
+    return _get_review_verdict(config.project_dir, review_task)
 
 
 def _create_review_task(

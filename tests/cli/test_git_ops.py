@@ -4094,6 +4094,23 @@ class TestAdvanceCommand:
         assert len(children) == 1
         assert children[0].session_id == "sess-xyz"
 
+    def test_advance_resumes_test_failure_failed_task(self, tmp_path: Path):
+        """advance resumes TEST_FAILURE failed tasks from the resumable-failed query set."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-test", failure_reason="TEST_FAILURE")
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume (failed: TEST_FAILURE" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+        assert children[0].session_id == "sess-test"
+
     def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
         """advance skips a failed task when chain depth >= max_resume_attempts."""
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
@@ -4371,6 +4388,103 @@ class TestAdvanceCommand:
         # Each of the 4 pending tasks should have been passed as an explicit task_id
         assert len(spawned_task_ids) == 4
         assert set(spawned_task_ids) == {t1.id, t2.id, t3.id, t4.id}
+
+    def test_advance_iterate_new_batch_needs_rebase_consumes_slot(self, tmp_path: Path):
+        """iterate mode accounts for needs_rebase as worker-consuming in --new --batch planning/execution."""
+        import io
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "advance_mode: iterate\n"
+        )
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path, "Conflict task")
+        pending = store.add("Pending task", task_type="implement")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli._determine_advance_action", return_value={"type": "needs_rebase", "description": "rebase"}),
+            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 0
+        assert pending.id not in output
+        assert "Will start 1 new pending task(s)" not in output
+        spawn_iterate.assert_called_once()
+        spawn_worker.assert_not_called()
+
+    def test_advance_iterate_new_batch_create_implement_consumes_slot(self, tmp_path: Path):
+        """iterate mode accounts for create_implement as worker-consuming in --new --batch planning/execution."""
+        import io
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "advance_mode: iterate\n"
+        )
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        plan = store.add("Plan task", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        pending = store.add("Pending task", task_type="implement")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(plan.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 0
+        assert pending.id not in output
+        assert "Will start 1 new pending task(s)" not in output
+        spawn_iterate.assert_called_once()
+        spawn_worker.assert_not_called()
 
 
 class TestAdvanceMergeSquashThreshold:
