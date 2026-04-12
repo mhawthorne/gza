@@ -1525,8 +1525,11 @@ def _check_dependency_merge_precondition(
         # Non-code dependencies may have no branch and are reachable via repo files.
         return (None, None, None)
     if not git.branch_exists(dep.branch):
-        # Branch may be deleted after merge; treat as reachable.
-        return (None, None, None)
+        # A missing local branch is only safe when merge status is explicitly known.
+        # Otherwise, fail closed so deleted local refs cannot bypass prerequisites.
+        if dep.merge_status == "merged":
+            return (None, None, None)
+        return (dep, default_branch, None)
 
     result = git._run("merge-base", "--is-ancestor", dep.branch, default_branch, check=False)
     if result.returncode == 0:
@@ -2038,7 +2041,7 @@ def _run_inner(
                 branch=branch_name,
                 failure_reason="PREREQUISITE_UNMERGED",
             )
-            return 0
+            return 1
 
     # Setup summary directory and path for task/implement types
     _, summary_path = get_task_output_paths(task, config.project_dir)

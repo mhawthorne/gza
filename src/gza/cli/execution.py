@@ -171,16 +171,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(task_separator)
             result = run(config, skip_precondition_check=getattr(args, "force", False))
 
-            # If run returns non-zero, it means something went wrong or no tasks left
+            # Any non-zero exit means the run failed.
             if result != 0:
                 if tasks_completed == 0:
-                    # First task failed or no tasks available, return the error code
-                    registry.mark_completed(worker_id, exit_code=result,
-                                           status="failed" if result != 0 else "completed")
+                    # First task failed, return the error code.
+                    registry.mark_completed(worker_id, exit_code=result, status="failed")
                     return result
-                else:
-                    # We completed some tasks before stopping, consider it success
-                    break
+                print(f"\nCompleted {tasks_completed} task(s) before a task failed")
+                registry.mark_completed(worker_id, exit_code=result, status="failed")
+                return result
 
             tasks_completed += 1
 

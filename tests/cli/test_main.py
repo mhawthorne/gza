@@ -202,3 +202,49 @@ class TestWorkForceBackgroundDispatch:
         assert captured_cmd is not None
         assert "--worker-mode" in captured_cmd
         assert "--force" in captured_cmd
+
+
+class TestDirectExecutionForceDispatch:
+    """Parser/dispatch coverage for --force on direct execution commands."""
+
+    @pytest.mark.parametrize(
+        ("argv", "command_patch"),
+        [
+            (
+                ["gza", "implement", "testproject-1", "--force"],
+                "gza.cli.main.cmd_implement",
+            ),
+            (
+                ["gza", "retry", "testproject-1", "--force"],
+                "gza.cli.main.cmd_retry",
+            ),
+            (
+                ["gza", "resume", "testproject-1", "--force"],
+                "gza.cli.main.cmd_resume",
+            ),
+            (
+                ["gza", "improve", "testproject-1", "--force"],
+                "gza.cli.main.cmd_improve",
+            ),
+            (
+                ["gza", "iterate", "testproject-1", "--force"],
+                "gza.cli.main.cmd_iterate",
+            ),
+        ],
+    )
+    def test_direct_execution_force_reaches_command_handler(self, tmp_path, argv, command_patch):
+        """CLI should parse --force and pass it through args to the selected direct execution handler."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", [*argv, "--project", str(tmp_path)]),
+            patch(command_patch, return_value=0) as cmd_handler,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_handler.assert_called_once()
+        parsed_args = cmd_handler.call_args[0][0]
+        assert parsed_args.force is True

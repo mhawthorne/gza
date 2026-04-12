@@ -1047,6 +1047,46 @@ class TestWorkCommandMultiTask:
         assert "Stuck task from yesterday" in result.stdout
         assert "gza work" in result.stdout
 
+    def test_work_count_nonzero_run_does_not_count_as_completed(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """A non-zero run result (e.g. PREREQUISITE_UNMERGED refusal) fails the session and stops batch accounting."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Pending task 1")
+        store.add("Pending task 2")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[],
+            count=2,
+            force=False,
+            resume=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.run", side_effect=[0, 1]),
+        ):
+            rc = cmd_run(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "Completed 1 task(s) before a task failed" in output
+        assert "Completed 2 task(s)" not in output
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].status == "failed"
+        assert workers[0].exit_code == 1
+
 
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
@@ -4168,6 +4208,26 @@ class TestRunForeground:
         assert w.status == "failed"
         assert w.exit_code == 1
 
+    def test_run_foreground_precondition_refusal_marks_worker_failed(self, tmp_path: Path):
+        """Precondition refusal (PREREQUISITE_UNMERGED path => non-zero) must not be recorded as completed."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Blocked by prerequisite")
+        assert task.id is not None
+
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+
+        with patch("gza.cli.run", return_value=1):
+            rc = _run_foreground(config, task_id=task.id)
+
+        assert rc == 1
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].status == "failed"
+        assert workers[0].exit_code == 1
+
     def test_run_foreground_passes_resume_and_open_after(self, tmp_path: Path):
         """_run_foreground correctly passes resume and open_after to run()."""
         setup_config(tmp_path)
@@ -4289,6 +4349,27 @@ class TestRunAsWorker:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.exit_code == 7
+
+    def test_run_as_worker_precondition_refusal_marks_failed(self, tmp_path: Path):
+        """Worker mode should record non-zero precondition refusal as failed, not completed."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker blocked task")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-prereq")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", return_value=1):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 1
+        worker = registry.get("w-worker-prereq")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
 
     def test_run_as_worker_exception_marks_failed_and_ps_shows_startup_failure(self, tmp_path: Path):
         """Exception cleanup keeps worker/task failed and startup failure visible in ps rows."""

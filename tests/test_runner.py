@@ -5316,13 +5316,17 @@ class TestDependencyMergePrecondition:
         merge_base_stdout: str = "",
         merge_base_stderr: str = "",
         setup_retry_chain: bool = False,
+        dep_mark_merged: bool = False,
     ) -> tuple[int, Mock, SqliteTaskStore, Task]:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         if setup_retry_chain:
-            _dep_task, _retry_task, downstream = self._setup_failed_dep_with_completed_retry(store)
+            dep_task, _retry_task, downstream = self._setup_failed_dep_with_completed_retry(store)
         else:
-            _dep_task, downstream = self._setup_dep_and_downstream(store, same_branch=same_branch)
+            dep_task, downstream = self._setup_dep_and_downstream(store, same_branch=same_branch)
+        if dep_mark_merged:
+            assert dep_task.id is not None
+            store.set_merge_status(dep_task.id, "merged")
         config = self._make_config(tmp_path, db_path)
 
         mock_provider = Mock()
@@ -5389,7 +5393,7 @@ class TestDependencyMergePrecondition:
             merge_base_return_code=1,
         )
 
-        assert result == 0
+        assert result == 1
         assert mock_provider.run.call_count == 0
         refreshed = store.get(downstream.id)
         assert refreshed is not None
@@ -5410,7 +5414,7 @@ class TestDependencyMergePrecondition:
             setup_retry_chain=True,
         )
 
-        assert result == 0
+        assert result == 1
         assert mock_provider.run.call_count == 0
         refreshed = store.get(downstream.id)
         assert refreshed is not None
@@ -5455,11 +5459,25 @@ class TestDependencyMergePrecondition:
         assert log_file.exists()
         assert "Skipped dependency merge precondition check (--force)" in log_file.read_text()
 
-    def test_missing_dependency_branch_is_treated_as_merged(self, tmp_path: Path):
+    def test_missing_dependency_branch_without_merged_status_fails_precondition(self, tmp_path: Path):
         result, mock_provider, store, downstream = self._run_with_merge_base(
             tmp_path,
             merge_base_return_code=1,
             branch_exists=False,
+        )
+
+        assert result == 1
+        assert mock_provider.run.call_count == 0
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
+
+    def test_missing_dependency_branch_with_known_merged_status_allows_task_start(self, tmp_path: Path):
+        result, mock_provider, store, downstream = self._run_with_merge_base(
+            tmp_path,
+            merge_base_return_code=1,
+            branch_exists=False,
+            dep_mark_merged=True,
         )
 
         assert result == 0
