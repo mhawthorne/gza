@@ -114,12 +114,8 @@ class TestTaskChaining:
 
         normal_1 = store.add("Normal 1")
         normal_2 = store.add("Normal 2")
-        urgent_1 = store.add("Urgent 1")
-        urgent_2 = store.add("Urgent 2")
-        assert urgent_1.id is not None
-        assert urgent_2.id is not None
-        store.set_urgent(urgent_1.id, True)
-        store.set_urgent(urgent_2.id, True)
+        urgent_1 = store.add("Urgent 1", urgent=True)
+        urgent_2 = store.add("Urgent 2", urgent=True)
 
         pending = store.get_pending()
         assert [task.id for task in pending] == [
@@ -128,6 +124,21 @@ class TestTaskChaining:
             normal_1.id,
             normal_2.id,
         ]
+
+    def test_bump_moves_task_to_front_of_urgent_pickup_lane(self, tmp_path: Path):
+        """Bumping a task should make it the first pickup item, ahead of older urgent tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        urgent_1 = store.add("Urgent 1", urgent=True)
+        urgent_2 = store.add("Urgent 2", urgent=True)
+        bumped = store.add("Will be bumped")
+        assert bumped.id is not None
+
+        store.set_urgent(bumped.id, True)
+
+        pickup = store.get_pending_pickup()
+        assert [task.id for task in pickup[:3]] == [bumped.id, urgent_1.id, urgent_2.id]
 
     def test_get_next_pending_prefers_urgent(self, tmp_path: Path):
         """get_next_pending picks urgent runnable tasks first."""
@@ -3773,7 +3784,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29]
+        assert status["pending_auto"] == [28, 29, 30]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -3785,7 +3796,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29]
+        assert status["pending_auto"] == [28, 29, 30]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -4264,7 +4275,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29]
+        assert status["pending_auto"] == [28, 29, 30]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

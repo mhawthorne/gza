@@ -65,6 +65,39 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
     assert spawn_worker.call_args.kwargs["task_id"] == plan.id
 
 
+def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Path) -> None:
+    """Queue bump semantics should be respected by watch pending pickup."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    older_urgent = store.add("Older urgent plan", task_type="plan", urgent=True)
+    bumped = store.add("Bumped plan", task_type="plan")
+    assert older_urgent.id is not None
+    assert bumped.id is not None
+    store.set_urgent(bumped.id, True)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == bumped.id
+
+
 def test_watch_cycle_resumes_failed_task_before_starting_new_pending(tmp_path: Path) -> None:
     """Resume-eligible failed tasks consume slots before new pending tasks."""
     setup_config(tmp_path)

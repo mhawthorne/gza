@@ -383,7 +383,7 @@ def main() -> int:
     )
     add_common_args(queue_parser)
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")
-    queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the urgent queue lane")
+    queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the front of the urgent queue lane")
     queue_bump.add_argument("task_id", type=str, help="Full prefixed task ID to bump")
     add_common_args(queue_bump)
     queue_unbump = queue_subparsers.add_parser("unbump", help="Move a pending task back to the normal queue lane")

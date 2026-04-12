@@ -859,6 +859,46 @@ class TestQueueCommand:
         assert refreshed is not None
         assert refreshed.urgent is False
 
+    def test_queue_bump_moves_task_to_front_of_urgent_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        older_urgent = store.add("Older urgent", urgent=True)
+        newer_urgent = store.add("Newer urgent", urgent=True)
+        bumped = store.add("Bumped now")
+        assert older_urgent.id is not None
+        assert newer_urgent.id is not None
+        assert bumped.id is not None
+
+        bump = run_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
+        assert bump.returncode == 0
+
+        queue = run_gza("queue", "--project", str(tmp_path))
+        assert queue.returncode == 0
+        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
+        older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
+        newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
+        assert bumped_line < older_line < newer_line
+
+    def test_next_shows_bumped_task_first(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Older urgent", urgent=True)
+        store.add("Newer urgent", urgent=True)
+        bumped = store.add("Bumped now")
+        assert bumped.id is not None
+        run_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
+
+        result = run_gza("next", "--project", str(tmp_path))
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
+        older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
+        newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
+        assert bumped_line < older_line < newer_line
+
     def test_queue_excludes_non_pickable_internal_and_blocked_pending_tasks(self, tmp_path: Path):
         """Queue pickup order output should only include runnable pending tasks."""
         setup_config(tmp_path)
@@ -3561,6 +3601,29 @@ class TestNextCommandWithDependencies:
         assert result.returncode == 0
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
+
+    def test_next_excludes_internal_and_only_shows_blocked_via_blocked_path(self, tmp_path: Path):
+        """Internal pending tasks should not appear in runnable or blocked output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Dependency blocker")
+        store.add("Blocked task", depends_on=blocker.id)
+        store.add("Internal pending", task_type="internal")
+        store.add("Runnable task")
+
+        result = run_gza("next", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Runnable task" in result.stdout
+        assert "Internal pending" not in result.stdout
+        assert "Blocked task" not in result.stdout
+        assert "blocked by dependencies" in result.stdout
+
+        result_all = run_gza("next", "--all", "--project", str(tmp_path))
+        assert result_all.returncode == 0
+        assert "Runnable task" in result_all.stdout
+        assert "Blocked task" in result_all.stdout
+        assert "Internal pending" not in result_all.stdout
 
 
 class TestKillCommand:

@@ -38,6 +38,7 @@ from pathlib import Path
 from gza import query as _query
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
+from gza.pickup import get_runnable_pending_tasks
 
 __all__ = ["GzaClient", "Task", "IncompleteSnapshot"]
 
@@ -165,7 +166,7 @@ class GzaClient:
         dependency-blocked tasks are excluded. Ordering is urgent-first, then
         FIFO by creation time within each lane.
         """
-        return self._store.get_pending_pickup(limit=limit)
+        return get_runnable_pending_tasks(self._store, limit=limit)
 
     def get_in_progress(self) -> list[Task]:
         """Return in-progress tasks, oldest-started first."""

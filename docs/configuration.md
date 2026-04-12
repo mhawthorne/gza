@@ -939,7 +939,7 @@ gza queue unbump <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to bump/unbump (e.g. `gza-1234`) |
 
-Queue pickup ordering is urgent-first, then FIFO within each lane.
+Queue pickup ordering is urgent-first. `queue bump` moves a task to the front of the urgent lane (next pickup), then remaining tasks stay FIFO by creation time within each lane.
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
 
 ### implement

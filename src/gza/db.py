@@ -263,8 +263,13 @@ MIGRATION_V28_TO_V29 = """
 ALTER TABLE tasks ADD COLUMN urgent INTEGER DEFAULT 0;
 """
 
+# Migration from v29 to v30: record bump time so "queue bump" can move to front
+MIGRATION_V29_TO_V30 = """
+ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -318,6 +323,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
     urgent INTEGER DEFAULT 0,
+    urgent_bumped_at TEXT,
     input_tokens INTEGER,
     output_tokens INTEGER,
     merge_status TEXT,
@@ -655,6 +661,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (27, None),  # Manual migration: remove TaskCycle bookkeeping tables/columns
     (28, MIGRATION_V27_TO_V28),
     (29, MIGRATION_V28_TO_V29),
+    (30, MIGRATION_V29_TO_V30),
 ]
 
 
@@ -1085,7 +1092,8 @@ class SqliteTaskStore:
         """Get runnable pending tasks in pickup order.
 
         Pickup semantics match default worker selection: excludes internal and
-        dependency-blocked tasks. Ordering is urgent-first, then FIFO.
+        dependency-blocked tasks. Ordering is urgent-first, with recently bumped
+        urgent tasks at the front, then FIFO by creation time.
         """
         with self._connect() as conn:
             query = """
@@ -1103,7 +1111,10 @@ class SqliteTaskStore:
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
-                ORDER BY t.urgent DESC, t.created_at ASC
+                ORDER BY
+                    t.urgent DESC,
+                    COALESCE(t.urgent_bumped_at, '') DESC,
+                    t.created_at ASC
                 """
             params: tuple[int, ...] | tuple[()] = ()
             if limit is not None:
@@ -1155,11 +1166,16 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def set_urgent(self, task_id: str, urgent: bool) -> bool:
-        """Set or clear a task's urgent queue flag. Returns True if task exists."""
+        """Set or clear a task's urgent queue flag.
+
+        Setting urgent=True records a bump timestamp so the task moves to the
+        front of the urgent pickup lane.
+        """
+        bumped_at = datetime.now(UTC).isoformat() if urgent else None
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE tasks SET urgent = ? WHERE id = ?",
-                (1 if urgent else 0, task_id),
+                "UPDATE tasks SET urgent = ?, urgent_bumped_at = ? WHERE id = ?",
+                (1 if urgent else 0, bumped_at, task_id),
             )
             return cur.rowcount > 0
 

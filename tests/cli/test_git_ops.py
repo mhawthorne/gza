@@ -4348,6 +4348,253 @@ class TestAdvanceCommand:
         assert len(spawned_task_ids) == 4
         assert set(spawned_task_ids) == {t1.id, t2.id, t3.id, t4.id}
 
+    def test_advance_new_batch_skips_internal_pending_tasks(self, tmp_path: Path):
+        """advance --new should only start runnable pickup tasks, not internal pending rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        internal = store.add("Internal pending", task_type="internal")
+        runnable = store.add("Runnable pending", task_type="implement")
+        assert internal.id is not None
+        assert runnable.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        started: list[str | None] = []
+
+        def fake_spawn(_args, _config, task_id=None, quiet=False):
+            started.append(task_id)
+            return 0
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        assert started == [runnable.id]
+        assert internal.id not in started
+
+    def test_advance_new_excludes_dependency_blocked_pending_from_plan_and_startup(self, tmp_path: Path):
+        """Blocked pending tasks must not appear in --new startup plan or be started."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        blocker = store.add("Failed blocker")
+        blocker.status = "failed"
+        blocker.completed_at = datetime.now(UTC)
+        store.update(blocker)
+        blocked = store.add("Blocked pending task", depends_on=blocker.id)
+        runnable = store.add("Runnable pending task")
+        assert blocked.id is not None
+        assert runnable.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        started: list[str | None] = []
+
+        def fake_spawn(_args, _config, task_id=None, quiet=False):
+            started.append(task_id)
+            return 0
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                rc = cmd_advance(args)
+                output = mock_stdout.getvalue()
+
+        assert rc == 0
+        assert "Blocked pending task" not in output
+        assert "Runnable pending task" in output
+        assert started == [runnable.id]
+
+    def test_advance_new_batch_plan_create_implement_consumes_slot_for_planning(self, tmp_path: Path):
+        """create_implement must count as worker-consuming in --new planning output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        plan = store.add("Plan for create_implement action", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        extra_pending = store.add("Extra runnable pending")
+        assert extra_pending.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        started: list[str | None] = []
+
+        def fake_spawn(_args, _config, task_id=None, quiet=False):
+            started.append(task_id)
+            return 0
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                rc = cmd_advance(args)
+                output = mock_stdout.getvalue()
+
+        assert rc == 0
+        assert "Will start 1 new pending task" not in output
+        assert len(started) == 1
+        assert started[0] != extra_pending.id
+        assert plan.id is not None
+        children = store.get_based_on_children(plan.id)
+        assert any(child.task_type == "implement" for child in children)
+
+    def test_advance_new_batch_needs_rebase_consumes_slot_for_planning(self, tmp_path: Path):
+        """needs_rebase must count as worker-consuming in --new planning output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        task = store.add("Completed unmerged task", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/rebase-me"
+        store.update(task)
+        assert task.id is not None
+        store.set_merge_status(task.id, "unmerged")
+
+        extra_pending = store.add("Extra runnable pending")
+        assert extra_pending.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        started: list[str | None] = []
+
+        def fake_spawn(_args, _config, task_id=None, quiet=False):
+            started.append(task_id)
+            return 0
+
+        with (
+            patch("gza.cli.git_ops._determine_advance_action", return_value={"type": "needs_rebase", "description": "Needs rebase"}),
+            patch("gza.cli._spawn_background_worker", side_effect=fake_spawn),
+            patch("sys.stdout", new_callable=io.StringIO) as mock_stdout,
+        ):
+            rc = cmd_advance(args)
+            output = mock_stdout.getvalue()
+
+        assert rc == 0
+        assert "Will start 1 new pending task" not in output
+        assert len(started) == 1
+        assert started[0] != extra_pending.id
+
+    def test_advance_new_picks_freshly_bumped_task_before_older_urgent(self, tmp_path: Path):
+        """advance --new should pick a freshly bumped task before older urgent tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        older_urgent = store.add("Older urgent", urgent=True)
+        bumped = store.add("Bumped task")
+        assert older_urgent.id is not None
+        assert bumped.id is not None
+        store.set_urgent(bumped.id, True)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        started: list[str | None] = []
+
+        def fake_spawn(_args, _config, task_id=None, quiet=False):
+            started.append(task_id)
+            return 0
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        assert started == [bumped.id]
+
 
 class TestAdvanceMergeSquashThreshold:
     """Tests for merge_squash_threshold feature in gza advance."""

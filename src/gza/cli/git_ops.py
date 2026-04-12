@@ -33,6 +33,11 @@ from ..db import SqliteTaskStore, Task as DbTask
 from ..failure_policy import is_resumable_failure_reason
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
+from ..pickup import (
+    count_worker_consuming_actions,
+    get_runnable_pending_tasks,
+    is_worker_consuming_advance_action,
+)
 from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task, load_dotenv
 from ._common import (
@@ -1696,11 +1701,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
             console.print(f"      [{_color}]→ {description}[/{_color}]")
             print()
         if new_mode and batch_limit is not None:
-            worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'})
-            planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+            planned_workers = count_worker_consuming_actions([action for _, action in plan])
             remaining = max(0, batch_limit - planned_workers)
             if remaining > 0:
-                pending_tasks = store.get_pending(limit=remaining)
+                pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
                 if pending_tasks:
                     print(f"Would start {len(pending_tasks)} new pending task(s):\n")
                     for pt in pending_tasks:
@@ -1725,11 +1729,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     new_pending_tasks: list = []
     if new_mode and batch_limit is not None:
-        worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'improve', 'resume'})
-        planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+        planned_workers = count_worker_consuming_actions([action for _, action in plan])
         remaining = max(0, batch_limit - planned_workers)
         if remaining > 0:
-            new_pending_tasks = store.get_pending(limit=remaining)
+            new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
             if new_pending_tasks:
                 print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
                 for pt in new_pending_tasks:
@@ -1779,7 +1782,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
-        if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
+        if is_worker_consuming_advance_action(action_type):
             if batch_limit is not None and workers_started >= batch_limit:
                 console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
@@ -1986,7 +1989,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # was shown), fetch now.
         if not new_pending_tasks:
             remaining = batch_limit - workers_started
-            new_pending_tasks = store.get_pending(limit=remaining)
+            new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
         for pt in new_pending_tasks:
             if workers_started >= batch_limit:
                 break

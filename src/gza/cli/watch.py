@@ -17,6 +17,7 @@ from ..console import truncate
 from ..db import SqliteTaskStore, Task as DbTask
 from ..failure_policy import is_resumable_failure_reason
 from ..git import Git
+from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..workers import WorkerRegistry
 from ._common import (
     _create_rebase_task,
@@ -195,7 +196,7 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
 
 
 def _pending_runnable_tasks(store: SqliteTaskStore) -> list[DbTask]:
-    return store.get_pending_pickup()
+    return get_runnable_pending_tasks(store)
 
 
 def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
@@ -299,14 +300,7 @@ def _run_cycle(
                     )
                 continue
 
-            if action_type not in {
-                "needs_rebase",
-                "run_review",
-                "run_improve",
-                "create_review",
-                "create_implement",
-                "improve",
-            }:
+            if not is_worker_consuming_advance_action(str(action_type)) or action_type == "resume":
                 continue
             if slots <= 0:
                 continue

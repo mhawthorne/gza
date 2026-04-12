@@ -37,6 +37,7 @@ from ..console import (
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
 from ..git import Git
+from ..pickup import get_runnable_pending_tasks
 from ..query import (
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
@@ -107,6 +108,8 @@ def cmd_next(args: argparse.Namespace) -> int:
     store = get_store(config)
 
     pending = store.get_pending()
+    runnable = get_runnable_pending_tasks(store)
+    blocked: list[tuple[DbTask, str | None]] = []
 
     # Check for orphaned/stale tasks once, regardless of whether pending tasks exist
     registry = WorkerRegistry(config.workers_path)
@@ -118,18 +121,16 @@ def cmd_next(args: argparse.Namespace) -> int:
             _print_orphaned_warning(orphaned)
         return 0
 
-    # Filter blocked tasks unless --all is specified
-    show_all = args.all if hasattr(args, 'all') else False
-
-    runnable = []
-    blocked = []
-
+    # Compute dependency-blocked non-internal pending tasks for blocked display/count.
     for task in pending:
-        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+        if task.task_type == "internal":
+            continue
+        is_blocked, blocking_id, _blocking_status = store.is_task_blocked(task)
         if is_blocked:
             blocked.append((task, blocking_id))
-        else:
-            runnable.append(task)
+
+    # Filter blocked tasks unless --all is specified
+    show_all = args.all if hasattr(args, 'all') else False
 
     # Colors consistent with cmd_history
     c = NEXT_COLORS_DICT
