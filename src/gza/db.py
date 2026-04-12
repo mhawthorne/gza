@@ -275,6 +275,41 @@ SCHEMA_VERSION = 30
 # These are NOT run automatically in _ensure_db.
 _MANUAL_MIGRATION_VERSIONS: frozenset[int] = frozenset({25, 26, 27})
 
+
+def _is_ignorable_migration_operational_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True when an auto-migration OperationalError is a safe duplicate artifact case."""
+    message = str(exc).lower()
+    return "duplicate column name" in message or "already exists" in message
+
+
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Check whether a table contains a specific column."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.OperationalError:
+        return False
+    def _column_name(row: sqlite3.Row | tuple[Any, ...]) -> str:
+        if isinstance(row, sqlite3.Row):
+            return str(row["name"])
+        return str(row[1])
+
+    return any(_column_name(row) == column for row in rows)
+
+
+def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: int) -> None:
+    """Validate required schema artifacts for selected automatic migration targets."""
+    required_columns_by_version: dict[int, tuple[str, str]] = {
+        30: ("tasks", "urgent_bumped_at"),
+    }
+    requirement = required_columns_by_version.get(target_version)
+    if requirement is None:
+        return
+    table, column = requirement
+    if not _table_has_column(conn, table, column):
+        raise RuntimeError(
+            f"Auto-migration to v{target_version} incomplete: missing required column {table}.{column}"
+        )
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
@@ -721,9 +756,12 @@ class SqliteTaskStore:
                                 if stmt:
                                     try:
                                         conn.execute(stmt)
-                                    except sqlite3.OperationalError:
-                                        # Column/table/index might already exist
-                                        pass
+                                    except sqlite3.OperationalError as exc:
+                                        if _is_ignorable_migration_operational_error(exc):
+                                            # Duplicate artifact from partially-applied/idempotent migration.
+                                            continue
+                                        raise
+                        _validate_auto_migration_target(conn, target_version)
                         conn.execute("UPDATE schema_version SET version = ?", (target_version,))
                         current_version = target_version
 

@@ -344,6 +344,23 @@ class TestGetPending:
         assert "Internal pending" not in prompts
         assert "Blocked pending" not in prompts
 
+    def test_bumped_urgent_task_is_returned_before_older_urgent_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        older_urgent = store.add("Older urgent", urgent=True)
+        newer_urgent = store.add("Newer urgent", urgent=True)
+        bumped = store.add("Bumped now")
+        assert older_urgent.id is not None
+        assert newer_urgent.id is not None
+        assert bumped.id is not None
+        store.set_urgent(bumped.id, True)
+
+        client = make_client(tmp_path)
+        result = client.get_pending()
+        ids = [task.id for task in result]
+
+        assert ids.index(bumped.id) < ids.index(older_urgent.id) < ids.index(newer_urgent.id)
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_in_progress

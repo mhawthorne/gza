@@ -826,7 +826,7 @@ def main() -> int:
     add_parser.add_argument(
         "--next",
         action="store_true",
-        help="Mark the new task as urgent so it is picked up before normal queue items",
+        help="Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump)",
     )
     add_parser.add_argument(
         "--model",

@@ -1031,6 +1031,37 @@ def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
     assert run_cycle.call_count == 2
 
 
+def test_cmd_watch_dry_run_actionable_cycles_do_not_count_toward_max_idle(tmp_path: Path) -> None:
+    """Dry-run cycles with actionable work should reset idle accounting."""
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+    )
+
+    cycle_results = [
+        _CycleResult(True, 0, 1),
+        _CycleResult(True, 0, 1),
+        _CycleResult(False, 0, 1),
+    ]
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results) as run_cycle,
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 3
+
+
 def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

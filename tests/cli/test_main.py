@@ -117,6 +117,20 @@ class TestHelpOutput:
         assert "Review and iteration analytics" in result.stdout
         assert "Review analytics (use 'gza stats reviews')" not in result.stdout
 
+    def test_add_next_help_and_docs_describe_front_of_urgent_lane(self, tmp_path):
+        """`add --next` contract should explicitly mention bump-to-front urgent-lane behavior."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("add", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+        normalized_help = " ".join(help_result.stdout.split())
+        assert "front of the urgent lane" in normalized_help
+        assert "picked up before normal queue items" not in normalized_help
+
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "front of the urgent lane" in docs_text
+        assert "picked up before normal queue items" not in docs_text
+
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
 

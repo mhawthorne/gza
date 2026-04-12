@@ -458,7 +458,7 @@ gza add [prompt] [options]
 | `--model MODEL` | Override model for this task (e.g., `claude-3-5-haiku-latest`) |
 | `--provider PROVIDER` | Override provider for this task (`claude`, `codex`, or `gemini`) |
 | `--no-learnings` | Skip injecting `.gza/learnings.md` context into this task's prompt |
-| `--next` | Mark the new task urgent so it is picked up before normal queue items |
+| `--next` | Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump) |
 
 ### edit
 

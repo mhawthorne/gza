@@ -163,8 +163,8 @@ class GzaClient:
         Notes
         -----
         This uses default worker pickup semantics: internal tasks and
-        dependency-blocked tasks are excluded. Ordering is urgent-first, then
-        FIFO by creation time within each lane.
+        dependency-blocked tasks are excluded. Ordering is urgent-first, with
+        recently bumped urgent tasks first, then FIFO by creation time.
         """
         return get_runnable_pending_tasks(self._store, limit=limit)
 

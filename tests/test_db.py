@@ -3772,6 +3772,29 @@ def _run_v25_v26_v27_migrations(db_path: Path, prefix: str = "gza") -> None:
     run_v27_migration(db_path)
 
 
+def _make_v29_db_without_urgent_bumped_at(db_path: Path) -> None:
+    """Create a minimal v29 DB where tasks.urgent exists but tasks.urgent_bumped_at does not."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (29)")
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            task_type TEXT NOT NULL DEFAULT 'implement',
+            created_at TEXT NOT NULL,
+            urgent INTEGER DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -4199,6 +4222,53 @@ class TestMigrationUtilityFunctions:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.attach_count == 1
+
+    def test_auto_migration_v29_to_v30_adds_urgent_bumped_at(self, tmp_path: Path) -> None:
+        """Opening a v29 DB should migrate to v30 and create tasks.urgent_bumped_at."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v29_db_without_urgent_bumped_at(db_path)
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 30
+        assert "urgent_bumped_at" in columns
+
+    def test_auto_migration_v30_failure_does_not_advance_schema_version(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Migration failures must not stamp schema_version forward when v30 SQL fails."""
+        import sqlite3
+
+        import gza.db as db_module
+
+        db_path = tmp_path / "test.db"
+        _make_v29_db_without_urgent_bumped_at(db_path)
+
+        broken_migrations = [
+            (version, "ALTER TABLE tasks ADD COLUMN ;" if version == 30 else sql)
+            for version, sql in db_module._MIGRATIONS
+        ]
+        monkeypatch.setattr(db_module, "_MIGRATIONS", broken_migrations)
+
+        with pytest.raises(sqlite3.OperationalError):
+            SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 29
+        assert "urgent_bumped_at" not in columns
 
     def test_run_v27_migration_drops_cycle_schema_and_preserves_task_data(self, tmp_path: Path) -> None:
         import sqlite3
