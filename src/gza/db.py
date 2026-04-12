@@ -879,6 +879,46 @@ class SqliteTaskStore:
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
 
+    def get_by_seq(self, seq_number: int, prefix: str | None = None) -> Task | None:
+        """Get task by ordinal sequence number within a project prefix.
+
+        This is equivalent to ``get(f"{prefix}-{seq_number}")`` and exists for
+        call sites that need explicit ordinal lookup without string formatting.
+        """
+        if seq_number < 1:
+            return None
+        task_prefix = prefix or self._prefix
+        return self.get(f"{task_prefix}-{seq_number}")
+
+    def next_task_after(self, task_id: str) -> Task | None:
+        """Return the next existing task by allocated sequence order.
+
+        Sequence order is defined by ``project_sequences`` allocation and the
+        decimal suffix in task IDs. Gaps are allowed (e.g. deletions), so this
+        returns the smallest existing sequence strictly greater than ``task_id``.
+        """
+        try:
+            canonical_id = resolve_task_id(task_id, self._prefix)
+        except InvalidTaskIdError:
+            return None
+        prefix, suffix = canonical_id.rsplit("-", 1)
+        seq = int(suffix)
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE id LIKE (? || '-%')
+                  AND substr(id, length(?) + 2) GLOB '[0-9]*'
+                  AND CAST(substr(id, length(?) + 2) AS INTEGER) > ?
+                ORDER BY CAST(substr(id, length(?) + 2) AS INTEGER) ASC
+                LIMIT 1
+                """,
+                (prefix, prefix, prefix, seq, prefix),
+            )
+            row = cur.fetchone()
+            return self._row_to_task(row) if row else None
+
     def get_by_slug(self, slug: str) -> Task | None:
         """Get a task by slug (YYYYMMDD-... format, stored in the 'slug' DB column)."""
         with self._connect() as conn:
