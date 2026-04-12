@@ -126,7 +126,7 @@ def create_review_task(
         task_type="review",
         depends_on=impl_task.id,
         group=impl_task.group,
-        based_on=impl_task.based_on,
+        based_on=impl_task.id,
         model=model,
         provider=provider,
     )

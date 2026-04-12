@@ -13,6 +13,7 @@ import pytest
 from gza.cli import _run_as_worker, _run_foreground
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.query import build_lineage_tree
 from gza.workers import WorkerRegistry
 
 from .conftest import get_latest_task, make_store, run_gza, setup_config, setup_db_with_tasks
@@ -2376,8 +2377,8 @@ class TestReviewCommand:
         assert result.returncode == 1
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
-    def test_review_inherits_based_on_from_implementation(self, tmp_path: Path):
-        """Review task inherits based_on from implementation to find plan."""
+    def test_review_anchors_lineage_to_reviewed_implementation(self, tmp_path: Path):
+        """Review task uses implementation ID for based_on and lineage placement."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2388,25 +2389,46 @@ class TestReviewCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        # Create implementation based on plan
+        # Create implementation based on plan and a retry implementation based on it
         impl_task = store.add("Implement feature", task_type="implement", based_on=plan_task.id)
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-implement-feature"
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
+        retry_impl = store.add("Retry implementation", task_type="implement", based_on=impl_task.id)
+        retry_impl.status = "completed"
+        retry_impl.branch = "test-project/20260130-retry-implementation"
+        retry_impl.completed_at = datetime.now(UTC)
+        store.update(retry_impl)
+
         # Run review command with --queue to only create (not run)
-        result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = run_gza("review", str(retry_impl.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created review task " in result.stdout
 
-        # Verify the review task inherited based_on
+        # Verify the review task is anchored to the reviewed implementation task
         all_tasks = store.get_all()
         review_task = [t for t in all_tasks if t.task_type == "review"][0]
         assert review_task is not None
-        assert review_task.based_on == plan_task.id
-        assert review_task.depends_on == impl_task.id
+        assert review_task.based_on == retry_impl.id
+        assert review_task.depends_on == retry_impl.id
+
+        retry_based_children = {t.id for t in store.get_based_on_children(retry_impl.id)}
+        parent_based_children = {t.id for t in store.get_based_on_children(impl_task.id)}
+        assert review_task.id in retry_based_children
+        assert review_task.id not in parent_based_children
+
+        # Verify canonical lineage placement is under retry implementation
+        lineage_tree = build_lineage_tree(store, plan_task)
+        assert len(lineage_tree.children) == 1
+        parent_impl_node = lineage_tree.children[0]
+        assert parent_impl_node.task.id == impl_task.id
+        assert len(parent_impl_node.children) == 1
+        retry_node = parent_impl_node.children[0]
+        assert retry_node.task.id == retry_impl.id
+        assert any(child.task.id == review_task.id for child in retry_node.children)
 
     def test_review_runs_by_default(self, tmp_path: Path):
         """Review command runs the review task immediately by default."""

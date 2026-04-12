@@ -25,6 +25,7 @@ from gza.runner import (
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
     _extract_review_verdict,
+    _find_task_of_type_in_chain,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
     _run_non_code_task,
@@ -5232,3 +5233,33 @@ class TestLoadDotenv:
         load_dotenv(project_dir)
 
         assert os.environ["MY_TEST_KEY"] == "from_project"
+
+
+class TestFindTaskOfTypeInChain:
+    def test_finds_plan_via_depends_on_only(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan = store.add("Plan feature", task_type="plan")
+        impl = store.add("Implement feature", task_type="implement", depends_on=plan.id)
+
+        found = _find_task_of_type_in_chain(impl.id, "plan", store)
+        assert found is not None
+        assert found.id == plan.id
+
+    def test_finds_plan_via_based_on_only(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan = store.add("Plan feature", task_type="plan")
+        impl = store.add("Implement feature", task_type="implement", based_on=plan.id)
+
+        found = _find_task_of_type_in_chain(impl.id, "plan", store)
+        assert found is not None
+        assert found.id == plan.id
+
+    def test_finds_plan_through_mixed_retry_chain(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan = store.add("Plan feature", task_type="plan")
+        impl = store.add("Implement feature", task_type="implement", depends_on=plan.id)
+        retry = store.add("Retry implementation", task_type="implement", based_on=impl.id)
+
+        found = _find_task_of_type_in_chain(retry.id, "plan", store)
+        assert found is not None
+        assert found.id == plan.id
