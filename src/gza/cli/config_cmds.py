@@ -611,6 +611,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
         if raw_hours_i is not None and raw_hours_i <= 0:
             print("Error: --hours must be >= 1", file=sys.stderr)
             return 1
+        if raw_days_i is not None and raw_days_i <= 0:
+            print("Error: --days must be >= 1", file=sys.stderr)
+            return 1
         if all_time_i and any(
             value is not None for value in (raw_hours_i, raw_days_i, raw_start_i, raw_end_i)
         ):

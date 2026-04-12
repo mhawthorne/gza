@@ -1580,6 +1580,48 @@ class TestStatsIterationsCommand:
         assert all_result.returncode == 1
         assert "--all cannot be combined" in all_result.stderr
 
+    def test_stats_iterations_rejects_non_positive_days(self, tmp_path: Path):
+        """--days must be >= 1 for iterations stats."""
+        setup_config(tmp_path)
+
+        zero_days_result = run_gza(
+            "stats",
+            "iterations",
+            "--days",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+        assert zero_days_result.returncode == 1
+        assert "--days must be >= 1" in zero_days_result.stderr
+
+        negative_days_result = run_gza(
+            "stats",
+            "iterations",
+            "--days",
+            "-1",
+            "--project",
+            str(tmp_path),
+        )
+        assert negative_days_result.returncode == 1
+        assert "--days must be >= 1" in negative_days_result.stderr
+
+    def test_stats_iterations_all_time_alias(self, tmp_path: Path):
+        """--all-time alias should behave the same as --all."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        result = run_gza("stats", "iterations", "--all-time", "--last", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert impl.id in result.stdout
+
 
 class TestStatsCommand:
     """Tests for the 'gza stats' parent command."""
