@@ -28,7 +28,7 @@ Advance collects tasks from two sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Resumable failed tasks**: Tasks with `status='failed'`, `failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')`, and `session_id IS NOT NULL`. Disabled with `--no-resume-failed`.
+2. **Resumable failed tasks**: Tasks with `status='failed'`, `failure_reason IN ('MAX_STEPS', 'MAX_TURNS')`, and `session_id IS NOT NULL`. Disabled with `--no-resume-failed`.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 
@@ -40,7 +40,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 |-------|---------|-------------|
 | `advance_requires_review` | `true` | Implement tasks must have a passing review before merge |
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements (only when `advance_requires_review=true`) |
-| `max_resume_attempts` | `3` | Max times a failed task can be auto-resumed |
+| `max_resume_attempts` | `1` | Max times a failed task can be auto-resumed |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 

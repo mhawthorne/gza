@@ -57,7 +57,7 @@ DEFAULT_CLAUDE_ARGS = [
 ]
 DEFAULT_ADVANCE_CREATE_REVIEWS = True
 DEFAULT_ADVANCE_REQUIRES_REVIEW = True
-DEFAULT_MAX_RESUME_ATTEMPTS = 3
+DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
@@ -947,10 +947,19 @@ class Config:
 
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
-        max_review_cycles = int(data.get("max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES))
-        max_resume_attempts = int(data.get("max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS))
+        try:
+            max_resume_attempts = int(data.get("max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS))
+        except (TypeError, ValueError):
+            raise ConfigError("'max_resume_attempts' must be an integer")
         if max_resume_attempts < 0:
             raise ConfigError("max_resume_attempts must be a non-negative integer")
+        try:
+            max_review_cycles = int(data.get("max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES))
+        except (TypeError, ValueError):
+            raise ConfigError("'max_review_cycles' must be an integer")
+        if max_review_cycles <= 0:
+            raise ConfigError("'max_review_cycles' must be positive")
+
         iterate_max_iterations = int(data.get("iterate_max_iterations", DEFAULT_ITERATE_MAX_ITERATIONS))
         if iterate_max_iterations < 1:
             raise ConfigError("iterate_max_iterations must be a positive integer")

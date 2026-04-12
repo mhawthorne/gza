@@ -88,8 +88,8 @@ project_name: my-project
 
 # --- Advance/Iterate ---
 
-# Auto-resume budget for MAX_STEPS/MAX_TURNS/TEST_FAILURE failures (default: 3)
-# max_resume_attempts: 3
+# Auto-resume budget for MAX_STEPS/MAX_TURNS failures (default: 1)
+# max_resume_attempts: 1
 
 # Default iterate action budget when --max-iterations is omitted (default: 5)
 # iterate_max_iterations: 5

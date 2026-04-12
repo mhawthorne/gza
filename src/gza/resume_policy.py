@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-RESUMABLE_FAILURE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"})
+RESUMABLE_FAILURE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS"})
 
 
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
@@ -24,4 +24,3 @@ def is_resumable_failed_task(task: Any) -> bool:
         failure_reason=getattr(task, "failure_reason", None),
         session_id=getattr(task, "session_id", None),
     )
-

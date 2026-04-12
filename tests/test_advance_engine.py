@@ -30,7 +30,7 @@ def _make_store(tmp_path: Path) -> SqliteTaskStore:
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
 
 
-def test_resolve_context_includes_resume_state_for_test_failure(tmp_path: Path):
+def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -50,7 +50,7 @@ def test_resolve_context_includes_resume_state_for_test_failure(tmp_path: Path):
         "main",
     )
 
-    assert ctx.is_resumable_failed_task is True
+    assert ctx.is_resumable_failed_task is False
     assert ctx.failure_reason == "TEST_FAILURE"
 
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from ..config import Config
+from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
 from ..console import format_duration
 from ..db import (
     SqliteTaskStore,
@@ -1096,7 +1096,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             store,
             task_to_run,
             run_task=_run_one,
-            max_resume_attempts=_int_config(getattr(config, "max_resume_attempts", None), 3),
+            max_resume_attempts=_int_config(
+                getattr(config, "max_resume_attempts", None),
+                DEFAULT_MAX_RESUME_ATTEMPTS,
+            ),
             on_resume=_on_resume,
         )
 
@@ -1262,7 +1265,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     final_status = "maxed_out"
     final_stop_reason = "max_actions"
     iteration = 0
-    max_resume_attempts = _int_config(getattr(config, "max_resume_attempts", None), 3)
+    max_resume_attempts = _int_config(
+        getattr(config, "max_resume_attempts", None),
+        DEFAULT_MAX_RESUME_ATTEMPTS,
+    )
     engine_config = _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
         advance_requires_review=bool(getattr(config, "advance_requires_review", True)),

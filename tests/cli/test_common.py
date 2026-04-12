@@ -136,7 +136,7 @@ class TestRunWithResume:
         assert final_task.status == "failed"
         assert len(store.get_all()) == 3  # original + 2 resume children
 
-    def test_resumes_on_test_failure(self, tmp_path):
+    def test_does_not_resume_on_test_failure(self, tmp_path):
         (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
@@ -145,18 +145,12 @@ class TestRunWithResume:
         task.session_id = "sess-123"
         store.update(task)
 
-        outcomes = ["TEST_FAILURE", None]
         seen_resume_flags: list[bool] = []
 
         def _run_task(run_task, resume: bool) -> int:
             seen_resume_flags.append(resume)
-            outcome = outcomes.pop(0)
-            if outcome is None:
-                run_task.status = "completed"
-                store.update(run_task)
-                return 0
             run_task.status = "failed"
-            run_task.failure_reason = outcome
+            run_task.failure_reason = "TEST_FAILURE"
             run_task.session_id = "sess-123"
             store.update(run_task)
             return 1
@@ -169,7 +163,7 @@ class TestRunWithResume:
             max_resume_attempts=3,
         )
 
-        assert rc == 0
-        assert final_task.status == "completed"
-        assert seen_resume_flags == [False, True]
-        assert len(store.get_all()) == 2
+        assert rc == 1
+        assert final_task.status == "failed"
+        assert seen_resume_flags == [False]
+        assert len(store.get_all()) == 1

@@ -4130,8 +4130,8 @@ class TestAdvanceCommand:
         assert len(children) == 1
         assert children[0].session_id == "sess-xyz"
 
-    def test_advance_resumes_test_failure_failed_task(self, tmp_path: Path):
-        """advance resumes TEST_FAILURE failed tasks from the resumable-failed query set."""
+    def test_advance_skips_test_failure_failed_task(self, tmp_path: Path):
+        """advance does not auto-resume TEST_FAILURE failed tasks."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -4141,11 +4141,10 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Resume (failed: TEST_FAILURE" in result.stdout
+        assert "No eligible tasks" in result.stdout
 
         children = store.get_based_on_children(failed_task.id)
-        assert len(children) == 1
-        assert children[0].session_id == "sess-test"
+        assert len(children) == 0
 
     def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
         """advance skips a failed task when chain depth >= max_resume_attempts."""
@@ -4174,6 +4173,28 @@ class TestAdvanceCommand:
         original_children = store.get_based_on_children(original.id)
         assert len(original_children) == 1  # only the pre-existing first_resume
         # first_resume should not have any new children (at max attempts)
+        first_resume_children = store.get_based_on_children(first_resume.id)
+        assert len(first_resume_children) == 0
+
+    def test_advance_default_resume_budget_is_one(self, tmp_path: Path):
+        """advance default max_resume_attempts=1 skips failed task at depth 1."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-1", failure_reason="MAX_STEPS")
+        first_resume = store.add("Implement feature", task_type="implement")
+        first_resume.status = "failed"
+        first_resume.failure_reason = "MAX_STEPS"
+        first_resume.session_id = "sess-2"
+        first_resume.based_on = original.id
+        first_resume.completed_at = datetime.now(UTC)
+        store.update(first_resume)
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "max resume attempts (1)" in result.stdout
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
 
@@ -5010,7 +5031,7 @@ class TestAdvanceMergeSquashThreshold:
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 0
-        assert config.max_resume_attempts == 3
+        assert config.max_resume_attempts == 1
 
     def test_yaml_merge_squash_threshold_parsed(self, tmp_path: Path):
         """merge_squash_threshold is correctly parsed from gza.yaml."""
@@ -5060,6 +5081,42 @@ class TestAdvanceMergeSquashThreshold:
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert "'max_review_cycles' must be positive" in errors
+
+    def test_load_rejects_non_integer_max_resume_attempts(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: nope\n")
+        with pytest.raises(ConfigError, match="'max_resume_attempts' must be an integer"):
+            Config.load(tmp_path)
+
+    def test_load_rejects_negative_max_resume_attempts(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: -1\n")
+        with pytest.raises(ConfigError, match="'max_resume_attempts' must be non-negative"):
+            Config.load(tmp_path)
+
+    def test_load_rejects_non_integer_max_review_cycles(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: nope\n")
+        with pytest.raises(ConfigError, match="'max_review_cycles' must be an integer"):
+            Config.load(tmp_path)
+
+    def test_load_rejects_non_positive_max_review_cycles(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 0\n")
+        with pytest.raises(ConfigError, match="'max_review_cycles' must be positive"):
+            Config.load(tmp_path)
 
 class TestAdvanceUnimplementedCommand:
     """Tests for 'gza advance --unimplemented' command."""

@@ -41,7 +41,6 @@ class AdvanceContext:
     create_reviews: bool
     max_review_cycles: int
     max_resume_attempts: int
-    allow_branchless_implement_review: bool = False
 
     has_implement_child: bool = False
 
@@ -199,7 +198,6 @@ def resolve_advance_context(
     *,
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
-    allow_branchless_implement_review: bool = False,
 ) -> AdvanceContext:
     """Resolve state once, then let rules evaluate pure context."""
     assert task.id is not None
@@ -221,7 +219,6 @@ def resolve_advance_context(
             task=task,
             task_type=task.task_type,
             has_branch=bool(task.branch),
-            allow_branchless_implement_review=False,
             requires_review=config.advance_requires_review,
             create_reviews=config.advance_create_reviews,
             max_review_cycles=config.max_review_cycles,
@@ -233,53 +230,15 @@ def resolve_advance_context(
             failure_reason=task.failure_reason,
         )
 
-    if not task.branch and not (allow_branchless_implement_review and task.task_type == "implement"):
-        return AdvanceContext(
-            task=task,
-            task_type=task.task_type,
-            has_branch=False,
-            allow_branchless_implement_review=False,
-            requires_review=config.advance_requires_review,
-            create_reviews=config.advance_create_reviews,
-            max_review_cycles=config.max_review_cycles,
-            max_resume_attempts=effective_max_resume,
-            is_resumable_failed_task=is_resumable_failed,
-            has_resume_children=has_resume_children,
-            resume_chain_depth=resume_chain_depth,
-            failure_reason=task.failure_reason,
-        )
-
     if not task.branch:
-        (
-            reviews,
-            active_review,
-            latest_completed_review,
-            review_cleared,
-            review_verdict,
-            completed_review_cycles,
-            active_improve_running,
-            active_improve_pending,
-            has_improve_after_review,
-        ) = _resolve_review_state(config, store, task)
         return AdvanceContext(
             task=task,
             task_type=task.task_type,
             has_branch=False,
-            allow_branchless_implement_review=True,
             requires_review=config.advance_requires_review,
             create_reviews=config.advance_create_reviews,
             max_review_cycles=config.max_review_cycles,
             max_resume_attempts=effective_max_resume,
-            can_merge=True,
-            reviews=reviews,
-            active_review=active_review,
-            latest_completed_review=latest_completed_review,
-            review_cleared=review_cleared,
-            review_verdict=review_verdict,
-            completed_review_cycles=completed_review_cycles,
-            active_improve_running=active_improve_running,
-            active_improve_pending=active_improve_pending,
-            has_improve_after_review=has_improve_after_review,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
@@ -325,7 +284,6 @@ def resolve_advance_context(
         task=task,
         task_type=task.task_type,
         has_branch=True,
-        allow_branchless_implement_review=False,
         requires_review=config.advance_requires_review,
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
@@ -387,7 +345,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="no_branch",
-        matches=lambda ctx: not ctx.has_branch and not ctx.allow_branchless_implement_review,
+        matches=lambda ctx: not ctx.has_branch,
         action=lambda ctx: {"type": "skip", "description": "SKIP: task has no branch (no commits)"},
     ),
     AdvanceRule(
@@ -579,7 +537,6 @@ def evaluate_advance_rules(
     *,
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
-    allow_branchless_implement_review: bool = False,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
     context = resolve_advance_context(
@@ -590,7 +547,6 @@ def evaluate_advance_rules(
         target_branch,
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
-        allow_branchless_implement_review=allow_branchless_implement_review,
     )
 
     for rule in ADVANCE_RULES:
