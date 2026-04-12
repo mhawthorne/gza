@@ -4096,7 +4096,7 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
         """advance skips a failed task when chain depth >= max_resume_attempts."""
-        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
@@ -4110,7 +4110,7 @@ class TestAdvanceCommand:
         first_resume.completed_at = datetime.now(UTC)
         store.update(first_resume)
 
-        # Default max_resume_attempts=1; original is skipped (already has a child),
+        # max_resume_attempts=1; original is skipped (already has a child),
         # first_resume (depth=1) is skipped (at max attempts)
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
@@ -4168,7 +4168,7 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
-        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
@@ -4280,6 +4280,46 @@ class TestAdvanceCommand:
         # first_resume should get a new resume child (depth=1 < max=2)
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 1
+
+    def test_advance_mode_iterate_spawns_iterate_worker(self, tmp_path: Path):
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "advance_mode: iterate\n"
+            "iterate_max_iterations: 7\n"
+        )
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=None,
+            new=False,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
+            patch("gza.cli._spawn_background_worker") as spawn_worker,
+        ):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        spawn_worker.assert_not_called()
+        spawn_iterate.assert_called_once()
+        assert spawn_iterate.call_args.kwargs["max_iterations"] == 7
 
 
     def test_advance_new_batch_spawns_distinct_tasks(self, tmp_path: Path):
@@ -4500,6 +4540,9 @@ class TestAdvanceMergeSquashThreshold:
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 0
+        assert config.advance_mode == "work"
+        assert config.max_resume_attempts == 3
+        assert config.iterate_max_iterations == 5
 
     def test_yaml_merge_squash_threshold_parsed(self, tmp_path: Path):
         """merge_squash_threshold is correctly parsed from gza.yaml."""
@@ -4507,6 +4550,16 @@ class TestAdvanceMergeSquashThreshold:
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 3\n")
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 3
+
+    def test_yaml_parses_advance_mode_and_iterate_max_iterations(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\nadvance_mode: iterate\niterate_max_iterations: 9\n"
+        )
+        config = Config.load(tmp_path)
+        assert config.advance_mode == "iterate"
+        assert config.iterate_max_iterations == 9
 
     def test_invalid_type_raises_config_error(self, tmp_path: Path):
         """Non-integer merge_squash_threshold in yaml raises ConfigError, not bare ValueError."""

@@ -40,8 +40,10 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 |-------|---------|-------------|
 | `advance_requires_review` | `true` | Implement tasks must have a passing review before merge |
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements (only when `advance_requires_review=true`) |
-| `max_resume_attempts` | `1` | Max times a failed task can be auto-resumed |
+| `advance_mode` | `work` | `work`: execute one action/task; `iterate`: spawn `iterate --background` for non-merge actions |
+| `max_resume_attempts` | `3` | Max times a failed task can be auto-resumed |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
+| `iterate_max_iterations` | `5` | Default iterate action budget when `--max-iterations` is omitted |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 
 ## Decision Tree

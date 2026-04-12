@@ -986,7 +986,7 @@ gza iterate <impl_task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `impl_task_id` | Full prefixed implementation task ID to iterate (e.g. `gza-1234`) |
-| `--max-iterations N` | Maximum review/improve iterations (default: 3) |
+| `--max-iterations N` | Maximum iterate actions (default: `iterate_max_iterations`, default value 5) |
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |

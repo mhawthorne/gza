@@ -10,11 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import gza.colors as _colors
-from gza.query import (
-    get_base_task_slug as _get_base_task_slug,
-    get_improves_for_root as _get_improves_for_root_task,
-    get_reviews_for_root as _get_reviews_for_root_task,
-)
+from gza.query import get_base_task_slug as _get_base_task_slug
 
 from .. import runner as runner_mod
 from ..colors import pink
@@ -40,12 +36,13 @@ from ._common import (
     _create_review_task,
     _get_pager,
     _looks_like_task_id,
+    _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
-    get_review_verdict,
     get_store,
     resolve_id,
 )
+from .advance_engine import determine_next_action
 
 logger = logging.getLogger(__name__)
 
@@ -1054,16 +1051,6 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
 
-def _count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
-    """Count completed review/improve cycles for an implementation task.
-
-    Counts completed improve tasks for the root task, since each improve
-    corresponds to one completed review→changes_requested→improve cycle.
-    """
-    improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
-    return sum(1 for t in improve_tasks if t.status == 'completed')
-
-
 def _determine_advance_action(
     config: Config,
     store: SqliteTaskStore,
@@ -1071,243 +1058,18 @@ def _determine_advance_action(
     task: DbTask,
     target_branch: str,
     impl_based_on_ids: set[str] | None = None,
+    max_resume_attempts: int | None = None,
 ) -> dict:
-    """Determine the next action needed to advance a task.
-
-    Returns a dict with:
-        type: action type ('merge', 'create_review', 'create_implement', 'improve',
-                           'needs_rebase', 'wait_review', 'wait_improve',
-                           'needs_discussion', 'skip')
-        description: human-readable description of the action
-        review_task: (optional) the review task involved
-
-    Args:
-        impl_based_on_ids: Pre-computed set of plan IDs that already have an
-            implement task.  Pass this to avoid repeated DB queries when
-            processing many plan tasks.  If *None*, it will be fetched on
-            demand for plan tasks.
-    """
-    assert task.id is not None
-
-    # Completed plan tasks: check if an implement child already exists
-    if task.task_type == 'plan':
-        if impl_based_on_ids is None:
-            impl_based_on_ids = store.get_impl_based_on_ids()
-        if task.id not in impl_based_on_ids:
-            return {
-                'type': 'create_implement',
-                'description': 'Create and start implement task',
-            }
-        return {
-            'type': 'skip',
-            'description': 'SKIP: implement task already exists for this plan',
-        }
-
-    # Tasks with no branch (no commits) cannot be merged or reviewed
-    if not task.branch:
-        return {
-            'type': 'skip',
-            'description': 'SKIP: task has no branch (no commits)',
-        }
-
-    # Fetch lineage children once (used for rebase conflict checks and post-rebase review invalidation)
-    assert task.id is not None
-    rebase_children = store.get_lineage_children(task.id)
-
-    # Check for merge conflicts against the current advance target branch.
-    if not git.can_merge(task.branch, target_branch):
-        # Check if a rebase is already in progress or has failed
-        for child in rebase_children:
-            if child.task_type != "rebase":
-                continue
-            if child.status == "in_progress" or child.status == "pending":
-                return {
-                    'type': 'skip',
-                    'description': f'SKIP: rebase {child.id} already in progress',
-                }
-            if child.status == "failed":
-                return {
-                    'type': 'needs_discussion',
-                    'description': f'SKIP: rebase {child.id} failed, needs manual resolution',
-                }
-        return {
-            'type': 'needs_rebase',
-            'description': 'rebase --resolve (conflicts detected)',
-        }
-
-    # Check if a rebase completed after the latest review — if so, the review
-    # is stale and we need a fresh one before merging.
-    completed_rebases = [
-        c for c in rebase_children
-        if c.task_type == "rebase" and c.status == "completed" and c.completed_at is not None
-    ]
-
-    # Check review state
-    reviews = _get_reviews_for_root_task(store, task)
-
-    if reviews:
-        active_review = next(
-            (r for r in reviews if r.status in ('pending', 'in_progress')),
-            None,
-        )
-        completed_reviews = [r for r in reviews if r.status == 'completed']
-        latest_completed_review = completed_reviews[0] if completed_reviews else None
-
-        # If a rebase completed after the latest review, force a new review
-        # (unless one is already pending/in_progress)
-        if completed_rebases and latest_completed_review and latest_completed_review.completed_at is not None:
-            latest_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
-            if latest_rebase.completed_at is not None and latest_rebase.completed_at > latest_completed_review.completed_at:
-                if active_review:
-                    if active_review.status == 'pending':
-                        return {
-                            'type': 'run_review',
-                            'description': f'Run pending review {active_review.id} (post-rebase)',
-                        }
-                    return {
-                        'type': 'wait_review',
-                        'description': f'SKIP: review {active_review.id} in progress (post-rebase)',
-                    }
-                return {
-                    'type': 'create_review',
-                    'description': 'Create review (code changed by rebase since last review)',
-                }
-
-        # Determine if the review has been cleared by a subsequent improve task
-        review_cleared = (
-            latest_completed_review is not None
-            and task.review_cleared_at is not None
-            and latest_completed_review.completed_at is not None
-            and task.review_cleared_at >= latest_completed_review.completed_at
-        )
-
-        # If review was cleared, check if code changed since the review
-        # (i.e., a completed improve task exists after the latest review).
-        # In that case, the review is stale and we need a new one.
-        if review_cleared and latest_completed_review and latest_completed_review.completed_at is not None:
-            # But first, check if a new review is already pending/in_progress
-            if active_review:
-                if active_review.status == 'pending':
-                    return {
-                        'type': 'run_review',
-                        'description': f'Spawn worker for pending review {active_review.id}',
-                        'review_task': active_review,
-                    }
-                return {
-                    'type': 'wait_review',
-                    'description': f'SKIP: review {active_review.id} is in_progress',
-                    'review_task': active_review,
-                }
-
-            improves = _get_improves_for_root_task(store, task)
-            completed_improves = [
-                t for t in improves
-                if t.status == 'completed' and t.completed_at is not None
-            ]
-            if completed_improves:
-                latest_improve = max(completed_improves, key=lambda t: t.completed_at or datetime.min)
-                if latest_improve.completed_at is not None and latest_improve.completed_at > latest_completed_review.completed_at:
-                    return {
-                        'type': 'create_review',
-                        'description': 'Create review (code changed since last review)',
-                    }
-
-        if not review_cleared:
-            # Active (non-cleared) review exists.
-            if active_review and active_review.status == 'pending':
-                return {
-                    'type': 'run_review',
-                    'description': f'Spawn worker for pending review {active_review.id}',
-                    'review_task': active_review,
-                }
-            if active_review and active_review.status == 'in_progress':
-                return {
-                    'type': 'wait_review',
-                    'description': f'SKIP: review {active_review.id} is in_progress',
-                    'review_task': active_review,
-                }
-
-            if latest_completed_review is not None:
-                latest_review = latest_completed_review
-                verdict = get_review_verdict(config, latest_review)
-                if verdict == 'APPROVED':
-                    return {
-                        'type': 'merge',
-                        'description': 'Merge (review APPROVED)',
-                        'review_task': latest_review,
-                    }
-                elif verdict == 'CHANGES_REQUESTED':
-                    # Check cycle limit before creating a new improve
-                    completed_cycles = _count_completed_review_cycles(store, task.id)
-                    if completed_cycles >= config.max_review_cycles:
-                        return {
-                            'type': 'max_cycles_reached',
-                            'description': f'SKIP: max review cycles ({config.max_review_cycles}) reached, needs manual intervention',
-                        }
-                    # Check if an improve task is already pending/in_progress
-                    assert latest_review.id is not None
-                    existing_improve = store.get_improve_tasks_for(task.id, latest_review.id)
-                    active_improve_running = [t for t in existing_improve if t.status == 'in_progress']
-                    if active_improve_running:
-                        return {
-                            'type': 'wait_improve',
-                            'description': f'SKIP: improve task {active_improve_running[0].id} is in_progress',
-                        }
-                    active_improve_pending = [t for t in existing_improve if t.status == 'pending']
-                    if active_improve_pending:
-                        return {
-                            'type': 'run_improve',
-                            'description': f'Spawn worker for pending improve {active_improve_pending[0].id}',
-                            'improve_task': active_improve_pending[0],
-                        }
-                    return {
-                        'type': 'improve',
-                        'description': 'Create improve task (review CHANGES_REQUESTED)',
-                        'review_task': latest_review,
-                    }
-                else:
-                    return {
-                        'type': 'needs_discussion',
-                        'description': f'SKIP: review verdict is {verdict or "unknown"}, needs manual attention',
-                        'review_task': latest_review,
-                    }
-
-        # Review was cleared by an improve task — always mergeable regardless of config.
-        if latest_completed_review is not None:
-            return {
-                'type': 'merge',
-                'description': 'Merge (previous review addressed)',
-            }
-
-    # Reached only when no reviews exist (all earlier paths with reviews have returned).
-    # Non-implement types (plan, explore, improve, etc.) go straight to merge.
-    # improve tasks are already produced by a review cycle; they merge directly.
-    if task.task_type != 'implement':
-        return {
-            'type': 'merge',
-            'description': 'Merge task (no review yet)',
-        }
-
-    # implement task with no review — consult config flags.
-    # Note: advance_create_reviews is only consulted when advance_requires_review=True.
-    # When advance_requires_review=False, tasks merge directly regardless of advance_create_reviews
-    # (there is no review gate, so creating one informally is not relevant).
-    if config.advance_requires_review:
-        if config.advance_create_reviews:
-            return {
-                'type': 'create_review',
-                'description': 'Create review (required before merge)',
-            }
-        else:
-            return {
-                'type': 'skip',
-                'description': 'SKIP: no review exists and advance_create_reviews=false (run gza review manually)',
-            }
-    # advance_requires_review=false — merge directly without a review.
-    return {
-        'type': 'merge',
-        'description': 'Merge task (no review yet)',
-    }
+    """Backward-compatible wrapper around the shared advance engine."""
+    return determine_next_action(
+        config,
+        store,
+        git,
+        task,
+        target_branch,
+        impl_based_on_ids=impl_based_on_ids,
+        max_resume_attempts=max_resume_attempts,
+    )
 
 
 def _unimplemented_implement_prompt(task: DbTask) -> str:
@@ -1397,7 +1159,7 @@ def _advance_action_color(action_type: str) -> str:
     ac = _colors.ADVANCE_COLORS
     if action_type == 'merge':
         return ac.merge
-    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached'):
+    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'):
         return ac.error
     if action_type in ('skip', 'wait_review', 'wait_improve'):
         return ac.waiting
@@ -1432,6 +1194,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     create_mode: bool = getattr(args, 'create', False)
     no_resume_failed: bool = getattr(args, 'no_resume_failed', False)
     max_resume_attempts_override: int | None = getattr(args, 'max_resume_attempts', None)
+    advance_mode: str = config.advance_mode
     advance_type: str | None = getattr(args, 'advance_type', None)
 
     # Determine effective max_resume_attempts
@@ -1490,8 +1253,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if not is_resumable:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            tasks = []
-            failed_tasks: list[DbTask] = [task]
+            tasks = [task]
         else:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
@@ -1500,13 +1262,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print(f"Task {task_id} is already merged")
                 return 0
             tasks = [task]
-            failed_tasks = []
     else:
         # Get all unmerged completed tasks
         all_unmerged = store.get_unmerged()
         tasks = [t for t in all_unmerged if t.status == 'completed']
         # Also collect resumable failed tasks (unless disabled)
-        failed_tasks = [] if no_resume_failed else store.get_resumable_failed_tasks()
+        if not no_resume_failed:
+            tasks.extend(store.get_resumable_failed_tasks())
 
         # Also fetch completed plans that have no implement child yet.
         # These are invisible to get_unmerged() (no branch/merge_status)
@@ -1526,12 +1288,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Apply --type filter
         if advance_type == 'plan':
             tasks = [t for t in tasks if t.task_type == 'plan']
-            failed_tasks = []  # plans don't have failed/resume logic
         elif advance_type == 'implement':
             tasks = [t for t in tasks if t.task_type == 'implement']
-            failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
 
-    if not tasks and not failed_tasks and not new_mode:
+    if not tasks and not new_mode:
         print("No eligible tasks to advance")
         return 0
 
@@ -1543,34 +1303,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # merge execution, and rebase task creation.
     target_branch = git.current_branch()
 
-    # Analyze each completed task to determine the next action
+    # Analyze each task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
-        action = _determine_advance_action(config, store, git, task, target_branch, impl_based_on_ids=impl_based_on_ids)
-        plan.append((task, action))
-
-    # Analyze each resumable failed task
-    for failed_task in failed_tasks:
-        assert failed_task.id is not None
-        failure_reason = failed_task.failure_reason or "UNKNOWN"
-        # If this task already has any resume children, skip it — the child
-        # task is what should be evaluated for further resume attempts, not this one.
-        children = store.get_based_on_children(failed_task.id)
-        if children:
+        action = _determine_advance_action(
+            config,
+            store,
+            git,
+            task,
+            target_branch,
+            impl_based_on_ids=impl_based_on_ids,
+            max_resume_attempts=max_resume_attempts,
+        )
+        if (
+            task.status == "failed"
+            and action.get("type") == "skip"
+            and action.get("description") == "SKIP: resume child already exists"
+        ):
             continue
-        # Check resume chain depth
-        depth = store.count_resume_chain_depth(failed_task.id)
-        if depth >= max_resume_attempts:
-            plan.append((failed_task, {
-                'type': 'skip',
-                'description': f"SKIP: max resume attempts ({max_resume_attempts}) reached",
-            }))
-        else:
-            attempt_num = depth + 1
-            plan.append((failed_task, {
-                'type': 'resume',
-                'description': f"Resume (failed: {failure_reason}, attempt {attempt_num}/{max_resume_attempts})",
-            }))
+        plan.append((task, action))
 
     # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
     # the rationale. The sort is stable, preserving DB order within each group.
@@ -1579,7 +1330,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     # If the plan is empty or every item is a skip, there's nothing actionable
     # (unless --new is set, in which case we still want to start pending tasks).
-    if not plan or all(action['type'] == 'skip' for _, action in plan):
+    if not plan or all(action['type'] in {'skip', 'max_resume_attempts'} for _, action in plan):
         if not new_mode:
             print("No eligible tasks to advance")
             if plan:
@@ -1632,7 +1383,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         return 0
 
     # Show the plan and prompt for confirmation
-    actionable_plan = [item for item in plan if item[1]['type'] != 'skip']
+    actionable_plan = [item for item in plan if item[1]['type'] not in {'skip', 'max_resume_attempts'}]
     if actionable_plan:
         print(f"Will advance {len(actionable_plan)} task(s):\n")
         for task, action in plan:
@@ -1688,7 +1439,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
         action_type = action['type']
 
-        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
+        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached', 'max_resume_attempts'):
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
@@ -1709,6 +1460,69 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+
+        if advance_mode == "iterate" and action_type in {
+            "create_review",
+            "run_review",
+            "improve",
+            "run_improve",
+            "needs_rebase",
+            "resume",
+            "create_implement",
+        }:
+            iterate_target: DbTask | None = None
+            iterate_resume = False
+
+            if action_type == "create_implement":
+                prompt_text = _unimplemented_implement_prompt(task)
+                impl_task = store.add(
+                    prompt=prompt_text,
+                    task_type="implement",
+                    based_on=task.id,
+                    group=task.group,
+                )
+                assert impl_task.id is not None
+                console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")
+                iterate_target = impl_task
+            elif task.task_type == "implement":
+                iterate_target = task
+                iterate_resume = action_type == "resume"
+            else:
+                iterate_target = None
+
+            if iterate_target is None or iterate_target.id is None:
+                console.print(
+                    f"      [{_c_warn}]SKIP: iterate mode requires an implement task target[/{_c_warn}]"
+                )
+                skip_count += 1
+                print()
+                continue
+
+            worker_args = argparse.Namespace(
+                no_docker=getattr(args, "no_docker", False),
+            )
+            rc = _spawn_background_iterate_worker(
+                worker_args,
+                config,
+                iterate_target,
+                max_iterations=config.iterate_max_iterations,
+                resume=iterate_resume,
+                retry=False,
+                quiet=True,
+            )
+            workers_started += 1
+            if rc == 0:
+                console.print(
+                    f"      [{_c_ok}]✓ Started iterate worker for {iterate_target.id}[/{_c_ok}]"
+                )
+                success_count += 1
+            else:
+                console.print(
+                    f"      [{_c_err}]✗ Failed to start iterate worker for {iterate_target.id}[/{_c_err}]"
+                )
+                error_count += 1
+            print()
+            continue
 
         if action_type == 'merge':
             # Determine whether to auto-squash based on commit count and threshold
