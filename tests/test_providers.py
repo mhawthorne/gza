@@ -3788,6 +3788,69 @@ class TestCodexOutputParsing:
         assert step_2_args[1] >= step_1_args[1]
         assert step_2_args[2] >= step_1_args[2]
 
+    def test_step_headers_rebase_estimates_after_turn_usage_arrives(self, tmp_path):
+        """Later turns should start from real totals and estimate only post-usage deltas."""
+        import json
+
+        from gza.providers.codex import CodexProvider, calculate_cost
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        mock_formatter = MagicMock()
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "a" * 4000},
+                }
+            ) + "\n",
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 300, "output_tokens": 100},
+                }
+            ) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "b" * 4000},
+                }
+            ) + "\n",
+        ]
+
+        with patch("gza.providers.codex.StreamOutputFormatter", return_value=mock_formatter):
+            with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+                mock_process = MagicMock()
+                mock_process.stdout = iter(json_lines)
+                mock_process.wait.return_value = None
+                mock_process.returncode = 0
+                mock_popen.return_value = mock_process
+
+                result = provider._run_with_output_parsing(
+                    cmd=["codex", "exec", "--json", "-"],
+                    log_file=log_file,
+                    timeout_minutes=30,
+                )
+
+        assert mock_formatter.print_step_header.call_count == 2
+        step_1_args = mock_formatter.print_step_header.call_args_list[0].args
+        step_2_args = mock_formatter.print_step_header.call_args_list[1].args
+
+        # Step 1: estimate only ("a" * 4000 => 1000 output tokens).
+        assert step_1_args[1] == 1000
+        assert step_1_args[2] == calculate_cost(0, 1000, "")
+
+        # Step 2: real turn1 totals (300/100) + estimate for turn2 delta only (1000 output).
+        assert step_2_args[1] == 1400
+        assert step_2_args[2] == calculate_cost(300, 1100, "")
+        assert step_2_args[1] < 2400  # Guard against old double-counting behavior.
+
+        assert result.input_tokens == 300
+        assert result.output_tokens == 100
+
     def test_on_session_id_callback_called_from_thread_started(self, tmp_path):
         """on_session_id callback should be invoked when thread.started event is parsed."""
         import json
