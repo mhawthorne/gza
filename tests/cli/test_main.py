@@ -366,6 +366,83 @@ class TestIterateBackgroundForceDispatch:
         assert captured_cmd is not None
         assert "--force" in captured_cmd
 
+    def test_iterate_background_propagates_explicit_max_iterations(self, tmp_path):
+        """`gza iterate --background --max-iterations N` should pass N unchanged to detached worker."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending implement for iterate background max-iterations", task_type="implement")
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 5353
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    "--max-iterations",
+                    "7",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        idx = captured_cmd.index("--max-iterations")
+        assert captured_cmd[idx + 1] == "7"
+
+    def test_iterate_background_rejects_zero_max_iterations_before_spawn(self, tmp_path):
+        """`gza iterate --background --max-iterations 0` should fail before detached worker spawn."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending implement for iterate background invalid max", task_type="implement")
+        assert task.id is not None
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    "--max-iterations",
+                    "0",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen") as popen_mock,
+        ):
+            rc = main()
+
+        assert rc == 1
+        popen_mock.assert_not_called()
+
     @pytest.mark.parametrize("restart_flag", ["--resume", "--retry"])
     def test_iterate_restart_background_keeps_force_in_worker_command(self, tmp_path, restart_flag):
         """Restarting iterate in background should preserve --force alongside --resume/--retry."""
@@ -412,3 +489,15 @@ class TestIterateBackgroundForceDispatch:
         assert captured_cmd is not None
         assert "--force" in captured_cmd
         assert restart_flag in captured_cmd
+
+
+class TestIterateMaxIterationsValidation:
+    """Command-level regression tests for iterate max-iterations bounds."""
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_iterate_rejects_non_positive_max_iterations(self, tmp_path, value):
+        setup_config(tmp_path)
+        result = run_gza("iterate", "testproject-1", "--max-iterations", value, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "--max-iterations must be a positive integer" in result.stdout

@@ -995,14 +995,14 @@ def _spawn_background_iterate(
     config: Config,
     impl_task: DbTask,
     *,
-    quiet: bool = False,
+    max_iterations: int,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     return _spawn_background_iterate_worker(
         args,
         config,
         impl_task,
-        max_iterations=getattr(args, "max_iterations", None) or 5,
+        max_iterations=max_iterations,
         resume=getattr(args, "resume", False),
         retry=getattr(args, "retry", False),
     )
@@ -1031,6 +1031,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     max_iterations_arg = getattr(args, "max_iterations", None)
     max_iterations = max_iterations_arg if max_iterations_arg is not None else 5
+    if max_iterations <= 0:
+        print("Error: --max-iterations must be a positive integer.")
+        return 1
     dry_run: bool = getattr(args, 'dry_run', False)
     use_resume: bool = getattr(args, 'resume', False)
     use_retry: bool = getattr(args, 'retry', False)
@@ -1068,7 +1071,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if dry_run:
             print(f"[dry-run] Would run iterate in background for {impl_task.id}")
             return 0
-        return _spawn_background_iterate(args, config, impl_task)
+        return _spawn_background_iterate(
+            args,
+            config,
+            impl_task,
+            max_iterations=max_iterations,
+        )
 
     def _run_task_with_resume(task_to_run: DbTask, *, initial_resume: bool = False) -> tuple[DbTask, int]:
         def _run_one(t: DbTask, resume_flag: bool) -> int:
@@ -1172,16 +1180,41 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     assert impl_task.id is not None
 
-    if dry_run:
-        print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} actions)")
-        return 0
-
     try:
         git_runtime: Any = Git(config.project_dir)
         target_branch = git_runtime.current_branch()
     except Exception as exc:
         print(f"Error: failed to initialize git runtime for iterate: {exc}")
         return 1
+
+    max_resume_attempts = _int_config(
+        getattr(config, "max_resume_attempts", None),
+        DEFAULT_MAX_RESUME_ATTEMPTS,
+    )
+    engine_config = _AdvanceEngineConfigAdapter(
+        project_dir=config.project_dir,
+        advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
+        advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
+        max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
+        max_resume_attempts=max_resume_attempts,
+    )
+    initial_action = determine_next_action(
+        engine_config,
+        store,
+        git_runtime,
+        impl_task,
+        target_branch,
+        max_resume_attempts=max_resume_attempts,
+    )
+    initial_action_type = initial_action["type"]
+    initial_action_description = initial_action.get("description")
+    if not isinstance(initial_action_description, str) or not initial_action_description:
+        initial_action_description = initial_action_type
+
+    if dry_run:
+        print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} actions)")
+        print(f"[dry-run] First action 1/{max_iterations}: {initial_action_type} - {initial_action_description}")
+        return 0
     print(f"Iterating implementation {impl_task.id} (max {max_iterations} actions)...")
     impl_task_key = impl_task.id
     assert impl_task_key is not None

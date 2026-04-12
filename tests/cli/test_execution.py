@@ -2816,10 +2816,22 @@ class TestIterateCommand:
         store.update(impl)
         return impl
 
+    def _init_git_repo(self, tmp_path: Path) -> None:
+        from gza.git import Git
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
     def test_cycle_dry_run(self, tmp_path: Path):
         """gza iterate --dry-run prints preview and exits 0."""
 
         setup_config(tmp_path)
+        self._init_git_repo(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
@@ -2830,6 +2842,7 @@ class TestIterateCommand:
 
     def test_cycle_uses_default_iterations_when_flag_omitted(self, tmp_path: Path):
         (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        self._init_git_repo(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
@@ -3648,6 +3661,7 @@ class TestIterateCommand:
 
     def test_cycle_alias_runs_iterate(self, tmp_path: Path):
         setup_config(tmp_path)
+        self._init_git_repo(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
         result = run_gza("cycle", str(impl.id), "--dry-run", "--project", str(tmp_path))
@@ -4862,19 +4876,11 @@ class TestIterateCommand:
             retry=False,
             background=False,
         )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            max_resume_attempts=3,
-        )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = False
 
         with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
         ):
@@ -4966,6 +4972,70 @@ class TestIterateCommand:
 
         assert result == 1
         assert "failed to initialize git runtime for iterate" in output
+
+    def test_iterate_dry_run_errors_when_git_init_fails_without_first_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+
+        with patch("gza.cli.Git", side_effect=RuntimeError("git init boom")):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 1
+        assert "failed to initialize git runtime for iterate" in output
+        assert "First action" not in output
+
+    def test_iterate_dry_run_errors_when_current_branch_fails_without_first_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.side_effect = RuntimeError("branch boom")
+
+        with patch("gza.cli.Git", return_value=mock_git):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 1
+        assert "failed to initialize git runtime for iterate" in output
+        assert "First action" not in output
 
 
 class TestMarkCompletedCommand:
