@@ -412,6 +412,74 @@ class TestHistoryCommand:
         grandchild_idx = result.stdout.index("Gchild pend")
         assert root_idx < child_idx < grandchild_idx
 
+    def test_history_lineage_same_branch_children_render_compact_without_repeated_connectors(
+        self,
+        tmp_path: Path,
+    ):
+        """Same-branch review/improve children render compactly and avoid connector/status/branch bugs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement root", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = "20260412-impl-history-lineage"
+        impl.merge_status = "merged"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            "Review root",
+            task_type="review",
+            based_on=impl.id,
+            depends_on=impl.id,
+            same_branch=True,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.branch = impl.branch
+        review.merge_status = "unmerged"
+        review.report_file = "reviews/review.md"
+        review.output_content = "Verdict: CHANGES_REQUESTED\n\nNeeds revisions."
+        review.duration_seconds = 99
+        review.cost_usd = 0.25
+        store.update(review)
+        assert review.id is not None
+
+        improve = store.add(
+            "Improve root",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        improve.status = "completed"
+        improve.completed_at = datetime.now(UTC)
+        improve.branch = impl.branch
+        improve.merge_status = "unmerged"
+        improve.report_file = "reviews/improve.md"
+        improve.duration_seconds = 111
+        improve.cost_usd = 0.33
+        store.update(improve)
+        assert improve.id is not None
+
+        result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"completed {review.id}" in result.stdout
+        assert f"completed {improve.id}" in result.stdout
+        assert f"unmerged  {review.id}" not in result.stdout
+        assert f"unmerged  {improve.id}" not in result.stdout
+        assert "verdict:" in result.stdout
+        assert "CHANGES_REQUESTED" in result.stdout
+        assert "| stats:" in result.stdout
+        assert result.stdout.count("branch: ") == 1
+        assert "└──     [review]" not in result.stdout
+        assert "├──     [review]" not in result.stdout
+        assert "└──     [improve]" not in result.stdout
+        assert "├──     [improve]" not in result.stdout
+        assert "report:" not in result.stdout
+
     def test_history_incomplete_with_lookback(self, tmp_path: Path):
         """--incomplete combined with --days applies both filters."""
 
