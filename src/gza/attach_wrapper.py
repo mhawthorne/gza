@@ -121,6 +121,7 @@ def main() -> int:
     parser.add_argument("--project", required=True)
     parser.add_argument("--no-docker", action="store_true")
     parser.add_argument("--max-turns", type=int)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     config = Config.load(Path(args.project))
@@ -200,6 +201,7 @@ def main() -> int:
                 worker_args = argparse.Namespace(
                     no_docker=args.no_docker,
                     max_turns=args.max_turns,
+                    force=args.force,
                     resume=True,
                 )
                 spawn_rc = _spawn_background_worker(

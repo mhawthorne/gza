@@ -2770,6 +2770,84 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         assert "Started review worker" in result.stdout
 
+    def test_advance_force_propagates_to_run_review_worker(self, tmp_path: Path):
+        """advance --force forwards force override when spawning run_review workers."""
+        import argparse
+
+        from gza.cli import cmd_advance
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+
+        captured_force: list[bool] = []
+
+        def fake_spawn(worker_args, _config, task_id, **_kw):
+            del task_id
+            captured_force.append(bool(getattr(worker_args, "force", False)))
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", side_effect=fake_spawn):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        assert captured_force == [True]
+
+    def test_advance_force_propagates_to_resume_worker(self, tmp_path: Path):
+        """advance --force forwards force override when spawning resume workers."""
+        import argparse
+
+        from gza.cli import cmd_advance
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = store.add("Resumable failure", task_type="implement")
+        failed_task.status = "failed"
+        failed_task.failure_reason = "MAX_STEPS"
+        failed_task.session_id = "ses_resume_123"
+        store.update(failed_task)
+
+        captured_force: list[bool] = []
+
+        def fake_spawn_resume(worker_args, _config, _task_id, **_kw):
+            captured_force.append(bool(getattr(worker_args, "force", False)))
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=True,
+        )
+
+        with patch("gza.cli._spawn_background_resume_worker", side_effect=fake_spawn_resume):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        assert captured_force == [True]
+
     def test_advance_waits_for_in_progress_review(self, tmp_path: Path):
         """advance skips a task whose review is in_progress."""
         setup_config(tmp_path)

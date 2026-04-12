@@ -910,7 +910,6 @@ gza review <task_id> [options]
 | `--open` | Open the review file in $EDITOR after completion |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
-| `--force` | Skip dependency merge precondition checks when running the review task |
 
 When a PR exists for the implementation task, the review is automatically posted as a PR comment.
 
@@ -964,6 +963,7 @@ gza advance [task_id] [options]
 | `--dry-run` | Preview actions without executing them |
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
+| `--force` | Skip dependency merge precondition checks when advance starts workers |
 | `--unimplemented` | List completed plans/explores with no implementation task yet |
 | `--create` | With `--unimplemented`: create queued implement tasks for listed tasks |
 | `--auto`, `-y` | Skip confirmation and execute immediately |

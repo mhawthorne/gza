@@ -255,6 +255,11 @@ def main() -> int:
         help="Run workers directly instead of in Docker",
     )
     advance_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when advance starts workers",
+    )
+    advance_parser.add_argument(
         "--unimplemented",
         action="store_true",
         help="List completed plans/explores with no implementation task yet",
@@ -1215,11 +1220,6 @@ def main() -> int:
         "--provider",
         metavar="PROVIDER",
         help="Override the provider for this task (e.g. 'claude', 'gemini', 'codex')",
-    )
-    review_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Skip dependency precondition checks when running the review task",
     )
     add_common_args(review_parser)
 

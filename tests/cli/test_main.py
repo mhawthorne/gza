@@ -80,7 +80,7 @@ class TestHelpOutput:
         assert "Expand lineage N levels for each matching task" not in result.stdout
 
     def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
-        """advance --help should show --unimplemented and keep --plans hidden."""
+        """advance --help should show --unimplemented/--force and keep --plans hidden."""
         result = subprocess.run(
             ["uv", "run", "gza", "advance", "--help"],
             capture_output=True,
@@ -89,6 +89,7 @@ class TestHelpOutput:
 
         assert result.returncode == 0
         assert "--unimplemented" in result.stdout
+        assert "--force" in result.stdout
         assert "--plans" not in result.stdout
 
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):

@@ -72,8 +72,8 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
         "| `--force` | Skip dependency merge precondition checks when starting the resumed task |",
         "| `--force` | Skip dependency merge precondition checks when starting the retry task |",
         "| `--force` | Skip dependency merge precondition checks when running the improve task |",
-        "| `--force` | Skip dependency merge precondition checks when running the review task |",
         "| `--force` | Skip dependency merge precondition checks when running the implement task |",
+        "| `--force` | Skip dependency merge precondition checks when advance starts workers |",
         "| `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |",
         "`PREREQUISITE_UNMERGED`: the resolved completed dependency branch is not reachable",
     ]
