@@ -80,7 +80,6 @@ def _split_rename_paths(pathspec: str) -> tuple[str, str] | None:
             return pathspec[:i], pathspec[i + 4:]
 
     return None
-
 def parse_diff_numstat(numstat_output: str) -> tuple[int, int, int]:
     """Parse --numstat output into (files_changed, lines_added, lines_removed).
 
