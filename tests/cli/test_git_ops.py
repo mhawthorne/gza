@@ -4,6 +4,7 @@
 import argparse
 import io
 import os
+import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -805,6 +806,32 @@ class TestCheckoutCommand:
         assert "Removing stale worktree" in result.stdout
         assert "Removed worktree" in result.stdout
         assert "Checked out" in result.stdout
+
+    def test_checkout_prunes_prunable_only_registration(self, tmp_path: Path):
+        """Checkout succeeds when branch has only a prunable worktree registration."""
+        _store, git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path, "Test checkout prunable", "feature/test-prunable-checkout",
+            worktree_name="test-prunable-checkout",
+        )
+
+        assert worktree_path is not None
+        assert worktree_path.exists()
+
+        # Leave stale metadata: remove directory without pruning git's registration.
+        shutil.rmtree(worktree_path)
+        porcelain_before = git._run("worktree", "list", "--porcelain").stdout
+        assert "feature/test-prunable-checkout" in porcelain_before
+        assert "prunable" in porcelain_before
+
+        result = run_gza("checkout", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Checked out" in result.stdout
+        assert "Removing stale worktree" not in result.stdout
+
+        porcelain_after = git._run("worktree", "list", "--porcelain").stdout
+        assert str(worktree_path) not in porcelain_after
+        assert "\nprunable" not in porcelain_after
 
     def test_checkout_fails_with_dirty_worktree(self, tmp_path: Path):
         """Checkout command fails if worktree has uncommitted changes."""

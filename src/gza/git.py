@@ -682,18 +682,17 @@ def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) ->
         # Remove the worktree
         git.worktree_remove(worktree_path, force=force)
 
-        registered_path = _registered_worktree_path_for_branch(git.worktree_list(), branch)
-        if registered_path is not None:
-            git._run("worktree", "prune", "--expire", "now", check=False)
-
-        still_active = active_worktree_path_for_branch(git, branch)
-        if still_active is not None:
+    # Prune stale registrations whether or not we removed a live worktree path.
+    registered_path = _registered_worktree_path_for_branch(git.worktree_list(), branch)
+    if registered_path is not None:
+        git._run("worktree", "prune", "--expire", "now", check=False)
+        still_registered = _registered_worktree_path_for_branch(git.worktree_list(), branch)
+        if still_registered is not None:
             raise GitError(
-                f"worktree for branch '{branch}' is still registered at '{still_active}' after removal"
+                f"worktree for branch '{branch}' is still registered at '{still_registered}' after cleanup"
             )
-        return worktree_path
 
-    return None
+    return worktree_path
 
 
 def _branch_matches_worktree_ref(worktree_branch: str, branch: str) -> bool:

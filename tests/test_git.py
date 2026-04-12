@@ -68,6 +68,25 @@ class TestCleanupWorktreeForBranch:
             mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
             mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
 
+    def test_prunes_prunable_only_registration(self, tmp_path: Path):
+        """Pruning still runs when only a prunable registration remains."""
+        git = Git(tmp_path)
+
+        with patch.object(git, "worktree_list") as mock_list, \
+             patch.object(git, "_run") as mock_run, \
+             patch.object(git, "worktree_remove") as mock_remove:
+            mock_list.side_effect = [
+                [{"path": "/tmp/gza/stale", "branch": "refs/heads/feature/test", "prunable": "gone"}],
+                [{"path": "/tmp/gza/stale", "branch": "refs/heads/feature/test", "prunable": "gone"}],
+                [],
+            ]
+
+            result = cleanup_worktree_for_branch(git, "feature/test", force=True)
+
+            assert result is None
+            mock_remove.assert_not_called()
+            mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
+
 
 class TestGitRun:
     """Tests for the _run helper method."""
