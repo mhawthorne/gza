@@ -41,6 +41,7 @@ class AdvanceContext:
     create_reviews: bool
     max_review_cycles: int
     max_resume_attempts: int
+    allow_branchless_implement_review: bool = False
 
     has_implement_child: bool = False
 
@@ -120,76 +121,22 @@ def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
     return None
 
 
-def resolve_advance_context(
+def _resolve_review_state(
     config: Any,
     store: SqliteTaskStore,
-    git: Any,
     task: DbTask,
-    target_branch: str,
-    *,
-    impl_based_on_ids: set[str] | None = None,
-    max_resume_attempts: int | None = None,
-) -> AdvanceContext:
-    """Resolve state once, then let rules evaluate pure context."""
-    assert task.id is not None
-
-    effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
-
-    is_resumable_failed = is_resumable_failed_task(task)
-    has_resume_children = False
-    resume_chain_depth = 0
-    if is_resumable_failed:
-        children = store.get_based_on_children(task.id)
-        has_resume_children = bool(children)
-        resume_chain_depth = store.count_resume_chain_depth(task.id)
-
-    if task.task_type == "plan":
-        if impl_based_on_ids is None:
-            impl_based_on_ids = store.get_impl_based_on_ids()
-        return AdvanceContext(
-            task=task,
-            task_type=task.task_type,
-            has_branch=bool(task.branch),
-            requires_review=config.advance_requires_review,
-            create_reviews=config.advance_create_reviews,
-            max_review_cycles=config.max_review_cycles,
-            max_resume_attempts=effective_max_resume,
-            has_implement_child=task.id in impl_based_on_ids,
-            is_resumable_failed_task=is_resumable_failed,
-            has_resume_children=has_resume_children,
-            resume_chain_depth=resume_chain_depth,
-            failure_reason=task.failure_reason,
-        )
-
-    if not task.branch:
-        return AdvanceContext(
-            task=task,
-            task_type=task.task_type,
-            has_branch=False,
-            requires_review=config.advance_requires_review,
-            create_reviews=config.advance_create_reviews,
-            max_review_cycles=config.max_review_cycles,
-            max_resume_attempts=effective_max_resume,
-            is_resumable_failed_task=is_resumable_failed,
-            has_resume_children=has_resume_children,
-            resume_chain_depth=resume_chain_depth,
-            failure_reason=task.failure_reason,
-        )
-
-    can_merge = git.can_merge(task.branch, target_branch)
-    rebase_children = [child for child in store.get_lineage_children(task.id) if child.task_type == "rebase"]
-    rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
-    rebase_failed = next((c for c in rebase_children if c.status == "failed"), None)
-
-    latest_completed_rebase: DbTask | None = None
-    completed_rebases = [
-        c
-        for c in rebase_children
-        if c.status == "completed" and c.completed_at is not None
-    ]
-    if completed_rebases:
-        latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
-
+) -> tuple[
+    list[DbTask],
+    DbTask | None,
+    DbTask | None,
+    bool,
+    str | None,
+    int,
+    DbTask | None,
+    DbTask | None,
+    bool,
+]:
+    """Resolve review/improve lineage state for the implementation root task."""
     reviews = get_reviews_for_root(store, task)
     active_review = _select_active_review(reviews)
     completed_reviews = [r for r in reviews if r.status == "completed"]
@@ -201,15 +148,6 @@ def resolve_advance_context(
         and latest_completed_review.completed_at is not None
         and task.review_cleared_at >= latest_completed_review.completed_at
     )
-
-    rebase_invalidates_review = False
-    if (
-        latest_completed_rebase is not None
-        and latest_completed_review is not None
-        and latest_completed_rebase.completed_at is not None
-        and latest_completed_review.completed_at is not None
-    ):
-        rebase_invalidates_review = latest_completed_rebase.completed_at > latest_completed_review.completed_at
 
     review_verdict: str | None = None
     completed_review_cycles = 0
@@ -232,16 +170,162 @@ def resolve_advance_context(
                     has_improve_after_review = latest_improve.completed_at > latest_completed_review.completed_at
 
         if review_verdict == "CHANGES_REQUESTED":
+            assert task.id is not None
             completed_review_cycles = _count_completed_review_cycles(store, task.id)
             assert latest_completed_review.id is not None
             improve_tasks = store.get_improve_tasks_for(task.id, latest_completed_review.id)
             active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
             active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
 
+    return (
+        reviews,
+        active_review,
+        latest_completed_review,
+        review_cleared,
+        review_verdict,
+        completed_review_cycles,
+        active_improve_running,
+        active_improve_pending,
+        has_improve_after_review,
+    )
+
+
+def resolve_advance_context(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    impl_based_on_ids: set[str] | None = None,
+    max_resume_attempts: int | None = None,
+    allow_branchless_implement_review: bool = False,
+) -> AdvanceContext:
+    """Resolve state once, then let rules evaluate pure context."""
+    assert task.id is not None
+
+    effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
+
+    is_resumable_failed = is_resumable_failed_task(task)
+    has_resume_children = False
+    resume_chain_depth = 0
+    if is_resumable_failed:
+        children = store.get_based_on_children(task.id)
+        has_resume_children = bool(children)
+        resume_chain_depth = store.count_resume_chain_depth(task.id)
+
+    if task.task_type == "plan":
+        if impl_based_on_ids is None:
+            impl_based_on_ids = store.get_impl_based_on_ids()
+        return AdvanceContext(
+            task=task,
+            task_type=task.task_type,
+            has_branch=bool(task.branch),
+            allow_branchless_implement_review=False,
+            requires_review=config.advance_requires_review,
+            create_reviews=config.advance_create_reviews,
+            max_review_cycles=config.max_review_cycles,
+            max_resume_attempts=effective_max_resume,
+            has_implement_child=task.id in impl_based_on_ids,
+            is_resumable_failed_task=is_resumable_failed,
+            has_resume_children=has_resume_children,
+            resume_chain_depth=resume_chain_depth,
+            failure_reason=task.failure_reason,
+        )
+
+    if not task.branch and not (allow_branchless_implement_review and task.task_type == "implement"):
+        return AdvanceContext(
+            task=task,
+            task_type=task.task_type,
+            has_branch=False,
+            allow_branchless_implement_review=False,
+            requires_review=config.advance_requires_review,
+            create_reviews=config.advance_create_reviews,
+            max_review_cycles=config.max_review_cycles,
+            max_resume_attempts=effective_max_resume,
+            is_resumable_failed_task=is_resumable_failed,
+            has_resume_children=has_resume_children,
+            resume_chain_depth=resume_chain_depth,
+            failure_reason=task.failure_reason,
+        )
+
+    if not task.branch:
+        (
+            reviews,
+            active_review,
+            latest_completed_review,
+            review_cleared,
+            review_verdict,
+            completed_review_cycles,
+            active_improve_running,
+            active_improve_pending,
+            has_improve_after_review,
+        ) = _resolve_review_state(config, store, task)
+        return AdvanceContext(
+            task=task,
+            task_type=task.task_type,
+            has_branch=False,
+            allow_branchless_implement_review=True,
+            requires_review=config.advance_requires_review,
+            create_reviews=config.advance_create_reviews,
+            max_review_cycles=config.max_review_cycles,
+            max_resume_attempts=effective_max_resume,
+            can_merge=True,
+            reviews=reviews,
+            active_review=active_review,
+            latest_completed_review=latest_completed_review,
+            review_cleared=review_cleared,
+            review_verdict=review_verdict,
+            completed_review_cycles=completed_review_cycles,
+            active_improve_running=active_improve_running,
+            active_improve_pending=active_improve_pending,
+            has_improve_after_review=has_improve_after_review,
+            is_resumable_failed_task=is_resumable_failed,
+            has_resume_children=has_resume_children,
+            resume_chain_depth=resume_chain_depth,
+            failure_reason=task.failure_reason,
+        )
+
+    can_merge = git.can_merge(task.branch, target_branch)
+    rebase_children = [child for child in store.get_lineage_children(task.id) if child.task_type == "rebase"]
+    rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
+    rebase_failed = next((c for c in rebase_children if c.status == "failed"), None)
+
+    latest_completed_rebase: DbTask | None = None
+    completed_rebases = [
+        c
+        for c in rebase_children
+        if c.status == "completed" and c.completed_at is not None
+    ]
+    if completed_rebases:
+        latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
+
+    (
+        reviews,
+        active_review,
+        latest_completed_review,
+        review_cleared,
+        review_verdict,
+        completed_review_cycles,
+        active_improve_running,
+        active_improve_pending,
+        has_improve_after_review,
+    ) = _resolve_review_state(config, store, task)
+
+    rebase_invalidates_review = False
+    if (
+        latest_completed_rebase is not None
+        and latest_completed_review is not None
+        and latest_completed_rebase.completed_at is not None
+        and latest_completed_review.completed_at is not None
+    ):
+        rebase_invalidates_review = latest_completed_rebase.completed_at > latest_completed_review.completed_at
+
     return AdvanceContext(
         task=task,
         task_type=task.task_type,
         has_branch=True,
+        allow_branchless_implement_review=False,
         requires_review=config.advance_requires_review,
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
@@ -303,7 +387,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="no_branch",
-        matches=lambda ctx: not ctx.has_branch,
+        matches=lambda ctx: not ctx.has_branch and not ctx.allow_branchless_implement_review,
         action=lambda ctx: {"type": "skip", "description": "SKIP: task has no branch (no commits)"},
     ),
     AdvanceRule(
@@ -495,6 +579,7 @@ def evaluate_advance_rules(
     *,
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
+    allow_branchless_implement_review: bool = False,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
     context = resolve_advance_context(
@@ -505,6 +590,7 @@ def evaluate_advance_rules(
         target_branch,
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
+        allow_branchless_implement_review=allow_branchless_implement_review,
     )
 
     for rule in ADVANCE_RULES:
