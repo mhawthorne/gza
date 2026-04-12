@@ -18,7 +18,7 @@ from ..colors import (
 )
 from ..config import Config
 from ..console import console, format_duration, truncate
-from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..db import SqliteTaskStore, Task as DbTask
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import _parse_iso, get_store, pager_context, resolve_id
 
@@ -598,97 +598,6 @@ def _format_log_entry(entry: dict) -> str | None:
     return None
 
 
-def _task_run_sort_key(task: DbTask) -> tuple[datetime, int]:
-    """Sort key for selecting latest task run attempt deterministically."""
-    timestamp = task.started_at or task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC)
-    return (timestamp, task_id_numeric_key(task.id))
-
-
-def _task_has_run_artifacts(task: DbTask) -> bool:
-    """Return True if task appears to have executed at least once."""
-    return (
-        task.status in {"in_progress", "completed", "failed", "unmerged"}
-        or task.log_file is not None
-        or task.started_at is not None
-        or task.completed_at is not None
-    )
-
-
-def _resolve_latest_attempt_for_task(store: SqliteTaskStore, task: DbTask) -> tuple[DbTask, list[DbTask]]:
-    """Resolve latest same-type retry/resume attempt for a task.
-
-    Rule: stay within the queried task's same-type retry/resume lineage.
-    Include same-type ancestors of the queried task, plus same-type descendants
-    branching from the queried task itself. Exclude sibling/parallel branches
-    that only share an older ancestor with the queried task.
-
-    Choose the newest task with run artifacts. If none have artifacts, choose
-    newest task by timestamp/id.
-    """
-    if task.id is None:
-        return task, [task]
-    assert task.id is not None
-
-    all_tasks = store.get_all()
-    by_parent: dict[str, list[DbTask]] = {}
-    for candidate in all_tasks:
-        if candidate.based_on is None:
-            continue
-        by_parent.setdefault(candidate.based_on, []).append(candidate)
-
-    by_id: dict[str, DbTask] = {t.id: t for t in all_tasks if t.id is not None}
-
-    # Collect same-type ancestors up from queried task (retry/resume chain backtracking).
-    related: list[DbTask] = []
-    ancestor_seen: set[str] = set()
-    current = task
-    while current.id is not None and current.id not in ancestor_seen:
-        ancestor_seen.add(current.id)
-        if current.task_type == task.task_type:
-            related.append(current)
-        if current.based_on is None:
-            break
-        parent = by_id.get(current.based_on)
-        if parent is None or parent.task_type != task.task_type:
-            break
-        current = parent
-
-    # Collect same-type descendants only from the queried task forward.
-    queue = [task.id]
-    seen: set[str] = set()
-    while queue:
-        parent_id = queue.pop(0)
-        if parent_id in seen:
-            continue
-        seen.add(parent_id)
-        for child in by_parent.get(parent_id, []):
-            if child.id is None or child.task_type != task.task_type:
-                continue
-            related.append(child)
-            queue.append(child.id)
-
-    # Deduplicate while preserving traversal order.
-    deduped_related: list[DbTask] = []
-    related_seen: set[str] = set()
-    for candidate in related:
-        if candidate.id is None:
-            continue
-        if candidate.id in related_seen:
-            continue
-        related_seen.add(candidate.id)
-        deduped_related.append(candidate)
-
-    # Preserve queried task in candidate set for edge-cases.
-    if task.id not in related_seen:
-        deduped_related.append(task)
-
-    related_sorted = sorted(deduped_related, key=_task_run_sort_key, reverse=True)
-    for candidate in related_sorted:
-        if _task_has_run_artifacts(candidate):
-            return candidate, related_sorted
-    return related_sorted[0], related_sorted
-
-
 def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
     """Build ordered candidate log paths for a task."""
     candidates: list[Path] = []
@@ -775,15 +684,10 @@ def _resolve_task_log_path(
     config: Config,
     registry: WorkerRegistry,
     task: DbTask,
-    attempts: list[DbTask],
 ) -> tuple[Path | None, bool]:
     """Resolve log path for task/slug lookups with worker startup fallback."""
     main_candidates: list[Path] = []
     main_candidates.extend(_task_log_candidates(config, task))
-    for attempt in attempts:
-        if attempt.id == task.id:
-            continue
-        main_candidates.extend(_task_log_candidates(config, attempt))
 
     for candidate in main_candidates:
         if candidate.exists():
@@ -861,7 +765,6 @@ def _print_log_header(
     log_path: Path,
     is_running: bool,
     using_startup_log: bool,
-    resolution_note: str | None,
 ) -> None:
     """Print the static task/worker header banner for ``gza log``."""
     _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
@@ -873,8 +776,6 @@ def _print_log_header(
         _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
         console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
-        if resolution_note:
-            console.print(f"Run selection: {rich_escape(resolution_note)}", soft_wrap=True)
         console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
         if using_startup_log:
             console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
@@ -903,8 +804,6 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     query = args.identifier
     task = None
-    requested_task = None
-    resolution_note = None
     worker = None
     log_path = None
     using_startup_log = False
@@ -925,26 +824,19 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     elif args.slug:
         # Look up by slug (exact or partial match)
-        requested_task = store.get_by_slug(query)
-        if not requested_task:
+        task = store.get_by_slug(query)
+        if not task:
             # Try partial match
             all_tasks = store.get_all()
             for t in all_tasks:
                 if t.slug and query in t.slug:
-                    requested_task = t
+                    task = t
                     break
-        if not requested_task:
+        if not task:
             print(f"Error: No task found matching slug '{query}'")
             return 1
 
-        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
-        if requested_task.id != task.id and task.id is not None:
-            resolution_note = (
-                f"Resolved to latest run attempt: task {task.id} "
-                "(latest same-type retry/resume in based_on chain)"
-            )
-
-        log_path, using_startup_log = _resolve_task_log_path(config, registry, task, attempts)
+        log_path, using_startup_log = _resolve_task_log_path(config, registry, task)
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
@@ -953,19 +845,12 @@ def cmd_log(args: argparse.Namespace) -> int:
     else:
         # Default: look up by task ID
         task_id: str = resolve_id(config, query)
-        requested_task = store.get(task_id)
-        if not requested_task:
+        task = store.get(task_id)
+        if not task:
             print(f"Error: Task {query} not found")
             return 1
 
-        task, attempts = _resolve_latest_attempt_for_task(store, requested_task)
-        if requested_task.id != task.id and task.id is not None:
-            resolution_note = (
-                f"Resolved to latest run attempt: task {task.id} "
-                "(latest same-type retry/resume in based_on chain)"
-            )
-
-        log_path, using_startup_log = _resolve_task_log_path(config, registry, task, attempts)
+        log_path, using_startup_log = _resolve_task_log_path(config, registry, task)
 
         if task.id is not None:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
@@ -1000,7 +885,6 @@ def cmd_log(args: argparse.Namespace) -> int:
             log_path=log_path,
             is_running=is_running,
             using_startup_log=using_startup_log,
-            resolution_note=resolution_note,
         )
 
     if follow or raw_mode:
@@ -1045,7 +929,6 @@ def cmd_log(args: argparse.Namespace) -> int:
             log_path=log_path,
             is_running=is_running,
             using_startup_log=using_startup_log,
-            resolution_note=resolution_note,
         )
 
         _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"

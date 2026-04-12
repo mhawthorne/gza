@@ -680,7 +680,7 @@ def main() -> int:
     log_parser.add_argument(
         "--follow", "-f",
         action="store_true",
-        help="Follow log in real-time when the resolved task run is actively running",
+        help="Follow log in real-time when the requested task or worker is actively running",
     )
     log_parser.add_argument(
         "--tail",
