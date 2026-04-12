@@ -4544,7 +4544,7 @@ class TestIterateCommand:
             result = cmd_iterate(args)
 
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id)
+        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id, force=False)
 
     def test_iterate_improve_duplicate_blocks_instead_of_raising(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

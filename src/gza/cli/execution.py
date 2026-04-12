@@ -1072,9 +1072,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     def _run_task_with_resume(task_to_run: DbTask, *, initial_resume: bool = False) -> tuple[DbTask, int]:
         def _run_one(t: DbTask, resume_flag: bool) -> int:
             assert t.id is not None
+            force = getattr(args, "force", False)
             if resume_flag or initial_resume:
-                return _run_foreground(config, task_id=t.id, resume=True)
-            return _run_foreground(config, task_id=t.id)
+                return _run_foreground(config, task_id=t.id, resume=True, force=force)
+            return _run_foreground(config, task_id=t.id, force=force)
 
         def _on_resume(
             failed_task: DbTask,
@@ -1178,8 +1179,86 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"Error: failed to initialize git runtime for iterate: {exc}")
         return 1
     print(f"Iterating implementation {impl_task.id} (max {max_iterations} actions)...")
+    impl_task_key = impl_task.id
+    assert impl_task_key is not None
 
-    summary_rows: list[tuple[int, str, str | None, str | None, str | None]] = []
+    @dataclass(frozen=True)
+    class IterateSummaryRow:
+        iteration_index: int
+        task_type: str
+        task_id: str | None
+        verdict: str | None
+        duration_seconds: float | None
+        steps: int | None
+        cost_usd: float | None
+        status: str
+        failure_reason: str | None
+
+    def _format_compact_duration(seconds: float | None) -> str:
+        if seconds is None:
+            return "-"
+        return format_duration(seconds).replace(" ", "")
+
+    def _format_summary_status(row: IterateSummaryRow) -> str:
+        if row.failure_reason:
+            return f"{row.status} ({row.failure_reason})"
+        return row.status
+
+    def _append_summary_row(
+        rows: list[IterateSummaryRow],
+        *,
+        iteration_index: int,
+        task_type: str,
+        task: DbTask | None,
+        verdict: str | None = None,
+        status: str | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        refreshed_task = task
+        if task is not None and task.id is not None:
+            refreshed_task = store.get(task.id) or task
+
+        row_status = status or (refreshed_task.status if refreshed_task else "failed")
+        row_failure_reason = (refreshed_task.failure_reason if refreshed_task else None) or failure_reason
+
+        rows.append(
+            IterateSummaryRow(
+                iteration_index=iteration_index,
+                task_type=task_type,
+                task_id=refreshed_task.id if refreshed_task else None,
+                verdict=verdict,
+                duration_seconds=refreshed_task.duration_seconds if refreshed_task else None,
+                steps=get_task_step_count(refreshed_task) if refreshed_task else None,
+                cost_usd=refreshed_task.cost_usd if refreshed_task else None,
+                status=row_status,
+                failure_reason=row_failure_reason,
+            )
+        )
+
+    def _task_sort_key(task: DbTask) -> tuple[datetime, str]:
+        return (task.created_at or datetime.min, task.id or "")
+
+    def _latest_with_status(tasks: list[DbTask], status: str) -> DbTask | None:
+        matching = [task for task in tasks if task.status == status]
+        if not matching:
+            return None
+        return max(matching, key=_task_sort_key)
+
+    def _latest_completed_review() -> DbTask | None:
+        reviews = [r for r in store.get_reviews_for_task(impl_task_key) if r.status == "completed"]
+        if not reviews:
+            return None
+        return max(
+            reviews,
+            key=lambda review: (
+                review.completed_at or datetime.min,
+                review.created_at or datetime.min,
+                review.id or "",
+            ),
+        )
+
+    iterate_started_at = time.monotonic()
+    summary_rows: list[IterateSummaryRow] = []
     final_status = "maxed_out"
     final_stop_reason = "max_actions"
     iteration = 0
@@ -1207,42 +1286,86 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if action_type == "merge":
             final_status = "approved"
             final_stop_reason = "approved"
-            summary_rows.append((iteration, action_type, None, None, None))
+            maybe_review = action.get("review_task")
+            if isinstance(maybe_review, DbTask):
+                maybe_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="review", task=maybe_review, verdict=maybe_verdict)
             break
 
         if action_type in {"needs_discussion", "max_cycles_reached", "skip"}:
             final_status = "blocked"
             final_stop_reason = action_type
-            summary_rows.append((iteration, action_type, None, None, None))
+            maybe_review = action.get("review_task")
+            if isinstance(maybe_review, DbTask):
+                maybe_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="review", task=maybe_review, verdict=maybe_verdict)
             break
 
-        if action_type in {"wait_review", "wait_improve"}:
+        if action_type == "wait_review":
             final_status = "blocked"
-            final_stop_reason = "review_in_progress" if action_type == "wait_review" else "improve_in_progress"
-            summary_rows.append((iteration, action_type, None, None, None))
+            final_stop_reason = "review_in_progress"
+            review_task = action.get("review_task")
+            if isinstance(review_task, DbTask):
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="review",
+                    task=review_task,
+                    status="in_progress",
+                )
+            else:
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="review", task=None, status="in_progress")
+            break
+
+        if action_type == "wait_improve":
+            final_status = "blocked"
+            final_stop_reason = "improve_in_progress"
+            latest_review = _latest_completed_review()
+            if latest_review is not None:
+                review_verdict = get_review_verdict(config, latest_review)
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="review",
+                    task=latest_review,
+                    verdict=review_verdict,
+                )
+                assert latest_review.id is not None
+                improves = store.get_improve_tasks_for(impl_task_key, latest_review.id)
+                running_improve = _latest_with_status(improves, "in_progress")
+                if running_improve is None:
+                    running_improve = _latest_with_status(improves, "pending")
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="improve",
+                    task=running_improve,
+                    status="in_progress",
+                )
+            else:
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="improve", task=None, status="in_progress")
             break
 
         action_task: DbTask | None = None
-        action_task_label: str | None = None
         verdict: str | None = None
         initial_resume = False
+        review_row_task: DbTask | None = None
+        review_row_verdict: str | None = None
 
         if action_type == "resume":
             action_task = _create_resume_task(store, impl_task)
             assert action_task.id is not None
             initial_resume = True
-            action_task_label = action_task.id
             print(f"  Resuming implementation as {action_task.id}...")
         elif action_type == "needs_rebase":
             if not impl_task.branch:
                 print(f"  Cannot rebase {impl_task.id}: no branch")
                 final_status = "blocked"
                 final_stop_reason = "needs_rebase"
-                summary_rows.append((iteration, action_type, None, None, None))
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
                 break
             action_task = _create_rebase_task(store, impl_task.id, impl_task.branch, target_branch)
             assert action_task.id is not None
-            action_task_label = action_task.id
             print(f"  Created rebase task {action_task.id}...")
         elif action_type == "create_review":
             try:
@@ -1254,59 +1377,107 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     print(f"  Waiting for review {action_task.id}: already in progress.")
                     final_status = "blocked"
                     final_stop_reason = "review_in_progress"
-                    summary_rows.append((iteration, "wait_review", action_task.id, None, None))
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="review",
+                        task=action_task,
+                        status="in_progress",
+                    )
                     break
                 if action_task.status != "pending":
                     print(f"  Error creating review: duplicate review {action_task.id} has unexpected status {action_task.status}.")
                     final_status = "blocked"
                     final_stop_reason = "review_failed"
-                    summary_rows.append((iteration, action_type, action_task.id, None, None))
+                    _append_summary_row(summary_rows, iteration_index=iteration, task_type="review", task=action_task, status="failed")
                     break
                 print(f"  Reusing pending review {action_task.id}...")
             except ValueError as e:
                 print(f"  Error creating review: {e}")
                 final_status = "blocked"
                 final_stop_reason = "review_failed"
-                summary_rows.append((iteration, action_type, None, None, None))
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="review",
+                    task=None,
+                    status="failed",
+                    failure_reason=str(e),
+                )
                 break
             assert action_task.id is not None
-            action_task_label = action_task.id
             print(f"  Running review {action_task.id}...")
         elif action_type == "run_review":
             action_task = action["review_task"]
             assert action_task.id is not None
-            action_task_label = action_task.id
             print(f"  Running pending review {action_task.id}...")
         elif action_type == "improve":
             review_task = action["review_task"]
+            review_row_task = review_task
+            review_row_verdict = get_review_verdict(config, review_task)
             try:
                 action_task = _create_improve_task(store, impl_task, review_task)
             except ValueError as e:
                 print(f"  Error creating improve task: {e}")
                 final_status = "blocked"
                 final_stop_reason = "improve_failed"
-                summary_rows.append((iteration, action_type, None, None, None))
+                if review_row_task is not None:
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="review",
+                        task=review_row_task,
+                        verdict=review_row_verdict,
+                    )
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="improve",
+                    task=None,
+                    status="failed",
+                    failure_reason=str(e),
+                )
                 break
             assert action_task.id is not None
-            action_task_label = action_task.id
             print(f"  Running improve {action_task.id}...")
         elif action_type == "run_improve":
             action_task = action["improve_task"]
             assert action_task.id is not None
-            action_task_label = action_task.id
+            if action_task.depends_on:
+                maybe_review = store.get(action_task.depends_on)
+                if maybe_review is not None and maybe_review.task_type == "review":
+                    review_row_task = maybe_review
+                    review_row_verdict = get_review_verdict(config, maybe_review)
             print(f"  Running pending improve {action_task.id}...")
         else:
             final_status = "blocked"
             final_stop_reason = f"unsupported_action:{action_type}"
-            summary_rows.append((iteration, action_type, None, None, None))
+            _append_summary_row(summary_rows, iteration_index=iteration, task_type=action_type, task=None, status="failed")
             break
+
+        if review_row_task is not None:
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type="review",
+                task=review_row_task,
+                verdict=review_row_verdict,
+            )
 
         assert action_task is not None
         action_task, rc = _run_task_with_resume(action_task, initial_resume=initial_resume)
         if rc != 0:
             final_status = "blocked"
             final_stop_reason = f"{action_type}_failed"
-            summary_rows.append((iteration, action_type, action_task_label, None, None))
+            task_type = "review" if action_type in {"create_review", "run_review"} else "improve" if action_type in {"improve", "run_improve"} else action_type
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type=task_type,
+                task=action_task,
+                status="failed",
+                failure_reason=f"exit code {rc}",
+            )
             break
 
         if action_task.id is not None:
@@ -1315,31 +1486,55 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if action_type in {"create_review", "run_review"}:
             verdict = get_review_verdict(config, action_task)
             print(f"  Review {action_task.id}: verdict={verdict or '(none)'}")
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type="review",
+                task=action_task,
+                verdict=verdict,
+            )
             if verdict == "APPROVED":
-                summary_rows.append((iteration, action_type, action_task_label, verdict, None))
                 final_status = "approved"
                 final_stop_reason = "approved"
                 break
             if verdict in {"NEEDS_DISCUSSION", None}:
-                summary_rows.append((iteration, action_type, action_task_label, verdict, None))
                 final_status = "blocked"
                 final_stop_reason = "needs_discussion" if verdict == "NEEDS_DISCUSSION" else "no_verdict"
                 break
-
-        summary_rows.append((iteration, action_type, action_task_label, verdict, None))
+        else:
+            task_type = "improve" if action_type in {"improve", "run_improve"} else action_type
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type=task_type,
+                task=action_task,
+                verdict=verdict,
+            )
         iteration += 1
         impl_task = store.get(impl_task.id) or impl_task
+
+    iterate_wall_seconds = time.monotonic() - iterate_started_at
+    total_steps = sum(row.steps or 0 for row in summary_rows)
+    total_cost = sum(row.cost_usd or 0.0 for row in summary_rows)
 
     print(f"\n{'=' * 60}")
     print(f"Iterate complete: {final_status.upper()} ({final_stop_reason})")
     print(f"{'=' * 60}")
-    print(f"{'Step':<6} {'Action':<16} {'Task':>8} {'Verdict':<22}")
-    print(f"{'-' * 6} {'-' * 16} {'-' * 8} {'-' * 22}")
-    for (iter_idx, action_name, action_task_id, row_verdict, _unused) in summary_rows:
-        iter_str = str(iter_idx + 1)
-        task_str = action_task_id or "-"
-        verdict_str = row_verdict or "-"
-        print(f"{iter_str:<6} {action_name:<16} {task_str:>8} {verdict_str:<22}")
+    print(f"{'Iter':<5} {'Type':<8} {'Task':<10} {'Verdict':<18} {'Duration':>8} {'Steps':>5} {'Cost':>8} Status")
+    print(f"{'-' * 5} {'-' * 8} {'-' * 10} {'-' * 18} {'-' * 8} {'-' * 5} {'-' * 8} {'-' * 12}")
+    for row in summary_rows:
+        iter_str = str(row.iteration_index + 1)
+        verdict_str = row.verdict or "-"
+        duration_str = _format_compact_duration(row.duration_seconds)
+        steps_str = str(row.steps) if row.steps is not None else "-"
+        cost_str = f"${row.cost_usd:.2f}" if row.cost_usd is not None else "-"
+        status_str = _format_summary_status(row)
+        task_str = row.task_id or "-"
+        print(
+            f"{iter_str:<5} {row.task_type:<8} {task_str:<10} {verdict_str:<18} "
+            f"{duration_str:>8} {steps_str:>5} {cost_str:>8} {status_str}"
+        )
+    print(f"Totals: {_format_compact_duration(iterate_wall_seconds)} wall | {total_steps} steps | ${total_cost:.2f}")
     print()
 
     if final_status == "approved":
