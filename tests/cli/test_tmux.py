@@ -263,6 +263,43 @@ class TestCmdAttach:
         captured = capsys.readouterr()
         assert "Detach with Ctrl-B D or exit Claude normally to auto-resume in background." in captured.out
 
+    def test_cmd_attach_claude_passes_force_override_to_attach_wrapper(self, tmp_path: Path, monkeypatch):
+        """Attach handoff should preserve --force when rebuilding wrapper command."""
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        call_state = {"new_session_calls": 0, "wrapper_has_force": False}
+
+        def fake_tmux_run(cmd, **kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                call_state["new_session_calls"] += 1
+                if call_state["new_session_calls"] == 2:
+                    call_state["wrapper_has_force"] = "--force" in cmd
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
+             patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
+             patch("gza.cli.query.os.kill", side_effect=fake_kill), \
+             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(False, None, True)), \
+             patch("gza.cli.query.os.execvp"):
+            from gza.cli.query import cmd_attach
+            result = cmd_attach(args)
+
+        assert result == 0
+        assert call_state["new_session_calls"] == 2
+        assert call_state["wrapper_has_force"] is True
+
     def test_cmd_attach_claude_sets_pipe_pane_to_task_log(self, tmp_path: Path, monkeypatch):
         """Claude attach should set tmux pipe-pane so interactive output is captured in the task log."""
         self._setup_running_worker(
@@ -373,7 +410,7 @@ class TestCmdAttach:
         with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
              patch("gza.cli.query.os.kill", side_effect=fake_kill), \
-             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(True, 77)), \
+             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(True, 77, True)), \
              patch("gza.cli.query._spawn_background_worker", return_value=0) as mock_spawn_bg:
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
@@ -384,6 +421,7 @@ class TestCmdAttach:
         recovery_args = mock_spawn_bg.call_args[0][0]
         assert recovery_args.no_docker is True
         assert recovery_args.max_turns == 77
+        assert recovery_args.force is True
 
     def test_cmd_attach_claude_marks_failed_when_session_and_recovery_both_fail(self, tmp_path: Path, monkeypatch):
         """If post-stop session create fails AND recovery also fails, task must end in failed/WORKER_DIED with a handoff log."""
@@ -421,7 +459,7 @@ class TestCmdAttach:
         with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
              patch("gza.cli.query.os.kill", side_effect=fake_kill), \
-             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(False, None)), \
+             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(False, None, False)), \
              patch("gza.cli.query._spawn_background_worker", return_value=1) as mock_spawn_bg:
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
@@ -520,13 +558,14 @@ class TestInferResumeOverrides:
 
         fake_result = MagicMock(
             returncode=0,
-            stdout="gza implement --no-docker --max-turns 42 some-task\n",
+            stdout="gza implement --no-docker --max-turns 42 --force some-task\n",
         )
         with patch("gza.cli.query.subprocess.run", return_value=fake_result) as mock_run:
-            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
 
         assert no_docker is True
         assert max_turns == 42
+        assert force is True
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert cmd == ["ps", "-p", "99999", "-o", "args="]
@@ -540,10 +579,11 @@ class TestInferResumeOverrides:
 
         fake_result = MagicMock(returncode=1, stdout="")
         with patch("gza.cli.query.subprocess.run", return_value=fake_result):
-            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
 
         assert no_docker is False
         assert max_turns is None
+        assert force is False
 
     def test_returns_defaults_when_no_overrides_in_cmdline(self):
         from gza.cli.query import _infer_resume_overrides_from_worker
@@ -557,10 +597,11 @@ class TestInferResumeOverrides:
             stdout="gza implement some-task\n",
         )
         with patch("gza.cli.query.subprocess.run", return_value=fake_result):
-            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
 
         assert no_docker is False
         assert max_turns is None
+        assert force is False
 
     def test_parses_max_turns_equals_format(self):
         from gza.cli.query import _infer_resume_overrides_from_worker
@@ -574,10 +615,11 @@ class TestInferResumeOverrides:
             stdout="gza implement --max-turns=77 some-task\n",
         )
         with patch("gza.cli.query.subprocess.run", return_value=fake_result):
-            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
 
         assert no_docker is False
         assert max_turns == 77
+        assert force is False
 
 
 class TestSpawnBackgroundWorkerTmux:

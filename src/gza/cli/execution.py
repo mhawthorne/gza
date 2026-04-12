@@ -136,7 +136,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                     # Update worker registry to track the current task
                     worker.task_id = task_id
                     registry.update(worker)
-                result = run(config, task_id=task_id)
+                result = run(
+                    config,
+                    task_id=task_id,
+                    skip_precondition_check=getattr(args, "force", False),
+                )
                 if result != 0:
                     if tasks_completed == 0:
                         # First task failed
@@ -165,18 +169,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         for i in range(count):
             if tasks_completed > 0:
                 print(task_separator)
-            result = run(config)
+            result = run(config, skip_precondition_check=getattr(args, "force", False))
 
-            # If run returns non-zero, it means something went wrong or no tasks left
+            # Any non-zero exit means the run failed.
             if result != 0:
                 if tasks_completed == 0:
-                    # First task failed or no tasks available, return the error code
-                    registry.mark_completed(worker_id, exit_code=result,
-                                           status="failed" if result != 0 else "completed")
+                    # First task failed, return the error code.
+                    registry.mark_completed(worker_id, exit_code=result, status="failed")
                     return result
-                else:
-                    # We completed some tasks before stopping, consider it success
-                    break
+                print(f"\nCompleted {tasks_completed} task(s) before a task failed")
+                registry.mark_completed(worker_id, exit_code=result, status="failed")
+                return result
 
             tasks_completed += 1
 
@@ -279,7 +282,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
 
     # Default: run the implement task immediately
     print(f"\nRunning implement task {impl_task.id}...")
-    return _run_foreground(config, task_id=impl_task.id)
+    return _run_foreground(config, task_id=impl_task.id, force=getattr(args, "force", False))
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -632,7 +635,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     # Default: run the new task immediately
     print(f"\nRunning task {new_task.id}...")
-    return _run_foreground(config, task_id=new_task.id)
+    return _run_foreground(config, task_id=new_task.id, force=getattr(args, "force", False))
 
 
 def _default_mark_completed_mode(task_type: str) -> str:
@@ -905,7 +908,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     # Default: run the improve task immediately
     print(f"\nRunning improve task {improve_task.id}...")
-    return _run_foreground(config, task_id=improve_task.id)
+    return _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -963,7 +966,12 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     print(f"\nRunning review task {review_task.id}...")
     open_after = hasattr(args, 'open') and args.open
-    return _run_foreground(config, task_id=review_task.id, open_after=open_after)
+    return _run_foreground(
+        config,
+        task_id=review_task.id,
+        open_after=open_after,
+        force=getattr(args, "force", False),
+    )
 
 
 def _spawn_background_iterate(
@@ -990,6 +998,8 @@ def _spawn_background_iterate(
         inner_cmd.append("--resume")
     if getattr(args, 'retry', False):
         inner_cmd.append("--retry")
+    if getattr(args, "force", False):
+        inner_cmd.append("--force")
 
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
 
@@ -1071,7 +1081,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             return 0
 
         print(f"Running pending implementation {impl_task.id}...")
-        rc = _run_foreground(config, task_id=impl_task.id)
+        rc = _run_foreground(config, task_id=impl_task.id, force=getattr(args, "force", False))
         if rc != 0:
             print(f"Implementation {impl_task.id} failed (exit code {rc})")
             return 1
@@ -1094,7 +1104,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             new_task = _create_resume_task(store, impl_task)
             assert new_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {new_task.id}...")
-            rc = _run_foreground(config, task_id=new_task.id, resume=True)
+            rc = _run_foreground(
+                config,
+                task_id=new_task.id,
+                resume=True,
+                force=getattr(args, "force", False),
+            )
         else:
             # --retry
             if dry_run:
@@ -1116,7 +1131,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             )
             assert new_task.id is not None
             print(f"Retrying failed implementation {impl_task.id} as {new_task.id}...")
-            rc = _run_foreground(config, task_id=new_task.id)
+            rc = _run_foreground(config, task_id=new_task.id, force=getattr(args, "force", False))
 
         if rc != 0:
             action = "Resume" if use_resume else "Retry"
@@ -1358,7 +1373,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if iteration < max_iterations:
             assert improve_task is not None
             print(f"  Running improve {improve_task.id}...")
-            rc = _run_foreground(config, task_id=improve_task.id)
+            rc = _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
             if rc != 0:
                 print(f"  Improve {improve_task.id} failed (exit code {rc})")
                 _append_summary_row(
@@ -1436,7 +1451,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         assert review_task.id is not None
 
         print(f"  Running review {review_task.id}...")
-        rc = _run_foreground(config, task_id=review_task.id)
+        rc = _run_foreground(config, task_id=review_task.id, force=getattr(args, "force", False))
         if rc != 0:
             print(f"  Review {review_task.id} failed (exit code {rc})")
             final_status = "blocked"
@@ -1500,7 +1515,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         assert improve_task.id is not None
 
         print(f"  Running improve {improve_task.id}...")
-        rc = _run_foreground(config, task_id=improve_task.id)
+        rc = _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
         if rc != 0:
             print(f"  Improve {improve_task.id} failed (exit code {rc})")
             final_status = "blocked"
@@ -1620,4 +1635,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 0
 
     # Default: run the new resume task immediately
-    return _run_foreground(config, task_id=new_task.id, resume=True)
+    return _run_foreground(
+        config,
+        task_id=new_task.id,
+        resume=True,
+        force=getattr(args, "force", False),
+    )

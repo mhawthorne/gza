@@ -131,6 +131,11 @@ def main() -> int:
         metavar="NAME",
         help=argparse.SUPPRESS,  # Internal flag: tmux session name when running inside tmux
     )
+    work_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks (allows running with unmerged depends_on tasks)",
+    )
 
     # attach command
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task (interactive for Claude, observe-only for Codex/Gemini)")
@@ -248,6 +253,11 @@ def main() -> int:
         "--no-docker",
         action="store_true",
         help="Run workers directly instead of in Docker",
+    )
+    advance_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when advance starts workers",
     )
     advance_parser.add_argument(
         "--unimplemented",
@@ -915,6 +925,11 @@ def main() -> int:
         metavar="N",
         help="Override max_turns setting from gza.yaml for this run",
     )
+    retry_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the retry task",
+    )
     add_common_args(retry_parser)
 
     # resume command
@@ -944,6 +959,11 @@ def main() -> int:
         type=int,
         metavar="N",
         help="Override max_turns setting from gza.yaml for this run",
+    )
+    resume_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the resumed task",
     )
     add_common_args(resume_parser)
 
@@ -996,6 +1016,11 @@ def main() -> int:
         metavar="PROVIDER",
         help="Override the provider for this task (e.g. 'claude', 'gemini', 'codex')",
     )
+    improve_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the improve task",
+    )
     add_common_args(improve_parser)
 
     def _add_iterate_args(iterate_parser: argparse.ArgumentParser) -> None:
@@ -1038,6 +1063,11 @@ def main() -> int:
             "--background", "-b",
             action="store_true",
             help="Run the entire iterate loop in the background",
+        )
+        iterate_parser.add_argument(
+            "--force",
+            action="store_true",
+            help="Skip dependency precondition checks when running review/improve tasks in the loop",
         )
         add_common_args(iterate_parser)
 
@@ -1133,6 +1163,11 @@ def main() -> int:
         type=int,
         metavar="N",
         help="Override max_turns setting from gza.yaml for this run",
+    )
+    implement_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the implement task",
     )
     add_common_args(implement_parser)
 

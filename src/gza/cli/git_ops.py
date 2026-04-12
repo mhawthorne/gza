@@ -1425,6 +1425,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     auto: bool = getattr(args, 'auto', False)
     max_tasks: int | None = getattr(args, 'max', None)
     batch_limit: int | None = getattr(args, 'batch', None)
+    force: bool = getattr(args, 'force', False)
     task_id: str | None = resolve_id(config, args.task_id) if getattr(args, 'task_id', None) is not None else None
     plans_mode: bool = getattr(args, 'plans', False)
     unimplemented_mode: bool = getattr(args, 'unimplemented', False)
@@ -1675,6 +1676,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
     _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached', 'max_resume_attempts'})
     attention_tasks: list[tuple[DbTask, dict]] = []
 
+    def _worker_args() -> argparse.Namespace:
+        return argparse.Namespace(
+            no_docker=getattr(args, 'no_docker', False),
+            max_turns=None,
+            force=force,
+        )
+
     for task, action in plan:
         assert task.id is not None
         prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
@@ -1752,6 +1760,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     worker_args = argparse.Namespace(
                         no_docker=getattr(args, 'no_docker', False),
                         max_turns=None,
+                        force=force,
                     )
                     rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
                     workers_started += 1
@@ -1781,10 +1790,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
             # Spawn background worker to run the review
             assert review_task.id is not None
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1798,10 +1804,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # Spawn worker for an existing pending review task
             review_task = action['review_task']
             assert review_task.id is not None
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1829,10 +1832,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
             # Spawn background worker to run the improve task
             assert improve_task.id is not None
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1846,10 +1846,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # Spawn worker for an existing pending improve task
             improve_task = action['improve_task']
             assert improve_task.id is not None
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1864,10 +1861,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             resume_task = _create_resume_task(store, task)
             assert resume_task.id is not None
             console.print(f"      [{_c_ok}]✓ Created resume task {resume_task.id}[/{_c_ok}]")
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_resume_worker(worker_args, config, resume_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1889,10 +1883,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")
 
             assert impl_task.id is not None
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1912,10 +1903,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             assert rebase_task.id is not None
             console.print(f"      [{_c_ok}]✓ Created rebase task {rebase_task.id}[/{_c_ok}]")
 
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
@@ -1939,10 +1927,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         for pt in new_pending_tasks:
             if workers_started >= batch_limit:
                 break
-            worker_args = argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
-                max_turns=None,
-            )
+            worker_args = _worker_args()
             rc = _spawn_background_worker(worker_args, config, task_id=pt.id, quiet=True)
             if rc != 0:
                 break  # error spawning

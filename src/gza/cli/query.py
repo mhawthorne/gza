@@ -1617,7 +1617,7 @@ def _cmd_show_output(
                     f"[{c['value']}]{result_context}[/{c['value']}]"
                 )
 
-        next_step_commands = _failure_next_steps(task, reason)
+        next_step_commands = _failure_next_steps(task, reason, config=config)
         if next_step_commands:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:
@@ -1655,15 +1655,16 @@ def _task_log_file_path(config: Config, task: DbTask) -> Path | None:
     return config.project_dir / task.log_file
 
 
-def _build_resume_worker_args(*, no_docker: bool, max_turns: int | None) -> argparse.Namespace:
+def _build_resume_worker_args(*, no_docker: bool, max_turns: int | None, force: bool) -> argparse.Namespace:
     return argparse.Namespace(
         no_docker=no_docker,
         max_turns=max_turns,
+        force=force,
         resume=True,
     )
 
 
-def _infer_resume_overrides_from_worker(worker: WorkerMetadata) -> tuple[bool, int | None]:
+def _infer_resume_overrides_from_worker(worker: WorkerMetadata) -> tuple[bool, int | None, bool]:
     """Best-effort parse of current worker CLI args for resume handoff parity.
 
     Uses ``ps -p <pid> -o args=`` which works on both macOS and Linux.
@@ -1676,12 +1677,13 @@ def _infer_resume_overrides_from_worker(worker: WorkerMetadata) -> tuple[bool, i
             timeout=5,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return (False, None)
+        return (False, None, False)
     if result.returncode != 0 or not result.stdout.strip():
-        return (False, None)
+        return (False, None, False)
 
     args = result.stdout.strip().split()
     no_docker = "--no-docker" in args
+    force = "--force" in args
     max_turns: int | None = None
     for index, arg in enumerate(args):
         if arg == "--max-turns" and index + 1 < len(args):
@@ -1696,7 +1698,7 @@ def _infer_resume_overrides_from_worker(worker: WorkerMetadata) -> tuple[bool, i
             except ValueError:
                 max_turns = None
             break
-    return (no_docker, max_turns)
+    return (no_docker, max_turns, force)
 
 
 def _stop_worker_for_attach(task: DbTask, worker: WorkerMetadata, registry: WorkerRegistry) -> bool:
@@ -1863,7 +1865,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
     session_name = f"gza-attach-{task.id}"
     cols, rows = config.tmux.terminal_size
-    resume_no_docker, resume_max_turns = _infer_resume_overrides_from_worker(worker)
+    resume_no_docker, resume_max_turns, resume_force = _infer_resume_overrides_from_worker(worker)
     wrapper_cmd = [
         sys.executable,
         "-m",
@@ -1879,6 +1881,8 @@ def cmd_attach(args: argparse.Namespace) -> int:
         wrapper_cmd.append("--no-docker")
     if resume_max_turns is not None:
         wrapper_cmd.extend(["--max-turns", str(resume_max_turns)])
+    if resume_force:
+        wrapper_cmd.append("--force")
     preflight_err = _preflight_attach_session(session_name, cols=cols, rows=rows)
     if preflight_err:
         print(f"Error: failed to create interactive tmux session: {preflight_err}")
@@ -1914,6 +1918,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         recovery_args = _build_resume_worker_args(
             no_docker=resume_no_docker,
             max_turns=resume_max_turns,
+            force=resume_force,
         )
         recovery_rc = _spawn_background_worker(
             recovery_args,

@@ -62,6 +62,26 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
     assert "`gza-1a2b`" not in config_content
 
 
+def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerged_guidance() -> None:
+    """Operator docs should stay in sync with execution --force and failure-recovery behavior."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    required_snippets = [
+        "| `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |",
+        "| `--force` | Skip dependency merge precondition checks when starting the resumed task |",
+        "| `--force` | Skip dependency merge precondition checks when starting the retry task |",
+        "| `--force` | Skip dependency merge precondition checks when running the improve task |",
+        "| `--force` | Skip dependency merge precondition checks when running the implement task |",
+        "| `--force` | Skip dependency merge precondition checks when advance starts workers |",
+        "| `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |",
+        "`PREREQUISITE_UNMERGED`: the resolved completed dependency branch is not reachable",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in config_content
+
+
 def test_skills_docs_do_not_advertise_unsupported_gza_log_task_flag() -> None:
     """docs/skills.md examples should avoid invalid gza log --task invocations."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

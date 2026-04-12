@@ -217,6 +217,7 @@ def _run_foreground(
     task_id: str | None,
     resume: bool = False,
     open_after: bool = False,
+    force: bool = False,
 ) -> int:
     """Run a task in the foreground with worker registration.
 
@@ -228,6 +229,7 @@ def _run_foreground(
         task_id: Task ID to run
         resume: Whether this is a resume run
         open_after: Whether to open the output after completion
+        force: Skip runner precondition checks
     """
     registry = WorkerRegistry(config.workers_path)
     worker_id = registry.generate_worker_id()
@@ -254,7 +256,13 @@ def _run_foreground(
     signal.signal(signal.SIGTERM, _cleanup)
 
     try:
-        exit_code = run(config, task_id=task_id, resume=resume, open_after=open_after)
+        exit_code = run(
+            config,
+            task_id=task_id,
+            resume=resume,
+            open_after=open_after,
+            skip_precondition_check=force,
+        )
         status = "completed" if exit_code == 0 else "failed"
         registry.mark_completed(worker_id, exit_code=exit_code, status=status)
         return exit_code
@@ -340,6 +348,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         inner_cmd.extend(["--max-turns", str(args.max_turns)])
+    if getattr(args, "force", False):
+        inner_cmd.append("--force")
 
     # Add project directory
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
@@ -556,10 +566,16 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
                 config,
                 task_id=args.task_ids[0],
                 resume=resume,
+                skip_precondition_check=getattr(args, "force", False),
                 on_task_claimed=_on_task_claimed,
             )
         else:
-            exit_code = run(config, resume=resume, on_task_claimed=_on_task_claimed)
+            exit_code = run(
+                config,
+                resume=resume,
+                skip_precondition_check=getattr(args, "force", False),
+                on_task_claimed=_on_task_claimed,
+            )
 
         # Update worker status on completion
         if worker_id:
@@ -630,6 +646,8 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
 
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         cmd.extend(["--max-turns", str(args.max_turns)])
+    if getattr(args, "force", False):
+        cmd.append("--force")
 
     # Add project directory
     cmd.extend(["--project", str(config.project_dir.absolute())])
@@ -1176,13 +1194,39 @@ def _failure_summary(reason: str) -> str:
     summaries = {
         "MAX_STEPS": "Stopped due to max steps limit.",
         "MAX_TURNS": "Stopped due to max steps limit.",
+        "PREREQUISITE_UNMERGED": "Dependency is not yet merged to main.",
         "TEST_FAILURE": "Stopped due to verification/test failure.",
         "UNKNOWN": "Task failed; inspect log output for details.",
     }
     return summaries.get(reason, f"Task failed: {reason}")
 
 
-def _failure_next_steps(task: DbTask, reason: str) -> list[str]:
+def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) -> str | None:
+    """Extract dependency_task_id from PREREQUISITE_UNMERGED outcome log entry."""
+    if config is None or not task.log_file:
+        return None
+    from .log import _load_log_file_entries
+
+    log_path = config.project_dir / task.log_file
+    if not log_path.exists():
+        return None
+    try:
+        entries = _load_log_file_entries(log_path)[1]
+    except OSError:
+        return None
+
+    for entry in reversed(entries):
+        if entry.get("type") != "gza" or entry.get("subtype") != "outcome":
+            continue
+        if entry.get("failure_reason") != "PREREQUISITE_UNMERGED":
+            continue
+        dep_id = entry.get("dependency_task_id")
+        if isinstance(dep_id, str) and dep_id:
+            return dep_id
+    return None
+
+
+def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = None) -> list[str]:
     """Return concrete next-step commands for a failed task."""
     if task.id is None:
         return []
@@ -1191,6 +1235,13 @@ def _failure_next_steps(task: DbTask, reason: str) -> list[str]:
     if reason in {"MAX_STEPS", "MAX_TURNS"}:
         if task.session_id:
             steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if reason == "PREREQUISITE_UNMERGED":
+        blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
+        if blocking_dep_id:
+            steps.append(f"gza merge {blocking_dep_id}")
         steps.append(f"gza retry {task.id}")
         return steps
 

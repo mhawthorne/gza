@@ -4,9 +4,12 @@
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+from gza.config import Config
+from gza.db import SqliteTaskStore
 
 from .conftest import run_gza, setup_config
 
@@ -77,7 +80,7 @@ class TestHelpOutput:
         assert "Expand lineage N levels for each matching task" not in result.stdout
 
     def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
-        """advance --help should show --unimplemented and keep --plans hidden."""
+        """advance --help should show --unimplemented/--force and keep --plans hidden."""
         result = subprocess.run(
             ["uv", "run", "gza", "advance", "--help"],
             capture_output=True,
@@ -86,6 +89,7 @@ class TestHelpOutput:
 
         assert result.returncode == 0
         assert "--unimplemented" in result.stdout
+        assert "--force" in result.stdout
         assert "--plans" not in result.stdout
 
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
@@ -151,3 +155,96 @@ class TestCommandAliases:
 
         assert rc == 0
         cmd_iterate.assert_called_once()
+
+
+class TestWorkForceBackgroundDispatch:
+    """Command-level regression tests for work --force dispatch and propagation."""
+
+    def test_work_force_background_propagates_to_worker_command(self, tmp_path):
+        """`gza work --force --background` should propagate --force to worker subprocess args."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending task for background force run")
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "work",
+                    str(task.id),
+                    "--background",
+                    "--force",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        assert "--worker-mode" in captured_cmd
+        assert "--force" in captured_cmd
+
+
+class TestDirectExecutionForceDispatch:
+    """Parser/dispatch coverage for --force on direct execution commands."""
+
+    @pytest.mark.parametrize(
+        ("argv", "command_patch"),
+        [
+            (
+                ["gza", "implement", "testproject-1", "--force"],
+                "gza.cli.main.cmd_implement",
+            ),
+            (
+                ["gza", "retry", "testproject-1", "--force"],
+                "gza.cli.main.cmd_retry",
+            ),
+            (
+                ["gza", "resume", "testproject-1", "--force"],
+                "gza.cli.main.cmd_resume",
+            ),
+            (
+                ["gza", "improve", "testproject-1", "--force"],
+                "gza.cli.main.cmd_improve",
+            ),
+            (
+                ["gza", "iterate", "testproject-1", "--force"],
+                "gza.cli.main.cmd_iterate",
+            ),
+        ],
+    )
+    def test_direct_execution_force_reaches_command_handler(self, tmp_path, argv, command_patch):
+        """CLI should parse --force and pass it through args to the selected direct execution handler."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", [*argv, "--project", str(tmp_path)]),
+            patch(command_patch, return_value=0) as cmd_handler,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_handler.assert_called_once()
+        parsed_args = cmd_handler.call_args[0][0]
+        assert parsed_args.force is True

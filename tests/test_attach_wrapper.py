@@ -131,7 +131,7 @@ def test_attach_wrapper_resume_failure_marks_task_failed(tmp_path: Path) -> None
 
 
 def test_attach_wrapper_passes_resume_overrides_to_background_worker(tmp_path: Path) -> None:
-    """Wrapper should preserve no-docker/max-turns overrides when respawning."""
+    """Wrapper should preserve no-docker/max-turns/force overrides when respawning."""
     task_id, _ = _setup_task_with_log(tmp_path)
 
     with (
@@ -142,6 +142,7 @@ def test_attach_wrapper_passes_resume_overrides_to_background_worker(tmp_path: P
             "--project", str(tmp_path),
             "--no-docker",
             "--max-turns", "66",
+            "--force",
         ]),
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0) as mock_interactive,
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
@@ -155,6 +156,7 @@ def test_attach_wrapper_passes_resume_overrides_to_background_worker(tmp_path: P
     worker_args = mock_spawn.call_args[0][0]
     assert worker_args.no_docker is True
     assert worker_args.max_turns == 66
+    assert worker_args.force is True
 
 
 def test_attach_wrapper_sigint_during_interactive_forwarded_to_child_without_detach_state(tmp_path: Path) -> None:
