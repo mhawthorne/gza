@@ -1146,17 +1146,18 @@ def _determine_advance_action(
     reviews = _get_reviews_for_root_task(store, task)
 
     if reviews:
-        latest_review = reviews[0]
+        active_review = next(
+            (r for r in reviews if r.status in ('pending', 'in_progress')),
+            None,
+        )
+        completed_reviews = [r for r in reviews if r.status == 'completed']
+        latest_completed_review = completed_reviews[0] if completed_reviews else None
 
         # If a rebase completed after the latest review, force a new review
         # (unless one is already pending/in_progress)
-        if completed_rebases and latest_review.completed_at is not None:
+        if completed_rebases and latest_completed_review and latest_completed_review.completed_at is not None:
             latest_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
-            if latest_rebase.completed_at is not None and latest_rebase.completed_at > latest_review.completed_at:
-                active_review = next(
-                    (r for r in reviews if r.status in ('pending', 'in_progress')),
-                    None,
-                )
+            if latest_rebase.completed_at is not None and latest_rebase.completed_at > latest_completed_review.completed_at:
                 if active_review:
                     if active_review.status == 'pending':
                         return {
@@ -1174,20 +1175,17 @@ def _determine_advance_action(
 
         # Determine if the review has been cleared by a subsequent improve task
         review_cleared = (
-            task.review_cleared_at is not None
-            and latest_review.completed_at is not None
-            and task.review_cleared_at >= latest_review.completed_at
+            latest_completed_review is not None
+            and task.review_cleared_at is not None
+            and latest_completed_review.completed_at is not None
+            and task.review_cleared_at >= latest_completed_review.completed_at
         )
 
         # If review was cleared, check if code changed since the review
         # (i.e., a completed improve task exists after the latest review).
         # In that case, the review is stale and we need a new one.
-        if review_cleared and latest_review.completed_at is not None:
+        if review_cleared and latest_completed_review and latest_completed_review.completed_at is not None:
             # But first, check if a new review is already pending/in_progress
-            active_review = next(
-                (r for r in reviews if r.status in ('pending', 'in_progress')),
-                None,
-            )
             if active_review:
                 if active_review.status == 'pending':
                     return {
@@ -1208,76 +1206,78 @@ def _determine_advance_action(
             ]
             if completed_improves:
                 latest_improve = max(completed_improves, key=lambda t: t.completed_at or datetime.min)
-                if latest_improve.completed_at is not None and latest_improve.completed_at > latest_review.completed_at:
+                if latest_improve.completed_at is not None and latest_improve.completed_at > latest_completed_review.completed_at:
                     return {
                         'type': 'create_review',
                         'description': 'Create review (code changed since last review)',
                     }
 
         if not review_cleared:
-            # Active (non-cleared) review exists
-            if latest_review.status == 'pending':
+            # Active (non-cleared) review exists.
+            if active_review and active_review.status == 'pending':
                 return {
                     'type': 'run_review',
-                    'description': f'Spawn worker for pending review {latest_review.id}',
-                    'review_task': latest_review,
+                    'description': f'Spawn worker for pending review {active_review.id}',
+                    'review_task': active_review,
                 }
-            if latest_review.status == 'in_progress':
+            if active_review and active_review.status == 'in_progress':
                 return {
                     'type': 'wait_review',
-                    'description': f'SKIP: review {latest_review.id} is in_progress',
-                    'review_task': latest_review,
+                    'description': f'SKIP: review {active_review.id} is in_progress',
+                    'review_task': active_review,
                 }
 
-            verdict = get_review_verdict(config, latest_review)
-            if verdict == 'APPROVED':
-                return {
-                    'type': 'merge',
-                    'description': 'Merge (review APPROVED)',
-                    'review_task': latest_review,
-                }
-            elif verdict == 'CHANGES_REQUESTED':
-                # Check cycle limit before creating a new improve
-                completed_cycles = _count_completed_review_cycles(store, task.id)
-                if completed_cycles >= config.max_review_cycles:
+            if latest_completed_review is not None:
+                latest_review = latest_completed_review
+                verdict = get_review_verdict(config, latest_review)
+                if verdict == 'APPROVED':
                     return {
-                        'type': 'max_cycles_reached',
-                        'description': f'SKIP: max review cycles ({config.max_review_cycles}) reached, needs manual intervention',
+                        'type': 'merge',
+                        'description': 'Merge (review APPROVED)',
+                        'review_task': latest_review,
                     }
-                # Check if an improve task is already pending/in_progress
-                assert latest_review.id is not None
-                existing_improve = store.get_improve_tasks_for(task.id, latest_review.id)
-                active_improve_running = [t for t in existing_improve if t.status == 'in_progress']
-                if active_improve_running:
+                elif verdict == 'CHANGES_REQUESTED':
+                    # Check cycle limit before creating a new improve
+                    completed_cycles = _count_completed_review_cycles(store, task.id)
+                    if completed_cycles >= config.max_review_cycles:
+                        return {
+                            'type': 'max_cycles_reached',
+                            'description': f'SKIP: max review cycles ({config.max_review_cycles}) reached, needs manual intervention',
+                        }
+                    # Check if an improve task is already pending/in_progress
+                    assert latest_review.id is not None
+                    existing_improve = store.get_improve_tasks_for(task.id, latest_review.id)
+                    active_improve_running = [t for t in existing_improve if t.status == 'in_progress']
+                    if active_improve_running:
+                        return {
+                            'type': 'wait_improve',
+                            'description': f'SKIP: improve task {active_improve_running[0].id} is in_progress',
+                        }
+                    active_improve_pending = [t for t in existing_improve if t.status == 'pending']
+                    if active_improve_pending:
+                        return {
+                            'type': 'run_improve',
+                            'description': f'Spawn worker for pending improve {active_improve_pending[0].id}',
+                            'improve_task': active_improve_pending[0],
+                        }
                     return {
-                        'type': 'wait_improve',
-                        'description': f'SKIP: improve task {active_improve_running[0].id} is in_progress',
+                        'type': 'improve',
+                        'description': 'Create improve task (review CHANGES_REQUESTED)',
+                        'review_task': latest_review,
                     }
-                active_improve_pending = [t for t in existing_improve if t.status == 'pending']
-                if active_improve_pending:
+                else:
                     return {
-                        'type': 'run_improve',
-                        'description': f'Spawn worker for pending improve {active_improve_pending[0].id}',
-                        'improve_task': active_improve_pending[0],
+                        'type': 'needs_discussion',
+                        'description': f'SKIP: review verdict is {verdict or "unknown"}, needs manual attention',
+                        'review_task': latest_review,
                     }
-                return {
-                    'type': 'improve',
-                    'description': 'Create improve task (review CHANGES_REQUESTED)',
-                    'review_task': latest_review,
-                }
-            else:
-                return {
-                    'type': 'needs_discussion',
-                    'description': f'SKIP: review verdict is {verdict or "unknown"}, needs manual attention',
-                    'review_task': latest_review,
-                }
 
-    # Review was cleared by an improve task — always mergeable regardless of config.
-    if reviews:
-        return {
-            'type': 'merge',
-            'description': 'Merge (previous review addressed)',
-        }
+        # Review was cleared by an improve task — always mergeable regardless of config.
+        if latest_completed_review is not None:
+            return {
+                'type': 'merge',
+                'description': 'Merge (previous review addressed)',
+            }
 
     # Reached only when no reviews exist (all earlier paths with reviews have returned).
     # Non-implement types (plan, explore, improve, etc.) go straight to merge.

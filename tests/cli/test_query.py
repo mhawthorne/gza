@@ -2607,6 +2607,55 @@ class TestUnmergedReviewStatus:
         assert "changes requested" not in result.stdout
         assert "needs discussion" not in result.stdout
 
+    def test_unmerged_failed_reviews_do_not_count_as_reviewed(self, tmp_path: Path):
+        """Failed reviews with completed_at set should not mark an impl as reviewed."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        failed_review_1 = store.add("Failed review 1", task_type="review")
+        failed_review_1.status = "failed"
+        failed_review_1.completed_at = datetime.now(UTC)
+        failed_review_1.depends_on = task.id
+        failed_review_1.output_content = "Verdict: APPROVED"
+        store.update(failed_review_1)
+
+        failed_review_2 = store.add("Failed review 2", task_type="review")
+        failed_review_2.status = "failed"
+        failed_review_2.completed_at = datetime.now(UTC)
+        failed_review_2.depends_on = task.id
+        failed_review_2.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(failed_review_2)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "review: no review" in result.stdout
+        assert "review: reviewed" not in result.stdout
+        assert "✓ approved" not in result.stdout
+        assert "⚠ changes requested" not in result.stdout
+
+    def test_unmerged_ignores_failed_review_when_completed_review_exists(self, tmp_path: Path):
+        """Only completed reviews should drive unmerged review classification and verdict."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        completed_review = store.add("Completed review", task_type="review")
+        completed_review.status = "completed"
+        completed_review.completed_at = datetime.now(UTC)
+        completed_review.depends_on = task.id
+        completed_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(completed_review)
+
+        failed_review = store.add("Failed review", task_type="review")
+        failed_review.status = "failed"
+        failed_review.completed_at = datetime.now(UTC)
+        failed_review.depends_on = task.id
+        failed_review.output_content = "Verdict: APPROVED"
+        store.update(failed_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "review: reviewed" in result.stdout
+        assert "⚠ changes requested" in result.stdout
+        assert "✓ approved" not in result.stdout
+
     def test_unmerged_uses_most_recent_review(self, tmp_path: Path):
         """Unmerged output shows status from most recent review."""
         import time

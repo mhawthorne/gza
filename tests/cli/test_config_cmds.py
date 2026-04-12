@@ -1291,6 +1291,29 @@ class TestStatsReviewsCommand:
         assert "Review tasks:    0" in result.stdout
         assert "Reviewed:        0/1" in result.stdout
 
+    def test_stats_reviews_failed_review_not_counted_as_reviewed(self, tmp_path: Path):
+        """Failed reviews should not contribute to reviewed implementation counts."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        failed_review = store.add("Failed review", task_type="review", depends_on=impl.id)
+        failed_review.status = "failed"
+        failed_review.completed_at = datetime.now(UTC)
+        store.update(failed_review)
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement tasks: 1" in result.stdout
+        assert "Review tasks:    0" in result.stdout
+        assert "Reviewed:        0/1" in result.stdout
+
     def test_stats_reviews_cycle_distribution(self, tmp_path: Path):
         """gza stats reviews shows cycle distribution for reviewed impls."""
         from gza.db import TaskStats

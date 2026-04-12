@@ -488,7 +488,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         )
 
         # Classify review freshness/status for this implementation.
-        latest_review = next((r for r in reviews if r.completed_at is not None), None)
+        latest_review = next((r for r in reviews if r.status == "completed"), None)
         latest_improve = max(
             (imp for imp in improve_tasks if imp.completed_at is not None),
             key=lambda imp: imp.completed_at or datetime.min,
@@ -526,7 +526,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             # and taking the first parseable verdict after stale filtering.
             if review_classification != "review stale":
                 for review in reviews:
-                    if review.completed_at is None:
+                    if review.status != "completed" or review.completed_at is None:
                         continue
                     if root_task.review_cleared_at and root_task.review_cleared_at >= review.completed_at:
                         continue
