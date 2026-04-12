@@ -239,8 +239,10 @@ class TestPromptBuilderBuild:
             in content
         )
 
-    def test_code_review_interactive_skill_requires_authoritative_diff_handoff(self):
-        """Test interactive review skill explicitly hands authoritative diff context to subagent."""
+    def test_code_review_interactive_skill_requires_authoritative_diff_and_ask_handoff(
+        self,
+    ):
+        """Interactive review skill must hand off authoritative diff plus canonical ask context."""
         skill_path = (
             Path(__file__).resolve().parents[1]
             / "src"
@@ -252,7 +254,11 @@ class TestPromptBuilderBuild:
         content = skill_path.read_text()
 
         assert (
-            "Pass the authoritative diff context (`## Implementation diff context`) and the PR number (if `--pr` was used and a PR was found) to the subagent."
+            "Pass the authoritative diff context (`## Implementation diff context`), canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available), and the PR number (if `--pr` was used and a PR was found) to the subagent."
+            in content
+        )
+        assert (
+            "Review the diff against the provided canonical ask context (`## Original plan:` or `## Original request:`) when present."
             in content
         )
         assert (

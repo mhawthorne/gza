@@ -1,8 +1,8 @@
 ---
 name: gza-code-review-interactive
 description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
-allowed-tools: Bash(git:*), Bash(gh:*), Read, Agent, AskUserQuestion
-version: 2.2.0
+allowed-tools: Bash(git:*), Bash(gh:*), Bash(uv run:*), Read, Agent, AskUserQuestion
+version: 2.3.0
 public: true
 ---
 
@@ -35,9 +35,16 @@ Requires being on a non-main branch with commits ahead of main. If not, stop and
 2. If no PR exists, stop and tell the user to create one first (do NOT create a PR automatically)
 3. Capture the PR number and URL
 
-### Step 3: Capture the committed diff
+### Step 3: Capture review context in the parent session
 
-If the caller already provided diff context, use that as-is and do not reconstruct it.
+Capture one canonical ask section before spawning the reviewer:
+- If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged.
+- Otherwise, try to resolve ask context from the branch's linked gza task chain (`uv run gza show <TASK_ID>` / `uv run gza log <TASK_ID>` is preferred once you identify the task for this branch).
+- If linked ask content exists but is unavailable on this machine, pass an explicit unavailable-content marker section (for example, `## Original plan:` followed by `(plan task <TASK_ID> exists but content unavailable on this machine - flag as blocker)`).
+- If no retrievable plan or request exists for this branch, pass no ask section and let the reviewer state: `No plan or request provided.`
+
+Then capture the committed diff:
+- If the caller already provided diff context, use that as-is and do not reconstruct it.
 Otherwise, collect the committed branch diff once in the parent session:
 ```bash
 git diff main...HEAD
@@ -60,6 +67,8 @@ Keep this review stack-agnostic. If project verification instructions are missin
 **Step 3**: The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it. You may read unchanged source files when surrounding context is needed to judge correctness.
 
 **Step 3.5**: When you need to verify behavior that isn't visible in the diff (e.g., whether a CLI command exists, how a called function works, what a referenced method does), use the Read, Grep, or Glob tools to check the current codebase. Do not guess or assume — verify.
+
+**Step 3.7**: Review the diff against the provided canonical ask context (`## Original plan:` or `## Original request:`) when present. If ask content is marked unavailable, call that out as a blocker. If neither ask section is provided, state `No plan or request provided.`
 
 **Step 4**: Write a structured review with these sections:
 
@@ -114,7 +123,7 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the authoritative diff context (`## Implementation diff context`) and the PR number (if `--pr` was used and a PR was found) to the subagent.
+Pass the authoritative diff context (`## Implementation diff context`), canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available), and the PR number (if `--pr` was used and a PR was found) to the subagent.
 
 ### Step 5: Report back
 
