@@ -92,6 +92,23 @@ class TestHelpOutput:
         assert "--force" in result.stdout
         assert "--plans" not in result.stdout
 
+    def test_advance_help_and_internal_docs_no_longer_advertise_test_failure_auto_resume(self):
+        """Operator-facing resume policy should only mention MAX_STEPS/MAX_TURNS."""
+        result = subprocess.run(
+            ["uv", "run", "gza", "advance", "--help"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        normalized_help = " ".join(result.stdout.split())
+        assert "MAX_STEPS/MAX_TURNS failures" in normalized_help
+        assert "TEST_FAILURE" not in normalized_help
+
+        internal_docs = Path("docs/internal/advance-workflow.md").read_text()
+        assert "MAX_STEPS', 'MAX_TURNS'" in internal_docs
+        assert "'TEST_FAILURE'" not in internal_docs
+
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
         setup_config(tmp_path)
@@ -116,6 +133,20 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "Review and iteration analytics" in result.stdout
         assert "Review analytics (use 'gza stats reviews')" not in result.stdout
+
+    def test_add_next_help_and_docs_describe_front_of_urgent_lane(self, tmp_path):
+        """`add --next` contract should explicitly mention bump-to-front urgent-lane behavior."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("add", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+        normalized_help = " ".join(help_result.stdout.split())
+        assert "front of the urgent lane" in normalized_help
+        assert "picked up before normal queue items" not in normalized_help
+
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "front of the urgent lane" in docs_text
+        assert "picked up before normal queue items" not in docs_text
 
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
@@ -155,6 +186,48 @@ class TestCommandAliases:
 
         assert rc == 0
         cmd_iterate.assert_called_once()
+
+    def test_watch_dispatches_to_cmd_watch(self, tmp_path):
+        """`watch` command should parse args and dispatch to cmd_watch."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "watch", "--batch", "2", "--project", str(tmp_path)]),
+            patch("gza.cli.main.cmd_watch", return_value=0) as cmd_watch,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_watch.assert_called_once()
+        args = cmd_watch.call_args.args[0]
+        assert args.command == "watch"
+        assert args.batch == 2
+
+    @pytest.mark.parametrize("queue_action", ["bump", "unbump"])
+    def test_queue_subcommands_dispatch_to_cmd_queue(self, tmp_path, queue_action):
+        """`queue bump|unbump` should parse subcommand shape and route to cmd_queue."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["gza", "queue", queue_action, "test-project-1", "--project", str(tmp_path)],
+            ),
+            patch("gza.cli.main.cmd_queue", return_value=0) as cmd_queue,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_queue.assert_called_once()
+        args = cmd_queue.call_args.args[0]
+        assert args.command == "queue"
+        assert args.queue_action == queue_action
+        assert args.task_id == "test-project-1"
 
 
 class TestWorkForceBackgroundDispatch:

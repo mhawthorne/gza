@@ -269,6 +269,22 @@ class TestGetIncomplete:
         assert len(snap.in_progress) == 1
         assert snap.total == 3
 
+    def test_pending_snapshot_includes_non_runnable_pending_rows(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Runnable pending")
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Blocking pending")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        client = make_client(tmp_path)
+        snap = client.get_incomplete()
+        pending_prompts = {task.prompt for task in snap.pending}
+
+        assert "Runnable pending" in pending_prompts
+        assert "Internal pending" in pending_prompts
+        assert "Blocked pending" in pending_prompts
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_pending
@@ -325,6 +341,41 @@ class TestGetPending:
         ids = {t.id for t in result}
         assert pending.id in ids
         assert done.id not in ids
+
+    def test_excludes_non_pickable_internal_and_blocked_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        runnable = store.add("Runnable pending")
+        assert runnable.id is not None
+
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Dependency blocker")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        client = make_client(tmp_path)
+        result = client.get_pending()
+        prompts = {t.prompt for t in result}
+
+        assert "Runnable pending" in prompts
+        assert "Internal pending" not in prompts
+        assert "Blocked pending" not in prompts
+
+    def test_bumped_urgent_task_is_returned_before_older_urgent_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        older_urgent = store.add("Older urgent", urgent=True)
+        newer_urgent = store.add("Newer urgent", urgent=True)
+        bumped = store.add("Bumped now")
+        assert older_urgent.id is not None
+        assert newer_urgent.id is not None
+        assert bumped.id is not None
+        store.set_urgent(bumped.id, True)
+
+        client = make_client(tmp_path)
+        result = client.get_pending()
+        ids = [task.id for task in result]
+
+        assert ids.index(bumped.id) < ids.index(older_urgent.id) < ids.index(newer_urgent.id)
 
 
 # ---------------------------------------------------------------------------

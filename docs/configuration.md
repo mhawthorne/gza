@@ -40,6 +40,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
+| `watch` | Dict | `{batch: 5, poll: 300, max_idle: null, max_iterations: 10}` | Defaults for `gza watch` loop behavior |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
 | `theme` | String | *(none)* | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
@@ -457,6 +458,7 @@ gza add [prompt] [options]
 | `--model MODEL` | Override model for this task (e.g., `claude-3-5-haiku-latest`) |
 | `--provider PROVIDER` | Override provider for this task (`claude`, `codex`, or `gemini`) |
 | `--no-learnings` | Skip injecting `.gza/learnings.md` context into this task's prompt |
+| `--next` | Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump) |
 
 ### edit
 
@@ -923,6 +925,23 @@ gza next [options]
 
 Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
 
+### queue
+
+Inspect and manage runnable pending queue ordering.
+
+```bash
+gza queue
+gza queue bump <task_id>
+gza queue unbump <task_id>
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID to bump/unbump (e.g. `gza-1234`) |
+
+Queue pickup ordering is urgent-first. `queue bump` moves a task to the front of the urgent lane (next pickup), then remaining tasks stay FIFO by creation time within each lane.
+`gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
+
 ### implement
 
 Create an implementation task from a completed plan task.
@@ -994,6 +1013,23 @@ gza iterate <impl_task_id> [options]
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |
+
+### watch
+
+Continuously maintain a target number of concurrent workers.
+
+```bash
+gza watch [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--batch N` | Target concurrent workers (default: `watch.batch` or `5`) |
+| `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
+| `--max-idle SECS` | Exit after consecutive idle time (default: `watch.max_idle`, no limit when unset) |
+| `--max-iterations N` | Iterate loop cap for implement tasks (default: `watch.max_iterations` or `10`) |
+| `--dry-run` | Show what each cycle would do without executing |
+| `--quiet` | Write events to `.gza/watch.log` only |
 
 ### learnings
 

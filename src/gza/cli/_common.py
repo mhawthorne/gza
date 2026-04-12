@@ -25,6 +25,7 @@ from ..console import (
     truncate,
 )
 from ..db import ManualMigrationRequired, SqliteTaskStore, Task as DbTask, resolve_task_id, task_id_numeric_key
+from ..failure_policy import is_resumable_failure_reason
 from ..prompts import PromptBuilder
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
@@ -52,6 +53,11 @@ def resolve_id(config: Config, arg: str) -> str:
     Wraps :func:`gza.db.resolve_task_id` using the project prefix from config.
     """
     return resolve_task_id(arg, config.project_prefix)
+
+
+def set_task_urgency(store: SqliteTaskStore, task_id: str, *, urgent: bool) -> bool:
+    """Shared urgency update path for queue bump/unbump and add --next."""
+    return store.set_urgent(task_id, urgent)
 
 
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
@@ -459,9 +465,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         )
         registry.register(worker_metadata)
 
-        if quiet:
-            print(f"Started worker {worker_id} (PID {pid}) for task {selected_task.id}")
-        else:
+        if not quiet:
             print(f"Started worker {worker_id} (PID {pid})")
             print(f"  Task: {selected_task.id}")
             if selected_task.prompt:
@@ -668,9 +672,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         )
         registry.register(worker)
 
-        if quiet:
-            print(f"Started worker {worker_id} (PID {proc.pid}) for task {task.id} (resuming)")
-        else:
+        if not quiet:
             print(f"Started worker {worker_id} (PID {proc.pid})")
             print(f"  Task: {task.id} (resuming)")
             if task.prompt:
@@ -1232,22 +1234,19 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
         return []
 
     steps = [f"gza log -t {task.id} --steps-verbose"]
-    if reason in {"MAX_STEPS", "MAX_TURNS"}:
-        if task.session_id:
-            steps.append(f"gza resume {task.id}")
-        steps.append(f"gza retry {task.id}")
-        return steps
-
     if reason == "PREREQUISITE_UNMERGED":
         blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
         if blocking_dep_id:
             steps.append(f"gza merge {blocking_dep_id}")
         steps.append(f"gza retry {task.id}")
         return steps
-
-    if reason == "TEST_FAILURE":
+    if is_resumable_failure_reason(reason):
         if task.session_id:
             steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if reason == "TEST_FAILURE":
         steps.append(f"gza retry {task.id}")
         return steps
 

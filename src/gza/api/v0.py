@@ -38,6 +38,7 @@ from pathlib import Path
 from gza import query as _query
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
+from gza.pickup import get_runnable_pending_tasks
 
 __all__ = ["GzaClient", "Task", "IncompleteSnapshot"]
 
@@ -145,6 +146,13 @@ class GzaClient:
         -------
         IncompleteSnapshot
             Dataclass with ``.pending``, ``.in_progress``, and ``.total``.
+
+        Notes
+        -----
+        ``pending`` uses raw pending rows from storage (``store.get_pending()``),
+        including non-runnable pending tasks (for example ``internal`` or
+        dependency-blocked tasks). Use :meth:`get_pending` for runnable pickup
+        order semantics.
         """
         return IncompleteSnapshot(
             pending=self._store.get_pending(),
@@ -152,14 +160,20 @@ class GzaClient:
         )
 
     def get_pending(self, limit: int | None = None) -> list[Task]:
-        """Return pending tasks, oldest first.
+        """Return pending tasks in pickup order.
 
         Parameters
         ----------
         limit:
             Maximum number of tasks to return. None means all.
+
+        Notes
+        -----
+        This uses default worker pickup semantics: internal tasks and
+        dependency-blocked tasks are excluded. Ordering is urgent-first, with
+        recently bumped urgent tasks first, then FIFO by creation time.
         """
-        return self._store.get_pending(limit=limit)
+        return get_runnable_pending_tasks(self._store, limit=limit)
 
     def get_in_progress(self) -> list[Task]:
         """Return in-progress tasks, oldest-started first."""

@@ -107,6 +107,72 @@ class TestTaskChaining:
 
         assert store.get_next_pending() is None
 
+    def test_pending_queue_orders_urgent_before_fifo(self, tmp_path: Path):
+        """Pending queue ordering is urgent-first, FIFO within each lane."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        normal_1 = store.add("Normal 1")
+        normal_2 = store.add("Normal 2")
+        urgent_1 = store.add("Urgent 1", urgent=True)
+        urgent_2 = store.add("Urgent 2", urgent=True)
+
+        pending = store.get_pending()
+        assert [task.id for task in pending] == [
+            urgent_1.id,
+            urgent_2.id,
+            normal_1.id,
+            normal_2.id,
+        ]
+
+    def test_bump_moves_task_to_front_of_urgent_pickup_lane(self, tmp_path: Path):
+        """Bumping a task should make it the first pickup item, ahead of older urgent tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        urgent_1 = store.add("Urgent 1", urgent=True)
+        urgent_2 = store.add("Urgent 2", urgent=True)
+        bumped = store.add("Will be bumped")
+        assert bumped.id is not None
+
+        store.set_urgent(bumped.id, True)
+
+        pickup = store.get_pending_pickup()
+        assert [task.id for task in pickup[:3]] == [bumped.id, urgent_1.id, urgent_2.id]
+
+    def test_get_next_pending_prefers_urgent(self, tmp_path: Path):
+        """get_next_pending picks urgent runnable tasks first."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        normal = store.add("Normal")
+        urgent = store.add("Urgent")
+        assert urgent.id is not None
+        store.set_urgent(urgent.id, True)
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == urgent.id
+        assert next_task.id != normal.id
+
+    def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
+        """Pickup listing excludes internal and dependency-blocked pending tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        runnable = store.add("Runnable pending")
+        assert runnable.id is not None
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Dependency blocker")
+        blocked = store.add("Blocked pending", depends_on=blocker.id)
+
+        pickup = store.get_pending_pickup()
+        pickup_ids = {task.id for task in pickup}
+
+        assert runnable.id in pickup_ids
+        assert blocked.id not in pickup_ids
+        assert all(task.task_type != "internal" for task in pickup)
+
     def test_get_in_progress_returns_only_in_progress_tasks(self, tmp_path: Path):
         """Test get_in_progress returns only in-progress tasks."""
         db_path = tmp_path / "test.db"
@@ -1646,6 +1712,29 @@ class TestFailureReasonTracking:
         retrieved = store.get(task.id)
         assert retrieved is not None
         assert retrieved.failure_reason == "TEST_FAILURE"
+
+    def test_get_resumable_failed_tasks_excludes_test_failure(self, tmp_path: Path):
+        """Auto-resume query includes MAX_* failures only, not TEST_FAILURE."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        resumable = store.add(prompt="Resumable task")
+        resumable.status = "failed"
+        resumable.failure_reason = "MAX_TURNS"
+        resumable.session_id = "sess-resume"
+        resumable.completed_at = datetime.now(UTC)
+        store.update(resumable)
+
+        non_resumable = store.add(prompt="Test failure task")
+        non_resumable.status = "failed"
+        non_resumable.failure_reason = "TEST_FAILURE"
+        non_resumable.session_id = "sess-test"
+        non_resumable.completed_at = datetime.now(UTC)
+        store.update(non_resumable)
+
+        resumable_ids = {task.id for task in store.get_resumable_failed_tasks()}
+        assert resumable.id in resumable_ids
+        assert non_resumable.id not in resumable_ids
 
     def test_extract_failure_reason_returns_unknown_for_missing_file(self, tmp_path: Path):
         """extract_failure_reason returns UNKNOWN when log file doesn't exist."""
@@ -3706,11 +3795,34 @@ def _run_v25_v26_v27_migrations(db_path: Path, prefix: str = "gza") -> None:
     run_v27_migration(db_path)
 
 
+def _make_v29_db_without_urgent_bumped_at(db_path: Path) -> None:
+    """Create a minimal v29 DB where tasks.urgent exists but tasks.urgent_bumped_at does not."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (29)")
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            task_type TEXT NOT NULL DEFAULT 'implement',
+            created_at TEXT NOT NULL,
+            urgent INTEGER DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
     def test_check_migration_status_on_v24_db(self, tmp_path: Path) -> None:
-        """check_migration_status on a v24 DB reports pending_manual=[25, 26, 27] and pending_auto=[28]."""
+        """check_migration_status on a v24 DB reports pending manual/auto migration chains."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
 
@@ -3718,11 +3830,11 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28]
+        assert status["pending_auto"] == [28, 29, 30]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
-        """After manual migrations, auto v28 is still pending until SqliteTaskStore runs."""
+        """After manual migrations, auto migrations remain pending until SqliteTaskStore runs."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
         _run_v25_v26_v27_migrations(db_path, "gza")
@@ -3730,10 +3842,10 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28]
+        assert status["pending_auto"] == [28, 29, 30]
         assert status["pending_manual"] == []
 
-        # Constructing SqliteTaskStore triggers auto-migration to v28
+        # Constructing SqliteTaskStore triggers remaining auto-migrations.
         SqliteTaskStore(db_path, prefix="gza")
         status_after = check_migration_status(db_path)
         assert status_after["current_version"] == SCHEMA_VERSION
@@ -4047,7 +4159,7 @@ class TestMigrationUtilityFunctions:
         conn.close()
         assert version == 27
 
-        # SqliteTaskStore auto-migrates to v28
+        # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")
 
         conn = sqlite3.connect(db_path)
@@ -4055,9 +4167,10 @@ class TestMigrationUtilityFunctions:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 28
+        assert version == SCHEMA_VERSION
         assert "attach_count" in columns
         assert "attach_duration_seconds" in columns
+        assert "urgent" in columns
 
         # store.update() should succeed
         task = store.get("gza-1")
@@ -4122,15 +4235,63 @@ class TestMigrationUtilityFunctions:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 28
+        assert version == SCHEMA_VERSION
         assert "attach_count" in columns
         assert "attach_duration_seconds" in columns
+        assert "urgent" in columns
 
         task = store.add("test missing columns")
         store.record_attach_session(task, 10.0)
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.attach_count == 1
+
+    def test_auto_migration_v29_to_v30_adds_urgent_bumped_at(self, tmp_path: Path) -> None:
+        """Opening a v29 DB should migrate to v30 and create tasks.urgent_bumped_at."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v29_db_without_urgent_bumped_at(db_path)
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 30
+        assert "urgent_bumped_at" in columns
+
+    def test_auto_migration_v30_failure_does_not_advance_schema_version(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Migration failures must not stamp schema_version forward when v30 SQL fails."""
+        import sqlite3
+
+        import gza.db as db_module
+
+        db_path = tmp_path / "test.db"
+        _make_v29_db_without_urgent_bumped_at(db_path)
+
+        broken_migrations = [
+            (version, "ALTER TABLE tasks ADD COLUMN ;" if version == 30 else sql)
+            for version, sql in db_module._MIGRATIONS
+        ]
+        monkeypatch.setattr(db_module, "_MIGRATIONS", broken_migrations)
+
+        with pytest.raises(sqlite3.OperationalError):
+            SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 29
+        assert "urgent_bumped_at" not in columns
 
     def test_run_v27_migration_drops_cycle_schema_and_preserves_task_data(self, tmp_path: Path) -> None:
         import sqlite3
@@ -4207,9 +4368,9 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28]
+        assert status["pending_auto"] == [28, 29, 30]
 
-        # SqliteTaskStore auto-migrates to v28
+        # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")
         child = store.get("gza-2")
         assert child is not None

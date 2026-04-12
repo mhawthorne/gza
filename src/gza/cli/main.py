@@ -73,6 +73,7 @@ from .query import (
     cmd_status,
     cmd_unmerged,
 )
+from .watch import cmd_queue, cmd_watch
 
 
 def main() -> int:
@@ -331,6 +332,64 @@ def main() -> int:
             "0 disables auto-squash. Default: from gza.yaml."
         ),
     )
+
+    # watch command
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Continuously maintain a target number of running workers",
+    )
+    add_common_args(watch_parser)
+    watch_parser.add_argument(
+        "--batch",
+        type=int,
+        metavar="N",
+        help="Target number of concurrent workers to maintain (default: watch.batch or 5)",
+    )
+    watch_parser.add_argument(
+        "--poll",
+        type=int,
+        metavar="SECS",
+        help="Polling interval in seconds (default: watch.poll or 300)",
+    )
+    watch_parser.add_argument(
+        "--max-idle",
+        type=int,
+        metavar="SECS",
+        dest="max_idle",
+        help="Exit after SECS of consecutive idle cycles (default: watch.max_idle)",
+    )
+    watch_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        metavar="N",
+        dest="max_iterations",
+        help="Max iterate review/improve loops for implement tasks (default: watch.max_iterations or 10)",
+    )
+    watch_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show what each cycle would do without executing",
+    )
+    watch_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Write events to .gza/watch.log only",
+    )
+
+    # queue command
+    queue_parser = subparsers.add_parser(
+        "queue",
+        help="List runnable pending tasks in pickup order and manage urgent bump flags",
+    )
+    add_common_args(queue_parser)
+    queue_subparsers = queue_parser.add_subparsers(dest="queue_action")
+    queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the front of the urgent queue lane")
+    queue_bump.add_argument("task_id", type=str, help="Full prefixed task ID to bump")
+    add_common_args(queue_bump)
+    queue_unbump = queue_subparsers.add_parser("unbump", help="Move a pending task back to the normal queue lane")
+    queue_unbump.add_argument("task_id", type=str, help="Full prefixed task ID to unbump")
+    add_common_args(queue_unbump)
 
     # refresh command
     refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
@@ -779,6 +838,11 @@ def main() -> int:
         "--prompt-file",
         metavar="FILE",
         help="Read prompt from file (for non-interactive use)",
+    )
+    add_parser.add_argument(
+        "--next",
+        action="store_true",
+        help="Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump)",
     )
     add_parser.add_argument(
         "--model",
@@ -1514,6 +1578,10 @@ def main() -> int:
             return cmd_unmerged(args)
         elif args.command == "advance":
             return cmd_advance(args)
+        elif args.command == "watch":
+            return cmd_watch(args)
+        elif args.command == "queue":
+            return cmd_queue(args)
         elif args.command == "refresh":
             return cmd_refresh(args)
         elif args.command == "merge":

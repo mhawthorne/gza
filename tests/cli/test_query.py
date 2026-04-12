@@ -811,6 +811,151 @@ class TestNextCommand:
         assert "<full-task-id>" in result.stdout
 
 
+class TestQueueCommand:
+    """Tests for `gza queue` ordering and urgent-lane controls."""
+
+    def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        normal_1 = store.add("Normal 1")
+        normal_2 = store.add("Normal 2")
+        urgent = store.add("Urgent")
+        assert urgent.id is not None
+        store.set_urgent(urgent.id, True)
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert any("Urgent" in line and "[urgent]" in line for line in lines)
+        assert any("Normal 1" in line and "[normal]" in line for line in lines)
+        assert any("Normal 2" in line and "[normal]" in line for line in lines)
+        urgent_line = next(i for i, line in enumerate(lines) if "Urgent" in line)
+        normal_1_line = next(i for i, line in enumerate(lines) if "Normal 1" in line)
+        normal_2_line = next(i for i, line in enumerate(lines) if "Normal 2" in line)
+        assert urgent_line < normal_1_line < normal_2_line
+        assert str(normal_1.id) in lines[normal_1_line]
+        assert str(normal_2.id) in lines[normal_2_line]
+
+    def test_queue_bump_and_unbump(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Need soon")
+        assert task.id is not None
+        assert task.urgent is False
+
+        bump = run_gza("queue", "bump", task.id, "--project", str(tmp_path))
+        assert bump.returncode == 0
+        assert "Bumped task" in bump.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.urgent is True
+
+        unbump = run_gza("queue", "unbump", task.id, "--project", str(tmp_path))
+        assert unbump.returncode == 0
+        assert "Removed task" in unbump.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.urgent is False
+
+    def test_queue_bump_rejects_internal_pending_task(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        internal = store.add("Internal pending", task_type="internal")
+        assert internal.id is not None
+
+        result = run_gza("queue", "bump", internal.id, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "is internal and not part of the runnable queue" in result.stdout
+
+    def test_queue_bump_blocked_pending_task_clarifies_non_runnable_status(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        blocker = store.add("Blocking task")
+        blocked = store.add("Blocked pending", depends_on=blocker.id)
+        assert blocked.id is not None
+
+        result = run_gza("queue", "bump", blocked.id, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "not currently runnable" in result.stdout
+        refreshed = store.get(blocked.id)
+        assert refreshed is not None
+        assert refreshed.urgent is True
+
+    def test_queue_bump_moves_task_to_front_of_urgent_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        older_urgent = store.add("Older urgent", urgent=True)
+        newer_urgent = store.add("Newer urgent", urgent=True)
+        bumped = store.add("Bumped now")
+        assert older_urgent.id is not None
+        assert newer_urgent.id is not None
+        assert bumped.id is not None
+
+        bump = run_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
+        assert bump.returncode == 0
+
+        queue = run_gza("queue", "--project", str(tmp_path))
+        assert queue.returncode == 0
+        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
+        older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
+        newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
+        assert bumped_line < older_line < newer_line
+
+    def test_next_shows_bumped_task_first(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Older urgent", urgent=True)
+        store.add("Newer urgent", urgent=True)
+        bumped = store.add("Bumped now")
+        assert bumped.id is not None
+        run_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
+
+        result = run_gza("next", "--project", str(tmp_path))
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
+        older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
+        newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
+        assert bumped_line < older_line < newer_line
+
+    def test_queue_excludes_non_pickable_internal_and_blocked_pending_tasks(self, tmp_path: Path):
+        """Queue pickup order output should only include runnable pending tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        runnable = store.add("Runnable")
+        assert runnable.id is not None
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Dependency blocker")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Runnable" in result.stdout
+        assert "Internal pending" not in result.stdout
+        assert "Blocked pending" not in result.stdout
+
+    def test_queue_shows_no_runnable_tasks_when_only_non_pickable_pending_exist(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Internal blocker", task_type="internal")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No runnable tasks" in result.stdout
+
+
 class TestShowCommand:
     """Tests for 'gza show' command."""
 
@@ -975,6 +1120,24 @@ class TestShowCommand:
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout
         assert "AssertionError" in result.stdout
+
+    def test_show_failed_test_failure_excludes_resume_next_step(self, tmp_path: Path):
+        """TEST_FAILURE guidance should not advertise gza resume."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Failed verification")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "TEST_FAILURE"
+        task.session_id = "sess-test-failure"
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"gza retry {task.id}" in result.stdout
+        assert f"gza resume {task.id}" not in result.stdout
 
     def test_show_failed_task_prerequisite_unmerged_next_steps(self, tmp_path: Path):
         """PREREQUISITE_UNMERGED should show merge+retry guidance."""
@@ -3494,6 +3657,29 @@ class TestNextCommandWithDependencies:
         assert result.returncode == 0
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
+
+    def test_next_excludes_internal_and_only_shows_blocked_via_blocked_path(self, tmp_path: Path):
+        """Internal pending tasks should not appear in runnable or blocked output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Dependency blocker")
+        store.add("Blocked task", depends_on=blocker.id)
+        store.add("Internal pending", task_type="internal")
+        store.add("Runnable task")
+
+        result = run_gza("next", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Runnable task" in result.stdout
+        assert "Internal pending" not in result.stdout
+        assert "Blocked task" not in result.stdout
+        assert "blocked by dependencies" in result.stdout
+
+        result_all = run_gza("next", "--all", "--project", str(tmp_path))
+        assert result_all.returncode == 0
+        assert "Runnable task" in result_all.stdout
+        assert "Blocked task" in result_all.stdout
+        assert "Internal pending" not in result_all.stdout
 
 
 class TestKillCommand:

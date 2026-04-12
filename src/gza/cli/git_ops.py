@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -29,8 +30,14 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask
+from ..failure_policy import is_resumable_failure_reason
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from ..github import GitHub, GitHubError
+from ..pickup import (
+    count_worker_consuming_actions,
+    get_runnable_pending_tasks,
+    is_worker_consuming_advance_action,
+)
 from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task, load_dotenv
 from ._common import (
@@ -48,6 +55,39 @@ from ._common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_advance_completed_tasks(
+    store: SqliteTaskStore,
+    *,
+    advance_type: str | None = None,
+) -> tuple[list[DbTask], set[str]]:
+    """Collect completed tasks eligible for advance-style action planning.
+
+    Returns completed unmerged tasks and also completed plan tasks without
+    implement children (except when filtering to implement-only mode).
+    """
+    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
+
+    all_unmerged = store.get_unmerged()
+    tasks = [t for t in all_unmerged if t.status == 'completed']
+
+    if advance_type != 'implement':
+        completed_plans = store.get_history(limit=None, status='completed', task_type='plan')
+        existing_ids = {t.id for t in tasks}
+        for plan_task in completed_plans:
+            if plan_task.id in impl_based_on_ids:
+                continue
+            if plan_task.id in existing_ids:
+                continue
+            tasks.append(plan_task)
+
+    if advance_type == 'plan':
+        tasks = [t for t in tasks if t.task_type == 'plan']
+    elif advance_type == 'implement':
+        tasks = [t for t in tasks if t.task_type == 'implement']
+
+    return tasks, impl_based_on_ids
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -111,6 +151,39 @@ def _require_default_branch(git: Git, current_branch: str, command: str) -> bool
         )
         return False
     return True
+
+
+def _auto_squash_commit_count(
+    config: Config,
+    git: Git,
+    task: DbTask,
+    target_branch: str,
+) -> int | None:
+    """Return commit count when task should auto-squash, otherwise None."""
+    if config.merge_squash_threshold <= 0 or not task.branch:
+        return None
+    commit_count = git.count_commits_ahead(task.branch, target_branch)
+    if commit_count < config.merge_squash_threshold:
+        return None
+    return commit_count
+
+
+def _build_auto_merge_args(
+    config: Config,
+    git: Git,
+    task: DbTask,
+    target_branch: str,
+) -> argparse.Namespace:
+    """Build merge args with auto-squash behavior aligned across entrypoints."""
+    should_squash = _auto_squash_commit_count(config, git, task, target_branch) is not None
+    return argparse.Namespace(
+        rebase=False,
+        squash=should_squash,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
 
 
 def _merge_single_task(
@@ -1392,6 +1465,38 @@ def _cmd_advance_unimplemented(
 _ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
 
 
+@dataclass
+class _CreateReviewActionResult:
+    status: str
+    review_task: DbTask | None
+    message: str
+
+
+def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _CreateReviewActionResult:
+    """Create or resolve the review task for an advance-style create_review action."""
+    try:
+        review_task = _create_review_task(store, task)
+    except DuplicateReviewError as exc:
+        review_task = exc.active_review
+        return _CreateReviewActionResult(
+            status="skip",
+            review_task=review_task,
+            message=f"SKIP: review {review_task.id} is already {review_task.status}",
+        )
+    except ValueError as exc:
+        return _CreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message=f"SKIP: {exc}",
+        )
+
+    return _CreateReviewActionResult(
+        status="created",
+        review_task=review_task,
+        message=f"✓ Created review task {review_task.id}",
+    )
+
+
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
     ac = _colors.ADVANCE_COLORS
@@ -1483,7 +1588,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if task.status == 'failed':
             # Allow a specific failed task if it's resumable
             is_resumable = (
-                task.failure_reason in ('MAX_STEPS', 'MAX_TURNS')
+                is_resumable_failure_reason(task.failure_reason)
                 and task.session_id is not None
                 and not no_resume_failed
             )
@@ -1502,33 +1607,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
             tasks = [task]
             failed_tasks = []
     else:
-        # Get all unmerged completed tasks
-        all_unmerged = store.get_unmerged()
-        tasks = [t for t in all_unmerged if t.status == 'completed']
+        tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, advance_type=advance_type)
         # Also collect resumable failed tasks (unless disabled)
         failed_tasks = [] if no_resume_failed else store.get_resumable_failed_tasks()
 
-        # Also fetch completed plans that have no implement child yet.
-        # These are invisible to get_unmerged() (no branch/merge_status)
-        # but can be auto-advanced by creating implement tasks.
-        if advance_type != 'implement':
-            completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
-            pending_plans = [
-                p for p in completed_plans
-                if p.id not in impl_based_on_ids
-            ]
-            # Avoid duplicates: only add plans not already in the unmerged list
-            existing_ids = {t.id for t in tasks}
-            for p in pending_plans:
-                if p.id not in existing_ids:
-                    tasks.append(p)
-
-        # Apply --type filter
+        # Apply failed-task filters after completed-task type filtering above.
         if advance_type == 'plan':
-            tasks = [t for t in tasks if t.task_type == 'plan']
             failed_tasks = []  # plans don't have failed/resume logic
         elif advance_type == 'implement':
-            tasks = [t for t in tasks if t.task_type == 'implement']
             failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
 
     if not tasks and not failed_tasks and not new_mode:
@@ -1607,19 +1693,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
-            if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
-                commit_count = git.count_commits_ahead(task.branch, target_branch)
-                if commit_count >= config.merge_squash_threshold:
+            if action['type'] == 'merge':
+                commit_count = _auto_squash_commit_count(config, git, task, target_branch)
+                if commit_count is not None:
                     description = f"{description} (auto-squash, {commit_count} commits)"
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {description}[/{_color}]")
             print()
         if new_mode and batch_limit is not None:
-            worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'})
-            planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+            planned_workers = count_worker_consuming_actions([action for _, action in plan])
             remaining = max(0, batch_limit - planned_workers)
             if remaining > 0:
-                pending_tasks = store.get_pending(limit=remaining)
+                pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
                 if pending_tasks:
                     print(f"Would start {len(pending_tasks)} new pending task(s):\n")
                     for pt in pending_tasks:
@@ -1644,11 +1729,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     new_pending_tasks: list = []
     if new_mode and batch_limit is not None:
-        worker_action_types = frozenset({'run_review', 'run_improve', 'create_review', 'improve', 'resume'})
-        planned_workers = sum(1 for _, a in plan if a['type'] in worker_action_types)
+        planned_workers = count_worker_consuming_actions([action for _, action in plan])
         remaining = max(0, batch_limit - planned_workers)
         if remaining > 0:
-            new_pending_tasks = store.get_pending(limit=remaining)
+            new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
             if new_pending_tasks:
                 print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
                 for pt in new_pending_tasks:
@@ -1698,7 +1782,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
-        if action_type in ('needs_rebase', 'run_review', 'run_improve', 'create_review', 'create_implement', 'improve', 'resume'):
+        if is_worker_consuming_advance_action(action_type):
             if batch_limit is not None and workers_started >= batch_limit:
                 console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
@@ -1711,21 +1795,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
         if action_type == 'merge':
-            # Determine whether to auto-squash based on commit count and threshold
-            should_squash = False
-            if config.merge_squash_threshold > 0 and task.branch:
-                commit_count = git.count_commits_ahead(task.branch, target_branch)
-                if commit_count >= config.merge_squash_threshold:
-                    should_squash = True
-            # Build a minimal args namespace for _merge_single_task
-            merge_args = argparse.Namespace(
-                rebase=False,
-                squash=should_squash,
-                delete=False,
-                mark_only=False,
-                remote=False,
-                resolve=False,
-            )
+            merge_args = _build_auto_merge_args(config, git, task, target_branch)
             rc = _merge_single_task(task.id, config, store, git, merge_args, target_branch)
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
@@ -1775,18 +1845,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     error_count += 1
 
         elif action_type == 'create_review':
-            try:
-                review_task = _create_review_task(store, task)
-            except DuplicateReviewError as e:
-                review_task = e.active_review
-                console.print(f"      [{_c_warn}]SKIP: review {review_task.id} is already {review_task.status}[/{_c_warn}]")
+            create_result = _prepare_create_review_action(store, task)
+            if create_result.status == "skip":
+                console.print(f"      [{_c_warn}]{create_result.message}[/{_c_warn}]")
                 skip_count += 1
                 continue
-            except ValueError as e:
-                console.print(f"      [{_c_warn}]SKIP: {e}[/{_c_warn}]")
-                skip_count += 1
-                continue
-            console.print(f"      [{_c_ok}]✓ Created review task {review_task.id}[/{_c_ok}]")
+            review_task = create_result.review_task
+            assert review_task is not None
+            console.print(f"      [{_c_ok}]{create_result.message}[/{_c_ok}]")
 
             # Spawn background worker to run the review
             assert review_task.id is not None
@@ -1923,7 +1989,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # was shown), fetch now.
         if not new_pending_tasks:
             remaining = batch_limit - workers_started
-            new_pending_tasks = store.get_pending(limit=remaining)
+            new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
         for pt in new_pending_tasks:
             if workers_started >= batch_limit:
                 break

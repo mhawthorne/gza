@@ -36,6 +36,7 @@ from ._common import (
     get_store,
     get_task_step_count,
     resolve_id,
+    set_task_urgency,
 )
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
@@ -318,6 +319,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
     skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
+    mark_next = bool(getattr(args, "next", False))
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -378,6 +380,9 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
+        if mark_next:
+            assert task.id is not None
+            set_task_urgency(store, task.id, urgent=True)
         print(f"✓ Added task {task.id}")
         return 0
 
@@ -399,6 +404,9 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         if not new_task:
             return 1
+        if mark_next:
+            assert new_task.id is not None
+            set_task_urgency(store, new_task.id, urgent=True)
         print(f"✓ Added task {new_task.id}")
         return 0
     else:
@@ -417,6 +425,9 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
+        if mark_next:
+            assert task.id is not None
+            set_task_urgency(store, task.id, urgent=True)
         print(f"✓ Added task {task.id}")
         return 0
 
@@ -978,6 +989,8 @@ def _spawn_background_iterate(
     args: argparse.Namespace,
     config: Config,
     impl_task: DbTask,
+    *,
+    quiet: bool = False,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     from ._common import _spawn_detached_worker_process
@@ -1012,11 +1025,12 @@ def _spawn_background_iterate(
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
-        print(f"Started iterate worker {worker_id} (PID {proc.pid})")
-        print(f"  Task: {impl_task.id}")
-        print()
-        print("Use 'gza ps' to view running workers")
-        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+        if not quiet:
+            print(f"Started iterate worker {worker_id} (PID {proc.pid})")
+            print(f"  Task: {impl_task.id}")
+            print()
+            print("Use 'gza ps' to view running workers")
+            print(f"Use 'gza log -w {worker_id} -f' to follow output")
         return 0
     except Exception as e:
         print(f"Error spawning background iterate worker: {e}")

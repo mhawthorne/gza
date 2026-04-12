@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
+from .failure_policy import is_resumable_failure_reason, resumable_failure_reasons
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -193,6 +195,7 @@ class Task:
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
+    urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
@@ -255,12 +258,57 @@ ALTER TABLE tasks ADD COLUMN attach_count INTEGER;
 ALTER TABLE tasks ADD COLUMN attach_duration_seconds REAL;
 """
 
+# Migration from v28 to v29: add queue urgency flag
+MIGRATION_V28_TO_V29 = """
+ALTER TABLE tasks ADD COLUMN urgent INTEGER DEFAULT 0;
+"""
+
+# Migration from v29 to v30: record bump time so "queue bump" can move to front
+MIGRATION_V29_TO_V30 = """
+ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 30
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
 _MANUAL_MIGRATION_VERSIONS: frozenset[int] = frozenset({25, 26, 27})
+
+
+def _is_ignorable_migration_operational_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True when an auto-migration OperationalError is a safe duplicate artifact case."""
+    message = str(exc).lower()
+    return "duplicate column name" in message or "already exists" in message
+
+
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Check whether a table contains a specific column."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.OperationalError:
+        return False
+    def _column_name(row: sqlite3.Row | tuple[Any, ...]) -> str:
+        if isinstance(row, sqlite3.Row):
+            return str(row["name"])
+        return str(row[1])
+
+    return any(_column_name(row) == column for row in rows)
+
+
+def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: int) -> None:
+    """Validate required schema artifacts for selected automatic migration targets."""
+    required_columns_by_version: dict[int, tuple[str, str]] = {
+        30: ("tasks", "urgent_bumped_at"),
+    }
+    requirement = required_columns_by_version.get(target_version)
+    if requirement is None:
+        return
+    table, column = requirement
+    if not _table_has_column(conn, table, column):
+        raise RuntimeError(
+            f"Auto-migration to v{target_version} incomplete: missing required column {table}.{column}"
+        )
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -309,6 +357,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
+    urgent INTEGER DEFAULT 0,
+    urgent_bumped_at TEXT,
     input_tokens INTEGER,
     output_tokens INTEGER,
     merge_status TEXT,
@@ -645,6 +695,8 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (26, None),  # Manual migration: base36-text IDs → decimal-text IDs
     (27, None),  # Manual migration: remove TaskCycle bookkeeping tables/columns
     (28, MIGRATION_V27_TO_V28),
+    (29, MIGRATION_V28_TO_V29),
+    (30, MIGRATION_V29_TO_V30),
 ]
 
 
@@ -704,9 +756,12 @@ class SqliteTaskStore:
                                 if stmt:
                                     try:
                                         conn.execute(stmt)
-                                    except sqlite3.OperationalError:
-                                        # Column/table/index might already exist
-                                        pass
+                                    except sqlite3.OperationalError as exc:
+                                        if _is_ignorable_migration_operational_error(exc):
+                                            # Duplicate artifact from partially-applied/idempotent migration.
+                                            continue
+                                        raise
+                        _validate_auto_migration_target(conn, target_version)
                         conn.execute("UPDATE schema_version SET version = ?", (target_version,))
                         current_version = target_version
 
@@ -769,6 +824,7 @@ class SqliteTaskStore:
             model=row["model"] if "model" in keys else None,
             provider=row["provider"] if "provider" in keys else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
+            urgent=bool(row["urgent"]) if "urgent" in keys and row["urgent"] is not None else False,
             merge_status=row["merge_status"] if "merge_status" in keys else None,
             merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in keys and row["merged_at"] else None,
             failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
@@ -862,6 +918,7 @@ class SqliteTaskStore:
         model: str | None = None,
         provider: str | None = None,
         provider_is_explicit: bool | None = None,
+        urgent: bool = False,
         skip_learnings: bool = False,
     ) -> Task:
         """Add a new task. Returns the created Task with its generated string ID."""
@@ -872,10 +929,27 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (new_id, prompt, task_type, based_on, now, group, depends_on, spec, 1 if create_review else 0, 1 if same_branch else 0, task_type_hint, model, provider, 1 if provider_is_explicit else 0, 1 if skip_learnings else 0),
+                (
+                    new_id,
+                    prompt,
+                    task_type,
+                    based_on,
+                    now,
+                    group,
+                    depends_on,
+                    spec,
+                    1 if create_review else 0,
+                    1 if same_branch else 0,
+                    task_type_hint,
+                    model,
+                    provider,
+                    1 if provider_is_explicit else 0,
+                    1 if urgent else 0,
+                    1 if skip_learnings else 0,
+                ),
             )
             result = self.get(new_id)
             assert result is not None
@@ -974,6 +1048,7 @@ class SqliteTaskStore:
                     model = ?,
                     provider = ?,
                     provider_is_explicit = ?,
+                    urgent = ?,
                     merge_status = ?,
                     merged_at = ?,
                     failure_reason = ?,
@@ -1019,6 +1094,7 @@ class SqliteTaskStore:
                     task.model,
                     task.provider,
                     1 if task.provider_is_explicit else 0,
+                    1 if task.urgent else 0,
                     task.merge_status,
                     task.merged_at.isoformat() if task.merged_at else None,
                     task.failure_reason,
@@ -1047,9 +1123,18 @@ class SqliteTaskStore:
         dependency is failed but a completed retry exists anywhere in the
         based_on chain.
         """
+        pending = self.get_pending_pickup(limit=1)
+        return pending[0] if pending else None
+
+    def get_pending_pickup(self, limit: int | None = None) -> list[Task]:
+        """Get runnable pending tasks in pickup order.
+
+        Pickup semantics match default worker selection: excludes internal and
+        dependency-blocked tasks. Ordering is urgent-first, with recently bumped
+        urgent tasks at the front, then FIFO by creation time.
+        """
         with self._connect() as conn:
-            cur = conn.execute(
-                """
+            query = """
                 WITH RECURSIVE successful_ancestors(id) AS (
                     SELECT id FROM tasks WHERE status = 'completed'
                     UNION ALL
@@ -1064,12 +1149,17 @@ class SqliteTaskStore:
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
-                ORDER BY t.created_at ASC
-                LIMIT 1
+                ORDER BY
+                    t.urgent DESC,
+                    COALESCE(t.urgent_bumped_at, '') DESC,
+                    t.created_at ASC
                 """
-            )
-            row = cur.fetchone()
-            return self._row_to_task(row) if row else None
+            params: tuple[int, ...] | tuple[()] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (limit,)
+            cur = conn.execute(query, params)
+            return [self._row_to_task(row) for row in cur.fetchall()]
 
     def try_mark_in_progress(self, task_id: str, pid: int) -> Task | None:
         """Compare-and-swap pending -> in_progress for a specific task.
@@ -1105,11 +1195,27 @@ class SqliteTaskStore:
     def get_pending(self, limit: int | None = None) -> list[Task]:
         """Get all pending tasks."""
         with self._connect() as conn:
-            query = "SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at ASC"
+            query = "SELECT * FROM tasks WHERE status = 'pending' ORDER BY urgent DESC, created_at ASC"
+            params: tuple[int, ...] | tuple[()] = ()
             if limit is not None:
-                query += f" LIMIT {limit}"
-            cur = conn.execute(query)
+                query += " LIMIT ?"
+                params = (limit,)
+            cur = conn.execute(query, params)
             return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def set_urgent(self, task_id: str, urgent: bool) -> bool:
+        """Set or clear a task's urgent queue flag.
+
+        Setting urgent=True records a bump timestamp so the task moves to the
+        front of the urgent pickup lane.
+        """
+        bumped_at = datetime.now(UTC).isoformat() if urgent else None
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET urgent = ?, urgent_bumped_at = ? WHERE id = ?",
+                (1 if urgent else 0, bumped_at, task_id),
+            )
+            return cur.rowcount > 0
 
     def get_in_progress(self) -> list[Task]:
         """Get all in-progress tasks, oldest first."""
@@ -1230,18 +1336,21 @@ class SqliteTaskStore:
 
         A task is resumable if:
         - status = 'failed'
-        - failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')
+        - failure_reason is in the shared resumable failure policy
         - session_id IS NOT NULL
         """
+        reasons = tuple(resumable_failure_reasons())
+        placeholders = ", ".join("?" for _ in reasons)
         with self._connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 SELECT * FROM tasks
                 WHERE status = 'failed'
-                AND failure_reason IN ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE')
+                AND failure_reason IN ({placeholders})
                 AND session_id IS NOT NULL
                 ORDER BY completed_at DESC, created_at DESC
-                """
+                """,
+                reasons,
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
@@ -1249,7 +1358,7 @@ class SqliteTaskStore:
         """Count consecutive failed ancestors with resumable failure reasons.
 
         Walks the based_on chain upward from task_id's parent, counting how many
-        consecutive failed ancestors have failure_reason in ('MAX_STEPS', 'MAX_TURNS', 'TEST_FAILURE').
+        consecutive failed ancestors have a failure_reason in the shared resumable policy.
         This tells us how many times we've already tried resuming (not counting task_id itself).
 
         Examples:
@@ -1283,7 +1392,7 @@ class SqliteTaskStore:
                 if row is None:
                     break
                 based_on, status, failure_reason = row["based_on"], row["status"], row["failure_reason"]
-                if status == "failed" and failure_reason in ("MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"):
+                if status == "failed" and is_resumable_failure_reason(failure_reason):
                     depth += 1
                     current_id = based_on
                 else:

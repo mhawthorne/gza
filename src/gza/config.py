@@ -59,6 +59,10 @@ DEFAULT_ADVANCE_CREATE_REVIEWS = True
 DEFAULT_ADVANCE_REQUIRES_REVIEW = True
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
+DEFAULT_WATCH_BATCH = 5
+DEFAULT_WATCH_POLL = 300
+DEFAULT_WATCH_MAX_IDLE: int | None = None
+DEFAULT_WATCH_MAX_ITERATIONS = 10
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_CLEANUP_DAYS = 30
@@ -122,6 +126,12 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "verify_command": None,
     "max_resume_attempts": None,
     "max_review_cycles": None,
+    "watch": {
+        "batch": None,
+        "poll": None,
+        "max_idle": None,
+        "max_iterations": None,
+    },
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
     "cleanup_days": None,
@@ -267,6 +277,15 @@ class TmuxConfig:
 
 
 @dataclass
+class WatchConfig:
+    """Configuration for the `gza watch` loop."""
+    batch: int = DEFAULT_WATCH_BATCH
+    poll: int = DEFAULT_WATCH_POLL
+    max_idle: int | None = DEFAULT_WATCH_MAX_IDLE
+    max_iterations: int = DEFAULT_WATCH_MAX_ITERATIONS
+
+
+@dataclass
 class BranchStrategy:
     """Configuration for branch naming strategy."""
     pattern: str
@@ -331,6 +350,7 @@ class Config:
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
+    watch: WatchConfig = field(default_factory=WatchConfig)
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
@@ -546,6 +566,7 @@ class Config:
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
+            "watch",
             "interactive_worktree_dir",
             "merge_squash_threshold",
             "cleanup_days",
@@ -925,6 +946,44 @@ class Config:
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
         max_review_cycles = int(data.get("max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES))
         max_resume_attempts = int(data.get("max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS))
+        watch_data = data.get("watch") or {}
+        if not isinstance(watch_data, dict):
+            raise ConfigError("'watch' must be a dictionary")
+        try:
+            watch_batch = int(watch_data.get("batch", DEFAULT_WATCH_BATCH))
+        except (TypeError, ValueError):
+            raise ConfigError("watch.batch must be a positive integer")
+        if watch_batch < 1:
+            raise ConfigError("watch.batch must be a positive integer")
+        try:
+            watch_poll = int(watch_data.get("poll", DEFAULT_WATCH_POLL))
+        except (TypeError, ValueError):
+            raise ConfigError("watch.poll must be a positive integer")
+        if watch_poll < 1:
+            raise ConfigError("watch.poll must be a positive integer")
+        watch_max_idle_raw = watch_data.get("max_idle", DEFAULT_WATCH_MAX_IDLE)
+        if watch_max_idle_raw is None:
+            watch_max_idle = None
+        else:
+            try:
+                watch_max_idle = int(watch_max_idle_raw)
+            except (TypeError, ValueError):
+                raise ConfigError("watch.max_idle must be null or a positive integer")
+            if watch_max_idle < 1:
+                raise ConfigError("watch.max_idle must be null or a positive integer")
+        try:
+            watch_max_iterations = int(watch_data.get("max_iterations", DEFAULT_WATCH_MAX_ITERATIONS))
+        except (TypeError, ValueError):
+            raise ConfigError("watch.max_iterations must be a positive integer")
+        if watch_max_iterations < 1:
+            raise ConfigError("watch.max_iterations must be a positive integer")
+
+        watch_config = WatchConfig(
+            batch=watch_batch,
+            poll=watch_poll,
+            max_idle=watch_max_idle,
+            max_iterations=watch_max_iterations,
+        )
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
 
         try:
@@ -1098,6 +1157,7 @@ class Config:
             advance_requires_review=advance_requires_review,
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
+            watch=watch_config,
             interactive_worktree_dir=interactive_worktree_dir,
             merge_squash_threshold=merge_squash_threshold,
             cleanup_days=cleanup_days,
@@ -1159,6 +1219,7 @@ class Config:
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
+            "watch",
             "interactive_worktree_dir",
             "merge_squash_threshold",
             "cleanup_days",
@@ -1256,6 +1317,24 @@ class Config:
                 isinstance(data.get("defaults"), dict) and "max_steps" in data["defaults"]
             ):
                 warnings.append("'max_turns' is deprecated; use 'max_steps'.")
+
+        if "watch" in data:
+            watch_data = data["watch"]
+            if not isinstance(watch_data, dict):
+                errors.append("'watch' must be a dictionary")
+            else:
+                if "batch" in watch_data:
+                    if not isinstance(watch_data["batch"], int) or watch_data["batch"] < 1:
+                        errors.append("watch.batch must be a positive integer")
+                if "poll" in watch_data:
+                    if not isinstance(watch_data["poll"], int) or watch_data["poll"] < 1:
+                        errors.append("watch.poll must be a positive integer")
+                if "max_idle" in watch_data and watch_data["max_idle"] is not None:
+                    if not isinstance(watch_data["max_idle"], int) or watch_data["max_idle"] < 1:
+                        errors.append("watch.max_idle must be null or a positive integer")
+                if "max_iterations" in watch_data:
+                    if not isinstance(watch_data["max_iterations"], int) or watch_data["max_iterations"] < 1:
+                        errors.append("watch.max_iterations must be a positive integer")
 
         if "claude_args" in data:
             warnings.append("'claude_args' is deprecated. Migrate to 'claude.args'.")
