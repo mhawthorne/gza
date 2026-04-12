@@ -385,6 +385,70 @@ class TestCmdAttach:
         assert recovery_args.no_docker is True
         assert recovery_args.max_turns == 77
 
+    def test_cmd_attach_claude_marks_failed_when_session_and_recovery_both_fail(self, tmp_path: Path, monkeypatch):
+        """If post-stop session create fails AND recovery also fails, task must end in failed/WORKER_DIED with a handoff log."""
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task_id = task.id
+        log_rel = task.log_file
+        log_path = tmp_path / log_rel
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        call_state = {"new_session_calls": 0}
+
+        def fake_tmux_run(cmd, **kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                call_state["new_session_calls"] += 1
+                if call_state["new_session_calls"] == 1:
+                    return MagicMock(returncode=0, stderr="")
+                return MagicMock(returncode=1, stderr="create failed")
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
+             patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
+             patch("gza.cli.query.os.kill", side_effect=fake_kill), \
+             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(False, None)), \
+             patch("gza.cli.query._spawn_background_worker", return_value=1) as mock_spawn_bg:
+            from gza.cli.query import cmd_attach
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert call_state["new_session_calls"] == 2
+        mock_spawn_bg.assert_called_once()
+
+        refreshed = make_store(tmp_path).get(task_id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+
+        import json as _json
+        events = [
+            _json.loads(line)
+            for line in log_path.read_text().splitlines()
+            if line.strip()
+        ]
+        handoff_events = [
+            e for e in events
+            if e.get("subtype") == "worker_lifecycle" and e.get("event") == "handoff_failed"
+        ]
+        assert handoff_events, "expected handoff_failed lifecycle event"
+        assert handoff_events[-1]["reason"] == "WORKER_DIED"
+        assert handoff_events[-1]["recovery_exit_code"] == 1
+
     def test_cmd_attach_claude_aborts_if_worker_still_alive_after_escalation(self, tmp_path: Path, monkeypatch):
         """Attach must fail safely if worker remains alive after SIGTERM/SIGKILL escalation."""
         from gza.workers import WorkerRegistry

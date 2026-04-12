@@ -1835,7 +1835,8 @@ def cmd_attach(args: argparse.Namespace) -> int:
         text=True,
     )
     if create_result.returncode != 0:
-        print(f"Error: failed to create interactive tmux session: {create_result.stderr.strip()}")
+        create_stderr = create_result.stderr.strip()
+        print(f"Error: failed to create interactive tmux session: {create_stderr}")
         recovery_args = _build_resume_worker_args(
             no_docker=resume_no_docker,
             max_turns=resume_max_turns,
@@ -1848,8 +1849,32 @@ def cmd_attach(args: argparse.Namespace) -> int:
         )
         if recovery_rc == 0:
             print(f"Recovered: background worker restarted for task {task.id}.")
-        else:
-            print("Recovery failed: unable to restart the background worker.")
+            return 1
+
+        print("Recovery failed: unable to restart the background worker.")
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            branch=task.branch,
+            has_commits=bool(task.has_commits),
+            failure_reason="WORKER_DIED",
+        )
+        if log_path is not None:
+            write_log_entry(
+                log_path,
+                {
+                    "type": "gza",
+                    "subtype": "worker_lifecycle",
+                    "event": "handoff_failed",
+                    "message": (
+                        "Interactive attach handoff failed: tmux session creation "
+                        "and background recovery both failed; task marked failed."
+                    ),
+                    "reason": "WORKER_DIED",
+                    "tmux_error": create_stderr,
+                    "recovery_exit_code": recovery_rc,
+                },
+            )
         return 1
 
     if log_path is not None:

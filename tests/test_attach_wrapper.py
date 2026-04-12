@@ -12,7 +12,9 @@ from gza.db import SqliteTaskStore
 
 
 def _setup_task_with_log(project_dir: Path) -> tuple[str, Path]:
-    (project_dir / "gza.yaml").write_text("project_name: test-project\n")
+    (project_dir / "gza.yaml").write_text(
+        "project_name: test-project\nuse_docker: false\n"
+    )
     (project_dir / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
     config = Config.load(project_dir)
     store = SqliteTaskStore(project_dir / ".gza" / "gza.db", prefix=config.project_prefix)
@@ -64,8 +66,8 @@ def test_attach_wrapper_sigterm_detach_auto_resumes(tmp_path: Path) -> None:
         handlers[sig] = handler
         return None
 
-    def fake_run_interactive(_config, _session_id, *, max_turns=None):
-        del max_turns
+    def fake_run_interactive(_config, _session_id, *, max_turns=None, task=None, no_docker=False):
+        del max_turns, task, no_docker
         assert signal.SIGTERM in handlers
         handlers[signal.SIGTERM](signal.SIGTERM, None)
         return 0
@@ -197,3 +199,149 @@ def test_attach_wrapper_sigint_during_interactive_forwarded_to_child_without_det
     detach_events = [event for event in events if event.get("event") == "detach"]
     assert detach_events
     assert detach_events[-1]["reason"] == "exited_ok"
+
+
+def _setup_docker_task(project_dir: Path) -> tuple[str, Path]:
+    (project_dir / "gza.yaml").write_text(
+        "project_name: test-project\nuse_docker: true\ndocker_image: test-project-gza\n"
+    )
+    (project_dir / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
+    config = Config.load(project_dir)
+    assert config.use_docker is True
+    store = SqliteTaskStore(project_dir / ".gza" / "gza.db", prefix=config.project_prefix)
+    task = store.add("Test docker attach")
+    task.log_file = ".gza/logs/task.log"
+    store.update(task)
+    assert task.id is not None
+    return task.id, project_dir / task.log_file
+
+
+def test_attach_wrapper_docker_task_launches_via_docker(tmp_path: Path) -> None:
+    """Docker-backed Claude task must route the interactive resume through Docker, not host claude."""
+    task_id, _ = _setup_docker_task(tmp_path)
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 5555
+    fake_proc.wait.return_value = 0
+
+    docker_cmd_stub = [
+        "timeout", "60m",
+        "docker", "run", "--rm", "-it",
+        "-v", f"{tmp_path}:/workspace",
+        "-w", "/workspace",
+        "test-project-gza-claude",
+        "claude", "--resume", "sess-docker", "--max-turns", "200",
+    ]
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-docker",
+            "--project", str(tmp_path),
+        ]),
+        patch(
+            "gza.attach_wrapper._build_docker_interactive_cmd",
+            return_value=docker_cmd_stub,
+        ) as mock_build,
+        patch("gza.attach_wrapper.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_build.assert_called_once()
+    _, build_kwargs = mock_build.call_args
+    assert build_kwargs["max_turns"] is None
+    # First positional: config; second: task; third: session id.
+    build_args = mock_build.call_args[0]
+    assert build_args[2] == "sess-docker"
+
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args[0][0]
+    assert cmd is docker_cmd_stub
+    assert mock_popen.call_args.kwargs.get("cwd") is None
+
+
+def test_build_docker_interactive_cmd_uses_it_and_claude_resume(tmp_path: Path) -> None:
+    """Unit test: _build_docker_interactive_cmd builds a -it docker run + claude --resume command."""
+    from gza.attach_wrapper import _build_docker_interactive_cmd
+
+    task_id, _ = _setup_docker_task(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    task = store.get(task_id)
+    assert task is not None
+
+    with (
+        patch("gza.attach_wrapper.ensure_docker_image", return_value=True),
+        patch("gza.attach_wrapper.sync_keychain_credentials", return_value=True),
+        patch("gza.providers.base.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
+    ):
+        cmd = _build_docker_interactive_cmd(config, task, "sess-docker", max_turns=42)
+
+    assert "docker" in cmd
+    assert "run" in cmd
+    assert "-it" in cmd, f"expected -it for interactive attach, got {cmd}"
+    assert "-i" not in cmd
+    claude_idx = cmd.index("claude")
+    assert cmd[claude_idx + 1 : claude_idx + 3] == ["--resume", "sess-docker"]
+    assert "--max-turns" in cmd[claude_idx:]
+    max_turns_idx = cmd.index("--max-turns", claude_idx)
+    assert cmd[max_turns_idx + 1] == "42"
+
+
+def test_attach_wrapper_docker_task_with_no_docker_flag_uses_host(tmp_path: Path) -> None:
+    """Even when config.use_docker is True, --no-docker should preserve host execution."""
+    task_id, _ = _setup_docker_task(tmp_path)
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 5555
+    fake_proc.wait.return_value = 0
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-host",
+            "--project", str(tmp_path),
+            "--no-docker",
+        ]),
+        patch("gza.attach_wrapper.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[0] == "claude"
+    assert "docker" not in cmd
+    assert mock_popen.call_args.kwargs.get("cwd") == tmp_path
+
+
+def test_attach_wrapper_non_docker_task_uses_host(tmp_path: Path) -> None:
+    """Tasks without use_docker must continue to resume via host claude."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 5555
+    fake_proc.wait.return_value = 0
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-plain",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[0] == "claude"
+    assert "docker" not in cmd
