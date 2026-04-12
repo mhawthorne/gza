@@ -138,6 +138,47 @@ def test_watch_cycle_resumes_failed_task_before_starting_new_pending(tmp_path: P
     assert spawn_iterate.call_count == 0
 
 
+def test_watch_cycle_dry_run_reuses_existing_pending_resume_child_in_log(tmp_path: Path) -> None:
+    """Dry-run resume planning should reference an existing pending resume child."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    resume_child = store.add("Resume child", task_type="implement", based_on=failed.id)
+    assert resume_child.id is not None
+    resume_child.session_id = failed.session_id
+    store.update(resume_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    assert f"RESUME {failed.id} -> {resume_child.id}" in log_text
+    assert "(new task)" not in log_text
+
+
 def test_watch_cycle_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
     """TEST_FAILURE is excluded from watch auto-resume selection."""
     setup_config(tmp_path)

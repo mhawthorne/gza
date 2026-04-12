@@ -146,6 +146,13 @@ class GzaClient:
         -------
         IncompleteSnapshot
             Dataclass with ``.pending``, ``.in_progress``, and ``.total``.
+
+        Notes
+        -----
+        ``pending`` uses raw pending rows from storage (``store.get_pending()``),
+        including non-runnable pending tasks (for example ``internal`` or
+        dependency-blocked tasks). Use :meth:`get_pending` for runnable pickup
+        order semantics.
         """
         return IncompleteSnapshot(
             pending=self._store.get_pending(),

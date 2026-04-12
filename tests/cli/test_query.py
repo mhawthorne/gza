@@ -859,6 +859,32 @@ class TestQueueCommand:
         assert refreshed is not None
         assert refreshed.urgent is False
 
+    def test_queue_bump_rejects_internal_pending_task(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        internal = store.add("Internal pending", task_type="internal")
+        assert internal.id is not None
+
+        result = run_gza("queue", "bump", internal.id, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "is internal and not part of the runnable queue" in result.stdout
+
+    def test_queue_bump_blocked_pending_task_clarifies_non_runnable_status(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        blocker = store.add("Blocking task")
+        blocked = store.add("Blocked pending", depends_on=blocker.id)
+        assert blocked.id is not None
+
+        result = run_gza("queue", "bump", blocked.id, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "not currently runnable" in result.stdout
+        refreshed = store.get(blocked.id)
+        assert refreshed is not None
+        assert refreshed.urgent is True
+
     def test_queue_bump_moves_task_to_front_of_urgent_lane(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

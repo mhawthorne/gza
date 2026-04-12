@@ -269,6 +269,22 @@ class TestGetIncomplete:
         assert len(snap.in_progress) == 1
         assert snap.total == 3
 
+    def test_pending_snapshot_includes_non_runnable_pending_rows(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Runnable pending")
+        store.add("Internal pending", task_type="internal")
+        blocker = store.add("Blocking pending")
+        store.add("Blocked pending", depends_on=blocker.id)
+
+        client = make_client(tmp_path)
+        snap = client.get_incomplete()
+        pending_prompts = {task.prompt for task in snap.pending}
+
+        assert "Runnable pending" in pending_prompts
+        assert "Internal pending" in pending_prompts
+        assert "Blocked pending" in pending_prompts
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_pending

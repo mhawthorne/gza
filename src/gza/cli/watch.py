@@ -574,9 +574,10 @@ def _run_cycle(
                 )
                 continue
             if dry_run:
+                resume_target = str(resume_task.id) if resume_task is not None and resume_task.id is not None else "(new task)"
                 log.emit(
                     "RESUME",
-                    f"{failed.id} -> (new task) (attempt {attempt}/{config.max_resume_attempts}) [dry-run]",
+                    f"{failed.id} -> {resume_target} (attempt {attempt}/{config.max_resume_attempts}) [dry-run]",
                 )
                 slots -= 1
                 work_done = True
@@ -779,12 +780,25 @@ def cmd_queue(args: argparse.Namespace) -> int:
         if task.status != "pending":
             print(f"Error: Task {task_id} is not pending (status: {task.status})")
             return 1
+        if task.task_type == "internal":
+            print(f"Error: Task {task_id} is internal and not part of the runnable queue")
+            return 1
+
+        runnable_pending_ids = {str(pending_task.id) for pending_task in store.get_pending_pickup() if pending_task.id is not None}
+        is_currently_runnable = str(task_id) in runnable_pending_ids
+
         new_urgent = action == "bump"
         set_task_urgency(store, task_id, urgent=new_urgent)
         if new_urgent:
-            print(f"✓ Bumped task {task_id} to urgent queue")
+            if is_currently_runnable:
+                print(f"✓ Bumped task {task_id} to urgent queue")
+            else:
+                print(f"✓ Bumped task {task_id} (not currently runnable; urgency will apply once runnable)")
         else:
-            print(f"✓ Removed task {task_id} from urgent queue")
+            if is_currently_runnable:
+                print(f"✓ Removed task {task_id} from urgent queue")
+            else:
+                print(f"✓ Removed urgent flag from task {task_id} (task is not currently runnable)")
         return 0
 
     pending = store.get_pending_pickup()
