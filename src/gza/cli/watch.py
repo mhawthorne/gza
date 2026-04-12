@@ -247,6 +247,7 @@ def _run_cycle(
     slots = max(0, batch - running)
     work_done = False
     started_task_ids: set[str] = set()
+    step1_handled_child_task_ids: set[str] = set()
 
     log.emit("WAKE", f"checking... ({running} running, {slots} slots)")
 
@@ -338,6 +339,7 @@ def _run_cycle(
                     continue
                 review_task = create_result.review_task
                 assert review_task is not None
+                step1_handled_child_task_ids.add(str(review_task.id))
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                 rc = _spawn_worker_with_failure_log(
@@ -407,6 +409,7 @@ def _run_cycle(
                     same_branch=True,
                     group=task.group,
                 )
+                step1_handled_child_task_ids.add(str(improve_task.id))
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                 rc = _spawn_worker_with_failure_log(
@@ -469,6 +472,7 @@ def _run_cycle(
                     based_on=task.id,
                     group=task.group,
                 )
+                step1_handled_child_task_ids.add(str(impl_task.id))
 
                 iterate_args = argparse.Namespace(
                     max_iterations=max_iterations,
@@ -499,6 +503,7 @@ def _run_cycle(
                     work_done = True
                     continue
                 rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
+                step1_handled_child_task_ids.add(str(rebase_task.id))
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                 rc = _spawn_worker_with_failure_log(
@@ -591,6 +596,8 @@ def _run_cycle(
             if str(task.id) in started_task_ids:
                 continue
             if str(task.id) in pending_resume_task_ids:
+                continue
+            if str(task.id) in step1_handled_child_task_ids:
                 continue
             task_type = task.task_type or "implement"
             if task_type == "implement":

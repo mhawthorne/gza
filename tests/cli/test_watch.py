@@ -186,6 +186,119 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
     assert len(pending_children) == 1
 
 
+@pytest.mark.parametrize(
+    ("action_type", "child_type"),
+    [
+        ("create_review", "review"),
+        ("improve", "improve"),
+        ("create_implement", "implement"),
+        ("needs_rebase", "rebase"),
+    ],
+)
+def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3(
+    tmp_path: Path, action_type: str, child_type: str
+) -> None:
+    """Task-creating advance children should not be retried via generic pickup in same cycle."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root_type = "plan" if action_type == "create_implement" else "implement"
+    root = store.add("Root task", task_type=root_type)
+    assert root.id is not None
+    root.status = "completed"
+    root.completed_at = datetime.now(UTC)
+    if action_type != "create_implement":
+        root.branch = "feature/same-cycle-no-retry"
+    store.update(root)
+    if action_type != "create_implement":
+        store.set_merge_status(root.id, "unmerged")
+
+    review_task = None
+    if action_type == "create_review":
+        review_task = store.add("Pending review", task_type="review", depends_on=root.id)
+        assert review_task.id is not None
+
+    if action_type == "improve":
+        review_task = store.add("Completed review", task_type="review", depends_on=root.id)
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        store.update(review_task)
+
+    rebase_task = None
+    if action_type == "needs_rebase":
+        rebase_task = store.add("Pending rebase", task_type="rebase", based_on=root.id, depends_on=root.id)
+        assert rebase_task.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    action: dict[str, object] = {"type": action_type}
+    if action_type == "improve":
+        assert review_task is not None
+        action["review_task"] = review_task
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            return_value=SimpleNamespace(
+                status="created",
+                review_task=review_task,
+                message="created",
+            ),
+        ) as create_review,
+        patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=[1, 0]) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    if action_type == "create_implement":
+        assert spawn_iterate.call_count == 1
+        assert spawn_worker.call_count == 0
+        created_children = [
+            task for task in store.get_based_on_children(root.id) if task.task_type == "implement"
+        ]
+        assert len(created_children) == 1
+        child_id = str(created_children[0].id)
+    else:
+        assert spawn_worker.call_count == 1
+        if action_type == "create_review":
+            assert create_review.call_count == 1
+            assert review_task is not None
+            child_id = str(review_task.id)
+        elif action_type == "needs_rebase":
+            assert create_rebase.call_count == 1
+            assert rebase_task is not None
+            child_id = str(rebase_task.id)
+        else:
+            improved_children = [
+                task for task in store.get_based_on_children(root.id) if task.task_type == "improve"
+            ]
+            assert len(improved_children) == 1
+            child_id = str(improved_children[0].id)
+
+    log_lines = log_path.read_text().splitlines()
+    assert any("START_FAILED" in line and child_id in line for line in log_lines)
+    assert not any(f"START  {child_id} {child_type}" in line for line in log_lines)
+
+
 def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_path: Path) -> None:
     """Iterate worker plus foreground child rows must consume one slot."""
     setup_config(tmp_path)
