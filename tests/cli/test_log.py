@@ -19,6 +19,17 @@ from .conftest import LOG_FIXTURES_DIR, make_store, run_gza, setup_config
 class TestLogCommand:
     """Tests for 'gza log' command."""
 
+    def test_log_help_follow_describes_requested_target_not_resolved_run(self, tmp_path: Path):
+        """Help text should describe exact requested target behavior for --follow."""
+        setup_config(tmp_path)
+
+        result = run_gza("log", "--help", "--project", str(tmp_path))
+        help_output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "resolved task run" not in help_output
+        assert "requested task or worker is actively running" in help_output
+
     def test_log_by_task_id_single_json_format(self, tmp_path: Path):
         """Log command by task ID parses single JSON format with successful result."""
         import json
