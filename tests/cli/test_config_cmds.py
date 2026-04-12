@@ -1928,3 +1928,90 @@ class TestTmuxConfigValidation:
         assert config.tmux.max_idle_timeout == 600.0
         assert config.tmux.detach_grace == 10.0
         assert config.tmux.terminal_size == [160, 40]
+
+
+class TestWatchConfigValidation:
+    """Tests for watch config section parsing and validation."""
+
+    def _write_config(self, tmp_path: Path, extra: str) -> None:
+        (tmp_path / "gza.yaml").write_text(f"project_name: test\n{extra}")
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("batch", "bad"),
+            ("poll", "bad"),
+            ("max_idle", "bad"),
+            ("max_iterations", "bad"),
+        ],
+    )
+    def test_config_watch_invalid_type_raises(self, tmp_path: Path, field: str, value: str) -> None:
+        """Config.load raises ConfigError for non-numeric watch values."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"watch:\n  {field}: {value}\n")
+        with pytest.raises(ConfigError, match=f"watch.{field}"):
+            Config.load(tmp_path)
+
+    @pytest.mark.parametrize("field", ["batch", "poll", "max_idle", "max_iterations"])
+    def test_config_watch_invalid_bounds_raises(self, tmp_path: Path, field: str) -> None:
+        """Config.load raises ConfigError when watch values are out of bounds."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"watch:\n  {field}: 0\n")
+        with pytest.raises(ConfigError, match=f"watch.{field}"):
+            Config.load(tmp_path)
+
+    def test_config_watch_custom_values_load(self, tmp_path: Path) -> None:
+        """Config.load stores custom watch values correctly."""
+        from gza.config import Config
+
+        self._write_config(
+            tmp_path,
+            "watch:\n"
+            "  batch: 7\n"
+            "  poll: 45\n"
+            "  max_idle: 180\n"
+            "  max_iterations: 9\n",
+        )
+        config = Config.load(tmp_path)
+        assert config.watch.batch == 7
+        assert config.watch.poll == 45
+        assert config.watch.max_idle == 180
+        assert config.watch.max_iterations == 9
+
+    def test_config_watch_null_max_idle_loads(self, tmp_path: Path) -> None:
+        """Config.load accepts null max_idle."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "watch:\n  max_idle: null\n")
+        config = Config.load(tmp_path)
+        assert config.watch.max_idle is None
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("batch", "bad"),
+            ("poll", "bad"),
+            ("max_idle", "bad"),
+            ("max_iterations", "bad"),
+        ],
+    )
+    def test_validate_watch_invalid_type(self, tmp_path: Path, field: str, value: str) -> None:
+        """Config.validate flags non-integer watch values."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, f"watch:\n  {field}: {value}\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert f"watch.{field}" in "\n".join(errors)
+
+    @pytest.mark.parametrize("field", ["batch", "poll", "max_idle", "max_iterations"])
+    def test_validate_watch_invalid_bounds(self, tmp_path: Path, field: str) -> None:
+        """Config.validate flags out-of-bounds watch values."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, f"watch:\n  {field}: 0\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert f"watch.{field}" in "\n".join(errors)

@@ -137,6 +137,55 @@ def test_watch_cycle_resumes_failed_task_before_starting_new_pending(tmp_path: P
     assert spawn_iterate.call_count == 0
 
 
+def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
+    """Pending resume children must only launch via resume worker path."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=1) as spawn_resume,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result_first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+        result_second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    pending_children = [task for task in children if task.status == "pending"]
+    assert result_first.work_done is False
+    assert result_second.work_done is False
+    assert spawn_resume.call_count == 2
+    assert spawn_iterate.call_count == 0
+    assert len(children) == 1
+    assert len(pending_children) == 1
+
+
 def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_path: Path) -> None:
     """Iterate worker plus foreground child rows must consume one slot."""
     setup_config(tmp_path)
@@ -1120,6 +1169,135 @@ def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert f"START  {impl.id} implement" in log_text
     assert f"START  {plan.id} plan" in log_text
+
+
+def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Quiet mode should suppress iterate helper stdout and emit START_FAILED."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def noisy_iterate_fail(*_args, **_kwargs):
+        print("Error spawning background iterate worker: boom")
+        return 1
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=noisy_iterate_fail),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "Error spawning background iterate worker" not in stdout
+    log_text = log_path.read_text()
+    assert "START_FAILED" in log_text
+    assert f"{impl.id} implement: iterate worker spawn failed" in log_text
+
+
+def test_watch_cycle_quiet_logs_start_failed_when_worker_spawn_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Quiet mode should suppress plain worker stdout and emit START_FAILED."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Plan follow-up", task_type="plan")
+    assert plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def noisy_worker_fail(*_args, **_kwargs):
+        print("Error spawning background worker: boom")
+        return 1
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=noisy_worker_fail),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "Error spawning background worker" not in stdout
+    log_text = log_path.read_text()
+    assert "START_FAILED" in log_text
+    assert f"{plan.id} plan: worker spawn failed" in log_text
+
+
+def test_watch_cycle_quiet_logs_start_failed_when_resume_spawn_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Quiet mode should suppress resume worker stdout and emit START_FAILED."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def noisy_resume_fail(*_args, **_kwargs):
+        print("Error spawning background worker: boom")
+        return 1
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=noisy_resume_fail),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "Error spawning background worker" not in stdout
+    assert spawn_iterate.call_count == 0
+    children = store.get_based_on_children(failed.id)
+    assert len(children) == 1
+    child = children[0]
+    assert child.id is not None
+    log_text = log_path.read_text()
+    assert "START_FAILED" in log_text
+    assert f"{failed.id} -> {child.id}: resume worker spawn failed" in log_text
 
 
 def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:

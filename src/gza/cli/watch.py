@@ -206,6 +206,20 @@ def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
         return fn()
 
 
+def _spawn_worker_with_failure_log(
+    *,
+    quiet: bool,
+    log: _WatchLog,
+    failure_message: str,
+    spawn_fn: Callable[[], int],
+    dedupe_key: str,
+) -> int:
+    rc = _run_with_optional_stdout_suppressed(quiet, spawn_fn)
+    if rc != 0:
+        log.emit("START_FAILED", failure_message, dedupe_key=dedupe_key)
+    return rc
+
+
 @dataclass
 class _CycleResult:
     work_done: bool
@@ -326,7 +340,15 @@ def _run_cycle(
                 assert review_task is not None
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{review_task.id} review: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{review_task.id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args, config, task_id=review_task.id, quiet=quiet
+                    ),
+                )
                 if rc == 0:
                     log.emit("START", f"{review_task.id} review")
                     started_task_ids.add(str(review_task.id))
@@ -338,19 +360,28 @@ def _run_cycle(
                 review_task_obj = action.get("review_task")
                 if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None:
                     continue
+                review_task_id = str(review_task_obj.id)
 
                 if dry_run:
-                    log.emit("START", f"{review_task_obj.id} review [dry-run]")
-                    started_task_ids.add(str(review_task_obj.id))
+                    log.emit("START", f"{review_task_id} review [dry-run]")
+                    started_task_ids.add(review_task_id)
                     slots -= 1
                     work_done = True
                     continue
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=review_task_obj.id, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{review_task_id} review: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{review_task_id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args, config, task_id=review_task_id, quiet=quiet
+                    ),
+                )
                 if rc == 0:
-                    log.emit("START", f"{review_task_obj.id} review")
-                    started_task_ids.add(str(review_task_obj.id))
+                    log.emit("START", f"{review_task_id} review")
+                    started_task_ids.add(review_task_id)
                     slots -= 1
                     work_done = True
                 continue
@@ -378,7 +409,15 @@ def _run_cycle(
                 )
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{improve_task.id} improve: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{improve_task.id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args, config, task_id=improve_task.id, quiet=quiet
+                    ),
+                )
                 if rc == 0:
                     log.emit("START", f"{improve_task.id} improve")
                     started_task_ids.add(str(improve_task.id))
@@ -399,7 +438,15 @@ def _run_cycle(
                     continue
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=improve_task_obj.id, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{improve_task_obj.id} improve: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{improve_task_obj.id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args, config, task_id=improve_task_obj.id, quiet=quiet
+                    ),
+                )
                 if rc == 0:
                     log.emit("START", f"{improve_task_obj.id} improve")
                     started_task_ids.add(str(improve_task_obj.id))
@@ -429,7 +476,13 @@ def _run_cycle(
                     resume=False,
                     retry=False,
                 )
-                rc = _spawn_background_iterate(iterate_args, config, impl_task, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{impl_task.id} implement: iterate worker spawn failed",
+                    dedupe_key=f"spawn-iterate-failed:{impl_task.id}",
+                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, impl_task, quiet=quiet),
+                )
                 if rc == 0:
                     log.emit("START", f"{impl_task.id} implement")
                     started_task_ids.add(str(impl_task.id))
@@ -448,7 +501,15 @@ def _run_cycle(
                 rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
 
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{rebase_task.id} rebase: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{rebase_task.id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args, config, task_id=rebase_task.id, quiet=quiet
+                    ),
+                )
                 if rc == 0:
                     log.emit("START", f"{rebase_task.id} rebase")
                     started_task_ids.add(str(rebase_task.id))
@@ -456,6 +517,7 @@ def _run_cycle(
                     work_done = True
 
     # 2) Resume failed resumable tasks (consumes slots)
+    pending_resume_task_ids: set[str] = set()
     if slots > 0:
         failed_tasks = store.get_resumable_failed_tasks()
         for failed in failed_tasks:
@@ -464,8 +526,21 @@ def _run_cycle(
             if not is_resumable_failure_reason(failed.failure_reason) or not failed.session_id:
                 continue
             assert failed.id is not None
-            if store.get_based_on_children(failed.id):
+
+            children = store.get_based_on_children(failed.id)
+            resume_task: DbTask | None = None
+            for child in children:
+                if (
+                    child.status == "pending"
+                    and child.task_type == failed.task_type
+                    and child.session_id == failed.session_id
+                    and child.id is not None
+                ):
+                    resume_task = child
+                    break
+            if resume_task is None and children:
                 continue
+
             depth = store.count_resume_chain_depth(failed.id)
             attempt = depth + 1
             if depth >= config.max_resume_attempts:
@@ -483,18 +558,27 @@ def _run_cycle(
                 slots -= 1
                 work_done = True
                 continue
-            resume_task = _create_resume_task(store, failed)
+            if resume_task is None:
+                resume_task = _create_resume_task(store, failed)
             assert resume_task.id is not None
+            resume_task_id = str(resume_task.id)
+            pending_resume_task_ids.add(resume_task_id)
             worker_args = argparse.Namespace(no_docker=False, max_turns=None)
-            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id, quiet=quiet)
+            rc = _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{failed.id} -> {resume_task_id}: resume worker spawn failed",
+                dedupe_key=f"spawn-resume-failed:{failed.id}:{resume_task_id}",
+                spawn_fn=lambda: _spawn_background_resume_worker(worker_args, config, resume_task_id, quiet=quiet),
+            )
             if rc != 0:
                 continue
             slots -= 1
             work_done = True
-            started_task_ids.add(str(resume_task.id))
+            started_task_ids.add(resume_task_id)
             log.emit(
                 "RESUME",
-                f"{failed.id} -> {resume_task.id} (attempt {attempt}/{config.max_resume_attempts})",
+                f"{failed.id} -> {resume_task_id} (attempt {attempt}/{config.max_resume_attempts})",
             )
 
     # 3) Start new queued tasks (consumes slots)
@@ -505,6 +589,8 @@ def _run_cycle(
                 break
             assert task.id is not None
             if str(task.id) in started_task_ids:
+                continue
+            if str(task.id) in pending_resume_task_ids:
                 continue
             task_type = task.task_type or "implement"
             if task_type == "implement":
@@ -520,7 +606,13 @@ def _run_cycle(
                     resume=False,
                     retry=False,
                 )
-                rc = _spawn_background_iterate(iterate_args, config, task, quiet=quiet)
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=log,
+                    failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
+                    dedupe_key=f"spawn-iterate-failed:{task.id}",
+                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, task, quiet=quiet),
+                )
                 if rc != 0:
                     continue
                 slots -= 1
@@ -536,7 +628,13 @@ def _run_cycle(
                 work_done = True
                 continue
             worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-            rc = _spawn_background_worker(worker_args, config, task_id=task.id, quiet=quiet)
+            rc = _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{task.id} {task_type}: worker spawn failed",
+                dedupe_key=f"spawn-worker-failed:{task.id}",
+                spawn_fn=lambda: _spawn_background_worker(worker_args, config, task_id=task.id, quiet=quiet),
+            )
             if rc != 0:
                 continue
             slots -= 1
