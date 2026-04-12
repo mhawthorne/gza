@@ -1350,12 +1350,16 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         queued_improve = _queue_improve_for_review(latest_review)
 
     summary_rows: list[IterateSummaryRow] = []
-    if initial_write_task is not None:
+    iteration_one_write_task = initial_write_task
+    if iteration_one_write_task is None and queued_improve is None and impl_task.status == "completed":
+        # Iteration 1 is always the implementation write, even when it completed before this invocation.
+        iteration_one_write_task = impl_task
+    if iteration_one_write_task is not None:
         _append_summary_row(
             summary_rows,
             iteration_index=0,
             task_type="implement",
-            task=initial_write_task,
+            task=iteration_one_write_task,
         )
 
     final_status = "maxed_out"
@@ -1405,6 +1409,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 print(
                     f"  Reusing completed improve {improve_task.id}; proceeding directly to review."
                 )
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="improve",
+                    task=improve_task,
+                )
                 queued_improve = None
 
             if queued_mode == "create":
@@ -1428,32 +1438,32 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 assert improve_task.id is not None
                 print(f"  Reusing existing improve {improve_task.id}...")
             else:
-                continue
+                improve_task = None
 
-            assert improve_task is not None
-            assert improve_task.id is not None
-            print(f"  Running improve {improve_task.id}...")
-            rc = _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
-            if rc != 0:
-                print(f"  Improve {improve_task.id} failed (exit code {rc})")
+            if improve_task is not None:
+                assert improve_task.id is not None
+                print(f"  Running improve {improve_task.id}...")
+                rc = _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
+                if rc != 0:
+                    print(f"  Improve {improve_task.id} failed (exit code {rc})")
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="improve",
+                        task=improve_task,
+                        status="failed",
+                        failure_reason=f"exit code {rc}",
+                    )
+                    final_status = "blocked"
+                    final_stop_reason = "improve_failed"
+                    break
+
                 _append_summary_row(
                     summary_rows,
                     iteration_index=iteration,
                     task_type="improve",
                     task=improve_task,
-                    status="failed",
-                    failure_reason=f"exit code {rc}",
                 )
-                final_status = "blocked"
-                final_stop_reason = "improve_failed"
-                break
-
-            _append_summary_row(
-                summary_rows,
-                iteration_index=iteration,
-                task_type="improve",
-                task=improve_task,
-            )
             queued_improve = None
 
         # --- REVIEW PHASE ---
