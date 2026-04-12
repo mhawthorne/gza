@@ -964,6 +964,53 @@ def cmd_review(args: argparse.Namespace) -> int:
     return _run_foreground(config, task_id=review_task.id, open_after=open_after)
 
 
+def _spawn_background_iterate(
+    args: argparse.Namespace,
+    config: Config,
+    impl_task: DbTask,
+) -> int:
+    """Spawn the iterate loop as a detached background process."""
+    from ._common import _spawn_detached_worker_process
+
+    registry = WorkerRegistry(config.workers_path)
+    worker_id = registry.generate_worker_id()
+
+    inner_cmd = [
+        sys.executable, "-m", "gza",
+        "iterate",
+        str(impl_task.id),
+        "--max-iterations", str(getattr(args, 'max_iterations', 3) or 3),
+    ]
+
+    if getattr(args, 'no_docker', False):
+        inner_cmd.append("--no-docker")
+    if getattr(args, 'resume', False):
+        inner_cmd.append("--resume")
+    if getattr(args, 'retry', False):
+        inner_cmd.append("--retry")
+
+    inner_cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    try:
+        proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            task_id=impl_task.id,
+            pid=proc.pid,
+            startup_log_file=startup_log_rel,
+        )
+        registry.register(worker)
+        print(f"Started iterate worker {worker_id} (PID {proc.pid})")
+        print(f"  Task: {impl_task.id}")
+        print()
+        print("Use 'gza ps' to view running workers")
+        print(f"Use 'gza log -w {worker_id} -f' to follow output")
+        return 0
+    except Exception as e:
+        print(f"Error spawning background iterate worker: {e}")
+        return 1
+
+
 def cmd_iterate(args: argparse.Namespace) -> int:
     """Run an automated review/improve loop for an implementation task.
 
@@ -977,6 +1024,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     store = get_store(config)
     max_iterations: int = getattr(args, 'max_iterations', 3) or 3
     dry_run: bool = getattr(args, 'dry_run', False)
+    use_resume: bool = getattr(args, 'resume', False)
+    use_retry: bool = getattr(args, 'retry', False)
+    background: bool = getattr(args, 'background', False)
 
     # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
     # it manages the full review/improve cycle lifecycle and requires the root impl task.
@@ -988,9 +1038,96 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if impl_task.task_type != "implement":
         print(f"Error: Task {impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
         return 1
-    if impl_task.status != "completed":
-        print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only iterate completed tasks.")
+
+    allowed_statuses = {"completed", "pending", "failed"}
+    if impl_task.status not in allowed_statuses:
+        print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only iterate completed, pending, or failed tasks.")
         return 1
+
+    if impl_task.status == "failed" and not use_resume and not use_retry:
+        print(f"Error: Task {impl_task.id} is failed. Use --resume or --retry to specify how to restart it.")
+        return 1
+
+    if (use_resume or use_retry) and impl_task.status != "failed":
+        flag = "--resume" if use_resume else "--retry"
+        print(f"Error: {flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).")
+        return 1
+
+    assert impl_task.id is not None
+
+    # Handle background mode: re-exec this command as a detached process.
+    if background:
+        if dry_run:
+            print(f"[dry-run] Would run iterate in background for {impl_task.id}")
+            return 0
+        return _spawn_background_iterate(args, config, impl_task)
+
+    # If the task is pending, run it first before entering the review/improve loop.
+    if impl_task.status == "pending":
+        if dry_run:
+            print(f"[dry-run] Would run pending implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
+            return 0
+
+        print(f"Running pending implementation {impl_task.id}...")
+        rc = _run_foreground(config, task_id=impl_task.id)
+        if rc != 0:
+            print(f"Implementation {impl_task.id} failed (exit code {rc})")
+            return 1
+        # Re-fetch to get updated status
+        impl_task = store.get(impl_task.id) or impl_task
+        assert impl_task.id is not None
+        if impl_task.status == "failed":
+            print(f"Implementation {impl_task.id} failed, cannot continue iteration.")
+            return 1
+
+    # If the task is failed, resume or retry it first.
+    if impl_task.status == "failed":
+        if use_resume:
+            if not impl_task.session_id:
+                print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
+                return 1
+            if dry_run:
+                print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
+                return 0
+            new_task = _create_resume_task(store, impl_task)
+            assert new_task.id is not None
+            print(f"Resuming failed implementation {impl_task.id} as {new_task.id}...")
+            rc = _run_foreground(config, task_id=new_task.id, resume=True)
+        else:
+            # --retry
+            if dry_run:
+                print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
+                return 0
+            new_task = store.add(
+                prompt=impl_task.prompt,
+                task_type=impl_task.task_type,
+                group=impl_task.group,
+                spec=impl_task.spec,
+                depends_on=impl_task.depends_on,
+                create_review=impl_task.create_review,
+                same_branch=impl_task.same_branch,
+                task_type_hint=impl_task.task_type_hint,
+                based_on=impl_task.id,
+                model=impl_task.model,
+                provider=impl_task.provider if impl_task.provider_is_explicit else None,
+                provider_is_explicit=impl_task.provider_is_explicit,
+            )
+            assert new_task.id is not None
+            print(f"Retrying failed implementation {impl_task.id} as {new_task.id}...")
+            rc = _run_foreground(config, task_id=new_task.id)
+
+        if rc != 0:
+            action = "Resume" if use_resume else "Retry"
+            print(f"{action} of {impl_task.id} failed (exit code {rc})")
+            return 1
+
+        # The new task is now the impl task for the review/improve loop
+        impl_task = store.get(new_task.id) or new_task
+        assert impl_task.id is not None
+        if impl_task.status == "failed":
+            action = "Resume" if use_resume else "Retry"
+            print(f"{action} of {impl_task_id} failed, cannot continue iteration.")
+            return 1
 
     assert impl_task.id is not None
 
@@ -1215,13 +1352,6 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             break
 
         # verdict == "CHANGES_REQUESTED"
-        if iteration >= max_iterations - 1:
-            # This was the last iteration
-            final_status = "maxed_out"
-            final_stop_reason = "max_iterations"
-            summary_rows.append((iteration, review_task.id, verdict, None))
-            break
-
         # --- IMPROVE PHASE ---
         try:
             # create_review is intentionally omitted (defaults to False) here:
