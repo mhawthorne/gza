@@ -459,7 +459,10 @@ def main() -> int:
     add_common_args(pr_parser)
 
     # stats command
-    stats_parser = subparsers.add_parser("stats", help="Review analytics (use 'gza stats reviews')")
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="Review and iteration analytics",
+    )
     add_common_args(stats_parser)
     stats_subs = stats_parser.add_subparsers(dest="stats_subcommand")
     stats_parser.set_defaults(_stats_parser=stats_parser)
@@ -498,6 +501,54 @@ def main() -> int:
         dest="all_time",
         action="store_true",
         help="Show stats across all time (ignore --days/--start-date/--end-date)",
+    )
+
+    # stats iterations subcommand
+    stats_iterations_parser = stats_subs.add_parser(
+        "iterations",
+        help="Show per-implementation review/improve iteration rollups",
+    )
+    add_common_args(stats_iterations_parser)
+    stats_iterations_parser.add_argument(
+        "-n",
+        "--last",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Limit output to the N most recent implementation tasks",
+    )
+    stats_iterations_parser.add_argument(
+        "--hours",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Show tasks with activity in the last N hours (cannot combine with --days/--start-date/--end-date)",
+    )
+    stats_iterations_parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Show tasks from the last N days (default: 14)",
+    )
+    stats_iterations_parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or after this date",
+    )
+    stats_iterations_parser.add_argument(
+        "--end-date",
+        dest="end_date",
+        metavar="YYYY-MM-DD",
+        help="Show only tasks on or before this date",
+    )
+    stats_iterations_parser.add_argument(
+        "--all",
+        "--all-time",
+        dest="all_time",
+        action="store_true",
+        help="Show stats across all time (cannot combine with --hours/--days/--start-date/--end-date)",
     )
 
     # validate command

@@ -15,12 +15,12 @@ from rich.table import Table
 
 from ..config import Config
 from ..console import console
-from ..db import SqliteTaskStore, Task
+from ..db import SqliteTaskStore, Task, task_id_numeric_key
 from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import get_store, resolve_id
+from ._common import get_review_verdict, get_store, resolve_id
 
 logger = logging.getLogger(__name__)
 
@@ -422,8 +422,145 @@ def _cmd_stats_reviews(
     return 0
 
 
+def _cmd_stats_iterations(
+    config: "Config",
+    store: "SqliteTaskStore",
+    start_dt: datetime | None,
+    end_dt: datetime | None,
+    header_range: str,
+    last_n: int | None = None,
+) -> int:
+    """Show per-implementation review/improve iteration rollups."""
+
+    def _normalize_dt(dt: datetime | None) -> datetime | None:
+        if dt is None:
+            return None
+        if dt.tzinfo is not None:
+            return dt.astimezone().replace(tzinfo=None)
+        return dt
+
+    def _task_dt(task: Task) -> datetime | None:
+        return _normalize_dt(task.created_at)
+
+    def _activity_dt(task: Task) -> datetime | None:
+        # For operational windowing, completed work should be attributed by
+        # completion time; incomplete rows fall back to creation time.
+        if task.status == "completed":
+            completed_dt = _normalize_dt(task.completed_at)
+            if completed_dt is not None:
+                return completed_dt
+        return _task_dt(task)
+
+    def _in_window(dt: datetime | None) -> bool:
+        if dt is None:
+            return False
+        if start_dt is not None and dt < start_dt:
+            return False
+        if end_dt is not None and dt >= end_dt:
+            return False
+        return True
+
+    def _cost(task: Task) -> float:
+        return task.cost_usd or 0.0
+
+    def _task_label(task: Task) -> str:
+        slug_display: str | None = None
+        if task.slug:
+            parts = task.slug.split("-", 2)
+            if len(parts) == 3 and len(parts[0]) == 8 and parts[0].isdigit():
+                slug_display = parts[2]
+            else:
+                slug_display = task.slug
+        elif task.prompt:
+            slug_display = re.sub(r"[^a-z0-9]+", "-", task.prompt.lower()).strip("-")
+        return f"{task.id}  {slug_display}" if slug_display else (task.id or "(unknown)")
+
+    all_tasks = store.get_all()
+    impl_tasks = [t for t in all_tasks if t.task_type == "implement" and t.id is not None]
+    impl_tasks.sort(
+        key=lambda task: (
+            _task_dt(task) or datetime.min,
+            task_id_numeric_key(task.id),
+        ),
+        reverse=True,
+    )
+
+    rows: list[tuple[str, int, int, str, float]] = []
+    for impl in impl_tasks:
+        assert impl.id is not None
+        reviews = store.get_reviews_for_task(impl.id)
+        improves = store.get_improve_tasks_by_root(impl.id)
+
+        if not (
+            _in_window(_activity_dt(impl))
+            or any(_in_window(_activity_dt(review)) for review in reviews)
+            or any(_in_window(_activity_dt(improve)) for improve in improves)
+        ):
+            continue
+
+        completed_reviews = [review for review in reviews if review.status == "completed"]
+        completed_improves = [improve for improve in improves if improve.status == "completed"]
+
+        latest_completed_review = next(
+            (review for review in reviews if review.status == "completed"),
+            None,
+        )
+        verdict: str = "NO_REVIEW"
+        if latest_completed_review is not None:
+            verdict = get_review_verdict(config, latest_completed_review) or "UNKNOWN"
+
+        total_cost = (
+            _cost(impl)
+            + sum(_cost(review) for review in reviews)
+            + sum(_cost(improve) for improve in improves)
+        )
+
+        rows.append(
+            (
+                _task_label(impl),
+                len(completed_reviews),
+                len(completed_improves),
+                verdict,
+                total_cost,
+            )
+        )
+
+        if last_n is not None and len(rows) >= last_n:
+            break
+
+    print(f"\n{header_range}\n")
+    task_col_width = 46
+    print(f"{'Task':<{task_col_width}} {'Reviews':>7}  {'Improves':>8}  {'Verdict':<14} {'Cost':>8}")
+    if rows:
+        for task_label, reviews_count, improves_count, verdict, task_cost in rows:
+            if len(task_label) > task_col_width:
+                task_label = f"{task_label[:task_col_width - 3]}..."
+            print(
+                f"{task_label:<{task_col_width}} "
+                f"{reviews_count:>7}  "
+                f"{improves_count:>8}  "
+                f"{verdict:<14} "
+                f"${task_cost:>7.2f}"
+            )
+
+    total_tasks = len(rows)
+    total_reviews = sum(reviews_count for _, reviews_count, _, _, _ in rows)
+    total_improves = sum(improves_count for _, _, improves_count, _, _ in rows)
+    approved = sum(1 for _, _, _, verdict, _ in rows if verdict == "APPROVED")
+    total_cost = sum(task_cost for _, _, _, _, task_cost in rows)
+    print(
+        f"\n{total_tasks} tasks  |  "
+        f"{total_reviews} reviews  |  "
+        f"{total_improves} improves  |  "
+        f"{approved}/{total_tasks} approved  |  "
+        f"${total_cost:.2f} total"
+    )
+
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
-    """Show review analytics. Use 'gza stats reviews' to see review analytics."""
+    """Show stats analytics subcommands for reviews and iterations."""
     stats_subcommand: str | None = getattr(args, 'stats_subcommand', None)
 
     if stats_subcommand is None:
@@ -456,6 +593,80 @@ def cmd_stats(args: argparse.Namespace) -> int:
         show_issues: bool = getattr(args, 'issues', False)
         return _cmd_stats_reviews(
             config, store, start_date_r, end_date_r, show_issues, all_time=all_time
+        )
+
+    if stats_subcommand == "iterations":
+        now = datetime.now()
+        today = date.today()
+        all_time_i: bool = getattr(args, 'all_time', False)
+        raw_hours_i: int | None = getattr(args, 'hours', None)
+        raw_end_i: str | None = getattr(args, 'end_date', None)
+        raw_start_i: str | None = getattr(args, 'start_date', None)
+        raw_days_i: int | None = getattr(args, 'days', None)
+        last_n: int | None = getattr(args, 'last', None)
+
+        if last_n is not None and last_n <= 0:
+            print("Error: --last must be >= 1", file=sys.stderr)
+            return 1
+        if raw_hours_i is not None and raw_hours_i <= 0:
+            print("Error: --hours must be >= 1", file=sys.stderr)
+            return 1
+        if raw_days_i is not None and raw_days_i <= 0:
+            print("Error: --days must be >= 1", file=sys.stderr)
+            return 1
+        if all_time_i and any(
+            value is not None for value in (raw_hours_i, raw_days_i, raw_start_i, raw_end_i)
+        ):
+            print(
+                "Error: --all cannot be combined with --hours/--days/--start-date/--end-date",
+                file=sys.stderr,
+            )
+            return 1
+        if raw_hours_i is not None and any(
+            value is not None for value in (raw_days_i, raw_start_i, raw_end_i)
+        ):
+            print(
+                "Error: --hours cannot be combined with --days/--start-date/--end-date",
+                file=sys.stderr,
+            )
+            return 1
+
+        start_dt_i: datetime | None
+        end_dt_i: datetime | None
+        header_range: str
+        if all_time_i:
+            start_dt_i = None
+            end_dt_i = None
+            header_range = "All time"
+        elif raw_hours_i is not None:
+            end_dt_i = now
+            start_dt_i = end_dt_i - timedelta(hours=raw_hours_i)
+            header_range = (
+                f"Last {raw_hours_i} hours "
+                f"({start_dt_i.strftime('%Y-%m-%d %H:%M')} - {end_dt_i.strftime('%Y-%m-%d %H:%M')})"
+            )
+        else:
+            end_date_i = datetime.strptime(raw_end_i, "%Y-%m-%d").date() if raw_end_i else today
+            if raw_start_i:
+                start_date_i = datetime.strptime(raw_start_i, "%Y-%m-%d").date()
+            elif raw_days_i:
+                start_date_i = end_date_i - timedelta(days=raw_days_i)
+            else:
+                start_date_i = end_date_i - timedelta(days=14)
+            start_dt_i = datetime(start_date_i.year, start_date_i.month, start_date_i.day)
+            end_dt_i = datetime(end_date_i.year, end_date_i.month, end_date_i.day) + timedelta(days=1)
+            if raw_days_i:
+                header_range = f"Last {raw_days_i} days ({start_date_i} - {end_date_i})"
+            else:
+                header_range = f"{start_date_i} to {end_date_i}"
+
+        return _cmd_stats_iterations(
+            config=config,
+            store=store,
+            start_dt=start_dt_i,
+            end_dt=end_dt_i,
+            header_range=header_range,
+            last_n=last_n,
         )
 
     return 0

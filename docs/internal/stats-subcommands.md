@@ -1,10 +1,10 @@
 # gza stats subcommands
 
-> **Status: Implemented** — Describes current behavior as of 2026-04-09.
+> **Status: Implemented** — Describes current behavior as of 2026-04-12.
 
 ## Overview
 
-`gza stats` has one subcommand: `reviews`. Running `gza stats` without a subcommand prints help text.
+`gza stats` has two subcommands: `reviews` and `iterations`. Running `gza stats` without a subcommand prints help text.
 
 ## gza stats reviews
 
@@ -39,3 +39,33 @@ The three-way priority for determining the start date:
 - `bin/review-cycle-stats.py` was removed in the same PR this subcommand was added. Use `gza stats reviews` instead.
 - `gza stats cycles` was removed as of 2026-04-09. Use `gza stats reviews` instead.
 - Output uses `print()` (plain text) rather than Rich markup, consistent with the original script and suitable for piping.
+
+## gza stats iterations
+
+Shows per-implementation operational rollups for review/improve loops, including completed review/improve counts, latest completed review verdict, and total cost.
+
+```bash
+gza stats iterations                              # Last 14 days (default)
+gza stats iterations --last N                     # Limit to N most-recent implementation rows
+gza stats iterations --hours N                    # Activity in the last N hours
+gza stats iterations --days N                     # Last N days
+gza stats iterations --start-date YYYY-MM-DD      # From a specific start date
+gza stats iterations --end-date YYYY-MM-DD        # Up to a specific end date
+gza stats iterations --all                         # All-time view
+```
+
+### Activity window semantics
+
+- Inclusion uses activity timestamps:
+  - Completed tasks use `completed_at`.
+  - Incomplete tasks fall back to `created_at`.
+- A row is included when any of these are in-window:
+  - The implementation task activity timestamp.
+  - Any child review task activity timestamp.
+  - Any child improve task activity timestamp.
+- Latest verdict comes from the most recently completed review task.
+
+### Flag compatibility
+
+- `--hours` cannot be combined with `--days`, `--start-date`, or `--end-date`.
+- `--all` cannot be combined with any date-window flags (`--hours`, `--days`, `--start-date`, `--end-date`).

@@ -103,6 +103,16 @@ class TestHelpOutput:
         assert "Normal interactive Claude exit also auto-resumes in background." in tmux_docs
         assert "Attach to a running task." in config_docs
 
+    def test_stats_help_no_longer_claims_reviews_only(self, tmp_path):
+        """Help output should not imply `stats` only supports `reviews`."""
+        setup_config(tmp_path)
+
+        result = run_gza("--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Review and iteration analytics" in result.stdout
+        assert "Review analytics (use 'gza stats reviews')" not in result.stdout
+
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
 

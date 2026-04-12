@@ -503,7 +503,7 @@ If no main task log exists yet, `gza log` can fall back to worker startup logs i
 
 ### stats
 
-Show review-iteration statistics. Run `gza stats reviews` to see analytics.
+Show analytics subcommands for reviews and iteration activity.
 
 #### stats reviews
 
@@ -517,6 +517,26 @@ gza stats reviews [options]
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date (default: today) |
 | `--issues` | Show per-model must-fix and suggestion counts |
+
+#### stats iterations
+
+```bash
+gza stats iterations [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-n, --last N` | Limit output to the N most recent implementation rows |
+| `--hours N` | Show tasks with activity in the last N hours (cannot combine with `--days`/`--start-date`/`--end-date`) |
+| `--days N` | Show only tasks from the last N days (default: 14) |
+| `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
+| `--end-date YYYY-MM-DD` | Show only tasks on or before this date (default: today) |
+| `--all`, `--all-time` | Show stats across all time (cannot combine with date-window flags) |
+
+`stats iterations` uses completion-aware activity windows:
+- Completed implementation/review/improve tasks use `completed_at`.
+- Incomplete tasks fall back to `created_at`.
+- A row is included when the implementation or any linked review/improve task has activity in the selected window.
 
 ### pr
 
