@@ -1122,6 +1122,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
 
+# Compatibility shim: downstream imports/tests still reference this legacy name.
 def _determine_advance_action(
     config: Config,
     store: SqliteTaskStore,

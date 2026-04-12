@@ -1147,7 +1147,7 @@ def main() -> int:
         iterate_parser.add_argument(
             "--force",
             action="store_true",
-            help="Skip dependency precondition checks when running review/improve tasks in the loop",
+            help="Skip dependency precondition checks when iterate starts workers",
         )
         add_common_args(iterate_parser)
 

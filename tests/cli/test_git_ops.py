@@ -5118,6 +5118,31 @@ class TestAdvanceMergeSquashThreshold:
         with pytest.raises(ConfigError, match="'max_review_cycles' must be positive"):
             Config.load(tmp_path)
 
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_error"),
+        [
+            ("max_resume_attempts", "true", "'max_resume_attempts' must be an integer"),
+            ("max_resume_attempts", '"2"', "'max_resume_attempts' must be an integer"),
+            ("max_review_cycles", "true", "'max_review_cycles' must be an integer"),
+            ("max_review_cycles", '"3"', "'max_review_cycles' must be an integer"),
+        ],
+    )
+    def test_load_and_validate_reject_bool_and_quoted_numeric_values(
+        self, tmp_path: Path, field: str, value: str, expected_error: str
+    ) -> None:
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text(f"project_name: test-project\n{field}: {value}\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert expected_error in errors
+
+        with pytest.raises(ConfigError, match=expected_error):
+            Config.load(tmp_path)
+
 class TestAdvanceUnimplementedCommand:
     """Tests for 'gza advance --unimplemented' command."""
 

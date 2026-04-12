@@ -1008,7 +1008,7 @@ gza iterate <impl_task_id> [options]
 | `--max-iterations N` | Maximum iterate actions (default: 5) |
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
-| `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |
+| `--force` | Skip dependency merge precondition checks when iterate starts workers |
 
 ### watch
 
