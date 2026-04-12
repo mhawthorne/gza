@@ -3074,6 +3074,59 @@ class TestIterateCommand:
         assert "pending" in result.stdout.lower()
         assert "dry-run" in result.stdout.lower()
 
+    def test_dry_run_reuses_completed_improve_for_changes_requested_review(self, tmp_path: Path):
+        """Dry-run reflects restart state when CHANGES_REQUESTED already has a completed improve."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        store.update(review)
+
+        improve = store.add("Completed improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+        store.update(improve)
+
+        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"reuse completed improve {improve.id}" in result.stdout.lower()
+        assert "iteration 1 write" in result.stdout.lower()
+        assert "would iterate implementation" not in result.stdout.lower()
+
+    def test_dry_run_review_cleared_starts_from_current_completed_improve(self, tmp_path: Path):
+        """Dry-run reports current-write improve when review state was cleared after older review."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = "**Verdict: APPROVED**"
+        stale_review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        store.update(stale_review)
+
+        improve = store.add("Current write", task_type="improve", based_on=impl.id, depends_on=stale_review.id)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        store.update(improve)
+
+        impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+        store.update(impl)
+
+        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"current write improve {improve.id}" in result.stdout.lower()
+        assert "as iteration 1" in result.stdout.lower()
+        assert "would iterate implementation" not in result.stdout.lower()
+
     def test_failed_task_requires_resume_or_retry(self, tmp_path: Path):
         """gza iterate on a failed task without --resume or --retry errors."""
         setup_config(tmp_path)

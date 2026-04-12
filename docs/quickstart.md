@@ -182,7 +182,7 @@ gza advance --auto --batch 3
 
 ### Automate iterate loops
 
-For a single implementation, `--max-iterations` counts code-write iterations. Iteration 1 is the implementation write (existing or newly run), and every iteration ends with a review:
+For a single implementation, `--max-iterations` counts code-write iterations. Iteration 1 is the current write awaiting review (usually the implementation write, but possibly a completed improve after a restart), and every iteration ends with a review:
 
 ```bash
 gza iterate gza-1 --max-iterations 3

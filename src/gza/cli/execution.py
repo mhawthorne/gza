@@ -1027,8 +1027,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     """Run an automated review/improve loop for an implementation task.
 
     Iteration semantics: each iteration represents one code write followed by a review.
-    Iteration 1 is the implementation write (which may already be completed), and
-    subsequent iterations run improve writes before review.
+    Iteration 1 is the current write awaiting review (usually the implementation write,
+    but it can be a completed improve in restart-state flows), and subsequent iterations
+    run improve writes before review.
     Stops on APPROVED, max iterations reached, NEEDS_DISCUSSION, or failure.
     """
     config = Config.load(args.project_dir)
@@ -1235,9 +1236,6 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     latest_review: DbTask | None = None
     latest_verdict: str | None = None
-    start_with_new_improve = False
-    start_with_existing_improve: DbTask | None = None
-    start_with_in_progress_improve: DbTask | None = None
     reviews = store.get_reviews_for_task(impl_task.id)
     active_review = _latest_active_review(reviews)
     if active_review is not None:
@@ -1253,36 +1251,87 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             label = "no verdict" if latest_verdict is None else latest_verdict
             print(f"Latest review {latest_review.id} is blocked ({label}); manual review required.")
             return 3
-        if latest_verdict == "CHANGES_REQUESTED":
-            assert latest_review.id is not None
-            improves = store.get_improve_tasks_for(impl_task.id, latest_review.id)
-            pending_improve = _latest_with_status(improves, "pending")
-            in_progress_improve = _latest_with_status(improves, "in_progress")
-            if in_progress_improve is not None:
-                start_with_in_progress_improve = in_progress_improve
-            elif pending_improve is not None:
-                start_with_existing_improve = pending_improve
-            elif not improves:
-                start_with_new_improve = True
+
+    @dataclass(frozen=True)
+    class QueuedImprove:
+        mode: str
+        review_task: DbTask
+        improve_task: DbTask | None = None
+        failure_reason: str | None = None
+
+    def _queue_improve_for_review(review_task: DbTask) -> QueuedImprove:
+        assert impl_task.id is not None
+        assert review_task.id is not None
+        improves = store.get_improve_tasks_for(impl_task.id, review_task.id)
+        in_progress_improve = _latest_with_status(improves, "in_progress")
+        if in_progress_improve is not None:
+            return QueuedImprove(mode="wait", review_task=review_task, improve_task=in_progress_improve)
+        pending_improve = _latest_with_status(improves, "pending")
+        if pending_improve is not None:
+            return QueuedImprove(mode="run", review_task=review_task, improve_task=pending_improve)
+        if not improves:
+            return QueuedImprove(mode="create", review_task=review_task)
+        latest_improve = max(improves, key=_task_order_key)
+        allowed_reuse_statuses = {"completed"}
+        unexpected_statuses = sorted({task.status for task in improves if task.status not in allowed_reuse_statuses})
+        if unexpected_statuses:
+            return QueuedImprove(
+                mode="error",
+                review_task=review_task,
+                improve_task=latest_improve,
+                failure_reason=(
+                    "Unexpected improve status(es) for review "
+                    f"{review_task.id}: {', '.join(unexpected_statuses)}"
+                ),
+            )
+        return QueuedImprove(mode="skip", review_task=review_task, improve_task=latest_improve)
+
+    queued_improve: QueuedImprove | None = None
+    if latest_review is not None and latest_verdict == "CHANGES_REQUESTED":
+        queued_improve = _queue_improve_for_review(latest_review)
+
+    iteration_one_write_task = initial_write_task
+    if iteration_one_write_task is None and queued_improve is None and impl_task.status == "completed":
+        # Iteration 1 starts from the current write state.
+        # If the latest completed review was cleared and a newer completed improve exists,
+        # the improve is the write now awaiting review.
+        iteration_one_write_task = _latest_completed_improve_since_review(reviews) or impl_task
 
     if dry_run:
-        if start_with_in_progress_improve is not None and latest_review is not None:
-            print(
-                f"[dry-run] Would wait for in-progress improve {start_with_in_progress_improve.id} "
-                f"for review {latest_review.id} on implementation {impl_task.id}"
-            )
-        elif start_with_existing_improve is not None and latest_review is not None:
-            print(
-                f"[dry-run] Would run existing improve {start_with_existing_improve.id} "
-                f"for review {latest_review.id} on implementation {impl_task.id} "
-                f"(max {max_iterations} iterations)"
-            )
-        elif start_with_new_improve and latest_review is not None:
-            print(
-                f"[dry-run] Would create improve for existing review {latest_review.id} "
-                f"on implementation {impl_task.id} (max {max_iterations} iterations)"
-            )
-        elif active_review is not None:
+        if queued_improve is not None and latest_review is not None:
+            if queued_improve.mode == "wait" and queued_improve.improve_task is not None:
+                print(
+                    f"[dry-run] Would wait for in-progress improve {queued_improve.improve_task.id} "
+                    f"for review {latest_review.id} on implementation {impl_task.id}"
+                )
+            elif queued_improve.mode == "run" and queued_improve.improve_task is not None:
+                print(
+                    f"[dry-run] Would run existing improve {queued_improve.improve_task.id} "
+                    f"for review {latest_review.id} on implementation {impl_task.id} "
+                    f"(max {max_iterations} iterations)"
+                )
+            elif queued_improve.mode == "create":
+                print(
+                    f"[dry-run] Would create improve for existing review {latest_review.id} "
+                    f"on implementation {impl_task.id} (max {max_iterations} iterations)"
+                )
+            elif queued_improve.mode == "skip" and queued_improve.improve_task is not None:
+                print(
+                    f"[dry-run] Would reuse completed improve {queued_improve.improve_task.id} "
+                    f"as iteration 1 write for review {latest_review.id} on implementation {impl_task.id} "
+                    f"(max {max_iterations} iterations)"
+                )
+            elif queued_improve.mode == "error":
+                failure_reason = queued_improve.failure_reason or "unexpected improve state"
+                print(
+                    f"[dry-run] Iterate would stop: unexpected improve state for review {latest_review.id} "
+                    f"on implementation {impl_task.id}: {failure_reason}"
+                )
+            else:
+                print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
+            return 0
+
+        if active_review is not None:
             if active_review.status == "pending":
                 print(
                     f"[dry-run] Would run existing pending review {active_review.id} "
@@ -1293,8 +1342,16 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     f"[dry-run] Would wait for in-progress review {active_review.id} "
                     f"on implementation {impl_task.id}"
                 )
-        else:
-            print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
+            return 0
+
+        if iteration_one_write_task is not None and iteration_one_write_task.task_type == "improve":
+            print(
+                f"[dry-run] Would start from current write improve {iteration_one_write_task.id} "
+                f"as iteration 1 on implementation {impl_task.id} (max {max_iterations} iterations)"
+            )
+            return 0
+
+        print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
         return 0
 
     print(f"Iterating implementation {impl_task.id} (max {max_iterations} iterations)...")
@@ -1352,51 +1409,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             )
         )
 
-    @dataclass(frozen=True)
-    class QueuedImprove:
-        mode: str
-        review_task: DbTask
-        improve_task: DbTask | None = None
-        failure_reason: str | None = None
-
-    def _queue_improve_for_review(review_task: DbTask) -> QueuedImprove:
-        assert impl_task.id is not None
-        assert review_task.id is not None
-        improves = store.get_improve_tasks_for(impl_task.id, review_task.id)
-        in_progress_improve = _latest_with_status(improves, "in_progress")
-        if in_progress_improve is not None:
-            return QueuedImprove(mode="wait", review_task=review_task, improve_task=in_progress_improve)
-        pending_improve = _latest_with_status(improves, "pending")
-        if pending_improve is not None:
-            return QueuedImprove(mode="run", review_task=review_task, improve_task=pending_improve)
-        if not improves:
-            return QueuedImprove(mode="create", review_task=review_task)
-        latest_improve = max(improves, key=_task_order_key)
-        allowed_reuse_statuses = {"completed"}
-        unexpected_statuses = sorted({task.status for task in improves if task.status not in allowed_reuse_statuses})
-        if unexpected_statuses:
-            return QueuedImprove(
-                mode="error",
-                review_task=review_task,
-                improve_task=latest_improve,
-                failure_reason=(
-                    "Unexpected improve status(es) for review "
-                    f"{review_task.id}: {', '.join(unexpected_statuses)}"
-                ),
-            )
-        return QueuedImprove(mode="skip", review_task=review_task, improve_task=latest_improve)
-
-    queued_improve: QueuedImprove | None = None
-    if latest_review is not None and latest_verdict == "CHANGES_REQUESTED":
-        queued_improve = _queue_improve_for_review(latest_review)
-
     summary_rows: list[IterateSummaryRow] = []
-    iteration_one_write_task = initial_write_task
-    if iteration_one_write_task is None and queued_improve is None and impl_task.status == "completed":
-        # Iteration 1 starts from the current write state.
-        # If the latest completed review was cleared and a newer completed improve exists,
-        # the improve is the write now awaiting review.
-        iteration_one_write_task = _latest_completed_improve_since_review(reviews) or impl_task
     if iteration_one_write_task is not None:
         _append_summary_row(
             summary_rows,

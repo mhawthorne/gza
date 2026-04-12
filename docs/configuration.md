@@ -979,7 +979,8 @@ gza advance [task_id] [options]
 
 Run an automated review/improve loop for an implementation task.
 Each iteration represents one code write that is followed by a review:
-iteration 1 is the implementation write (existing or newly run), and
+iteration 1 is the current write awaiting review (usually the implementation write,
+but possibly a completed improve when restarting from newer unreviewed branch state), and
 later iterations are improve writes.
 
 ```bash
