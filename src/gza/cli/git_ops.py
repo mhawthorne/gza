@@ -113,6 +113,39 @@ def _require_default_branch(git: Git, current_branch: str, command: str) -> bool
     return True
 
 
+def _auto_squash_commit_count(
+    config: Config,
+    git: Git,
+    task: DbTask,
+    target_branch: str,
+) -> int | None:
+    """Return commit count when task should auto-squash, otherwise None."""
+    if config.merge_squash_threshold <= 0 or not task.branch:
+        return None
+    commit_count = git.count_commits_ahead(task.branch, target_branch)
+    if commit_count < config.merge_squash_threshold:
+        return None
+    return commit_count
+
+
+def _build_auto_merge_args(
+    config: Config,
+    git: Git,
+    task: DbTask,
+    target_branch: str,
+) -> argparse.Namespace:
+    """Build merge args with auto-squash behavior aligned across entrypoints."""
+    should_squash = _auto_squash_commit_count(config, git, task, target_branch) is not None
+    return argparse.Namespace(
+        rebase=False,
+        squash=should_squash,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+
+
 def _merge_single_task(
     task_id: str,
     config: Config,
@@ -1607,9 +1640,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
-            if action['type'] == 'merge' and config.merge_squash_threshold > 0 and task.branch:
-                commit_count = git.count_commits_ahead(task.branch, target_branch)
-                if commit_count >= config.merge_squash_threshold:
+            if action['type'] == 'merge':
+                commit_count = _auto_squash_commit_count(config, git, task, target_branch)
+                if commit_count is not None:
                     description = f"{description} (auto-squash, {commit_count} commits)"
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {description}[/{_color}]")
@@ -1711,21 +1744,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
         if action_type == 'merge':
-            # Determine whether to auto-squash based on commit count and threshold
-            should_squash = False
-            if config.merge_squash_threshold > 0 and task.branch:
-                commit_count = git.count_commits_ahead(task.branch, target_branch)
-                if commit_count >= config.merge_squash_threshold:
-                    should_squash = True
-            # Build a minimal args namespace for _merge_single_task
-            merge_args = argparse.Namespace(
-                rebase=False,
-                squash=should_squash,
-                delete=False,
-                mark_only=False,
-                remote=False,
-                resolve=False,
-            )
+            merge_args = _build_auto_merge_args(config, git, task, target_branch)
             rc = _merge_single_task(task.id, config, store, git, merge_args, target_branch)
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")

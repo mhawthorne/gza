@@ -22,7 +22,12 @@ from ._common import (
     resolve_id,
 )
 from .execution import _spawn_background_iterate
-from .git_ops import _determine_advance_action, _merge_single_task
+from .git_ops import (
+    _build_auto_merge_args,
+    _determine_advance_action,
+    _merge_single_task,
+    _require_default_branch,
+)
 
 RESUMABLE_FAILURE_REASONS = {"MAX_STEPS", "MAX_TURNS", "TEST_FAILURE"}
 SUPPORTED_PLAIN_QUEUE_TYPES = {"plan", "explore"}
@@ -137,23 +142,24 @@ def _emit_transition_events(
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
     registry = WorkerRegistry(config.workers_path)
-    live: set[str] = set()
+    live_pids: set[int] = set()
 
     for worker in registry.list_all(include_completed=False):
         if worker.status != "running":
             continue
         if not registry.is_running(worker.worker_id):
             continue
-        key = f"task:{worker.task_id}" if worker.task_id else f"worker:{worker.worker_id}"
-        live.add(key)
+        if worker.pid > 0:
+            live_pids.add(worker.pid)
 
     for task in store.get_in_progress():
-        assert task.id is not None
-        if not _pid_alive(task.running_pid):
+        pid = task.running_pid
+        if not _pid_alive(pid):
             continue
-        live.add(f"task:{task.id}")
+        assert pid is not None
+        live_pids.add(pid)
 
-    return len(live)
+    return len(live_pids)
 
 
 def _pending_runnable_tasks(store: SqliteTaskStore) -> list[DbTask]:
@@ -183,6 +189,7 @@ def _run_cycle(
     max_iterations: int,
     dry_run: bool,
     log: _WatchLog,
+    seen_unsupported_types: set[str] | None = None,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
@@ -192,6 +199,7 @@ def _run_cycle(
     running = _count_live_workers(config, store)
     slots = max(0, batch - running)
     work_done = False
+    pending_tasks = _pending_runnable_tasks(store)
 
     log.emit("WAKE", f"checking... ({running} running, {slots} slots)")
 
@@ -200,34 +208,30 @@ def _run_cycle(
     if merge_candidates:
         git = Git(config.project_dir)
         target_branch = git.current_branch()
-        impl_based_on_ids = store.get_impl_based_on_ids()
-        for task in merge_candidates:
-            action = _determine_advance_action(
-                config,
-                store,
-                git,
-                task,
-                target_branch,
-                impl_based_on_ids=impl_based_on_ids,
-            )
-            if action.get("type") != "merge":
-                continue
-            if dry_run:
-                log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
-                work_done = True
-                continue
-            merge_args = argparse.Namespace(
-                rebase=False,
-                squash=False,
-                delete=False,
-                mark_only=False,
-                remote=False,
-                resolve=False,
-            )
-            rc = _merge_single_task(str(task.id), config, store, git, merge_args, target_branch)
-            if rc == 0:
-                log.emit("MERGE", f"{task.id} -> {target_branch}")
-                work_done = True
+        if _require_default_branch(git, target_branch, "merge"):
+            impl_based_on_ids = store.get_impl_based_on_ids()
+            for task in merge_candidates:
+                action = _determine_advance_action(
+                    config,
+                    store,
+                    git,
+                    task,
+                    target_branch,
+                    impl_based_on_ids=impl_based_on_ids,
+                )
+                if action.get("type") != "merge":
+                    continue
+                if dry_run:
+                    log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
+                    work_done = True
+                    continue
+                merge_args = _build_auto_merge_args(config, git, task, target_branch)
+                rc = _merge_single_task(str(task.id), config, store, git, merge_args, target_branch)
+                if rc == 0:
+                    log.emit("MERGE", f"{task.id} -> {target_branch}")
+                    work_done = True
+        else:
+            log.emit("SKIP", "merge actions skipped: not on default branch")
 
     # 2) Resume failed resumable tasks (consumes slots)
     if slots > 0:
@@ -267,8 +271,17 @@ def _run_cycle(
             )
 
     # 3) Start new queued tasks (consumes slots)
+    unsupported_pending_keys = {
+        f"{task.id}:{task.task_type}"
+        for task in pending_tasks
+        if (task.task_type or "implement") not in SUPPORTED_PLAIN_QUEUE_TYPES
+        and (task.task_type or "implement") != "implement"
+    }
+    if seen_unsupported_types is not None:
+        seen_unsupported_types.intersection_update(unsupported_pending_keys)
+
     if slots > 0:
-        for task in _pending_runnable_tasks(store):
+        for task in pending_tasks:
             if slots <= 0:
                 break
             assert task.id is not None
@@ -308,12 +321,16 @@ def _run_cycle(
                 log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
                 continue
 
-            log.emit("SKIP", f"{task.id}: unsupported pending type '{task_type}' for watch")
+            unsupported_key = f"{task.id}:{task_type}"
+            if seen_unsupported_types is None or unsupported_key not in seen_unsupported_types:
+                log.emit("SKIP", f"{task.id}: unsupported pending type '{task_type}' for watch")
+            if seen_unsupported_types is not None:
+                seen_unsupported_types.add(unsupported_key)
 
     return _CycleResult(
         work_done=work_done,
         running=_count_live_workers(config, store),
-        pending=len(_pending_runnable_tasks(store)),
+        pending=len(pending_tasks),
     )
 
 
@@ -357,6 +374,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     idle_seconds = 0
     previous_snapshot = _task_snapshot(store)
+    seen_unsupported_types: set[str] = set()
 
     try:
         while True:
@@ -370,6 +388,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 max_iterations=max_iterations,
                 dry_run=dry_run,
                 log=log,
+                seen_unsupported_types=seen_unsupported_types,
             )
 
             current_snapshot = _task_snapshot(store)

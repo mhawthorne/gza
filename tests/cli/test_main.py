@@ -156,6 +156,48 @@ class TestCommandAliases:
         assert rc == 0
         cmd_iterate.assert_called_once()
 
+    def test_watch_dispatches_to_cmd_watch(self, tmp_path):
+        """`watch` command should parse args and dispatch to cmd_watch."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "watch", "--batch", "2", "--project", str(tmp_path)]),
+            patch("gza.cli.main.cmd_watch", return_value=0) as cmd_watch,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_watch.assert_called_once()
+        args = cmd_watch.call_args.args[0]
+        assert args.command == "watch"
+        assert args.batch == 2
+
+    @pytest.mark.parametrize("queue_action", ["bump", "unbump"])
+    def test_queue_subcommands_dispatch_to_cmd_queue(self, tmp_path, queue_action):
+        """`queue bump|unbump` should parse subcommand shape and route to cmd_queue."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["gza", "queue", queue_action, "test-project-1", "--project", str(tmp_path)],
+            ),
+            patch("gza.cli.main.cmd_queue", return_value=0) as cmd_queue,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_queue.assert_called_once()
+        args = cmd_queue.call_args.args[0]
+        assert args.command == "queue"
+        assert args.queue_action == queue_action
+        assert args.task_id == "test-project-1"
+
 
 class TestWorkForceBackgroundDispatch:
     """Command-level regression tests for work --force dispatch and propagation."""
