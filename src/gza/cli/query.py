@@ -36,7 +36,7 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
-from ..git import Git
+from ..git import Git, GitError
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
     TaskLineageNode,
@@ -1481,6 +1481,23 @@ def cmd_show(args: argparse.Namespace) -> int:
         return _cmd_show_output(task, args, config, store)
 
 
+def _find_active_worktree_path_for_branch(config: Config, branch: str) -> Path | None:
+    """Return active worktree path for a branch, if one is currently registered."""
+    try:
+        git = Git(config.project_dir)
+        worktrees = git.worktree_list()
+    except (GitError, OSError):
+        return None
+
+    for wt in worktrees:
+        wt_branch = wt.get("branch", "")
+        if wt_branch == f"refs/heads/{branch}" or wt_branch == branch:
+            wt_path = wt.get("path")
+            if wt_path:
+                return Path(wt_path)
+    return None
+
+
 def _cmd_show_output(
     task: DbTask,
     args: argparse.Namespace,
@@ -1533,6 +1550,9 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Skip Learnings:[/{c['label']}] [green]yes[/green]")
     if task.branch:
         console.print(f"[{c['label']}]Branch:[/{c['label']}] [{c['branch']}]{task.branch}[/{c['branch']}]")
+        active_worktree_path = _find_active_worktree_path_for_branch(config, task.branch)
+        if active_worktree_path:
+            console.print(f"[{c['label']}]Worktree:[/{c['label']}] [{c['value']}]{active_worktree_path}[/{c['value']}]")
     if task.log_file:
         console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{task.log_file}[/{c['value']}]")
     if task.report_file:

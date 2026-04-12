@@ -398,10 +398,10 @@ def cmd_tv(args: argparse.Namespace) -> int:
 
                 # Refresh task metadata
                 for i in range(len(tasks)):
-                    tid = tasks[i].id
-                    if tid is None:
+                    current_task_id = tasks[i].id
+                    if current_task_id is None:
                         continue
-                    refreshed = store.get(tid)
+                    refreshed = store.get(current_task_id)
                     if refreshed:
                         tasks[i] = refreshed
 
@@ -410,8 +410,8 @@ def cmd_tv(args: argparse.Namespace) -> int:
 
                 # Re-resolve log paths (may appear after task starts)
                 for i in range(len(tasks)):
-                    lp_current = log_paths[i]
-                    if lp_current is None or not lp_current.exists():
+                    log_path = log_paths[i]
+                    if log_path is None or not log_path.exists():
                         lp, _ = _resolve_task_log_path(config, registry, tasks[i])
                         log_paths[i] = lp
 

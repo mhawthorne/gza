@@ -10,7 +10,14 @@ from unittest.mock import patch
 
 import pytest
 
-from .conftest import make_store, run_gza, setup_config, setup_db_with_tasks, setup_unmerged_env
+from .conftest import (
+    make_store,
+    run_gza,
+    setup_config,
+    setup_db_with_tasks,
+    setup_git_repo_with_task_branch,
+    setup_unmerged_env,
+)
 
 
 class TestHistoryCommand:
@@ -998,6 +1005,41 @@ class TestShowCommand:
         assert "Lineage:" in result.stdout
         assert f"{impl.id}" in result.stdout
         assert f"{review.id}" in result.stdout
+
+    def test_show_displays_active_worktree_path_for_task_branch(self, tmp_path: Path):
+        """Show command includes active worktree path when task branch is checked out in a worktree."""
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path,
+            task_prompt="Task with worktree",
+            branch_name="feature/show-worktree",
+            worktree_name="show-worktree",
+        )
+        assert task.id is not None
+        assert worktree_path is not None
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Branch: feature/show-worktree" in result.stdout
+        compact_output = "".join(result.stdout.split())
+        assert f"Worktree: {worktree_path}".replace(" ", "") in compact_output
+
+    def test_show_omits_worktree_path_when_branch_has_no_active_worktree(self, tmp_path: Path):
+        """Show command omits worktree line when no active worktree is registered for the task branch."""
+        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+            tmp_path,
+            task_prompt="Task without active worktree",
+            branch_name="feature/no-worktree",
+            worktree_name=None,
+        )
+        assert task.id is not None
+        assert worktree_path is None
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Branch: feature/no-worktree" in result.stdout
+        assert "Worktree:" not in result.stdout
 
     def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
         """Failed task output includes reason, limits, context, and next-step commands."""
