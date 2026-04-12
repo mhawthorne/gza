@@ -233,7 +233,7 @@ claude:
 
 ### Tmux Sessions
 
-Background tasks run inside tmux sessions so you can attach to observe or take interactive control. See [Tmux Sessions](tmux.md) for full details on attach/detach workflow, provider behavior, and safety timeouts.
+Tmux behavior is provider-specific. By default, Claude background workers run in pipe mode (no tmux proxy), while Codex/Gemini can run in tmux when enabled. Claude interactive attach still uses tmux for kill/resume handoff sessions. Set `GZA_ENABLE_TMUX_PROXY=1` to force legacy Claude tmux proxy mode. See [Tmux Sessions](tmux.md) for full details.
 
 ```yaml
 tmux:
@@ -578,7 +578,7 @@ gza status
 
 ### attach
 
-Attach to a running task's tmux session. See [Tmux Sessions](tmux.md) for details.
+Attach to a running task. Claude uses an interactive kill/resume handoff session; Codex/Gemini attach read-only. See [Tmux Sessions](tmux.md) for details.
 
 ```bash
 gza attach <worker_id_or_task_id>

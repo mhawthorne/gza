@@ -282,6 +282,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     store = get_store(config)
     explicit_task_id = task_id
     selected_task: DbTask | None = None
+    resume_mode = bool(getattr(args, "resume", False))
 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
@@ -289,17 +290,31 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print(f"Error: Task {explicit_task_id} not found")
             return 1
 
-        if task.status != "pending":
-            print(f"Error: Task {explicit_task_id} is not pending (status: {task.status})")
-            return 1
+        if resume_mode:
+            if task.status not in ("pending", "failed"):
+                print(
+                    f"Error: Task {explicit_task_id} is not resumable "
+                    f"(status: {task.status})"
+                )
+                return 1
+            if not task.session_id:
+                print(f"Error: Task {explicit_task_id} has no session ID (cannot resume)")
+                return 1
+        else:
+            if task.status != "pending":
+                print(f"Error: Task {explicit_task_id} is not pending (status: {task.status})")
+                return 1
 
-        # Check if task is blocked
-        is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
-        if is_blocked:
-            print(f"Error: Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})")
-            return 1
+            # Check if task is blocked
+            is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
+            if is_blocked:
+                print(f"Error: Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})")
+                return 1
         selected_task = task
     else:
+        if resume_mode:
+            print("Error: Cannot resume without specifying a task ID")
+            return 1
         # Select a candidate for UX; actual claim happens in the child runner.
         selected_task = store.get_next_pending()
         if not selected_task:
@@ -314,6 +329,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         "work",
         "--worker-mode",
     ]
+    if resume_mode:
+        inner_cmd.append("--resume")
 
     if explicit_task_id is not None:
         inner_cmd.append(str(explicit_task_id))
@@ -327,7 +344,14 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     # Add project directory
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
 
+    provider_name = (selected_task.provider or config.provider or "claude").lower()
+    # The proxy-based tmux auto-accept flow is superseded for Claude attach.
+    # Keep a compatibility escape hatch for testing or emergency fallback.
+    legacy_tmux_proxy = os.environ.get("GZA_ENABLE_TMUX_PROXY", "").strip() == "1"
     use_tmux = config.tmux.enabled
+    if use_tmux and provider_name == "claude" and not legacy_tmux_proxy:
+        use_tmux = False
+
     if use_tmux:
         # Verify tmux binary is present; fall back to bare subprocess if not available
         if shutil.which("tmux") is None:
@@ -513,6 +537,12 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     if hasattr(args, "tmux_session") and args.tmux_session:
         config.tmux.session_name = args.tmux_session
 
+    previous_worker_id = os.environ.get("GZA_WORKER_ID")
+    previous_worker_mode = os.environ.get("GZA_WORKER_MODE")
+    if worker_id:
+        os.environ["GZA_WORKER_ID"] = worker_id
+        os.environ["GZA_WORKER_MODE"] = "1"
+
     try:
         if startup_log_path:
             startup_log_path.write_text(
@@ -554,6 +584,15 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         if worker_id:
             registry.mark_completed(worker_id, exit_code=1, status="failed")
         return 1
+    finally:
+        if previous_worker_id is None:
+            os.environ.pop("GZA_WORKER_ID", None)
+        else:
+            os.environ["GZA_WORKER_ID"] = previous_worker_id
+        if previous_worker_mode is None:
+            os.environ.pop("GZA_WORKER_MODE", None)
+        else:
+            os.environ["GZA_WORKER_MODE"] = previous_worker_mode
 
 
 def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: str, quiet: bool = False) -> int:
@@ -717,6 +756,19 @@ def format_stats(task: DbTask) -> str:
     resolved_steps = get_task_step_count(task)
     if resolved_steps is not None:
         parts.append(f"{resolved_steps} steps")
+    if task.attach_count:
+        attach_part = f"{task.attach_count} attach"
+        if task.attach_count != 1:
+            attach_part += "es"
+        if task.attach_duration_seconds:
+            attach_secs = task.attach_duration_seconds
+            if attach_secs < 60:
+                attach_part += f" ({attach_secs:.0f}s)"
+            else:
+                mins = int(attach_secs // 60)
+                secs = int(attach_secs % 60)
+                attach_part += f" ({mins}m{secs}s)"
+        parts.append(attach_part)
     if task.cost_usd is not None:
         parts.append(f"${task.cost_usd:.4f}")
     return " | ".join(parts) if parts else ""

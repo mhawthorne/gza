@@ -3,6 +3,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -86,6 +87,21 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "--unimplemented" in result.stdout
         assert "--plans" not in result.stdout
+
+    def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
+        """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
+        setup_config(tmp_path)
+
+        result = run_gza("--help", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "interactive for Claude" in result.stdout
+        assert "observe-only for Codex/Gemini" in result.stdout
+
+        tmux_docs = Path("docs/tmux.md").read_text()
+        config_docs = Path("docs/configuration.md").read_text()
+        assert "GZA_ENABLE_TMUX_PROXY=1" in tmux_docs
+        assert "Normal interactive Claude exit also auto-resumes in background." in tmux_docs
+        assert "Attach to a running task." in config_docs
 
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""

@@ -62,6 +62,26 @@ def write_log_entry(log_file: "Path", entry: dict) -> None:
         logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
 
 
+def write_worker_start_event(log_file: "Path", *, resumed: bool) -> None:
+    """Write a worker start lifecycle event when running under worker mode."""
+    if os.environ.get("GZA_WORKER_MODE") != "1":
+        return
+    worker_id = os.environ.get("GZA_WORKER_ID")
+    if not worker_id:
+        return
+    mode = "pipe mode, resumed" if resumed else "pipe mode"
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "worker_lifecycle",
+            "event": "start",
+            "worker_id": worker_id,
+            "message": f"Worker {worker_id} started ({mode})",
+        },
+    )
+
+
 def extract_content_from_log(log_file: "Path") -> str | None:
     """Scan a JSONL log file for a provider 'result' entry and return its text.
 
@@ -1877,6 +1897,7 @@ def _run_inner(
     store.update(task)
 
     # Write orchestration pre-run entries
+    write_worker_start_event(log_file, resumed=resume)
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
@@ -2061,6 +2082,7 @@ def _run_non_code_task(
     store.update(task)
 
     # Write orchestration pre-run entries
+    write_worker_start_event(log_file, resumed=resume)
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
 

@@ -5,11 +5,14 @@ Covers: next, history, unmerged, groups, status, ps, kill, delete, show, attach.
 
 import argparse
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from rich.markup import escape as rich_escape
 
@@ -42,7 +45,7 @@ from ..query import (
     get_reviews_for_root as _get_reviews_for_root_task,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
-from ..runner import _get_task_output, get_effective_config_for_task
+from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     TASK_COLORS,
@@ -50,6 +53,7 @@ from ._common import (
     _failure_summary,
     _format_lineage,
     _parse_iso,
+    _spawn_background_worker,
     format_stats,
     get_review_verdict,
     get_store,
@@ -1578,8 +1582,138 @@ _INTERACTIVE_PROVIDERS = {"claude"}
 _OBSERVE_ONLY_PROVIDERS = {"codex", "gemini"}
 
 
+def _task_log_file_path(config: Config, task: DbTask) -> Path | None:
+    if not task.log_file:
+        return None
+    return config.project_dir / task.log_file
+
+
+def _build_resume_worker_args(*, no_docker: bool, max_turns: int | None) -> argparse.Namespace:
+    return argparse.Namespace(
+        no_docker=no_docker,
+        max_turns=max_turns,
+        resume=True,
+    )
+
+
+def _infer_resume_overrides_from_worker(worker: WorkerMetadata) -> tuple[bool, int | None]:
+    """Best-effort parse of current worker CLI args for resume handoff parity.
+
+    Uses ``ps -p <pid> -o args=`` which works on both macOS and Linux.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(worker.pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return (False, None)
+    if result.returncode != 0 or not result.stdout.strip():
+        return (False, None)
+
+    args = result.stdout.strip().split()
+    no_docker = "--no-docker" in args
+    max_turns: int | None = None
+    for index, arg in enumerate(args):
+        if arg == "--max-turns" and index + 1 < len(args):
+            try:
+                max_turns = int(args[index + 1])
+            except ValueError:
+                max_turns = None
+            break
+        if arg.startswith("--max-turns="):
+            try:
+                max_turns = int(arg.split("=", 1)[1])
+            except ValueError:
+                max_turns = None
+            break
+    return (no_docker, max_turns)
+
+
+def _stop_worker_for_attach(task: DbTask, worker: WorkerMetadata, registry: WorkerRegistry) -> bool:
+    """Stop a running worker process without marking the task failed."""
+    pid = worker.pid
+
+    def _pid_exists() -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"✗ Failed to stop worker {worker.worker_id}: {exc}")
+        return False
+
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+            time.sleep(0.1)
+        except OSError:
+            break
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError as exc:
+            print(f"✗ Failed to force-stop worker {worker.worker_id}: {exc}")
+            return False
+
+    # Confirm the worker process is truly gone before mutating task/registry state.
+    force_deadline = time.time() + 1
+    while time.time() < force_deadline:
+        if not _pid_exists():
+            break
+        time.sleep(0.05)
+    else:
+        if _pid_exists():
+            print(f"✗ Worker {worker.worker_id} is still running; aborting attach handoff.")
+            return False
+
+    registry.mark_completed(
+        worker.worker_id,
+        exit_code=0,
+        status="completed",
+        completion_reason="stopped_for_attach",
+    )
+    task.running_pid = None
+    if task.status == "in_progress":
+        task.status = "pending"
+        task.completed_at = None
+        task.failure_reason = None
+    return True
+
+
+def _preflight_attach_session(
+    session_name: str,
+    *,
+    cols: int,
+    rows: int,
+) -> str | None:
+    """Validate tmux availability and ability to create the attach session."""
+    if shutil.which("tmux") is None:
+        return "tmux is not installed; install tmux to use interactive attach."
+
+    subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
+    probe_result = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session_name, "-x", str(cols), "-y", str(rows), "--", "sh", "-lc", "exit 0"],
+        capture_output=True,
+        text=True,
+    )
+    if probe_result.returncode != 0:
+        stderr = probe_result.stderr.strip()
+        return stderr or "unknown tmux error"
+
+    subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
+    return None
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
-    """Attach to a running task's tmux session."""
+    """Attach to a running task."""
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
@@ -1605,50 +1739,39 @@ def cmd_attach(args: argparse.Namespace) -> int:
         print(f"Worker {worker.worker_id} has no associated task ID")
         return 1
 
-    session_name = worker.tmux_session or f"gza-{worker.task_id}"
-
-    # Verify the tmux session exists
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", session_name],
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        print(f"No tmux session found: {session_name}")
-        if not worker.is_background:
-            print("Foreground tasks (gza work without -b) don't use tmux sessions.")
-            print("Use -b to run tasks in the background with tmux attach support.")
-        else:
-            print("This task may have been started without tmux support.")
+    # Determine provider to decide attach mode.
+    task = store.get(worker.task_id)
+    if task is None:
+        print(f"Task not found: {worker.task_id}")
         return 1
 
-    # Determine provider to decide attach mode
-    task = store.get(worker.task_id)
     provider_name = "claude"
-    if task is not None:
-        provider_name = (task.provider or config.provider or "claude").lower()
+    provider_name = (task.provider or config.provider or "claude").lower()
 
     # When already inside tmux, use switch-client instead of attach-session
     # to avoid the "sessions should be nested with care" error.
     inside_tmux = bool(os.environ.get("TMUX"))
 
-    if inside_tmux:
-        # When task ends and its session is destroyed, switch back to the
-        # previous session instead of detaching from tmux entirely.
-        # Scoped to the task session (not -g) to avoid mutating global config.
-        # Requires tmux 3.2+ for session-level detach-on-destroy.
-        dod_result = subprocess.run(
-            ["tmux", "set-option", "-t", session_name,
-             "detach-on-destroy", "previous"],
+    if provider_name in _OBSERVE_ONLY_PROVIDERS:
+        session_name = worker.tmux_session or f"gza-{worker.task_id}"
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
             capture_output=True,
         )
-        if dod_result.returncode != 0:
-            print(
-                "Warning: could not set detach-on-destroy on task session. "
-                "When the task ends you may be detached from tmux.",
-                file=sys.stderr,
+        if result.returncode != 0:
+            print(f"No tmux session found: {session_name}")
+            return 1
+        if inside_tmux:
+            dod_result = subprocess.run(
+                ["tmux", "set-option", "-t", session_name, "detach-on-destroy", "previous"],
+                capture_output=True,
             )
-
-    if provider_name in _OBSERVE_ONLY_PROVIDERS:
+            if dod_result.returncode != 0:
+                print(
+                    "Warning: could not set detach-on-destroy on task session. "
+                    "When the task ends you may be detached from tmux.",
+                    file=sys.stderr,
+                )
         print(f"Attaching to task {worker.task_id} (provider: {provider_name})...")
         print(
             f"Note: {provider_name.title()} runs in headless mode. You can observe"
@@ -1662,13 +1785,135 @@ def cmd_attach(args: argparse.Namespace) -> int:
             os.execvp("tmux", ["tmux", "switch-client", "-r", "-t", session_name])
         else:
             os.execvp("tmux", ["tmux", "attach-session", "-r", "-t", session_name])
+
+    if provider_name not in _INTERACTIVE_PROVIDERS:
+        print(f"Error: Interactive attach is not supported for provider '{provider_name}'")
+        return 1
+
+    if not task.session_id:
+        print(f"Error: Task {task.id} has no session ID (cannot attach interactively)")
+        return 1
+
+    session_name = f"gza-attach-{task.id}"
+    cols, rows = config.tmux.terminal_size
+    resume_no_docker, resume_max_turns = _infer_resume_overrides_from_worker(worker)
+    wrapper_cmd = [
+        sys.executable,
+        "-m",
+        "gza.attach_wrapper",
+        "--task-id",
+        str(task.id),
+        "--session-id",
+        task.session_id,
+        "--project",
+        str(config.project_dir.absolute()),
+    ]
+    if resume_no_docker:
+        wrapper_cmd.append("--no-docker")
+    if resume_max_turns is not None:
+        wrapper_cmd.extend(["--max-turns", str(resume_max_turns)])
+    preflight_err = _preflight_attach_session(session_name, cols=cols, rows=rows)
+    if preflight_err:
+        print(f"Error: failed to create interactive tmux session: {preflight_err}")
+        return 1
+
+    if not _stop_worker_for_attach(task, worker, registry):
+        return 1
+    store.update(task)
+
+    log_path = _task_log_file_path(config, task)
+    if log_path is not None:
+        write_log_entry(
+            log_path,
+            {
+                "type": "gza",
+                "subtype": "worker_lifecycle",
+                "event": "stop",
+                "worker_id": worker.worker_id,
+                "message": f"Worker {worker.worker_id} stopped (interactive attach)",
+                "reason": "stopped_for_attach",
+            },
+        )
+
+    subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
+    create_result = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session_name, "-x", str(cols), "-y", str(rows), "--", *wrapper_cmd],
+        capture_output=True,
+        text=True,
+    )
+    if create_result.returncode != 0:
+        create_stderr = create_result.stderr.strip()
+        print(f"Error: failed to create interactive tmux session: {create_stderr}")
+        recovery_args = _build_resume_worker_args(
+            no_docker=resume_no_docker,
+            max_turns=resume_max_turns,
+        )
+        recovery_rc = _spawn_background_worker(
+            recovery_args,
+            config,
+            task_id=task.id,
+            quiet=True,
+        )
+        if recovery_rc == 0:
+            print(f"Recovered: background worker restarted for task {task.id}.")
+            return 1
+
+        print("Recovery failed: unable to restart the background worker.")
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            branch=task.branch,
+            has_commits=bool(task.has_commits),
+            failure_reason="WORKER_DIED",
+        )
+        if log_path is not None:
+            write_log_entry(
+                log_path,
+                {
+                    "type": "gza",
+                    "subtype": "worker_lifecycle",
+                    "event": "handoff_failed",
+                    "message": (
+                        "Interactive attach handoff failed: tmux session creation "
+                        "and background recovery both failed; task marked failed."
+                    ),
+                    "reason": "WORKER_DIED",
+                    "tmux_error": create_stderr,
+                    "recovery_exit_code": recovery_rc,
+                },
+            )
+        return 1
+
+    if log_path is not None:
+        subprocess.run(
+            [
+                "tmux",
+                "pipe-pane",
+                "-t",
+                session_name,
+                f"cat >> {shlex.quote(str(log_path))}",
+            ],
+            capture_output=True,
+        )
+
+    subprocess.run(["tmux", "set-option", "-t", session_name, "remain-on-exit", "off"], capture_output=True)
+    subprocess.run(
+        ["tmux", "set-hook", "-t", session_name, "client-detached", f"kill-session -t {session_name}"],
+        capture_output=True,
+    )
+    if inside_tmux:
+        subprocess.run(
+            ["tmux", "set-option", "-t", session_name, "detach-on-destroy", "previous"],
+            capture_output=True,
+        )
+
+    print(f"Attaching to task {task.id} (provider: {provider_name})...")
+    print("Worker stopped. Interactive Claude session is live.")
+    print("Detach with Ctrl-B D or exit Claude normally to auto-resume in background.")
+    print()
+    if inside_tmux:
+        os.execvp("tmux", ["tmux", "switch-client", "-t", session_name])
     else:
-        print(f"Attaching to task {worker.task_id} (provider: {provider_name})...")
-        print("You have full interactive control. Ctrl-B D to detach.")
-        print()
-        if inside_tmux:
-            os.execvp("tmux", ["tmux", "switch-client", "-t", session_name])
-        else:
-            os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
+        os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
 
     return 0  # unreachable after execvp but satisfies the return type

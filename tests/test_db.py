@@ -3636,7 +3636,7 @@ class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
     def test_check_migration_status_on_v24_db(self, tmp_path: Path) -> None:
-        """check_migration_status on a v24 DB reports pending_manual=[25, 26, 27]."""
+        """check_migration_status on a v24 DB reports pending_manual=[25, 26, 27] and pending_auto=[28]."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
 
@@ -3644,20 +3644,27 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == []
+        assert status["pending_auto"] == [28]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
-        """check_migration_status on a fully-migrated DB reports no pending migrations."""
+        """After manual migrations, auto v28 is still pending until SqliteTaskStore runs."""
         db_path = tmp_path / "test.db"
         _make_v24_db(db_path)
         _run_v25_v26_v27_migrations(db_path, "gza")
 
         status = check_migration_status(db_path)
 
-        assert status["current_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == []
+        assert status["current_version"] == 27
+        assert status["pending_auto"] == [28]
         assert status["pending_manual"] == []
+
+        # Constructing SqliteTaskStore triggers auto-migration to v28
+        SqliteTaskStore(db_path, prefix="gza")
+        status_after = check_migration_status(db_path)
+        assert status_after["current_version"] == SCHEMA_VERSION
+        assert status_after["pending_auto"] == []
+        assert status_after["pending_manual"] == []
 
     def test_preview_v25_migration_shows_samples(self, tmp_path: Path) -> None:
         """preview_v25_migration returns correct task_count and sample ID conversions."""
@@ -3946,6 +3953,111 @@ class TestMigrationUtilityFunctions:
             assert "-" in old_id and "-" in new_id
             assert new_id.rsplit("-", 1)[-1].isdigit()
 
+    def test_auto_migration_v27_to_v28_adds_attach_columns(self, tmp_path: Path) -> None:
+        """Opening a v27 DB with SqliteTaskStore auto-migrates to v28, adding attach columns.
+
+        Note: the v27 manual migration's CREATE TABLE already includes the columns,
+        so this test verifies the version bump and that record_attach_session works.
+        For pre-v27 DBs that somehow reached v27 without the columns, the ALTER TABLE
+        in the v28 migration adds them (OperationalError for duplicates is silently ignored).
+        """
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+        _run_v25_v26_v27_migrations(db_path, "gza")
+
+        # Verify DB is at v27
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        conn.close()
+        assert version == 27
+
+        # SqliteTaskStore auto-migrates to v28
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 28
+        assert "attach_count" in columns
+        assert "attach_duration_seconds" in columns
+
+        # store.update() should succeed
+        task = store.get("gza-1")
+        if task is None:
+            task = store.add("test v28 migration")
+        store.update(task)
+
+        # record_attach_session should work on migrated DB
+        store.record_attach_session(task, 42.5)
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.attach_count == 1
+        assert refreshed.attach_duration_seconds == 42.5
+
+    def test_auto_migration_v27_to_v28_adds_columns_when_missing(self, tmp_path: Path) -> None:
+        """If a v27 DB lacks attach columns (e.g. old v27 CREATE TABLE), v28 migration adds them."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+        _run_v25_v26_v27_migrations(db_path, "gza")
+
+        # Simulate a v27 DB where attach columns are missing by dropping them
+        conn = sqlite3.connect(db_path)
+        # SQLite doesn't support DROP COLUMN easily; recreate without the columns
+        conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+        # Get existing columns minus attach ones
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
+        kept_cols = [c for c in cols if c not in ("attach_count", "attach_duration_seconds")]
+        _quote = lambda c: f'"{c}"' if c in ("group",) else c
+        cols_str = ", ".join(_quote(c) for c in kept_cols)
+        # Recreate with same columns minus attach
+        col_defs = []
+        for row in conn.execute("PRAGMA table_info(tasks_old)"):
+            if row[1] in ("attach_count", "attach_duration_seconds"):
+                continue
+            name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+            quoted_name = f'"{name}"' if name in ("group",) else name
+            parts = [quoted_name, typ]
+            if pk:
+                parts.append("PRIMARY KEY")
+            if notnull and not pk:
+                parts.append("NOT NULL")
+            if dflt is not None:
+                parts.append(f"DEFAULT {dflt}")
+            col_defs.append(" ".join(parts))
+        conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
+        conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
+        conn.execute("DROP TABLE tasks_old")
+        conn.commit()
+
+        # Confirm attach columns are missing
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert "attach_count" not in columns
+        conn.close()
+
+        # SqliteTaskStore auto-migrates: ALTER TABLE ADD COLUMN succeeds
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == 28
+        assert "attach_count" in columns
+        assert "attach_duration_seconds" in columns
+
+        task = store.add("test missing columns")
+        store.record_attach_session(task, 10.0)
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.attach_count == 1
+
     def test_run_v27_migration_drops_cycle_schema_and_preserves_task_data(self, tmp_path: Path) -> None:
         import sqlite3
 
@@ -4021,9 +4133,14 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
+        assert status["pending_auto"] == [28]
 
+        # SqliteTaskStore auto-migrates to v28
         store = SqliteTaskStore(db_path, prefix="gza")
         child = store.get("gza-2")
         assert child is not None
         assert child.based_on == "gza-1"
         assert child.depends_on == "gza-1"
+
+        status_after = check_migration_status(db_path)
+        assert status_after["current_version"] == SCHEMA_VERSION

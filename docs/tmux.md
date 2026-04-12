@@ -1,25 +1,20 @@
 # Tmux Sessions
 
-Gza runs every background task inside a tmux session. This means you can attach to any running task to observe or take interactive control, without needing to decide upfront which tasks might need intervention.
+Tmux behavior is provider-specific:
+
+- Claude background workers default to pipe mode (no tmux proxy).
+- Codex and Gemini background workers can run in tmux when `tmux.enabled: true`.
+- Claude interactive attach uses a dedicated tmux session that performs a kill/resume handoff.
 
 ## How It Works
 
-Each background task launches inside a tmux session with a proxy process (`gza-tmux-proxy`) sitting between the terminal and Claude Code. Claude runs in **interactive mode** (not `-p` print mode), and the proxy auto-accepts tool prompts when no human is attached.
+By default, Claude background execution does not use `gza-tmux-proxy`. `gza attach` for Claude now:
 
-```
-tmux session: gza-{task_id}
-┌───────────────────────────────────┐
-│  gza-tmux-proxy  ◄──►  claude    │
-│       │              (interactive)│
-│   [if attached]                   │
-│       ▼                           │
-│  human terminal                   │
-└───────────────────────────────────┘
-```
-
-**Detached (default):** The proxy monitors for output quiescence. When Claude stops producing output for `auto_accept_timeout` seconds (default: 10), the proxy sends Enter to accept the pending tool prompt. The task runs fully autonomously.
-
-**Attached:** When you connect via `gza attach`, the proxy detects a tmux client and stops auto-accepting. You get the full Claude Code interactive TUI and can type messages, approve or deny tool calls, or redirect the approach. Ctrl-B D to detach.
+1. Preflights tmux session creation.
+2. Stops the running Claude worker.
+3. Launches `gza.attach_wrapper` in a fresh tmux session.
+4. Runs `claude --resume <session_id>` interactively.
+5. On tmux detach (`Ctrl-B D`), auto-resumes background pipe-mode execution.
 
 ## Attaching to a Task
 
@@ -32,17 +27,13 @@ gza attach w-20260301-143025
 ```
 
 When you attach:
-1. Auto-accept stops immediately — you have full control
-2. You see the live Claude Code interface
-3. You can type messages, approve/deny tools, guide the task
-4. Ctrl-B D to detach and return to autonomous mode
+1. Claude: current worker is stopped and replaced by an interactive resume session.
+2. Codex/Gemini: attach is read-only observe mode.
+3. You can type only in Claude interactive attach sessions.
 
-When you detach:
-1. A grace period starts (`detach_grace` seconds, default: 5)
-2. After the grace period, auto-accept resumes
-3. The task continues autonomously
-
-The grace period prevents accidental auto-accepts if you briefly disconnect and want to reattach.
+For Claude:
+- `Ctrl-B D` (detach) auto-resumes in background.
+- Normal interactive Claude exit also auto-resumes in background.
 
 ### Attaching from inside tmux
 
@@ -50,13 +41,11 @@ If you're already in a tmux session, `gza attach` uses `tmux switch-client` inst
 
 This requires tmux 3.2+ for the automatic switch-back. On older versions, you'll be detached from tmux when the task session ends.
 
-## Safety Timeouts
+## Claude Proxy Compatibility Mode
 
-The proxy has two layers of protection against hung sessions:
+Set `GZA_ENABLE_TMUX_PROXY=1` to force legacy Claude tmux proxy behavior.
 
-**Auto-accept timeout** (`auto_accept_timeout`, default: 10s): When detached and no output for this duration, sends Enter to accept a pending prompt. This is the normal autonomous operation.
-
-**Max idle timeout** (`max_idle_timeout`, default: 300s): When detached and no output for this duration, the proxy assumes the session is stuck. It sends Ctrl-C, then EOF, and exits. The task is marked failed with a `stuck_idle` reason.
+In compatibility mode, Claude background workers run through `gza-tmux-proxy` and `detach_grace` applies to proxy auto-accept behavior.
 
 ## Provider Behavior
 
@@ -64,7 +53,7 @@ Tmux attach works differently depending on the AI provider:
 
 | Provider | Attach Mode | What You Can Do |
 |----------|-------------|-----------------|
-| Claude | Interactive | Type messages, approve/deny tools, redirect approach |
+| Claude | Interactive kill/resume handoff | Type messages, approve/deny tools, redirect approach |
 | Codex | Observe only | Watch terminal output (read-only) |
 | Gemini | Observe only | Watch terminal output (read-only) |
 
@@ -84,21 +73,22 @@ Configure tmux behavior in `gza.yaml`:
 
 ```yaml
 tmux:
-  enabled: true              # default: true
+  enabled: true              # default: false
   auto_accept_timeout: 10    # seconds before auto-accept when detached
   max_idle_timeout: 300      # seconds before assuming stuck (5 min)
   detach_grace: 5            # seconds after detach before auto-accept resumes
   terminal_size: [200, 50]   # [columns, rows]
 ```
 
-Tmux sessions are opt-in. Set `tmux.enabled: true` in your `gza.yaml` to enable them. See the [configuration reference](configuration.md) for all options.
+Tmux sessions are opt-in (`tmux.enabled: true`). For Claude, this mainly affects compatibility proxy mode (`GZA_ENABLE_TMUX_PROXY=1`) and interactive attach session sizing.
 
 ## Log Capture
 
 In tmux mode, log capture works differently from print mode:
 
 - **Terminal output** is captured via `tmux pipe-pane` to `.gza/logs/{task_id}.log`
-- **Proxy events** (auto-accepts, attach/detach, timeouts) are logged to `.gza/logs/{task_id}-proxy.log` in JSONL format
+- **Worker lifecycle events** (start/stop/attach/detach/resume) are logged in `.gza/logs/{task_id}.log` as JSONL entries
+- **Proxy events** (when using compatibility mode) are logged to `.gza/logs/{task_id}-proxy.log`
 - **`gza log`** tails the raw terminal capture, or you can `gza attach` for the live view
 
 ## Requirements

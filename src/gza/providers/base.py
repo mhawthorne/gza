@@ -226,6 +226,7 @@ def build_docker_cmd(
     timeout_minutes: int,
     docker_volumes: list[str] | None = None,
     docker_setup_command: str = "",
+    interactive: bool = False,
 ) -> list[str]:
     """Build the base Docker run command.
 
@@ -235,13 +236,16 @@ def build_docker_cmd(
         timeout_minutes: Timeout in minutes
         docker_volumes: Optional list of custom volume mounts (e.g., ["/host:/container:ro"])
         docker_setup_command: Optional setup command to run inside container before CLI starts
+        interactive: If True, allocate a TTY (-it) for interactive use (e.g. attach handoff).
+            When False, attach only stdin (-i) which is required for streaming-json pipe mode.
 
     Returns:
         List of command arguments (without the actual CLI command)
     """
+    stdio_flag = "-it" if interactive else "-i"
     cmd = [
         "timeout", f"{timeout_minutes}m",
-        "docker", "run", "--rm", "-i",
+        "docker", "run", "--rm", stdio_flag,
         "-v", f"{work_dir}:/workspace",
         "-w", "/workspace",
     ]
