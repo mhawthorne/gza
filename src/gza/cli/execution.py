@@ -1192,6 +1192,47 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             ),
         )
 
+    def _latest_completed_review(reviews: list[DbTask]) -> DbTask | None:
+        completed = [review for review in reviews if review.status == "completed"]
+        if not completed:
+            return None
+        return max(
+            completed,
+            key=lambda review: (
+                review.completed_at or datetime.min,
+                review.created_at or datetime.min,
+                task_id_numeric_key(review.id),
+            ),
+        )
+
+    def _latest_completed_improve_since_review(reviews: list[DbTask]) -> DbTask | None:
+        assert impl_task.id is not None
+        latest_completed_review = _latest_completed_review(reviews)
+        if latest_completed_review is None or latest_completed_review.completed_at is None:
+            return None
+        review_cleared_at = impl_task.review_cleared_at
+        if review_cleared_at is None or review_cleared_at < latest_completed_review.completed_at:
+            return None
+
+        improves = store.get_improve_tasks_by_root(impl_task.id)
+        completed_improves = [
+            improve
+            for improve in improves
+            if improve.status == "completed"
+            and improve.completed_at is not None
+            and improve.completed_at > latest_completed_review.completed_at
+        ]
+        if not completed_improves:
+            return None
+        return max(
+            completed_improves,
+            key=lambda improve: (
+                improve.completed_at or datetime.min,
+                improve.created_at or datetime.min,
+                task_id_numeric_key(improve.id),
+            ),
+        )
+
     latest_review: DbTask | None = None
     latest_verdict: str | None = None
     start_with_new_improve = False
@@ -1352,13 +1393,15 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     summary_rows: list[IterateSummaryRow] = []
     iteration_one_write_task = initial_write_task
     if iteration_one_write_task is None and queued_improve is None and impl_task.status == "completed":
-        # Iteration 1 is always the implementation write, even when it completed before this invocation.
-        iteration_one_write_task = impl_task
+        # Iteration 1 starts from the current write state.
+        # If the latest completed review was cleared and a newer completed improve exists,
+        # the improve is the write now awaiting review.
+        iteration_one_write_task = _latest_completed_improve_since_review(reviews) or impl_task
     if iteration_one_write_task is not None:
         _append_summary_row(
             summary_rows,
             iteration_index=0,
-            task_type="implement",
+            task_type=iteration_one_write_task.task_type,
             task=iteration_one_write_task,
         )
 
