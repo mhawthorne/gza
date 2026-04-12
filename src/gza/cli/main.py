@@ -954,7 +954,7 @@ def main() -> int:
             help="Full prefixed implementation task ID to iterate (e.g. 'gza-1234')",
         )
         iterate_parser.add_argument(
-            "--max-iterations",
+            "-i", "--max-iterations",
             type=int,
             default=3,
             dest="max_iterations",
@@ -972,14 +972,28 @@ def main() -> int:
             action="store_true",
             help="Run Claude directly instead of in Docker",
         )
-        # TODO: Phase 1 deferred — add --queue (create chain without running immediately)
-        # and --background flags as specified in the design plan.
+        start_action = iterate_parser.add_mutually_exclusive_group()
+        start_action.add_argument(
+            "--resume",
+            action="store_true",
+            help="Resume a failed task before iterating (picks up where it left off)",
+        )
+        start_action.add_argument(
+            "--retry",
+            action="store_true",
+            help="Retry a failed task before iterating (starts fresh)",
+        )
+        iterate_parser.add_argument(
+            "--background", "-b",
+            action="store_true",
+            help="Run the entire iterate loop in the background",
+        )
         add_common_args(iterate_parser)
 
     # iterate command
     iterate_parser = subparsers.add_parser(
         "iterate",
-        help="Run an automated review/improve loop for a completed implementation task",
+        help="Run an automated review/improve loop for an implementation task (pending, failed, or completed)",
     )
     _add_iterate_args(iterate_parser)
 

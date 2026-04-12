@@ -2758,18 +2758,191 @@ class TestIterateCommand:
         assert result.returncode != 0
         assert "implement" in result.stdout.lower() or "implement" in result.stderr.lower()
 
-    def test_cycle_rejects_incomplete_task(self, tmp_path: Path):
-        """gza iterate rejects implementation tasks that are not completed."""
+    def test_cycle_rejects_in_progress_task(self, tmp_path: Path):
+        """gza iterate rejects implementation tasks that are in_progress."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "in_progress"
+        store.update(impl)
+
+        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "in_progress" in result.stdout or "in_progress" in result.stderr
+
+    def test_pending_impl_runs_first_then_iterates(self, tmp_path: Path):
+        """gza iterate on a pending task runs it first, then enters review/improve loop."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")  # status = 'pending'
+
+        from datetime import datetime
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            # Simulate the impl task completing
+            task = store.get(task_id)
+            if task and task.status == "pending":
+                task.status = "completed"
+                task.completed_at = datetime.now()
+                store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground, \
+             patch("gza.cli._create_review_task") as create_review:
+            # With max_iterations=1 and no existing review, it will run impl then try to create a review
+            # The create_review mock will raise to stop the loop cleanly
+            create_review.side_effect = ValueError("test stop")
+            result = cmd_iterate(args)
+
+        # The first call should be running the pending impl task
+        assert run_foreground.call_count >= 1
+        first_call = run_foreground.call_args_list[0]
+        assert first_call == ((mock_config,), {"task_id": impl.id})
+
+    def test_pending_impl_dry_run(self, tmp_path: Path):
+        """gza iterate --dry-run on a pending task shows it would run the impl first."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")  # status = 'pending'
 
-        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
+        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
+        assert result.returncode == 0
+        assert "pending" in result.stdout.lower()
+        assert "dry-run" in result.stdout.lower()
+
+    def test_failed_task_requires_resume_or_retry(self, tmp_path: Path):
+        """gza iterate on a failed task without --resume or --retry errors."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "failed"
+        store.update(impl)
+
+        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
         assert result.returncode != 0
-        assert "pending" in result.stdout or "pending" in result.stderr
+        assert "--resume" in result.stdout or "--resume" in result.stderr
+        assert "--retry" in result.stdout or "--retry" in result.stderr
+
+    def test_resume_flag_rejected_for_non_failed_task(self, tmp_path: Path):
+        """--resume is only valid for failed tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        result = run_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode != 0
+        output = result.stdout + (result.stderr or "")
+        assert "failed" in output.lower()
+
+    def test_retry_flag_rejected_for_non_failed_task(self, tmp_path: Path):
+        """--retry is only valid for failed tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        result = run_gza("iterate", str(impl.id), "--retry", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode != 0
+        output = result.stdout + (result.stderr or "")
+        assert "failed" in output.lower()
+
+    def test_resume_and_retry_mutually_exclusive(self, tmp_path: Path):
+        """--resume and --retry cannot be used together."""
+        setup_config(tmp_path)
+        result = run_gza("iterate", "testproject-1", "--resume", "--retry", "--project", str(tmp_path))
+        assert result.returncode != 0
+
+    def test_failed_task_retry_dry_run(self, tmp_path: Path):
+        """gza iterate --retry --dry-run on a failed task shows what would happen."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "failed"
+        store.update(impl)
+
+        result = run_gza("iterate", str(impl.id), "--retry", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "dry-run" in result.stdout.lower()
+        assert "retry" in result.stdout.lower()
+
+    def test_failed_task_resume_dry_run(self, tmp_path: Path):
+        """gza iterate --resume --dry-run on a failed task shows what would happen."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "failed"
+        impl.session_id = "some-session"
+        store.update(impl)
+
+        result = run_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "dry-run" in result.stdout.lower()
+        assert "resume" in result.stdout.lower()
+
+    def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path):
+        """gza iterate --retry on a failed task retries it then enters the loop."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+        from datetime import datetime
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "failed"
+        store.update(impl)
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            if task and task.status == "pending":
+                task.status = "completed"
+                task.completed_at = datetime.now()
+                store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        with patch("gza.cli.Config.load", return_value=mock_config), \
+             patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg, \
+             patch("gza.cli._create_review_task") as create_review:
+            create_review.side_effect = ValueError("test stop")
+            cmd_iterate(args)
+
+        # First call should be running the retry task (not the original failed one)
+        assert run_fg.call_count >= 1
+        first_task_id = run_fg.call_args_list[0][1]["task_id"]
+        assert first_task_id != impl.id  # Should be a new task
 
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
