@@ -201,6 +201,38 @@ def test_attach_wrapper_sigint_during_interactive_forwarded_to_child_without_det
     assert detach_events[-1]["reason"] == "exited_ok"
 
 
+def test_attach_wrapper_calls_load_dotenv_before_interactive_claude(tmp_path: Path) -> None:
+    """Attach wrapper must load .env files so API keys are available during interactive session."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+
+    call_order: list[str] = []
+
+    def track_dotenv(project_dir):
+        call_order.append("load_dotenv")
+
+    def track_interactive(*args, **kwargs):
+        call_order.append("interactive_claude")
+        return 0
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper.load_dotenv", side_effect=track_dotenv) as mock_dotenv,
+        patch("gza.attach_wrapper._run_interactive_claude", side_effect=track_interactive),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_dotenv.assert_called_once_with(tmp_path)
+    assert call_order.index("load_dotenv") < call_order.index("interactive_claude"), \
+        "load_dotenv must be called before _run_interactive_claude"
+
+
 def _setup_docker_task(project_dir: Path) -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
         "project_name: test-project\nuse_docker: true\ndocker_image: test-project-gza\n"

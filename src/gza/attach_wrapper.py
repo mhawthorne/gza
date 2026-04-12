@@ -13,7 +13,7 @@ from .cli._common import _spawn_background_worker, get_store
 from .config import Config
 from .providers.base import build_docker_cmd, ensure_docker_image
 from .providers.claude import _get_docker_config, sync_keychain_credentials
-from .runner import write_log_entry
+from .runner import load_dotenv, write_log_entry
 
 
 def _task_log_path(config: Config, task) -> Path | None:
@@ -124,6 +124,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config = Config.load(Path(args.project))
+    load_dotenv(config.project_dir)
     store = get_store(config)
     task = store.get(args.task_id)
     if task is None:

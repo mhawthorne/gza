@@ -508,6 +508,78 @@ class TestCmdAttach:
         assert refreshed.running_pid == 12345
 
 
+class TestInferResumeOverrides:
+    """Tests for _infer_resume_overrides_from_worker (cross-platform ps-based)."""
+
+    def test_parses_no_docker_and_max_turns(self):
+        from gza.cli.query import _infer_resume_overrides_from_worker
+        from gza.workers import WorkerMetadata
+
+        worker = MagicMock(spec=WorkerMetadata)
+        worker.pid = 99999
+
+        fake_result = MagicMock(
+            returncode=0,
+            stdout="gza implement --no-docker --max-turns 42 some-task\n",
+        )
+        with patch("gza.cli.query.subprocess.run", return_value=fake_result) as mock_run:
+            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+
+        assert no_docker is True
+        assert max_turns == 42
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["ps", "-p", "99999", "-o", "args="]
+
+    def test_returns_defaults_when_ps_fails(self):
+        from gza.cli.query import _infer_resume_overrides_from_worker
+        from gza.workers import WorkerMetadata
+
+        worker = MagicMock(spec=WorkerMetadata)
+        worker.pid = 99999
+
+        fake_result = MagicMock(returncode=1, stdout="")
+        with patch("gza.cli.query.subprocess.run", return_value=fake_result):
+            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+
+        assert no_docker is False
+        assert max_turns is None
+
+    def test_returns_defaults_when_no_overrides_in_cmdline(self):
+        from gza.cli.query import _infer_resume_overrides_from_worker
+        from gza.workers import WorkerMetadata
+
+        worker = MagicMock(spec=WorkerMetadata)
+        worker.pid = 99999
+
+        fake_result = MagicMock(
+            returncode=0,
+            stdout="gza implement some-task\n",
+        )
+        with patch("gza.cli.query.subprocess.run", return_value=fake_result):
+            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+
+        assert no_docker is False
+        assert max_turns is None
+
+    def test_parses_max_turns_equals_format(self):
+        from gza.cli.query import _infer_resume_overrides_from_worker
+        from gza.workers import WorkerMetadata
+
+        worker = MagicMock(spec=WorkerMetadata)
+        worker.pid = 99999
+
+        fake_result = MagicMock(
+            returncode=0,
+            stdout="gza implement --max-turns=77 some-task\n",
+        )
+        with patch("gza.cli.query.subprocess.run", return_value=fake_result):
+            no_docker, max_turns = _infer_resume_overrides_from_worker(worker)
+
+        assert no_docker is False
+        assert max_turns == 77
+
+
 class TestSpawnBackgroundWorkerTmux:
     """Tests for tmux integration in _spawn_background_worker."""
 

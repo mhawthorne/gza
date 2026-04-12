@@ -1597,16 +1597,23 @@ def _build_resume_worker_args(*, no_docker: bool, max_turns: int | None) -> argp
 
 
 def _infer_resume_overrides_from_worker(worker: WorkerMetadata) -> tuple[bool, int | None]:
-    """Best-effort parse of current worker CLI args for resume handoff parity."""
-    cmdline_path = Path(f"/proc/{worker.pid}/cmdline")
+    """Best-effort parse of current worker CLI args for resume handoff parity.
+
+    Uses ``ps -p <pid> -o args=`` which works on both macOS and Linux.
+    """
     try:
-        raw_cmdline = cmdline_path.read_bytes()
-    except OSError:
+        result = subprocess.run(
+            ["ps", "-p", str(worker.pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return (False, None)
-    if not raw_cmdline:
+    if result.returncode != 0 or not result.stdout.strip():
         return (False, None)
 
-    args = [part for part in raw_cmdline.decode(errors="replace").split("\x00") if part]
+    args = result.stdout.strip().split()
     no_docker = "--no-docker" in args
     max_turns: int | None = None
     for index, arg in enumerate(args):
