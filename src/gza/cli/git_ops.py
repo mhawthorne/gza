@@ -50,6 +50,39 @@ from ._common import (
 logger = logging.getLogger(__name__)
 
 
+def _collect_advance_completed_tasks(
+    store: SqliteTaskStore,
+    *,
+    advance_type: str | None = None,
+) -> tuple[list[DbTask], set[str]]:
+    """Collect completed tasks eligible for advance-style action planning.
+
+    Returns completed unmerged tasks and also completed plan tasks without
+    implement children (except when filtering to implement-only mode).
+    """
+    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
+
+    all_unmerged = store.get_unmerged()
+    tasks = [t for t in all_unmerged if t.status == 'completed']
+
+    if advance_type != 'implement':
+        completed_plans = store.get_history(limit=None, status='completed', task_type='plan')
+        existing_ids = {t.id for t in tasks}
+        for plan_task in completed_plans:
+            if plan_task.id in impl_based_on_ids:
+                continue
+            if plan_task.id in existing_ids:
+                continue
+            tasks.append(plan_task)
+
+    if advance_type == 'plan':
+        tasks = [t for t in tasks if t.task_type == 'plan']
+    elif advance_type == 'implement':
+        tasks = [t for t in tasks if t.task_type == 'implement']
+
+    return tasks, impl_based_on_ids
+
+
 def cmd_refresh(args: argparse.Namespace) -> int:
     """Refresh cached diff stats for one or all unmerged tasks."""
     config = Config.load(args.project_dir)
@@ -1535,33 +1568,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
             tasks = [task]
             failed_tasks = []
     else:
-        # Get all unmerged completed tasks
-        all_unmerged = store.get_unmerged()
-        tasks = [t for t in all_unmerged if t.status == 'completed']
+        tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, advance_type=advance_type)
         # Also collect resumable failed tasks (unless disabled)
         failed_tasks = [] if no_resume_failed else store.get_resumable_failed_tasks()
 
-        # Also fetch completed plans that have no implement child yet.
-        # These are invisible to get_unmerged() (no branch/merge_status)
-        # but can be auto-advanced by creating implement tasks.
-        if advance_type != 'implement':
-            completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
-            pending_plans = [
-                p for p in completed_plans
-                if p.id not in impl_based_on_ids
-            ]
-            # Avoid duplicates: only add plans not already in the unmerged list
-            existing_ids = {t.id for t in tasks}
-            for p in pending_plans:
-                if p.id not in existing_ids:
-                    tasks.append(p)
-
-        # Apply --type filter
+        # Apply failed-task filters after completed-task type filtering above.
         if advance_type == 'plan':
-            tasks = [t for t in tasks if t.task_type == 'plan']
             failed_tasks = []  # plans don't have failed/resume logic
         elif advance_type == 'implement':
-            tasks = [t for t in tasks if t.task_type == 'implement']
             failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
 
     if not tasks and not failed_tasks and not new_mode:

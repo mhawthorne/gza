@@ -27,6 +27,7 @@ from ._common import (
 from .execution import _spawn_background_iterate
 from .git_ops import (
     _build_auto_merge_args,
+    _collect_advance_completed_tasks,
     _determine_advance_action,
     _merge_single_task,
     _require_default_branch,
@@ -104,8 +105,20 @@ class _WatchLog:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.quiet = quiet
+        self._skip_keys_prev_cycle: set[str] = set()
+        self._skip_keys_this_cycle: set[str] = set()
 
-    def emit(self, event: str, message: str) -> None:
+    def begin_cycle(self) -> None:
+        self._skip_keys_this_cycle.clear()
+
+    def end_cycle(self) -> None:
+        self._skip_keys_prev_cycle = set(self._skip_keys_this_cycle)
+
+    def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
+        if event == "SKIP" and dedupe_key is not None:
+            self._skip_keys_this_cycle.add(dedupe_key)
+            if dedupe_key in self._skip_keys_prev_cycle:
+                return
         line = f"{_format_hms()} {event:<6} {message}".rstrip()
         with open(self.path, "a") as f:
             f.write(line + "\n")
@@ -196,24 +209,25 @@ def _run_cycle(
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
+    log.begin_cycle()
     reconcile_in_progress_tasks(config)
     prune_terminal_dead_workers(config)
 
     running = _count_live_workers(config, store)
     slots = max(0, batch - running)
     work_done = False
-    pending_tasks = _pending_runnable_tasks(store)
+    started_task_ids: set[str] = set()
 
     log.emit("WAKE", f"checking... ({running} running, {slots} slots)")
 
-    # 1) Execute advance actions for completed unmerged tasks.
+    # 1) Execute advance actions for completed tasks (includes completed plans
+    # with no implement child, aligned with gza advance).
     # Merges run first; worker-spawning actions consume available slots.
-    merge_candidates = [task for task in store.get_unmerged() if task.status == "completed"]
+    merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store)
     if merge_candidates:
         git = Git(config.project_dir)
         target_branch = git.current_branch()
         if _require_default_branch(git, target_branch, "merge"):
-            impl_based_on_ids = store.get_impl_based_on_ids()
             action_plan: list[tuple[DbTask, dict]] = []
             for task in merge_candidates:
                 action_plan.append(
@@ -269,7 +283,8 @@ def _run_cycle(
                         continue
 
                     if dry_run:
-                        log.emit("REVIEW", f"{task.id} -> {review_task.id} [dry-run]")
+                        log.emit("START", f"{review_task.id} review [dry-run]")
+                        started_task_ids.add(str(review_task.id))
                         slots -= 1
                         work_done = True
                         continue
@@ -277,7 +292,8 @@ def _run_cycle(
                     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                     rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
                     if rc == 0:
-                        log.emit("REVIEW", f"{task.id} -> {review_task.id}")
+                        log.emit("START", f"{review_task.id} review")
+                        started_task_ids.add(str(review_task.id))
                         slots -= 1
                         work_done = True
                     continue
@@ -288,7 +304,8 @@ def _run_cycle(
                         continue
 
                     if dry_run:
-                        log.emit("REVIEW", f"run {review_task_obj.id} [dry-run]")
+                        log.emit("START", f"{review_task_obj.id} review [dry-run]")
+                        started_task_ids.add(str(review_task_obj.id))
                         slots -= 1
                         work_done = True
                         continue
@@ -296,7 +313,8 @@ def _run_cycle(
                     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                     rc = _spawn_background_worker(worker_args, config, task_id=review_task_obj.id, quiet=True)
                     if rc == 0:
-                        log.emit("REVIEW", f"run {review_task_obj.id}")
+                        log.emit("START", f"{review_task_obj.id} review")
+                        started_task_ids.add(str(review_task_obj.id))
                         slots -= 1
                         work_done = True
                     continue
@@ -319,7 +337,8 @@ def _run_cycle(
                     )
 
                     if dry_run:
-                        log.emit("IMPROVE", f"{task.id} -> {improve_task.id} [dry-run]")
+                        log.emit("START", f"{improve_task.id} improve [dry-run]")
+                        started_task_ids.add(str(improve_task.id))
                         slots -= 1
                         work_done = True
                         continue
@@ -327,7 +346,8 @@ def _run_cycle(
                     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                     rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
                     if rc == 0:
-                        log.emit("IMPROVE", f"{task.id} -> {improve_task.id}")
+                        log.emit("START", f"{improve_task.id} improve")
+                        started_task_ids.add(str(improve_task.id))
                         slots -= 1
                         work_done = True
                     continue
@@ -338,7 +358,8 @@ def _run_cycle(
                         continue
 
                     if dry_run:
-                        log.emit("IMPROVE", f"run {improve_task_obj.id} [dry-run]")
+                        log.emit("START", f"{improve_task_obj.id} improve [dry-run]")
+                        started_task_ids.add(str(improve_task_obj.id))
                         slots -= 1
                         work_done = True
                         continue
@@ -346,7 +367,8 @@ def _run_cycle(
                     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                     rc = _spawn_background_worker(worker_args, config, task_id=improve_task_obj.id, quiet=True)
                     if rc == 0:
-                        log.emit("IMPROVE", f"run {improve_task_obj.id}")
+                        log.emit("START", f"{improve_task_obj.id} improve")
+                        started_task_ids.add(str(improve_task_obj.id))
                         slots -= 1
                         work_done = True
                     continue
@@ -364,14 +386,21 @@ def _run_cycle(
 
                     if dry_run:
                         log.emit("START", f"{impl_task.id} implement [dry-run]")
+                        started_task_ids.add(str(impl_task.id))
                         slots -= 1
                         work_done = True
                         continue
 
-                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                    rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id, quiet=True)
+                    iterate_args = argparse.Namespace(
+                        max_iterations=max_iterations,
+                        no_docker=False,
+                        resume=False,
+                        retry=False,
+                    )
+                    rc = _spawn_background_iterate(iterate_args, config, impl_task)
                     if rc == 0:
                         log.emit("START", f"{impl_task.id} implement")
+                        started_task_ids.add(str(impl_task.id))
                         slots -= 1
                         work_done = True
                     continue
@@ -382,7 +411,8 @@ def _run_cycle(
                     rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
 
                     if dry_run:
-                        log.emit("REBASE", f"{task.id} -> {rebase_task.id} [dry-run]")
+                        log.emit("START", f"{rebase_task.id} rebase [dry-run]")
+                        started_task_ids.add(str(rebase_task.id))
                         slots -= 1
                         work_done = True
                         continue
@@ -390,11 +420,16 @@ def _run_cycle(
                     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                     rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
                     if rc == 0:
-                        log.emit("REBASE", f"{task.id} -> {rebase_task.id}")
+                        log.emit("START", f"{rebase_task.id} rebase")
+                        started_task_ids.add(str(rebase_task.id))
                         slots -= 1
                         work_done = True
         else:
-            log.emit("SKIP", "merge actions skipped: not on default branch")
+            log.emit(
+                "SKIP",
+                "merge actions skipped: not on default branch",
+                dedupe_key="merge-not-default-branch",
+            )
 
     # 2) Resume failed resumable tasks (consumes slots)
     if slots > 0:
@@ -410,7 +445,11 @@ def _run_cycle(
             depth = store.count_resume_chain_depth(failed.id)
             attempt = depth + 1
             if depth >= config.max_resume_attempts:
-                log.emit("SKIP", f"{failed.id}: max_resume_attempts reached")
+                log.emit(
+                    "SKIP",
+                    f"{failed.id}: max_resume_attempts reached",
+                    dedupe_key=f"max-resume:{failed.id}",
+                )
                 continue
             if dry_run:
                 log.emit(
@@ -428,21 +467,26 @@ def _run_cycle(
                 continue
             slots -= 1
             work_done = True
+            started_task_ids.add(str(resume_task.id))
             log.emit(
                 "RESUME",
                 f"{failed.id} -> {resume_task.id} (attempt {attempt}/{config.max_resume_attempts})",
             )
 
     # 3) Start new queued tasks (consumes slots)
+    pending_tasks = _pending_runnable_tasks(store)
     if slots > 0:
         for task in pending_tasks:
             if slots <= 0:
                 break
             assert task.id is not None
+            if str(task.id) in started_task_ids:
+                continue
             task_type = task.task_type or "implement"
             if task_type == "implement":
                 if dry_run:
                     log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\" [dry-run]")
+                    started_task_ids.add(str(task.id))
                     slots -= 1
                     work_done = True
                     continue
@@ -457,11 +501,13 @@ def _run_cycle(
                     continue
                 slots -= 1
                 work_done = True
+                started_task_ids.add(str(task.id))
                 log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
                 continue
 
             if dry_run:
                 log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\" [dry-run]")
+                started_task_ids.add(str(task.id))
                 slots -= 1
                 work_done = True
                 continue
@@ -471,12 +517,15 @@ def _run_cycle(
                 continue
             slots -= 1
             work_done = True
+            started_task_ids.add(str(task.id))
             log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
 
+    pending_count = len(_pending_runnable_tasks(store))
+    log.end_cycle()
     return _CycleResult(
         work_done=work_done,
         running=_count_live_workers(config, store),
-        pending=len(pending_tasks),
+        pending=pending_count,
     )
 
 
