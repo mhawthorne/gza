@@ -360,6 +360,34 @@ class CodexProvider(Provider):
                 data["exceeded_max_steps"] = True
                 data["__terminate_process__"] = True
 
+        def _step_header_usage(data: dict) -> tuple[int, int]:
+            """Return token totals to display in step header."""
+            turn_count = _as_nonnegative_int(data.get("turn_count"))
+            turns_with_usage = data.get("turns_with_usage")
+            has_real_usage_for_turn = isinstance(turns_with_usage, set) and turn_count in turns_with_usage
+
+            if has_real_usage_for_turn:
+                return (
+                    _as_nonnegative_int(data.get("input_tokens")),
+                    _as_nonnegative_int(data.get("output_tokens")),
+                )
+
+            base_input = _as_nonnegative_int(data.get("input_tokens"))
+            base_output = _as_nonnegative_int(data.get("output_tokens"))
+
+            approx_input_chars = _as_nonnegative_int(data.get("approx_input_chars"))
+            approx_output_chars = _as_nonnegative_int(data.get("approx_output_chars"))
+            baseline_input_chars = _as_nonnegative_int(data.get("estimate_input_chars_baseline"))
+            baseline_output_chars = _as_nonnegative_int(data.get("estimate_output_chars_baseline"))
+            delta_input_chars = max(0, approx_input_chars - baseline_input_chars)
+            delta_output_chars = max(0, approx_output_chars - baseline_output_chars)
+
+            # Keep estimates cumulative only for character deltas that have not yet
+            # been accounted for by real usage payloads.
+            est_input = base_input + _estimate_tokens_from_chars(delta_input_chars)
+            est_output = base_output + _estimate_tokens_from_chars(delta_output_chars)
+            return est_input, est_output
+
         def _start_step(
             data: dict,
             message_text: str | None,
@@ -388,7 +416,10 @@ class CodexProvider(Provider):
                 if "approx_input_chars" not in data:
                     data["approx_input_chars"] = len(stdin_input or "")
                     data["approx_output_chars"] = 0
+                    data["estimate_input_chars_baseline"] = 0
+                    data["estimate_output_chars_baseline"] = 0
                     data["usage_events_seen"] = set()
+                    data["turns_with_usage"] = set()
                 _ensure_step_store(data)
 
                 event: dict[str, Any] = json.loads(line)
@@ -520,12 +551,9 @@ class CodexProvider(Provider):
                         step_num = data["computed_step_count"]
 
                         elapsed_seconds = int(time.time() - data.get("start_time", time.time()))
-                        total_tokens = data.get("input_tokens", 0) + data.get("output_tokens", 0)
-                        cost = calculate_cost(
-                            data.get("input_tokens", 0),
-                            data.get("output_tokens", 0),
-                            model,
-                        )
+                        display_input_tokens, display_output_tokens = _step_header_usage(data)
+                        total_tokens = display_input_tokens + display_output_tokens
+                        cost = calculate_cost(display_input_tokens, display_output_tokens, model)
 
                         if log_handle:
                             from datetime import datetime
@@ -586,6 +614,13 @@ class CodexProvider(Provider):
                         data["input_tokens"] += input_tokens
                         data["output_tokens"] += output_tokens
                         data["cached_tokens"] += cached_tokens
+                        turns_with_usage = data.get("turns_with_usage")
+                        if isinstance(turns_with_usage, set):
+                            turns_with_usage.add(_as_nonnegative_int(data.get("turn_count")))
+                        # Rebase estimate deltas so already-priced turns are not
+                        # counted again in later step headers.
+                        data["estimate_input_chars_baseline"] = _as_nonnegative_int(data.get("approx_input_chars"))
+                        data["estimate_output_chars_baseline"] = _as_nonnegative_int(data.get("approx_output_chars"))
 
                 elif isinstance(event_type, str) and "error" in event_type:
                     message = event.get("message") or event.get("error") or json.dumps(event)
