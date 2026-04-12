@@ -1076,6 +1076,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             return 0
         return _spawn_background_iterate(args, config, impl_task)
 
+    iterate_started_at = time.monotonic()
+    initial_write_task: DbTask | None = None
+
     # If the task is pending, run it first before entering the review/improve loop.
     if impl_task.status == "pending":
         if dry_run:
@@ -1093,6 +1096,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if impl_task.status == "failed":
             print(f"Implementation {impl_task.id} failed, cannot continue iteration.")
             return 1
+        initial_write_task = impl_task
 
     # If the task is failed, resume or retry it first.
     if impl_task.status == "failed":
@@ -1147,6 +1151,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             action = "Resume" if use_resume else "Retry"
             print(f"{action} of {impl_task_id} failed, cannot continue iteration.")
             return 1
+        initial_write_task = impl_task
 
     assert impl_task.id is not None
 
@@ -1311,8 +1316,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         mode: str
         review_task: DbTask
         improve_task: DbTask | None = None
+        failure_reason: str | None = None
 
-    def _queue_improve_for_review(review_task: DbTask) -> QueuedImprove | None:
+    def _queue_improve_for_review(review_task: DbTask) -> QueuedImprove:
         assert impl_task.id is not None
         assert review_task.id is not None
         improves = store.get_improve_tasks_for(impl_task.id, review_task.id)
@@ -1324,14 +1330,33 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             return QueuedImprove(mode="run", review_task=review_task, improve_task=pending_improve)
         if not improves:
             return QueuedImprove(mode="create", review_task=review_task)
-        return None
+        latest_improve = max(improves, key=_task_order_key)
+        allowed_reuse_statuses = {"completed"}
+        unexpected_statuses = sorted({task.status for task in improves if task.status not in allowed_reuse_statuses})
+        if unexpected_statuses:
+            return QueuedImprove(
+                mode="error",
+                review_task=review_task,
+                improve_task=latest_improve,
+                failure_reason=(
+                    "Unexpected improve status(es) for review "
+                    f"{review_task.id}: {', '.join(unexpected_statuses)}"
+                ),
+            )
+        return QueuedImprove(mode="skip", review_task=review_task, improve_task=latest_improve)
 
     queued_improve: QueuedImprove | None = None
     if latest_review is not None and latest_verdict == "CHANGES_REQUESTED":
         queued_improve = _queue_improve_for_review(latest_review)
 
-    iterate_started_at = time.monotonic()
     summary_rows: list[IterateSummaryRow] = []
+    if initial_write_task is not None:
+        _append_summary_row(
+            summary_rows,
+            iteration_index=0,
+            task_type="implement",
+            task=initial_write_task,
+        )
 
     final_status = "maxed_out"
     final_stop_reason = "max_iterations"
@@ -1342,10 +1367,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         # --- CODE WRITE PHASE (improve only; initial implementation write already exists) ---
         if queued_improve is not None:
             improve_task: DbTask | None = queued_improve.improve_task
-            if queued_improve.mode == "wait":
+            queued_mode = queued_improve.mode
+            queued_review_task = queued_improve.review_task
+            if queued_mode == "wait":
                 assert improve_task is not None
                 print(
-                    f"  Waiting: improve {improve_task.id} for review {queued_improve.review_task.id} is in_progress."
+                    f"  Waiting: improve {improve_task.id} for review {queued_review_task.id} is in_progress."
                 )
                 _append_summary_row(
                     summary_rows,
@@ -1358,9 +1385,31 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 final_stop_reason = "improve_in_progress"
                 break
 
-            if queued_improve.mode == "create":
+            if queued_mode == "error":
+                failure_reason = queued_improve.failure_reason or "unexpected improve state"
+                print(f"  Error: {failure_reason}")
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="improve",
+                    task=improve_task,
+                    status="failed",
+                    failure_reason=failure_reason,
+                )
+                final_status = "blocked"
+                final_stop_reason = "improve_unexpected_state"
+                break
+
+            if queued_mode == "skip":
+                assert improve_task is not None
+                print(
+                    f"  Reusing completed improve {improve_task.id}; proceeding directly to review."
+                )
+                queued_improve = None
+
+            if queued_mode == "create":
                 try:
-                    improve_task = _create_improve_task(store, impl_task, queued_improve.review_task)
+                    improve_task = _create_improve_task(store, impl_task, queued_review_task)
                 except ValueError as e:
                     print(f"  Error creating improve: {e}")
                     _append_summary_row(
@@ -1374,10 +1423,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     final_status = "blocked"
                     final_stop_reason = "improve_failed"
                     break
-            else:
+            elif queued_mode == "run":
                 assert improve_task is not None
                 assert improve_task.id is not None
                 print(f"  Reusing existing improve {improve_task.id}...")
+            else:
+                continue
 
             assert improve_task is not None
             assert improve_task.id is not None
