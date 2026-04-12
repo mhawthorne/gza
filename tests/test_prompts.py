@@ -12,6 +12,7 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
     "Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
+    "Treat unexplained deviations from the provided plan or request as Must-Fix.",
     "Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.",
     "Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.",
     "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.",
@@ -235,6 +236,10 @@ class TestPromptBuilderBuild:
             in content
         )
         assert (
+            "<Treat unexplained deviations from the provided plan or request as Must-Fix.>"
+            in content
+        )
+        assert (
             "<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>"
             in content
         )
@@ -313,6 +318,36 @@ class TestPromptBuilderBuild:
             in content
         )
         assert "- Task prompt: `<impl_prompt>`" not in content
+
+    def test_task_review_skill_requires_parent_session_canonical_ask_capture(self):
+        """Task-review scaffold must define canonical ask capture and fallback behavior."""
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "skills"
+            / "gza-task-review"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+
+        assert "Capture one canonical ask section before spawning the reviewer:" in content
+        assert (
+            "If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged."
+            in content
+        )
+        assert (
+            "If linked ask content exists but is unavailable on this machine, pass an explicit unavailable-content marker section"
+            in content
+        )
+        assert (
+            "(plan task <TASK_ID> exists but content unavailable on this machine - flag as blocker)"
+            in content
+        )
+        assert (
+            "If no retrievable plan or request exists for this task, pass no ask section and let the reviewer state: `No plan or request provided.`"
+            in content
+        )
 
     def test_build_review_type_with_review_md(self, tmp_path: Path):
         """Test that REVIEW.md content is included in review prompts."""

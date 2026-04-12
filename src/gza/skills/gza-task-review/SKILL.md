@@ -89,7 +89,15 @@ uv run gza show <IMPL_TASK_ID>
 uv run gza log <IMPL_TASK_ID>
 ```
 
-### Step 4: Capture the committed diff
+### Step 4: Capture review context in the parent session
+
+Capture one canonical ask section before spawning the reviewer:
+- If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged.
+- Otherwise, derive ask context from the linked task chain using the context gathered in Step 3.
+- If linked ask content exists but is unavailable on this machine, pass an explicit unavailable-content marker section (for example, `## Original plan:` followed by `(plan task <TASK_ID> exists but content unavailable on this machine - flag as blocker)`).
+- If no retrievable plan or request exists for this task, pass no ask section and let the reviewer state: `No plan or request provided.`
+
+### Step 5: Capture the committed diff
 
 If the caller already provided diff context, use that as-is and do not reconstruct it.
 Otherwise, collect the committed branch diff once in the parent session:
@@ -98,7 +106,7 @@ git diff main...<impl_branch>
 ```
 Pass this diff to the subagent as `## Implementation diff context`.
 
-### Step 5: Run the review
+### Step 6: Run the review
 
 Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt:
 
@@ -141,6 +149,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 <Use ### M1, ### M2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
 <Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat unexplained deviations from the provided plan or request as Must-Fix.>
 <Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
 <Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
@@ -177,7 +186,7 @@ If no PR number is provided, just output the review directly.
 
 Pass the branch name, authoritative diff context, and the canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available) to the subagent, plus PR number if `--pr` was used.
 
-### Step 6: Save the review to the task database (optional)
+### Step 7: Save the review to the task database (optional)
 
 If the review found must-fix items (verdict is CHANGES_REQUESTED), ask the user if they want to record this as a review in the task database so `/gza-task-improve` can consume it:
 
@@ -207,7 +216,7 @@ print(f'Review saved as task #{created.id}')
 "
 ```
 
-### Step 7: Report back
+### Step 8: Report back
 
 After the subagent completes:
 - Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)

@@ -89,6 +89,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <Use ### M1, ### M2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
 <Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat unexplained deviations from the provided plan or request as Must-Fix.>
 <Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
 <Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
