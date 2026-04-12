@@ -1007,6 +1007,17 @@ def _spawn_background_iterate(
     )
 
 
+@dataclass(frozen=True)
+class _AdvanceEngineConfigAdapter:
+    """Minimal config surface required by determine_next_action()."""
+
+    project_dir: Any
+    advance_requires_review: bool
+    advance_create_reviews: bool
+    max_review_cycles: int
+    max_resume_attempts: int
+
+
 def cmd_iterate(args: argparse.Namespace) -> int:
     """Run an automated lifecycle loop for an implementation task."""
     config = Config.load(args.project_dir)
@@ -1172,12 +1183,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     final_status = "maxed_out"
     final_stop_reason = "max_actions"
     iteration = 0
-    engine_config = argparse.Namespace(
+    max_resume_attempts = _int_config(getattr(config, "max_resume_attempts", None), 3)
+    engine_config = _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
         advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_resume_attempts=_int_config(getattr(config, "max_resume_attempts", None), 3),
+        max_resume_attempts=max_resume_attempts,
     )
 
     while iteration < max_iterations:
@@ -1187,8 +1199,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             git_runtime,
             impl_task,
             target_branch,
-            max_resume_attempts=_int_config(getattr(config, "max_resume_attempts", None), 3),
-            allow_branchless_implement_review=True,
+            max_resume_attempts=max_resume_attempts,
         )
         action_type = action["type"]
         print(f"\nAction {iteration + 1}/{max_iterations}: {action_type}")
@@ -1238,6 +1249,20 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 action_task = _create_review_task(store, impl_task)
             except DuplicateReviewError as e:
                 action_task = e.active_review
+                assert action_task.id is not None
+                if action_task.status == "in_progress":
+                    print(f"  Waiting for review {action_task.id}: already in progress.")
+                    final_status = "blocked"
+                    final_stop_reason = "review_in_progress"
+                    summary_rows.append((iteration, "wait_review", action_task.id, None, None))
+                    break
+                if action_task.status != "pending":
+                    print(f"  Error creating review: duplicate review {action_task.id} has unexpected status {action_task.status}.")
+                    final_status = "blocked"
+                    final_stop_reason = "review_failed"
+                    summary_rows.append((iteration, action_type, action_task.id, None, None))
+                    break
+                print(f"  Reusing pending review {action_task.id}...")
             except ValueError as e:
                 print(f"  Error creating review: {e}")
                 final_status = "blocked"
