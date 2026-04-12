@@ -4611,6 +4611,40 @@ class TestAddCommandWithChaining:
         assert pickup[0].prompt == "Urgent from file"
         assert pickup[0].urgent is True
 
+    def test_add_with_next_uses_shared_queue_urgency_helper(self, tmp_path: Path):
+        """`add --next` should route through the same shared urgency helper used by queue bump."""
+        from gza.cli.execution import cmd_add
+
+        setup_config(tmp_path)
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            prompt="Urgent via helper",
+            prompt_file=None,
+            edit=False,
+            type=None,
+            explore=False,
+            plan=False,
+            implement=False,
+            review=False,
+            group=None,
+            depends_on=None,
+            based_on=None,
+            same_branch=False,
+            spec=None,
+            branch_type=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            next=True,
+        )
+
+        with patch("gza.cli.execution.set_task_urgency", return_value=True) as set_urgency:
+            rc = cmd_add(args)
+
+        assert rc == 0
+        set_urgency.assert_called_once()
+        assert set_urgency.call_args.kwargs["urgent"] is True
+
 
 class TestAddCommandWithModelAndProvider:
     """Tests for 'gza add' command with --model and --provider flags."""

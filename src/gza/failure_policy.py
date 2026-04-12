@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 
-RESUMABLE_FAILURE_REASONS: tuple[str, ...] = ("MAX_STEPS", "MAX_TURNS", "TEST_FAILURE")
+RESUMABLE_FAILURE_REASONS: tuple[str, ...] = ("MAX_STEPS", "MAX_TURNS")
 
 
 def is_resumable_failure_reason(reason: str | None) -> bool:

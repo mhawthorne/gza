@@ -1095,6 +1095,24 @@ class TestShowCommand:
         assert "uv run pytest tests/ -q" in result.stdout
         assert "AssertionError" in result.stdout
 
+    def test_show_failed_test_failure_excludes_resume_next_step(self, tmp_path: Path):
+        """TEST_FAILURE guidance should not advertise gza resume."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Failed verification")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "TEST_FAILURE"
+        task.session_id = "sess-test-failure"
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"gza retry {task.id}" in result.stdout
+        assert f"gza resume {task.id}" not in result.stdout
+
     def test_show_failed_task_prerequisite_unmerged_next_steps(self, tmp_path: Path):
         """PREREQUISITE_UNMERGED should show merge+retry guidance."""
         setup_config(tmp_path)

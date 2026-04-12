@@ -2,6 +2,7 @@
 
 import argparse
 import signal
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,9 +20,9 @@ from gza.cli.watch import (
     cmd_watch,
 )
 from gza.config import Config
-from gza.workers import WorkerMetadata
+from gza.workers import WorkerMetadata, WorkerRegistry
 
-from .conftest import make_store, setup_config
+from .conftest import make_store, run_gza, setup_config
 
 
 def _task_count(store) -> int:
@@ -135,6 +136,46 @@ def test_watch_cycle_resumes_failed_task_before_starting_new_pending(tmp_path: P
     assert result.work_done is True
     assert spawn_resume.call_count == 1
     assert spawn_iterate.call_count == 0
+
+
+def test_watch_cycle_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
+    """TEST_FAILURE is excluded from watch auto-resume selection."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TEST_FAILURE"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_impl = store.add("Pending implement", task_type="implement")
+    assert pending_impl.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == pending_impl.id
 
 
 def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
@@ -992,6 +1033,182 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
         assert create_rebase.call_count == 0
     log_lines = log_path.read_text().splitlines()
     assert any("[dry-run]" in line and expected_fragment in line for line in log_lines)
+
+
+def test_watch_dry_run_command_does_not_reconcile_or_prune_dead_in_progress_task(tmp_path: Path) -> None:
+    """watch --dry-run must not mutate dead in-progress tasks or worker registry rows."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    task = store.add("Dead worker in progress", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC)
+    task.running_pid = dead_pid
+    store.update(task)
+
+    registry = WorkerRegistry(tmp_path / ".gza" / "workers")
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-watch-dry-run-command",
+            task_id=task.id,
+            pid=dead_pid,
+            status="running",
+            started_at=datetime.now(UTC).isoformat(),
+        )
+    )
+
+    before_row = store.get(task.id)
+    assert before_row is not None
+    before_worker = registry.get("w-watch-dry-run-command")
+    assert before_worker is not None
+
+    result = run_gza(
+        "watch",
+        "--dry-run",
+        "--poll",
+        "1",
+        "--max-idle",
+        "1",
+        "--batch",
+        "1",
+        "--quiet",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 0
+    after_row = store.get(task.id)
+    assert after_row is not None
+    after_worker = registry.get("w-watch-dry-run-command")
+    assert after_worker is not None
+
+    assert after_row.status == "in_progress"
+    assert after_row.failure_reason == before_row.failure_reason
+    assert after_row.running_pid == before_row.running_pid
+    assert after_row.started_at == before_row.started_at
+    assert after_row.completed_at == before_row.completed_at
+    assert after_worker.status == before_worker.status
+    assert after_worker.task_id == before_worker.task_id
+    assert after_worker.pid == before_worker.pid
+
+
+def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Path) -> None:
+    """_run_cycle(dry_run=True) should leave dead in-progress rows untouched with real helpers."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    task = store.add("Dead worker in progress", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC)
+    task.running_pid = dead_pid
+    store.update(task)
+
+    registry = WorkerRegistry(tmp_path / ".gza" / "workers")
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-watch-dry-run-cycle",
+            task_id=task.id,
+            pid=dead_pid,
+            status="running",
+            started_at=datetime.now(UTC).isoformat(),
+        )
+    )
+
+    before_row = store.get(task.id)
+    assert before_row is not None
+    before_worker = registry.get("w-watch-dry-run-cycle")
+    assert before_worker is not None
+
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    result = _run_cycle(
+        config=config,
+        store=store,
+        batch=1,
+        max_iterations=10,
+        dry_run=True,
+        log=log,
+    )
+
+    assert result.work_done is False
+    after_row = store.get(task.id)
+    assert after_row is not None
+    after_worker = registry.get("w-watch-dry-run-cycle")
+    assert after_worker is not None
+
+    assert after_row.status == "in_progress"
+    assert after_row.failure_reason == before_row.failure_reason
+    assert after_row.running_pid == before_row.running_pid
+    assert after_row.started_at == before_row.started_at
+    assert after_row.completed_at == before_row.completed_at
+    assert after_worker.status == before_worker.status
+    assert after_worker.task_id == before_worker.task_id
+    assert after_worker.pid == before_worker.pid
+
+
+@pytest.mark.parametrize(
+    ("action_type", "description"),
+    [
+        ("skip", "SKIP: no review exists and advance_create_reviews=false"),
+        ("wait_review", "SKIP: review test-review is in_progress"),
+        ("wait_improve", "SKIP: improve task test-improve is in_progress"),
+        ("needs_discussion", "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention"),
+        ("max_cycles_reached", "SKIP: max review cycles (2) reached, needs manual intervention"),
+    ],
+)
+def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
+    tmp_path: Path,
+    action_type: str,
+    description: str,
+) -> None:
+    """Silent skip outcomes should emit SKIP events in watch logs."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/skip-visibility"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": action_type, "description": description}),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    text = log_path.read_text()
+    assert "SKIP" in text
+    assert str(impl.id) in text
 
 
 def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp_path: Path, capsys) -> None:

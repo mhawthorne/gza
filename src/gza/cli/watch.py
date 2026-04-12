@@ -27,6 +27,7 @@ from ._common import (
     get_review_verdict,
     get_store,
     resolve_id,
+    set_task_urgency,
 )
 from .execution import _spawn_background_iterate
 from .git_ops import (
@@ -41,6 +42,17 @@ from .git_ops import (
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 T = TypeVar("T")
+
+
+def _watch_skip_message(task: DbTask, action: dict) -> str:
+    """Build a stable skip message for non-executed advance actions."""
+    action_type = str(action.get("type", "skip"))
+    description = str(action.get("description", "")).strip()
+    if description.startswith("SKIP: "):
+        description = description[len("SKIP: ") :]
+    if not description:
+        description = action_type.replace("_", " ")
+    return f"{task.id}: {description}"
 
 
 def _short_prompt(prompt: str) -> str:
@@ -240,8 +252,9 @@ def _run_cycle(
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
     log.begin_cycle()
-    reconcile_in_progress_tasks(config)
-    prune_terminal_dead_workers(config)
+    if not dry_run:
+        reconcile_in_progress_tasks(config)
+        prune_terminal_dead_workers(config)
 
     running = _count_live_workers(config, store)
     slots = max(0, batch - running)
@@ -286,6 +299,11 @@ def _run_cycle(
         for task, action in action_plan:
             action_type = action.get("type")
             if action_type in {"skip", "wait_review", "wait_improve", "needs_discussion", "max_cycles_reached"}:
+                log.emit(
+                    "SKIP",
+                    _watch_skip_message(task, action),
+                    dedupe_key=f"advance-skip:{action_type}:{task.id}",
+                )
                 continue
 
             if action_type == "merge":
@@ -762,7 +780,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"Error: Task {task_id} is not pending (status: {task.status})")
             return 1
         new_urgent = action == "bump"
-        store.set_urgent(task_id, new_urgent)
+        set_task_urgency(store, task_id, urgent=new_urgent)
         if new_urgent:
             print(f"✓ Bumped task {task_id} to urgent queue")
         else:

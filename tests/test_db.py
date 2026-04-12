@@ -1713,6 +1713,29 @@ class TestFailureReasonTracking:
         assert retrieved is not None
         assert retrieved.failure_reason == "TEST_FAILURE"
 
+    def test_get_resumable_failed_tasks_excludes_test_failure(self, tmp_path: Path):
+        """Auto-resume query includes MAX_* failures only, not TEST_FAILURE."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        resumable = store.add(prompt="Resumable task")
+        resumable.status = "failed"
+        resumable.failure_reason = "MAX_TURNS"
+        resumable.session_id = "sess-resume"
+        resumable.completed_at = datetime.now(UTC)
+        store.update(resumable)
+
+        non_resumable = store.add(prompt="Test failure task")
+        non_resumable.status = "failed"
+        non_resumable.failure_reason = "TEST_FAILURE"
+        non_resumable.session_id = "sess-test"
+        non_resumable.completed_at = datetime.now(UTC)
+        store.update(non_resumable)
+
+        resumable_ids = {task.id for task in store.get_resumable_failed_tasks()}
+        assert resumable.id in resumable_ids
+        assert non_resumable.id not in resumable_ids
+
     def test_extract_failure_reason_returns_unknown_for_missing_file(self, tmp_path: Path):
         """extract_failure_reason returns UNKNOWN when log file doesn't exist."""
         from gza.db import extract_failure_reason

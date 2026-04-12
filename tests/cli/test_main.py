@@ -92,6 +92,23 @@ class TestHelpOutput:
         assert "--force" in result.stdout
         assert "--plans" not in result.stdout
 
+    def test_advance_help_and_internal_docs_no_longer_advertise_test_failure_auto_resume(self):
+        """Operator-facing resume policy should only mention MAX_STEPS/MAX_TURNS."""
+        result = subprocess.run(
+            ["uv", "run", "gza", "advance", "--help"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        normalized_help = " ".join(result.stdout.split())
+        assert "MAX_STEPS/MAX_TURNS failures" in normalized_help
+        assert "TEST_FAILURE" not in normalized_help
+
+        internal_docs = Path("docs/internal/advance-workflow.md").read_text()
+        assert "MAX_STEPS', 'MAX_TURNS'" in internal_docs
+        assert "'TEST_FAILURE'" not in internal_docs
+
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
         setup_config(tmp_path)

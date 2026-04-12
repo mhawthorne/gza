@@ -292,7 +292,7 @@ def main() -> int:
         "--no-resume-failed",
         action="store_true",
         dest="no_resume_failed",
-        help="Skip auto-resume of failed tasks (do not create resume tasks for MAX_STEPS/MAX_TURNS/TEST_FAILURE failures)",
+        help="Skip auto-resume of failed tasks (do not create resume tasks for MAX_STEPS/MAX_TURNS failures)",
     )
     advance_parser.add_argument(
         "--max-resume-attempts",

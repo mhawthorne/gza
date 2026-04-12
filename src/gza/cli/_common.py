@@ -55,6 +55,11 @@ def resolve_id(config: Config, arg: str) -> str:
     return resolve_task_id(arg, config.project_prefix)
 
 
+def set_task_urgency(store: SqliteTaskStore, task_id: str, *, urgent: bool) -> bool:
+    """Shared urgency update path for queue bump/unbump and add --next."""
+    return store.set_urgent(task_id, urgent)
+
+
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
@@ -1238,6 +1243,10 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
     if is_resumable_failure_reason(reason):
         if task.session_id:
             steps.append(f"gza resume {task.id}")
+        steps.append(f"gza retry {task.id}")
+        return steps
+
+    if reason == "TEST_FAILURE":
         steps.append(f"gza retry {task.id}")
         return steps
 

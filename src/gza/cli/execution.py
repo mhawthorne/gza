@@ -36,6 +36,7 @@ from ._common import (
     get_store,
     get_task_step_count,
     resolve_id,
+    set_task_urgency,
 )
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
@@ -381,7 +382,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         if mark_next:
             assert task.id is not None
-            store.set_urgent(task.id, True)
+            set_task_urgency(store, task.id, urgent=True)
         print(f"✓ Added task {task.id}")
         return 0
 
@@ -405,7 +406,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             return 1
         if mark_next:
             assert new_task.id is not None
-            store.set_urgent(new_task.id, True)
+            set_task_urgency(store, new_task.id, urgent=True)
         print(f"✓ Added task {new_task.id}")
         return 0
     else:
@@ -426,7 +427,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         if mark_next:
             assert task.id is not None
-            store.set_urgent(task.id, True)
+            set_task_urgency(store, task.id, urgent=True)
         print(f"✓ Added task {task.id}")
         return 0
 
