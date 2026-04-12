@@ -51,7 +51,7 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `plan_task_id` | Full prefixed completed plan task ID to implement",
         "| `--depends-on ID` | Set dependency on another task by full prefixed task ID",
         "| `task_id` | Specific full prefixed task ID to advance",
-        "| `impl_task_id` | Full prefixed implementation task ID to cycle",
+        "| `impl_task_id` | Full prefixed implementation task ID to iterate",
         "| `task_id` | Full prefixed task ID to refresh",
         "`task_id` must be a full prefixed task ID (for example `gza-1234`).",
     ]
@@ -78,6 +78,7 @@ def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     config_cmds_content = (repo_root / "src" / "gza" / "cli" / "config_cmds.py").read_text()
 
     assert "gza-1234" in main_content
+    assert "Full prefixed implementation task ID to iterate" in main_content
     assert "gza-1a2b" not in main_content
     assert "{prefix}-{decimal}" in config_cmds_content
     assert "{prefix}-{base36}" not in config_cmds_content

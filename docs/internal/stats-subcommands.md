@@ -8,7 +8,7 @@
 
 ## gza stats reviews
 
-Ports the functionality of the former `bin/review-cycle-stats.py` script into the CLI. Shows per-implementation-task review cycle stats, weekly groupings, cycle distribution, and per-model issue counts.
+Ports the functionality of the former `bin/review-cycle-stats.py` script into the CLI. Shows per-implementation-task review iteration stats, weekly groupings, iteration-count distribution, and per-model issue counts.
 
 ```bash
 gza stats reviews                            # Last 14 days (default)
@@ -30,8 +30,8 @@ The three-way priority for determining the start date:
 ### Output
 
 - Summary header: implement task count, total reviews, reviewed fraction.
-- Weekly table: week range, impl count, review count, review %, median/P90/max number of reviews per impl.
-- Reviews-per-implementation distribution: histogram of how many impls had 1, 2, 3, … reviews.
+- Weekly table: week range, impl count, review count, review %, median/P90/max number of review iterations per impl.
+- Reviews-per-implementation distribution: histogram of how many impls had 1, 2, 3, … review iterations.
 - Per-model section: when `--issues` is passed, must-fix and suggestion counts parsed from review content.
 
 ### Notes

@@ -40,7 +40,7 @@ Practical examples showing common workflows with Gza.
 | Run in background | `gza work --background` |
 | Advance all tasks | `gza advance --dry-run` |
 | Advance (execute) | `gza advance --auto --batch 3` |
-| Review/improve cycle | `gza iterate <impl_id>` |
+| Review/improve loop | `gza iterate <impl_id>` |
 | View pending | `gza next` |
 | View active/startup-failed workers | `gza ps` |
 | Tail worker logs | `gza log -w <worker_id> -f` |

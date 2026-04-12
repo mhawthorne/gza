@@ -3,23 +3,20 @@
 
 Usage:
     # Re-parse verdict from review task's output_content:
-    python bin/set-review-verdict.py 409
+    python bin/set-review-verdict.py gza-409
 
     # Explicitly set a verdict (also backfills output_content if it is NULL):
-    python bin/set-review-verdict.py 409 --verdict CHANGES_REQUESTED
+    python bin/set-review-verdict.py gza-409 --verdict CHANGES_REQUESTED
 
     # Extract review content from the task's log file and backfill output_content:
-    python bin/set-review-verdict.py 409 --from-log
+    python bin/set-review-verdict.py gza-409 --from-log
 
     # Dry-run (show what would happen):
-    python bin/set-review-verdict.py 409 --dry-run
+    python bin/set-review-verdict.py gza-409 --dry-run
 
-The verdict is stored on cycle_iterations (if the review belongs to a cycle)
-and is also used dynamically by `gza show` / `gza advance` via output_content parsing.
-This script handles both cases:
-  1. If the review task belongs to a cycle, updates cycle_iterations.review_verdict.
-  2. If the verdict in output_content doesn't match the expected format, patches it
-     so the regex-based extractors can find it.
+The verdict is extracted dynamically by `gza show` / `gza advance` from
+output_content. This script's job is to patch output_content so the
+regex-based extractors can find the verdict reliably.
 """
 
 import argparse
@@ -29,7 +26,7 @@ import sys
 from pathlib import Path
 
 from gza.config import Config
-from gza.db import resolve_task_id
+from gza.db import InvalidTaskIdError, resolve_task_id
 from gza.runner import extract_content_from_log
 
 VALID_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION")
@@ -60,7 +57,7 @@ def extract_verdict(content: str) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("task_id", type=str, help="Review task ID")
+    parser.add_argument("task_id", type=str, help="Full prefixed review task ID (for example: gza-1234)")
     parser.add_argument("--verdict", choices=VALID_VERDICTS, help="Explicitly set this verdict (skip parsing)")
     parser.add_argument("--from-log", action="store_true", help="Extract review content from the task's log file and backfill output_content")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be updated without writing")
@@ -76,13 +73,17 @@ def main() -> int:
         return 1
 
     config = Config.load(Path("."))
-    resolved_task_id = resolve_task_id(args.task_id, config.project_prefix)
+    try:
+        resolved_task_id = resolve_task_id(args.task_id, config.project_prefix)
+    except InvalidTaskIdError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     row = conn.execute(
-        "SELECT id, task_type, output_content, cycle_id, cycle_iteration_index, log_file FROM tasks WHERE id = ?",
+        "SELECT id, task_type, output_content, log_file FROM tasks WHERE id = ?",
         (resolved_task_id,),
     ).fetchone()
     if not row:
@@ -145,31 +146,9 @@ def main() -> int:
         else:
             conn.execute(
                 "UPDATE tasks SET output_content = ? WHERE id = ?",
-                (new_output_content, args.task_id),
+                (new_output_content, resolved_task_id),
             )
             print(f"Updated tasks {args.task_id}: output_content backfilled ({len(new_output_content)} chars)")
-
-    # Update cycle_iterations if this review belongs to a cycle
-    cycle_id = row["cycle_id"]
-    if cycle_id is not None:
-        iter_row = conn.execute(
-            "SELECT id, review_verdict FROM cycle_iterations WHERE review_task_id = ?",
-            (args.task_id,),
-        ).fetchone()
-        if iter_row:
-            old = iter_row["review_verdict"]
-            if args.dry_run:
-                print(f"Would update cycle_iterations #{iter_row['id']}: review_verdict {old!r} -> {verdict!r}")
-            else:
-                conn.execute(
-                    "UPDATE cycle_iterations SET review_verdict = ? WHERE id = ?",
-                    (verdict, iter_row["id"]),
-                )
-                print(f"Updated cycle_iterations #{iter_row['id']}: review_verdict {old!r} -> {verdict!r}")
-        else:
-            print(f"No cycle_iteration row found for review task {args.task_id}")
-    else:
-        print(f"Task {args.task_id} is not part of a cycle (no cycle_iterations to update)")
 
     # Show current state for verification
     print(f"\nVerdict for review task {args.task_id}: {verdict}")

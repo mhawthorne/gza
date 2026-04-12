@@ -37,7 +37,6 @@ def _insert_review_task(
     *,
     output_content: str | None = None,
     log_file: str | None = None,
-    cycle_id: int | None = None,
 ) -> str:
     """Insert a review task via SqliteTaskStore and patch optional fields."""
     from gza.db import SqliteTaskStore
@@ -47,8 +46,8 @@ def _insert_review_task(
     # Patch optional fields directly with raw SQL.
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "UPDATE tasks SET output_content = ?, log_file = ?, cycle_id = ? WHERE id = ?",
-        (output_content, log_file, cycle_id, task.id),
+        "UPDATE tasks SET output_content = ?, log_file = ? WHERE id = ?",
+        (output_content, log_file, task.id),
     )
     conn.commit()
     conn.close()
@@ -162,3 +161,19 @@ class TestMutualExclusivity:
                 exit_code = main()
 
         assert exit_code != 0
+
+
+class TestTaskIdValidation:
+    def test_bare_numeric_task_id_returns_clean_error(self, tmp_path: Path, capsys) -> None:
+        """Bare numeric task IDs should fail cleanly with full-ID guidance."""
+        db_path = _make_db(tmp_path)
+        full_task_id = _insert_review_task(db_path)
+        numeric_task_id = full_task_id.rsplit("-", 1)[1]
+
+        with patch.object(_mod, "get_db_path", return_value=db_path):
+            with patch("sys.argv", ["set-review-verdict.py", numeric_task_id, "--verdict", "APPROVED"]):
+                exit_code = main()
+
+        captured = capsys.readouterr()
+        assert exit_code != 0
+        assert "Use a full prefixed task ID" in captured.err

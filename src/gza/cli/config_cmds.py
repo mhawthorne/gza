@@ -178,14 +178,14 @@ def _cmd_stats_reviews(
                 root_impls_in_range.append(root_impl)
 
     total_impls = len(root_impls_in_range)
-    total_improves = sum(
-        1
-        for t in all_tasks
-        if t.task_type == "improve"
-        and t.status == "completed"
-        and _task_dt(t) is not None
-        and start_dt <= _task_dt(t) < end_dt  # type: ignore
-    )
+    total_improves = 0
+    for t in all_tasks:
+        if t.task_type != "improve" or t.status != "completed":
+            continue
+        dt = _task_dt(t)
+        if dt is None or dt < start_dt or dt >= end_dt:
+            continue
+        total_improves += 1
     total_reviews = sum(
         len(dates) for root_id, dates in root_reviews.items() if root_id in seen_roots
     )

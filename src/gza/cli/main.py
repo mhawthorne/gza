@@ -14,6 +14,7 @@ from ..db import (
     preview_v26_migration,
     run_v25_migration,
     run_v26_migration,
+    run_v27_migration,
 )
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
 from ._common import (
@@ -946,45 +947,48 @@ def main() -> int:
     )
     add_common_args(improve_parser)
 
-    # iterate command (formerly "cycle"; "cycle" kept as a hidden alias for backward compatibility)
-    cycle_parser = subparsers.add_parser(
+    def _add_iterate_args(iterate_parser: argparse.ArgumentParser) -> None:
+        iterate_parser.add_argument(
+            "impl_task_id",
+            type=str,
+            help="Full prefixed implementation task ID to iterate (e.g. 'gza-1234')",
+        )
+        iterate_parser.add_argument(
+            "--max-iterations",
+            type=int,
+            default=3,
+            dest="max_iterations",
+            metavar="N",
+            help="Maximum review/improve iterations (default: 3)",
+        )
+        iterate_parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            dest="dry_run",
+            help="Preview what would happen without executing",
+        )
+        iterate_parser.add_argument(
+            "--no-docker",
+            action="store_true",
+            help="Run Claude directly instead of in Docker",
+        )
+        # TODO: Phase 1 deferred — add --queue (create chain without running immediately)
+        # and --background flags as specified in the design plan.
+        add_common_args(iterate_parser)
+
+    # iterate command
+    iterate_parser = subparsers.add_parser(
         "iterate",
-        aliases=["cycle"],
-        help="Run an automated review/improve cycle for an implementation task",
+        help="Run an automated review/improve loop for a completed implementation task",
     )
-    cycle_parser.add_argument(
-        "impl_task_id",
-        type=str,
-        help="Full implementation task ID to cycle",
+    _add_iterate_args(iterate_parser)
+
+    # Backward-compat parser for legacy command spelling.
+    cycle_parser = subparsers.add_parser(
+        "cycle",
+        help=argparse.SUPPRESS,
     )
-    cycle_parser.add_argument(
-        "--max-iterations",
-        type=int,
-        default=3,
-        dest="max_iterations",
-        metavar="N",
-        help="Maximum review/improve iterations (default: 3)",
-    )
-    cycle_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        dest="dry_run",
-        help="Preview what would happen without executing",
-    )
-    cycle_parser.add_argument(
-        "--continue",
-        action="store_true",
-        dest="continue_cycle",
-        help="Resume an existing active cycle instead of starting a new one",
-    )
-    cycle_parser.add_argument(
-        "--no-docker",
-        action="store_true",
-        help="Run Claude directly instead of in Docker",
-    )
-    # TODO: Phase 1 deferred — add --queue (create chain without running immediately)
-    # and --background flags as specified in the design plan.
-    add_common_args(cycle_parser)
+    _add_iterate_args(cycle_parser)
 
     # implement command
     implement_parser = subparsers.add_parser(
@@ -1332,7 +1336,7 @@ def main() -> int:
     # migrate command
     migrate_parser = subparsers.add_parser(
         "migrate",
-        help="Run pending manual database migrations (e.g. v25/v26 task ID migrations)",
+        help="Run pending manual database migrations (e.g. v25/v26/v27)",
     )
     migrate_parser.add_argument(
         "--status",
@@ -1572,6 +1576,10 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                     print(f"  Sample ID conversions (random {len(random_samples_v26)}):")
                     for old_v26_id, new_id in random_samples_v26:
                         print(f"    {old_v26_id:>{id_width}} → {new_id}")
+            elif version == 27:
+                print("\nMigration v27 preview (drop TaskCycle bookkeeping tables/columns):")
+                print("  - Drop task_cycles and task_cycle_iterations tables")
+                print("  - Rebuild tasks table without cycle_id/cycle_iteration_index/cycle_role")
         return 0
 
     versions_str = ", ".join(f"v{v}" for v in pending_manual)
@@ -1610,6 +1618,15 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                 print(f"Migration v26 complete. Backup at: {backup_path}")
             except Exception as e:
                 print(f"Migration v26 failed: {e}", file=sys.stderr)
+                return 1
+        elif version == 27:
+            print("Running migration v27 (drop TaskCycle bookkeeping)...")
+            try:
+                run_v27_migration(config.db_path)
+                backup_path = config.db_path.with_suffix(".backup.pre-v27.db")
+                print(f"Migration v27 complete. Backup at: {backup_path}")
+            except Exception as e:
+                print(f"Migration v27 failed: {e}", file=sys.stderr)
                 return 1
         else:
             print(f"Unknown manual migration v{version}", file=sys.stderr)

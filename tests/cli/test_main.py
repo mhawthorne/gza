@@ -106,3 +106,22 @@ class TestReconciliationWarnings:
         captured = capsys.readouterr()
         assert rc == 0
         assert "Warning: In-progress reconciliation failed: boom" in captured.err
+
+
+class TestCommandAliases:
+    """Tests for CLI command alias dispatch behavior."""
+
+    def test_cycle_alias_dispatches_to_cmd_iterate(self, tmp_path):
+        """Legacy `cycle` command should route to cmd_iterate."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "cycle", "testproject-1", "--dry-run", "--project", str(tmp_path)]),
+            patch("gza.cli.main.cmd_iterate", return_value=0) as cmd_iterate,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_iterate.assert_called_once()
