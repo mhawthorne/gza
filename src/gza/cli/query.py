@@ -231,9 +231,28 @@ def cmd_history(args: argparse.Namespace) -> int:
     # Fixed width for status labels to ensure alignment
     STATUS_WIDTH = 9  # "completed" is the longest at 9 chars
 
-    def _render_task_line(task: DbTask, indent: str = "") -> None:
+    def _task_shares_parent_branch(task: DbTask, parent_task: DbTask | None) -> bool:
+        """Return True when a child task is anchored to the parent's branch."""
+        if parent_task is None or parent_task.id is None:
+            return False
+        if not task.branch or not parent_task.branch:
+            return False
+        if task.branch != parent_task.branch:
+            return False
+        return task.same_branch or task.based_on == parent_task.id
+
+    def _render_task_line(
+        task: DbTask,
+        *,
+        first_prefix: str = "",
+        detail_prefix: str = "",
+        parent_task: DbTask | None = None,
+        compact_child: bool = False,
+    ) -> None:
         """Render a single task entry."""
-        if task.merge_status == "unmerged":
+        shares_parent_branch = _task_shares_parent_branch(task, parent_task)
+        use_merge_status = task.merge_status == "unmerged" and not shares_parent_branch
+        if use_merge_status:
             status_label = "unmerged"
             status_color = c['unmerged']
         elif task.status == "completed":
@@ -252,20 +271,19 @@ def cmd_history(args: argparse.Namespace) -> int:
             if task.completed_at
             else ""
         )
-        # prefix: indent + "completed " (STATUS_WIDTH+1) + ID " + "(YYYY-MM-DD HH:MM) "
+        # prefix: first_prefix + "completed " (STATUS_WIDTH+1) + ID " + "(YYYY-MM-DD HH:MM) "
         task_id_len = len(str(task.id))
         date_len = 19 if task.completed_at else 0  # "(YYYY-MM-DD HH:MM) "
-        prefix_len = len(indent) + STATUS_WIDTH + 1 + task_id_len + date_len
+        prefix_len = len(first_prefix) + STATUS_WIDTH + 1 + task_id_len + date_len
         prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
         console.print(
-            f"{indent}{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
+            f"{first_prefix}{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
             f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
         )
-        # Failed reason on its own line
         if task.status == "failed":
             reason = task.failure_reason or "UNKNOWN"
-            console.print(f"{indent}    [{c['failure']}]reason: {reason}[/{c['failure']}]")
-        # Type + deps on a separate line
+            console.print(f"{detail_prefix}    [{c['failure']}]reason: {reason}[/{c['failure']}]")
+
         type_label = f"\\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
         tid = c['task_id']
@@ -277,31 +295,61 @@ def cmd_history(args: argparse.Namespace) -> int:
             parent_label = f" ← [{tid}]{task.depends_on}[/{tid}]"
         else:
             parent_label = ""
-        console.print(f"{indent}    {type_label}{merge_label}{parent_label}")
-        if task.branch:
-            console.print(f"{indent}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
+
+        if compact_child and task.task_type in {"review", "improve"}:
+            compact_parts = [f"{type_label}{merge_label}{parent_label}"]
+            if task.task_type == "review":
+                verdict = get_review_verdict(config, task)
+                if verdict:
+                    compact_parts.append(f"verdict: {verdict}")
+            stats_str = format_stats(task)
+            if stats_str:
+                compact_parts.append(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
+            console.print(f"{detail_prefix}    " + " | ".join(compact_parts))
+            return
+
+        console.print(f"{detail_prefix}    {type_label}{merge_label}{parent_label}")
+        show_branch = bool(task.branch) and not shares_parent_branch
+        if show_branch:
+            console.print(f"{detail_prefix}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
         if task.report_file:
-            console.print(f"{indent}    report: [{c['file']}]{task.report_file}[/{c['file']}]")
+            console.print(f"{detail_prefix}    report: [{c['file']}]{task.report_file}[/{c['file']}]")
         stats_str = format_stats(task)
         if stats_str:
-            console.print(f"{indent}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
+            console.print(f"{detail_prefix}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
 
     def _render_lineage_node(node: TaskLineageNode) -> None:
         """Render a lineage tree using branch connectors."""
 
-        def _render_subtree(current: TaskLineageNode, prefix: str = "", is_last: bool = True) -> None:
-            if prefix:
+        def _render_subtree(
+            current: TaskLineageNode,
+            *,
+            parent_task: DbTask | None = None,
+            prefix: str = "",
+            is_last: bool = True,
+        ) -> None:
+            if parent_task is not None:
                 connector = "└── " if is_last else "├── "
-                indent = f"[{c['lineage']}]{prefix}{connector}[/{c['lineage']}]"
+                child_prefix_raw = f"{prefix}{'    ' if is_last else '│   '}"
+                first_prefix = f"[{c['lineage']}]{prefix}{connector}[/{c['lineage']}]"
+                detail_prefix = f"[{c['lineage']}]{child_prefix_raw}[/{c['lineage']}]"
             else:
-                indent = ""
-            _render_task_line(current.task, indent=indent)
+                child_prefix_raw = ""
+                first_prefix = ""
+                detail_prefix = ""
+            _render_task_line(
+                current.task,
+                first_prefix=first_prefix,
+                detail_prefix=detail_prefix,
+                parent_task=parent_task,
+                compact_child=parent_task is not None,
+            )
 
-            next_prefix = f"{prefix}{'    ' if is_last else '│   '}"
             for index, child in enumerate(current.children):
                 _render_subtree(
                     child,
-                    prefix=next_prefix,
+                    parent_task=current.task,
+                    prefix=child_prefix_raw,
                     is_last=index == (len(current.children) - 1),
                 )
 
@@ -335,7 +383,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             _render_orphaned_task(task, c)
 
         for task in recent:
-            _render_task_line(task)
+            _render_task_line(task, first_prefix="", detail_prefix="")
             print()
 
     return 0
