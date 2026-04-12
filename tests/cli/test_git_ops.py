@@ -3576,6 +3576,27 @@ class TestAdvanceCommand:
         action = _determine_advance_action(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
+    def test_advance_failed_review_is_treated_as_unreviewed(self, tmp_path: Path):
+        """Failed review tasks should not block creating a required review."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        failed_review = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        failed_review.status = "failed"
+        failed_review.completed_at = datetime.now(UTC)
+        failed_review.output_content = "**Verdict: APPROVED**"
+        store.update(failed_review)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, task, "main")
+        assert action['type'] == 'create_review'
+
     def _create_completed_improve(self, store, impl_task, review_task):
         """Create a completed improve task for the given impl and review tasks."""
         improve = store.add(
