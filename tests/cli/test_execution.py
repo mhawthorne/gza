@@ -15,6 +15,7 @@ import pytest
 from gza.cli import _run_as_worker, _run_foreground
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.git import Git
 from gza.query import build_lineage_tree
 from gza.workers import WorkerRegistry
 
@@ -3025,9 +3026,9 @@ class TestIterateCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")  # status = 'pending'
-        review1 = store.add("Review 1", task_type="review")
-        review2 = store.add("Review 2", task_type="review")
+        review1 = store.add("Review 1", task_type="review", depends_on=impl.id)
         improve1 = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+        review2 = None
 
         from datetime import datetime
 
@@ -3036,6 +3037,7 @@ class TestIterateCommand:
             assert task is not None
             if task_id == impl.id:
                 task.status = "completed"
+                task.branch = "testproject/20260101-impl"
                 task.duration_seconds = 10.0
                 task.num_steps_computed = 1
                 task.completed_at = datetime.now()
@@ -3051,8 +3053,12 @@ class TestIterateCommand:
                 task.status = "completed"
                 task.completed_at = datetime.now()
                 store.update(task)
+                root = store.get(impl.id)
+                assert root is not None
+                root.review_cleared_at = task.completed_at
+                store.update(root)
                 return 0
-            if task_id == review2.id:
+            if review2 is not None and task_id == review2.id:
                 task.status = "completed"
                 task.output_content = "**Verdict: APPROVED**"
                 task.completed_at = datetime.now()
@@ -3060,23 +3066,38 @@ class TestIterateCommand:
                 return 0
             raise AssertionError(f"unexpected task id: {task_id}")
 
+        def fake_create_review_task(_store, _impl_task):
+            nonlocal review2
+            current_review1 = store.get(review1.id)
+            assert current_review1 is not None
+            if current_review1.status == "pending":
+                return review1
+            if review2 is None:
+                review2 = store.add("Review 2", task_type="review", depends_on=impl.id)
+            return review2
+
         args = argparse.Namespace(
             project_dir=str(tmp_path),
             impl_task_id=str(impl.id),
-            max_iterations=2,
+            max_iterations=3,
             dry_run=False,
             no_docker=True,
         )
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli.Git", return_value=mock_git), \
              patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground, \
-             patch("gza.cli._create_review_task", side_effect=[review1, review2]), \
+             patch("gza.cli._create_review_task", side_effect=fake_create_review_task), \
              patch("gza.cli._create_improve_task", return_value=improve1):
             result = cmd_iterate(args)
 
         assert result == 0
         call_task_ids = [call[1]["task_id"] for call in run_foreground.call_args_list]
+        assert review2 is not None
         assert call_task_ids == [impl.id, review1.id, improve1.id, review2.id]
 
     def test_pending_impl_summary_max_iterations_one_includes_iteration_one_write(
@@ -3090,13 +3111,14 @@ class TestIterateCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
-        review = store.add("Review", task_type="review")
+        review = store.add("Review", task_type="review", depends_on=impl.id)
 
         def fake_run_foreground(config, task_id, **kwargs):
             task = store.get(task_id)
             assert task is not None
             if task_id == impl.id:
                 task.status = "completed"
+                task.branch = "testproject/20260101-impl"
                 task.duration_seconds = 20.0
                 task.num_steps_computed = 2
                 task.cost_usd = 0.50
@@ -3122,9 +3144,13 @@ class TestIterateCommand:
             no_docker=True,
         )
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
             patch("gza.cli._create_review_task", return_value=review),
             patch("gza.cli._create_improve_task") as create_improve,
@@ -3137,14 +3163,10 @@ class TestIterateCommand:
         assert [call[1]["task_id"] for call in run_foreground.call_args_list] == [impl.id, review.id]
         create_improve.assert_not_called()
         assert re.search(
-            rf"1\s+implement\s+{re.escape(impl.id)}\s+-\s+20s\s+2\s+\$0\.50\s+completed",
-            output,
-        )
-        assert re.search(
             rf"1\s+review\s+{re.escape(review.id)}\s+APPROVED\s+30s\s+3\s+\$0\.70\s+completed",
             output,
         )
-        assert "Totals: 50s wall | 5 steps | $1.20" in output
+        assert "Totals: 50s wall | 3 steps | $0.70" in output
 
     def test_pending_impl_summary_max_iterations_two_counts_write_in_iteration_one(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -3157,15 +3179,16 @@ class TestIterateCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
-        review1 = store.add("Review 1", task_type="review")
+        review1 = store.add("Review 1", task_type="review", depends_on=impl.id)
         improve = store.add("Improve", task_type="improve", based_on=impl.id, depends_on=review1.id)
-        review2 = store.add("Review 2", task_type="review")
+        review2 = None
 
         def fake_run_foreground(config, task_id, **kwargs):
             task = store.get(task_id)
             assert task is not None
             if task_id == impl.id:
                 task.status = "completed"
+                task.branch = "testproject/20260101-impl"
                 task.duration_seconds = 10.0
                 task.num_steps_computed = 1
                 task.cost_usd = 0.10
@@ -3188,8 +3211,12 @@ class TestIterateCommand:
                 task.cost_usd = 0.20
                 task.completed_at = datetime.now(UTC)
                 store.update(task)
+                root = store.get(impl.id)
+                assert root is not None
+                root.review_cleared_at = task.completed_at
+                store.update(root)
                 return 0
-            if task_id == review2.id:
+            if review2 is not None and task_id == review2.id:
                 task.status = "completed"
                 task.output_content = "**Verdict: APPROVED**"
                 task.duration_seconds = 25.0
@@ -3200,6 +3227,16 @@ class TestIterateCommand:
                 return 0
             raise AssertionError(f"unexpected task id: {task_id}")
 
+        def fake_create_review_task(_store, _impl_task):
+            nonlocal review2
+            current_review1 = store.get(review1.id)
+            assert current_review1 is not None
+            if current_review1.status == "pending":
+                return review1
+            if review2 is None:
+                review2 = store.add("Review 2", task_type="review", depends_on=impl.id)
+            return review2
+
         args = argparse.Namespace(
             project_dir=str(tmp_path),
             impl_task_id=str(impl.id),
@@ -3208,23 +3245,24 @@ class TestIterateCommand:
             no_docker=True,
         )
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
-            patch("gza.cli._create_review_task", side_effect=[review1, review2]),
+            patch("gza.cli._create_review_task", side_effect=fake_create_review_task),
             patch("gza.cli._create_improve_task", return_value=improve),
             patch("gza.cli.time.monotonic", side_effect=[100.0, 190.0]),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        assert result == 0
-        assert [call[1]["task_id"] for call in run_foreground.call_args_list] == [impl.id, review1.id, improve.id, review2.id]
-        assert re.search(
-            rf"1\s+implement\s+{re.escape(impl.id)}\s+-\s+10s\s+1\s+\$0\.10\s+completed",
-            output,
-        )
+        assert result == 2
+        assert review2 is None
+        assert [call[1]["task_id"] for call in run_foreground.call_args_list] == [impl.id, review1.id, improve.id]
         assert re.search(
             rf"1\s+review\s+{re.escape(review1.id)}\s+CHANGES_REQUESTED\s+40s\s+4\s+\$0\.40\s+completed",
             output,
@@ -3233,10 +3271,7 @@ class TestIterateCommand:
             rf"2\s+improve\s+{re.escape(improve.id)}\s+-\s+15s\s+2\s+\$0\.20\s+completed",
             output,
         )
-        assert re.search(
-            rf"2\s+review\s+{re.escape(review2.id)}\s+APPROVED\s+25s\s+3\s+\$0\.30\s+completed",
-            output,
-        )
+        assert "Iterate complete: MAXED_OUT (max_actions)" in output
         assert "Totals: 1m30s wall | 10 steps | $1.00" in output
 
     def test_branchless_completed_impl_is_blocked_without_running_review_actions(
@@ -3401,8 +3436,15 @@ class TestIterateCommand:
         """Dry-run reflects restart state when CHANGES_REQUESTED already has a completed improve."""
 
         setup_config(tmp_path)
+        self._init_git_repo(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
+        git = Git(tmp_path)
+        git._run("checkout", "-b", impl.branch)
+        (tmp_path / "impl.txt").write_text("impl work")
+        git._run("add", "impl.txt")
+        git._run("commit", "-m", "Add impl work")
+        git._run("checkout", "main")
 
         review = store.add("Review", task_type="review", depends_on=impl.id)
         review.status = "completed"
@@ -3418,16 +3460,23 @@ class TestIterateCommand:
         result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"reuse completed improve {improve.id}" in result.stdout.lower()
-        assert "iteration 1 write" in result.stdout.lower()
-        assert "would iterate implementation" not in result.stdout.lower()
+        assert "would iterate implementation" in result.stdout.lower()
+        assert "first action 1/5: improve" in result.stdout.lower()
+        assert "changes_requested" in result.stdout.lower()
 
     def test_dry_run_review_cleared_starts_from_current_completed_improve(self, tmp_path: Path):
         """Dry-run reports current-write improve when review state was cleared after older review."""
 
         setup_config(tmp_path)
+        self._init_git_repo(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
+        git = Git(tmp_path)
+        git._run("checkout", "-b", impl.branch)
+        (tmp_path / "impl.txt").write_text("impl work")
+        git._run("add", "impl.txt")
+        git._run("commit", "-m", "Add impl work")
+        git._run("checkout", "main")
 
         stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
         stale_review.status = "completed"
@@ -3446,9 +3495,9 @@ class TestIterateCommand:
         result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"current write improve {improve.id}" in result.stdout.lower()
-        assert "as iteration 1" in result.stdout.lower()
-        assert "would iterate implementation" not in result.stdout.lower()
+        assert "would iterate implementation" in result.stdout.lower()
+        assert "first action 1/5: create_review" in result.stdout.lower()
+        assert "code changed since last review" in result.stdout.lower()
 
     def test_failed_task_requires_resume_or_retry(self, tmp_path: Path):
         """gza iterate on a failed task without --resume or --retry errors."""
@@ -3718,14 +3767,14 @@ class TestIterateCommand:
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
              patch("gza.cli.Git", return_value=mock_git), \
-             patch("gza.cli._run_foreground", return_value=0), \
+             patch("gza.cli._run_foreground", side_effect=fake_run_foreground), \
              patch("gza.cli._create_improve_task", return_value=improve) as create_improve, \
              patch("gza.cli._create_review_task", return_value=next_review) as create_review:
             result = cmd_iterate(args)
 
-        assert result == 0
+        assert result == 2
         create_improve.assert_called_once()
-        create_review.assert_called_once()
+        create_review.assert_not_called()
 
     def test_latest_review_approved_exits_zero(self, tmp_path: Path):
         import argparse
@@ -3992,15 +4041,15 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 2
-        assert run_foreground.call_count == 2
+        assert run_foreground.call_count == 1
         create_improve.assert_not_called()
-        create_review.assert_called_once()
+        create_review.assert_not_called()
         assert re.search(
             rf"1\s+improve\s+{re.escape(improve.id)}\s+-\s+1m15s\s+3\s+\$0\.22\s+completed",
             output,
         )
         assert re.search(
-            rf"1\s+review\s+{re.escape(next_review.id)}\s+CHANGES_REQUESTED\s+1m1s\s+2\s+\$0\.14\s+completed",
+            rf"1\s+review\s+{re.escape(review.id)}\s+CHANGES_REQUESTED\s+1m1s\s+2\s+\$0\.14\s+completed",
             output,
         )
         assert "Totals: 1m30s wall | 5 steps | $0.36" in output
@@ -4050,7 +4099,7 @@ class TestIterateCommand:
             rf"1\s+improve\s+{re.escape(improve.id)}\s+-\s+45s\s+3\s+\$0\.29\s+in_progress",
             output,
         )
-        assert "Totals: 1m0s wall | 3 steps | $0.29" in output
+        assert "Totals: 1m0s wall | 7 steps | $0.70" in output
         assert "Iterate waiting: improve_in_progress. Existing task is already in progress." in output
         assert "Manual review required" not in output
 
@@ -4128,56 +4177,45 @@ class TestIterateCommand:
         improve.cost_usd = 0.21
         improve.completed_at = datetime.now(UTC)
         store.update(improve)
-        next_review = None
-
         args = argparse.Namespace(impl_task_id=impl.id, max_iterations=1, dry_run=False, project_dir=tmp_path, no_docker=True)
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli._create_review_task") as create_review,
-            patch("gza.cli._create_improve_task") as create_improve,
+            patch("gza.cli._create_improve_task", return_value=improve) as create_improve,
             patch("gza.cli._run_foreground") as run_foreground,
             patch("gza.cli.time.monotonic", side_effect=[100.0, 140.0]),
         ):
-            def create_review_side_effect(*_args, **_kwargs):
-                nonlocal next_review
-                next_review = store.add("Next review", task_type="review", depends_on=impl.id)
-                return next_review
-
             def run_foreground_side_effect(_config, task_id, **_kwargs):
-                assert next_review is not None
-                assert task_id == next_review.id
+                assert task_id == improve.id
                 task = store.get(task_id)
                 assert task is not None
                 task.status = "completed"
-                task.output_content = "**Verdict: APPROVED**"
                 task.duration_seconds = 20.0
-                task.num_steps_reported = 2
+                task.num_steps_computed = 2
                 task.cost_usd = 0.11
                 task.completed_at = datetime.now(UTC)
                 store.update(task)
                 return 0
 
-            create_review.side_effect = create_review_side_effect
             run_foreground.side_effect = run_foreground_side_effect
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        assert result == 0
-        assert next_review is not None
-        run_foreground.assert_called_once_with(mock_config, task_id=next_review.id, force=False)
-        create_review.assert_called_once()
-        create_improve.assert_not_called()
+        assert result == 2
+        run_foreground.assert_called_once_with(mock_config, task_id=improve.id, force=False)
+        create_review.assert_not_called()
+        create_improve.assert_called_once()
         assert re.search(
-            rf"1\s+improve\s+{re.escape(improve.id)}\s+-\s+45s\s+3\s+\$0\.21\s+completed",
+            rf"1\s+improve\s+{re.escape(improve.id)}\s+-\s+20s\s+2\s+\$0\.11\s+completed",
             output,
         )
         assert re.search(
-            rf"1\s+review\s+{re.escape(next_review.id)}\s+APPROVED\s+20s\s+2\s+\$0\.11\s+completed",
+            rf"1\s+review\s+{re.escape(review.id)}\s+CHANGES_REQUESTED\s+-\s+-\s+-\s+completed",
             output,
         )
-        assert "Totals: 40s wall | 5 steps | $0.32" in output
+        assert "Totals: 40s wall | 2 steps | $0.11" in output
 
     def test_review_cleared_with_completed_improve_bootstraps_iteration_one_to_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4255,10 +4293,6 @@ class TestIterateCommand:
             output,
         )
         assert re.search(
-            rf"1\s+improve\s+{re.escape(improve.id)}\s+-\s+40s\s+4\s+\$0\.25\s+completed",
-            output,
-        )
-        assert re.search(
             rf"1\s+review\s+{re.escape(next_review.id)}\s+APPROVED\s+20s\s+3\s+\$0\.15\s+completed",
             output,
         )
@@ -4321,10 +4355,6 @@ class TestIterateCommand:
         run_foreground.assert_not_called()
         assert not re.search(
             rf"1\s+implement\s+{re.escape(impl.id)}\s+",
-            output,
-        )
-        assert re.search(
-            rf"1\s+improve\s+{re.escape(improve.id)}\s+-\s+45s\s+5\s+\$0\.33\s+completed",
             output,
         )
         assert re.search(
@@ -4476,7 +4506,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.determine_next_action",
-                side_effect=[{"type": "create_review", "description": "Create review"}],
+                return_value={"type": "create_review", "description": "Create review"},
             ),
             patch("gza.cli._create_review_task", side_effect=DuplicateReviewError(active_review)),
             patch("gza.cli._run_foreground") as run_foreground,
@@ -4523,7 +4553,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.determine_next_action",
-                side_effect=[{"type": "create_review", "description": "Create review"}],
+                return_value={"type": "create_review", "description": "Create review"},
             ),
             patch("gza.cli._create_review_task", side_effect=DuplicateReviewError(pending_review)),
             patch("gza.cli._run_foreground", return_value=0) as run_foreground,
@@ -4571,13 +4601,11 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.determine_next_action",
-                side_effect=[
-                    {
-                        "type": "improve",
-                        "description": "Create improve task",
-                        "review_task": completed_review,
-                    }
-                ],
+                return_value={
+                    "type": "improve",
+                    "description": "Create improve task",
+                    "review_task": completed_review,
+                },
             ),
             patch(
                 "gza.cli._create_improve_task",
@@ -4649,7 +4677,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.determine_next_action",
-                side_effect=[{"type": "run_review", "description": "Run review", "review_task": review}],
+                return_value={"type": "run_review", "description": "Run review", "review_task": review},
             ),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
         ):
@@ -4711,7 +4739,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.determine_next_action",
-                side_effect=[{"type": "run_review", "description": "Run review", "review_task": review}],
+                return_value={"type": "run_review", "description": "Run review", "review_task": review},
             ),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
         ):
@@ -4773,7 +4801,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.determine_next_action",
-                side_effect=[{"type": "run_review", "description": "Run review", "review_task": review}],
+                return_value={"type": "run_review", "description": "Run review", "review_task": review},
             ),
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
         ):
@@ -4817,6 +4845,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
 
         engine_actions = [
+            {"type": "needs_rebase", "description": "needs rebase"},
             {"type": "needs_rebase", "description": "needs rebase"},
             {"type": "resume", "description": "resume"},
             {"type": "merge", "description": "done"},

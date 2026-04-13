@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console, Group
@@ -15,11 +17,19 @@ from rich.text import Text
 import gza.colors as _colors
 
 from ..config import Config
-from ..console import console, format_duration, truncate
+from ..console import console, format_duration, shorten_prompt, truncate
 from ..db import SqliteTaskStore, Task as DbTask
+from ..providers.output_formatter import format_token_count
 from ..workers import WorkerRegistry
 from ._common import get_store, resolve_id
 from .log import _resolve_task_log_path
+
+
+@dataclass
+class _LogStats:
+    step_count: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
 
 # Sensible upper bound — beyond this the rows become unreadable.
 MAX_SLOTS = 8
@@ -37,17 +47,19 @@ def _themed_console() -> Console:
     return Console(theme=build_rich_theme(), highlight=True)
 
 
-def _extract_log_lines(log_path: Path, n: int) -> list[str]:
-    """Read the last *n* meaningful display lines from a JSONL task log."""
+def _scan_log(log_path: Path, n: int) -> tuple[list[str], _LogStats]:
+    """Read the last *n* display lines and accumulate stats from a JSONL task log."""
+    stats = _LogStats()
     if not log_path.exists():
-        return ["(log file not found)"]
+        return ["(log file not found)"], stats
 
     try:
         with open(log_path) as f:
             raw_lines = f.readlines()
     except OSError:
-        return ["(unable to read log)"]
+        return ["(unable to read log)"], stats
 
+    seen_msg_ids: set[str] = set()
     display: list[str] = []
     for raw in raw_lines:
         raw = raw.strip()
@@ -59,9 +71,38 @@ def _extract_log_lines(log_path: Path, n: int) -> list[str]:
             display.append(raw[:200])
             continue
 
+        prev_steps = stats.step_count
+        _accumulate_stats(entry, stats, seen_msg_ids)
+        if stats.step_count > prev_steps and display:
+            display.append("")
         display.extend(_summarize_entry(entry))
 
-    return display[-n:] if display else ["(no log output)"]
+    if not display:
+        display = ["(no log output)"]
+    return display[-n:], stats
+
+
+def _accumulate_stats(entry: dict, stats: _LogStats, seen_msg_ids: set[str]) -> None:
+    """Update running stats from a single log entry (mirrors ``_LiveLogPrinter``)."""
+    etype = entry.get("type")
+    if etype == "assistant":
+        message = entry.get("message", {}) or {}
+        msg_id = message.get("id")
+        if msg_id and msg_id not in seen_msg_ids:
+            seen_msg_ids.add(msg_id)
+            stats.step_count += 1
+            usage = message.get("usage", {}) or {}
+            stats.total_tokens += usage.get("input_tokens", 0) or 0
+            stats.total_tokens += usage.get("cache_creation_input_tokens", 0) or 0
+            stats.total_tokens += usage.get("cache_read_input_tokens", 0) or 0
+            stats.total_tokens += usage.get("output_tokens", 0) or 0
+    elif etype == "turn.started":
+        stats.step_count += 1
+    elif etype == "result":
+        # Final cost, when provider emits it.
+        cost = entry.get("total_cost_usd") or entry.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            stats.cost_usd = float(cost)
 
 
 def _summarize_entry(entry: dict) -> list[str]:
@@ -169,6 +210,18 @@ def _tool_one_liner(name: str, inp: dict) -> str:
     return name
 
 
+def _task_elapsed_seconds(task: DbTask) -> float | None:
+    """Live elapsed time: use recorded duration when set, else now - started_at."""
+    if task.duration_seconds is not None:
+        return task.duration_seconds
+    if task.started_at is not None:
+        started = task.started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - started).total_seconds()
+    return None
+
+
 def _lines_per_panel(n_tasks: int) -> int:
     """Compute how many log lines each panel gets based on terminal height."""
     try:
@@ -195,22 +248,36 @@ def _build_task_panel(
     rc = _colors.RUNNER_COLORS
     sc = _status_color(task.status or "unknown")
 
+    # --- log body & live stats ---
+    # Render lines through a themed console so Rich highlighting applies
+    # (numbers, paths, strings pick up the gza rich theme overrides).
+    if log_path and log_path.exists():
+        lines, log_stats = _scan_log(log_path, n_lines)
+    else:
+        lines, log_stats = ["(no log available)"], _LogStats()
+
     # --- subtitle with metadata ---
     parts: list[str] = []
     if task.task_type:
         parts.append(f"[{rc.task_type}]{task.task_type}[/{rc.task_type}]")
     parts.append(f"[{sc}]{task.status or 'unknown'}[/{sc}]")
-    if task.duration_seconds is not None:
-        parts.append(f"[{rc.value}]{format_duration(task.duration_seconds)}[/{rc.value}]")
-    subtitle = "  ".join(parts)
 
-    # --- log body ---
-    # Render lines through a themed console so Rich highlighting applies
-    # (numbers, paths, strings pick up the gza rich theme overrides).
-    if log_path and log_path.exists():
-        lines = _extract_log_lines(log_path, n_lines)
-    else:
-        lines = ["(no log available)"]
+    elapsed = _task_elapsed_seconds(task)
+    if elapsed is not None:
+        parts.append(f"[{rc.value}]{format_duration(elapsed)}[/{rc.value}]")
+
+    steps = task.num_steps_reported or task.num_steps_computed or log_stats.step_count
+    if steps:
+        parts.append(f"[{rc.value}]{steps} steps[/{rc.value}]")
+
+    if log_stats.total_tokens:
+        parts.append(f"[{rc.value}]{format_token_count(log_stats.total_tokens)}[/{rc.value}]")
+
+    cost = task.cost_usd if task.cost_usd is not None else log_stats.cost_usd
+    if cost:
+        parts.append(f"[{rc.value}]${cost:.2f}[/{rc.value}]")
+
+    subtitle = "  ".join(parts)
 
     # Pad to n_lines so panels are uniform height
     while len(lines) < n_lines:
@@ -226,10 +293,22 @@ def _build_task_panel(
 
     body = Text("\n").join(body_parts)
 
-    # --- title ---
+    # --- title: prompt styled in themed "prompt" color (pink in minimal),
+    # expanded to fill the panel width using the centralized width helper.
     task_id = task.id or "?"
-    prompt_short = truncate(task.prompt or "", 60)
-    title = f"[{_colors.TASK_COLORS.task_id}]{task_id}[/{_colors.TASK_COLORS.task_id}]  {prompt_short}"
+    prompt_color = _colors.TASK_COLORS.prompt
+    # Panel borders (2) + padding (2) + 2 spaces between id and prompt.
+    prefix_chars = len(task_id) + 2
+    suffix_chars = 0
+    # Fit the prompt into the panel's width specifically (not the whole
+    # terminal), since each row may be narrower than the full screen.
+    border_and_padding = 4
+    available = max(20, width - border_and_padding - prefix_chars - suffix_chars)
+    prompt_display = shorten_prompt(task.prompt or "", available=available)
+    title = (
+        f"[{_colors.TASK_COLORS.task_id}]{task_id}[/{_colors.TASK_COLORS.task_id}]  "
+        f"[{prompt_color}]{rich_escape(prompt_display)}[/{prompt_color}]"
+    )
 
     return Panel(
         body,

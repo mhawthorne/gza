@@ -995,14 +995,19 @@ def _spawn_background_iterate(
     config: Config,
     impl_task: DbTask,
     *,
-    max_iterations: int,
+    max_iterations: int | None = None,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
+    effective_max_iterations = max_iterations
+    if effective_max_iterations is None:
+        arg_value = getattr(args, "max_iterations", None)
+        effective_max_iterations = arg_value if isinstance(arg_value, int) else config.iterate_max_iterations
+
     return _spawn_background_iterate_worker(
         args,
         config,
         impl_task,
-        max_iterations=max_iterations,
+        max_iterations=effective_max_iterations,
         resume=getattr(args, "resume", False),
         retry=getattr(args, "retry", False),
     )

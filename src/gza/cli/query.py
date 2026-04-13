@@ -1106,7 +1106,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
     )
 
     started = _started_at(worker, task)
-    ended = _ended_at(worker)
+    ended = _ended_at(worker, task)
     duration = _format_duration(started, ended)
 
     worker_id = worker.worker_id if worker else "-"
@@ -1170,11 +1170,15 @@ def _started_at(worker: WorkerMetadata | None, task: DbTask | None) -> datetime 
     return None
 
 
-def _ended_at(worker: WorkerMetadata | None) -> datetime | None:
+def _ended_at(worker: WorkerMetadata | None, task: DbTask | None = None) -> datetime | None:
     """Get completed timestamp when available."""
-    if not worker:
-        return None
-    return _parse_iso(worker.completed_at)
+    if worker:
+        ended = _parse_iso(worker.completed_at)
+        if ended:
+            return ended
+    if task and task.status in ("completed", "failed") and task.completed_at:
+        return task.completed_at
+    return None
 
 
 def _format_duration(started: datetime | None, ended: datetime | None = None) -> str:

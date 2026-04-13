@@ -42,6 +42,7 @@ from ._common import (
     _create_review_task,
     _get_pager,
     _looks_like_task_id,
+    _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     get_review_verdict,  # noqa: F401  # re-exported for test patching
@@ -51,6 +52,11 @@ from ._common import (
 from .advance_engine import determine_next_action, is_resumable_failed_task
 
 logger = logging.getLogger(__name__)
+
+
+def _advance_uses_iterate(config: Config) -> bool:
+    """Whether advance should launch implement work through the iterate loop."""
+    return getattr(config, "advance_mode", "default") == "iterate"
 
 
 def _collect_advance_completed_tasks(
@@ -1717,14 +1723,29 @@ def cmd_advance(args: argparse.Namespace) -> int:
             console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")
 
             assert impl_task.id is not None
-            worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id, quiet=True)
+            if _advance_uses_iterate(config):
+                iterate_args = argparse.Namespace(
+                    no_docker=getattr(args, 'no_docker', False),
+                    force=force,
+                )
+                rc = _spawn_background_iterate_worker(
+                    iterate_args,
+                    config,
+                    impl_task,
+                    max_iterations=config.iterate_max_iterations,
+                    quiet=True,
+                )
+            else:
+                worker_args = _worker_args()
+                rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started implement worker[/{_c_ok}]")
+                started_label = "iterate worker for implement task" if _advance_uses_iterate(config) else "implement worker"
+                console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [{_c_err}]✗ Failed to start implement worker[/{_c_err}]")
+                failed_label = "iterate worker for implement task" if _advance_uses_iterate(config) else "implement worker"
+                console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
                 error_count += 1
 
         elif action_type == 'needs_rebase':
@@ -1733,18 +1754,32 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 console.print(f"      [{_c_err}]✗ Cannot rebase: task {task.id} has no branch[/{_c_err}]")
                 error_count += 1
                 continue
-            rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
-            assert rebase_task.id is not None
-            console.print(f"      [{_c_ok}]✓ Created rebase task {rebase_task.id}[/{_c_ok}]")
-
-            worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
+            if _advance_uses_iterate(config):
+                iterate_args = argparse.Namespace(
+                    no_docker=getattr(args, 'no_docker', False),
+                    force=force,
+                )
+                rc = _spawn_background_iterate_worker(
+                    iterate_args,
+                    config,
+                    task,
+                    max_iterations=config.iterate_max_iterations,
+                    quiet=True,
+                )
+            else:
+                rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
+                assert rebase_task.id is not None
+                console.print(f"      [{_c_ok}]✓ Created rebase task {rebase_task.id}[/{_c_ok}]")
+                worker_args = _worker_args()
+                rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started rebase worker[/{_c_ok}]")
+                started_label = "iterate worker for rebase cycle" if _advance_uses_iterate(config) else "rebase worker"
+                console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
                 success_count += 1
             else:
-                console.print(f"      [{_c_err}]✗ Failed to start rebase worker[/{_c_err}]")
+                failed_label = "iterate worker for rebase cycle" if _advance_uses_iterate(config) else "rebase worker"
+                console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
                 error_count += 1
 
         print()
@@ -1761,8 +1796,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
         for pt in new_pending_tasks:
             if workers_started >= batch_limit:
                 break
-            worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=pt.id, quiet=True)
+            if _advance_uses_iterate(config) and pt.task_type == "implement":
+                iterate_args = argparse.Namespace(
+                    no_docker=getattr(args, 'no_docker', False),
+                    force=force,
+                )
+                rc = _spawn_background_iterate_worker(
+                    iterate_args,
+                    config,
+                    pt,
+                    max_iterations=config.iterate_max_iterations,
+                    quiet=True,
+                )
+            else:
+                worker_args = _worker_args()
+                rc = _spawn_background_worker(worker_args, config, task_id=pt.id, quiet=True)
             if rc != 0:
                 break  # error spawning
             new_started += 1

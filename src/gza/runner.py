@@ -376,13 +376,13 @@ def generate_slug(
                 base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
-    if not _slug_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
+    if not _slug_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type, project_prefix):
         return base_id
 
     # Find next available suffix
     suffix = 2
     new_id = f"{base_id}-{suffix}"
-    while _slug_exists(new_id, log_path, git, project_name, prompt, branch_strategy, explicit_type):
+    while _slug_exists(new_id, log_path, git, project_name, prompt, branch_strategy, explicit_type, project_prefix):
         suffix += 1
         new_id = f"{base_id}-{suffix}"
     return new_id
@@ -450,6 +450,7 @@ def _slug_exists(
     prompt: str = "",
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
+    project_prefix: str | None = None,
 ) -> bool:
     """Check if a slug is already in use (log file or branch exists)."""
     # Check log file
@@ -461,10 +462,14 @@ def _slug_exists(
             branch_name = generate_branch_name(
                 pattern=branch_strategy.pattern,
                 project_name=project_name,
-                task_id=task_id,
+                task_slug=task_id,
                 prompt=prompt,
                 default_type=branch_strategy.default_type,
                 explicit_type=explicit_type,
+                # task.id is not yet assigned at slug-generation time; patterns
+                # that depend on {task_id} won't collision-check cleanly.
+                task_id="",
+                project_prefix=project_prefix or "",
             )
         else:
             # Fallback for callers that don't supply a strategy (e.g., tests or legacy callers).
@@ -1565,10 +1570,12 @@ def _resolve_code_task_branch_name(
         branch_name = generate_branch_name(
             pattern=config.branch_strategy.pattern,
             project_name=config.project_name,
-            task_id=task.slug,
+            task_slug=task.slug,
             prompt=task.prompt,
             default_type=config.branch_strategy.default_type,
             explicit_type=task.task_type_hint,
+            task_id=task.id or "",
+            project_prefix=config.project_prefix,
         )
         console.print(f"Resuming on branch: [blue]{branch_name}[/blue]")
         return branch_name
@@ -1619,14 +1626,21 @@ def _resolve_code_task_branch_name(
     # multi branch mode uses branch naming strategy
     assert config.branch_strategy is not None
     assert task.slug is not None
-    return generate_branch_name(
+    branch_name = generate_branch_name(
         pattern=config.branch_strategy.pattern,
         project_name=config.project_name,
-        task_id=task.slug,
+        task_slug=task.slug,
         prompt=task.prompt,
         default_type=config.branch_strategy.default_type,
         explicit_type=task.task_type_hint,
+        task_id=task.id or "",
+        project_prefix=config.project_prefix,
     )
+    console.print(
+        f"Branch strategy: [{_colors.RUNNER_COLORS.label}]{config.branch_strategy.pattern}[/] "
+        f"→ [blue]{branch_name}[/blue]"
+    )
+    return branch_name
 
 
 def _select_worktree_base_ref(git: Git, default_branch: str) -> str:

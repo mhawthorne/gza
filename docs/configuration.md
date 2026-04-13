@@ -136,13 +136,13 @@ From highest to lowest:
 
 ### Branch Naming Strategy
 
-Configure branch naming with the `branch_strategy` option. Three presets are available:
+Configure branch naming with the `branch_strategy` option. Several presets are available:
 
 ```yaml
-# Preset: monorepo (default)
-# Generates: {project}/{task_id}
+# Preset: project_date_slug (default)
+# Generates: {project}/{date}-{slug}
 # Example: myproject/20260108-add-feature
-branch_strategy: monorepo
+branch_strategy: project_date_slug
 
 # Preset: conventional
 # Generates: {type}/{slug}
@@ -155,8 +155,8 @@ branch_strategy: conventional
 branch_strategy: simple
 
 # Preset: date_slug
-# Generates: {date}/{slug}
-# Example: 20260108/add-feature
+# Generates: {date}-{slug}
+# Example: 20260108-add-feature
 branch_strategy: date_slug
 ```
 
@@ -173,9 +173,11 @@ branch_strategy:
 | Variable | Description |
 |----------|-------------|
 | `{project}` | Project name |
-| `{task_id}` | Full task ID (`{prefix}-{decimal}`, for example `gza-1234`) |
-| `{date}` | Date portion (YYYYMMDD) |
-| `{slug}` | Slug portion |
+| `{prefix}` | Project prefix (used in task slugs) |
+| `{task_id}` | Short task id (`{prefix}-{decimal}`, for example `gza-1234`) |
+| `{task_slug}` | Full task slug (`YYYYMMDD-{prefix}-{slug}`) |
+| `{date}` | Date portion of the task slug (YYYYMMDD) |
+| `{slug}` | Bare slug with `{prefix}-` stripped (e.g. `add-feature`) |
 | `{type}` | Inferred or default type |
 
 **Branch types** are automatically inferred from task prompts:

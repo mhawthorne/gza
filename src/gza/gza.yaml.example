@@ -6,9 +6,11 @@ project_name: my-project
 # Optional local override file: gza.local.yaml (gitignored)
 # Keep shared defaults here and put machine-specific settings in gza.local.yaml.
 
-# Branch naming strategy (default: monorepo)
-# Options: monorepo, conventional, simple, or custom pattern dict
-# branch_strategy: monorepo  # Default: {project}/{task_id}
+# Branch naming strategy (default: project_date_slug)
+# Options: project_date_slug, monorepo, conventional, simple, date_slug,
+# or a custom pattern dict. Variables: {project} {task_id} {task_slug}
+# {date} {slug} {type}
+# branch_strategy: project_date_slug  # Default: {project}/{date}-{slug}
 
 # All settings below show default values and are commented out.
 # Uncomment and modify any setting you want to change.
