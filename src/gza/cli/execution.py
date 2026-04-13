@@ -39,8 +39,8 @@ from ._common import (
     get_store,
     get_task_step_count,
     resolve_id,
-    set_task_urgency,
     run_with_resume,
+    set_task_urgency,
 )
 from .advance_engine import determine_next_action
 from .log import _latest_worker_for_task, _running_worker_id_for_task
@@ -1127,7 +1127,6 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if impl_task.status == "failed":
             print(f"Implementation {impl_task.id} failed, cannot continue iteration.")
             return 1
-        initial_write_task = impl_task
 
     # If the task is failed, resume or retry it first.
     if impl_task.status == "failed":
@@ -1176,7 +1175,6 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             action_label = "Resume" if use_resume else "Retry"
             print(f"{action_label} of {impl_task_id} failed, cannot continue iteration.")
             return 1
-        initial_write_task = impl_task
 
     assert impl_task.id is not None
 

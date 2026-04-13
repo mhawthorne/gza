@@ -44,10 +44,11 @@ from ._common import (
     _looks_like_task_id,
     _spawn_background_resume_worker,
     _spawn_background_worker,
+    get_review_verdict,
     get_store,
     resolve_id,
 )
-from .advance_engine import WORKER_CONSUMING_ACTIONS, determine_next_action, is_resumable_failed_task
+from .advance_engine import determine_next_action, is_resumable_failed_task
 
 logger = logging.getLogger(__name__)
 

@@ -366,6 +366,7 @@ class Config:
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
     watch: WatchConfig = field(default_factory=WatchConfig)
+    iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD

@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 import gza.colors as _colors
+
 from ..config import Config
 from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
@@ -135,9 +136,9 @@ def _summarize_entry(entry: dict) -> list[str]:
 
 def _text_to_lines(text: str, max_lines: int = 6) -> list[str]:
     """Extract the last *max_lines* non-empty lines from a block of text."""
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     lines = lines[-max_lines:]
-    return [l[:200] for l in lines]
+    return [line[:200] for line in lines]
 
 
 def _strip_shell_wrapper(cmd: str) -> str:
@@ -318,7 +319,10 @@ def cmd_tv(args: argparse.Namespace) -> int:
 
                 # Refresh task metadata
                 for i in range(len(tasks)):
-                    refreshed = store.get(tasks[i].id)  # type: ignore[arg-type]
+                    tid = tasks[i].id
+                    if tid is None:
+                        continue
+                    refreshed = store.get(tid)
                     if refreshed:
                         tasks[i] = refreshed
 
@@ -327,7 +331,8 @@ def cmd_tv(args: argparse.Namespace) -> int:
 
                 # Re-resolve log paths (may appear after task starts)
                 for i in range(len(tasks)):
-                    if log_paths[i] is None or not log_paths[i].exists():  # type: ignore[union-attr]
+                    lp_current = log_paths[i]
+                    if lp_current is None or not lp_current.exists():
                         lp, _ = _resolve_task_log_path(config, registry, tasks[i])
                         log_paths[i] = lp
 

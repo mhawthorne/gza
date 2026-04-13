@@ -509,7 +509,7 @@ def _run_cycle(
                     log=log,
                     failure_message=f"{impl_task.id} implement: iterate worker spawn failed",
                     dedupe_key=f"spawn-iterate-failed:{impl_task.id}",
-                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, impl_task, quiet=quiet),
+                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, impl_task, max_iterations=max_iterations),
                 )
                 if rc == 0:
                     log.emit("START", f"{impl_task.id} implement")
@@ -643,7 +643,7 @@ def _run_cycle(
                     log=log,
                     failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
                     dedupe_key=f"spawn-iterate-failed:{task.id}",
-                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, task, quiet=quiet),
+                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, task, max_iterations=max_iterations),
                 )
                 if rc != 0:
                     continue
