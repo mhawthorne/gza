@@ -1469,6 +1469,29 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             review_task = action["review_task"]
             review_row_task = review_task
             review_row_verdict = get_review_verdict(config, review_task)
+            # Guard against improves with statuses the engine can't reconcile
+            # (e.g. failed, dropped). The engine only considers pending / in_progress
+            # in context; creating a fresh improve here would mask operator attention.
+            assert impl_task.id is not None
+            assert review_task.id is not None
+            sibling_improves = store.get_improve_tasks_for(impl_task.id, review_task.id)
+            unexpected = [
+                t for t in sibling_improves
+                if t.status not in {"pending", "in_progress", "completed"}
+            ]
+            if unexpected:
+                statuses = sorted({t.status for t in unexpected if t.status})
+                print(f"  Unexpected improve status(es) for review {review_task.id}: {', '.join(statuses)}")
+                final_status = "blocked"
+                final_stop_reason = "improve_unexpected_state. Manual review required."
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="review",
+                    task=review_row_task,
+                    verdict=review_row_verdict,
+                )
+                break
             try:
                 action_task = _create_improve_task(store, impl_task, review_task)
             except ValueError as e:
