@@ -44,7 +44,7 @@ from ._common import (
     _looks_like_task_id,
     _spawn_background_resume_worker,
     _spawn_background_worker,
-    get_review_verdict,
+    get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
     resolve_id,
 )
