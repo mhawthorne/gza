@@ -1244,3 +1244,35 @@ class TestStatusPorcelain:
             result = git.status_porcelain()
 
         assert result == {("R", "new.py")}
+
+    def test_c_style_quoted_filename(self, tmp_path: Path):
+        """Test status_porcelain decodes C-style quoted paths."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='?? "file\\040\\074x\\076\\040\\"q\\".txt"\n',
+                stderr="",
+            )
+            result = git.status_porcelain()
+
+        assert result == {("??", 'file <x> "q".txt')}
+
+    def test_quoted_rename_with_arrow_in_old_name(self, tmp_path: Path):
+        """Test status_porcelain handles quoted rename records with embedded delimiters."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='R  "old -> name.txt" -> "new -> name.txt"\n',
+                stderr="",
+            )
+            result = git.status_porcelain()
+
+        assert result == {("R", "new -> name.txt")}

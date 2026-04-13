@@ -10,6 +10,78 @@ class GitError(Exception):
     pass
 
 
+def _unquote_c_style_path(path: str) -> str:
+    """Decode git C-style quoted paths from porcelain output."""
+    if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
+        return path
+
+    escaped = path[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(escaped):
+        ch = escaped[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+
+        if i + 1 >= len(escaped):
+            out.append(ord("\\"))
+            break
+
+        nxt = escaped[i + 1]
+        if nxt in "01234567":
+            j = i + 1
+            while j < len(escaped) and (j - (i + 1)) < 3 and escaped[j] in "01234567":
+                j += 1
+            out.append(int(escaped[i + 1:j], 8))
+            i = j
+            continue
+
+        simple_escapes = {
+            '"': ord('"'),
+            "\\": ord("\\"),
+            "a": 7,
+            "b": 8,
+            "f": 12,
+            "n": 10,
+            "r": 13,
+            "t": 9,
+            "v": 11,
+        }
+        if nxt in simple_escapes:
+            out.append(simple_escapes[nxt])
+        else:
+            out.extend(nxt.encode("utf-8"))
+        i += 2
+
+    return out.decode("utf-8", errors="surrogateescape")
+
+
+def _split_rename_paths(pathspec: str) -> tuple[str, str] | None:
+    """Split ``old -> new`` pathspec while respecting quoted segments."""
+    in_quotes = False
+    escaped = False
+
+    for i, ch in enumerate(pathspec):
+        if escaped:
+            escaped = False
+            continue
+
+        if in_quotes and ch == "\\":
+            escaped = True
+            continue
+
+        if ch == '"':
+            in_quotes = not in_quotes
+            continue
+
+        if not in_quotes and pathspec.startswith(" -> ", i):
+            return pathspec[:i], pathspec[i + 4:]
+
+    return None
+
+
 def parse_diff_numstat(numstat_output: str) -> tuple[int, int, int]:
     """Parse --numstat output into (files_changed, lines_added, lines_removed).
 
@@ -146,9 +218,11 @@ class Git:
             # Porcelain format: XY filename (or XY orig -> renamed)
             status = line[:2].strip()
             filepath = line[3:]
-            # Handle renames: "R  old -> new"
-            if " -> " in filepath:
-                filepath = filepath.split(" -> ", 1)[1]
+            rename_paths = _split_rename_paths(filepath)
+            if rename_paths is not None:
+                _src_path, dst_path = rename_paths
+                filepath = dst_path
+            filepath = _unquote_c_style_path(filepath)
             entries.add((status, filepath))
         return entries
 
