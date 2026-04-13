@@ -2750,6 +2750,42 @@ class TestAdvanceCommand:
         # task1 is the oldest so it falls outside the --max 2 window.
         assert review_counts[0] == 0
 
+    def test_advance_max_still_resumes_failed_tasks(self, tmp_path: Path):
+        """advance --max should not suppress resumable failed-task handling."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        self._create_implement_task_with_branch(store, git, tmp_path, "Completed task in --max window")
+        failed_task = self._create_failed_task(store, session_id="sess-max-1", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--max", "1", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Resume (failed: MAX_STEPS" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 1
+
+    def test_advance_dry_run_max_still_plans_failed_resume(self, tmp_path: Path):
+        """advance --dry-run --max should still include resumable failed tasks in the plan."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        self._create_implement_task_with_branch(store, git, tmp_path, "Completed task in --max window")
+        failed_task = self._create_failed_task(store, session_id="sess-max-2", failure_reason="MAX_STEPS")
+
+        result = run_gza("advance", "--max", "1", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance" in result.stdout
+        assert str(failed_task.id) in result.stdout
+        assert "Resume (failed: MAX_STEPS" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 0
+
     def test_advance_spawns_worker_for_pending_review(self, tmp_path: Path):
         """advance spawns a worker for a pending review instead of skipping."""
         setup_config(tmp_path)
@@ -4094,9 +4130,25 @@ class TestAdvanceCommand:
         assert len(children) == 1
         assert children[0].session_id == "sess-xyz"
 
+    def test_advance_skips_test_failure_failed_task(self, tmp_path: Path):
+        """advance does not auto-resume TEST_FAILURE failed tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-test", failure_reason="TEST_FAILURE")
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No eligible tasks" in result.stdout
+
+        children = store.get_based_on_children(failed_task.id)
+        assert len(children) == 0
+
     def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
         """advance skips a failed task when chain depth >= max_resume_attempts."""
-        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
@@ -4110,7 +4162,7 @@ class TestAdvanceCommand:
         first_resume.completed_at = datetime.now(UTC)
         store.update(first_resume)
 
-        # Default max_resume_attempts=1; original is skipped (already has a child),
+        # max_resume_attempts=1; original is skipped (already has a child),
         # first_resume (depth=1) is skipped (at max attempts)
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
@@ -4123,6 +4175,50 @@ class TestAdvanceCommand:
         # first_resume should not have any new children (at max attempts)
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
+
+    def test_advance_default_resume_budget_is_one(self, tmp_path: Path):
+        """advance default max_resume_attempts=1 skips failed task at depth 1."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-1", failure_reason="MAX_STEPS")
+        first_resume = store.add("Implement feature", task_type="implement")
+        first_resume.status = "failed"
+        first_resume.failure_reason = "MAX_STEPS"
+        first_resume.session_id = "sess-2"
+        first_resume.based_on = original.id
+        first_resume.completed_at = datetime.now(UTC)
+        store.update(first_resume)
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "max resume attempts (1)" in result.stdout
+        first_resume_children = store.get_based_on_children(first_resume.id)
+        assert len(first_resume_children) == 0
+
+    def test_determine_advance_action_returns_skip_at_max_resume_attempts(self, tmp_path: Path):
+        """Action selection keeps max resume exhaustion on the skip contract."""
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-1", failure_reason="MAX_STEPS")
+        first_resume = store.add("Implement feature", task_type="implement")
+        first_resume.status = "failed"
+        first_resume.failure_reason = "MAX_STEPS"
+        first_resume.session_id = "sess-2"
+        first_resume.based_on = original.id
+        first_resume.completed_at = datetime.now(UTC)
+        first_resume.branch = f"feat/task-{first_resume.id}"
+        store.update(first_resume)
+
+        config = Config.load(tmp_path)
+        action = _determine_advance_action(config, store, git, first_resume, "main")
+
+        assert action["type"] == "skip"
+        assert action["description"] == "SKIP: max resume attempts (1) reached"
 
     def test_advance_skips_failed_task_with_existing_resume_child(self, tmp_path: Path):
         """advance skips a failed task that already has a pending/in_progress child."""
@@ -4168,7 +4264,7 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
-        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
@@ -4190,6 +4286,7 @@ class TestAdvanceCommand:
         # (and the child should be skipped due to max resume attempts)
         assert f"{original.id}" not in result.stdout
         assert "SKIP: max resume attempts" in result.stdout
+        assert "No eligible tasks to advance" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
@@ -4297,6 +4394,80 @@ class TestAdvanceCommand:
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 1
 
+    def test_advance_prefers_in_progress_review_over_pending_sibling(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        pending_review = store.add(f"Review {task.id} pending", task_type="review", depends_on=task.id)
+        pending_review.status = "pending"
+        store.update(pending_review)
+
+        in_progress_review = store.add(f"Review {task.id} in-progress", task_type="review", depends_on=task.id)
+        in_progress_review.status = "in_progress"
+        store.update(in_progress_review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=None,
+            new=False,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker:
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        spawn_worker.assert_not_called()
+
+    def test_advance_runs_pending_review_when_no_in_progress_review_exists(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        pending_review = store.add(f"Review {task.id} pending", task_type="review", depends_on=task.id)
+        pending_review.status = "pending"
+        store.update(pending_review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=None,
+            new=False,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker:
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        spawn_worker.assert_called_once()
+
 
     def test_advance_new_batch_spawns_distinct_tasks(self, tmp_path: Path):
         """advance --new --batch N spawns a separate worker for each pending task.
@@ -4391,6 +4562,54 @@ class TestAdvanceCommand:
         assert rc == 0
         assert started == [runnable.id]
         assert internal.id not in started
+
+    def test_advance_iterate_new_batch_needs_rebase_consumes_slot(self, tmp_path: Path):
+        """iterate mode accounts for needs_rebase as worker-consuming in --new --batch planning/execution."""
+        import io
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "advance_mode: iterate\n"
+        )
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path, "Conflict task")
+        pending = store.add("Pending task", task_type="implement")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli._determine_advance_action", return_value={"type": "needs_rebase", "description": "rebase"}),
+            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 0
+        assert pending.id not in output
+        assert "Will start 1 new pending task(s)" not in output
+        spawn_iterate.assert_called_once()
+        spawn_worker.assert_not_called()
 
     def test_advance_new_excludes_dependency_blocked_pending_from_plan_and_startup(self, tmp_path: Path):
         """Blocked pending tasks must not appear in --new startup plan or be started."""
@@ -4495,6 +4714,57 @@ class TestAdvanceCommand:
         children = store.get_based_on_children(plan.id)
         assert any(child.task_type == "implement" for child in children)
 
+    def test_advance_iterate_new_batch_create_implement_consumes_slot(self, tmp_path: Path):
+        """iterate mode accounts for create_implement as worker-consuming in --new --batch planning/execution."""
+        import io
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "advance_mode: iterate\n"
+        )
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        plan = store.add("Plan task", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        pending = store.add("Pending task", task_type="implement")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(plan.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            batch=1,
+            new=True,
+            no_docker=True,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            max_review_cycles=None,
+            squash_threshold=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 0
+        assert pending.id not in output
+        assert "Will start 1 new pending task(s)" not in output
+        spawn_iterate.assert_called_once()
+        spawn_worker.assert_not_called()
+
     def test_advance_new_batch_needs_rebase_consumes_slot_for_planning(self, tmp_path: Path):
         """needs_rebase must count as worker-consuming in --new planning output."""
         setup_config(tmp_path)
@@ -4594,8 +4864,6 @@ class TestAdvanceCommand:
 
         assert rc == 0
         assert started == [bumped.id]
-
-
 class TestAdvanceMergeSquashThreshold:
     """Tests for merge_squash_threshold feature in gza advance."""
 
@@ -4763,6 +5031,7 @@ class TestAdvanceMergeSquashThreshold:
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 0
+        assert config.max_resume_attempts == 1
 
     def test_yaml_merge_squash_threshold_parsed(self, tmp_path: Path):
         """merge_squash_threshold is correctly parsed from gza.yaml."""
@@ -4787,6 +5056,91 @@ class TestAdvanceMergeSquashThreshold:
         from gza.config import Config, ConfigError
         (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: -1\n")
         with pytest.raises(ConfigError):
+            Config.load(tmp_path)
+
+    def test_validate_rejects_negative_max_resume_attempts(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: -1\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'max_resume_attempts' must be non-negative" in errors
+
+    def test_validate_rejects_non_integer_max_resume_attempts(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: nope\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'max_resume_attempts' must be an integer" in errors
+
+    def test_validate_rejects_non_positive_max_review_cycles(self, tmp_path: Path):
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 0\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'max_review_cycles' must be positive" in errors
+
+    def test_load_rejects_non_integer_max_resume_attempts(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: nope\n")
+        with pytest.raises(ConfigError, match="'max_resume_attempts' must be an integer"):
+            Config.load(tmp_path)
+
+    def test_load_rejects_negative_max_resume_attempts(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: -1\n")
+        with pytest.raises(ConfigError, match="'max_resume_attempts' must be non-negative"):
+            Config.load(tmp_path)
+
+    def test_load_rejects_non_integer_max_review_cycles(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: nope\n")
+        with pytest.raises(ConfigError, match="'max_review_cycles' must be an integer"):
+            Config.load(tmp_path)
+
+    def test_load_rejects_non_positive_max_review_cycles(self, tmp_path: Path):
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 0\n")
+        with pytest.raises(ConfigError, match="'max_review_cycles' must be positive"):
+            Config.load(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_error"),
+        [
+            ("max_resume_attempts", "true", "'max_resume_attempts' must be an integer"),
+            ("max_resume_attempts", '"2"', "'max_resume_attempts' must be an integer"),
+            ("max_review_cycles", "true", "'max_review_cycles' must be an integer"),
+            ("max_review_cycles", '"3"', "'max_review_cycles' must be an integer"),
+        ],
+    )
+    def test_load_and_validate_reject_bool_and_quoted_numeric_values(
+        self, tmp_path: Path, field: str, value: str, expected_error: str
+    ) -> None:
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text(f"project_name: test-project\n{field}: {value}\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert expected_error in errors
+
+        with pytest.raises(ConfigError, match=expected_error):
             Config.load(tmp_path)
 
 class TestAdvanceUnimplementedCommand:

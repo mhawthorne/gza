@@ -63,6 +63,7 @@ DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_MAX_IDLE: int | None = None
 DEFAULT_WATCH_MAX_ITERATIONS = 10
+DEFAULT_ITERATE_MAX_ITERATIONS = 5
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_CLEANUP_DAYS = 30
@@ -132,6 +133,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "max_idle": None,
         "max_iterations": None,
     },
+    "iterate_max_iterations": None,
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
     "cleanup_days": None,
@@ -176,6 +178,19 @@ def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
         f"'{path}' model '{model}' appears incompatible with provider '{provider}'. "
         f"Use a model for '{provider}' or change provider."
     )
+
+
+def _is_strict_int(value: object) -> bool:
+    """Return True only for real integer scalars (exclude booleans)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _load_strict_int_field(data: dict, field_name: str, default: int) -> int:
+    """Load an integer config field without coercion."""
+    value = data.get(field_name, default)
+    if not _is_strict_int(value):
+        raise ConfigError(f"'{field_name}' must be an integer")
+    return value
 
 
 def _read_yaml_dict(path: Path) -> dict:
@@ -565,7 +580,8 @@ class Config:
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
+            "advance_create_reviews", "advance_requires_review", "advance_mode",
+            "max_resume_attempts", "max_review_cycles", "iterate_max_iterations",
             "watch",
             "interactive_worktree_dir",
             "merge_squash_threshold",
@@ -944,8 +960,16 @@ class Config:
 
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
-        max_review_cycles = int(data.get("max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES))
-        max_resume_attempts = int(data.get("max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS))
+        max_resume_attempts = _load_strict_int_field(data, "max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS)
+        if max_resume_attempts < 0:
+            raise ConfigError("'max_resume_attempts' must be non-negative")
+        max_review_cycles = _load_strict_int_field(data, "max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES)
+        if max_review_cycles <= 0:
+            raise ConfigError("'max_review_cycles' must be positive")
+
+        iterate_max_iterations = int(data.get("iterate_max_iterations", DEFAULT_ITERATE_MAX_ITERATIONS))
+        if iterate_max_iterations < 1:
+            raise ConfigError("iterate_max_iterations must be a positive integer")
         watch_data = data.get("watch") or {}
         if not isinstance(watch_data, dict):
             raise ConfigError("'watch' must be a dictionary")
@@ -1158,6 +1182,7 @@ class Config:
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
             watch=watch_config,
+            iterate_max_iterations=iterate_max_iterations,
             interactive_worktree_dir=interactive_worktree_dir,
             merge_squash_threshold=merge_squash_threshold,
             cleanup_days=cleanup_days,
@@ -1218,7 +1243,8 @@ class Config:
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review", "max_resume_attempts", "max_review_cycles",
+            "advance_create_reviews", "advance_requires_review", "advance_mode",
+            "max_resume_attempts", "max_review_cycles", "iterate_max_iterations",
             "watch",
             "interactive_worktree_dir",
             "merge_squash_threshold",
@@ -1436,6 +1462,16 @@ class Config:
 
         if "advance_requires_review" in data and not isinstance(data["advance_requires_review"], bool):
             errors.append("'advance_requires_review' must be a boolean (true/false)")
+        if "max_resume_attempts" in data:
+            if not _is_strict_int(data["max_resume_attempts"]):
+                errors.append("'max_resume_attempts' must be an integer")
+            elif data["max_resume_attempts"] < 0:
+                errors.append("'max_resume_attempts' must be non-negative")
+        if "max_review_cycles" in data:
+            if not _is_strict_int(data["max_review_cycles"]):
+                errors.append("'max_review_cycles' must be an integer")
+            elif data["max_review_cycles"] <= 0:
+                errors.append("'max_review_cycles' must be positive")
 
         # Validate defaults section
         if "defaults" in data:

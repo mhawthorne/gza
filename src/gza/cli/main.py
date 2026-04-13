@@ -1112,10 +1112,10 @@ def main() -> int:
         iterate_parser.add_argument(
             "-i", "--max-iterations",
             type=int,
-            default=3,
+            default=None,
             dest="max_iterations",
             metavar="N",
-            help="Maximum code-write iterations; each iteration ends with a review (default: 3)",
+            help="Maximum iterate actions (default: 5)",
         )
         iterate_parser.add_argument(
             "--dry-run",
@@ -1147,14 +1147,15 @@ def main() -> int:
         iterate_parser.add_argument(
             "--force",
             action="store_true",
-            help="Skip dependency precondition checks when running review/improve tasks in the loop",
+            help="Skip dependency precondition checks when iterate starts workers",
         )
         add_common_args(iterate_parser)
 
     # iterate command
     iterate_parser = subparsers.add_parser(
         "iterate",
-        help="Run an automated review/improve loop for an implementation task (pending, failed, or completed)",
+        help="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for an implementation task",
+        description="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for an implementation task",
     )
     _add_iterate_args(iterate_parser)
 

@@ -1,10 +1,16 @@
 # gza advance
 
-> **Status: Implemented** — This spec describes the current behavior of `gza advance` as of 2026-03-26.
+> **Status: Implemented** — This spec describes the current behavior of `gza advance` as of 2026-04-12.
 
 ## Overview
 
 `gza advance` is the main orchestration command. It inspects all completed/unmerged tasks, determines the next action for each, and executes those actions (spawning workers, merging, etc.). It is designed to be idempotent and safe to run repeatedly.
+
+## Scope note (gza-956)
+
+The shared rule engine introduced for `advance` is also the decision source for `iterate` (`determine_next_action` in `src/gza/cli/advance_engine.py` wraps the same `evaluate_advance_rules()` chain). Keeping both commands on one rule evaluator is intentional to preserve the project learning: avoid diverging procedural forks between lifecycle commands.
+
+As a result, this change set includes iterate-facing contract alignment where needed (status wording, help text, and regressions) in the same patch as the engine migration, rather than splitting into a separate task with duplicated decision logic changes.
 
 ## Usage
 
@@ -46,7 +52,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 
 ## Decision Tree
 
-For each task, `_determine_advance_action()` returns an action. The decision tree is evaluated top-to-bottom; first match wins.
+For each task, `evaluate_advance_rules()` returns an action from `src/gza/advance_engine.py`. The decision tree is evaluated by an ordered rule list; first match wins.
 
 ### 1. Plan tasks
 
@@ -117,7 +123,7 @@ Conflict detection uses the currently checked-out branch as the merge target (`t
 
 ### 8. Failed task resumption
 
-Failed tasks are evaluated separately from the main decision tree.
+Failed task resume rules run in the same ordered rule engine.
 
 | Condition | Action |
 |-----------|--------|
@@ -128,7 +134,7 @@ Failed tasks are evaluated separately from the main decision tree.
 
 ### Worker-spawning actions
 
-These actions create background workers and count toward the batch limit.
+These actions create background workers and count toward the batch limit. The source of truth is `WORKER_CONSUMING_ACTIONS` in `src/gza/advance_engine.py`.
 
 | Action | What it does |
 |--------|-------------|

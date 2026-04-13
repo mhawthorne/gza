@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
-from .failure_policy import is_resumable_failure_reason, resumable_failure_reasons
+from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
 logger = logging.getLogger(__name__)
 
@@ -1339,9 +1339,9 @@ class SqliteTaskStore:
         - failure_reason is in the shared resumable failure policy
         - session_id IS NOT NULL
         """
-        reasons = tuple(resumable_failure_reasons())
-        placeholders = ", ".join("?" for _ in reasons)
         with self._connect() as conn:
+            resumable_reasons = tuple(sorted(RESUMABLE_FAILURE_REASONS))
+            placeholders = ",".join("?" for _ in resumable_reasons)
             cur = conn.execute(
                 f"""
                 SELECT * FROM tasks
@@ -1350,7 +1350,7 @@ class SqliteTaskStore:
                 AND session_id IS NOT NULL
                 ORDER BY completed_at DESC, created_at DESC
                 """,
-                reasons,
+                resumable_reasons,
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 

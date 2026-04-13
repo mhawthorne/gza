@@ -92,22 +92,20 @@ class TestHelpOutput:
         assert "--force" in result.stdout
         assert "--plans" not in result.stdout
 
-    def test_advance_help_and_internal_docs_no_longer_advertise_test_failure_auto_resume(self):
-        """Operator-facing resume policy should only mention MAX_STEPS/MAX_TURNS."""
-        result = subprocess.run(
-            ["uv", "run", "gza", "advance", "--help"],
-            capture_output=True,
-            text=True,
-        )
+    def test_iterate_help_uses_lifecycle_wording_and_default_5(self, tmp_path):
+        """iterate --help should keep lifecycle wording and current max-iterations default text."""
+        setup_config(tmp_path)
+
+        result = run_gza("iterate", "--help", "--project", str(tmp_path))
+        normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
-        normalized_help = " ".join(result.stdout.split())
-        assert "MAX_STEPS/MAX_TURNS failures" in normalized_help
-        assert "TEST_FAILURE" not in normalized_help
-
-        internal_docs = Path("docs/internal/advance-workflow.md").read_text()
-        assert "MAX_STEPS', 'MAX_TURNS'" in internal_docs
-        assert "'TEST_FAILURE'" not in internal_docs
+        assert "implementation lifecycle loop" in normalized_output
+        assert "for an implementation task" in normalized_output
+        assert "for a task" not in normalized_output
+        assert "Maximum iterate actions (default: 5)" in normalized_output
+        assert "review/improve loop" not in normalized_output
+        assert "default: 3" not in normalized_output
 
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
@@ -321,3 +319,185 @@ class TestDirectExecutionForceDispatch:
         cmd_handler.assert_called_once()
         parsed_args = cmd_handler.call_args[0][0]
         assert parsed_args.force is True
+
+
+class TestIterateBackgroundForceDispatch:
+    """Command-level regression tests for iterate --background force propagation."""
+
+    def test_iterate_force_background_propagates_to_worker_command(self, tmp_path):
+        """`gza iterate --background --force` should retain --force in the detached iterate command."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending implement for iterate background", task_type="implement")
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 5252
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    "--force",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        assert "--force" in captured_cmd
+
+    def test_iterate_background_propagates_explicit_max_iterations(self, tmp_path):
+        """`gza iterate --background --max-iterations N` should pass N unchanged to detached worker."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending implement for iterate background max-iterations", task_type="implement")
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 5353
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    "--max-iterations",
+                    "7",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        idx = captured_cmd.index("--max-iterations")
+        assert captured_cmd[idx + 1] == "7"
+
+    def test_iterate_background_rejects_zero_max_iterations_before_spawn(self, tmp_path):
+        """`gza iterate --background --max-iterations 0` should fail before detached worker spawn."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending implement for iterate background invalid max", task_type="implement")
+        assert task.id is not None
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    "--max-iterations",
+                    "0",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen") as popen_mock,
+        ):
+            rc = main()
+
+        assert rc == 1
+        popen_mock.assert_not_called()
+
+    @pytest.mark.parametrize("restart_flag", ["--resume", "--retry"])
+    def test_iterate_restart_background_keeps_force_in_worker_command(self, tmp_path, restart_flag):
+        """Restarting iterate in background should preserve --force alongside --resume/--retry."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Failed implement for iterate restart", task_type="implement")
+        task.status = "failed"
+        store.update(task)
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 6262
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    restart_flag,
+                    "--force",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        assert "--force" in captured_cmd
+        assert restart_flag in captured_cmd
+
+
+class TestIterateMaxIterationsValidation:
+    """Command-level regression tests for iterate max-iterations bounds."""
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_iterate_rejects_non_positive_max_iterations(self, tmp_path, value):
+        setup_config(tmp_path)
+        result = run_gza("iterate", "testproject-1", "--max-iterations", value, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "--max-iterations must be a positive integer" in result.stdout

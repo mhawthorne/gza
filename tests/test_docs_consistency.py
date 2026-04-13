@@ -74,7 +74,7 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
         "| `--force` | Skip dependency merge precondition checks when running the improve task |",
         "| `--force` | Skip dependency merge precondition checks when running the implement task |",
         "| `--force` | Skip dependency merge precondition checks when advance starts workers |",
-        "| `--force` | Skip dependency merge precondition checks when running review/improve tasks in the loop |",
+        "| `--force` | Skip dependency merge precondition checks when iterate starts workers |",
         "`PREREQUISITE_UNMERGED`: the resolved completed dependency branch is not reachable",
     ]
 
