@@ -69,22 +69,66 @@ class TestBranchNameGeneration:
     """Test branch name generation."""
 
     def test_monorepo_pattern(self):
-        """Test monorepo pattern: {project}/{task_id}."""
+        """Test monorepo pattern: {project}/{task_slug}."""
         name = generate_branch_name(
-            pattern="{project}/{task_id}",
+            pattern="{project}/{task_slug}",
             project_name="myproj",
-            task_id="20260107-add-auth",
+            task_slug="20260107-add-auth",
             prompt="Add authentication",
             default_type="feature",
         )
         assert name == "myproj/20260107-add-auth"
+
+    def test_slug_strips_project_prefix(self):
+        """{slug} should not duplicate project_prefix when it's embedded in task_slug."""
+        name = generate_branch_name(
+            pattern="{project}/{date}-{slug}",
+            project_name="myproj",
+            project_prefix="myproj",
+            task_slug="20260108-myproj-add-feature",
+            prompt="Add feature",
+        )
+        assert name == "myproj/20260108-add-feature"
+
+    def test_slug_keeps_rest_when_prefix_absent(self):
+        """When task_slug lacks the prefix, {slug} keeps everything after the date."""
+        name = generate_branch_name(
+            pattern="{date}-{slug}",
+            project_name="myproj",
+            project_prefix="myproj",
+            task_slug="20260108-add-feature",
+            prompt="Add feature",
+        )
+        assert name == "20260108-add-feature"
+
+    def test_prefix_variable(self):
+        """{prefix} substitutes project_prefix."""
+        name = generate_branch_name(
+            pattern="{prefix}/{slug}",
+            project_name="myproj",
+            project_prefix="myproj",
+            task_slug="20260108-myproj-add-feature",
+            prompt="Add feature",
+        )
+        assert name == "myproj/add-feature"
+
+    def test_task_id_variable(self):
+        """{task_id} substitutes the short task id."""
+        name = generate_branch_name(
+            pattern="{project}/{task_id}",
+            project_name="myproj",
+            task_slug="20260107-myproj-add-auth",
+            task_id="myproj-42",
+            prompt="Add authentication",
+        )
+        assert name == "myproj/myproj-42"
 
     def test_conventional_pattern(self):
         """Test conventional pattern: {type}/{slug}."""
         name = generate_branch_name(
             pattern="{type}/{slug}",
             project_name="myproj",
-            task_id="20260107-add-auth",
+            task_slug="20260107-add-auth",
             prompt="Add authentication",
             default_type="feature",
         )
@@ -95,7 +139,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="{type}/{slug}",
             project_name="myproj",
-            task_id="20260107-fix-login-bug",
+            task_slug="20260107-fix-login-bug",
             prompt="Fix login bug",
             default_type="feature",
         )
@@ -106,7 +150,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="{type}/{slug}",
             project_name="myproj",
-            task_id="20260107-update-deps",
+            task_slug="20260107-update-deps",
             prompt="Update dependencies",
             default_type="feature",
             explicit_type="chore",
@@ -118,7 +162,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="{slug}",
             project_name="myproj",
-            task_id="20260107-add-auth",
+            task_slug="20260107-add-auth",
             prompt="Add authentication",
             default_type="feature",
         )
@@ -129,7 +173,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="{type}/{date}-{slug}",
             project_name="myproj",
-            task_id="20260107-add-auth",
+            task_slug="20260107-add-auth",
             prompt="Add authentication",  # Infers to "feature" from "add"
             default_type="feat",
         )
@@ -140,7 +184,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="user/{project}-{type}-{slug}",
             project_name="myproj",
-            task_id="20260107-fix-bug",
+            task_slug="20260107-fix-bug",
             prompt="Fix bug in login",
             default_type="feature",
         )
@@ -151,7 +195,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="{type}/{slug}",
             project_name="myproj",
-            task_id="20260107-update-readme",
+            task_slug="20260107-update-readme",
             prompt="Fix the README",  # Would infer "fix"
             default_type="feature",
             explicit_type="docs",  # But explicit type overrides
@@ -163,7 +207,7 @@ class TestBranchNameGeneration:
         name = generate_branch_name(
             pattern="{type}/{slug}",
             project_name="myproj",
-            task_id="20260107-do-something",
+            task_slug="20260107-do-something",
             prompt="Do something",  # Cannot infer type
             default_type="task",
         )
@@ -175,6 +219,7 @@ class TestBranchStrategyValidation:
 
     def test_valid_patterns(self):
         """Test valid patterns."""
+        BranchStrategy(pattern="{project}/{task_slug}")
         BranchStrategy(pattern="{project}/{task_id}")
         BranchStrategy(pattern="{type}/{slug}")
         BranchStrategy(pattern="{slug}")
@@ -225,15 +270,25 @@ class TestBranchStrategyValidation:
 class TestConfigBranchStrategy:
     """Test Config loading with branch_strategy."""
 
-    def test_preset_monorepo(self, tmp_path):
-        """Test loading monorepo preset."""
+    def test_preset_monorepo_removed(self, tmp_path):
+        """The 'monorepo' preset was removed; loading it should error."""
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
 branch_strategy: monorepo
 """)
+        with pytest.raises(ConfigError, match="'monorepo' was removed"):
+            Config.load(tmp_path)
+
+    def test_preset_project_date_slug(self, tmp_path):
+        """Test loading project_date_slug preset."""
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text("""
+project_name: test
+branch_strategy: project_date_slug
+""")
         config = Config.load(tmp_path)
-        assert config.branch_strategy.pattern == "{project}/{task_id}"
+        assert config.branch_strategy.pattern == "{project}/{date}-{slug}"
         assert config.branch_strategy.default_type == "feature"
 
     def test_preset_conventional(self, tmp_path):
@@ -281,7 +336,7 @@ branch_strategy: date_slug
         name = generate_branch_name(
             pattern=config.branch_strategy.pattern,
             project_name="test",
-            task_id="20260220-add-feature",
+            task_slug="20260220-add-feature",
             prompt="Add feature",
             default_type=config.branch_strategy.default_type,
         )
@@ -307,8 +362,8 @@ branch_strategy:
 project_name: test
 """)
         config = Config.load(tmp_path)
-        # Default should be monorepo pattern
-        assert config.branch_strategy.pattern == "{project}/{task_id}"
+        # Default is project_date_slug
+        assert config.branch_strategy.pattern == "{project}/{date}-{slug}"
         assert config.branch_strategy.default_type == "feature"
 
     def test_invalid_preset_name(self, tmp_path):

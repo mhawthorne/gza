@@ -57,6 +57,7 @@ DEFAULT_CLAUDE_ARGS = [
 ]
 DEFAULT_ADVANCE_CREATE_REVIEWS = True
 DEFAULT_ADVANCE_REQUIRES_REVIEW = True
+DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_WATCH_BATCH = 5
@@ -361,6 +362,7 @@ class Config:
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
     advance_requires_review: bool = DEFAULT_ADVANCE_REQUIRES_REVIEW
+    advance_mode: str = DEFAULT_ADVANCE_MODE
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
@@ -401,7 +403,7 @@ class Config:
         # Set default branch strategy if not provided
         if self.branch_strategy is None:
             self.branch_strategy = BranchStrategy(
-                pattern="{project}/{task_id}",
+                pattern="{project}/{date}-{slug}",
                 default_type="feature"
             )
 
@@ -873,9 +875,11 @@ class Config:
             # Handle preset names
             if isinstance(bs_data, str):
                 if bs_data == "monorepo":
-                    branch_strategy = BranchStrategy(
-                        pattern="{project}/{task_id}",
-                        default_type="feature"
+                    raise ConfigError(
+                        "branch_strategy preset 'monorepo' was removed. "
+                        "Use 'project_date_slug' (the new default) instead, "
+                        "or define a custom pattern via "
+                        "'branch_strategy: {pattern: ...}'."
                     )
                 elif bs_data == "conventional":
                     branch_strategy = BranchStrategy(
@@ -892,10 +896,15 @@ class Config:
                         pattern="{date}-{slug}",
                         default_type="feature"
                     )
+                elif bs_data == "project_date_slug":
+                    branch_strategy = BranchStrategy(
+                        pattern="{project}/{date}-{slug}",
+                        default_type="feature"
+                    )
                 else:
                     raise ConfigError(
                         f"Unknown branch_strategy preset: '{bs_data}'\n"
-                        f"Valid presets are: monorepo, conventional, simple, date_slug\n"
+                        f"Valid presets are: project_date_slug, conventional, simple, date_slug\n"
                         f"Or use a dict with 'pattern' key for custom patterns."
                     )
             # Handle custom pattern dict
@@ -961,6 +970,9 @@ class Config:
 
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
+        advance_mode = str(data.get("advance_mode", DEFAULT_ADVANCE_MODE))
+        if advance_mode not in {"default", "iterate"}:
+            raise ConfigError("'advance_mode' must be 'default' or 'iterate'")
         max_resume_attempts = _load_strict_int_field(data, "max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS)
         if max_resume_attempts < 0:
             raise ConfigError("'max_resume_attempts' must be non-negative")
@@ -1180,6 +1192,7 @@ class Config:
             verify_command=data.get("verify_command", ""),
             advance_create_reviews=advance_create_reviews,
             advance_requires_review=advance_requires_review,
+            advance_mode=advance_mode,
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
             watch=watch_config,
@@ -1704,7 +1717,7 @@ class Config:
             bs_data = data["branch_strategy"]
             if isinstance(bs_data, str):
                 # Validate preset names
-                valid_presets = {"monorepo", "conventional", "simple", "date_slug"}
+                valid_presets = {"conventional", "simple", "date_slug", "project_date_slug"}
                 if bs_data not in valid_presets:
                     errors.append(
                         f"'branch_strategy' preset '{bs_data}' is invalid. "
