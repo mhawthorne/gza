@@ -19,6 +19,7 @@ import gza.colors as _colors
 from ..config import Config
 from ..console import console, format_duration, shorten_prompt, truncate
 from ..db import SqliteTaskStore, Task as DbTask
+from ..log_events import is_new_step
 from ..providers.output_formatter import format_token_count
 from ..workers import WorkerRegistry
 from ._common import get_store, resolve_id
@@ -84,20 +85,16 @@ def _scan_log(log_path: Path, n: int) -> tuple[list[str], _LogStats]:
 
 def _accumulate_stats(entry: dict, stats: _LogStats, seen_msg_ids: set[str]) -> None:
     """Update running stats from a single log entry (mirrors ``_LiveLogPrinter``)."""
-    etype = entry.get("type")
-    if etype == "assistant":
-        message = entry.get("message", {}) or {}
-        msg_id = message.get("id")
-        if msg_id and msg_id not in seen_msg_ids:
-            seen_msg_ids.add(msg_id)
-            stats.step_count += 1
-            usage = message.get("usage", {}) or {}
-            stats.total_tokens += usage.get("input_tokens", 0) or 0
-            stats.total_tokens += usage.get("cache_creation_input_tokens", 0) or 0
-            stats.total_tokens += usage.get("cache_read_input_tokens", 0) or 0
-            stats.total_tokens += usage.get("output_tokens", 0) or 0
-    elif etype == "turn.started":
+    is_step = is_new_step(entry, seen_msg_ids)
+    if is_step:
         stats.step_count += 1
+    etype = entry.get("type")
+    if etype == "assistant" and is_step:
+        usage = (entry.get("message") or {}).get("usage", {}) or {}
+        stats.total_tokens += usage.get("input_tokens", 0) or 0
+        stats.total_tokens += usage.get("cache_creation_input_tokens", 0) or 0
+        stats.total_tokens += usage.get("cache_read_input_tokens", 0) or 0
+        stats.total_tokens += usage.get("output_tokens", 0) or 0
     elif etype == "result":
         # Final cost, when provider emits it.
         cost = entry.get("total_cost_usd") or entry.get("cost_usd")
@@ -229,8 +226,9 @@ def _lines_per_panel(n_tasks: int) -> int:
     except OSError:
         term_height = 40
     # Each panel has 2 lines of border (top + bottom) + content lines.
-    # Reserve 1 line for any trailing cursor / prompt.
-    available = term_height - 1
+    # Reserve 2 lines: one for Rich Live's trailing newline, one for the shell
+    # cursor. Without this the bottom row of the bottom panel gets clipped.
+    available = term_height - 2
     if n_tasks <= 0:
         return 10
     # panel overhead: top border + bottom border = 2 lines per panel

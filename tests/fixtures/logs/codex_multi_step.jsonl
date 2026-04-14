@@ -1,0 +1,12 @@
+{"type":"thread.started","thread_id":"abc-123"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"type":"command_execution","id":"cmd_1","command":"pwd"}}
+{"type":"item.completed","item":{"type":"command_execution","id":"cmd_1","command":"pwd","aggregated_output":"/workspace","exit_code":0}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Looked at the repo layout."}}
+{"type":"item.started","item":{"type":"command_execution","id":"cmd_2","command":"ls src"}}
+{"type":"item.completed","item":{"type":"command_execution","id":"cmd_2","command":"ls src","aggregated_output":"gza","exit_code":0}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Now inspecting gza/."}}
+{"type":"item.completed","item":{"type":"agent_message","text":""}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Final answer."}}
+{"type":"turn.completed"}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.02}
