@@ -296,6 +296,24 @@ class TestSkillContentValidation:
         assert "supports `42` or `#42`" not in content
         assert "strip the leading `#`" not in content
 
+    def test_gza_task_run_includes_runner_like_log_and_provenance_guidance(self):
+        """gza-task-run should guide explicit log_file persistence and synthetic provenance writes."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        required_snippets = [
+            "task.log_file",
+            "write_log_entry",
+            "write_worker_start_event",
+            "Execution mode: inline skill gza-task-run",
+            "Outcome: completed (inline skill)",
+            "Outcome: failed (inline skill)",
+        ]
+        for snippet in required_snippets:
+            assert snippet in content
+
     @pytest.mark.parametrize(
         "skill_name",
         [
