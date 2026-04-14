@@ -681,6 +681,10 @@ gza show <task_id> [options]
 | `--full` | Show full output without truncation |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--prompt`, `--output`, and `--path` modes |
 
+When a task has a branch, `gza show` also reports active worktree information:
+- `Worktree: <path>` when the task branch is currently checked out in an active worktree
+- `Warning: Worktree lookup failed: ...` when git worktree metadata could not be read
+
 ### resume
 
 Resume a failed task from where it left off. The AI continues with the existing conversation context.

@@ -17,12 +17,16 @@ Tasks can fail for several reasons:
 $ gza show gza-5
 Task gza-5: 20260108-add-user-auth
 Status: failed
+Branch: feature/20260108-add-user-auth
+Worktree: /tmp/gza-worktrees/gza/20260108-add-user-auth
 Duration: 10m 00s
 Turns: 50/50
 Cost: $0.89
 
 Error: max turns of 50 exceeded
 ```
+
+If git worktree metadata is unavailable, `gza show` prints a warning so lookup failures are distinct from "no active worktree".
 
 View the conversation to understand what happened:
 

@@ -36,7 +36,7 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
-from ..git import Git
+from ..git import Git, GitError, active_worktree_path_for_branch
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
     TaskLineageNode,
@@ -1481,6 +1481,15 @@ def cmd_show(args: argparse.Namespace) -> int:
         return _cmd_show_output(task, args, config, store)
 
 
+def _find_active_worktree_path_for_branch(config: Config, branch: str) -> tuple[Path | None, str | None]:
+    """Return active worktree path and optional lookup error for a branch."""
+    try:
+        git = Git(config.project_dir)
+        return active_worktree_path_for_branch(git, branch), None
+    except (GitError, OSError) as exc:
+        return None, " ".join(str(exc).split())
+
+
 def _cmd_show_output(
     task: DbTask,
     args: argparse.Namespace,
@@ -1533,6 +1542,11 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Skip Learnings:[/{c['label']}] [green]yes[/green]")
     if task.branch:
         console.print(f"[{c['label']}]Branch:[/{c['label']}] [{c['branch']}]{task.branch}[/{c['branch']}]")
+        active_worktree_path, worktree_lookup_error = _find_active_worktree_path_for_branch(config, task.branch)
+        if active_worktree_path:
+            console.print(f"[{c['label']}]Worktree:[/{c['label']}] [{c['value']}]{active_worktree_path}[/{c['value']}]")
+        elif worktree_lookup_error:
+            console.print(f"[yellow]Warning: Worktree lookup failed: {rich_escape(worktree_lookup_error)}[/yellow]")
     if task.log_file:
         console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{task.log_file}[/{c['value']}]")
     if task.report_file:
