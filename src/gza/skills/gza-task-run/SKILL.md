@@ -124,14 +124,14 @@ git add <changed_files>
 git commit -m "<descriptive message>"
 ```
 
-### Step 6: Persist task output, finalize synthetic task log, and mark task as completed
+### Step 6: Persist task output, run completion checks, then finalize success outcome log
 
 Persist the output file you wrote in Step 4 before marking the task completed.
 
 - If you wrote a summary file, store it as task output.
 - If you wrote a report file, store it as both `report_file` and task output.
 
-Write completion metadata to the synthetic log and keep `task.log_file` explicitly persisted.
+Write artifact metadata to the synthetic log and keep `task.log_file` explicitly persisted.
 
 ```bash
 uv run python -c "
@@ -162,7 +162,6 @@ store.update(task)
 
 log_path = config.project_dir / task.log_file
 write_log_entry(log_path, {'type': 'gza', 'subtype': 'artifact', 'message': f'Output artifact: {rel}', 'path': rel})
-write_log_entry(log_path, {'type': 'gza', 'subtype': 'outcome', 'message': 'Outcome: completed (inline skill)', 'exit_code': 0})
 
 print(f'Persisted {rel}')
 "
@@ -172,6 +171,23 @@ Then mark the task completed:
 
 ```bash
 uv run gza mark-completed <TASK_ID>
+```
+
+Only after `mark-completed` succeeds, append a successful outcome entry:
+
+```bash
+uv run python -c "
+from pathlib import Path
+from gza.config import Config
+from gza.db import SqliteTaskStore
+from gza.runner import write_log_entry
+
+config = Config.load(Path.cwd())
+store = SqliteTaskStore(config.db_path)
+task = store.get('<TASK_ID>')
+if task and task.log_file:
+    write_log_entry(config.project_dir / task.log_file, {'type': 'gza', 'subtype': 'outcome', 'message': 'Outcome: completed (inline skill)', 'exit_code': 0})
+"
 ```
 
 ### Step 7: Failure-path consistency (if inline execution fails)

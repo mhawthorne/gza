@@ -334,6 +334,22 @@ class TestSkillContentValidation:
         assert "uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>" not in content
         assert "uv run gza mark-completed <TASK_ID>" in content
 
+    def test_gza_task_run_logs_success_outcome_only_after_mark_completed_step(self):
+        """gza-task-run should document success outcome logging after mark-completed succeeds."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        mark_completed_cmd = "uv run gza mark-completed <TASK_ID>"
+        success_outcome = "Outcome: completed (inline skill)"
+
+        mark_idx = content.find(mark_completed_cmd)
+        outcome_idx = content.find(success_outcome)
+        assert mark_idx != -1
+        assert outcome_idx != -1
+        assert outcome_idx > mark_idx
+
     @pytest.mark.parametrize(
         "skill_name",
         [
