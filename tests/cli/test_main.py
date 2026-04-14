@@ -103,7 +103,10 @@ class TestHelpOutput:
         assert "implementation lifecycle loop" in normalized_output
         assert "for an implementation task" in normalized_output
         assert "for a task" not in normalized_output
-        assert "Maximum iterate actions (default: iterate_max_iterations or 3)" in normalized_output
+        assert (
+            "Maximum iterate iterations (each is a code-change task [implement/improve] plus its review)"
+            in normalized_output
+        )
         assert "review/improve loop" not in normalized_output
         assert "default: 5" not in normalized_output
 

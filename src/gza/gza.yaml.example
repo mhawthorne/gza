@@ -93,7 +93,8 @@ project_name: my-project
 # Auto-resume budget for MAX_STEPS/MAX_TURNS failures (default: 1)
 # max_resume_attempts: 1
 
-# Default iterate action budget when --max-iterations is omitted (default: 3)
+# Default iterate iteration budget when --max-iterations is omitted
+# (1 iteration = code-change task [implement/improve] + review; default: 3)
 # iterate_max_iterations: 3
 
 # --- Watch loop ---
