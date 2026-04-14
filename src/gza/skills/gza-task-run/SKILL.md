@@ -64,11 +64,12 @@ Before executing, initialize and persist task metadata/log path like the runner 
 ```bash
 uv run python -c "
 import os
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.runner import get_effective_config_for_task, write_log_entry, write_worker_start_event
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 task = store.get('<TASK_ID>')
 if task is None:
@@ -139,7 +140,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.runner import write_log_entry
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 task = store.get('<TASK_ID>')
 if task is None:
@@ -170,7 +171,7 @@ print(f'Persisted {rel}')
 Then mark the task completed:
 
 ```bash
-uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>
+uv run gza mark-completed <TASK_ID>
 ```
 
 ### Step 7: Failure-path consistency (if inline execution fails)
@@ -184,11 +185,12 @@ Example:
 
 ```bash
 uv run python -c "
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.runner import write_log_entry
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 task = store.get('<TASK_ID>')
 if task and task.log_file:
@@ -206,6 +208,7 @@ uv run gza set-status <TASK_ID> failed --reason <FAILURE_REASON>
 - **Synthetic provenance is intentional**: Inline execution cannot reproduce provider-native telemetry, but synthetic `gza` JSONL entries keep outcome and artifact traces discoverable.
 - **Branch management**: Create a new branch for the task work, just like background execution would.
 - **Editing prompts**: Use `gza edit <task_id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
-- **Proper status tracking**: Uses `mark-completed` to ensure correct `merge_status` so tasks appear in `gza unmerged` and work with `gza advance`.
+- **Proper status tracking**: Step 4 persists `task.branch`; then `mark-completed <TASK_ID>` reads that stored branch and applies the normal completion logic. This keeps `merge_status` correct so tasks appear in `gza unmerged` and work with `gza advance`.
+- **Expected warning behavior**: `mark-completed` may print a warning when status is not `failed`; this is expected for inline runs that set `in_progress` first and does not block completion.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.

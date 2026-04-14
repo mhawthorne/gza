@@ -314,6 +314,26 @@ class TestSkillContentValidation:
         for snippet in required_snippets:
             assert snippet in content
 
+    def test_gza_task_run_uses_explicit_project_dir_for_config_load_examples(self):
+        """gza-task-run examples should use Config.load with an explicit project_dir argument."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Config.load()" not in content
+        assert "Config.load(Path.cwd())" in content
+
+    def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
+        """gza-task-run should not document unsupported mark-completed branch flags."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>" not in content
+        assert "uv run gza mark-completed <TASK_ID>" in content
+
     @pytest.mark.parametrize(
         "skill_name",
         [
