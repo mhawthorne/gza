@@ -1115,7 +1115,7 @@ def main() -> int:
             default=None,
             dest="max_iterations",
             metavar="N",
-            help="Maximum iterate actions (default: 5)",
+            help="Maximum iterate actions (default: iterate_max_iterations or 3)",
         )
         iterate_parser.add_argument(
             "--dry-run",

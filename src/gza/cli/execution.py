@@ -1035,7 +1035,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         return value if isinstance(value, int) else default
 
     max_iterations_arg = getattr(args, "max_iterations", None)
-    max_iterations = max_iterations_arg if max_iterations_arg is not None else 5
+    max_iterations = max_iterations_arg if max_iterations_arg is not None else config.iterate_max_iterations
     if max_iterations <= 0:
         print("Error: --max-iterations must be a positive integer.")
         return 1

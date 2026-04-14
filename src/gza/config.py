@@ -64,7 +64,7 @@ DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_MAX_IDLE: int | None = None
 DEFAULT_WATCH_MAX_ITERATIONS = 10
-DEFAULT_ITERATE_MAX_ITERATIONS = 5
+DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_CLEANUP_DAYS = 30
@@ -980,9 +980,11 @@ class Config:
         if max_review_cycles <= 0:
             raise ConfigError("'max_review_cycles' must be positive")
 
-        iterate_max_iterations = int(data.get("iterate_max_iterations", DEFAULT_ITERATE_MAX_ITERATIONS))
-        if iterate_max_iterations < 1:
-            raise ConfigError("iterate_max_iterations must be a positive integer")
+        iterate_max_iterations = _load_strict_int_field(
+            data, "iterate_max_iterations", DEFAULT_ITERATE_MAX_ITERATIONS
+        )
+        if iterate_max_iterations <= 0:
+            raise ConfigError("'iterate_max_iterations' must be positive")
         watch_data = data.get("watch") or {}
         if not isinstance(watch_data, dict):
             raise ConfigError("'watch' must be a dictionary")
@@ -1486,6 +1488,11 @@ class Config:
                 errors.append("'max_review_cycles' must be an integer")
             elif data["max_review_cycles"] <= 0:
                 errors.append("'max_review_cycles' must be positive")
+        if "iterate_max_iterations" in data:
+            if not _is_strict_int(data["iterate_max_iterations"]):
+                errors.append("'iterate_max_iterations' must be an integer")
+            elif data["iterate_max_iterations"] <= 0:
+                errors.append("'iterate_max_iterations' must be positive")
 
         # Validate defaults section
         if "defaults" in data:

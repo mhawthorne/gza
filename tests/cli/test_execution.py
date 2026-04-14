@@ -2850,7 +2850,7 @@ class TestIterateCommand:
         result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "max 5 actions" in result.stdout
+        assert "max 3 actions" in result.stdout
 
     def test_iterate_live_progress_uses_action_wording(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         import argparse
@@ -3461,7 +3461,7 @@ class TestIterateCommand:
 
         assert result.returncode == 0
         assert "would iterate implementation" in result.stdout.lower()
-        assert "first action 1/5: improve" in result.stdout.lower()
+        assert "first action 1/3: improve" in result.stdout.lower()
         assert "changes_requested" in result.stdout.lower()
 
     def test_dry_run_review_cleared_starts_from_current_completed_improve(self, tmp_path: Path):
@@ -3496,7 +3496,7 @@ class TestIterateCommand:
 
         assert result.returncode == 0
         assert "would iterate implementation" in result.stdout.lower()
-        assert "first action 1/5: create_review" in result.stdout.lower()
+        assert "first action 1/3: create_review" in result.stdout.lower()
         assert "code changed since last review" in result.stdout.lower()
 
     def test_failed_task_requires_resume_or_retry(self, tmp_path: Path):

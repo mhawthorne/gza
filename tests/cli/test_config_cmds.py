@@ -452,6 +452,7 @@ class TestInitCommand:
         content = config_path.read_text()
         assert "project_name:" in content
         assert tmp_path.name in content
+        assert "# iterate_max_iterations: 3" in content
 
     def test_init_does_not_overwrite(self, tmp_path: Path):
         """Init command does not overwrite existing config without --force."""
@@ -2015,3 +2016,52 @@ class TestWatchConfigValidation:
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert f"watch.{field}" in "\n".join(errors)
+
+
+class TestIterateMaxIterationsConfigValidation:
+    """Tests for iterate_max_iterations config parsing and validation."""
+
+    def _write_config(self, tmp_path: Path, extra: str) -> None:
+        (tmp_path / "gza.yaml").write_text(f"project_name: test\n{extra}")
+
+    def test_config_iterate_max_iterations_default_is_three(self, tmp_path: Path) -> None:
+        """Config.load defaults iterate_max_iterations to 3 when omitted."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.iterate_max_iterations == 3
+
+    def test_config_iterate_max_iterations_custom_value_loads(self, tmp_path: Path) -> None:
+        """Config.load stores custom iterate_max_iterations values."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "iterate_max_iterations: 8\n")
+        config = Config.load(tmp_path)
+        assert config.iterate_max_iterations == 8
+
+    @pytest.mark.parametrize(
+        ("value", "expected_error"),
+        [
+            ("0", "'iterate_max_iterations' must be positive"),
+            ("-1", "'iterate_max_iterations' must be positive"),
+            ("true", "'iterate_max_iterations' must be an integer"),
+            ('"3"', "'iterate_max_iterations' must be an integer"),
+        ],
+    )
+    def test_config_iterate_max_iterations_invalid_values_rejected(
+        self, tmp_path: Path, value: str, expected_error: str
+    ) -> None:
+        """Config.load and Config.validate reject invalid iterate_max_iterations values."""
+        import pytest
+
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"iterate_max_iterations: {value}\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert expected_error in errors
+
+        with pytest.raises(ConfigError, match=expected_error):
+            Config.load(tmp_path)
