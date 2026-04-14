@@ -92,8 +92,8 @@ class TestHelpOutput:
         assert "--force" in result.stdout
         assert "--plans" not in result.stdout
 
-    def test_iterate_help_uses_lifecycle_wording_and_default_5(self, tmp_path):
-        """iterate --help should keep lifecycle wording and current max-iterations default text."""
+    def test_iterate_help_uses_lifecycle_wording_and_config_default(self, tmp_path):
+        """iterate --help should keep lifecycle wording and describe config-backed max-iterations default."""
         setup_config(tmp_path)
 
         result = run_gza("iterate", "--help", "--project", str(tmp_path))
@@ -103,9 +103,9 @@ class TestHelpOutput:
         assert "implementation lifecycle loop" in normalized_output
         assert "for an implementation task" in normalized_output
         assert "for a task" not in normalized_output
-        assert "Maximum iterate actions (default: 5)" in normalized_output
+        assert "Maximum iterate actions (default: iterate_max_iterations or 3)" in normalized_output
         assert "review/improve loop" not in normalized_output
-        assert "default: 3" not in normalized_output
+        assert "default: 5" not in normalized_output
 
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
@@ -409,6 +409,48 @@ class TestIterateBackgroundForceDispatch:
         assert captured_cmd is not None
         idx = captured_cmd.index("--max-iterations")
         assert captured_cmd[idx + 1] == "7"
+
+    def test_iterate_background_uses_config_max_iterations_when_flag_omitted(self, tmp_path):
+        """`gza iterate --background` should use iterate_max_iterations from config when -i is omitted."""
+        from gza.cli.main import main
+
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\niterate_max_iterations: 6\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Pending implement for iterate background config max-iterations", task_type="implement")
+        assert task.id is not None
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 5454
+
+        def capture_popen(cmd, **_kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "iterate",
+                    str(task.id),
+                    "--background",
+                    "--no-docker",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ),
+            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+        ):
+            rc = main()
+
+        assert rc == 0
+        assert captured_cmd is not None
+        idx = captured_cmd.index("--max-iterations")
+        assert captured_cmd[idx + 1] == "6"
 
     def test_iterate_background_rejects_zero_max_iterations_before_spawn(self, tmp_path):
         """`gza iterate --background --max-iterations 0` should fail before detached worker spawn."""

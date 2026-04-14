@@ -40,6 +40,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
+| `iterate_max_iterations` | Integer | `3` | Default iterate action budget when `gza iterate` omits `--max-iterations` |
 | `watch` | Dict | `{batch: 5, poll: 300, max_idle: null, max_iterations: 10}` | Defaults for `gza watch` loop behavior |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
@@ -1011,7 +1012,7 @@ gza iterate <impl_task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `impl_task_id` | Full prefixed implementation task ID to iterate (e.g. `gza-1234`) |
-| `--max-iterations N` | Maximum iterate actions (default: 5) |
+| `--max-iterations N` | Maximum iterate actions (default: `iterate_max_iterations` or `3`) |
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when iterate starts workers |
