@@ -1096,6 +1096,44 @@ class TestWorkCommandMultiTask:
         assert workers[0].status == "failed"
         assert workers[0].exit_code == 1
 
+    def test_work_forwards_create_pr_flag_to_runner(self, tmp_path: Path):
+        """work --pr should forward create_pr intent to runner.run."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Pending task 1")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=True,
+        )
+
+        seen_create_pr: list[bool] = []
+
+        def _fake_run(*_args, **kwargs):
+            seen_create_pr.append(bool(kwargs.get("create_pr")))
+            return 0
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.run", side_effect=_fake_run),
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        assert seen_create_pr == [True]
+
 
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
@@ -1161,6 +1199,46 @@ class TestBackgroundWorkerCommand:
         assert captured_cmd[project_idx - 1] == "--project", \
             f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
             f"Full command: {captured_cmd}"
+
+    def test_background_worker_command_forwards_pr_flag(self, tmp_path: Path):
+        """Background work with create_pr intent should include --pr in child command."""
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Test background task with pr")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=True,
+        )
+
+        captured_cmd = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 11111
+
+        def capture_popen(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc
+
+        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+            _spawn_background_worker(args, config, task_id=task.id)
+
+        assert captured_cmd is not None
+        assert "--pr" in captured_cmd
 
     def test_background_worker_without_explicit_task_does_not_pass_task_id(self, tmp_path: Path):
         """No-id background work should not pass a selected task ID to child runner."""

@@ -357,6 +357,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         inner_cmd.extend(["--max-turns", str(args.max_turns)])
     if getattr(args, "force", False):
         inner_cmd.append("--force")
+    if getattr(args, "create_pr", False):
+        inner_cmd.append("--pr")
 
     # Add project directory
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
@@ -567,20 +569,39 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         resume = hasattr(args, 'resume') and args.resume
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
-            exit_code = run(
-                config,
-                task_id=args.task_ids[0],
-                resume=resume,
-                skip_precondition_check=getattr(args, "force", False),
-                on_task_claimed=_on_task_claimed,
-            )
+            if getattr(args, "create_pr", False):
+                exit_code = run(
+                    config,
+                    task_id=args.task_ids[0],
+                    resume=resume,
+                    skip_precondition_check=getattr(args, "force", False),
+                    on_task_claimed=_on_task_claimed,
+                    create_pr=True,
+                )
+            else:
+                exit_code = run(
+                    config,
+                    task_id=args.task_ids[0],
+                    resume=resume,
+                    skip_precondition_check=getattr(args, "force", False),
+                    on_task_claimed=_on_task_claimed,
+                )
         else:
-            exit_code = run(
-                config,
-                resume=resume,
-                skip_precondition_check=getattr(args, "force", False),
-                on_task_claimed=_on_task_claimed,
-            )
+            if getattr(args, "create_pr", False):
+                exit_code = run(
+                    config,
+                    resume=resume,
+                    skip_precondition_check=getattr(args, "force", False),
+                    on_task_claimed=_on_task_claimed,
+                    create_pr=True,
+                )
+            else:
+                exit_code = run(
+                    config,
+                    resume=resume,
+                    skip_precondition_check=getattr(args, "force", False),
+                    on_task_claimed=_on_task_claimed,
+                )
 
         # Update worker status on completion
         if worker_id:

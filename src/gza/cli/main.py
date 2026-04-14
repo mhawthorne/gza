@@ -138,6 +138,12 @@ def main() -> int:
         action="store_true",
         help="Skip dependency precondition checks (allows running with unmerged depends_on tasks)",
     )
+    work_parser.add_argument(
+        "--pr",
+        action="store_true",
+        dest="create_pr",
+        help="Create/reuse a GitHub PR after successful code-task completion (when branch has commits)",
+    )
 
     # attach command
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task (interactive for Claude, observe-only for Codex/Gemini)")

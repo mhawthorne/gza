@@ -1239,6 +1239,79 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     return run(config, task_id=review_task.id)
 
 
+def _ensure_work_pr_for_completed_code_task(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+) -> None:
+    """Ensure a PR exists for a completed code task branch when `gza work --pr` is set."""
+    if not task.branch:
+        return
+
+    default_branch = git.default_branch()
+    if git.count_commits_ahead(task.branch, default_branch) <= 0:
+        print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
+        return
+
+    gh = GitHub()
+    if not gh.is_available():
+        print("Info: GitHub CLI (gh) not available, skipping PR creation")
+        return
+
+    if task.pr_number:
+        print(f"Info: Reusing cached PR #{task.pr_number} for task {task.id}")
+        return
+
+    existing_pr_url = gh.pr_exists(task.branch)
+    if existing_pr_url:
+        print(f"Info: Reusing existing PR for branch {task.branch}: {existing_pr_url}")
+        pr_number = gh.get_pr_number(task.branch)
+        if pr_number:
+            task.pr_number = pr_number
+            store.update(task)
+        return
+
+    try:
+        if git.needs_push(task.branch):
+            print(f"Pushing branch '{task.branch}' to origin...")
+            git.push_branch(task.branch)
+    except GitError as e:
+        print(f"Warning: Failed to push branch '{task.branch}' before PR creation: {e}")
+        return
+
+    if git.is_merged(task.branch, default_branch):
+        print(f"Info: Branch '{task.branch}' is already merged into {default_branch}, skipping PR creation")
+        return
+
+    first_line = task.prompt.strip().splitlines()
+    title = first_line[0] if first_line else f"Task {task.id}"
+    title = title[:72].strip() or f"Task {task.id}"
+    body = f"""## Task
+
+{task.prompt}
+
+## Task ID
+
+{task.id}
+"""
+
+    try:
+        pr = gh.create_pr(
+            head=task.branch,
+            base=default_branch,
+            title=title,
+            body=body,
+            draft=False,
+        )
+        print(f"✓ Created PR: {pr.url}")
+        if pr.number:
+            task.pr_number = pr.number
+            store.update(task)
+    except GitHubError as e:
+        print(f"Warning: Failed to create PR for task {task.id}: {e}")
+
+
 def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
     """Copy .gza/learnings.md into the worktree so the agent can read it.
 
@@ -1334,6 +1407,7 @@ def run(
     open_after: bool = False,
     skip_precondition_check: bool = False,
     on_task_claimed: Callable[[Task], None] | None = None,
+    create_pr: bool = False,
 ) -> int:
     """Run Gza on the next pending task or a specific task.
 
@@ -1347,6 +1421,7 @@ def run(
         open_after: If True, open the report file in $EDITOR after completion (for review tasks).
         skip_precondition_check: If True, skip dependency merge precondition checks.
         on_task_claimed: Optional callback invoked after task ownership is established.
+        create_pr: If True, create/reuse a PR after successful code-task completion.
     """
     load_dotenv(config.project_dir)
 
@@ -1509,6 +1584,7 @@ def run(
         resume=resume,
         open_after=open_after,
         skip_precondition_check=skip_precondition_check,
+        create_pr=create_pr,
     )
 
 
@@ -1734,6 +1810,7 @@ def _complete_code_task(
     summary_dir: Path,
     *,
     skip_commit: bool = False,
+    create_pr: bool = False,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -1913,6 +1990,9 @@ def _complete_code_task(
         store=store,
     )
 
+    if create_pr:
+        _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+
     # Auto-create and run review task if requested
     if task.create_review:
         return _create_and_run_review_task(task, config, store)
@@ -1930,6 +2010,7 @@ def _run_inner(
     resume: bool = False,
     open_after: bool = False,
     skip_precondition_check: bool = False,
+    create_pr: bool = False,
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
     # For explore, plan, review, and internal tasks, run without creating a branch.
@@ -2192,6 +2273,7 @@ def _run_inner(
             summary_path,
             summary_dir,
             skip_commit=task.task_type == "rebase",
+            create_pr=create_pr,
         )
 
     except GitError as e:

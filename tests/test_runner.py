@@ -24,6 +24,7 @@ from gza.runner import (
     _compute_slug_override,
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
+    _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
     _find_task_of_type_in_chain,
     _resolve_code_task_branch_name,
@@ -4522,6 +4523,140 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "completed"
         assert summary_path.exists()
+
+    def test_ensure_work_pr_creates_pr_for_committed_branch(self, tmp_path: Path):
+        """`work --pr` should create a PR when branch has commits and no PR exists."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/work-pr"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 2
+        git.needs_push.return_value = True
+        git.is_merged.return_value = False
+
+        with patch("gza.runner.GitHub") as gh_cls:
+            gh = gh_cls.return_value
+            gh.is_available.return_value = True
+            gh.pr_exists.return_value = None
+            gh.create_pr.return_value = Mock(url="https://github.com/o/r/pull/99", number=99)
+
+            _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        git.push_branch.assert_called_once_with("feature/work-pr")
+        gh.create_pr.assert_called_once()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.pr_number == 99
+
+    def test_ensure_work_pr_skips_when_branch_has_no_commits(self, tmp_path: Path):
+        """`work --pr` should skip PR creation when branch has no commits."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/no-commits"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 0
+
+        with patch("gza.runner.GitHub") as gh_cls:
+            _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        gh_cls.assert_not_called()
+
+    def test_ensure_work_pr_reuses_existing_pr_and_caches_number(self, tmp_path: Path):
+        """`work --pr` should reuse an existing PR and cache its number."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/existing-pr"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+
+        with patch("gza.runner.GitHub") as gh_cls:
+            gh = gh_cls.return_value
+            gh.is_available.return_value = True
+            gh.pr_exists.return_value = "https://github.com/o/r/pull/55"
+            gh.get_pr_number.return_value = 55
+
+            _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        gh.create_pr.assert_not_called()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.pr_number == 55
+
+    def test_complete_code_task_creates_pr_before_auto_review(self, tmp_path: Path):
+        """When create_review is enabled, PR creation should run before auto-review execution."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement with review", task_type="implement", create_review=True)
+        task.slug = "20260414-impl-review-order"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        call_order: list[str] = []
+
+        def _mark_pr(*_args, **_kwargs):
+            call_order.append("pr")
+
+        def _run_review(*_args, **_kwargs):
+            call_order.append("review")
+            return 7
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", side_effect=_mark_pr),
+            patch("gza.runner._create_and_run_review_task", side_effect=_run_review),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/review-order",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                create_pr=True,
+            )
+
+        assert rc == 7
+        assert call_order == ["pr", "review"]
 
     def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
         """Rebase completion should force-push from the host runner."""
