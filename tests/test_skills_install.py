@@ -350,6 +350,22 @@ class TestSkillContentValidation:
         assert outcome_idx != -1
         assert outcome_idx > mark_idx
 
+    def test_gza_task_run_scopes_branch_and_commit_guidance_to_code_tasks(self):
+        """gza-task-run should scope branch/task.branch/commit guidance to git-verified code task types."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "For **task/implement/improve/rebase** tasks only:" in content
+        assert "Persist `task.branch` in the DB only for these git-verified task types." in content
+        assert "For **explore/plan/review** tasks:" in content
+        assert "Do **not** create a new task branch." in content
+        assert "For **explore/plan/review** tasks, do not create a task commit" in content
+        assert "Branch and commit scope" in content
+        assert "Create a new branch for the task work, just like background execution would." not in content
+        assert "After completing the task, stage and commit all changes:" not in content
+
     @pytest.mark.parametrize(
         "skill_name",
         [

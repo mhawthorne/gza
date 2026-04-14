@@ -2,7 +2,7 @@
 name: gza-task-run
 description: Run a gza task inline in the current conversation, using the same prompt that background execution would use
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), AskUserQuestion
-version: 2.1.0
+version: 2.2.0
 public: true
 ---
 
@@ -44,19 +44,10 @@ Then re-run `gza show --prompt` to get the updated built prompt.
 uv run gza set-status <TASK_ID> in_progress
 ```
 
-### Step 4: Create a branch and initialize runner-like artifacts
+### Step 4: Initialize runner-like log metadata for all task types
 
-Create a branch for the task if one doesn't already exist:
+Before executing, initialize and persist task log metadata like the runner does:
 
-```bash
-git checkout -b <branch_name>
-```
-
-Use the branch name from the task if it has one, otherwise use the task slug (e.g., `20260326-task-slug`).
-
-Before executing, initialize and persist task metadata/log path like the runner does:
-
-- Set `task.branch` on the DB task if needed.
 - Create `.gza/logs/<task_slug>.log` under `config.log_path`.
 - Persist `task.log_file` immediately so it exists even if the inline run is interrupted.
 - Write synthetic JSONL provenance entries to the log.
@@ -75,9 +66,6 @@ task = store.get('<TASK_ID>')
 if task is None:
     raise SystemExit('Task not found')
 
-if '<BRANCH_NAME>' and task.branch != '<BRANCH_NAME>':
-    task.branch = '<BRANCH_NAME>'
-
 config.log_path.mkdir(parents=True, exist_ok=True)
 log_file = config.log_path / f'{task.slug}.log'
 task.log_file = str(log_file.relative_to(config.project_dir))
@@ -93,6 +81,43 @@ write_log_entry(log_file, {'type': 'gza', 'subtype': 'provenance', 'message': 'E
 print(task.log_file)
 "
 ```
+
+### Step 5: Type-specific execution setup
+
+For **task/implement/improve/rebase** tasks only:
+
+- Create or switch to the task branch.
+- Persist `task.branch` in the DB only for these git-verified task types.
+
+```bash
+git checkout -b <branch_name>
+```
+
+Use the branch name from the task if it has one, otherwise use the task slug (e.g., `20260326-task-slug`).
+
+```bash
+uv run python -c "
+from pathlib import Path
+from gza.config import Config
+from gza.db import SqliteTaskStore
+
+config = Config.load(Path.cwd())
+store = SqliteTaskStore(config.db_path)
+task = store.get('<TASK_ID>')
+if task is None:
+    raise SystemExit('Task not found')
+
+if '<BRANCH_NAME>' and task.branch != '<BRANCH_NAME>':
+    task.branch = '<BRANCH_NAME>'
+    store.update(task)
+"
+```
+
+For **explore/plan/review** tasks:
+
+- Do **not** create a new task branch.
+- Do **not** persist a new `task.branch` value.
+- Review-task branch context comes from the implementation branch/worktree being reviewed, not from creating a new review-task branch.
 
 Before executing, capture the output path from Step 2:
 
@@ -115,16 +140,18 @@ Now **execute the instructions from the built prompt**. The prompt from Step 2 c
 
 Do not skip the output artifact. Inline runs do not automatically capture this conversation as task output; the file you write here is what later `gza show`, summaries, and follow-up automation can read.
 
-### Step 5: Commit your changes
+### Step 6: Commit code changes (code-task types only)
 
-After completing the task, stage and commit all changes:
+For **task/implement/improve/rebase** tasks, after completing the task, stage and commit all code changes:
+
+For **explore/plan/review** tasks, do not create a task commit; write the report artifact and use status-only completion.
 
 ```bash
 git add <changed_files>
 git commit -m "<descriptive message>"
 ```
 
-### Step 6: Persist task output, run completion checks, then finalize success outcome log
+### Step 7: Persist task output, run completion checks, then finalize success outcome log
 
 Persist the output file you wrote in Step 4 before marking the task completed.
 
@@ -173,6 +200,8 @@ Then mark the task completed:
 uv run gza mark-completed <TASK_ID>
 ```
 
+For **explore/plan/review** tasks, `mark-completed` uses status-only completion by default.
+
 Only after `mark-completed` succeeds, append a successful outcome entry:
 
 ```bash
@@ -190,7 +219,7 @@ if task and task.log_file:
 "
 ```
 
-### Step 7: Failure-path consistency (if inline execution fails)
+### Step 8: Failure-path consistency (if inline execution fails)
 
 If the inline run cannot be completed, preserve diagnostic state instead of leaving a partially tracked task:
 
@@ -222,9 +251,10 @@ uv run gza set-status <TASK_ID> failed --reason <FAILURE_REASON>
 - **Output persistence is explicit**: Inline runs must write the summary/report file and persist it into the task record. The task log does not automatically contain this conversation.
 - **`log_file` persistence is explicit**: Set `task.log_file` before execution and keep it in DB updates so `gza log`, query views, and debugging flows behave consistently.
 - **Synthetic provenance is intentional**: Inline execution cannot reproduce provider-native telemetry, but synthetic `gza` JSONL entries keep outcome and artifact traces discoverable.
-- **Branch management**: Create a new branch for the task work, just like background execution would.
+- **Worker lifecycle line is conditional**: Inline runs always write the explicit synthetic `gza` entries shown above. `write_worker_start_event()` only emits `worker_lifecycle:start` when worker-mode env vars are present (`GZA_WORKER_MODE=1` and `GZA_WORKER_ID` set).
+- **Branch and commit scope**: Branch creation, `task.branch` persistence, and commits apply only to git-verified types (`task`/`implement`/`improve`/`rebase`). `explore`/`plan`/`review` runs should persist log + output artifacts and finish with status-only completion.
 - **Editing prompts**: Use `gza edit <task_id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
-- **Proper status tracking**: Step 4 persists `task.branch`; then `mark-completed <TASK_ID>` reads that stored branch and applies the normal completion logic. This keeps `merge_status` correct so tasks appear in `gza unmerged` and work with `gza advance`.
+- **Proper status tracking**: For git-verified task types, Step 5 persists `task.branch`; then `mark-completed <TASK_ID>` reads that stored branch and applies normal completion logic. This keeps `merge_status` correct so tasks appear in `gza unmerged` and work with `gza advance`.
 - **Expected warning behavior**: `mark-completed` may print a warning when status is not `failed`; this is expected for inline runs that set `in_progress` first and does not block completion.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.
