@@ -19,6 +19,7 @@ from ..colors import (
 from ..config import Config
 from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
+from ..log_events import is_new_step
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import _parse_iso, get_store, pager_context, resolve_id
 
@@ -285,14 +286,12 @@ class _LiveLogPrinter:
 
         elif entry_type == "assistant":
             message = entry.get("message", {})
-            msg_id = message.get("id")
 
             if self._start_time is None:
                 self._start_time = time.time()
 
             # New step on new message ID
-            if msg_id and msg_id not in self._seen_msg_ids:
-                self._seen_msg_ids.add(msg_id)
+            if is_new_step(entry, self._seen_msg_ids):
                 self._step_count += 1
 
                 if self._step_count > 1:
@@ -366,23 +365,10 @@ class _LiveLogPrinter:
                 self._fmt.print_agent_message(f"Session started (thread: {thread_id})")
 
         elif entry_type == "turn.started":
+            # Codex emits turn.started once per session (not per logical step).
+            # Step headers are printed when agent_message items arrive instead.
             if self._start_time is None:
                 self._start_time = time.time()
-            self._step_count += 1
-            if self._step_count > 1:
-                self._console.print()
-            if self._live:
-                elapsed = int(time.time() - self._start_time)
-                total_tokens = self._total_input_tokens + self._total_output_tokens
-                self._fmt.print_step_header(
-                    self._step_count, total_tokens, 0.0, elapsed,
-                    blank_line_before=False,
-                )
-            else:
-                self._console.print(
-                    f"| Step {self._step_count} |",
-                    style=blue,
-                )
 
         elif entry_type == "item.completed":
             item = entry.get("item", {})
@@ -390,7 +376,24 @@ class _LiveLogPrinter:
                 pass
             elif item.get("type") == "agent_message":
                 text = item.get("text", "")
-                if isinstance(text, str) and text.strip():
+                if is_new_step(entry, self._seen_msg_ids):
+                    if self._start_time is None:
+                        self._start_time = time.time()
+                    self._step_count += 1
+                    if self._step_count > 1:
+                        self._console.print()
+                    if self._live:
+                        total_tokens = self._total_input_tokens + self._total_output_tokens
+                        elapsed = int(time.time() - self._start_time)
+                        self._fmt.print_step_header(
+                            self._step_count, total_tokens, 0.0, elapsed,
+                            blank_line_before=False,
+                        )
+                    else:
+                        self._console.print(
+                            f"| Step {self._step_count} |",
+                            style=blue,
+                        )
                     self._fmt.print_agent_message(text.strip())
             elif item.get("type") == "command_execution":
                 command = item.get("command", "")
