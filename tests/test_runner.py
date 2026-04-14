@@ -10,7 +10,8 @@ import pytest
 
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
-from gza.git import Git
+from gza.git import Git, GitError
+from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
 from gza.runner import (
     BACKUP_DIR,
@@ -4545,8 +4546,9 @@ class TestExtractedRunInnerHelpers:
             gh.pr_exists.return_value = None
             gh.create_pr.return_value = Mock(url="https://github.com/o/r/pull/99", number=99)
 
-            _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
+        assert ok is True
         git.push_branch.assert_called_once_with("feature/work-pr")
         gh.create_pr.assert_called_once()
         refreshed = store.get(task.id)
@@ -4567,8 +4569,9 @@ class TestExtractedRunInnerHelpers:
         git.count_commits_ahead.return_value = 0
 
         with patch("gza.runner.GitHub") as gh_cls:
-            _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
+        assert ok is True
         gh_cls.assert_not_called()
 
     def test_ensure_work_pr_reuses_existing_pr_and_caches_number(self, tmp_path: Path):
@@ -4590,12 +4593,34 @@ class TestExtractedRunInnerHelpers:
             gh.pr_exists.return_value = "https://github.com/o/r/pull/55"
             gh.get_pr_number.return_value = 55
 
-            _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
+        assert ok is True
         gh.create_pr.assert_not_called()
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.pr_number == 55
+
+    def test_ensure_work_pr_reuses_cached_pr_without_remote_lookup(self, tmp_path: Path):
+        """`work --pr` should short-circuit on cached task.pr_number."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/cached-pr"
+        task.pr_number = 81
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+
+        with patch("gza.runner.GitHub") as gh_cls:
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+        gh_cls.return_value.pr_exists.assert_not_called()
+        gh_cls.return_value.create_pr.assert_not_called()
 
     def test_complete_code_task_creates_pr_before_auto_review(self, tmp_path: Path):
         """When create_review is enabled, PR creation should run before auto-review execution."""
@@ -4628,6 +4653,7 @@ class TestExtractedRunInnerHelpers:
 
         def _mark_pr(*_args, **_kwargs):
             call_order.append("pr")
+            return True
 
         def _run_review(*_args, **_kwargs):
             call_order.append("review")
@@ -4657,6 +4683,87 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 7
         assert call_order == ["pr", "review"]
+
+    @pytest.mark.parametrize(
+        ("failure_mode", "gh_available", "needs_push", "push_error", "create_pr_error"),
+        [
+            ("gh_unavailable", False, False, None, None),
+            ("push_fails", True, True, GitError("push failed"), None),
+            ("create_pr_fails", True, False, None, GitHubError("create failed")),
+        ],
+    )
+    def test_complete_code_task_work_pr_failure_aborts_before_auto_review(
+        self,
+        tmp_path: Path,
+        failure_mode: str,
+        gh_available: bool,
+        needs_push: bool,
+        push_error: GitError | None,
+        create_pr_error: GitHubError | None,
+    ):
+        """Explicit `work --pr` failures should return non-zero and skip auto-review."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt=f"Implement with review ({failure_mode})", task_type="implement", create_review=True)
+        task.slug = f"20260414-impl-review-{failure_mode}"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.needs_push.return_value = needs_push
+        worktree_git.is_merged.return_value = False
+        if push_error is not None:
+            worktree_git.push_branch.side_effect = push_error
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.GitHub") as gh_cls,
+        ):
+            gh = gh_cls.return_value
+            gh.is_available.return_value = gh_available
+            gh.pr_exists.return_value = None
+            if create_pr_error is not None:
+                gh.create_pr.side_effect = create_pr_error
+            else:
+                gh.create_pr.return_value = Mock(url="https://github.com/o/r/pull/42", number=42)
+
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/review-order",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                create_pr=True,
+            )
+
+        assert rc == 1
+        run_review.assert_not_called()
 
     def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
         """Rebase completion should force-push from the host runner."""

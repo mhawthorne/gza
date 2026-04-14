@@ -146,6 +146,20 @@ class TestHelpOutput:
         assert "front of the urgent lane" in docs_text
         assert "picked up before normal queue items" not in docs_text
 
+    def test_work_pr_help_and_docs_are_aligned(self, tmp_path):
+        """`work --pr` should be documented in CLI help and canonical configuration docs."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("work", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+        normalized_help = " ".join(help_result.stdout.split())
+        assert "--pr" in help_result.stdout
+        assert "Create/reuse a GitHub PR after successful code-task completion" in normalized_help
+
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "--pr" in docs_text
+        assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
+
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
 

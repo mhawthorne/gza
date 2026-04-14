@@ -567,41 +567,17 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             )
             startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
+        run_kwargs: dict[str, Any] = {
+            "resume": resume,
+            "skip_precondition_check": getattr(args, "force", False),
+            "on_task_claimed": _on_task_claimed,
+        }
+        if getattr(args, "create_pr", False):
+            run_kwargs["create_pr"] = True
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
-            if getattr(args, "create_pr", False):
-                exit_code = run(
-                    config,
-                    task_id=args.task_ids[0],
-                    resume=resume,
-                    skip_precondition_check=getattr(args, "force", False),
-                    on_task_claimed=_on_task_claimed,
-                    create_pr=True,
-                )
-            else:
-                exit_code = run(
-                    config,
-                    task_id=args.task_ids[0],
-                    resume=resume,
-                    skip_precondition_check=getattr(args, "force", False),
-                    on_task_claimed=_on_task_claimed,
-                )
-        else:
-            if getattr(args, "create_pr", False):
-                exit_code = run(
-                    config,
-                    resume=resume,
-                    skip_precondition_check=getattr(args, "force", False),
-                    on_task_claimed=_on_task_claimed,
-                    create_pr=True,
-                )
-            else:
-                exit_code = run(
-                    config,
-                    resume=resume,
-                    skip_precondition_check=getattr(args, "force", False),
-                    on_task_claimed=_on_task_claimed,
-                )
+            run_kwargs["task_id"] = args.task_ids[0]
+        exit_code = run(config, **run_kwargs)
 
         # Update worker status on completion
         if worker_id:

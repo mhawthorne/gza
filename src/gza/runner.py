@@ -1244,24 +1244,29 @@ def _ensure_work_pr_for_completed_code_task(
     config: Config,
     store: SqliteTaskStore,
     git: Git,
-) -> None:
-    """Ensure a PR exists for a completed code task branch when `gza work --pr` is set."""
+) -> bool:
+    """Ensure a PR exists for a completed code task branch when `gza work --pr` is set.
+
+    Returns:
+        True when PR requirements are satisfied or PR creation is not applicable.
+        False when explicit PR creation was requested but could not be fulfilled.
+    """
     if not task.branch:
-        return
+        return True
 
     default_branch = git.default_branch()
     if git.count_commits_ahead(task.branch, default_branch) <= 0:
         print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
-        return
+        return True
 
     gh = GitHub()
     if not gh.is_available():
-        print("Info: GitHub CLI (gh) not available, skipping PR creation")
-        return
+        print("Error: GitHub CLI (gh) not available, cannot create PR")
+        return False
 
     if task.pr_number:
         print(f"Info: Reusing cached PR #{task.pr_number} for task {task.id}")
-        return
+        return True
 
     existing_pr_url = gh.pr_exists(task.branch)
     if existing_pr_url:
@@ -1270,19 +1275,19 @@ def _ensure_work_pr_for_completed_code_task(
         if pr_number:
             task.pr_number = pr_number
             store.update(task)
-        return
+        return True
 
     try:
         if git.needs_push(task.branch):
             print(f"Pushing branch '{task.branch}' to origin...")
             git.push_branch(task.branch)
     except GitError as e:
-        print(f"Warning: Failed to push branch '{task.branch}' before PR creation: {e}")
-        return
+        print(f"Error: Failed to push branch '{task.branch}' before PR creation: {e}")
+        return False
 
     if git.is_merged(task.branch, default_branch):
         print(f"Info: Branch '{task.branch}' is already merged into {default_branch}, skipping PR creation")
-        return
+        return True
 
     first_line = task.prompt.strip().splitlines()
     title = first_line[0] if first_line else f"Task {task.id}"
@@ -1308,8 +1313,10 @@ def _ensure_work_pr_for_completed_code_task(
         if pr.number:
             task.pr_number = pr.number
             store.update(task)
+        return True
     except GitHubError as e:
-        print(f"Warning: Failed to create PR for task {task.id}: {e}")
+        print(f"Error: Failed to create PR for task {task.id}: {e}")
+        return False
 
 
 def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
@@ -1991,7 +1998,10 @@ def _complete_code_task(
     )
 
     if create_pr:
-        _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+        pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+        if not pr_ready:
+            print("Error: `gza work --pr` requested PR creation/reuse, aborting before auto-review")
+            return 1
 
     # Auto-create and run review task if requested
     if task.create_review:

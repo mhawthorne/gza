@@ -434,6 +434,7 @@ gza work [task_id...] [options]
 | `--background`, `-b` | Run worker in background |
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
+| `--pr` | Create/reuse a GitHub PR for completed code tasks before auto-created review runs (when the branch has commits) |
 
 ### add
 

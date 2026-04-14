@@ -131,6 +131,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     start_time = time.time()
 
     try:
+        run_kwargs: dict[str, Any] = {
+            "skip_precondition_check": getattr(args, "force", False),
+        }
+        if getattr(args, "create_pr", False):
+            run_kwargs["create_pr"] = True
+
         # Run the task(s)
         if hasattr(args, 'task_ids') and args.task_ids:
             # Run the specific tasks
@@ -142,19 +148,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     # Update worker registry to track the current task
                     worker.task_id = task_id
                     registry.update(worker)
-                if getattr(args, "create_pr", False):
-                    result = run(
-                        config,
-                        task_id=task_id,
-                        skip_precondition_check=getattr(args, "force", False),
-                        create_pr=True,
-                    )
-                else:
-                    result = run(
-                        config,
-                        task_id=task_id,
-                        skip_precondition_check=getattr(args, "force", False),
-                    )
+                result = run(config, task_id=task_id, **run_kwargs)
                 if result != 0:
                     if tasks_completed == 0:
                         # First task failed
@@ -183,17 +177,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         for i in range(count):
             if tasks_completed > 0:
                 print(task_separator)
-            if getattr(args, "create_pr", False):
-                result = run(
-                    config,
-                    skip_precondition_check=getattr(args, "force", False),
-                    create_pr=True,
-                )
-            else:
-                result = run(
-                    config,
-                    skip_precondition_check=getattr(args, "force", False),
-                )
+            result = run(config, **run_kwargs)
 
             # Any non-zero exit means the run failed.
             if result != 0:
