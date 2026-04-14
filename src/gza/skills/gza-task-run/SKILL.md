@@ -74,7 +74,6 @@ store.update(task)
 model, provider_name, _ = get_effective_config_for_task(task, config)
 write_worker_start_event(log_file, resumed=False)
 write_log_entry(log_file, {'type': 'gza', 'subtype': 'info', 'message': f'Task: {task.id} {task.slug}'})
-write_log_entry(log_file, {'type': 'gza', 'subtype': 'branch', 'message': f'Branch: {task.branch or "<none>"}', 'branch': task.branch})
 write_log_entry(log_file, {'type': 'gza', 'subtype': 'info', 'message': f'Provider: {provider_name}, Model: {model or "default"}'})
 write_log_entry(log_file, {'type': 'gza', 'subtype': 'provenance', 'message': 'Execution mode: inline skill gza-task-run', 'skill': 'gza-task-run', 'inline': True, 'pid': os.getpid()})
 
@@ -84,22 +83,33 @@ print(task.log_file)
 
 ### Step 5: Type-specific execution setup
 
-For **task/implement/improve/rebase** tasks only:
+For **task/implement** tasks only:
 
-- Create or switch to the task branch.
-- Persist `task.branch` in the DB only for these git-verified task types.
+- Create or switch to the task branch using the branch reported by `gza show --prompt` when present.
+- If no branch was precomputed, derive it from the configured branch strategy instead of falling back to `task.slug`.
 
 ```bash
 git checkout -b <branch_name>
 ```
 
-Use the branch name from the task if it has one, otherwise use the task slug (e.g., `20260326-task-slug`).
+For **improve** tasks only:
+
+- Reuse the ancestor implementation branch instead of creating a fresh improve-task branch.
+- Resolve the branch from the implementation/review ancestry before executing.
+
+For **rebase** tasks only:
+
+- Reuse the ancestor implementation branch instead of creating a fresh rebase-task branch.
+- Do **not** add a generic post-task commit step; `/gza-rebase` handles the rebase flow and any conflict-resolution commits itself.
+
+For all **task/implement/improve/rebase** tasks, once you have the resolved execution branch, persist it in the DB and append the branch log entry at that point so the synthetic log matches the actual branch being used:
 
 ```bash
 uv run python -c "
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.runner import write_log_entry
 
 config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
@@ -107,9 +117,18 @@ task = store.get('<TASK_ID>')
 if task is None:
     raise SystemExit('Task not found')
 
-if '<BRANCH_NAME>' and task.branch != '<BRANCH_NAME>':
+if not '<BRANCH_NAME>':
+    raise SystemExit('Resolved branch name is required for code tasks')
+
+log_file = config.project_dir / task.log_file if task.log_file else None
+if log_file is None:
+    raise SystemExit('task.log_file is not set; initialize Step 4 first')
+
+if task.branch != '<BRANCH_NAME>':
     task.branch = '<BRANCH_NAME>'
     store.update(task)
+
+write_log_entry(log_file, {'type': 'gza', 'subtype': 'branch', 'message': f'Branch: <BRANCH_NAME>', 'branch': '<BRANCH_NAME>'})
 "
 ```
 
@@ -140,11 +159,12 @@ Now **execute the instructions from the built prompt**. The prompt from Step 2 c
 
 Do not skip the output artifact. Inline runs do not automatically capture this conversation as task output; the file you write here is what later `gza show`, summaries, and follow-up automation can read.
 
-### Step 6: Commit code changes (code-task types only)
+### Step 6: Commit code changes (task/implement/improve only)
 
-For **task/implement/improve/rebase** tasks, after completing the task, stage and commit all code changes:
+For **task/implement/improve** tasks, after completing the task, stage and commit all code changes:
 
 For **explore/plan/review** tasks, do not create a task commit; write the report artifact and use status-only completion.
+For **rebase** tasks, do **not** add a generic `git add`/`git commit` step here; the rebase instructions handle commits as part of the rebase workflow.
 
 ```bash
 git add <changed_files>
@@ -252,9 +272,10 @@ uv run gza set-status <TASK_ID> failed --reason <FAILURE_REASON>
 - **`log_file` persistence is explicit**: Set `task.log_file` before execution and keep it in DB updates so `gza log`, query views, and debugging flows behave consistently.
 - **Synthetic provenance is intentional**: Inline execution cannot reproduce provider-native telemetry, but synthetic `gza` JSONL entries keep outcome and artifact traces discoverable.
 - **Worker lifecycle line is conditional**: Inline runs always write the explicit synthetic `gza` entries shown above. `write_worker_start_event()` only emits `worker_lifecycle:start` when worker-mode env vars are present (`GZA_WORKER_MODE=1` and `GZA_WORKER_ID` set).
-- **Branch and commit scope**: Branch creation, `task.branch` persistence, and commits apply only to git-verified types (`task`/`implement`/`improve`/`rebase`). `explore`/`plan`/`review` runs should persist log + output artifacts and finish with status-only completion.
+- **Branch setup scope**: `task`/`implement` create a fresh execution branch; `improve`/`rebase` reuse an ancestor branch resolved from lineage. Persist `task.branch` only after resolving the actual execution branch, then write the synthetic branch log entry with that resolved value.
+- **Commit scope**: The generic `git add`/`git commit` step applies to `task`/`implement`/`improve` only. `rebase` follows its own rebase flow and `mark-completed` defaults to status-only mode there.
 - **Editing prompts**: Use `gza edit <task_id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
-- **Proper status tracking**: For git-verified task types, Step 5 persists `task.branch`; then `mark-completed <TASK_ID>` reads that stored branch and applies normal completion logic. This keeps `merge_status` correct so tasks appear in `gza unmerged` and work with `gza advance`.
+- **Proper status tracking**: Step 5 persists the resolved execution branch for code tasks. `mark-completed <TASK_ID>` uses git verification by default for `task`/`implement`/`improve`, but `rebase` defaults to status-only completion.
 - **Expected warning behavior**: `mark-completed` may print a warning when status is not `failed`; this is expected for inline runs that set `in_progress` first and does not block completion.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.
