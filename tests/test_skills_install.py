@@ -296,6 +296,99 @@ class TestSkillContentValidation:
         assert "supports `42` or `#42`" not in content
         assert "strip the leading `#`" not in content
 
+    def test_gza_task_run_includes_runner_like_log_and_provenance_guidance(self):
+        """gza-task-run should guide explicit log_file persistence and synthetic provenance writes."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        required_snippets = [
+            "task.log_file",
+            "write_log_entry",
+            "write_worker_start_event",
+            "Execution mode: inline skill gza-task-run",
+            "Outcome: completed (inline skill)",
+            "Outcome: failed (inline skill)",
+        ]
+        for snippet in required_snippets:
+            assert snippet in content
+
+    def test_gza_task_run_uses_explicit_project_dir_for_config_load_examples(self):
+        """gza-task-run examples should use Config.load with an explicit project_dir argument."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Config.load()" not in content
+        assert "Config.load(Path.cwd())" in content
+
+    def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
+        """gza-task-run should not document unsupported mark-completed branch flags."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>" not in content
+        assert "uv run gza mark-completed <TASK_ID>" in content
+
+    def test_gza_task_run_logs_success_outcome_only_after_mark_completed_step(self):
+        """gza-task-run should document success outcome logging after mark-completed succeeds."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        mark_completed_cmd = "uv run gza mark-completed <TASK_ID>"
+        success_outcome = "Outcome: completed (inline skill)"
+
+        mark_idx = content.find(mark_completed_cmd)
+        outcome_idx = content.find(success_outcome)
+        assert mark_idx != -1
+        assert outcome_idx != -1
+        assert outcome_idx > mark_idx
+
+    def test_gza_task_run_scopes_branch_and_commit_guidance_to_actual_code_task_behavior(self):
+        """gza-task-run should distinguish fresh-branch vs same-branch task types and avoid generic rebase commits."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "For **task/implement** tasks only:" in content
+        assert "For **improve** tasks only:" in content
+        assert "For **rebase** tasks only:" in content
+        assert "reuse the ancestor implementation branch" in content.lower()
+        assert "Do **not** add a generic post-task commit step" in content
+        assert "For **task/implement/improve/rebase** tasks, after completing the task, stage and commit all code changes:" not in content
+        assert "For **task/implement/improve/rebase** tasks only:" not in content
+        assert "git-verified types (`task`/`implement`/`improve`/`rebase`)" not in content
+        assert "For **explore/plan/review** tasks:" in content
+        assert "Do **not** create a new task branch." in content
+        assert "For **explore/plan/review** tasks, do not create a task commit" in content
+        assert "Branch setup scope" in content
+        assert "Commit scope" in content
+        assert "Create a new branch for the task work, just like background execution would." not in content
+        assert "After completing the task, stage and commit all changes:" not in content
+
+    def test_gza_task_run_logs_branch_only_after_branch_resolution_setup(self):
+        """gza-task-run should write the synthetic branch log after resolving the execution branch."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        pre_setup_log = "write_log_entry(log_file, {'type': 'gza', 'subtype': 'branch', 'message': f'Branch: {task.branch or \"<none>\"}', 'branch': task.branch})"
+        setup_heading = "### Step 5: Type-specific execution setup"
+        resolved_branch_log = "write_log_entry(log_file, {'type': 'gza', 'subtype': 'branch', 'message': f'Branch: <BRANCH_NAME>', 'branch': '<BRANCH_NAME>'})"
+
+        assert pre_setup_log not in content
+        assert setup_heading in content
+        assert resolved_branch_log in content
+        assert content.find(resolved_branch_log) > content.find(setup_heading)
+
     @pytest.mark.parametrize(
         "skill_name",
         [
