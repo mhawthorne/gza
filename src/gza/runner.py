@@ -34,6 +34,7 @@ from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_i
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
+from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task
@@ -41,6 +42,8 @@ from .review_verdict import parse_review_verdict
 from .task_slug import extract_task_id_suffix, get_base_task_slug
 
 logger = logging.getLogger(__name__)
+
+PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 
 __all__ = [
     "run",
@@ -1259,36 +1262,6 @@ def _ensure_work_pr_for_completed_code_task(
         print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
         return True
 
-    gh = GitHub()
-    if not gh.is_available():
-        print("Error: GitHub CLI (gh) not available, cannot create PR")
-        return False
-
-    if task.pr_number:
-        print(f"Info: Reusing cached PR #{task.pr_number} for task {task.id}")
-        return True
-
-    existing_pr_url = gh.pr_exists(task.branch)
-    if existing_pr_url:
-        print(f"Info: Reusing existing PR for branch {task.branch}: {existing_pr_url}")
-        pr_number = gh.get_pr_number(task.branch)
-        if pr_number:
-            task.pr_number = pr_number
-            store.update(task)
-        return True
-
-    try:
-        if git.needs_push(task.branch):
-            print(f"Pushing branch '{task.branch}' to origin...")
-            git.push_branch(task.branch)
-    except GitError as e:
-        print(f"Error: Failed to push branch '{task.branch}' before PR creation: {e}")
-        return False
-
-    if git.is_merged(task.branch, default_branch):
-        print(f"Info: Branch '{task.branch}' is already merged into {default_branch}, skipping PR creation")
-        return True
-
     first_line = task.prompt.strip().splitlines()
     title = first_line[0] if first_line else f"Task {task.id}"
     title = title[:72].strip() or f"Task {task.id}"
@@ -1300,23 +1273,38 @@ def _ensure_work_pr_for_completed_code_task(
 
 {task.id}
 """
-
-    try:
-        pr = gh.create_pr(
-            head=task.branch,
-            base=default_branch,
-            title=title,
-            body=body,
-            draft=False,
-        )
-        print(f"✓ Created PR: {pr.url}")
-        if pr.number:
-            task.pr_number = pr.number
-            store.update(task)
+    if git.needs_push(task.branch):
+        print(f"Pushing branch '{task.branch}' to origin...")
+    result = ensure_task_pr(
+        task,
+        store,
+        git,
+        title=title,
+        body=body,
+        draft=False,
+        merged_behavior="skip",
+    )
+    if result.ok and result.status == "cached" and task.pr_number:
+        print(f"Info: Reusing cached PR #{task.pr_number} for task {task.id}")
         return True
-    except GitHubError as e:
-        print(f"Error: Failed to create PR for task {task.id}: {e}")
-        return False
+    if result.ok and result.status == "existing":
+        print(f"Info: Reusing existing PR for branch {task.branch}: {result.pr_url}")
+        return True
+    if result.ok and result.status == "merged":
+        print(f"Info: Branch '{task.branch}' is already merged into {default_branch}, skipping PR creation")
+        return True
+    if result.ok and result.status == "created":
+        print(f"✓ Created PR: {result.pr_url}")
+        return True
+    if result.status == "gh_unavailable":
+        print("Error: GitHub CLI (gh) not available, cannot create PR")
+    elif result.status == "push_failed":
+        print(f"Error: Failed to push branch '{task.branch}' before PR creation: {result.error}")
+    elif result.status == "create_failed":
+        print(f"Error: Failed to create PR for task {task.id}: {result.error}")
+    else:
+        print(f"Error: Failed to ensure PR for task {task.id}")
+    return False
 
 
 def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
@@ -1438,6 +1426,7 @@ def run(
     # Load tasks from SQLite
     store = SqliteTaskStore(config.db_path)
 
+    pr_retry_mode = False
     if task_id:
         task = store.get(task_id)
         if not task:
@@ -1475,9 +1464,21 @@ def run(
             if is_blocked:
                 error_message(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
                 return 1
+            allow_pr_retry = (
+                create_pr
+                and task.status == "failed"
+                and task.failure_reason == PR_REQUIRED_FAILURE_REASON
+            )
             if task.status == "in_progress":
                 task.running_pid = os.getpid()
                 store.update(task)
+            elif allow_pr_retry:
+                task.status = "in_progress"
+                task.started_at = datetime.now(UTC)
+                task.completed_at = None
+                task.running_pid = os.getpid()
+                store.update(task)
+                pr_retry_mode = True
             elif task.status != "pending":
                 error_message(f"Error: Task {task_id} is no longer pending (status: {task.status})")
                 return 1
@@ -1511,6 +1512,8 @@ def run(
         return 0
     if on_task_claimed is not None:
         on_task_claimed(task)
+    if pr_retry_mode:
+        return _retry_pr_required_code_task_completion(task, config, store)
 
     # Get effective model and provider for this task
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
@@ -1932,6 +1935,47 @@ def _complete_code_task(
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
 
+    # Keep branch context on the in-memory task so PR ensure can run before
+    # the final completed-state DB transition.
+    task.branch = branch_name
+    if create_pr:
+        pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+        if not pr_ready:
+            print("Error: `gza work --pr` requested PR creation/reuse, aborting before auto-review")
+            task.output_content = output_content
+            task.diff_files_changed = diff_files
+            task.diff_lines_added = diff_added
+            task.diff_lines_removed = diff_removed
+            store.mark_failed(
+                task,
+                log_file=str(log_file.relative_to(config.project_dir)),
+                has_commits=True,
+                stats=stats,
+                branch=branch_name,
+                failure_reason=PR_REQUIRED_FAILURE_REASON,
+            )
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "message": "Outcome: failed (PR_REQUIRED)",
+                    "exit_code": 1,
+                },
+            )
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "stats",
+                    "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+                    "duration_seconds": stats.duration_seconds,
+                    "cost_usd": stats.cost_usd,
+                    "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+                },
+            )
+            return 1
+
     # Write final log entries before marking completed in DB, so that
     # `gza log -f` (which checks task status) doesn't break out of the
     # follow loop before the log file is fully written.
@@ -1997,16 +2041,81 @@ def _complete_code_task(
         store=store,
     )
 
-    if create_pr:
-        pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
-        if not pr_ready:
-            print("Error: `gza work --pr` requested PR creation/reuse, aborting before auto-review")
-            return 1
-
     # Auto-create and run review task if requested
     if task.create_review:
         return _create_and_run_review_task(task, config, store)
 
+    return 0
+
+
+def _retry_pr_required_code_task_completion(task: Task, config: Config, store: SqliteTaskStore) -> int:
+    """Retry post-code PR/completion steps for tasks blocked by explicit `work --pr`."""
+    if not task.branch:
+        print(f"Error: Task {task.id} has no branch to create/reuse PR")
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            has_commits=bool(task.has_commits),
+            failure_reason=PR_REQUIRED_FAILURE_REASON,
+        )
+        return 1
+
+    git = Git(config.project_dir)
+    pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+    if not pr_ready:
+        print("Error: `gza work --pr` retry still could not create/reuse PR")
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            branch=task.branch,
+            has_commits=bool(task.has_commits),
+            failure_reason=PR_REQUIRED_FAILURE_REASON,
+        )
+        return 1
+
+    stats = TaskStats(
+        duration_seconds=task.duration_seconds,
+        num_steps_reported=task.num_steps_reported,
+        num_steps_computed=task.num_steps_computed,
+        num_turns_reported=task.num_turns_reported,
+        num_turns_computed=task.num_turns_computed,
+        cost_usd=task.cost_usd,
+        input_tokens=task.input_tokens,
+        output_tokens=task.output_tokens,
+    )
+
+    task.failure_reason = None
+    store.mark_completed(
+        task,
+        branch=task.branch,
+        log_file=task.log_file,
+        output_content=task.output_content,
+        has_commits=bool(task.has_commits),
+        stats=stats,
+        diff_files_changed=task.diff_files_changed,
+        diff_lines_added=task.diff_lines_added,
+        diff_lines_removed=task.diff_lines_removed,
+    )
+    auto_learnings = maybe_auto_regenerate_learnings(store, config)
+
+    if task.task_type == "improve" and task.based_on:
+        store.clear_review_state(task.based_on)
+        parent = store.get(task.based_on)
+        if parent and parent.id is not None and parent.merge_status == "merged":
+            store.set_merge_status(parent.id, "unmerged")
+
+    console.print("")
+    task_footer(
+        task,
+        stats,
+        status="Done",
+        branch=task.branch,
+        learnings=auto_learnings,
+        store=store,
+    )
+
+    if task.create_review:
+        return _create_and_run_review_task(task, config, store)
     return 0
 
 

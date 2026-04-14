@@ -92,7 +92,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(f"Error: Task {task_id} not found")
                 return 1
 
-            if task.status != "pending":
+            allow_pr_retry = (
+                getattr(args, "create_pr", False)
+                and task.status == "failed"
+                and task.failure_reason == "PR_REQUIRED"
+            )
+            if task.status != "pending" and not allow_pr_retry:
                 print(f"Error: Task {task_id} is not pending (status: {task.status})")
                 return 1
 

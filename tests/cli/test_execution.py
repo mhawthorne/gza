@@ -1134,6 +1134,41 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         assert seen_create_pr == [True]
 
+    def test_work_allows_failed_pr_required_task_with_pr_flag(self, tmp_path: Path):
+        """work <task> --pr should allow retrying failed PR_REQUIRED tasks."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required task")
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[task.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.run", return_value=0) as run_mock,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        run_mock.assert_called_once()
+
 
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
