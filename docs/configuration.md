@@ -292,7 +292,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`
+Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal`
 
 Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
 
@@ -508,26 +508,6 @@ gza log <identifier> [options]
 By default, the identifier is treated as a full task ID (for example `gza-1234`).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
 
-### tv
-
-Live multi-task dashboard for active and recent task logs.
-
-```bash
-gza tv [task_ids...] [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `task_ids...` | Optional explicit full prefixed task IDs to pin in the dashboard (up to 8) |
-| `-n, --number N` | Fixed slot count (equivalent to `--min N --max N`) |
-| `--min N` | Minimum slot count in auto-select mode (default: `1`) |
-| `--max N` | Maximum slot count in auto-select mode (default: `4`, hard cap: `8`) |
-
-`gza tv` header semantics:
-- Auto-select mode shows `slots: <visible> (min <min>, max <max>)`.
-- Explicit-ID mode shows `slots: <visible> (explicit)`.
-- Slot count always reflects the visible panel count on screen.
-
 ### stats
 
 Show analytics subcommands for reviews and iteration activity.
@@ -710,25 +690,26 @@ When a task has a branch, `gza show` also reports active worktree information:
 When execution provenance is known, `gza show` also includes:
 - `Execution Mode: worker_background` for detached worker runs
 - `Execution Mode: worker_foreground` for foreground worker runs
+- `Execution Mode: foreground_inline` for `gza run-inline` runner-managed foreground runs
+- `Execution Mode: foreground_attach_resume` for attach-resume handoff execution
 - `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 
-When task comments exist, `gza show` also includes a `Comments:` section with each
-comment's state (`open` or `resolved`), timestamp, source/author attribution, and content.
+### run-inline
 
-### comment
-
-Add a direct comment to a task.
+Run a specific task in the foreground through the same runner path used by workers.
 
 ```bash
-gza comment <task_id> <text> [options]
+gza run-inline <task_id> [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID to comment on (e.g. `gza-1234`) |
-| `text` | Comment text to attach to the task |
-| `--author AUTHOR` | Optional author attribution |
+| `task_id` | Full prefixed task ID to run inline (e.g. `gza-1234`) |
+| `--resume` | Resume from the stored provider session instead of starting fresh |
+| `--no-docker` | Run provider directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+| `--force` | Skip dependency merge precondition checks when starting the run |
 
 ### resume
 
@@ -840,53 +821,16 @@ By default, `gza history` excludes `internal` tasks. Use `--type internal` to vi
 gza history [options]
 ```
 
-`gza history` is a flat chronological record. Use `gza incomplete` for a
-lineage-aware unresolved attention view.
-
-When tasks have comments, `gza history` includes a `comments: N` indicator in
-task detail lines and compact lineage summaries.
-
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal` |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
-| `--incomplete` | Show only unresolved flat history rows (failed or unmerged) |
+| `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
-
-### incomplete
-
-Show unresolved task lineages that need attention now.
-
-```bash
-gza incomplete [options]
-```
-
-`gza incomplete` groups by canonical lineage root and suppresses resolved
-descendants (for example, completed review/improve tasks already rolled up by a
-merged root or successful retry chain).
-
-| Option | Description |
-|--------|-------------|
-| `--last N`, `-n N` | Show last N unresolved lineages (default: 5, `0` for all) |
-| `--type TYPE` | Filter terminal tasks by type before lineage rollup |
-| `--days N` | Show unresolved lineages with activity in the last N days |
-
-### search
-
-Search task prompt text by substring across all task statuses.
-
-```bash
-gza search <term> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `term` | Substring to match in task prompt text |
-| `--last N`, `-n N` | Show last N matching tasks (default: 10, `0` for all matches) |
 
 ### checkout
 
@@ -960,7 +904,7 @@ gza clean [options]
 
 ### improve
 
-Create an improve task to address feedback on an implementation.
+Create an improve task to address review feedback on an implementation.
 
 ```bash
 gza improve <impl_task_id> [options]
@@ -968,7 +912,7 @@ gza improve <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — resolves to the owning implementation; e.g. `gza-1234`) |
+| `impl_task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
@@ -979,33 +923,7 @@ gza improve <impl_task_id> [options]
 | `--provider PROVIDER` | Override provider for this task |
 | `--force` | Skip dependency merge precondition checks when running the improve task |
 
-The improve command resolves the owning implementation, gathers the most recent completed
-review when available, and also includes unresolved task comments as feedback context. If no
-review exists but unresolved comments do, improve still runs using comments-only feedback.
-Comments-only improve runs follow normal improve lifecycle semantics: existing pending tasks are
-reused, failed attempts are resumed/retried up to `max_resume_attempts`, and completed prior
-rounds do not block creating a fresh comments-only improve when new unresolved comments exist.
-
-### fix
-
-Create and run an interactive stuck-task rescue pass for an implementation lineage.
-
-```bash
-gza fix <task_id> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `task_id` | Full prefixed task ID (implement, improve, review, or fix — resolves to the owning implementation; e.g. `gza-1234`) |
-| `--queue`, `-q` | Add task to queue without executing immediately |
-| `--background`, `-b` | Run worker in background |
-| `--no-docker` | Run Claude directly instead of in Docker |
-| `--max-turns N` | Override max_turns setting for this run |
-| `--model MODEL` | Override model for this task |
-| `--provider PROVIDER` | Override provider for this task |
-| `--force` | Skip dependency merge precondition checks when running the fix task |
-
-`gza fix` is an escalation path for review/improve churn. It creates a `fix` task with assembled rescue context (latest review, repeated blockers, prior improve attempts), runs the repair pass, and auto-creates a fresh independent review when code changes were made.
+The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
 
 ### review
 
@@ -1017,7 +935,7 @@ gza review <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID (implement, improve, review, or fix — resolves to the owning implementation; e.g. `gza-1234`) |
+| `task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
@@ -1124,12 +1042,6 @@ gza iterate <impl_task_id> [options]
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when iterate starts workers |
 
-When iterate stops with `max_cycles_reached` or `max_improve_attempts`, the recommended next step is:
-
-```bash
-uv run gza fix <impl_task_id>
-```
-
 ### watch
 
 Continuously maintain a target number of concurrent workers.
@@ -1211,7 +1123,7 @@ gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
 Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
 
 `--execution-mode` is only valid with `in_progress`, and accepts:
-`worker_background`, `worker_foreground`, `manual`, `skill_inline`.
+`worker_background`, `worker_foreground`, `foreground_inline`, `foreground_attach_resume`, `manual`, `skill_inline`.
 
 ### sync-report
 
@@ -1238,7 +1150,6 @@ Gza supports several task types, each with distinct behavior:
 | `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
-| `fix` | Rescue stuck review/improve churn with closure ledger handoff | Code changes on same branch |
 | `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
 
 **Typical workflow:**
@@ -1247,7 +1158,6 @@ Gza supports several task types, each with distinct behavior:
 2. `implement --based-on <plan_id> --review` - Build per plan, auto-create review
 3. `review` runs automatically, saved to `.gza/reviews/`
 4. If changes requested: `improve <impl_id>` addresses feedback on same branch
-5. If churn persists or max cycles are reached: `fix <impl_id>` runs escalation rescue and hands off to a fresh review when needed
 
 **Per-type configuration:**
 

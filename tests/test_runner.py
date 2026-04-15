@@ -20,6 +20,7 @@ from gza.review_tasks import create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
+    RunInvocationContext,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
@@ -51,6 +52,7 @@ from gza.runner import (
     generate_slug,
     get_task_output_paths,
     run,
+    write_execution_provenance_event,
     write_log_entry,
     write_worker_start_event,
 )
@@ -260,6 +262,37 @@ class TestWorkerLifecycleLogging:
         assert event["event"] == "start"
         assert event["worker_id"] == "w-20260411-1"
         assert "resumed" in event["message"]
+
+    def test_write_execution_provenance_event_logs_structured_entry(self, tmp_path: Path):
+        """Execution provenance should include command/mode/interaction metadata."""
+        log_file = tmp_path / "exec.log"
+        provider = Mock()
+        provider.name = "Claude"
+        context = RunInvocationContext(
+            command="run-inline",
+            execution_mode="foreground_inline",
+            interaction_mode="auto",
+        )
+
+        write_execution_provenance_event(
+            log_file,
+            invocation=context,
+            provider=provider,
+            interaction_mode="interactive",
+            resumed=True,
+        )
+
+        import json
+
+        event = json.loads(log_file.read_text().strip())
+        assert event["type"] == "gza"
+        assert event["subtype"] == "execution"
+        assert event["command"] == "run-inline"
+        assert event["execution_mode"] == "foreground_inline"
+        assert event["interaction_mode"] == "interactive"
+        assert event["provider"] == "claude"
+        assert event["worker_mode"] is False
+        assert event["resumed"] is True
 
     def test_build_prompt_skips_learnings_when_skip_learnings_true(self, tmp_path: Path):
         """Test that build_prompt skips learnings reference when task.skip_learnings is True."""
@@ -4657,6 +4690,39 @@ class TestTaskClaimSafety:
         # descriptive reason — not left dangling in_progress.
         assert second_refreshed.status == "failed"
         assert second_refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+
+    def test_invocation_context_sets_foreground_inline_execution_mode(self, tmp_path: Path):
+        """run() should persist foreground_inline mode when inline invocation is requested."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline run task", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = False
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.execution_mode == "foreground_inline"
 
 
 class TestSameBranchLineageWalk:

@@ -25,7 +25,7 @@ from ..git import Git
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
 from ..review_verdict import get_review_report
-from ..runner import run
+from ..runner import RunInvocationContext, run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     DuplicateReviewError,
@@ -225,6 +225,31 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Clean up worker registration on exception
         registry.mark_completed(worker_id, exit_code=1, status="failed")
         raise
+
+
+def cmd_run_inline(args: argparse.Namespace) -> int:
+    """Run a specific task inline via the real runner orchestration path."""
+    config = Config.load(args.project_dir)
+    if args.no_docker:
+        config.use_docker = False
+
+    if getattr(args, "max_turns", None) is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    task_id = resolve_id(config, args.task_id)
+    invocation = RunInvocationContext(
+        command="run-inline",
+        execution_mode="foreground_inline",
+        interaction_mode="auto",
+    )
+    return _run_foreground(
+        config,
+        task_id=task_id,
+        resume=bool(getattr(args, "resume", False)),
+        force=getattr(args, "force", False),
+        invocation=invocation,
+    )
 
 
 def cmd_implement(args: argparse.Namespace) -> int:

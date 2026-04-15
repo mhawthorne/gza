@@ -521,6 +521,11 @@ class Provider(ABC):
         ...
 
     @property
+    def supports_interactive_foreground(self) -> bool:
+        """Return whether provider supports interactive foreground inline runs."""
+        return False
+
+    @property
     def credential_setup_hint(self) -> str:
         """Return a hint for setting up credentials.
 
@@ -553,6 +558,7 @@ class Provider(ABC):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        interactive: bool = False,
     ) -> RunResult:
         """Run the provider to execute a task.
 
@@ -569,6 +575,8 @@ class Provider(ABC):
             on_step_count: Optional callback invoked with the current step count
                 whenever the step count changes during streaming.  Use this to
                 update the task record in real time.
+            interactive: If True, run in provider-specific interactive foreground
+                mode when supported.
 
         Returns:
             RunResult with exit code and statistics

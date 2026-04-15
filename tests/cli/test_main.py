@@ -355,6 +355,10 @@ class TestDirectExecutionForceDispatch:
                 "gza.cli.main.cmd_resume",
             ),
             (
+                ["gza", "run-inline", "testproject-1", "--force"],
+                "gza.cli.main.cmd_run_inline",
+            ),
+            (
                 ["gza", "improve", "testproject-1", "--force"],
                 "gza.cli.main.cmd_improve",
             ),
