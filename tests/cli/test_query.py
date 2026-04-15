@@ -713,6 +713,58 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert f"→ resumed as {resumed.id} ✗" in result.stdout
 
+    def test_history_annotates_failed_task_with_queued_retry_without_outcome_marker(self, tmp_path: Path):
+        """Queued retries are annotated without a terminal outcome marker."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        queued_retry = store.add("Queued retry", task_type="implement", based_on=original.id)
+        queued_retry.status = "pending"
+        store.update(queued_retry)
+        assert queued_retry.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {queued_retry.id}" in result.stdout
+        assert f"→ retried as {queued_retry.id} ✗" not in result.stdout
+        assert f"→ retried as {queued_retry.id} ✓" not in result.stdout
+
+    def test_history_annotates_failed_task_with_queued_resume_without_outcome_marker(self, tmp_path: Path):
+        """Queued resume attempts are annotated without a terminal outcome marker."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.branch = "20260415-impl-resume-queued"
+        original.session_id = "session-queued"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        queued_resumed = store.add("Queued resumed", task_type="implement", based_on=original.id)
+        queued_resumed.status = "pending"
+        queued_resumed.branch = "20260415-impl-resume-queued"
+        queued_resumed.session_id = "session-queued"
+        store.update(queued_resumed)
+        assert queued_resumed.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ resumed as {queued_resumed.id}" in result.stdout
+        assert f"→ resumed as {queued_resumed.id} ✗" not in result.stdout
+        assert f"→ resumed as {queued_resumed.id} ✓" not in result.stdout
+
     def test_history_retry_annotation_follows_chain_and_ignores_other_task_types(self, tmp_path: Path):
         """Retry annotation follows same-type based_on chains to the final attempt."""
         setup_config(tmp_path)

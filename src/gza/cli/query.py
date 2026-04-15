@@ -284,6 +284,14 @@ def cmd_history(args: argparse.Namespace) -> int:
             return None
         return (root_action, current)
 
+    def _retry_outcome_annotation(attempt: DbTask) -> tuple[str, str] | None:
+        """Return (label, color) for retry/resume final-attempt outcome annotation."""
+        if attempt.status in {"completed", "unmerged"}:
+            return ("✓", c['success'])
+        if attempt.status in {"failed", "dropped"}:
+            return ("✗", c['failure'])
+        return None
+
     def _render_task_line(
         task: DbTask,
         *,
@@ -330,12 +338,15 @@ def cmd_history(args: argparse.Namespace) -> int:
             if retry_annotation is not None:
                 action, final_attempt = retry_annotation
                 if final_attempt.id is not None:
-                    outcome_symbol = "✓" if final_attempt.status == "completed" else "✗"
-                    outcome_color = c['success'] if final_attempt.status == "completed" else c['failure']
+                    outcome_annotation = _retry_outcome_annotation(final_attempt)
+                    suffix = ""
+                    if outcome_annotation is not None:
+                        outcome_label, outcome_color = outcome_annotation
+                        suffix = f" [{outcome_color}]{outcome_label}[/{outcome_color}]"
                     console.print(
                         f"{detail_prefix}    [{c['lineage']}]→ {action} as[/{c['lineage']}] "
-                        f"[{c['task_id']}]{final_attempt.id}[/{c['task_id']}] "
-                        f"[{outcome_color}]{outcome_symbol}[/{outcome_color}]"
+                        f"[{c['task_id']}]{final_attempt.id}[/{c['task_id']}]"
+                        f"{suffix}"
                     )
 
         type_label = f"\\[{task.task_type}]"
