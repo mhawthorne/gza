@@ -25,10 +25,12 @@ Current review context logic lives in `_build_context_from_chain()` and `_build_
 
 The worktree is a git checkout of the implementation branch. It contains:
 - All git-tracked files from that branch
-- Empty `.gza/` directory (since `.gza/` is gitignored)
+- `.gza/gza.db` as a host-created point-in-time snapshot of the live task DB
+  (copied via SQLite backup API before provider launch, then chmod `0444`)
+- `.gza/learnings.md` copied by the host runner for non-internal tasks
 
 ## If Claude tries to query gza directly
 
-If Claude runs `gza` commands or reads `.gza/gza.db` during the review, it will find an empty database. This is unnecessary - all relevant context is already in the prompt. In task containers, prefer `uv run gza ...` in guidance snippets because `gza` may rely on a project-local shim.
+If Claude runs `gza` commands or reads `.gza/gza.db` during the review, reads will succeed against the frozen snapshot captured at worktree spawn time. Snapshot writes fail with SQLite read-only errors because the file mode is `0444`. In task containers, prefer `uv run gza ...` in guidance snippets because `gza` may rely on a project-local shim.
 
-If a review complains about "database is empty" or "cannot find task record," the reviewer is going beyond the provided prompt context. The prompt should contain everything needed.
+If a review complains about task lookups from inside the worktree, check whether the lookup should exist in the spawn-time snapshot and whether the reviewer expected post-spawn host DB changes to appear (they will not). The prompt should still contain everything needed for the review.

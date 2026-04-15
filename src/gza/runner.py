@@ -262,6 +262,19 @@ def _extract_review_verdict(content: str | None) -> str | None:
     return parse_review_verdict(content)
 
 
+def _backup_sqlite_file(source_path: Path, destination_path: Path) -> None:
+    """Copy a SQLite database file using SQLite's backup API."""
+    source = sqlite3.connect(str(source_path))
+    try:
+        destination = sqlite3.connect(str(destination_path))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+
+
 def backup_database(db_path: Path, project_dir: Path) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
 
@@ -286,15 +299,7 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
 
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    source = sqlite3.connect(str(db_path))
-    try:
-        dest = sqlite3.connect(str(backup_path))
-        try:
-            source.backup(dest)
-        finally:
-            dest.close()
-    finally:
-        source.close()
+    _backup_sqlite_file(db_path, backup_path)
 
 
 def load_dotenv(project_dir: Path) -> None:
@@ -1351,15 +1356,7 @@ def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
     if snapshot_path.exists():
         snapshot_path.unlink()
 
-    source = sqlite3.connect(str(db_path))
-    try:
-        dest = sqlite3.connect(str(snapshot_path))
-        try:
-            source.backup(dest)
-        finally:
-            dest.close()
-    finally:
-        source.close()
+    _backup_sqlite_file(db_path, snapshot_path)
 
     snapshot_path.chmod(0o444)
 
