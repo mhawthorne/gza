@@ -42,7 +42,6 @@ from ..pickup import get_runnable_pending_tasks
 from ..query import (
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
-    filter_lineage_tree as _filter_lineage_tree,
     get_improves_for_root as _get_improves_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
     resolve_lineage_root as _resolve_lineage_root_task,
@@ -576,29 +575,34 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             console.print(task_separator)
         first_task = False
 
-        # Sort tasks by created_at to find the root task (earliest)
-        tasks_sorted = sorted(tasks, key=lambda t: t.created_at if t.created_at else datetime.min)
+        # Choose the current branch-head implementation for summary/review status.
+        # When retries/resumes share a branch, the latest implementation is the
+        # state users care about when asking what remains unmerged.
+        branch_implement_tasks = [task for task in tasks if task.task_type == "implement"]
+        if branch_implement_tasks:
+            branch_task = max(
+                branch_implement_tasks,
+                key=lambda t: (
+                    _task_id_numeric_key(t.id),
+                    t.completed_at or t.created_at or datetime.min,
+                ),
+            )
+        else:
+            branch_task = max(
+                tasks,
+                key=lambda t: (
+                    _task_id_numeric_key(t.id),
+                    t.completed_at or t.created_at or datetime.min,
+                ),
+            )
 
-        # Find the root implementation task and any improve tasks that reference it
-        root_task = None
-
-        # First pass: identify the root implementation task
-        for task in tasks_sorted:
-            if task.task_type == "implement":
-                root_task = task
-                break
-
-        # If no implement task, use the earliest task as root
-        if not root_task:
-            root_task = tasks_sorted[0]
-
-        reviews = _get_reviews_for_root_task(store, root_task)
-        improve_tasks = _get_improves_for_root_task(store, root_task)
-        lineage_tree = _build_lineage_tree_for_root(store, root_task)
-        filtered_lineage_tree = _filter_lineage_tree(lineage_tree, {"review", "improve"})
+        reviews = _get_reviews_for_root_task(store, branch_task)
+        improve_tasks = _get_improves_for_root_task(store, branch_task)
+        lineage_root = _resolve_lineage_root_task(store, branch_task)
+        lineage_tree = _build_lineage_tree_for_root(store, lineage_root)
         c = UNMERGED_COLORS  # shorthand
         lineage_str = _format_lineage(
-            filtered_lineage_tree,
+            lineage_tree,
             annotate=True,
             review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
         )
@@ -621,7 +625,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             assert latest_review_completed is not None
 
             review_is_stale = False
-            if root_task.review_cleared_at and root_task.review_cleared_at >= latest_review_completed:
+            if branch_task.review_cleared_at and branch_task.review_cleared_at >= latest_review_completed:
                 review_is_stale = True
             if latest_improve and latest_improve.completed_at and latest_improve.completed_at > latest_review_completed:
                 review_is_stale = True
@@ -644,7 +648,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 for review in reviews:
                     if review.status != "completed" or review.completed_at is None:
                         continue
-                    if root_task.review_cleared_at and root_task.review_cleared_at >= review.completed_at:
+                    if branch_task.review_cleared_at and branch_task.review_cleared_at >= review.completed_at:
                         continue
                     verdict = get_review_verdict(config, review)
                     if verdict:
@@ -670,17 +674,17 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         suffix = ""
         # Append failure reason if present and not UNKNOWN
-        if root_task.status == "failed" and root_task.failure_reason and root_task.failure_reason != "UNKNOWN":
-            suffix += f" [red]failed ({root_task.failure_reason})[/red]"
+        if branch_task.status == "failed" and branch_task.failure_reason and branch_task.failure_reason != "UNKNOWN":
+            suffix += f" [red]failed ({branch_task.failure_reason})[/red]"
 
         # Header line: task ID, completion time, prompt
-        task_id_len = len(str(root_task.id))
-        date_len = 19 if root_task.completed_at else 0
+        task_id_len = len(str(branch_task.id))
+        date_len = 19 if branch_task.completed_at else 0
         prefix_len = 2 + task_id_len + date_len  # "⚡ ID (date) "
-        prompt_display = shorten_prompt(root_task.prompt, prompt_available_width(prefix=prefix_len))
-        date_str = f"[{c['date']}]({root_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]" if root_task.completed_at else ""
+        prompt_display = shorten_prompt(branch_task.prompt, prompt_available_width(prefix=prefix_len))
+        date_str = f"[{c['date']}]({branch_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]" if branch_task.completed_at else ""
 
-        console.print(f"⚡ [{c['task_id']}]{root_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
+        console.print(f"⚡ [{c['task_id']}]{branch_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
 
         if lineage_str:
             console.print("lineage:")
@@ -689,10 +693,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # Show branch with diff stats (branch may no longer exist if deleted)
         if git.branch_exists(branch):
             # Use cached diff stats if available; fall back to live git call
-            if root_task.diff_files_changed is not None:
-                files_changed = root_task.diff_files_changed
-                insertions = root_task.diff_lines_added or 0
-                deletions = root_task.diff_lines_removed or 0
+            if branch_task.diff_files_changed is not None:
+                files_changed = branch_task.diff_files_changed
+                insertions = branch_task.diff_lines_added or 0
+                deletions = branch_task.diff_lines_removed or 0
                 commit_count = git.count_commits_ahead(branch, target_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
@@ -717,10 +721,10 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # Review freshness status for this implementation.
         console.print(f"review: [{review_status_color}]{review_line}[/{review_status_color}]")
 
-        if root_task.report_file:
-            console.print(f"report: [{c['task_id']}]{root_task.report_file}[/{c['task_id']}]")
+        if branch_task.report_file:
+            console.print(f"report: [{c['task_id']}]{branch_task.report_file}[/{c['task_id']}]")
 
-        stats_str = format_stats(root_task)
+        stats_str = format_stats(branch_task)
         if stats_str:
             console.print(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
 
