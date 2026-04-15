@@ -345,6 +345,37 @@ def _is_branch_target_live(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "into_current", False) or getattr(args, "target", None))
 
 
+def _suppress_stale_merged_rows(tasks: list[DbTask], git: Git, target_branch: str) -> list[DbTask]:
+    """Hide rows that are stale in DB but already merged in git.
+
+    This is a read-time suppression only. It keeps default `gza unmerged`
+    output truthful without requiring `--update`, while preserving the
+    explicit reconcile behavior (`--update`) for DB writes.
+    """
+    merged_by_branch: dict[str, bool] = {}
+    filtered: list[DbTask] = []
+
+    for task in tasks:
+        branch = task.branch
+        if not branch:
+            continue
+
+        cached = merged_by_branch.get(branch)
+        if cached is None:
+            try:
+                # Keep deleted/missing branches visible; deletion alone does not
+                # prove the branch was merged into the target branch.
+                merged_by_branch[branch] = git.branch_exists(branch) and git.is_merged(branch, target_branch)
+            except GitError:
+                merged_by_branch[branch] = False
+            cached = merged_by_branch[branch]
+
+        if not cached:
+            filtered.append(task)
+
+    return filtered
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
@@ -653,6 +684,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # --commits-only and --all flags are kept for backwards compatibility but are no-ops
         all_unmerged = store.get_unmerged()
         unmerged = [t for t in all_unmerged if t.status == "completed"]
+        unmerged = _suppress_stale_merged_rows(unmerged, git, default_branch)
 
     if not unmerged:
         console.print("No unmerged tasks")

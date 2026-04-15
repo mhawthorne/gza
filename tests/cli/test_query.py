@@ -4107,7 +4107,7 @@ class TestUnmergedAllFlag:
         assert "Migrating merge status" not in result.stdout
 
     def test_unmerged_update_marks_stale_merged_task_as_merged(self, tmp_path: Path):
-        """--update reconciles stale unmerged tasks whose branch is already merged."""
+        """Default unmerged suppresses stale merged rows; --update reconciles persisted state."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Stale unmerged task",
@@ -4119,7 +4119,11 @@ class TestUnmergedAllFlag:
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Stale unmerged task" in result.stdout
+        assert "Stale unmerged task" not in result.stdout
+        assert "No unmerged tasks" in result.stdout
+
+        stale_task = store.get(task.id)
+        assert stale_task.merge_status == "unmerged"
 
         result = run_gza("unmerged", "--update", "--project", str(tmp_path))
         assert result.returncode == 0
