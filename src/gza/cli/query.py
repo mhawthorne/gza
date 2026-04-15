@@ -242,6 +242,48 @@ def cmd_history(args: argparse.Namespace) -> int:
             return False
         return task.same_branch or task.based_on == parent_task.id
 
+    def _is_resume_attempt(parent_task: DbTask, child_task: DbTask) -> bool:
+        """Best-effort detection for resume attempts based on session + branch reuse."""
+        if not parent_task.session_id or not child_task.session_id:
+            return False
+        if parent_task.session_id != child_task.session_id:
+            return False
+        if not parent_task.branch or not child_task.branch:
+            return False
+        return parent_task.branch == child_task.branch
+
+    def _resolve_retry_annotation(task: DbTask) -> tuple[str, DbTask] | None:
+        """Resolve final retry/resume descendant for failed tasks of the same type."""
+        if task.id is None:
+            return None
+
+        current = task
+        root_action = "retried"
+        visited: set[str] = {task.id}
+
+        while current.id is not None:
+            children = store.get_based_on_children_by_type(current.id, current.task_type)
+            if not children:
+                break
+            # Retries/resumes form a chain in normal operation; prefer newest child if multiple exist.
+            next_task = max(
+                children,
+                key=lambda t: (
+                    t.created_at or datetime.min,
+                    _task_id_numeric_key(t.id if isinstance(t.id, str) else None),
+                ),
+            )
+            if next_task.id is None or next_task.id in visited:
+                break
+            if current.id == task.id and _is_resume_attempt(current, next_task):
+                root_action = "resumed"
+            visited.add(next_task.id)
+            current = next_task
+
+        if current.id == task.id:
+            return None
+        return (root_action, current)
+
     def _render_task_line(
         task: DbTask,
         *,
@@ -284,6 +326,17 @@ def cmd_history(args: argparse.Namespace) -> int:
         if task.status == "failed":
             reason = task.failure_reason or "UNKNOWN"
             console.print(f"{detail_prefix}    [{c['failure']}]reason: {reason}[/{c['failure']}]")
+            retry_annotation = _resolve_retry_annotation(task)
+            if retry_annotation is not None:
+                action, final_attempt = retry_annotation
+                if final_attempt.id is not None:
+                    outcome_symbol = "✓" if final_attempt.status == "completed" else "✗"
+                    outcome_color = c['success'] if final_attempt.status == "completed" else c['failure']
+                    console.print(
+                        f"{detail_prefix}    [{c['lineage']}]→ {action} as[/{c['lineage']}] "
+                        f"[{c['task_id']}]{final_attempt.id}[/{c['task_id']}] "
+                        f"[{outcome_color}]{outcome_symbol}[/{outcome_color}]"
+                    )
 
         type_label = f"\\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""

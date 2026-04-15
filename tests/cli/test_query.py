@@ -662,6 +662,95 @@ class TestHistoryCommand:
         assert result.stdout.count("reason: UNKNOWN") >= 2  # explicit UNKNOWN and None both map to UNKNOWN
         assert "reason: MAX_STEPS" in result.stdout
 
+    def test_history_annotates_failed_task_with_retry_outcome(self, tmp_path: Path):
+        """Failed tasks show a retry annotation with final retry outcome."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+
+        assert original.id is not None
+        retry = store.add("Retry succeeded", task_type="implement", based_on=original.id)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(UTC)
+        store.update(retry)
+        assert retry.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {retry.id} ✓" in result.stdout
+
+    def test_history_annotates_failed_task_with_resume_outcome(self, tmp_path: Path):
+        """Failed tasks show 'resumed' when the next attempt reused session + branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.branch = "20260415-impl-resume-test"
+        original.session_id = "session-123"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+
+        assert original.id is not None
+        resumed = store.add("Resumed failed again", task_type="implement", based_on=original.id)
+        resumed.status = "failed"
+        resumed.failure_reason = "TEST_FAILURE"
+        resumed.branch = "20260415-impl-resume-test"
+        resumed.session_id = "session-123"
+        resumed.completed_at = datetime.now(UTC)
+        store.update(resumed)
+        assert resumed.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ resumed as {resumed.id} ✗" in result.stdout
+
+    def test_history_retry_annotation_follows_chain_and_ignores_other_task_types(self, tmp_path: Path):
+        """Retry annotation follows same-type based_on chains to the final attempt."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        # Different task type child should not be considered a retry/resume.
+        review = store.add("Review child", task_type="review", based_on=original.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        retry_1 = store.add("Retry one", task_type="implement", based_on=original.id)
+        retry_1.status = "failed"
+        retry_1.failure_reason = "MAX_TURNS"
+        retry_1.completed_at = datetime.now(UTC)
+        store.update(retry_1)
+        assert retry_1.id is not None
+
+        retry_2 = store.add("Retry two", task_type="implement", based_on=retry_1.id)
+        retry_2.status = "completed"
+        retry_2.completed_at = datetime.now(UTC)
+        store.update(retry_2)
+        assert retry_2.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {retry_2.id} ✓" in result.stdout
+        assert f"→ retried as {review.id}" not in result.stdout
+
     def test_history_shows_parent_task_id(self, tmp_path: Path):
         """History shows parent task ID when based_on or depends_on is set."""
 
