@@ -1,12 +1,14 @@
 """Task execution commands: run, add, edit, retry, resume, review, improve, iterate."""
 
 import argparse
+import json
 import os
 import signal
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
@@ -665,6 +667,32 @@ def _default_mark_completed_mode(task_type: str) -> str:
     return "force"
 
 
+def _log_indicates_inline_skill(task: DbTask, config: Config) -> bool:
+    """Best-effort check for synthetic inline-skill provenance in task logs."""
+    if not task.log_file:
+        return False
+    log_path = config.project_dir / Path(task.log_file)
+    if not log_path.exists():
+        return False
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "gza" or entry.get("subtype") != "provenance":
+                    continue
+                if entry.get("inline") is True and entry.get("skill"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def cmd_mark_completed(args: argparse.Namespace) -> int:
     """Mark a task as completed with either git verification or status-only mode."""
     config = Config.load(args.project_dir)
@@ -685,6 +713,10 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         return 1
 
     mode = "verify-git" if args.verify_git else ("force" if args.force else _default_mark_completed_mode(task.task_type))
+
+    if task.execution_mode in (None, "manual") and _log_indicates_inline_skill(task, config):
+        task.execution_mode = "skill_inline"
+        store.update(task)
 
     # Warn if task wasn't failed (but still proceed)
     if task.status != "failed":
@@ -739,6 +771,8 @@ def cmd_set_status(args: argparse.Namespace) -> int:
 
     old_status = task.status
     task.status = args.status
+    if args.status == "in_progress" and task.execution_mode is None:
+        task.execution_mode = "manual"
 
     if args.status in ("completed", "failed", "dropped"):
         task.completed_at = datetime.now(UTC)

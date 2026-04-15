@@ -1423,6 +1423,9 @@ def run(
 
     # Load tasks from SQLite
     store = SqliteTaskStore(config.db_path)
+    execution_mode = (
+        "worker_background" if os.environ.get("GZA_WORKER_MODE") == "1" else "worker_foreground"
+    )
 
     pr_retry_mode = False
     if task_id:
@@ -1449,12 +1452,16 @@ def run(
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
+                task.execution_mode = execution_mode
+                assert task.id is not None
+                store.set_execution_mode(task.id, execution_mode)
             else:
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
                 task.failure_reason = None
                 task.running_pid = os.getpid()
+                task.execution_mode = execution_mode
                 store.update(task)
         else:
             # Check if task is blocked by dependencies
@@ -1469,12 +1476,14 @@ def run(
             )
             if task.status == "in_progress":
                 task.running_pid = os.getpid()
+                task.execution_mode = execution_mode
                 store.update(task)
             elif allow_pr_retry:
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
                 task.running_pid = os.getpid()
+                task.execution_mode = execution_mode
                 store.update(task)
                 pr_retry_mode = True
             elif task.status != "pending":
@@ -1489,6 +1498,9 @@ def run(
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
+                task.execution_mode = execution_mode
+                assert task.id is not None
+                store.set_execution_mode(task.id, execution_mode)
     else:
         if resume:
             error_message("Error: Cannot resume without specifying a task ID")
@@ -1503,6 +1515,9 @@ def run(
             if claimed is None:
                 continue
             task = claimed
+            task.execution_mode = execution_mode
+            assert task.id is not None
+            store.set_execution_mode(task.id, execution_mode)
             break
 
     if not task:

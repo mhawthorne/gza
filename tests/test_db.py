@@ -3096,6 +3096,27 @@ class TestRunStepPersistence:
         assert updated is not None
         assert updated.log_schema_version == 2
 
+    def test_new_tasks_default_execution_mode_none(self, tmp_path: Path):
+        """New tasks should default to no execution provenance until execution begins."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.execution_mode is None
+
+        reloaded = store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.execution_mode is None
+
+    def test_set_execution_mode_updates_task(self, tmp_path: Path):
+        """set_execution_mode should persist recognized execution provenance values."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task")
+        assert task.id is not None
+
+        store.set_execution_mode(task.id, "skill_inline")
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "skill_inline"
+
 
 def test_get_impl_based_on_ids_returns_targeted_set(tmp_path: Path):
     """get_impl_based_on_ids returns only based_on IDs from implement tasks."""
@@ -3831,7 +3852,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30]
+        assert status["pending_auto"] == [28, 29, 30, 31]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -3843,7 +3864,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30]
+        assert status["pending_auto"] == [28, 29, 30, 31]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -4247,8 +4268,8 @@ class TestMigrationUtilityFunctions:
         assert refreshed is not None
         assert refreshed.attach_count == 1
 
-    def test_auto_migration_v29_to_v30_adds_urgent_bumped_at(self, tmp_path: Path) -> None:
-        """Opening a v29 DB should migrate to v30 and create tasks.urgent_bumped_at."""
+    def test_auto_migration_v29_to_v31_adds_provenance_columns(self, tmp_path: Path) -> None:
+        """Opening a v29 DB should migrate through v31 and create provenance columns."""
         import sqlite3
 
         db_path = tmp_path / "test.db"
@@ -4261,8 +4282,9 @@ class TestMigrationUtilityFunctions:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         conn.close()
 
-        assert version == 30
+        assert version == SCHEMA_VERSION
         assert "urgent_bumped_at" in columns
+        assert "execution_mode" in columns
 
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,
@@ -4369,7 +4391,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30]
+        assert status["pending_auto"] == [28, 29, 30, 31]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

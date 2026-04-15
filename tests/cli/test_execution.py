@@ -5486,6 +5486,30 @@ class TestMarkCompletedCommand:
         assert result.returncode == 0
         assert "status-only" in result.stdout
 
+    def test_mark_completed_promotes_manual_mode_to_skill_inline_from_log(self, tmp_path: Path):
+        """Inline skill provenance in log should persist as skill_inline execution mode."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Inline skill review task", task_type="review")
+        assert task.id is not None
+        task.status = "failed"
+        task.execution_mode = "manual"
+        task.log_file = ".gza/logs/inline.log"
+        store.update(task)
+
+        log_path = tmp_path / task.log_file
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
+        )
+
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "skill_inline"
+
     def test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
         """mark-completed leaves an already-completed worker unchanged."""
         from gza.workers import WorkerMetadata
@@ -5605,6 +5629,21 @@ class TestSetStatusCommand:
         assert updated is not None
         assert updated.status == "failed"
         assert updated.failure_reason == "Process killed"
+
+    def test_set_status_in_progress_defaults_execution_mode_to_manual(self, tmp_path: Path):
+        """Manual in-progress transitions should stamp execution_mode=manual."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+
+        result = run_gza("set-status", str(task.id), "in_progress", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "manual"
 
     def test_set_status_reason_warns_for_non_failed(self, tmp_path: Path):
         """set-status warns when --reason is used with a non-failed status."""
