@@ -1,9 +1,15 @@
 """Shared fixtures and helpers for CLI tests."""
 
+import io
+import os
 import subprocess
+import sys
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
+from gza.cli import main as cli_main
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 
 LOG_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "logs"
@@ -48,21 +54,67 @@ def get_latest_task(
     return max(tasks, key=lambda t: task_id_numeric_key(t.id)) if tasks else None
 
 
-def run_gza(*args: str, cwd: Path | None = None, stdin_input: str | None = None) -> subprocess.CompletedProcess:
-    """Run gza command and return result."""
-    return subprocess.run(
-        ["uv", "run", "gza", *args],
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        input=stdin_input,
+def run_gza(
+    *args: str,
+    cwd: Path | None = None,
+    stdin_input: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run gza CLI in-process and capture stdout/stderr like subprocess.run."""
+    if args and args[0] in {"diff"}:
+        run_env = os.environ.copy()
+        if env:
+            run_env.update(env)
+        return subprocess.run(
+            ["uv", "run", "gza", *args],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            input=stdin_input,
+            env=run_env,
+        )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    old_cwd = Path.cwd()
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    try:
+        if cwd is not None:
+            os.chdir(cwd)
+        with (
+            patch.dict(os.environ, run_env, clear=True),
+            patch.object(sys, "argv", ["gza", *args]),
+            patch("sys.stdin", io.StringIO(stdin_input or "")),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            try:
+                returncode = cli_main()
+            except SystemExit as exc:
+                code = exc.code
+                returncode = code if isinstance(code, int) else 1
+    finally:
+        os.chdir(old_cwd)
+
+    return subprocess.CompletedProcess(
+        args=["uv", "run", "gza", *args],
+        returncode=returncode,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
     )
 
 
 def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
     """Set up a minimal gza config file."""
     config_path = tmp_path / "gza.yaml"
-    config_path.write_text(f"project_name: {project_name}\n")
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    config_path.write_text(
+        f"project_name: {project_name}\n"
+        f"worktree_dir: {worktree_dir}\n"
+    )
 
 
 def setup_db_with_tasks(tmp_path: Path, tasks: list[dict], project_name: str = "test-project") -> None:
