@@ -1866,9 +1866,9 @@ class TestGenerateSlugSlugOverride:
         """slug_override replaces the slug derived from prompt."""
         task_id = generate_slug(
             "some long generic prompt text",
-            slug_override="rev-add-docker-volumes",
+            slug_override="add-docker-volumes",
         )
-        assert task_id.endswith("-rev-add-docker-volumes")
+        assert task_id.endswith("-add-docker-volumes")
 
     def test_slug_override_none_falls_back_to_prompt(self, tmp_path: Path):
         """When slug_override is None, slug is derived from prompt as usual."""
@@ -1883,7 +1883,7 @@ class TestGenerateSlugSlugOverride:
         task_id = generate_slug(
             "some prompt",
             existing_id="20260101-original-slug",
-            slug_override="rev-something-else",
+            slug_override="something-else",
         )
         # Should re-use the base from existing_id, not slug_override
         assert "original-slug" in task_id
@@ -2063,112 +2063,142 @@ class TestTaskIdExistsBranchStrategy:
 class TestComputeSlugOverride:
     """Tests for _compute_slug_override helper."""
 
-    @staticmethod
-    def _suffix(task_id: str | None) -> str:
-        assert task_id is not None
-        prefix, sep, suffix = task_id.partition("-")
-        assert sep and prefix and suffix
-        return suffix
-
-    def test_sibling_review_tasks_use_their_own_direct_targets(self, tmp_path: Path):
-        """Sibling reviews in one lineage derive different target slugs."""
+    def test_implement_uses_root_ancestor_prompt_across_multiple_generations(self, tmp_path: Path):
+        """Implement descendants derive slug from lineage-root prompt."""
         store = SqliteTaskStore(tmp_path / "test.db")
-        root_impl = store.add(prompt="Remove shorthand and legacy task id resolution", task_type="implement")
-        root_suffix = self._suffix(root_impl.id)
-        root_impl.slug = f"20260410-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution"
-        store.update(root_impl)
-        child_impl = store.add(
-            prompt="Switch task ids to variable length decimal",
+        root_plan = store.add(prompt="Roll out authentication platform", task_type="plan")
+        impl1 = store.add(
+            prompt="Implement auth v1",
             task_type="implement",
-            based_on=root_impl.id,
+            based_on=root_plan.id,
         )
-        child_suffix = self._suffix(child_impl.id)
-        child_impl.slug = (
-            f"20260410-{child_suffix}-impl-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution"
+        impl2 = store.add(
+            prompt="Implement auth v2",
+            task_type="implement",
+            based_on=impl1.id,
         )
-        store.update(child_impl)
-
-        review_root = store.add(
-            prompt="Review root implementation",
-            task_type="review",
-            depends_on=root_impl.id,
-        )
-        review_child = store.add(
-            prompt="Review child implementation",
-            task_type="review",
-            depends_on=child_impl.id,
+        impl3 = store.add(
+            prompt="Implement auth v3",
+            task_type="implement",
+            based_on=impl2.id,
         )
 
-        root_slug = _compute_slug_override(review_root, store)
-        child_slug = _compute_slug_override(review_child, store)
+        result = _compute_slug_override(impl3, store)
+        assert result == "roll-out-authentication-platform"
 
-        assert root_slug is not None
-        assert child_slug is not None
-        assert root_slug != child_slug
-        assert f"rev-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution" in root_slug
-        assert f"rev-{child_suffix}-impl-{root_suffix}-impl-remove-shorthand-and-legacy-task-id-resolution" in child_slug
-
-    def test_review_slug_override_includes_review_task_id_suffix(self, tmp_path: Path):
-        """Review slug override embeds the review task's own id suffix."""
+    def test_improve_uses_same_root_prompt_as_implementation_lineage(self, tmp_path: Path):
+        """Improve task derives slug from lineage root via based_on chain."""
         store = SqliteTaskStore(tmp_path / "test.db")
-        impl_task = store.add(prompt="Add docker volumes", task_type="implement")
-        impl_suffix = self._suffix(impl_task.id)
-        impl_task.slug = f"20260129-{impl_suffix}-impl-add-docker-volumes"
-        store.update(impl_task)
-        review_task = store.add(
-            prompt="Review implementation",
-            task_type="review",
-            depends_on=impl_task.id,
-        )
-
-        result = _compute_slug_override(review_task, store)
-        assert result == f"{self._suffix(review_task.id)}-rev-{impl_suffix}-impl-add-docker-volumes"
-
-    def test_implement_and_improve_use_based_on_with_implement_fallback(self, tmp_path: Path):
-        """Implement/improve anchor to based_on; implement falls back to depends_on."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        plan_task = store.add(prompt="Add authentication system", task_type="plan")
-        plan_task.slug = "20260129-add-authentication-system"
-        store.update(plan_task)
+        root_plan = store.add(prompt="Stabilize job scheduler", task_type="plan")
         impl_task = store.add(
-            prompt="Implement authentication",
+            prompt="Implement scheduler stabilization",
             task_type="implement",
-            based_on=plan_task.id,
+            based_on=root_plan.id,
         )
-        impl_suffix = self._suffix(impl_task.id)
-        impl_task.slug = f"20260129-{impl_suffix}-impl-add-authentication-system"
-        store.update(impl_task)
-        impl_result = _compute_slug_override(impl_task, store)
-        assert impl_result == f"{self._suffix(impl_task.id)}-impl-add-authentication-system"
-
-        fallback_target = store.add(prompt="Fallback parent prompt", task_type="task")
-        fallback_target.slug = "20260410-fallback-parent-slug"
-        store.update(fallback_target)
-        impl_fallback = store.add(
-            prompt="Implement with fallback",
-            task_type="implement",
-            depends_on=fallback_target.id,
-        )
-        fallback_result = _compute_slug_override(impl_fallback, store)
-        assert fallback_result == f"{self._suffix(impl_fallback.id)}-impl-fallback-parent-slug"
-
         improve_task = store.add(
-            prompt="Fix auth edge cases",
+            prompt="Fix scheduler edge cases",
             task_type="improve",
             based_on=impl_task.id,
         )
-        improve_result = _compute_slug_override(improve_task, store)
-        assert improve_result == f"{self._suffix(improve_task.id)}-impr-{impl_suffix}-impl-add-authentication-system"
 
-    def test_variable_width_task_ids_are_supported(self):
-        """Task id suffix extraction does not assume fixed-width ids."""
-        anchor = Task(id="gza-1", prompt="Switch task ids", task_type="implement", slug="20260410-1-impl-switch-task-ids")
+        result = _compute_slug_override(improve_task, store)
+        assert result == "stabilize-job-scheduler"
+
+    def test_review_uses_direct_depends_on_target_prompt(self, tmp_path: Path):
+        """Review task derives slug from immediate depends_on target only."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        root_plan = store.add(prompt="Migrate billing stack", task_type="plan")
+        impl_task = store.add(
+            prompt="Implement billing migration",
+            task_type="implement",
+            based_on=root_plan.id,
+        )
+        improve_task = store.add(
+            prompt="Improve migration observability",
+            task_type="improve",
+            based_on=impl_task.id,
+        )
+        review_task = store.add(
+            prompt="Review migration changes",
+            task_type="review",
+            depends_on=improve_task.id,
+        )
+        result = _compute_slug_override(review_task, store)
+        assert result == "improve-migration-observability"
+
+    def test_missing_ancestor_during_based_on_walk_uses_last_resolved_prompt(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Missing parent while walking ancestors uses last resolved task prompt."""
+        mid = Task(id="gza-mid", prompt="Mid ancestor prompt", task_type="implement", based_on="gza-root")
+        child = Task(
+            id="gza-child",
+            prompt="Implement child",
+            task_type="implement",
+            based_on="gza-mid",
+        )
+        store = Mock(spec=SqliteTaskStore)
+        store.get.side_effect = lambda task_id: {
+            "gza-mid": mid,
+            "gza-root": None,
+        }.get(task_id)
+
+        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+            result = _compute_slug_override(child, store)
+        assert result == "mid-ancestor-prompt"
+        assert (
+            "Slug override ancestor missing for task #gza-child while walking based_on chain: "
+            "missing_parent=gza-root; using last resolved ancestor #gza-mid"
+        ) in caplog.text
+
+    def test_missing_review_target_falls_back_to_review_prompt_and_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Missing review depends_on target falls back to review prompt."""
+        review_task = Task(
+            id="gza-review",
+            prompt="Review missing target behavior",
+            task_type="review",
+            depends_on="gza-missing",
+        )
+        store = Mock(spec=SqliteTaskStore)
+        store.get.return_value = None
+
+        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+            result = _compute_slug_override(review_task, store)
+        assert result == "review-missing-target-behavior"
+        assert (
+            "Slug override review target missing for task #gza-review: depends_on=gza-missing; "
+            "falling back to review task prompt"
+        ) in caplog.text
+
+    def test_cycle_in_based_on_chain_uses_last_resolved_prompt_and_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Cycle in based_on walk should stop and use last resolved prompt."""
+        a = Task(id="gza-a", prompt="Root A prompt", task_type="implement", based_on="gza-b")
+        b = Task(id="gza-b", prompt="Root B prompt", task_type="implement", based_on="gza-a")
+        child = Task(id="gza-child", prompt="Child prompt", task_type="implement", based_on="gza-a")
+        store = Mock(spec=SqliteTaskStore)
+        store.get.side_effect = lambda task_id: {"gza-a": a, "gza-b": b}.get(task_id)
+
+        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+            result = _compute_slug_override(child, store)
+        assert result == "root-b-prompt"
+        assert (
+            "Slug override cycle detected for task #gza-child while walking based_on chain: "
+            "ancestor=gza-a; using last resolved ancestor #gza-b"
+        ) in caplog.text
+
+    def test_variable_width_task_ids_no_longer_shape_slug_override(self):
+        """Slug override does not embed task-id suffixes."""
+        anchor = Task(id="gza-1", prompt="Switch task ids", task_type="implement")
         review_task = Task(id="gza-mp", prompt="Review switch task ids", task_type="review", depends_on=anchor.id)
         store = Mock(spec=SqliteTaskStore)
         store.get.return_value = anchor
 
         result = _compute_slug_override(review_task, store)
-        assert result == "mp-rev-1-impl-switch-task-ids"
+        assert result == "switch-task-ids"
 
     def test_plain_task_returns_none(self, tmp_path: Path):
         """Non-review/implement/improve tasks return None."""
@@ -2183,37 +2213,6 @@ class TestComputeSlugOverride:
         task = store.add(prompt="Explore codebase", task_type="explore")
         result = _compute_slug_override(task, store)
         assert result is None
-
-    def test_implement_falls_back_to_target_prompt_when_target_has_no_slug(self, tmp_path: Path):
-        """Falls back to slugifying direct target prompt when target has no slug."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        plan_task = store.add(prompt="Add authentication system", task_type="plan")
-        # plan_task.slug intentionally unset
-        impl_task = store.add(
-            prompt="Implement authentication",
-            task_type="implement",
-            based_on=plan_task.id,
-        )
-
-        result = _compute_slug_override(impl_task, store)
-        assert result == f"{self._suffix(impl_task.id)}-impl-add-authentication-system"
-
-    def test_missing_anchor_logs_warning_and_uses_child_prompt_fallback(self, caplog: pytest.LogCaptureFixture):
-        """Missing direct anchors emit a warning instead of silently falling back."""
-        store = Mock(spec=SqliteTaskStore)
-        store.get.return_value = None
-        review_task = Task(
-            id="gza-0000ab",
-            prompt="Review missing anchor behavior",
-            task_type="review",
-            depends_on="gza-unknown",
-        )
-
-        with caplog.at_level(logging.WARNING, logger="gza.runner"):
-            result = _compute_slug_override(review_task, store)
-
-        assert result == "0000ab-rev-review-missing-anchor-behavior"
-        assert "Slug override anchor task missing for task #gza-0000ab (review): anchor_id=gza-unknown" in caplog.text
 
 
 class TestReviewNextSteps:
