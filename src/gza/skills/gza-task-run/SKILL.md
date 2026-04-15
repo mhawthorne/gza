@@ -41,7 +41,7 @@ Then re-run `gza show --prompt` to get the updated built prompt.
 ### Step 3: Mark task as in-progress
 
 ```bash
-uv run gza set-status <TASK_ID> in_progress
+uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline
 ```
 
 ### Step 4: Initialize runner-like log metadata for all task types
@@ -276,6 +276,7 @@ uv run gza set-status <TASK_ID> failed --reason <FAILURE_REASON>
 - **Commit scope**: The generic `git add`/`git commit` step applies to `task`/`implement`/`improve` only. `rebase` follows its own rebase flow and `mark-completed` defaults to status-only mode there.
 - **Editing prompts**: Use `gza edit <task_id> --prompt "..."` to modify a task's prompt before running. Supports `--prompt-file` for multi-line prompts and `--prompt -` to read from stdin.
 - **Proper status tracking**: Step 5 persists the resolved execution branch for code tasks. `mark-completed <TASK_ID>` uses git verification by default for `task`/`implement`/`improve`, but `rebase` defaults to status-only completion.
+- **Inline provenance source of truth**: Step 3 sets `execution_mode=skill_inline` when moving to `in_progress`; this is the primary provenance path. `mark-completed` log-based promotion is only a defensive backfill for older runs.
 - **Expected warning behavior**: `mark-completed` may print a warning when status is not `failed`; this is expected for inline runs that set `in_progress` first and does not block completion.
 - **Failed tasks can be re-run**: Tasks with status "failed" can also be run inline — useful for debugging failures interactively.
 - **Verify command**: For task/implement/improve types, the built prompt already includes the verify command instruction. Follow it.

@@ -687,6 +687,12 @@ When a task has a branch, `gza show` also reports active worktree information:
 - `Worktree: <path>` when the task branch is currently checked out in an active worktree
 - `Warning: Worktree lookup failed: ...` when git worktree metadata could not be read
 
+When execution provenance is known, `gza show` also includes:
+- `Execution Mode: worker_background` for detached worker runs
+- `Execution Mode: worker_foreground` for foreground worker runs
+- `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
+- `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
+
 ### resume
 
 Resume a failed task from where it left off. The AI continues with the existing conversation context.
@@ -1091,12 +1097,15 @@ If a `ManualMigrationRequired` error appears when running any other command, run
 Manually force a task's status.
 
 ```bash
-gza set-status <task_id> <status>
+gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
 ```
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
 
 Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
+
+`--execution-mode` is only valid with `in_progress`, and accepts:
+`worker_background`, `worker_foreground`, `manual`, `skill_inline`.
 
 ### sync-report
 

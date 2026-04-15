@@ -1204,6 +1204,20 @@ class TestShowCommand:
         assert "A detailed task prompt" in result.stdout
         assert "Status: pending" in result.stdout
 
+    def test_show_displays_execution_mode_when_set(self, tmp_path: Path):
+        """Show command includes execution provenance mode when present."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with execution mode")
+        assert task.id is not None
+        task.execution_mode = "skill_inline"
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Execution Mode: skill_inline" in result.stdout
+
     def test_show_nonexistent_task(self, tmp_path: Path):
         """Show command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])

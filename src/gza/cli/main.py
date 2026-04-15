@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ..config import Config, ConfigError
 from ..db import (
+    KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
     ManualMigrationRequired,
     SqliteTaskStore,
@@ -1509,6 +1510,11 @@ def main() -> int:
         "--reason",
         default=None,
         help="Failure reason (only meaningful for failed status)",
+    )
+    set_status_parser.add_argument(
+        "--execution-mode",
+        choices=sorted(KNOWN_EXECUTION_MODES),
+        help="Execution provenance to persist when status is in_progress",
     )
     add_common_args(set_status_parser)
 

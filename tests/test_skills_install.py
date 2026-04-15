@@ -350,6 +350,24 @@ class TestSkillContentValidation:
         assert outcome_idx != -1
         assert outcome_idx > mark_idx
 
+    def test_gza_task_run_marks_in_progress_with_skill_inline_execution_mode(self):
+        """gza-task-run should stamp in-progress inline runs with skill_inline provenance."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline" in content
+
+    def test_gza_task_resume_marks_in_progress_with_skill_inline_execution_mode(self):
+        """gza-task-resume should stamp in-progress inline runs with skill_inline provenance."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-resume" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline" in content
+
     def test_gza_task_run_scopes_branch_and_commit_guidance_to_actual_code_task_behavior(self):
         """gza-task-run should distinguish fresh-branch vs same-branch task types and avoid generic rebase commits."""
         from gza.skills_utils import get_skills_source_path

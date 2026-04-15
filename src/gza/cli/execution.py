@@ -1,12 +1,14 @@
 """Task execution commands: run, add, edit, retry, resume, review, improve, iterate."""
 
 import argparse
+import json
 import os
 import signal
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
@@ -665,6 +667,52 @@ def _default_mark_completed_mode(task_type: str) -> str:
     return "force"
 
 
+def _log_indicates_inline_skill(task: DbTask, config: Config) -> tuple[bool, str | None]:
+    """Check synthetic inline-skill provenance in task logs.
+
+    Returns ``(found, warning)`` where ``warning`` is set when log provenance
+    could not be fully evaluated due to read or parse issues.
+    """
+    if not task.log_file:
+        return False, None
+    log_path = config.project_dir / Path(task.log_file)
+    if not log_path.exists():
+        return False, None
+    malformed_lines = 0
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed_lines += 1
+                    continue
+                if entry.get("type") != "gza" or entry.get("subtype") != "provenance":
+                    continue
+                if entry.get("inline") is True and entry.get("skill"):
+                    return True, None
+    except OSError as exc:
+        return (
+            False,
+            (
+                f"Warning: Could not read task log '{task.log_file}' while checking inline provenance: "
+                f"{exc.__class__.__name__}: {exc}"
+            ),
+        )
+    if malformed_lines:
+        return (
+            False,
+            (
+                f"Warning: Found {malformed_lines} malformed JSON line(s) in task log "
+                f"'{task.log_file}' while checking inline provenance; execution mode was not promoted."
+            ),
+        )
+    return False, None
+
+
 def cmd_mark_completed(args: argparse.Namespace) -> int:
     """Mark a task as completed with either git verification or status-only mode."""
     config = Config.load(args.project_dir)
@@ -685,6 +733,14 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         return 1
 
     mode = "verify-git" if args.verify_git else ("force" if args.force else _default_mark_completed_mode(task.task_type))
+
+    if task.execution_mode is None:
+        inline_skill_detected, log_warning = _log_indicates_inline_skill(task, config)
+        if log_warning:
+            print(log_warning)
+        if inline_skill_detected:
+            task.execution_mode = "skill_inline"
+            store.update(task)
 
     # Warn if task wasn't failed (but still proceed)
     if task.status != "failed":
@@ -727,6 +783,9 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     """Manually force a task's status to any valid value."""
     if args.reason and args.status != "failed":
         print(f"Warning: --reason is only meaningful for 'failed' status (current target: '{args.status}')")
+    if args.execution_mode and args.status != "in_progress":
+        print("Error: --execution-mode is only valid when setting status to 'in_progress'")
+        return 1
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -739,6 +798,11 @@ def cmd_set_status(args: argparse.Namespace) -> int:
 
     old_status = task.status
     task.status = args.status
+    if args.status == "in_progress":
+        if args.execution_mode:
+            task.execution_mode = args.execution_mode
+        else:
+            task.execution_mode = "manual"
 
     if args.status in ("completed", "failed", "dropped"):
         task.completed_at = datetime.now(UTC)

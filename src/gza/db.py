@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "KNOWN_FAILURE_REASONS",
+    "KNOWN_EXECUTION_MODES",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
     "Task",
@@ -46,6 +47,13 @@ KNOWN_FAILURE_REASONS = {
     "WORKER_DIED",
     "KILLED",
     "UNKNOWN",
+}
+
+KNOWN_EXECUTION_MODES = {
+    "worker_background",
+    "worker_foreground",
+    "manual",
+    "skill_inline",
 }
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
@@ -206,6 +214,7 @@ class Task:
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
+    execution_mode: str | None = None  # worker_background, worker_foreground, manual, skill_inline
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -269,8 +278,13 @@ MIGRATION_V29_TO_V30 = """
 ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT;
 """
 
+# Migration from v30 to v31: persist execution provenance mode
+MIGRATION_V30_TO_V31 = """
+ALTER TABLE tasks ADD COLUMN execution_mode TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -301,6 +315,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
     """Validate required schema artifacts for selected automatic migration targets."""
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
+        31: ("tasks", "execution_mode"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is None:
@@ -370,7 +385,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_lines_added INTEGER,
     diff_lines_removed INTEGER,
     review_cleared_at TEXT,
-    log_schema_version INTEGER DEFAULT 1
+    log_schema_version INTEGER DEFAULT 1,
+    execution_mode TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -698,6 +714,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (28, MIGRATION_V27_TO_V28),
     (29, MIGRATION_V28_TO_V29),
     (30, MIGRATION_V29_TO_V30),
+    (31, MIGRATION_V30_TO_V31),
 ]
 
 
@@ -839,6 +856,7 @@ class SqliteTaskStore:
                 if "log_schema_version" in keys and row["log_schema_version"] is not None
                 else 1
             ),
+            execution_mode=row["execution_mode"] if "execution_mode" in keys else None,
         )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
@@ -1058,7 +1076,8 @@ class SqliteTaskStore:
                     diff_lines_added = ?,
                     diff_lines_removed = ?,
                     review_cleared_at = ?,
-                    log_schema_version = ?
+                    log_schema_version = ?,
+                    execution_mode = ?
                 WHERE id = ?
                 """,
                 (
@@ -1105,6 +1124,7 @@ class SqliteTaskStore:
                     task.diff_lines_removed,
                     task.review_cleared_at.isoformat() if task.review_cleared_at else None,
                     task.log_schema_version,
+                    task.execution_mode,
                     task.id,
                 ),
             )
@@ -1498,6 +1518,16 @@ class SqliteTaskStore:
             conn.execute(
                 "UPDATE tasks SET log_schema_version = ? WHERE id = ?",
                 (version, task_id),
+            )
+
+    def set_execution_mode(self, task_id: str, mode: str | None) -> None:
+        """Set persisted execution provenance mode for a task/run."""
+        if mode is not None and mode not in KNOWN_EXECUTION_MODES:
+            raise ValueError(f"Unknown execution mode: {mode}")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET execution_mode = ? WHERE id = ?",
+                (mode, task_id),
             )
 
     # === Run step/substep persistence ===
@@ -2473,6 +2503,7 @@ def _task_to_dict(task: "Task") -> dict:
         "diff_lines_removed": task.diff_lines_removed,
         "review_cleared_at": task.review_cleared_at.isoformat() if task.review_cleared_at else None,
         "log_schema_version": task.log_schema_version,
+        "execution_mode": task.execution_mode,
     }
 
 
