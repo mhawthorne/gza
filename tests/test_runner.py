@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 import stat
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -1025,7 +1026,9 @@ class TestWorktreeDbSnapshotIntegration:
 
     def test_run_code_task_uses_readonly_frozen_snapshot(self, tmp_path: Path):
         """Code-task path should expose readonly worktree snapshot and keep it frozen."""
-        db_path = tmp_path / "test.db"
+        uv_project = Path(__file__).resolve().parents[1]
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement snapshot feature", task_type="implement")
         task.slug = "20260414-implement-snapshot-feature"
@@ -1036,6 +1039,7 @@ class TestWorktreeDbSnapshotIntegration:
         host_conn.execute("INSERT INTO snapshot_probe (value) VALUES ('before')")
         host_conn.commit()
         host_conn.close()
+        (tmp_path / "gza.yaml").write_text("project_name: gza\n")
 
         config = self._make_code_config(tmp_path, db_path)
         observed: dict[str, str | int | None] = {
@@ -1044,7 +1048,17 @@ class TestWorktreeDbSnapshotIntegration:
             "snapshot_probe_before": None,
             "snapshot_probe_after_host_mutation": None,
             "write_error": None,
+            "show_worktree_rc": None,
+            "show_worktree_stdout": None,
+            "show_worktree_stderr": None,
+            "show_host_rc": None,
+            "show_host_stdout": None,
+            "show_host_stderr": None,
+            "add_worktree_rc": None,
+            "add_worktree_stdout": None,
+            "add_worktree_stderr": None,
         }
+        task_count_before = len(store.get_all())
 
         def provider_run(_cfg, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             snapshot_path = work_dir / ".gza" / "gza.db"
@@ -1074,6 +1088,37 @@ class TestWorktreeDbSnapshotIntegration:
                 observed["write_error"] = str(exc).lower()
             assert observed["write_error"] is not None
             snapshot_conn.close()
+            (work_dir / "gza.yaml").write_text("project_name: gza\n")
+
+            show_worktree = subprocess.run(
+                ["uv", "run", "--project", str(uv_project), "gza", "show", task.id],
+                capture_output=True,
+                text=True,
+                cwd=work_dir,
+            )
+            observed["show_worktree_rc"] = show_worktree.returncode
+            observed["show_worktree_stdout"] = show_worktree.stdout
+            observed["show_worktree_stderr"] = show_worktree.stderr
+
+            show_host = subprocess.run(
+                ["uv", "run", "--project", str(uv_project), "gza", "show", task.id],
+                capture_output=True,
+                text=True,
+                cwd=tmp_path,
+            )
+            observed["show_host_rc"] = show_host.returncode
+            observed["show_host_stdout"] = show_host.stdout
+            observed["show_host_stderr"] = show_host.stderr
+
+            add_worktree = subprocess.run(
+                ["uv", "run", "--project", str(uv_project), "gza", "add", "write attempt from worktree snapshot"],
+                capture_output=True,
+                text=True,
+                cwd=work_dir,
+            )
+            observed["add_worktree_rc"] = add_worktree.returncode
+            observed["add_worktree_stdout"] = add_worktree.stdout
+            observed["add_worktree_stderr"] = add_worktree.stderr
 
             summary_dir = work_dir / ".gza" / "summaries"
             summary_dir.mkdir(parents=True, exist_ok=True)
@@ -1126,16 +1171,39 @@ class TestWorktreeDbSnapshotIntegration:
         assert observed["snapshot_probe_before"] == "before"
         assert observed["snapshot_probe_after_host_mutation"] == "before"
         assert observed["write_error"] is not None and "readonly" in str(observed["write_error"])
+        assert observed["show_worktree_rc"] == 0, (
+            f"worktree show failed\nstdout:\n{observed['show_worktree_stdout']}\n"
+            f"stderr:\n{observed['show_worktree_stderr']}"
+        )
+        assert observed["show_host_rc"] == 0, (
+            f"host show failed\nstdout:\n{observed['show_host_stdout']}\n"
+            f"stderr:\n{observed['show_host_stderr']}"
+        )
+        assert observed["show_worktree_stdout"] is not None
+        assert observed["show_host_stdout"] is not None
+        assert f"Task {task.id}" in str(observed["show_worktree_stdout"])
+        assert "Implement snapshot feature" in str(observed["show_worktree_stdout"])
+        assert f"Task {task.id}" in str(observed["show_host_stdout"])
+        assert "Implement snapshot feature" in str(observed["show_host_stdout"])
+        assert observed["add_worktree_rc"] is not None
+        assert int(observed["add_worktree_rc"]) != 0
+        add_output = (
+            f"{observed['add_worktree_stdout'] or ''}\n{observed['add_worktree_stderr'] or ''}"
+        ).lower()
+        assert "readonly" in add_output or "read-only" in add_output
 
         host_check_conn = sqlite3.connect(str(db_path))
         host_value = host_check_conn.execute("SELECT value FROM snapshot_probe").fetchone()
         sandbox_table = host_check_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='sandbox_write_attempt'"
         ).fetchone()
+        task_count_after = host_check_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
         host_check_conn.close()
         assert host_value is not None
         assert host_value[0] == "after"
         assert sandbox_table is None
+        assert task_count_after is not None
+        assert task_count_after[0] == task_count_before
 
     def test_run_non_code_task_creates_readonly_snapshot(self, tmp_path: Path):
         """Non-code task path should expose readonly worktree DB snapshot."""
