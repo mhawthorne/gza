@@ -803,6 +803,90 @@ class TestHistoryCommand:
         assert f"→ retried as {retry_2.id} ✓" in result.stdout
         assert f"→ retried as {review.id}" not in result.stdout
 
+    def test_history_retry_annotation_resolves_latest_descendant_across_sibling_branches(self, tmp_path: Path):
+        """Retry annotation resolves from the full same-type descendant tree, not one direct-child branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        older_branch = store.add("Older retry branch", task_type="implement", based_on=original.id)
+        older_branch.status = "failed"
+        older_branch.failure_reason = "MAX_TURNS"
+        older_branch.completed_at = datetime.now(UTC)
+        store.update(older_branch)
+        assert older_branch.id is not None
+
+        newer_direct_child = store.add("Newest direct child", task_type="implement", based_on=original.id)
+        newer_direct_child.status = "pending"
+        store.update(newer_direct_child)
+        assert newer_direct_child.id is not None
+
+        final_attempt = store.add("Final success on older branch", task_type="implement", based_on=older_branch.id)
+        final_attempt.status = "completed"
+        final_attempt.completed_at = datetime.now(UTC)
+        store.update(final_attempt)
+        assert final_attempt.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {final_attempt.id} ✓" in result.stdout
+        assert f"→ retried as {newer_direct_child.id}" not in result.stdout
+
+    def test_history_retry_annotation_keeps_resume_label_in_mixed_sibling_branches(self, tmp_path: Path):
+        """Mixed retry/resume siblings should keep action label from the resolved descendant path."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.branch = "20260415-impl-branching"
+        original.session_id = "session-branching"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        resume_child = store.add("Resume sibling", task_type="implement", based_on=original.id)
+        resume_child.status = "failed"
+        resume_child.failure_reason = "MAX_TURNS"
+        resume_child.branch = "20260415-impl-branching"
+        resume_child.session_id = "session-branching"
+        resume_child.completed_at = datetime.now(UTC)
+        store.update(resume_child)
+        assert resume_child.id is not None
+
+        retry_child = store.add("Retry sibling", task_type="implement", based_on=original.id)
+        retry_child.status = "pending"
+        retry_child.branch = "20260415-impl-other-branch"
+        retry_child.session_id = "session-other"
+        store.update(retry_child)
+        assert retry_child.id is not None
+
+        resumed_terminal = store.add(
+            "Terminal resumed attempt",
+            task_type="implement",
+            based_on=resume_child.id,
+        )
+        resumed_terminal.status = "completed"
+        resumed_terminal.completed_at = datetime.now(UTC)
+        resumed_terminal.branch = "20260415-impl-branching"
+        resumed_terminal.session_id = "session-branching"
+        store.update(resumed_terminal)
+        assert resumed_terminal.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ resumed as {resumed_terminal.id} ✓" in result.stdout
+        assert f"→ retried as {resumed_terminal.id}" not in result.stdout
+
     def test_history_shows_parent_task_id(self, tmp_path: Path):
         """History shows parent task ID when based_on or depends_on is set."""
 

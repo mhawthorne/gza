@@ -92,13 +92,14 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 $ gza history --status failed
 Recent failed tasks:
 
-  gza-5 20260108-add-user-auth
-     failed - max turns exceeded (50/50)
-     10m ago
+failed    gza-5 (2026-01-08 14:12) add user auth
+    reason: MAX_TURNS
+    → resumed as gza-9 ✓
+    [implement] ← gza-4
 
-  gza-3 20260107-refactor-api
-     failed - timeout after 10m
-     2h ago
+failed    gza-3 (2026-01-07 09:44) refactor api
+    reason: MAX_STEPS
+    [implement]
 ```
 
 ## Tips for avoiding failures

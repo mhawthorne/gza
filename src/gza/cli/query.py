@@ -257,32 +257,34 @@ def cmd_history(args: argparse.Namespace) -> int:
         if task.id is None:
             return None
 
-        current = task
-        root_action = "retried"
         visited: set[str] = {task.id}
+        descendants: list[tuple[str, DbTask]] = []
+        frontier: list[tuple[DbTask, str]] = []
 
-        while current.id is not None:
-            children = store.get_based_on_children_by_type(current.id, current.task_type)
-            if not children:
-                break
-            # Retries/resumes form a chain in normal operation; prefer newest child if multiple exist.
-            next_task = max(
-                children,
-                key=lambda t: (
-                    t.created_at or datetime.min,
-                    _task_id_numeric_key(t.id if isinstance(t.id, str) else None),
-                ),
-            )
-            if next_task.id is None or next_task.id in visited:
-                break
-            if current.id == task.id and _is_resume_attempt(current, next_task):
-                root_action = "resumed"
-            visited.add(next_task.id)
-            current = next_task
+        for child in store.get_based_on_children_by_type(task.id, task.task_type):
+            if child.id is None:
+                continue
+            action = "resumed" if _is_resume_attempt(task, child) else "retried"
+            frontier.append((child, action))
 
-        if current.id == task.id:
+        while frontier:
+            current, root_action = frontier.pop()
+            if current.id is None or current.id in visited:
+                continue
+            visited.add(current.id)
+            descendants.append((root_action, current))
+            for child in store.get_based_on_children_by_type(current.id, task.task_type):
+                frontier.append((child, root_action))
+
+        if not descendants:
             return None
-        return (root_action, current)
+        return max(
+            descendants,
+            key=lambda item: (
+                item[1].created_at or datetime.min,
+                _task_id_numeric_key(item[1].id if isinstance(item[1].id, str) else None),
+            ),
+        )
 
     def _retry_outcome_annotation(attempt: DbTask) -> tuple[str, str] | None:
         """Return (label, color) for retry/resume final-attempt outcome annotation."""
