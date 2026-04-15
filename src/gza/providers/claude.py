@@ -155,6 +155,10 @@ class ClaudeProvider(Provider):
         return "Claude"
 
     @property
+    def supports_interactive_foreground(self) -> bool:
+        return True
+
+    @property
     def credential_setup_hint(self) -> str:
         return "Set ANTHROPIC_API_KEY in ~/.gza/.env or run 'claude login' to authenticate via OAuth"
 
@@ -263,11 +267,63 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        interactive: bool = False,
     ) -> RunResult:
         """Run Claude to execute a task."""
+        if interactive:
+            return self._run_interactive(config, prompt, log_file, work_dir, resume_session_id=resume_session_id)
         if config.use_docker:
             return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
         return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
+
+    def _run_interactive(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+    ) -> RunResult:
+        """Run Claude in interactive foreground mode."""
+        import shlex
+
+        if config.use_docker:
+            print("Note: Interactive inline mode is not available in Docker; falling back to observe-only stream mode.")
+            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id)
+
+        cmd = ["claude"]
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+        if config.model:
+            cmd.extend(["--model", config.model])
+        cmd.extend(config.claude.args)
+        cmd.extend(["--max-turns", str(config.max_steps), prompt])
+
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        if shutil.which("script"):
+            script_cmd = [
+                "script",
+                "-q",
+                "-e",
+                "-f",
+                str(log_file),
+                "-c",
+                shlex.join(cmd),
+            ]
+            started_at = time.time()
+            result = subprocess.run(script_cmd, cwd=work_dir)
+            return RunResult(
+                exit_code=result.returncode,
+                duration_seconds=round(time.time() - started_at, 1),
+            )
+
+        print("Warning: 'script' command not found; interactive terminal output will not be captured in task log.")
+        started_at = time.time()
+        result = subprocess.run(cmd, cwd=work_dir)
+        return RunResult(
+            exit_code=result.returncode,
+            duration_seconds=round(time.time() - started_at, 1),
+        )
 
     @staticmethod
     def _build_claude_args(config: Config, resume_session_id: str | None = None) -> list[str]:

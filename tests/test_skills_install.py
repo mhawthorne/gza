@@ -328,33 +328,27 @@ class TestSkillContentValidation:
         assert "supports `42` or `#42`" not in content
         assert "strip the leading `#`" not in content
 
-    def test_gza_task_run_includes_runner_like_log_and_provenance_guidance(self):
-        """gza-task-run should guide explicit log_file persistence and synthetic provenance writes."""
+    def test_gza_task_run_routes_to_first_class_run_inline_command(self):
+        """gza-task-run should delegate execution to `gza run-inline` instead of synthetic lifecycle steps."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
         content = skill_file.read_text()
 
-        required_snippets = [
-            "task.log_file",
-            "write_log_entry",
-            "write_worker_start_event",
-            "Execution mode: inline skill gza-task-run",
-            "Outcome: completed (inline skill)",
-            "Outcome: failed (inline skill)",
-        ]
-        for snippet in required_snippets:
-            assert snippet in content
+        assert "uv run gza run-inline <TASK_ID>" in content
+        assert "uv run gza set-status" not in content
+        assert "uv run gza mark-completed" not in content
+        assert "write_log_entry" not in content
 
-    def test_gza_task_run_uses_explicit_project_dir_for_config_load_examples(self):
-        """gza-task-run examples should use Config.load with an explicit project_dir argument."""
+    def test_gza_task_run_mentions_runner_owned_lifecycle(self):
+        """gza-task-run should explicitly state that runner owns lifecycle responsibilities."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "Config.load()" not in content
-        assert "Config.load(Path.cwd())" in content
+        assert "runner-managed task execution" in content
+        assert "lifecycle ownership stays in the runner" in content
 
     @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
     def test_manual_review_improve_skills_use_explicit_project_dir_for_all_config_loads(
@@ -614,53 +608,16 @@ class TestSkillContentValidation:
 
         assert "uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline" in content
 
-    def test_gza_task_resume_marks_in_progress_with_skill_inline_execution_mode(self):
-        """gza-task-resume should stamp in-progress inline runs with skill_inline provenance."""
+    def test_gza_task_resume_routes_to_resume_or_run_inline_resume(self):
+        """gza-task-resume should route users to first-class CLI resume flows."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-resume" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline" in content
-
-    def test_gza_task_run_scopes_branch_and_commit_guidance_to_actual_code_task_behavior(self):
-        """gza-task-run should distinguish fresh-branch vs same-branch task types and avoid generic rebase commits."""
-        from gza.skills_utils import get_skills_source_path
-
-        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
-        content = skill_file.read_text()
-
-        assert "For **task/implement** tasks only:" in content
-        assert "For **improve** tasks only:" in content
-        assert "For **rebase** tasks only:" in content
-        assert "reuse the ancestor implementation branch" in content.lower()
-        assert "Do **not** add a generic post-task commit step" in content
-        assert "For **task/implement/improve/rebase** tasks, after completing the task, stage and commit all code changes:" not in content
-        assert "For **task/implement/improve/rebase** tasks only:" not in content
-        assert "git-verified types (`task`/`implement`/`improve`/`rebase`)" not in content
-        assert "For **explore/plan/review** tasks:" in content
-        assert "Do **not** create a new task branch." in content
-        assert "For **explore/plan/review** tasks, do not create a task commit" in content
-        assert "Branch setup scope" in content
-        assert "Commit scope" in content
-        assert "Create a new branch for the task work, just like background execution would." not in content
-        assert "After completing the task, stage and commit all changes:" not in content
-
-    def test_gza_task_run_logs_branch_only_after_branch_resolution_setup(self):
-        """gza-task-run should write the synthetic branch log after resolving the execution branch."""
-        from gza.skills_utils import get_skills_source_path
-
-        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
-        content = skill_file.read_text()
-
-        pre_setup_log = "write_log_entry(log_file, {'type': 'gza', 'subtype': 'branch', 'message': f'Branch: {task.branch or \"<none>\"}', 'branch': task.branch})"
-        setup_heading = "### Step 5: Type-specific execution setup"
-        resolved_branch_log = "write_log_entry(log_file, {'type': 'gza', 'subtype': 'branch', 'message': f'Branch: <BRANCH_NAME>', 'branch': '<BRANCH_NAME>'})"
-
-        assert pre_setup_log not in content
-        assert setup_heading in content
-        assert resolved_branch_log in content
-        assert content.find(resolved_branch_log) > content.find(setup_heading)
+        assert "uv run gza resume <TASK_ID>" in content
+        assert "uv run gza run-inline <TASK_ID> --resume" in content
+        assert "gza set-status" not in content
 
     @pytest.mark.parametrize(
         "skill_name",

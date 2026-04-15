@@ -35,7 +35,7 @@ from ..review_tasks import (
     create_review_task,
 )
 from ..review_verdict import ReviewFinding, get_review_verdict as _get_review_verdict, parse_review_verdict
-from ..runner import get_effective_config_for_task, run
+from ..runner import RunInvocationContext, get_effective_config_for_task, run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
@@ -278,6 +278,7 @@ def _run_foreground(
     resume: bool = False,
     open_after: bool = False,
     force: bool = False,
+    invocation: RunInvocationContext | None = None,
 ) -> int:
     """Run a task in the foreground with worker registration.
 
@@ -290,6 +291,7 @@ def _run_foreground(
         resume: Whether this is a resume run
         open_after: Whether to open the output after completion
         force: Skip runner precondition checks
+        invocation: Optional runner invocation context.
     """
     registry = WorkerRegistry(config.workers_path)
     worker_id = registry.generate_worker_id()
@@ -327,6 +329,7 @@ def _run_foreground(
             resume=resume,
             open_after=open_after,
             skip_precondition_check=force,
+            invocation=invocation,
         )
         status = "completed" if exit_code == 0 else "failed"
         registry.mark_completed(worker_id, exit_code=exit_code, status=status)
