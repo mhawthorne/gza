@@ -25,6 +25,7 @@ from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     DuplicateReviewError,
+    _allow_pr_required_retry,
     _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
@@ -92,7 +93,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(f"Error: Task {task_id} not found")
                 return 1
 
-            if task.status != "pending":
+            allow_pr_retry = _allow_pr_required_retry(args, task)
+            if task.status != "pending" and not allow_pr_retry:
                 print(f"Error: Task {task_id} is not pending (status: {task.status})")
                 return 1
 
@@ -131,6 +133,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     start_time = time.time()
 
     try:
+        run_kwargs: dict[str, Any] = {
+            "skip_precondition_check": getattr(args, "force", False),
+        }
+        if getattr(args, "create_pr", False):
+            run_kwargs["create_pr"] = True
+
         # Run the task(s)
         if hasattr(args, 'task_ids') and args.task_ids:
             # Run the specific tasks
@@ -142,11 +150,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     # Update worker registry to track the current task
                     worker.task_id = task_id
                     registry.update(worker)
-                result = run(
-                    config,
-                    task_id=task_id,
-                    skip_precondition_check=getattr(args, "force", False),
-                )
+                result = run(config, task_id=task_id, **run_kwargs)
                 if result != 0:
                     if tasks_completed == 0:
                         # First task failed
@@ -175,7 +179,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         for i in range(count):
             if tasks_completed > 0:
                 print(task_separator)
-            result = run(config, skip_precondition_check=getattr(args, "force", False))
+            result = run(config, **run_kwargs)
 
             # Any non-zero exit means the run failed.
             if result != 0:

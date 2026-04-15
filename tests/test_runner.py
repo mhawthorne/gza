@@ -10,7 +10,8 @@ import pytest
 
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
-from gza.git import Git
+from gza.git import Git, GitError
+from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
 from gza.runner import (
     BACKUP_DIR,
@@ -24,6 +25,7 @@ from gza.runner import (
     _compute_slug_override,
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
+    _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
     _find_task_of_type_in_chain,
     _resolve_code_task_branch_name,
@@ -4522,6 +4524,338 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "completed"
         assert summary_path.exists()
+
+    def test_ensure_work_pr_creates_pr_for_committed_branch(self, tmp_path: Path):
+        """`work --pr` should create a PR when branch has commits and no PR exists."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/work-pr"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 2
+        git.needs_push.return_value = True
+        git.is_merged.return_value = False
+
+        ensure_result = Mock(ok=True, status="created", pr_url="https://github.com/o/r/pull/99")
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr:
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+        ensure_pr.assert_called_once()
+        git.needs_push.assert_not_called()
+
+    def test_ensure_work_pr_skips_when_branch_has_no_commits(self, tmp_path: Path):
+        """`work --pr` should skip PR creation when branch has no commits."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/no-commits"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 0
+
+        with patch("gza.runner.GitHub") as gh_cls:
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+        gh_cls.assert_not_called()
+
+    def test_ensure_work_pr_reuses_existing_pr_and_caches_number(self, tmp_path: Path):
+        """`work --pr` should reuse an existing PR and cache its number."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/existing-pr"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+
+        ensure_result = Mock(ok=True, status="existing", pr_url="https://github.com/o/r/pull/55")
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+
+    def test_ensure_work_pr_reuses_revalidated_cached_pr(self, tmp_path: Path):
+        """`work --pr` should reuse cached PRs only after remote revalidation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/cached-pr"
+        task.pr_number = 81
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+
+        ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/81", pr_number=81)
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+
+    def test_ensure_work_pr_revalidates_cached_pr_before_reuse(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Cached PR reuse should reflect the revalidated PR URL and avoid fake push output."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/cached-pr"
+        task.pr_number = 81
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+
+        ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/81", pr_number=81)
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr:
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+        output = capsys.readouterr().out
+        assert "Pushing branch" not in output
+        assert "Reusing cached PR #81" in output
+        ensure_pr.assert_called_once()
+
+    def test_complete_code_task_creates_pr_before_auto_review(self, tmp_path: Path):
+        """When create_review is enabled, PR creation should run before auto-review execution."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement with review", task_type="implement", create_review=True)
+        task.slug = "20260414-impl-review-order"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        call_order: list[str] = []
+
+        def _mark_pr(*_args, **_kwargs):
+            call_order.append("pr")
+            return True
+
+        def _run_review(*_args, **_kwargs):
+            call_order.append("review")
+            return 7
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", side_effect=_mark_pr),
+            patch("gza.runner._create_and_run_review_task", side_effect=_run_review),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/review-order",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                create_pr=True,
+            )
+
+        assert rc == 7
+        assert call_order == ["pr", "review"]
+
+    @pytest.mark.parametrize(
+        ("failure_mode", "ensure_result"),
+        [
+            ("gh_unavailable", (False, "gh_unavailable", None)),
+            ("push_fails", (False, "push_failed", "push failed")),
+            ("create_pr_fails", (False, "create_failed", "create failed")),
+        ],
+    )
+    def test_complete_code_task_work_pr_failure_aborts_before_auto_review(
+        self,
+        tmp_path: Path,
+        failure_mode: str,
+        ensure_result: tuple[bool, str, str | None],
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Explicit `work --pr` failures should fail task state and skip success output/review."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt=f"Implement with review ({failure_mode})", task_type="implement", create_review=True)
+        task.slug = f"20260414-impl-review-{failure_mode}"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        pre_status = set()
+        post_status = {("M", "src/foo.py")}
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = post_status
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+        worktree_git.count_commits_ahead.return_value = 1
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        ok, status, error = ensure_result
+        ensure_mock_result = Mock()
+        ensure_mock_result.ok = ok
+        ensure_mock_result.status = status
+        ensure_mock_result.error = error
+        ensure_mock_result.pr_url = None
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.ensure_task_pr", return_value=ensure_mock_result),
+            patch("gza.runner.task_footer") as footer,
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/review-order",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=pre_status,
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                create_pr=True,
+            )
+
+        assert rc == 1
+        footer.assert_not_called()
+        run_review.assert_not_called()
+        output = capsys.readouterr().out
+        assert "aborting before auto-review" in output
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PR_REQUIRED"
+        assert refreshed.output_content == "summary"
+
+    def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
+        """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement with review", task_type="implement", create_review=True)
+        task.slug = "20260414-pr-required-retry"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-pr-required"
+        task.log_file = "logs/retry.log"
+        task.output_content = "summary"
+        task.has_commits = True
+        store.update(task)
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
+            patch("gza.runner.task_footer"),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 0
+        run_review.assert_called_once()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+
+    def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
+        """PR retry completion for rebases should invalidate review state and force-push."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        parent.merge_status = "merged"
+        store.update(parent)
+        store.clear_review_state(parent.id)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        task.slug = "20260414-retry-rebase-pr-required"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-rebase-pr-required"
+        task.log_file = "logs/retry-rebase.log"
+        task.output_content = "summary"
+        task.has_commits = True
+        store.update(task)
+
+        git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 0
+        git.push_force_with_lease.assert_called_once_with(task.branch)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+
+        updated_parent = store.get(parent.id)
+        assert updated_parent is not None
+        assert updated_parent.review_cleared_at is None
+        assert updated_parent.merge_status == "unmerged"
 
     def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
         """Rebase completion should force-push from the host runner."""

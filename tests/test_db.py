@@ -1944,6 +1944,7 @@ class TestFailureReasonTracking:
 
         assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
+        assert "PR_REQUIRED" in KNOWN_FAILURE_REASONS
         assert "PREREQUISITE_UNMERGED" in KNOWN_FAILURE_REASONS
         assert "TEST_FAILURE" in KNOWN_FAILURE_REASONS
         assert "UNKNOWN" in KNOWN_FAILURE_REASONS

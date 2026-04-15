@@ -316,7 +316,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
                 print(f"Error: Task {explicit_task_id} has no session ID (cannot resume)")
                 return 1
         else:
-            if task.status != "pending":
+            allow_pr_retry = _allow_pr_required_retry(args, task)
+            if task.status != "pending" and not allow_pr_retry:
                 print(f"Error: Task {explicit_task_id} is not pending (status: {task.status})")
                 return 1
 
@@ -357,6 +358,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         inner_cmd.extend(["--max-turns", str(args.max_turns)])
     if getattr(args, "force", False):
         inner_cmd.append("--force")
+    if getattr(args, "create_pr", False):
+        inner_cmd.append("--pr")
 
     # Add project directory
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
@@ -565,22 +568,17 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             )
             startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
+        run_kwargs: dict[str, Any] = {
+            "resume": resume,
+            "skip_precondition_check": getattr(args, "force", False),
+            "on_task_claimed": _on_task_claimed,
+        }
+        if getattr(args, "create_pr", False):
+            run_kwargs["create_pr"] = True
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
-            exit_code = run(
-                config,
-                task_id=args.task_ids[0],
-                resume=resume,
-                skip_precondition_check=getattr(args, "force", False),
-                on_task_claimed=_on_task_claimed,
-            )
-        else:
-            exit_code = run(
-                config,
-                resume=resume,
-                skip_precondition_check=getattr(args, "force", False),
-                on_task_claimed=_on_task_claimed,
-            )
+            run_kwargs["task_id"] = args.task_ids[0]
+        exit_code = run(config, **run_kwargs)
 
         # Update worker status on completion
         if worker_id:
@@ -817,6 +815,15 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         print(f"\n=== Attempted to spawn {count} background worker(s) ===")
 
     return 0
+
+
+def _allow_pr_required_retry(args: argparse.Namespace, task: DbTask) -> bool:
+    """Return whether explicit `work --pr` may retry a failed PR_REQUIRED task."""
+    return bool(
+        getattr(args, "create_pr", False)
+        and task.status == "failed"
+        and task.failure_reason == "PR_REQUIRED"
+    )
 
 
 def format_stats(task: DbTask) -> str:

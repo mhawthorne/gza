@@ -111,6 +111,13 @@ class GitHub:
                 return None
         return None
 
+    def get_pr_url(self, pr_ref: str | int) -> str | None:
+        """Get PR URL for a PR number/ref, or None if no live PR exists."""
+        result = self._run("pr", "view", str(pr_ref), "--json", "url", "-q", ".url", check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return None
+
     def add_pr_comment(self, pr_number: int, body: str) -> None:
         """Add a comment to a PR.
 

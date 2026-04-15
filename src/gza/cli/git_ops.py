@@ -27,12 +27,12 @@ from ..console import (
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
-from ..github import GitHub, GitHubError
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
     is_worker_consuming_advance_action,
 )
+from ..pr_ops import ensure_task_pr
 from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task, load_dotenv
 from ._common import (
@@ -1039,7 +1039,6 @@ def cmd_pr(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
-    gh = GitHub()
 
     # Get the task first (validate task exists and state before checking gh)
     task_id = resolve_id(config, args.task_id)
@@ -1066,34 +1065,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print(f"Error: Task {task.id} is already marked as merged")
         return 1
 
-    # Check gh CLI is available (after task validation so tests can run without gh)
-    if not gh.is_available():
-        print("Error: GitHub CLI (gh) is not installed or not authenticated")
-        print("Install: https://cli.github.com/")
-        print("Auth: gh auth login")
-        return 1
-
     default_branch = git.default_branch()
-
-    # Check branch is not actually merged into default branch
-    if git.is_merged(task.branch, default_branch):
-        print(f"Error: Branch '{task.branch}' is already merged into {default_branch}")
-        return 1
-
-    # Check if PR already exists
-    existing_pr = gh.pr_exists(task.branch)
-    if existing_pr:
-        print(f"PR already exists: {existing_pr}")
-        return 0
-
-    # Ensure branch is pushed to remote (push if remote doesn't exist or is behind)
-    try:
-        if git.needs_push(task.branch):
-            print(f"Pushing branch '{task.branch}' to origin...")
-            git.push_branch(task.branch)
-    except GitError as e:
-        print(f"Error pushing branch: {e}")
-        return 1
 
     # Get commit log and diff stat for context
     commit_log = git.get_log(f"{default_branch}..{task.branch}")
@@ -1107,26 +1079,40 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print("Generating PR description...")
         title, body = _generate_pr_content(task, commit_log, diff_stat, config, store)
 
-    # Create the PR
-    try:
-        pr = gh.create_pr(
-            head=task.branch,
-            base=default_branch,
-            title=title,
-            body=body,
-            draft=args.draft,
-        )
-        print(f"✓ Created PR: {pr.url}")
-
-        # Cache PR number in task
-        if pr.number:
-            task.pr_number = pr.number
-            store.update(task)
-
+    result = ensure_task_pr(
+        task,
+        store,
+        git,
+        title=title,
+        body=body,
+        draft=args.draft,
+        merged_behavior="error",
+    )
+    if result.ok and result.status == "created":
+        print(f"✓ Created PR: {result.pr_url}")
         return 0
-    except GitHubError as e:
-        print(f"Error creating PR:\n{e}")
+    if result.ok and result.status == "existing":
+        print(f"PR already exists: {result.pr_url}")
+        return 0
+    if result.ok and result.status == "cached" and task.pr_number:
+        print(f"PR already exists: #{task.pr_number}")
+        return 0
+    if result.status == "gh_unavailable":
+        print("Error: GitHub CLI (gh) is not installed or not authenticated")
+        print("Install: https://cli.github.com/")
+        print("Auth: gh auth login")
         return 1
+    if result.status == "push_failed":
+        print(f"Error pushing branch: {result.error}")
+        return 1
+    if result.status == "merged":
+        print(f"Error: Branch '{task.branch}' is already merged into {default_branch}")
+        return 1
+    if result.status == "create_failed":
+        print(f"Error creating PR:\n{result.error}")
+        return 1
+    print("Error creating PR")
+    return 1
 
 
 # Compatibility shim: downstream imports/tests still reference this legacy name.
