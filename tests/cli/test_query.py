@@ -3545,8 +3545,8 @@ class TestUnmergedReviewStatus:
         assert "[improve]" in result.stdout
         assert "review stale" in result.stdout
 
-    def test_unmerged_lineage_filters_downstream_implement_and_shows_annotations(self, tmp_path: Path):
-        """Unmerged lineage omits downstream implement nodes and annotates each rendered node."""
+    def test_unmerged_lineage_shows_full_canonical_tree_and_annotations(self, tmp_path: Path):
+        """Unmerged lineage uses the canonical tree and keeps node annotations."""
         store, impl, git = setup_unmerged_env(tmp_path)
 
         review = store.add("Review", task_type="review")
@@ -3579,11 +3579,122 @@ class TestUnmergedReviewStatus:
         assert f"{impl.id}" in result.stdout
         assert f"{review.id}" in result.stdout
         assert f"{improve.id}" in result.stdout
-        assert f"{downstream_impl.id}" not in result.stdout
+        assert f"{downstream_impl.id}" in result.stdout
         assert "| completed |" in result.stdout
         assert "changes_requested" in result.stdout
         # The "← latest" annotation may wrap across lines at narrow terminal widths
         assert "latest" in " ".join(result.stdout.split())
+
+    def test_unmerged_uses_latest_branch_implementation_for_summary_and_review(self, tmp_path: Path):
+        """Unmerged summarizes the latest implementation on a shared branch, not an older retry."""
+        store, root_impl, git = setup_unmerged_env(tmp_path)
+
+        retry_impl = store.add("Retry implementation", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/test"
+        retry_impl.same_branch = True
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        store.update(retry_impl)
+
+        review = store.add("Review retry", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        review.depends_on = retry_impl.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        improve = store.add("Improve retry", task_type="improve")
+        improve.status = "failed"
+        improve.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        improve.based_on = retry_impl.id
+        improve.depends_on = review.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        sibling_impl = store.add("Sibling retry", task_type="implement")
+        sibling_impl.status = "completed"
+        sibling_impl.completed_at = datetime(2026, 2, 12, 14, 0, tzinfo=UTC)
+        sibling_impl.based_on = root_impl.id
+        sibling_impl.branch = "feature/test"
+        sibling_impl.same_branch = True
+        sibling_impl.has_commits = True
+        sibling_impl.merge_status = "unmerged"
+        store.update(sibling_impl)
+
+        sibling_review = store.add("Review sibling retry", task_type="review")
+        sibling_review.status = "completed"
+        sibling_review.completed_at = datetime(2026, 2, 12, 15, 0, tzinfo=UTC)
+        sibling_review.depends_on = sibling_impl.id
+        sibling_review.output_content = "Verdict: APPROVED"
+        store.update(sibling_review)
+
+        unmerged_result = run_gza("unmerged", "--project", str(tmp_path))
+        assert unmerged_result.returncode == 0
+
+        unmerged_output = " ".join(unmerged_result.stdout.split())
+        assert f"⚡ {sibling_impl.id}" in unmerged_output
+        assert "review: reviewed [✓ approved]" in unmerged_output
+        assert root_impl.id in unmerged_output
+        assert retry_impl.id in unmerged_output
+        assert sibling_impl.id in unmerged_output
+        assert sibling_review.id in unmerged_output
+
+    def test_unmerged_lineage_matches_lineage_command_root_for_retry_chain(self, tmp_path: Path):
+        """Unmerged lineage keeps the same canonical root as `gza lineage` for retried implementations."""
+        store, root_impl, git = setup_unmerged_env(tmp_path)
+
+        retry_impl = store.add("Retry implementation", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/test"
+        retry_impl.same_branch = True
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        store.update(retry_impl)
+
+        review = store.add("Review retry", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        review.depends_on = retry_impl.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        improve = store.add("Improve retry", task_type="improve")
+        improve.status = "failed"
+        improve.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        improve.based_on = retry_impl.id
+        improve.depends_on = review.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        sibling_impl = store.add("Sibling retry", task_type="implement")
+        sibling_impl.status = "completed"
+        sibling_impl.completed_at = datetime(2026, 2, 12, 14, 0, tzinfo=UTC)
+        sibling_impl.based_on = root_impl.id
+        sibling_impl.branch = "feature/test"
+        sibling_impl.same_branch = True
+        store.update(sibling_impl)
+
+        lineage_result = run_gza("lineage", retry_impl.id, "--project", str(tmp_path))
+        assert lineage_result.returncode == 0
+
+        unmerged_result = run_gza("unmerged", "--project", str(tmp_path))
+        assert unmerged_result.returncode == 0
+
+        lineage_output = " ".join(lineage_result.stdout.split())
+        unmerged_output = " ".join(unmerged_result.stdout.split())
+        assert root_impl.id in lineage_output
+        assert root_impl.id in unmerged_output
+        assert retry_impl.id in lineage_output
+        assert retry_impl.id in unmerged_output
+        assert sibling_impl.id in lineage_output
+        assert sibling_impl.id in unmerged_output
 
     def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
         """The most recent review node is annotated with the latest marker."""
