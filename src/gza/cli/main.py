@@ -590,8 +590,8 @@ def main() -> int:
         "--last",
         type=int,
         metavar="N",
-        default=None,
-        help="Limit output to the N most recent implementation tasks",
+        default=20,
+        help="Limit output to the N most recent implementation tasks (default: 20)",
     )
     stats_iterations_parser.add_argument(
         "--hours",

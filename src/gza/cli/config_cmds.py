@@ -485,9 +485,11 @@ def _cmd_stats_iterations(
         reverse=True,
     )
 
-    rows: list[tuple[str, int, int, str, float]] = []
+    rows: list[tuple[str, str, int, int, str, float]] = []
     for impl in impl_tasks:
         assert impl.id is not None
+        if impl.status == "pending":
+            continue
         reviews = store.get_reviews_for_task(impl.id)
         improves = store.get_improve_tasks_by_root(impl.id)
 
@@ -508,6 +510,10 @@ def _cmd_stats_iterations(
         verdict: str = "NO_REVIEW"
         if latest_completed_review is not None:
             verdict = get_review_verdict(config, latest_completed_review) or "UNKNOWN"
+        elif impl.status == "failed":
+            verdict = "FAILED"
+        elif impl.status in ("in_progress", "queued"):
+            verdict = "IN_PROGRESS"
 
         total_cost = (
             _cost(impl)
@@ -515,9 +521,13 @@ def _cmd_stats_iterations(
             + sum(_cost(improve) for improve in improves)
         )
 
+        run_dt = _activity_dt(impl)
+        run_date = run_dt.strftime("%Y-%m-%d") if run_dt is not None else "-"
+
         rows.append(
             (
                 _task_label(impl),
+                run_date,
                 len(completed_reviews),
                 len(completed_improves),
                 verdict,
@@ -530,31 +540,42 @@ def _cmd_stats_iterations(
 
     print(f"\n{header_range}\n")
     task_col_width = 46
-    print(f"{'Task':<{task_col_width}} {'Reviews':>7}  {'Improves':>8}  {'Verdict':<14} {'Cost':>8}")
+    verdict_col_width = 17
+    print(
+        f"{'Task':<{task_col_width}} {'Date':<10}  "
+        f"{'Reviews':>7}  {'Improves':>8}  "
+        f"{'Verdict':<{verdict_col_width}} {'Cost':>8}"
+    )
     if rows:
-        for task_label, reviews_count, improves_count, verdict, task_cost in rows:
+        for task_label, run_date, reviews_count, improves_count, verdict, task_cost in rows:
             if len(task_label) > task_col_width:
                 task_label = f"{task_label[:task_col_width - 3]}..."
             print(
                 f"{task_label:<{task_col_width}} "
+                f"{run_date:<10}  "
                 f"{reviews_count:>7}  "
                 f"{improves_count:>8}  "
-                f"{verdict:<14} "
+                f"{verdict:<{verdict_col_width}} "
                 f"${task_cost:>7.2f}"
             )
 
     total_tasks = len(rows)
-    total_reviews = sum(reviews_count for _, reviews_count, _, _, _ in rows)
-    total_improves = sum(improves_count for _, _, improves_count, _, _ in rows)
-    approved = sum(1 for _, _, _, verdict, _ in rows if verdict == "APPROVED")
-    total_cost = sum(task_cost for _, _, _, _, task_cost in rows)
-    print(
-        f"\n{total_tasks} tasks  |  "
-        f"{total_reviews} reviews  |  "
-        f"{total_improves} improves  |  "
-        f"{approved}/{total_tasks} approved  |  "
-        f"${total_cost:.2f} total"
-    )
+    total_reviews = sum(reviews_count for _, _, reviews_count, _, _, _ in rows)
+    total_improves = sum(improves_count for _, _, _, improves_count, _, _ in rows)
+    reviewable = [r for r in rows if r[4] not in ("FAILED", "IN_PROGRESS", "NO_REVIEW")]
+    approved = sum(1 for r in reviewable if r[4] == "APPROVED")
+    failed = sum(1 for r in rows if r[4] == "FAILED")
+    total_cost = sum(task_cost for _, _, _, _, _, task_cost in rows)
+    parts = [
+        f"{total_tasks} tasks",
+        f"{total_reviews} reviews",
+        f"{total_improves} improves",
+        f"{approved}/{len(reviewable)} approved",
+    ]
+    if failed:
+        parts.append(f"{failed} failed")
+    parts.append(f"${total_cost:.2f} total")
+    print("\n" + "  |  ".join(parts))
 
     return 0
 
