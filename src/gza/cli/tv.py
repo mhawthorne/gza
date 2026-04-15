@@ -326,6 +326,17 @@ def _render_all(
     n_lines: int,
 ) -> Group:
     """Render all task panels as a Rich Group."""
+    if not tasks:
+        return Group(
+            Panel(
+                Text("Waiting for in-progress tasks...", justify="center"),
+                title="gza tv",
+                title_align="left",
+                border_style=_colors.TASK_COLORS.task_id,
+                padding=(1, 2),
+            )
+        )
+
     width = console.width or 120
     panels = [
         _build_task_panel(task, lp, n_lines, width)
@@ -338,11 +349,39 @@ def _auto_select_tasks(
     store: SqliteTaskStore,
     max_slots: int,
 ) -> list[DbTask]:
-    """Pick up to *max_slots* in-progress tasks, most recently started first."""
+    """Pick tasks for auto mode, filling slots with live tasks first and recent finished tasks second."""
     in_progress = store.get_in_progress()
     # get_in_progress returns oldest-first; we want newest-first for TV
     in_progress.reverse()
-    return in_progress[:max_slots]
+    selected = in_progress[:max_slots]
+
+    if len(selected) >= max_slots:
+        return selected
+
+    seen_ids = {task.id for task in selected if task.id is not None}
+    for task in store.get_history(limit=max_slots * 3):
+        if task.id is not None and task.id in seen_ids:
+            continue
+        selected.append(task)
+        if task.id is not None:
+            seen_ids.add(task.id)
+        if len(selected) >= max_slots:
+            break
+
+    return selected
+
+
+def _resolve_log_paths(
+    config: Config,
+    registry: WorkerRegistry,
+    tasks: list[DbTask],
+) -> list[Path | None]:
+    """Resolve log paths for the current set of displayed tasks."""
+    log_paths: list[Path | None] = []
+    for task in tasks:
+        log_path, _startup = _resolve_task_log_path(config, registry, task)
+        log_paths.append(log_path)
+    return log_paths
 
 
 def cmd_tv(args: argparse.Namespace) -> int:
@@ -371,18 +410,12 @@ def cmd_tv(args: argparse.Namespace) -> int:
     else:
         # Auto-select running tasks
         tasks = _auto_select_tasks(store, max_slots)
-        if not tasks:
-            print("No in-progress tasks found.")
-            return 0
 
     n_tasks = len(tasks)
     n_lines = _lines_per_panel(n_tasks)
 
     # Resolve initial log paths
-    log_paths: list[Path | None] = []
-    for task in tasks:
-        log_path, _startup = _resolve_task_log_path(config, registry, task)
-        log_paths.append(log_path)
+    log_paths = _resolve_log_paths(config, registry, tasks)
 
     try:
         with Live(
@@ -394,14 +427,22 @@ def cmd_tv(args: argparse.Namespace) -> int:
             while True:
                 time.sleep(0.5)
 
-                # Refresh task metadata
-                for i in range(len(tasks)):
-                    current_task_id = tasks[i].id
-                    if current_task_id is None:
-                        continue
-                    refreshed = store.get(current_task_id)
-                    if refreshed:
-                        tasks[i] = refreshed
+                if explicit_ids:
+                    # Refresh task metadata for the fixed set of requested tasks.
+                    for i in range(len(tasks)):
+                        current_task_id = tasks[i].id
+                        if current_task_id is None:
+                            continue
+                        refreshed = store.get(current_task_id)
+                        if refreshed:
+                            tasks[i] = refreshed
+                else:
+                    # In auto-select mode, repoll the live task set so finished
+                    # tasks fall off the screen and newly running tasks replace them.
+                    refreshed_tasks = _auto_select_tasks(store, max_slots)
+                    if refreshed_tasks:
+                        tasks = refreshed_tasks
+                        log_paths = _resolve_log_paths(config, registry, tasks)
 
                 # Recalculate lines (terminal may have resized)
                 n_lines = _lines_per_panel(len(tasks))
@@ -414,12 +455,6 @@ def cmd_tv(args: argparse.Namespace) -> int:
                         log_paths[i] = lp
 
                 live.update(_render_all(tasks, log_paths, n_lines))
-
-                # Exit when all displayed tasks are done
-                if not any(t.status == "in_progress" for t in tasks):
-                    time.sleep(1)
-                    live.update(_render_all(tasks, log_paths, n_lines))
-                    break
 
     except KeyboardInterrupt:
         pass

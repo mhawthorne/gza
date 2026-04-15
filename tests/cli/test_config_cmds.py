@@ -4,7 +4,7 @@
 import json
 import os
 import subprocess
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1375,10 +1375,12 @@ class TestStatsIterationsCommand:
 
         assert result.returncode == 0
         assert "Task" in result.stdout
+        assert "Last Run Date" in result.stdout
+        assert "Iterations" in result.stdout
         assert "0 tasks" in result.stdout
 
     def test_stats_iterations_rolls_up_reviews_improves_verdict_and_cost(self, tmp_path: Path):
-        """Iterations output should roll up child tasks and show latest review verdict/cost."""
+        """Iterations output should roll up child tasks and show latest run date/verdict/cost."""
         from gza.db import TaskStats
 
         setup_config(tmp_path)
@@ -1411,9 +1413,12 @@ class TestStatsIterationsCommand:
 
         assert result.returncode == 0
         assert impl.id in result.stdout
+        assert "Last Run Date" in result.stdout
         assert "APPROVED" in result.stdout
         assert "$   0.19" in result.stdout
-        assert "1 tasks  |  2 reviews  |  1 improves  |  1/1 approved  |  $0.19 total" in result.stdout
+        assert f"{date.today():%Y-%m-%d}" in result.stdout
+        assert "1 tasks  |  2 iterations  |  1 improves  |  1/1 approved  |  $0.19 total" in result.stdout
+        assert "Iteration count stats: min 2  |  p10 2  |  p25 2  |  p50 2  |  p75 2  |  p90 2  |  p99 2  |  max 2" in result.stdout
 
     def test_stats_iterations_last_limits_to_recent_implementations(self, tmp_path: Path):
         """--last N should keep only the N newest implementation rows."""
@@ -1436,6 +1441,7 @@ class TestStatsIterationsCommand:
         assert impl_2.id in result.stdout
         assert impl_1.id not in result.stdout
         assert "1 tasks" in result.stdout
+        assert "Iteration count stats: min 0  |  p10 0  |  p25 0  |  p50 0  |  p75 0  |  p90 0  |  p99 0  |  max 0" in result.stdout
 
     def test_stats_iterations_hours_filters_on_impl_or_child_activity(self, tmp_path: Path):
         """--hours should include rows with recent review/improve activity even for older impls."""
@@ -1477,6 +1483,44 @@ class TestStatsIterationsCommand:
         assert "Last 12 hours" in result.stdout
         assert impl_with_recent_review.id in result.stdout
         assert impl_without_recent_activity.id not in result.stdout
+
+    def test_stats_iterations_uses_latest_child_activity_for_last_run_date(self, tmp_path: Path):
+        """Displayed last run date should use the latest activity across impl/review/improve tasks."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement old feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.30))
+
+        review = store.add("Recent review", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.05),
+        )
+
+        old_completed = datetime(2026, 4, 10, tzinfo=UTC).isoformat()
+        recent_completed = datetime(2026, 4, 14, 18, 0, tzinfo=UTC).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                (old_completed, old_completed, impl.id),
+            )
+            conn.execute(
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                (recent_completed, recent_completed, review.id),
+            )
+
+        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "2026-04-14" in result.stdout
+        assert "2026-04-10" not in result.stdout
 
     def test_stats_iterations_hours_includes_review_completed_in_window(self, tmp_path: Path):
         """--hours should include rows when review completion is in-window despite older creation."""

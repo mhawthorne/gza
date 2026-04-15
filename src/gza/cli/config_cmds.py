@@ -463,6 +463,11 @@ def _cmd_stats_iterations(
     def _cost(task: Task) -> float:
         return task.cost_usd or 0.0
 
+    def _latest_activity_dt(tasks: list[Task]) -> datetime | None:
+        activity_dts = [_activity_dt(task) for task in tasks]
+        non_null_dts = [dt for dt in activity_dts if dt is not None]
+        return max(non_null_dts) if non_null_dts else None
+
     def _task_label(task: Task) -> str:
         slug_display: str | None = None
         if task.slug:
@@ -485,7 +490,7 @@ def _cmd_stats_iterations(
         reverse=True,
     )
 
-    rows: list[tuple[str, str, int, int, str, float]] = []
+    rows: list[tuple[str, str, int, str, float, int]] = []
     for impl in impl_tasks:
         assert impl.id is not None
         if impl.status == "pending":
@@ -521,17 +526,18 @@ def _cmd_stats_iterations(
             + sum(_cost(improve) for improve in improves)
         )
 
-        run_dt = _activity_dt(impl)
+        iterations_count = len(completed_reviews)
+        run_dt = _latest_activity_dt([impl, *reviews, *improves])
         run_date = run_dt.strftime("%Y-%m-%d") if run_dt is not None else "-"
 
         rows.append(
             (
                 _task_label(impl),
                 run_date,
-                len(completed_reviews),
-                len(completed_improves),
+                iterations_count,
                 verdict,
                 total_cost,
+                len(completed_improves),
             )
         )
 
@@ -542,33 +548,32 @@ def _cmd_stats_iterations(
     task_col_width = 46
     verdict_col_width = 17
     print(
-        f"{'Task':<{task_col_width}} {'Date':<10}  "
-        f"{'Reviews':>7}  {'Improves':>8}  "
+        f"{'Task':<{task_col_width}} {'Last Run Date':<13}  "
+        f"{'Iterations':>10}  "
         f"{'Verdict':<{verdict_col_width}} {'Cost':>8}"
     )
     if rows:
-        for task_label, run_date, reviews_count, improves_count, verdict, task_cost in rows:
+        for task_label, run_date, iterations_count, verdict, task_cost, _ in rows:
             if len(task_label) > task_col_width:
                 task_label = f"{task_label[:task_col_width - 3]}..."
             print(
                 f"{task_label:<{task_col_width}} "
-                f"{run_date:<10}  "
-                f"{reviews_count:>7}  "
-                f"{improves_count:>8}  "
+                f"{run_date:<13}  "
+                f"{iterations_count:>10}  "
                 f"{verdict:<{verdict_col_width}} "
                 f"${task_cost:>7.2f}"
             )
 
     total_tasks = len(rows)
-    total_reviews = sum(reviews_count for _, _, reviews_count, _, _, _ in rows)
-    total_improves = sum(improves_count for _, _, _, improves_count, _, _ in rows)
-    reviewable = [r for r in rows if r[4] not in ("FAILED", "IN_PROGRESS", "NO_REVIEW")]
-    approved = sum(1 for r in reviewable if r[4] == "APPROVED")
-    failed = sum(1 for r in rows if r[4] == "FAILED")
-    total_cost = sum(task_cost for _, _, _, _, _, task_cost in rows)
+    total_iterations = sum(iterations_count for _, _, iterations_count, _, _, _ in rows)
+    total_improves = sum(improves_count for _, _, _, _, _, improves_count in rows)
+    reviewable = [r for r in rows if r[3] not in ("FAILED", "IN_PROGRESS", "NO_REVIEW")]
+    approved = sum(1 for r in reviewable if r[3] == "APPROVED")
+    failed = sum(1 for r in rows if r[3] == "FAILED")
+    total_cost = sum(task_cost for _, _, _, _, task_cost, _ in rows)
     parts = [
         f"{total_tasks} tasks",
-        f"{total_reviews} reviews",
+        f"{total_iterations} iterations",
         f"{total_improves} improves",
         f"{approved}/{len(reviewable)} approved",
     ]
@@ -576,6 +581,20 @@ def _cmd_stats_iterations(
         parts.append(f"{failed} failed")
     parts.append(f"${total_cost:.2f} total")
     print("\n" + "  |  ".join(parts))
+
+    iteration_counts = sorted(iterations_count for _, _, iterations_count, _, _, _ in rows)
+    if iteration_counts:
+        summary_parts = [
+            f"min {min(iteration_counts)}",
+            f"p10 {_percentile(iteration_counts, 10)}",
+            f"p25 {_percentile(iteration_counts, 25)}",
+            f"p50 {_percentile(iteration_counts, 50)}",
+            f"p75 {_percentile(iteration_counts, 75)}",
+            f"p90 {_percentile(iteration_counts, 90)}",
+            f"p99 {_percentile(iteration_counts, 99)}",
+            f"max {max(iteration_counts)}",
+        ]
+        print("Iteration count stats: " + "  |  ".join(summary_parts))
 
     return 0
 
