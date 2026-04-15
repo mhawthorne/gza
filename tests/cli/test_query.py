@@ -662,6 +662,231 @@ class TestHistoryCommand:
         assert result.stdout.count("reason: UNKNOWN") >= 2  # explicit UNKNOWN and None both map to UNKNOWN
         assert "reason: MAX_STEPS" in result.stdout
 
+    def test_history_annotates_failed_task_with_retry_outcome(self, tmp_path: Path):
+        """Failed tasks show a retry annotation with final retry outcome."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+
+        assert original.id is not None
+        retry = store.add("Retry succeeded", task_type="implement", based_on=original.id)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(UTC)
+        store.update(retry)
+        assert retry.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {retry.id} ✓" in result.stdout
+
+    def test_history_annotates_failed_task_with_resume_outcome(self, tmp_path: Path):
+        """Failed tasks show 'resumed' when the next attempt reused session + branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.branch = "20260415-impl-resume-test"
+        original.session_id = "session-123"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+
+        assert original.id is not None
+        resumed = store.add("Resumed failed again", task_type="implement", based_on=original.id)
+        resumed.status = "failed"
+        resumed.failure_reason = "TEST_FAILURE"
+        resumed.branch = "20260415-impl-resume-test"
+        resumed.session_id = "session-123"
+        resumed.completed_at = datetime.now(UTC)
+        store.update(resumed)
+        assert resumed.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ resumed as {resumed.id} ✗" in result.stdout
+
+    def test_history_annotates_failed_task_with_queued_retry_without_outcome_marker(self, tmp_path: Path):
+        """Queued retries are annotated without a terminal outcome marker."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        queued_retry = store.add("Queued retry", task_type="implement", based_on=original.id)
+        queued_retry.status = "pending"
+        store.update(queued_retry)
+        assert queued_retry.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {queued_retry.id}" in result.stdout
+        assert f"→ retried as {queued_retry.id} ✗" not in result.stdout
+        assert f"→ retried as {queued_retry.id} ✓" not in result.stdout
+
+    def test_history_annotates_failed_task_with_queued_resume_without_outcome_marker(self, tmp_path: Path):
+        """Queued resume attempts are annotated without a terminal outcome marker."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.branch = "20260415-impl-resume-queued"
+        original.session_id = "session-queued"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        queued_resumed = store.add("Queued resumed", task_type="implement", based_on=original.id)
+        queued_resumed.status = "pending"
+        queued_resumed.branch = "20260415-impl-resume-queued"
+        queued_resumed.session_id = "session-queued"
+        store.update(queued_resumed)
+        assert queued_resumed.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ resumed as {queued_resumed.id}" in result.stdout
+        assert f"→ resumed as {queued_resumed.id} ✗" not in result.stdout
+        assert f"→ resumed as {queued_resumed.id} ✓" not in result.stdout
+
+    def test_history_retry_annotation_follows_chain_and_ignores_other_task_types(self, tmp_path: Path):
+        """Retry annotation follows same-type based_on chains to the final attempt."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        # Different task type child should not be considered a retry/resume.
+        review = store.add("Review child", task_type="review", based_on=original.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        retry_1 = store.add("Retry one", task_type="implement", based_on=original.id)
+        retry_1.status = "failed"
+        retry_1.failure_reason = "MAX_TURNS"
+        retry_1.completed_at = datetime.now(UTC)
+        store.update(retry_1)
+        assert retry_1.id is not None
+
+        retry_2 = store.add("Retry two", task_type="implement", based_on=retry_1.id)
+        retry_2.status = "completed"
+        retry_2.completed_at = datetime.now(UTC)
+        store.update(retry_2)
+        assert retry_2.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {retry_2.id} ✓" in result.stdout
+        assert f"→ retried as {review.id}" not in result.stdout
+
+    def test_history_retry_annotation_resolves_latest_descendant_across_sibling_branches(self, tmp_path: Path):
+        """Retry annotation resolves from the full same-type descendant tree, not one direct-child branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        older_branch = store.add("Older retry branch", task_type="implement", based_on=original.id)
+        older_branch.status = "failed"
+        older_branch.failure_reason = "MAX_TURNS"
+        older_branch.completed_at = datetime.now(UTC)
+        store.update(older_branch)
+        assert older_branch.id is not None
+
+        newer_direct_child = store.add("Newest direct child", task_type="implement", based_on=original.id)
+        newer_direct_child.status = "pending"
+        store.update(newer_direct_child)
+        assert newer_direct_child.id is not None
+
+        final_attempt = store.add("Final success on older branch", task_type="implement", based_on=older_branch.id)
+        final_attempt.status = "completed"
+        final_attempt.completed_at = datetime.now(UTC)
+        store.update(final_attempt)
+        assert final_attempt.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ retried as {final_attempt.id} ✓" in result.stdout
+        assert f"→ retried as {newer_direct_child.id}" not in result.stdout
+
+    def test_history_retry_annotation_keeps_resume_label_in_mixed_sibling_branches(self, tmp_path: Path):
+        """Mixed retry/resume siblings should keep action label from the resolved descendant path."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.branch = "20260415-impl-branching"
+        original.session_id = "session-branching"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+        assert original.id is not None
+
+        resume_child = store.add("Resume sibling", task_type="implement", based_on=original.id)
+        resume_child.status = "failed"
+        resume_child.failure_reason = "MAX_TURNS"
+        resume_child.branch = "20260415-impl-branching"
+        resume_child.session_id = "session-branching"
+        resume_child.completed_at = datetime.now(UTC)
+        store.update(resume_child)
+        assert resume_child.id is not None
+
+        retry_child = store.add("Retry sibling", task_type="implement", based_on=original.id)
+        retry_child.status = "pending"
+        retry_child.branch = "20260415-impl-other-branch"
+        retry_child.session_id = "session-other"
+        store.update(retry_child)
+        assert retry_child.id is not None
+
+        resumed_terminal = store.add(
+            "Terminal resumed attempt",
+            task_type="implement",
+            based_on=resume_child.id,
+        )
+        resumed_terminal.status = "completed"
+        resumed_terminal.completed_at = datetime.now(UTC)
+        resumed_terminal.branch = "20260415-impl-branching"
+        resumed_terminal.session_id = "session-branching"
+        store.update(resumed_terminal)
+        assert resumed_terminal.id is not None
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"→ resumed as {resumed_terminal.id} ✓" in result.stdout
+        assert f"→ retried as {resumed_terminal.id}" not in result.stdout
+
     def test_history_shows_parent_task_id(self, tmp_path: Path):
         """History shows parent task ID when based_on or depends_on is set."""
 

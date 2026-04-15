@@ -1316,6 +1316,19 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_based_on_children_by_type(self, task_id: str, task_type: str) -> list[Task]:
+        """Return tasks where based_on = task_id and task_type matches."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE based_on = ? AND task_type = ?
+                ORDER BY created_at ASC
+                """,
+                (task_id, task_type),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_lineage_children(self, task_id: str) -> list[Task]:
         """Return direct lineage children linked by based_on or depends_on.
 
