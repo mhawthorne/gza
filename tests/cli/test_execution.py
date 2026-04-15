@@ -5510,6 +5510,54 @@ class TestMarkCompletedCommand:
         assert updated is not None
         assert updated.execution_mode == "skill_inline"
 
+    def test_mark_completed_warns_when_inline_provenance_log_is_unreadable(self, tmp_path: Path):
+        """mark-completed should surface a warning when provenance log cannot be read."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Unreadable inline provenance log", task_type="review")
+        assert task.id is not None
+        task.status = "failed"
+        task.execution_mode = "manual"
+        task.log_file = ".gza/logs/inline-unreadable.log"
+        store.update(task)
+
+        # Make log path unreadable as a file by creating a directory at the same location.
+        (tmp_path / task.log_file).mkdir(parents=True, exist_ok=True)
+
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Could not read task log" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "manual"
+
+    def test_mark_completed_warns_when_inline_provenance_log_has_malformed_json(self, tmp_path: Path):
+        """mark-completed should surface a warning when provenance log has malformed JSON lines."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Malformed inline provenance log", task_type="review")
+        assert task.id is not None
+        task.status = "failed"
+        task.execution_mode = "manual"
+        task.log_file = ".gza/logs/inline-malformed.log"
+        store.update(task)
+
+        log_path = tmp_path / task.log_file
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "{not valid json}\n"
+            '{"type":"gza","subtype":"info","message":"hello"}\n'
+        )
+
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "malformed JSON line(s)" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "manual"
+
     def test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
         """mark-completed leaves an already-completed worker unchanged."""
         from gza.workers import WorkerMetadata
@@ -5644,6 +5692,105 @@ class TestSetStatusCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.execution_mode == "manual"
+
+    def test_set_status_in_progress_accepts_explicit_execution_mode(self, tmp_path: Path):
+        """in_progress transitions can persist explicit execution provenance."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending", "task_type": "review"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+
+        result = run_gza(
+            "set-status",
+            str(task.id),
+            "in_progress",
+            "--execution-mode",
+            "skill_inline",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+
+        # Simulate inline runner synthetic provenance log written after transition.
+        reloaded = store.get(task.id)
+        assert reloaded is not None
+        reloaded.log_file = ".gza/logs/inline-in-progress.log"
+        store.update(reloaded)
+        log_path = tmp_path / reloaded.log_file
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
+        )
+
+        shown = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert shown.returncode == 0
+        assert "Execution Mode: skill_inline" in shown.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "in_progress"
+        assert updated.execution_mode == "skill_inline"
+
+    def test_set_status_failed_preserves_skill_inline_execution_mode(self, tmp_path: Path):
+        """Inline runs that fail before mark-completed should retain skill_inline provenance."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending", "task_type": "review"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+
+        result = run_gza(
+            "set-status",
+            str(task.id),
+            "in_progress",
+            "--execution-mode",
+            "skill_inline",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+
+        fail_result = run_gza(
+            "set-status",
+            str(task.id),
+            "failed",
+            "--reason",
+            "TEST_FAILURE",
+            "--project",
+            str(tmp_path),
+        )
+        assert fail_result.returncode == 0
+
+        shown = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert shown.returncode == 0
+        assert "Execution Mode: skill_inline" in shown.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "failed"
+        assert updated.execution_mode == "skill_inline"
+
+    def test_set_status_execution_mode_rejected_for_non_in_progress(self, tmp_path: Path):
+        """--execution-mode should be rejected unless status is in_progress."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+
+        result = run_gza(
+            "set-status",
+            str(task.id),
+            "failed",
+            "--execution-mode",
+            "skill_inline",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "--execution-mode is only valid" in result.stdout
 
     def test_set_status_reason_warns_for_non_failed(self, tmp_path: Path):
         """set-status warns when --reason is used with a non-failed status."""
