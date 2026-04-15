@@ -4,6 +4,7 @@ Covers: next, history, unmerged, groups, status, ps, kill, delete, show, attach.
 """
 
 import argparse
+import datetime as _dt
 import os
 import shlex
 import shutil
@@ -780,13 +781,14 @@ def _print_ps_output(
     poll_interval: int | None = None,
     seen_tasks: "dict | None" = None,
     show_all: bool = False,
+    poll_started_at: "_dt.datetime | None" = None,
+    last_poll_at: "_dt.datetime | None" = None,
 ) -> None:
     """Print ps output once. Used by cmd_ps directly and in poll loop.
 
     When seen_tasks is provided (poll mode), rows from this dict are merged with
     live results so that completed/failed tasks remain visible.
     """
-    import datetime
     # Include completed workers so startup failures and poll transitions remain visible.
     live_rows, _ = _build_ps_rows(registry, store, include_completed=True)
 
@@ -799,10 +801,19 @@ def _print_ps_output(
             # already track it (status transition), or if it is a startup
             # failure. This preserves first-seen startup failures in poll mode
             # while still avoiding unrelated completed history.
+            ended_at_iso = row.get("ended_at")
+            ended_after_last_poll = False
+            if last_poll_at is not None and ended_at_iso:
+                try:
+                    ended_dt = _dt.datetime.fromisoformat(ended_at_iso)
+                    ended_after_last_poll = ended_dt >= last_poll_at
+                except ValueError:
+                    pass
             if (
                 key in seen_tasks
-                or row["status"] == "in_progress"
+                or row["status"] in ("in_progress", "stale")
                 or row.get("startup_failure", False)
+                or ended_after_last_poll
             ):
                 seen_tasks[key] = row
             live_keys.add(key)
@@ -832,8 +843,16 @@ def _print_ps_output(
         ]
 
     if poll_interval is not None:
-        now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"Refreshing every {poll_interval}s — last updated: {now}  (Ctrl+C to exit)")
+        now = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        started_str = (
+            poll_started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if poll_started_at is not None
+            else now
+        )
+        print(
+            f"Refreshing every {poll_interval}s — started: {started_str} — "
+            f"last updated: {now}  (Ctrl+C to exit)"
+        )
         print()
 
     if not rows:
@@ -895,12 +914,23 @@ def cmd_ps(args: argparse.Namespace) -> int:
             return 1
         # Poll runs indefinitely until Ctrl+C — no auto-stop when tasks complete,
         # since new tasks may start at any time.
+        import datetime as _dt
         seen_tasks: dict = {}
+        poll_started_at = _dt.datetime.now(_dt.UTC)
+        last_poll_at: _dt.datetime | None = None
         try:
             while True:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")  # clear screen, move cursor to top
-                _print_ps_output(args, registry, store, poll_interval=poll_interval, seen_tasks=seen_tasks, show_all=show_all)
+                _print_ps_output(
+                    args, registry, store,
+                    poll_interval=poll_interval,
+                    seen_tasks=seen_tasks,
+                    show_all=show_all,
+                    poll_started_at=poll_started_at,
+                    last_poll_at=last_poll_at,
+                )
+                last_poll_at = _dt.datetime.now(_dt.UTC)
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
             return 0
@@ -1148,6 +1178,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "task": task_display,
         "started": _format_started(started),
         "started_at": started.isoformat() if started else None,
+        "ended_at": ended.isoformat() if ended else None,
         "steps": _get_ps_steps(task, store),
         "duration": duration,
         "is_stale": is_stale,
