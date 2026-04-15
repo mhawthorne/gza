@@ -734,7 +734,7 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
     mode = "verify-git" if args.verify_git else ("force" if args.force else _default_mark_completed_mode(task.task_type))
 
-    if task.execution_mode in (None, "manual"):
+    if task.execution_mode is None:
         inline_skill_detected, log_warning = _log_indicates_inline_skill(task, config)
         if log_warning:
             print(log_warning)
@@ -801,7 +801,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     if args.status == "in_progress":
         if args.execution_mode:
             task.execution_mode = args.execution_mode
-        elif task.execution_mode is None:
+        else:
             task.execution_mode = "manual"
 
     if args.status in ("completed", "failed", "dropped"):

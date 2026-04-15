@@ -5486,14 +5486,14 @@ class TestMarkCompletedCommand:
         assert result.returncode == 0
         assert "status-only" in result.stdout
 
-    def test_mark_completed_promotes_manual_mode_to_skill_inline_from_log(self, tmp_path: Path):
-        """Inline skill provenance in log should persist as skill_inline execution mode."""
+    def test_mark_completed_promotes_unset_mode_to_skill_inline_from_log(self, tmp_path: Path):
+        """Inline skill provenance in log should backfill execution_mode when unset."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         task = store.add("Inline skill review task", task_type="review")
         assert task.id is not None
         task.status = "failed"
-        task.execution_mode = "manual"
+        task.execution_mode = None
         task.log_file = ".gza/logs/inline.log"
         store.update(task)
 
@@ -5510,6 +5510,30 @@ class TestMarkCompletedCommand:
         assert updated is not None
         assert updated.execution_mode == "skill_inline"
 
+    def test_mark_completed_preserves_manual_mode_even_with_inline_provenance_log(self, tmp_path: Path):
+        """Explicit manual mode should not be overwritten by log-based inline backfill."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Manual rerun with historical inline log", task_type="review")
+        assert task.id is not None
+        task.status = "failed"
+        task.execution_mode = "manual"
+        task.log_file = ".gza/logs/inline-historical.log"
+        store.update(task)
+
+        log_path = tmp_path / task.log_file
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
+        )
+
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "manual"
+
     def test_mark_completed_warns_when_inline_provenance_log_is_unreadable(self, tmp_path: Path):
         """mark-completed should surface a warning when provenance log cannot be read."""
         setup_config(tmp_path)
@@ -5517,7 +5541,7 @@ class TestMarkCompletedCommand:
         task = store.add("Unreadable inline provenance log", task_type="review")
         assert task.id is not None
         task.status = "failed"
-        task.execution_mode = "manual"
+        task.execution_mode = None
         task.log_file = ".gza/logs/inline-unreadable.log"
         store.update(task)
 
@@ -5530,7 +5554,7 @@ class TestMarkCompletedCommand:
 
         updated = store.get(task.id)
         assert updated is not None
-        assert updated.execution_mode == "manual"
+        assert updated.execution_mode is None
 
     def test_mark_completed_warns_when_inline_provenance_log_has_malformed_json(self, tmp_path: Path):
         """mark-completed should surface a warning when provenance log has malformed JSON lines."""
@@ -5539,7 +5563,7 @@ class TestMarkCompletedCommand:
         task = store.add("Malformed inline provenance log", task_type="review")
         assert task.id is not None
         task.status = "failed"
-        task.execution_mode = "manual"
+        task.execution_mode = None
         task.log_file = ".gza/logs/inline-malformed.log"
         store.update(task)
 
@@ -5556,7 +5580,7 @@ class TestMarkCompletedCommand:
 
         updated = store.get(task.id)
         assert updated is not None
-        assert updated.execution_mode == "manual"
+        assert updated.execution_mode is None
 
     def test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
         """mark-completed leaves an already-completed worker unchanged."""
@@ -5692,6 +5716,30 @@ class TestSetStatusCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.execution_mode == "manual"
+
+    @pytest.mark.parametrize("existing_mode", ["worker_foreground", "skill_inline"])
+    def test_set_status_in_progress_without_mode_overwrites_existing_mode_to_manual(
+        self, tmp_path: Path, existing_mode: str
+    ):
+        """Manual in-progress transitions should override stale prior execution provenance."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "failed", "task_type": "review"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task.execution_mode = existing_mode
+        store.update(task)
+
+        result = run_gza("set-status", str(task.id), "in_progress", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "manual"
+
+        shown = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert shown.returncode == 0
+        assert "Execution Mode: manual" in shown.stdout
 
     def test_set_status_in_progress_accepts_explicit_execution_mode(self, tmp_path: Path):
         """in_progress transitions can persist explicit execution provenance."""

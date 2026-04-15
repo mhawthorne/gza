@@ -114,7 +114,7 @@ Ask: "Should I continue with this, or would you like to adjust the approach?"
 Mark the original task as failed (if it isn't already) and set the current one to in_progress:
 
 ```bash
-uv run gza set-status <TASK_ID> in_progress
+uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline
 ```
 
 ### Step 8: Execute the remaining work
