@@ -1214,9 +1214,14 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if not isinstance(initial_action_description, str) or not initial_action_description:
         initial_action_description = initial_action_type
 
+    iteration_actions = {"create_review", "run_review", "improve", "run_improve"}
+
     if dry_run:
         print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
-        print(f"[dry-run] First iteration 1/{max_iterations} action: {initial_action_type} - {initial_action_description}")
+        if initial_action_type in iteration_actions:
+            print(f"[dry-run] First iteration 1/{max_iterations} action: {initial_action_type} - {initial_action_description}")
+        else:
+            print(f"[dry-run] First next action: {initial_action_type} - {initial_action_description}")
         return 0
     print(f"Iterating implementation {impl_task.id} (max {max_iterations} iterations)...")
     impl_task_key = impl_task.id
@@ -1324,7 +1329,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             max_resume_attempts=max_resume_attempts,
         )
         action_type = action["type"]
-        print(f"\nIteration {iteration + 1}/{max_iterations}: {action_type}")
+        if action_type in iteration_actions:
+            print(f"\nIteration {iteration + 1}/{max_iterations}: {action_type}")
+        else:
+            print(f"\nNext action: {action_type}")
 
         if action_type == "merge":
             final_status = "merge_ready"
