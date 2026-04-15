@@ -1322,6 +1322,48 @@ def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
     shutil.copy2(src, dst_dir / "learnings.md")
 
 
+def _resolve_task_db_path(config: Config) -> Path:
+    """Resolve the live task DB path for worktree snapshotting."""
+    db_path = getattr(config, "db_path", None)
+    if isinstance(db_path, Path):
+        return db_path
+
+    project_dir = getattr(config, "project_dir", None)
+    if isinstance(project_dir, Path):
+        return project_dir / ".gza" / "gza.db"
+
+    return Path(".gza") / "gza.db"
+
+
+def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
+    """Create a consistent read-only DB snapshot in the task worktree.
+
+    Uses SQLite's backup API so the snapshot is transactionally consistent even
+    while the live DB is being written by the host runner.
+    """
+    if not db_path.exists():
+        return
+
+    dst_dir = worktree_path / ".gza"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = dst_dir / "gza.db"
+
+    if snapshot_path.exists():
+        snapshot_path.unlink()
+
+    source = sqlite3.connect(str(db_path))
+    try:
+        dest = sqlite3.connect(str(snapshot_path))
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+
+    snapshot_path.chmod(0o444)
+
+
 def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
     """Create symlinks for local path dependencies so uv can resolve them in worktrees.
 
@@ -2309,6 +2351,7 @@ def _run_inner(
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
     # Copy learnings file into worktree so the agent can read it
+    _snapshot_task_db_to_worktree(_resolve_task_db_path(config), worktree_path)
     _copy_learnings_to_worktree(config, worktree_path)
 
     if not config.use_docker:
@@ -2516,6 +2559,8 @@ def _run_non_code_task(
         n_installed = ensure_all_skills(skills_dir)
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
+
+        _snapshot_task_db_to_worktree(_resolve_task_db_path(config), worktree_path)
 
         # Internal orchestration tasks do not implicitly consume learnings context.
         if task.task_type not in ("internal", "learn"):

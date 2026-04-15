@@ -2,6 +2,8 @@
 
 import logging
 import os
+import sqlite3
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -29,6 +31,7 @@ from gza.runner import (
     _extract_review_verdict,
     _find_task_of_type_in_chain,
     _resolve_code_task_branch_name,
+    _snapshot_task_db_to_worktree,
     _restore_wip_changes,
     _run_non_code_task,
     _run_result_to_stats,
@@ -949,6 +952,46 @@ class TestCopyLearningsToWorktree:
         assert not (worktree_dir / ".gza").exists()
         _copy_learnings_to_worktree(config, worktree_dir)
         assert (worktree_dir / ".gza").is_dir()
+
+
+class TestSnapshotTaskDbToWorktree:
+    """Tests for _snapshot_task_db_to_worktree."""
+
+    def test_creates_sqlite_snapshot_with_read_only_mode(self, tmp_path: Path):
+        """Snapshot should contain DB content and be chmod 0444."""
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('alpha')")
+        conn.commit()
+        conn.close()
+
+        worktree_dir = tmp_path / "worktree"
+        worktree_dir.mkdir()
+
+        _snapshot_task_db_to_worktree(db_path, worktree_dir)
+
+        snapshot_path = worktree_dir / ".gza" / "gza.db"
+        assert snapshot_path.exists()
+        assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o444
+
+        snapshot_conn = sqlite3.connect(str(snapshot_path))
+        row = snapshot_conn.execute("SELECT name FROM items").fetchone()
+        assert row is not None
+        assert row[0] == "alpha"
+        with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
+            snapshot_conn.execute("CREATE TABLE blocked (id INTEGER)")
+        snapshot_conn.close()
+
+    def test_noop_when_source_db_missing(self, tmp_path: Path):
+        """Missing source DB should not create a snapshot file."""
+        worktree_dir = tmp_path / "worktree"
+        worktree_dir.mkdir()
+
+        _snapshot_task_db_to_worktree(tmp_path / ".gza" / "gza.db", worktree_dir)
+
+        assert not (worktree_dir / ".gza" / "gza.db").exists()
 
 
 class TestReviewTaskSlugGeneration:
