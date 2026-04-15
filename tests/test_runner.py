@@ -4546,7 +4546,7 @@ class TestExtractedRunInnerHelpers:
 
         assert ok is True
         ensure_pr.assert_called_once()
-        git.needs_push.assert_called_once_with("feature/work-pr")
+        git.needs_push.assert_not_called()
 
     def test_ensure_work_pr_skips_when_branch_has_no_commits(self, tmp_path: Path):
         """`work --pr` should skip PR creation when branch has no commits."""
@@ -4586,8 +4586,8 @@ class TestExtractedRunInnerHelpers:
 
         assert ok is True
 
-    def test_ensure_work_pr_reuses_cached_pr_without_remote_lookup(self, tmp_path: Path):
-        """`work --pr` should short-circuit on cached task.pr_number."""
+    def test_ensure_work_pr_reuses_revalidated_cached_pr(self, tmp_path: Path):
+        """`work --pr` should reuse cached PRs only after remote revalidation."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement X", task_type="implement")
@@ -4600,11 +4600,35 @@ class TestExtractedRunInnerHelpers:
         git.default_branch.return_value = "main"
         git.count_commits_ahead.return_value = 1
 
-        ensure_result = Mock(ok=True, status="cached", pr_url=None)
+        ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/81", pr_number=81)
         with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
             ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
         assert ok is True
+
+    def test_ensure_work_pr_revalidates_cached_pr_before_reuse(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Cached PR reuse should reflect the revalidated PR URL and avoid fake push output."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/cached-pr"
+        task.pr_number = 81
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+
+        ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/81", pr_number=81)
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr:
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+        output = capsys.readouterr().out
+        assert "Pushing branch" not in output
+        assert "Reusing cached PR #81" in output
+        ensure_pr.assert_called_once()
 
     def test_complete_code_task_creates_pr_before_auto_review(self, tmp_path: Path):
         """When create_review is enabled, PR creation should run before auto-review execution."""

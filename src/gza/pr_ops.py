@@ -51,8 +51,24 @@ def ensure_task_pr(
     if merged_behavior == "error" and git.is_merged(task.branch, default_branch):
         return EnsureTaskPrResult(ok=False, status="merged", error=default_branch)
 
+    try:
+        if git.needs_push(task.branch):
+            print(f"Pushing branch '{task.branch}' to origin...")
+            git.push_branch(task.branch)
+    except GitError as e:
+        return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
+
     if task.pr_number:
-        return EnsureTaskPrResult(ok=True, status="cached", pr_number=task.pr_number)
+        pr_url = gh.get_pr_url(task.pr_number)
+        if pr_url:
+            return EnsureTaskPrResult(
+                ok=True,
+                status="cached",
+                pr_url=pr_url,
+                pr_number=task.pr_number,
+            )
+        task.pr_number = None
+        store.update(task)
 
     existing_pr_url = gh.pr_exists(task.branch)
     if existing_pr_url:
@@ -61,12 +77,6 @@ def ensure_task_pr(
             task.pr_number = pr_number
             store.update(task)
         return EnsureTaskPrResult(ok=True, status="existing", pr_url=existing_pr_url, pr_number=pr_number)
-
-    try:
-        if git.needs_push(task.branch):
-            git.push_branch(task.branch)
-    except GitError as e:
-        return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
 
     if git.is_merged(task.branch, default_branch):
         if merged_behavior == "error":

@@ -1079,9 +1079,6 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print("Generating PR description...")
         title, body = _generate_pr_content(task, commit_log, diff_stat, config, store)
 
-    if git.needs_push(task.branch):
-        print(f"Pushing branch '{task.branch}' to origin...")
-
     result = ensure_task_pr(
         task,
         store,

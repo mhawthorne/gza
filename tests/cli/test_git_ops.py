@@ -5780,6 +5780,49 @@ class TestPrCommand:
         assert "already merged into main" in output
         gh.pr_exists.assert_not_called()
 
+    def test_pr_reuses_cached_pr_without_claiming_push_when_helper_did_not_push(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """`gza pr` should not print a push banner unless the shared helper actually pushes."""
+        import argparse
+
+        from gza.cli.git_ops import cmd_pr
+
+        store, task = self._make_completed_pr_task(
+            tmp_path,
+            branch="feature/cached-pr",
+            pr_number=42,
+        )
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.get_log.return_value = "abc123 test"
+        git.get_diff_stat.return_value = "1 file changed"
+        git.needs_push.return_value = True
+
+        ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/42", pr_number=42)
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            title="Manual title",
+            draft=False,
+        )
+
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=git),
+            patch("gza.cli.git_ops.ensure_task_pr", return_value=ensure_result) as ensure_pr,
+        ):
+            rc = cmd_pr(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert "Pushing branch" not in output
+        assert "PR already exists: #42" in output
+        ensure_pr.assert_called_once()
+
     def test_generate_pr_content_uses_internal_task_output(self, tmp_path: Path):
         """PR content generation uses an internal task and parses output_content."""
         from gza.cli.git_ops import _generate_pr_content

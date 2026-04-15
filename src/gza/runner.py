@@ -1273,8 +1273,6 @@ def _ensure_work_pr_for_completed_code_task(
 
 {task.id}
 """
-    if git.needs_push(task.branch):
-        print(f"Pushing branch '{task.branch}' to origin...")
     result = ensure_task_pr(
         task,
         store,
@@ -1284,8 +1282,8 @@ def _ensure_work_pr_for_completed_code_task(
         draft=False,
         merged_behavior="skip",
     )
-    if result.ok and result.status == "cached" and task.pr_number:
-        print(f"Info: Reusing cached PR #{task.pr_number} for task {task.id}")
+    if result.ok and result.status == "cached" and result.pr_number:
+        print(f"Info: Reusing cached PR #{result.pr_number} for task {task.id}: {result.pr_url}")
         return True
     if result.ok and result.status == "existing":
         print(f"Info: Reusing existing PR for branch {task.branch}: {result.pr_url}")
