@@ -1434,6 +1434,46 @@ class TestBackgroundWorkerCommand:
         assert worker.log_file is None
         assert (tmp_path / worker.startup_log_file).exists()
 
+    def test_background_worker_allows_failed_pr_required_task_with_pr_flag(self, tmp_path: Path):
+        """Background explicit work should allow retrying failed PR_REQUIRED tasks with --pr."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required task in background")
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=True,
+            resume=False,
+            force=False,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        with patch("gza.cli.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 0
+        mock_popen.assert_called_once()
+
 
 class TestReconciliation:
     """Tests for in-progress reconciliation behavior."""

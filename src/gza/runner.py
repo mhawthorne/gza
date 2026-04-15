@@ -2005,6 +2005,25 @@ def _complete_code_task(
         diff_lines_added=diff_added,
         diff_lines_removed=diff_removed,
     )
+    return _post_complete_code_task(
+        task,
+        config,
+        store,
+        worktree_git,
+        branch_name,
+        stats,
+    )
+
+
+def _post_complete_code_task(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    worktree_git: Git,
+    branch_name: str,
+    stats: TaskStats,
+) -> int:
+    """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
     # Clear review state on the based_on implementation task after improve completes.
@@ -2096,27 +2115,14 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         diff_lines_added=task.diff_lines_added,
         diff_lines_removed=task.diff_lines_removed,
     )
-    auto_learnings = maybe_auto_regenerate_learnings(store, config)
-
-    if task.task_type == "improve" and task.based_on:
-        store.clear_review_state(task.based_on)
-        parent = store.get(task.based_on)
-        if parent and parent.id is not None and parent.merge_status == "merged":
-            store.set_merge_status(parent.id, "unmerged")
-
-    console.print("")
-    task_footer(
+    return _post_complete_code_task(
         task,
+        config,
+        store,
+        git,
+        task.branch,
         stats,
-        status="Done",
-        branch=task.branch,
-        learnings=auto_learnings,
-        store=store,
     )
-
-    if task.create_review:
-        return _create_and_run_review_task(task, config, store)
-    return 0
 
 
 def _run_inner(

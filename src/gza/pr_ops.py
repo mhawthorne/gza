@@ -47,6 +47,10 @@ def ensure_task_pr(
     if not gh.is_available():
         return EnsureTaskPrResult(ok=False, status="gh_unavailable")
 
+    default_branch = git.default_branch()
+    if merged_behavior == "error" and git.is_merged(task.branch, default_branch):
+        return EnsureTaskPrResult(ok=False, status="merged", error=default_branch)
+
     if task.pr_number:
         return EnsureTaskPrResult(ok=True, status="cached", pr_number=task.pr_number)
 
@@ -64,7 +68,6 @@ def ensure_task_pr(
     except GitError as e:
         return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
 
-    default_branch = git.default_branch()
     if git.is_merged(task.branch, default_branch):
         if merged_behavior == "error":
             return EnsureTaskPrResult(ok=False, status="merged", error=default_branch)

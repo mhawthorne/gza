@@ -4782,6 +4782,57 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.status == "completed"
         assert refreshed.failure_reason is None
 
+    def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
+        """PR retry completion for rebases should invalidate review state and force-push."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        parent.merge_status = "merged"
+        store.update(parent)
+        store.clear_review_state(parent.id)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        task.slug = "20260414-retry-rebase-pr-required"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-rebase-pr-required"
+        task.log_file = "logs/retry-rebase.log"
+        task.output_content = "summary"
+        task.has_commits = True
+        store.update(task)
+
+        git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 0
+        git.push_force_with_lease.assert_called_once_with(task.branch)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+
+        updated_parent = store.get(parent.id)
+        assert updated_parent is not None
+        assert updated_parent.review_cleared_at is None
+        assert updated_parent.merge_status == "unmerged"
+
     def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
         """Rebase completion should force-push from the host runner."""
         db_path = tmp_path / "test.db"

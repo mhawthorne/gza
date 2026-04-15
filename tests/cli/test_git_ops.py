@@ -8,7 +8,7 @@ import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -5606,6 +5606,17 @@ class TestAdvanceAutoPlans:
 class TestPrCommand:
     """Tests for 'gza pr' command."""
 
+    def _make_completed_pr_task(self, tmp_path: Path, *, branch: str, pr_number: int | None = None):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Completed task ready for PR")
+        task.status = "completed"
+        task.branch = branch
+        task.has_commits = True
+        task.pr_number = pr_number
+        store.update(task)
+        return store, task
+
     def test_pr_task_not_found(self, tmp_path: Path):
         """PR command handles nonexistent task."""
         setup_config(tmp_path)
@@ -5684,6 +5695,90 @@ class TestPrCommand:
         assert "already marked as merged" in result.stdout
         # Should NOT say "merged into" since the branch was not actually merged
         assert "merged into" not in result.stdout
+
+    def test_pr_cached_pr_still_errors_when_branch_is_merged(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Merged branches must still error even if the task has a cached PR number."""
+        import argparse
+
+        from gza.cli.git_ops import cmd_pr
+
+        store, task = self._make_completed_pr_task(
+            tmp_path,
+            branch="feature/cached-pr-merged",
+            pr_number=42,
+        )
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.get_log.return_value = "abc123 test"
+        git.get_diff_stat.return_value = "1 file changed"
+        git.needs_push.return_value = False
+        git.is_merged.return_value = True
+
+        gh = Mock()
+        gh.is_available.return_value = True
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            title="Manual title",
+            draft=False,
+        )
+
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=git),
+            patch("gza.pr_ops.GitHub", return_value=gh),
+        ):
+            rc = cmd_pr(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "already merged into main" in output
+
+    def test_pr_existing_remote_pr_still_errors_when_branch_is_merged(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Merged branches must still error before reusing an existing remote PR."""
+        import argparse
+
+        from gza.cli.git_ops import cmd_pr
+
+        store, task = self._make_completed_pr_task(
+            tmp_path,
+            branch="feature/remote-pr-merged",
+        )
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.get_log.return_value = "abc123 test"
+        git.get_diff_stat.return_value = "1 file changed"
+        git.needs_push.return_value = False
+        git.is_merged.return_value = True
+
+        gh = Mock()
+        gh.is_available.return_value = True
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            title="Manual title",
+            draft=False,
+        )
+
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=git),
+            patch("gza.pr_ops.GitHub", return_value=gh),
+        ):
+            rc = cmd_pr(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "already merged into main" in output
+        gh.pr_exists.assert_not_called()
 
     def test_generate_pr_content_uses_internal_task_output(self, tmp_path: Path):
         """PR content generation uses an internal task and parses output_content."""

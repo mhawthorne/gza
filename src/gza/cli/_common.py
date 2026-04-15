@@ -316,7 +316,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
                 print(f"Error: Task {explicit_task_id} has no session ID (cannot resume)")
                 return 1
         else:
-            if task.status != "pending":
+            allow_pr_retry = _allow_pr_required_retry(args, task)
+            if task.status != "pending" and not allow_pr_retry:
                 print(f"Error: Task {explicit_task_id} is not pending (status: {task.status})")
                 return 1
 
@@ -814,6 +815,15 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         print(f"\n=== Attempted to spawn {count} background worker(s) ===")
 
     return 0
+
+
+def _allow_pr_required_retry(args: argparse.Namespace, task: DbTask) -> bool:
+    """Return whether explicit `work --pr` may retry a failed PR_REQUIRED task."""
+    return bool(
+        getattr(args, "create_pr", False)
+        and task.status == "failed"
+        and task.failure_reason == "PR_REQUIRED"
+    )
 
 
 def format_stats(task: DbTask) -> str:

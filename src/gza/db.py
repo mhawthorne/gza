@@ -39,6 +39,7 @@ __all__ = [
 KNOWN_FAILURE_REASONS = {
     "MAX_STEPS",
     "MAX_TURNS",
+    "PR_REQUIRED",
     "PREREQUISITE_UNMERGED",
     "TEST_FAILURE",
     "TIMEOUT",

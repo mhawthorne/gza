@@ -25,6 +25,7 @@ from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     DuplicateReviewError,
+    _allow_pr_required_retry,
     _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
@@ -92,11 +93,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(f"Error: Task {task_id} not found")
                 return 1
 
-            allow_pr_retry = (
-                getattr(args, "create_pr", False)
-                and task.status == "failed"
-                and task.failure_reason == "PR_REQUIRED"
-            )
+            allow_pr_retry = _allow_pr_required_retry(args, task)
             if task.status != "pending" and not allow_pr_retry:
                 print(f"Error: Task {task_id} is not pending (status: {task.status})")
                 return 1
