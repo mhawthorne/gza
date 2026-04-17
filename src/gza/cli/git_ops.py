@@ -1643,18 +1643,44 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif action_type == 'improve':
             review_task = action['review_task']
             assert review_task.id is not None
+            assert task.id is not None
 
-            from ..prompts import PromptBuilder
-            improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task.id)
-            improve_task = store.add(
-                prompt=improve_prompt,
-                task_type='improve',
-                depends_on=review_task.id,
-                based_on=task.id,
-                same_branch=True,
-                group=task.group,
+            # Check for existing failed improve for this impl+review pair.
+            # Retry the most recent failed one instead of creating a duplicate sibling.
+            existing_improves = store.get_improve_tasks_for(task.id, review_task.id)
+            failed_improve = next(
+                (t for t in sorted(existing_improves, key=lambda t: t.created_at or datetime.min, reverse=True)
+                 if t.status == "failed"),
+                None,
             )
-            console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
+            if failed_improve is not None:
+                assert failed_improve.id is not None
+                retry_same_branch = failed_improve.same_branch
+                retry_base_branch: str | None = None
+                if failed_improve.same_branch and failed_improve.branch:
+                    retry_same_branch = False
+                    retry_base_branch = failed_improve.branch
+                improve_task = store.add(
+                    prompt=failed_improve.prompt,
+                    task_type='improve',
+                    depends_on=failed_improve.depends_on,
+                    based_on=failed_improve.id,
+                    same_branch=retry_same_branch,
+                    group=failed_improve.group,
+                    base_branch=retry_base_branch,
+                )
+                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (retry of {failed_improve.id})[/{_c_ok}]")
+            else:
+                improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task.id)
+                improve_task = store.add(
+                    prompt=improve_prompt,
+                    task_type='improve',
+                    depends_on=review_task.id,
+                    based_on=task.id,
+                    same_branch=True,
+                    group=task.group,
+                )
+                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
 
             # Spawn background worker to run the improve task
             assert improve_task.id is not None
