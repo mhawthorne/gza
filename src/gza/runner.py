@@ -1848,7 +1848,11 @@ def _setup_code_task_worktree(
         git._run("branch", "-D", branch_name, check=False)
 
     try:
-        base_ref = _select_worktree_base_ref(git, default_branch)
+        if task.base_branch:
+            base_ref = task.base_branch
+            console.print(f"Forking from branch: [blue]{base_ref}[/blue]")
+        else:
+            base_ref = _select_worktree_base_ref(git, default_branch)
         console.print(f"Creating worktree: {worktree_path}")
         git.worktree_add(worktree_path, branch_name, base_ref)
         return True

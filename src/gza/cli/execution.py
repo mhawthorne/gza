@@ -625,6 +625,16 @@ def cmd_retry(args: argparse.Namespace) -> int:
         print(f"Error: Task {task_id} already has a successful retry ({successful_retry.id}).")
         return 1
 
+    # For same_branch tasks (improve/review) that have run and have a branch,
+    # fork a new branch from the parent branch instead of reusing it.
+    # This gives the retry agent a clean start without inheriting WIP commits
+    # from the failed attempt.
+    retry_same_branch = task.same_branch
+    retry_base_branch: str | None = None
+    if task.same_branch and task.branch:
+        retry_same_branch = False
+        retry_base_branch = task.branch
+
     # Create new task copying relevant fields
     new_task = store.add(
         prompt=task.prompt,
@@ -633,12 +643,13 @@ def cmd_retry(args: argparse.Namespace) -> int:
         spec=task.spec,
         depends_on=task.depends_on,
         create_review=task.create_review,
-        same_branch=task.same_branch,
+        same_branch=retry_same_branch,
         task_type_hint=task.task_type_hint,
         based_on=task_id,  # Track retry lineage
         model=task.model,
         provider=task.provider if task.provider_is_explicit else None,
         provider_is_explicit=task.provider_is_explicit,
+        base_branch=retry_base_branch,
     )
 
     print(f"✓ Created task {new_task.id} (retry of {task_id})")

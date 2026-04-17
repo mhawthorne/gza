@@ -66,6 +66,16 @@ _TASK_ID_SEQ_WIDTH = 6
 _FULL_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """sqlite3 connection that closes when used as a context manager."""
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            super().close()
+
+
 class InvalidTaskIdError(ValueError):
     """Raised when a user-supplied task ID is not a full prefixed ID."""
 
@@ -215,6 +225,7 @@ class Task:
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
     execution_mode: str | None = None  # worker_background, worker_foreground, manual, skill_inline
+    base_branch: str | None = None  # Fork new branch from this ref instead of default branch
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -283,8 +294,13 @@ MIGRATION_V30_TO_V31 = """
 ALTER TABLE tasks ADD COLUMN execution_mode TEXT;
 """
 
+# Migration from v31 to v32: base_branch for retry forking
+MIGRATION_V31_TO_V32 = """
+ALTER TABLE tasks ADD COLUMN base_branch TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -386,7 +402,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_lines_removed INTEGER,
     review_cleared_at TEXT,
     log_schema_version INTEGER DEFAULT 1,
-    execution_mode TEXT
+    execution_mode TEXT,
+    base_branch TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -715,6 +732,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (29, MIGRATION_V28_TO_V29),
     (30, MIGRATION_V29_TO_V30),
     (31, MIGRATION_V30_TO_V31),
+    (32, MIGRATION_V31_TO_V32),
 ]
 
 
@@ -791,7 +809,12 @@ class SqliteTaskStore:
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
-        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
+        conn = sqlite3.connect(
+            self.db_path,
+            isolation_level=None,
+            timeout=5,
+            factory=_ClosingConnection,
+        )
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -857,6 +880,7 @@ class SqliteTaskStore:
                 else 1
             ),
             execution_mode=row["execution_mode"] if "execution_mode" in keys else None,
+            base_branch=row["base_branch"] if "base_branch" in keys else None,
         )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
@@ -939,6 +963,7 @@ class SqliteTaskStore:
         provider_is_explicit: bool | None = None,
         urgent: bool = False,
         skip_learnings: bool = False,
+        base_branch: str | None = None,
     ) -> Task:
         """Add a new task. Returns the created Task with its generated string ID."""
         now = datetime.now(UTC).isoformat()
@@ -948,8 +973,8 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings, base_branch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_id,
@@ -968,6 +993,7 @@ class SqliteTaskStore:
                     1 if provider_is_explicit else 0,
                     1 if urgent else 0,
                     1 if skip_learnings else 0,
+                    base_branch,
                 ),
             )
             result = self.get(new_id)
