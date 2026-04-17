@@ -1646,14 +1646,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
             assert task.id is not None
 
             # Check for existing failed improve for this impl+review pair.
-            # Retry the most recent failed one instead of creating a duplicate sibling.
+            # Resume if possible, otherwise retry — never create a duplicate sibling.
             existing_improves = store.get_improve_tasks_for(task.id, review_task.id)
             failed_improve = next(
                 (t for t in sorted(existing_improves, key=lambda t: t.created_at or datetime.min, reverse=True)
                  if t.status == "failed"),
                 None,
             )
-            if failed_improve is not None:
+            if failed_improve is not None and is_resumable_failed_task(failed_improve):
+                assert failed_improve.id is not None
+                improve_task = _create_resume_task(store, failed_improve)
+                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (resume of {failed_improve.id})[/{_c_ok}]")
+            elif failed_improve is not None:
                 assert failed_improve.id is not None
                 retry_same_branch = failed_improve.same_branch
                 retry_base_branch: str | None = None
@@ -1682,10 +1686,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 )
                 console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
 
-            # Spawn background worker to run the improve task
+            # Spawn background worker — use resume worker if this is a resume task
             assert improve_task.id is not None
             worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
+            is_resume = improve_task.session_id is not None
+            if is_resume:
+                rc = _spawn_background_resume_worker(worker_args, config, new_task_id=improve_task.id, quiet=True)
+            else:
+                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")
