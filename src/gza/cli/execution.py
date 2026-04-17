@@ -28,6 +28,7 @@ from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     DuplicateReviewError,
     _allow_pr_required_retry,
+    _auto_rebase_before_resume,
     _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
@@ -642,6 +643,11 @@ def cmd_retry(args: argparse.Namespace) -> int:
     )
 
     print(f"✓ Created task {new_task.id} (retry of {task_id})")
+
+    if task.branch and task.task_type in {"task", "implement", "improve"}:
+        rebase_exit_code = _auto_rebase_before_resume(config, task_id)
+        if rebase_exit_code != 0:
+            return rebase_exit_code
 
     # Handle background mode - spawn worker to run the new task
     if args.background:
