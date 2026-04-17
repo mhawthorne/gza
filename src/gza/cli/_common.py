@@ -263,6 +263,11 @@ def _run_foreground(
     signal.signal(signal.SIGTERM, _cleanup)
 
     try:
+        if resume and task_id is not None:
+            rebase_exit_code = _auto_rebase_before_resume(config, task_id)
+            if rebase_exit_code != 0:
+                registry.mark_completed(worker_id, exit_code=rebase_exit_code, status="failed")
+                return rebase_exit_code
         exit_code = run(
             config,
             task_id=task_id,
@@ -568,6 +573,13 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             )
             startup_header_written = True
         resume = hasattr(args, 'resume') and args.resume
+        explicit_run_task_id = args.task_ids[0] if hasattr(args, 'task_ids') and args.task_ids else None
+        if resume and explicit_run_task_id is not None:
+            rebase_exit_code = _auto_rebase_before_resume(config, explicit_run_task_id)
+            if rebase_exit_code != 0:
+                if worker_id:
+                    registry.mark_completed(worker_id, exit_code=rebase_exit_code, status="failed")
+                return rebase_exit_code
         run_kwargs: dict[str, Any] = {
             "resume": resume,
             "skip_precondition_check": getattr(args, "force", False),
@@ -1064,6 +1076,92 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     new_task.branch = original_task.branch
     store.update(new_task)
     return new_task
+
+
+def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
+    """Rebase resumable code-task branches onto the default branch before resuming."""
+    from ..git import Git, GitError, cleanup_worktree_for_branch
+
+    task = get_store(config).get(task_id)
+    if task is None or not task.branch or task.task_type not in {"task", "implement", "improve"}:
+        return 0
+
+    git = Git(config.project_dir)
+    default_branch = git.default_branch()
+    store = get_store(config)
+    rebase_task = _create_rebase_task(store, task.id or task_id, task.branch, default_branch)
+    assert rebase_task.id is not None
+    rebase_task.branch = task.branch
+    store.mark_in_progress(rebase_task)
+
+    worktree_path = config.worktree_path / str(rebase_task.id)
+    print(f"Auto-rebasing task {task.id} onto '{default_branch}' before resume...")
+    try:
+        stale_path = cleanup_worktree_for_branch(git, task.branch, force=True)
+        if stale_path:
+            print(f"Removing stale worktree at {stale_path}...")
+            print("✓ Removed worktree")
+        if worktree_path.exists():
+            git.worktree_remove(worktree_path, force=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), task.branch)
+    except GitError as e:
+        store.mark_failed(rebase_task, branch=task.branch, failure_reason="GIT_ERROR")
+        print(f"Error setting up resume rebase worktree: {e}")
+        return 1
+
+    worktree_git = Git(worktree_path)
+    try:
+        print(f"Rebasing '{task.branch}' onto '{default_branch}'...")
+        try:
+            worktree_git.rebase(default_branch)
+            output_content = f"Rebased '{task.branch}' onto '{default_branch}' before resuming {task.id}."
+        except GitError as e:
+            print(f"Conflicts detected: {e}")
+            try:
+                worktree_git.rebase_abort()
+            except GitError:
+                pass
+            from .git_ops import invoke_provider_resolve
+
+            print("Invoking provider to resolve via /gza-rebase --auto...")
+            resolved = invoke_provider_resolve(rebase_task, task.branch, default_branch, config, worktree_path=worktree_path)
+            if not resolved:
+                store.mark_failed(rebase_task, branch=task.branch, failure_reason="TEST_FAILURE")
+                print("Could not resolve resume rebase automatically.")
+                print("Use 'gza retry' to start fresh or run 'gza rebase' manually.")
+                return 1
+            print(f"Pushing {task.branch}...")
+            worktree_git.push_force_with_lease(task.branch)
+            output_content = (
+                f"Resolved conflicts and rebased '{task.branch}' onto '{default_branch}' "
+                f"before resuming {task.id}."
+            )
+
+        has_commits = _branch_has_commits(config, task.branch)
+        store.mark_completed(
+            rebase_task,
+            branch=task.branch,
+            output_content=output_content,
+            has_commits=has_commits,
+        )
+        if task.id is not None:
+            store.invalidate_review_state(task.id)
+            parent = store.get(task.id)
+            if parent and parent.id is not None and parent.merge_status == "merged":
+                store.set_merge_status(parent.id, "unmerged")
+        print(f"✓ Auto-rebased {task.branch} onto {default_branch}")
+        print()
+        return 0
+    finally:
+        try:
+            git.worktree_remove(worktree_path, force=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def run_with_resume(
