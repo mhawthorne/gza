@@ -308,7 +308,7 @@ class TestBuildLineage:
 
         store.get_lineage_children.side_effect = lineage_children
         tree = build_lineage_tree(store, root)
-        assert [child.relationship for child in tree.children] == ["review", "implement-based"]
+        assert [child.relationship for child in tree.children] == ["review", "retry"]
 
     def test_tree_defers_cross_parent_improve_to_review_parent(self):
         store = MagicMock()

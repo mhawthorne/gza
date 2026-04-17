@@ -1024,12 +1024,16 @@ def _format_lineage(
 
         return f" [{lc.annotation}]({completed_label} | {status_label} | {verdict_label})[/{lc.annotation}]"
 
-    def _node_label(task: DbTask) -> str:
+    def _node_label(task: DbTask, relationship: str = "root") -> str:
+        rel_suffix = ""
+        if relationship in ("resume", "retry"):
+            rel_suffix = f" [{lc.task_type}]\\[{relationship}][/{lc.task_type}]"
         if task.id is None:
-            return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{_annotation(task)}"
+            return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{rel_suffix}{_annotation(task)}"
         return (
             f"[{_task_id_color}]{task.id}[/{_task_id_color}]"
             f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]"
+            f"{rel_suffix}"
             f"{_annotation(task)}"
         )
 
@@ -1039,7 +1043,7 @@ def _format_lineage(
         for index, child in enumerate(node.children):
             is_last = index == (len(node.children) - 1)
             branch = "└── " if is_last else "├── "
-            lines.append(f"{prefix}{branch}{_node_label(child.task)}")
+            lines.append(f"{prefix}{branch}{_node_label(child.task, child.relationship)}")
             next_prefix = f"{prefix}{'    ' if is_last else '│   '}"
             _walk(child, next_prefix)
 

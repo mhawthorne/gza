@@ -70,7 +70,8 @@ _LINEAGE_REL_LABELS: dict[str, str] = {
     "implement-based": "implement",
     "depends-and-based": "retry",
     "depends": "depends",
-    "based": "retry",
+    "retry": "retry",
+    "resume": "resume",
     # Relationships not in this map (e.g. "plan", "explore", "task", "internal")
     # silently produce no label — this is intentional for unusual/unknown relationships.
 }
