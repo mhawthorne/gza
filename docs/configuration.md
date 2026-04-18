@@ -814,6 +814,19 @@ gza history [options]
 | `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 
+### search
+
+Search task prompt text by substring across all task statuses.
+
+```bash
+gza search <term> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `term` | Substring to match in task prompt text |
+| `--last N`, `-n N` | Show last N matching tasks (default: 10, `0` for all matches) |
+
 ### checkout
 
 Checkout a task's branch, removing any stale worktree if needed.

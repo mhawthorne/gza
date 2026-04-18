@@ -163,6 +163,17 @@ class TestHelpOutput:
         assert "--pr" in docs_text
         assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
 
+    def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
+        """`search --help` should describe prompt-only substring matching."""
+        setup_config(tmp_path)
+
+        result = run_gza("search", "--help", "--project", str(tmp_path))
+        normalized_output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "Substring to match in task prompt text" in normalized_output
+        assert "Show last N matching tasks" in normalized_output
+
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
 

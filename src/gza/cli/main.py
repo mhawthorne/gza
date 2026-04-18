@@ -70,12 +70,24 @@ from .query import (
     cmd_lineage,
     cmd_next,
     cmd_ps,
+    cmd_search,
     cmd_show,
     cmd_status,
     cmd_unmerged,
 )
 from .tv import cmd_tv
 from .watch import cmd_queue, cmd_watch
+
+
+def _parse_search_last(value: str) -> int:
+    """Parse `search --last` where 0 means unlimited and negatives are invalid."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--last must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all matches)")
+    return parsed
 
 
 def main() -> int:
@@ -193,6 +205,26 @@ def main() -> int:
             "Render root-deduplicated lineage trees up to N levels from each "
             "resolved root"
         ),
+    )
+
+    # search command
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search task prompts by substring",
+    )
+    add_common_args(search_parser)
+    search_parser.add_argument(
+        "term",
+        type=str,
+        help="Substring to match in task prompt text",
+    )
+    search_parser.set_defaults(last=10)
+    search_parser.add_argument(
+        "--last",
+        "-n",
+        type=_parse_search_last,
+        metavar="N",
+        help="Show last N matching tasks (default: 10, 0 for all)",
     )
 
     # unmerged command
@@ -1593,6 +1625,8 @@ def main() -> int:
             return cmd_next(args)
         elif args.command == "history":
             return cmd_history(args)
+        elif args.command == "search":
+            return cmd_search(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
         elif args.command == "advance":
