@@ -42,6 +42,7 @@ from ._common import (
     get_store,
     get_task_step_count,
     resolve_id,
+    resolve_improve_action,
     run_with_resume,
     set_task_urgency,
 )
@@ -1559,52 +1560,56 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             review_task = action["review_task"]
             review_row_task = review_task
             review_row_verdict = get_review_verdict(config, review_task)
-            # Guard against improves with statuses the engine can't reconcile
-            # (e.g. failed, dropped). The engine only considers pending / in_progress
-            # in context; creating a fresh improve here would mask operator attention.
             assert impl_task.id is not None
             assert review_task.id is not None
-            sibling_improves = store.get_improve_tasks_for(impl_task.id, review_task.id)
-            unexpected = [
-                t for t in sibling_improves
-                if t.status not in {"pending", "in_progress", "completed"}
-            ]
-            if unexpected:
-                statuses = sorted({t.status for t in unexpected if t.status})
-                print(f"  Unexpected improve status(es) for review {review_task.id}: {', '.join(statuses)}")
-                final_status = "blocked"
-                final_stop_reason = "improve_unexpected_state. Manual review required."
-                _append_summary_row(
-                    summary_rows,
-                    iteration_index=iteration,
-                    task_type="review",
-                    task=review_row_task,
-                    verdict=review_row_verdict,
+
+            # Use shared logic to decide resume/retry/new for this impl+review pair
+            improve_action, failed_improve = resolve_improve_action(store, impl_task.id, review_task.id)
+            if improve_action == "resume" and failed_improve is not None:
+                assert failed_improve.id is not None
+                action_task = _create_resume_task(store, failed_improve)
+                print(f"  Created improve task {action_task.id} (resume of {failed_improve.id})")
+            elif improve_action == "retry" and failed_improve is not None:
+                assert failed_improve.id is not None
+                retry_same_branch = failed_improve.same_branch
+                retry_base_branch: str | None = None
+                if failed_improve.same_branch and failed_improve.branch:
+                    retry_same_branch = False
+                    retry_base_branch = failed_improve.branch
+                action_task = store.add(
+                    prompt=failed_improve.prompt,
+                    task_type='improve',
+                    depends_on=failed_improve.depends_on,
+                    based_on=failed_improve.id,
+                    same_branch=retry_same_branch,
+                    group=failed_improve.group,
+                    base_branch=retry_base_branch,
                 )
-                break
-            try:
-                action_task = _create_improve_task(store, impl_task, review_task)
-            except ValueError as e:
-                print(f"  Error creating improve task: {e}")
-                final_status = "blocked"
-                final_stop_reason = "improve_failed"
-                if review_row_task is not None:
+                print(f"  Created improve task {action_task.id} (retry of {failed_improve.id})")
+            else:
+                try:
+                    action_task = _create_improve_task(store, impl_task, review_task)
+                except ValueError as e:
+                    print(f"  Error creating improve task: {e}")
+                    final_status = "blocked"
+                    final_stop_reason = "improve_failed"
+                    if review_row_task is not None:
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="review",
+                            task=review_row_task,
+                            verdict=review_row_verdict,
+                        )
                     _append_summary_row(
                         summary_rows,
                         iteration_index=iteration,
-                        task_type="review",
-                        task=review_row_task,
-                        verdict=review_row_verdict,
+                        task_type="improve",
+                        task=None,
+                        status="failed",
+                        failure_reason=str(e),
                     )
-                _append_summary_row(
-                    summary_rows,
-                    iteration_index=iteration,
-                    task_type="improve",
-                    task=None,
-                    status="failed",
-                    failure_reason=str(e),
-                )
-                break
+                    break
             assert action_task.id is not None
             print(f"  Running improve {action_task.id}...")
         elif action_type == "run_improve":

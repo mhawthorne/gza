@@ -48,6 +48,7 @@ from ._common import (
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
     resolve_id,
+    resolve_improve_action,
 )
 from .advance_engine import determine_next_action, is_resumable_failed_task
 
@@ -1453,7 +1454,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
-            if action['type'] == 'merge':
+            if action['type'] == 'improve':
+                review_task = action.get('review_task')
+                if review_task is not None and task.id is not None and review_task.id is not None:
+                    improve_action, failed_task = resolve_improve_action(store, task.id, review_task.id)
+                    if improve_action == "resume" and failed_task is not None:
+                        description = f"Resume improve {failed_task.id} (failed: {failed_task.failure_reason or 'UNKNOWN'})"
+                    elif improve_action == "retry" and failed_task is not None:
+                        description = f"Retry improve {failed_task.id} (failed: {failed_task.failure_reason or 'UNKNOWN'})"
+            elif action['type'] == 'merge':
                 commit_count = _auto_squash_commit_count(config, git, task, target_branch)
                 if commit_count is not None:
                     description = f"{description} (auto-squash, {commit_count} commits)"
@@ -1647,17 +1656,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
             # Check for existing failed improve for this impl+review pair.
             # Resume if possible, otherwise retry — never create a duplicate sibling.
-            existing_improves = store.get_improve_tasks_for(task.id, review_task.id)
-            failed_improve = next(
-                (t for t in sorted(existing_improves, key=lambda t: t.created_at or datetime.min, reverse=True)
-                 if t.status == "failed"),
-                None,
-            )
-            if failed_improve is not None and is_resumable_failed_task(failed_improve):
+            improve_action, failed_improve = resolve_improve_action(store, task.id, review_task.id)
+            if improve_action == "resume" and failed_improve is not None:
                 assert failed_improve.id is not None
                 improve_task = _create_resume_task(store, failed_improve)
                 console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (resume of {failed_improve.id})[/{_c_ok}]")
-            elif failed_improve is not None:
+            elif improve_action == "retry" and failed_improve is not None:
                 assert failed_improve.id is not None
                 retry_same_branch = failed_improve.same_branch
                 retry_base_branch: str | None = None

@@ -913,6 +913,31 @@ def _create_review_task(
     )
 
 
+def resolve_improve_action(
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    review_task_id: str,
+) -> tuple[str, DbTask | None]:
+    """Determine the right improve action for an impl+review pair.
+
+    Returns:
+        ("new", None) — no existing improve, create fresh
+        ("resume", failed_task) — resumable failed improve exists
+        ("retry", failed_task) — non-resumable failed improve exists
+    """
+    from ..resume_policy import is_resumable_failed_task
+
+    existing = store.get_improve_tasks_for(impl_task_id, review_task_id)
+    failed_improves = [t for t in existing if t.status == "failed"]
+    if not failed_improves:
+        return ("new", None)
+
+    latest_failed = max(failed_improves, key=lambda t: t.created_at or datetime.min)
+    if is_resumable_failed_task(latest_failed):
+        return ("resume", latest_failed)
+    return ("retry", latest_failed)
+
+
 def _create_improve_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
