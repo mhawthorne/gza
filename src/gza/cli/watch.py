@@ -724,6 +724,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
     idle_seconds = 0
     previous_snapshot = _task_snapshot(store)
 
+    # Preview first cycle and ask for confirmation before executing
+    skip_confirm = dry_run or bool(getattr(args, "yes", False))
+    if not skip_confirm:
+        preview_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=batch,
+            max_iterations=max_iterations,
+            dry_run=True,
+            quiet=False,
+            log=log,
+        )
+        if preview_result.work_done:
+            try:
+                answer = input("\nProceed? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if answer not in ("y", "yes"):
+                print("Aborted.")
+                return 0
+
     try:
         while True:
             if stop_requested:
