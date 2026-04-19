@@ -1831,20 +1831,34 @@ class SqliteTaskStore:
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_improve_tasks_for(self, impl_task_id: str, review_task_id: str) -> list[Task]:
-        """Get improve tasks that match the given implementation and review task IDs."""
+        """Get all improve tasks for an (impl, review) pair, including retry/resume chains.
+
+        Filters by depends_on=review_task_id (all improves for a review share this)
+        rather than based_on=impl_task_id, which only finds first-generation improves
+        and misses retries/resumes whose based_on points at the previous improve.
+        The impl_task_id argument is accepted for call-site clarity but not used in
+        the query since (review_task.depends_on == impl_task_id) already constrains
+        results to this impl.
+        """
+        del impl_task_id  # retained for API compatibility; see docstring
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE task_type = 'improve' AND based_on = ? AND depends_on = ?
+                WHERE task_type = 'improve' AND depends_on = ?
                 ORDER BY created_at DESC
                 """,
-                (impl_task_id, review_task_id),
+                (review_task_id,),
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_improve_tasks_by_root(self, root_task_id: str) -> list[Task]:
-        """Get all improve tasks whose based_on points to root_task_id.
+        """Get all improve tasks transitively rooted at root_task_id.
+
+        Walks the based_on chain so retry/resume improves (which set based_on to
+        the previous improve, not the impl) are included. See
+        ``docs/internal/advance-workflow.md`` (Improve chain semantics) for the
+        invariant.
 
         This remains for review/improve workflow logic; lineage display should
         use get_lineage_children() via gza.query.build_lineage_tree().
@@ -1852,9 +1866,15 @@ class SqliteTaskStore:
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT * FROM tasks
-                WHERE task_type = 'improve' AND based_on = ?
-                ORDER BY created_at DESC
+                WITH RECURSIVE improve_chain AS (
+                    SELECT * FROM tasks
+                    WHERE task_type = 'improve' AND based_on = ?
+                    UNION ALL
+                    SELECT t.* FROM tasks t
+                    JOIN improve_chain ic ON t.based_on = ic.id
+                    WHERE t.task_type = 'improve'
+                )
+                SELECT * FROM improve_chain ORDER BY created_at DESC
                 """,
                 (root_task_id,),
             )
