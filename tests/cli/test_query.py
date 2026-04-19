@@ -5172,3 +5172,37 @@ class TestIncompleteCommand:
         assert result.returncode == 0
         assert "No unresolved task lineages" in result.stdout
         assert "Failed implement root" not in result.stdout
+
+    def test_incomplete_last_zero_shows_all_matching_lineages(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        for index in range(3):
+            task = store.add(f"Unresolved lineage {index}", task_type="implement")
+            task.status = "failed"
+            task.completed_at = datetime.now(UTC)
+            task.failure_reason = "TEST_FAILURE"
+            store.update(task)
+
+        result = run_gza("incomplete", "--last", "0", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Unresolved lineage 0" in result.stdout
+        assert "Unresolved lineage 1" in result.stdout
+        assert "Unresolved lineage 2" in result.stdout
+
+    def test_incomplete_last_rejects_negative_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--last", "-1", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "--last must be >= 0 (use 0 for all unresolved lineages)" in result.stderr
+
+    def test_incomplete_days_rejects_negative_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--days", "-1", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "value must be >= 0" in result.stderr

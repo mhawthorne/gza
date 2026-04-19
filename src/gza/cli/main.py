@@ -91,6 +91,28 @@ def _parse_search_last(value: str) -> int:
     return parsed
 
 
+def _parse_incomplete_last(value: str) -> int:
+    """Parse `incomplete --last` where 0 means unlimited and negatives are invalid."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--last must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all unresolved lineages)")
+    return parsed
+
+
+def _parse_non_negative_int(value: str) -> int:
+    """Parse integer flags that must be zero or positive."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
 def main() -> int:
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
@@ -238,9 +260,9 @@ def main() -> int:
     incomplete_parser.add_argument(
         "--last",
         "-n",
-        type=int,
+        type=_parse_incomplete_last,
         metavar="N",
-        help="Show last N unresolved lineages",
+        help="Show last N unresolved lineages (0 for all)",
     )
     incomplete_parser.add_argument(
         "--type",
@@ -250,7 +272,7 @@ def main() -> int:
     )
     incomplete_parser.add_argument(
         "--days",
-        type=int,
+        type=_parse_non_negative_int,
         metavar="N",
         help="Show only unresolved lineages with activity in the last N days",
     )

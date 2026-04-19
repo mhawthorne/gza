@@ -548,6 +548,8 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     task_type = getattr(args, "type", None)
     days = getattr(args, "days", None)
     limit = getattr(args, "last", None)
+    if limit == 0:
+        limit = None
 
     filters = HistoryFilter(
         limit=limit,
