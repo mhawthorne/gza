@@ -1187,6 +1187,46 @@ class TestGetReviewsForTask:
         assert reviews[0].id == review.id
 
 
+class TestGetImproveTasksByRoot:
+    """Tests for get_improve_tasks_by_root — must walk retry/resume chains."""
+
+    def test_direct_improves_are_returned(self, tmp_path: Path):
+        """A first-generation improve (based_on=impl) is returned."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Impl", task_type="implement")
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        improve = store.add("Improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+
+        results = store.get_improve_tasks_by_root(impl.id)
+        assert [t.id for t in results] == [improve.id]
+
+    def test_chained_retry_resume_improves_are_returned(self, tmp_path: Path):
+        """Retries/resumes whose based_on points at the previous improve are included."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Impl", task_type="implement")
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        improve1 = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        improve2 = store.add("Improve 2 (retry)", task_type="improve", based_on=improve1.id, depends_on=review.id)
+        improve3 = store.add("Improve 3 (resume)", task_type="improve", based_on=improve2.id, depends_on=review.id)
+
+        results = store.get_improve_tasks_by_root(impl.id)
+        returned_ids = {t.id for t in results}
+        assert returned_ids == {improve1.id, improve2.id, improve3.id}
+
+    def test_unrelated_improves_are_excluded(self, tmp_path: Path):
+        """An improve rooted at a different impl is not returned."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_a = store.add("Impl A", task_type="implement")
+        impl_b = store.add("Impl B", task_type="implement")
+        review_a = store.add("Review A", task_type="review", depends_on=impl_a.id)
+        review_b = store.add("Review B", task_type="review", depends_on=impl_b.id)
+        improve_a = store.add("Improve A", task_type="improve", based_on=impl_a.id, depends_on=review_a.id)
+        store.add("Improve B", task_type="improve", based_on=impl_b.id, depends_on=review_b.id)
+
+        results = store.get_improve_tasks_by_root(impl_a.id)
+        assert [t.id for t in results] == [improve_a.id]
+
+
 class TestMergeStatus:
     """Tests for merge_status field and related functionality."""
 
@@ -3852,7 +3892,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -3864,7 +3904,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -4391,7 +4431,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

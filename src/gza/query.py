@@ -196,6 +196,13 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
     if parent_id is None:
         return "child"
 
+    # Detect resume/retry first: same task_type + based_on pointing to parent
+    # indicates a re-execution of the same work, not a lifecycle transition.
+    if child.based_on == parent_id and child.task_type == parent.task_type:
+        if child.session_id and child.session_id == parent.session_id:
+            return "resume"
+        return "retry"
+
     if child.task_type == "review" and child.depends_on == parent_id:
         return "review"
     if child.task_type == "improve" and child.depends_on == parent_id:
@@ -211,7 +218,7 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
     if child.depends_on == parent_id:
         return "depends"
     if child.based_on == parent_id:
-        return "based"
+        return "retry"
     return child.task_type
 
 
@@ -226,7 +233,8 @@ def _lineage_child_sort_key(parent: Task, child: Task) -> tuple[int, datetime, i
         "improve": 4,
         "depends-and-based": 5,
         "depends": 6,
-        "based": 7,
+        "retry": 7,
+        "resume": 7,
     }.get(relation, 8)
 
     child_time = _normalize_lineage_time(task_time_for_lineage(child))

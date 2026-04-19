@@ -1848,7 +1848,11 @@ def _setup_code_task_worktree(
         git._run("branch", "-D", branch_name, check=False)
 
     try:
-        base_ref = _select_worktree_base_ref(git, default_branch)
+        if task.base_branch:
+            base_ref = task.base_branch
+            console.print(f"Forking from branch: [blue]{base_ref}[/blue]")
+        else:
+            base_ref = _select_worktree_base_ref(git, default_branch)
         console.print(f"Creating worktree: {worktree_path}")
         git.worktree_add(worktree_path, branch_name, base_ref)
         return True
@@ -2067,6 +2071,20 @@ def _complete_code_task(
     )
 
 
+def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
+    """Walk up an improve's based_on chain until a non-improve (impl) ancestor is found.
+
+    Retry/resume improves set based_on to the previous improve, not the impl task —
+    so a single hop can land on another improve. Returns None if no ancestor exists.
+    """
+    current: Task | None = task
+    while current is not None and current.task_type == "improve" and current.based_on:
+        current = store.get(current.based_on)
+    if current is None or current.task_type == "improve":
+        return None
+    return current
+
+
 def _post_complete_code_task(
     task: Task,
     config: Config,
@@ -2078,16 +2096,17 @@ def _post_complete_code_task(
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
-    # Clear review state on the based_on implementation task after improve completes.
+    # Clear review state on the implementation task after improve completes.
     # The improve task has addressed the review feedback, so the old review no longer
     # reflects the current code state.
-    if task.task_type == "improve" and task.based_on:
-        store.clear_review_state(task.based_on)
-        # If parent was already merged, flip it back to unmerged — the improve
-        # task added commits to the shared branch after the merge.
-        parent = store.get(task.based_on)
-        if parent and parent.id is not None and parent.merge_status == "merged":
-            store.set_merge_status(parent.id, "unmerged")
+    if task.task_type == "improve":
+        impl_ancestor = _resolve_impl_ancestor(store, task)
+        if impl_ancestor is not None and impl_ancestor.id is not None:
+            store.clear_review_state(impl_ancestor.id)
+            # If parent was already merged, flip it back to unmerged — the improve
+            # task added commits to the shared branch after the merge.
+            if impl_ancestor.merge_status == "merged":
+                store.set_merge_status(impl_ancestor.id, "unmerged")
 
     # Invalidate review state after rebase completes, since conflict resolution
     # may have introduced changes not covered by prior reviews.

@@ -58,7 +58,7 @@ fallback-version = "0.1.0.dev0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-n auto --dist loadscope"
+addopts = ""
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",
 ]

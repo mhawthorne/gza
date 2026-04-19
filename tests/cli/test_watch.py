@@ -1438,6 +1438,7 @@ def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
         max_iterations=10,
         dry_run=False,
         quiet=True,
+        yes=True,
     )
 
     with (
@@ -1502,6 +1503,7 @@ def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
         max_iterations=10,
         dry_run=False,
         quiet=True,
+        yes=True,
     )
 
     def fake_spawn_iterate(_args, _config, impl_task, *, quiet=False):
@@ -1683,6 +1685,7 @@ def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:
         max_iterations=10,
         dry_run=False,
         quiet=True,
+        yes=True,
     )
 
     handlers: dict[int, object] = {}

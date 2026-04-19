@@ -1859,6 +1859,7 @@ class TestLearningsCommand:
 
     def test_learnings_update_generates_file(self, tmp_path: Path):
         """gza learnings update writes .gza/learnings.md from completed tasks."""
+        from unittest.mock import patch
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1866,7 +1867,8 @@ class TestLearningsCommand:
         task = store.add("Implement testing flow", task_type="implement")
         store.mark_completed(task, output_content="- Use dedicated fixtures for tests\n", has_commits=False)
 
-        result = run_gza("learnings", "update", "--project", str(tmp_path))
+        with patch("gza.learnings._run_learnings_task", return_value=None):
+            result = run_gza("learnings", "update", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Updated learnings" in result.stdout

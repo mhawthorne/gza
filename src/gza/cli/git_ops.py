@@ -48,6 +48,7 @@ from ._common import (
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
     resolve_id,
+    resolve_improve_action,
 )
 from .advance_engine import determine_next_action, is_resumable_failed_task
 
@@ -1453,7 +1454,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
-            if action['type'] == 'merge':
+            if action['type'] == 'improve':
+                review_task = action.get('review_task')
+                if review_task is not None and task.id is not None and review_task.id is not None:
+                    improve_action, failed_improve = resolve_improve_action(store, task.id, review_task.id)
+                    if improve_action == "resume" and failed_improve is not None:
+                        description = f"Resume improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
+                    elif improve_action == "retry" and failed_improve is not None:
+                        description = f"Retry improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
+            elif action['type'] == 'merge':
                 commit_count = _auto_squash_commit_count(config, git, task, target_branch)
                 if commit_count is not None:
                     description = f"{description} (auto-squash, {commit_count} commits)"
@@ -1643,23 +1652,52 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif action_type == 'improve':
             review_task = action['review_task']
             assert review_task.id is not None
+            assert task.id is not None
 
-            from ..prompts import PromptBuilder
-            improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task.id)
-            improve_task = store.add(
-                prompt=improve_prompt,
-                task_type='improve',
-                depends_on=review_task.id,
-                based_on=task.id,
-                same_branch=True,
-                group=task.group,
-            )
-            console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
+            # Check for existing failed improve for this impl+review pair.
+            # Resume if possible, otherwise retry — never create a duplicate sibling.
+            improve_action, failed_improve = resolve_improve_action(store, task.id, review_task.id)
+            if improve_action == "resume" and failed_improve is not None:
+                assert failed_improve.id is not None
+                improve_task = _create_resume_task(store, failed_improve)
+                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (resume of {failed_improve.id})[/{_c_ok}]")
+            elif improve_action == "retry" and failed_improve is not None:
+                assert failed_improve.id is not None
+                retry_same_branch = failed_improve.same_branch
+                retry_base_branch: str | None = None
+                if failed_improve.same_branch and failed_improve.branch:
+                    retry_same_branch = False
+                    retry_base_branch = failed_improve.branch
+                improve_task = store.add(
+                    prompt=failed_improve.prompt,
+                    task_type='improve',
+                    depends_on=failed_improve.depends_on,
+                    based_on=failed_improve.id,
+                    same_branch=retry_same_branch,
+                    group=failed_improve.group,
+                    base_branch=retry_base_branch,
+                )
+                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (retry of {failed_improve.id})[/{_c_ok}]")
+            else:
+                improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task.id)
+                improve_task = store.add(
+                    prompt=improve_prompt,
+                    task_type='improve',
+                    depends_on=review_task.id,
+                    based_on=task.id,
+                    same_branch=True,
+                    group=task.group,
+                )
+                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
 
-            # Spawn background worker to run the improve task
+            # Spawn background worker — use resume worker if this is a resume task
             assert improve_task.id is not None
             worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
+            is_resume = improve_task.session_id is not None
+            if is_resume:
+                rc = _spawn_background_resume_worker(worker_args, config, new_task_id=improve_task.id, quiet=True)
+            else:
+                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
             workers_started += 1
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")

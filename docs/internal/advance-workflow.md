@@ -106,6 +106,17 @@ Conflict detection uses the currently checked-out branch as the merge target (`t
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
 | Verdict = unknown | `needs_discussion` — manual intervention |
 
+When the engine emits `improve`, the caller (iterate) delegates to `resolve_improve_action(store, impl_id, review_id, max_resume_attempts)` to pick one of:
+
+| Condition | Sub-action |
+|-----------|-----------|
+| No prior failed improve for this (impl, review) | `new` — create a fresh improve |
+| Latest failed improve is resumable (`MAX_STEPS`/`MAX_TURNS`/`TIMEOUT`) AND prior attempts `<` cap | `resume` — reopen the failed improve's session |
+| Latest failed improve is not resumable AND prior attempts `<` cap | `retry` — fork a new branch from the previous improve |
+| Prior failed attempts `>=` `max_resume_attempts` | `give_up` — stop iterating; surface `max_improve_attempts` as the stop reason |
+
+The cap counts **all** failed improves for this (impl, review) pair, including chained retries/resumes (see *Improve chain semantics* below), so it protects against unbounded loops when a fix on `main` is needed to break a persistent TIMEOUT.
+
 ### 6. No reviews / all cleared
 
 | Condition | Action |
@@ -129,6 +140,20 @@ Failed task resume rules run in the same ordered rule engine.
 |-----------|--------|
 | Resume chain depth >= `max_resume_attempts` | `skip` |
 | Otherwise | `resume` — create resume task and spawn worker |
+
+## Improve chain semantics
+
+A single (impl, review) pair can produce a **chain** of improve tasks — the original improve plus any retries or resumes of it. The chain's shape:
+
+- **depends_on** is stable across the chain. Every improve in the chain sets `depends_on = review.id`. This is the canonical link between an improve and the review that prompted it.
+- **based_on** points to the *previous* task in the chain:
+  - The original improve: `based_on = impl.id`
+  - A retry of an improve: `based_on = failed_improve.id` (the improve being retried, *not* the impl)
+  - A resume of an improve: `based_on = failed_improve.id` (same)
+
+Implication for queries: **to find all improves for an (impl, review) pair, filter by `depends_on = review.id`, not by `based_on = impl.id`.** Filtering by `based_on = impl.id` only finds first-generation improves and misses every retry/resume. This has been the root cause of multiple bugs where iterate or the engine couldn't "see" chained work (e.g. keeping the review state dirty because a completed retry wasn't counted as addressing the review).
+
+Likewise, post-completion side effects that logically target "the impl this improve belongs to" must walk up the `based_on` chain until a non-improve ancestor is found, because `task.based_on` on a retry/resume points at the previous improve, not the impl. The helper `runner._resolve_impl_ancestor()` encapsulates this walk.
 
 ## Action Types
 

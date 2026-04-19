@@ -383,6 +383,11 @@ def main() -> int:
         action="store_true",
         help="Write events to .gza/watch.log only",
     )
+    watch_parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Skip confirmation prompt before first cycle",
+    )
 
     # queue command
     queue_parser = subparsers.add_parser(

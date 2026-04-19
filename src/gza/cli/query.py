@@ -70,7 +70,8 @@ _LINEAGE_REL_LABELS: dict[str, str] = {
     "implement-based": "implement",
     "depends-and-based": "retry",
     "depends": "depends",
-    "based": "retry",
+    "retry": "retry",
+    "resume": "resume",
     # Relationships not in this map (e.g. "plan", "explore", "task", "internal")
     # silently produce no label — this is intentional for unusual/unknown relationships.
 }
@@ -1488,10 +1489,14 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         stats = format_stats(t)
         stats_part = f" [{lc.stats}]({stats})[/{lc.stats}]" if stats else ""
 
+        when = t.completed_at or t.started_at or t.created_at
+        when_part = f" [{lc.annotation}]({when.strftime('%Y-%m-%d %H:%M')})[/{lc.annotation}]" if when else ""
+
         status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
 
         label = (
             f"[{lc.task_id}]{t.id}[/{lc.task_id}]"
+            f"{when_part}"
             f" [{lc.type_label}]{rich_escape(type_str)}[/{lc.type_label}]"
             f" [{status_color}]{rich_escape(status)}[/{status_color}]"
             f"{rel_part}"
