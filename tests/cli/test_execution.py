@@ -7435,6 +7435,38 @@ class TestGetReviewVerdict:
         assert get_review_verdict(config, task) == "APPROVED"
 
 
+class TestResolveImplAncestor:
+    """Tests for runner._resolve_impl_ancestor walking improve based_on chains."""
+
+    def test_resolve_impl_ancestor_direct_improve(self, tmp_path: Path):
+        """A first-generation improve (based_on=impl) resolves to the impl."""
+        from gza.runner import _resolve_impl_ancestor
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Impl", task_type="implement")
+        improve = store.add("Improve", task_type="improve", based_on=impl.id)
+
+        ancestor = _resolve_impl_ancestor(store, improve)
+        assert ancestor is not None
+        assert ancestor.id == impl.id
+
+    def test_resolve_impl_ancestor_chained_improves(self, tmp_path: Path):
+        """A chained retry/resume improve (based_on=previous_improve) still resolves to the impl."""
+        from gza.runner import _resolve_impl_ancestor
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Impl", task_type="implement")
+        improve1 = store.add("Improve 1", task_type="improve", based_on=impl.id)
+        improve2 = store.add("Improve 2 (retry)", task_type="improve", based_on=improve1.id)
+        improve3 = store.add("Improve 3 (retry of retry)", task_type="improve", based_on=improve2.id)
+
+        ancestor = _resolve_impl_ancestor(store, improve3)
+        assert ancestor is not None
+        assert ancestor.id == impl.id
+
+
 class TestClearReviewState:
     """Tests for SqliteTaskStore.clear_review_state()."""
 
