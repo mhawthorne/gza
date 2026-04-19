@@ -40,6 +40,7 @@ from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_i
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
+    _LINEAGE_REL_LABELS,
     HistoryFilter,
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
@@ -66,22 +67,8 @@ from ._common import (
     resolve_id,
 )
 
-_LINEAGE_REL_LABELS: dict[str, str] = {
-    "review": "review",
-    "improve-from-review": "improve",
-    "improve": "improve",
-    "implement-depends": "implement",
-    "implement-based": "implement",
-    "depends-and-based": "retry",
-    "depends": "depends",
-    "retry": "retry",
-    "resume": "resume",
-    # Relationships not in this map (e.g. "plan", "explore", "task", "internal")
-    # silently produce no label — this is intentional for unusual/unknown relationships.
-}
-
-
-_HISTORY_STATUS_WIDTH = 9  # "completed"
+_HISTORY_STATUS_LABELS = ("completed", "failed", "dropped", "pending", "in_progress", "unmerged")
+_HISTORY_STATUS_WIDTH = max(len(label) for label in _HISTORY_STATUS_LABELS)
 
 
 def _task_shares_parent_branch(task: DbTask, parent_task: DbTask | None) -> bool:
@@ -181,6 +168,15 @@ def _render_history_task_line(
         elif task.status == "completed":
             status_label = "completed"
             status_color = c['success']
+        elif task.status == "pending":
+            status_label = "pending"
+            status_color = _colors.STATUS_COLORS_DICT.get("pending", c['header'])
+        elif task.status == "in_progress":
+            status_label = "in_progress"
+            status_color = _colors.STATUS_COLORS_DICT.get("in_progress", c['header'])
+        elif task.status == "unmerged":
+            status_label = "unmerged"
+            status_color = c['unmerged']
         elif task.status == "dropped":
             status_label = "dropped"
             status_color = c['failure']

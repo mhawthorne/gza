@@ -530,3 +530,39 @@ class TestQueryIncomplete:
         # Root is unresolved, so the unmerged completed retry is suppressed
         # from the displayed attention rows — the root itself is the attention item.
         assert unresolved_ids == {first.id}
+
+    def test_failed_root_is_not_suppressed_by_completed_improve_descendant(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("failed implement", task_type="implement")
+        self._fail(root)
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("completed improve", task_type="improve", based_on=root.id, same_branch=True)
+        self._complete(improve, merge_status="merged")
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == root.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id}
+
+    def test_unmerged_root_is_not_suppressed_by_merged_improve_descendant(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("unmerged implement", task_type="implement")
+        self._complete(root, merge_status="unmerged")
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("merged improve", task_type="improve", based_on=root.id, same_branch=True)
+        self._complete(improve, merge_status="merged")
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == root.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id}

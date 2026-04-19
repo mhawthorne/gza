@@ -4761,6 +4761,15 @@ class TestLineageCommand:
         # "[depends]" in stdout catches silent text loss of the relationship label
         assert "[depends]" in result.stdout
 
+    def test_cli_lineage_uses_shared_relationship_label_map(self):
+        from gza import query as query_module
+        from gza.cli import query as cli_query
+
+        cli_query_path = Path(cli_query.__file__)
+
+        assert cli_query._LINEAGE_REL_LABELS is query_module._LINEAGE_REL_LABELS
+        assert "_LINEAGE_REL_LABELS:" not in cli_query_path.read_text()
+
 
 class TestPsSortKey:
     """Tests for _ps_sort_key sort-key function."""
@@ -5106,3 +5115,60 @@ class TestIncompleteCommand:
         assert result.returncode == 0
         assert "No unresolved task lineages" in result.stdout
         assert "Plan complete" not in result.stdout
+
+    def test_incomplete_days_filter_hides_old_failed_root_with_recent_merged_retry(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Old failed root", task_type="implement")
+        root.status = "failed"
+        root.created_at = datetime.now(UTC) - timedelta(days=30)
+        root.completed_at = datetime.now(UTC) - timedelta(days=30)
+        root.failure_reason = "TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        retry = store.add("Recent merged retry", task_type="implement", based_on=root.id)
+        retry.status = "completed"
+        retry.created_at = datetime.now(UTC) - timedelta(hours=12)
+        retry.completed_at = datetime.now(UTC) - timedelta(hours=12)
+        retry.has_commits = True
+        retry.merge_status = "merged"
+        store.update(retry)
+
+        result = run_gza("incomplete", "--days", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unresolved task lineages" in result.stdout
+        assert "Old failed root" not in result.stdout
+
+    def test_incomplete_type_filter_hides_failed_root_when_same_type_retry_succeeds(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Failed implement root", task_type="implement")
+        root.status = "failed"
+        root.completed_at = datetime.now(UTC) - timedelta(hours=2)
+        root.failure_reason = "TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("Intervening improve", task_type="improve", based_on=root.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime.now(UTC) - timedelta(hours=1)
+        improve.has_commits = True
+        improve.merge_status = "unmerged"
+        store.update(improve)
+
+        retry = store.add("Successful implement retry", task_type="implement", based_on=root.id)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(UTC)
+        retry.has_commits = True
+        retry.merge_status = "merged"
+        store.update(retry)
+
+        result = run_gza("incomplete", "--type", "implement", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unresolved task lineages" in result.stdout
+        assert "Failed implement root" not in result.stdout

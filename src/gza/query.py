@@ -160,36 +160,34 @@ def _is_shared_branch_descendant(task: Task, root_task: Task) -> bool:
     return bool(task.same_branch)
 
 
-def _has_successful_retry_descendant(task_id: str, by_parent: dict[str, list[Task]]) -> bool:
-    """Return True when any based_on descendant has status='completed'."""
-    visited: set[str] = {task_id}
-    queue: list[str] = [task_id]
+def _iter_same_type_retry_descendants(store: SqliteTaskStore, task: Task) -> list[Task]:
+    """Return same-type retry descendants by following based_on edges via the store."""
+    if task.id is None:
+        return []
+
+    descendants: list[Task] = []
+    visited: set[str] = {task.id}
+    queue: list[Task] = list(store.get_based_on_children_by_type(task.id, task.task_type))
+
     while queue:
-        current = queue.pop(0)
-        for child in by_parent.get(current, []):
-            if child.id is None or child.id in visited:
-                continue
-            if child.status == "completed":
-                return True
-            visited.add(child.id)
-            queue.append(child.id)
-    return False
+        child = queue.pop(0)
+        if child.id is None or child.id in visited:
+            continue
+        visited.add(child.id)
+        descendants.append(child)
+        queue.extend(store.get_based_on_children_by_type(child.id, task.task_type))
+
+    return descendants
 
 
-def _has_merged_retry_descendant(task_id: str, by_parent: dict[str, list[Task]]) -> bool:
-    """Return True when any based_on descendant has merge_status='merged'."""
-    visited: set[str] = {task_id}
-    queue: list[str] = [task_id]
-    while queue:
-        current = queue.pop(0)
-        for child in by_parent.get(current, []):
-            if child.id is None or child.id in visited:
-                continue
-            if child.merge_status == "merged":
-                return True
-            visited.add(child.id)
-            queue.append(child.id)
-    return False
+def _has_successful_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
+    """Return True when any same-type retry descendant has status='completed'."""
+    return any(child.status == "completed" for child in _iter_same_type_retry_descendants(store, task))
+
+
+def _has_merged_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
+    """Return True when any same-type retry descendant has merge_status='merged'."""
+    return any(child.merge_status == "merged" for child in _iter_same_type_retry_descendants(store, task))
 
 
 def _get_unresolved_terminal_kind(task: Task) -> str | None:
@@ -246,11 +244,6 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         return []
 
     by_id = {task.id: task for task in tasks if task.id is not None}
-    by_parent: dict[str, list[Task]] = {}
-    for task in tasks:
-        if task.id is None or task.based_on is None:
-            continue
-        by_parent.setdefault(task.based_on, []).append(task)
 
     unresolved_by_root: dict[str, list[Task]] = {}
     root_by_id: dict[str, Task] = {}
@@ -264,7 +257,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
             continue
 
         if unresolved_kind == "failed":
-            if _has_successful_retry_descendant(task.id, by_parent):
+            if _has_successful_retry_descendant(store, task):
                 continue
             root = resolve_lineage_root(store, task)
             if root.id is None:
@@ -285,7 +278,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         else:
             if task.merge_status == "merged":
                 continue
-            if _has_merged_retry_descendant(task.id, by_parent):
+            if _has_merged_retry_descendant(store, task):
                 continue
 
         unresolved_by_root.setdefault(root.id, []).append(task)
