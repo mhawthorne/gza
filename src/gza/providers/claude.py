@@ -21,6 +21,7 @@ from .base import (
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
+    write_preflight_entry,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -166,18 +167,27 @@ class ClaudeProvider(Provider):
             return True
         return False
 
-    def verify_credentials(self, config: Config) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
         """Verify Claude credentials by testing the claude command."""
         if config.use_docker:
-            return self._verify_docker(config)
-        return self._verify_direct()
+            return self._verify_docker(config, log_file=log_file)
+        return self._verify_direct(log_file=log_file)
 
-    def _verify_docker(self, config: Config) -> bool:
+    def _verify_docker(self, config: Config, log_file: Path | None = None) -> bool:
         """Verify credentials work in Docker."""
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
         docker_config = _get_docker_config(f"{config.docker_image}-claude")
         if not ensure_docker_image(docker_config, config.project_dir):
+            write_preflight_entry(
+                log_file,
+                event="docker_image_build_failed",
+                command=["docker", "build", "-t", docker_config.image_name],
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="Failed to build Claude Docker image",
+            )
             print("Error: Failed to build Docker image")
             return False
         return verify_docker_credentials(
@@ -188,28 +198,59 @@ class ClaudeProvider(Provider):
                 "Error: Invalid or missing Claude credentials\n"
                 "  Run 'claude login' or set ANTHROPIC_API_KEY in .env"
             ),
+            log_file=log_file,
         )
 
-    def _verify_direct(self) -> bool:
+    def _verify_direct(self, log_file: Path | None = None) -> bool:
         """Verify credentials work directly."""
+        cmd = ["claude", "--version"]
         try:
             result = subprocess.run(
-                ["claude", "--version"],
+                cmd,
                 capture_output=True,
-                timeout=10,
+                timeout=5,
                 text=True,
             )
             output = result.stdout + result.stderr
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_direct",
+                command=cmd,
+                returncode=result.returncode,
+                stdout_tail=result.stdout,
+                stderr_tail=result.stderr,
+                message=f"claude --version exited {result.returncode}",
+            )
             if "Invalid API key" in output or "Please run /login" in output or "/login" in output:
                 print("Error: Invalid or missing Claude credentials")
                 print("  Run 'claude login' or set ANTHROPIC_API_KEY in .env")
                 return False
             if result.returncode == 0:
                 return True
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            if isinstance(e, FileNotFoundError):
-                print("Error: 'claude' command not found")
-                print("  Install with: npm install -g @anthropic-ai/claude-code")
+        except subprocess.TimeoutExpired:
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_timeout",
+                command=cmd,
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="claude --version timed out after 5s",
+            )
+            print("Error: 'claude --version' timed out (CLI may be hanging)")
+            return False
+        except FileNotFoundError:
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_missing_binary",
+                command=cmd,
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="claude binary not found on PATH",
+            )
+            print("Error: 'claude' command not found")
+            print("  Install with: npm install -g @anthropic-ai/claude-code")
             return False
         return False
 

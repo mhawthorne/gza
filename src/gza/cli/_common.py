@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -74,6 +75,36 @@ def _looks_like_task_id(arg: str) -> bool:
     return bool(_TASK_ID_RE.match(arg))
 
 
+NO_ACTIVITY_THRESHOLD_SECONDS = 60
+
+
+def _task_looks_stuck(config: Config, task: DbTask) -> bool:
+    """Return True if an in-progress task has not logged anything in NO_ACTIVITY_THRESHOLD_SECONDS.
+
+    A task is considered stuck when its process has been alive for more than
+    the threshold and its log file is either missing, empty, or has not been
+    written to within the threshold.  This catches preflight hangs such as a
+    CLI blocking on an update/login prompt.
+    """
+    if task.started_at is None:
+        return False
+    now = datetime.now(UTC)
+    age = (now - task.started_at).total_seconds()
+    if age <= NO_ACTIVITY_THRESHOLD_SECONDS:
+        return False
+    if not task.log_file:
+        return True
+    log_path = config.project_dir / task.log_file
+    try:
+        stat = log_path.stat()
+    except OSError:
+        return True
+    if stat.st_size == 0:
+        return True
+    mtime_age = now.timestamp() - stat.st_mtime
+    return mtime_age > NO_ACTIVITY_THRESHOLD_SECONDS
+
+
 def _branch_has_commits(config: Config, branch: str | None) -> bool:
     """Check if a branch has commits beyond the default branch.
 
@@ -130,7 +161,23 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED", has_commits=has_commits)
                 continue
 
-            # PID is alive — leave timeout handling to the runner process.
+            # PID is alive — check for a stuck worker that hasn't logged anything.
+            if _task_looks_stuck(config, task):
+                # Attempt to stop the wedged worker before marking failed so it
+                # cannot later overwrite the outcome.
+                if task.running_pid is not None and task.running_pid > 0:
+                    try:
+                        os.kill(task.running_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                has_commits = _branch_has_commits(config, task.branch)
+                store.mark_failed(
+                    task,
+                    log_file=task.log_file,
+                    branch=task.branch,
+                    failure_reason="NO_ACTIVITY",
+                    has_commits=has_commits,
+                )
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
         except Exception as exc:
@@ -709,10 +756,10 @@ def _spawn_background_iterate_worker(
     resume: bool = False,
     retry: bool = False,
     quiet: bool = False,
+    dry_run: bool = False,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     registry = WorkerRegistry(config.workers_path)
-    worker_id = registry.generate_worker_id()
 
     inner_cmd = [
         sys.executable, "-m", "gza",
@@ -731,6 +778,12 @@ def _spawn_background_iterate_worker(
         inner_cmd.append("--retry")
 
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
+
+    if dry_run:
+        print(f"[dry-run] Would spawn background iterate worker: {shlex.join(inner_cmd)}")
+        return 0
+
+    worker_id = registry.generate_worker_id()
 
     try:
         proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
@@ -989,7 +1042,7 @@ def _create_improve_task(
     )
 
 
-from ..query import TaskLineageNode as _TaskLineageNode  # noqa: E402
+from ..query import _LINEAGE_REL_LABELS, TaskLineageNode as _TaskLineageNode  # noqa: E402
 
 
 def _format_lineage(
@@ -1064,8 +1117,9 @@ def _format_lineage(
 
     def _node_label(task: DbTask, relationship: str = "root") -> str:
         rel_suffix = ""
-        if relationship in ("resume", "retry"):
-            rel_suffix = f" [{lc.task_type}]\\[{relationship}][/{lc.task_type}]"
+        rel_label = _LINEAGE_REL_LABELS.get(relationship, "")
+        if rel_label and rel_label != task.task_type:
+            rel_suffix = f" [{lc.task_type}]\\[{rel_label}][/{lc.task_type}]"
         if task.id is None:
             return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{rel_suffix}{_annotation(task)}"
         return (

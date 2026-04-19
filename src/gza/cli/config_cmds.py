@@ -490,6 +490,10 @@ def _cmd_stats_iterations(
         reverse=True,
     )
 
+    excluded_order = ("FAILED", "IN_PROGRESS", "NO_REVIEW")
+    excluded_counts: Counter[str] = Counter()
+    excluded_cost: float = 0.0
+
     rows: list[tuple[str, str, int, str, float, int]] = []
     for impl in impl_tasks:
         assert impl.id is not None
@@ -526,6 +530,11 @@ def _cmd_stats_iterations(
             + sum(_cost(improve) for improve in improves)
         )
 
+        if verdict in excluded_order:
+            excluded_counts[verdict] += 1
+            excluded_cost += total_cost
+            continue
+
         iterations_count = len(completed_reviews)
         run_dt = _latest_activity_dt([impl, *reviews, *improves])
         run_date = run_dt.strftime("%Y-%m-%d") if run_dt is not None else "-"
@@ -541,8 +550,8 @@ def _cmd_stats_iterations(
             )
         )
 
-        if last_n is not None and len(rows) >= last_n:
-            break
+    if last_n is not None:
+        rows = rows[:last_n]
 
     print(f"\n{header_range}\n")
     task_col_width = 46
@@ -567,20 +576,25 @@ def _cmd_stats_iterations(
     total_tasks = len(rows)
     total_iterations = sum(iterations_count for _, _, iterations_count, _, _, _ in rows)
     total_improves = sum(improves_count for _, _, _, _, _, improves_count in rows)
-    reviewable = [r for r in rows if r[3] not in ("FAILED", "IN_PROGRESS", "NO_REVIEW")]
-    approved = sum(1 for r in reviewable if r[3] == "APPROVED")
-    failed = sum(1 for r in rows if r[3] == "FAILED")
+    approved = sum(1 for r in rows if r[3] == "APPROVED")
     total_cost = sum(task_cost for _, _, _, _, task_cost, _ in rows)
     parts = [
         f"{total_tasks} tasks",
         f"{total_iterations} iterations",
         f"{total_improves} improves",
-        f"{approved}/{len(reviewable)} approved",
+        f"{approved}/{total_tasks} approved",
+        f"${total_cost:.2f} total",
     ]
-    if failed:
-        parts.append(f"{failed} failed")
-    parts.append(f"${total_cost:.2f} total")
     print("\n" + "  |  ".join(parts))
+
+    if excluded_counts:
+        label_map = {"FAILED": "failed", "IN_PROGRESS": "in-progress", "NO_REVIEW": "no-review"}
+        breakdown = ", ".join(
+            f"{excluded_counts[v]} {label_map[v]}"
+            for v in excluded_order
+            if excluded_counts[v]
+        )
+        print(f"Excluded: {breakdown}  |  ${excluded_cost:.2f}")
 
     iteration_counts = sorted(iterations_count for _, _, iterations_count, _, _, _ in rows)
     if iteration_counts:

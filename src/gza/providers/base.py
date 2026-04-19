@@ -327,11 +327,53 @@ def is_docker_running() -> bool:
         return False
 
 
+def _tail(text: str, max_chars: int = 2000) -> str:
+    """Return the last ``max_chars`` of ``text`` (non-destructive)."""
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def write_preflight_entry(
+    log_file: Path | None,
+    *,
+    event: str,
+    command: list[str],
+    returncode: int | None,
+    stdout_tail: str,
+    stderr_tail: str,
+    message: str,
+) -> None:
+    """Append a preflight JSONL entry describing a verify subprocess call."""
+    if log_file is None:
+        return
+    import json
+    entry = {
+        "type": "gza",
+        "subtype": "preflight",
+        "event": event,
+        "command": _format_command_for_log(command),
+        "returncode": returncode,
+        "stdout_tail": _tail(stdout_tail),
+        "stderr_tail": _tail(stderr_tail),
+        "message": message,
+    }
+    try:
+        with open(log_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except OSError:
+        pass
+
+
 def verify_docker_credentials(
     docker_config: DockerConfig,
     version_cmd: list[str],
     error_patterns: list[str],
     error_message: str,
+    log_file: Path | None = None,
 ) -> bool:
     """Verify credentials work in Docker by running a version check.
 
@@ -345,6 +387,15 @@ def verify_docker_credentials(
         True if credentials are valid
     """
     if not is_docker_running():
+        write_preflight_entry(
+            log_file,
+            event="docker_daemon_missing",
+            command=["docker", "info"],
+            returncode=None,
+            stdout_tail="",
+            stderr_tail="",
+            message="Docker daemon is not running",
+        )
         print("Error: Docker daemon is not running")
         print("  Start Docker Desktop or use --no-docker flag")
         return False
@@ -366,6 +417,15 @@ def verify_docker_credentials(
             text=True,
         )
         output = result.stdout + result.stderr
+        write_preflight_entry(
+            log_file,
+            event="verify_credentials_docker",
+            command=cmd,
+            returncode=result.returncode,
+            stdout_tail=result.stdout,
+            stderr_tail=result.stderr,
+            message=f"docker {' '.join(version_cmd)} exited {result.returncode}",
+        )
 
         for pattern in error_patterns:
             if pattern in output:
@@ -400,9 +460,27 @@ def verify_docker_credentials(
 
         return False
     except subprocess.TimeoutExpired:
+        write_preflight_entry(
+            log_file,
+            event="verify_credentials_timeout",
+            command=["docker", "run", "--rm", docker_config.image_name, *version_cmd],
+            returncode=None,
+            stdout_tail="",
+            stderr_tail="",
+            message="Docker command timed out during verify",
+        )
         print("Error: Docker command timed out")
         return False
     except FileNotFoundError:
+        write_preflight_entry(
+            log_file,
+            event="verify_credentials_missing_binary",
+            command=["docker"],
+            returncode=None,
+            stdout_tail="",
+            stderr_tail="",
+            message="Docker binary not found on PATH",
+        )
         print("Error: Docker not found")
         return False
 
@@ -451,8 +529,13 @@ class Provider(ABC):
         ...
 
     @abstractmethod
-    def verify_credentials(self, config: Config) -> bool:
-        """Verify credentials work by testing the command."""
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
+        """Verify credentials work by testing the command.
+
+        If ``log_file`` is provided, implementations should append a JSONL
+        entry capturing the subprocess command, return code, and a tail of its
+        stdout+stderr so preflight failures leave a breadcrumb on disk.
+        """
         ...
 
     @abstractmethod
@@ -519,6 +602,25 @@ class Provider(ABC):
         print(f"Logging to: {log_file}")
         print(f"Timeout: {timeout_minutes} minutes")
         print("")
+
+        # Write a breadcrumb so the exact command is captured even if the
+        # subprocess hangs before producing any output.
+        import json
+        try:
+            with open(log_file, "a") as log_breadcrumb:
+                log_breadcrumb.write(
+                    json.dumps({
+                        "type": "gza",
+                        "subtype": "command",
+                        "event": "provider_exec_start",
+                        "command": _format_command_for_log(cmd),
+                        "cwd": str(cwd) if cwd else None,
+                        "timeout_minutes": timeout_minutes,
+                    }) + "\n"
+                )
+                log_breadcrumb.flush()
+        except OSError:
+            pass
 
         start_time = time.time()
         accumulated_data: dict = {}

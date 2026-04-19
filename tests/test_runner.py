@@ -21,6 +21,8 @@ from gza.runner import (
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
+    open_task_startup_log,
+    rename_startup_log_to_slug,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
@@ -4300,8 +4302,10 @@ class TestTaskClaimSafety:
         assert first_refreshed is not None
         assert second_refreshed is not None
         assert first_refreshed.status == "in_progress"
-        assert second_refreshed.status == "in_progress"
-        assert second_refreshed.running_pid == os.getpid()
+        # Second task was claimed then failed at credential check with a
+        # descriptive reason — not left dangling in_progress.
+        assert second_refreshed.status == "failed"
+        assert second_refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
 
 
 class TestSameBranchLineageWalk:
@@ -6198,3 +6202,53 @@ class TestFindTaskOfTypeInChain:
         found = _find_task_of_type_in_chain(retry.id, "plan", store)
         assert found is not None
         assert found.id == plan.id
+
+
+class TestStartupLogHelpers:
+    """Tests for open_task_startup_log / rename_startup_log_to_slug."""
+
+    def test_open_creates_task_id_file_when_no_log_file(self, tmp_path: Path):
+        config = Config(project_dir=tmp_path, project_name="test-project")
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("hello")
+
+        path = open_task_startup_log(config, task)
+
+        assert path.exists()
+        assert path.name == f"{task.id}.startup.log"
+        assert path.parent == config.log_path
+
+    def test_open_reuses_existing_log_file(self, tmp_path: Path):
+        config = Config(project_dir=tmp_path, project_name="test-project")
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("hello")
+        task.log_file = "logs/existing.log"
+        (tmp_path / "logs").mkdir()
+        existing = tmp_path / "logs" / "existing.log"
+        existing.write_text("prior content\n")
+
+        path = open_task_startup_log(config, task)
+        assert path == existing
+        assert path.read_text() == "prior content\n"
+
+    def test_rename_moves_startup_to_slug(self, tmp_path: Path):
+        config = Config(project_dir=tmp_path, project_name="test-project")
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        startup = config.log_path / "gza-1.startup.log"
+        startup.write_text('{"subtype": "preflight"}\n')
+
+        final = rename_startup_log_to_slug(config, startup, "20260419-hello")
+
+        assert not startup.exists()
+        assert final.name == "20260419-hello.log"
+        assert final.read_text() == '{"subtype": "preflight"}\n'
+
+    def test_rename_is_noop_when_paths_match(self, tmp_path: Path):
+        config = Config(project_dir=tmp_path, project_name="test-project")
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        slug_log = config.log_path / "20260419-hello.log"
+        slug_log.write_text("already here\n")
+
+        final = rename_startup_log_to_slug(config, slug_log, "20260419-hello")
+        assert final == slug_log
+        assert slug_log.read_text() == "already here\n"

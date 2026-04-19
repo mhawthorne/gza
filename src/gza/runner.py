@@ -85,6 +85,40 @@ def write_worker_start_event(log_file: "Path", *, resumed: bool) -> None:
     )
 
 
+def open_task_startup_log(config: "Config", task: "Task") -> "Path":
+    """Return the path of the task's startup log, creating the file if needed.
+
+    For a brand-new task (no ``task.log_file`` yet), uses
+    ``{task.id}.startup.log`` under ``config.log_path``.  On resume the
+    existing ``task.log_file`` path is reused.  The file is always touched so
+    reconciliation can observe that a task began writing.
+    """
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    if task.log_file:
+        log_path = config.project_dir / task.log_file
+    else:
+        log_path = config.log_path / f"{task.id}.startup.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
+    return log_path
+
+
+def rename_startup_log_to_slug(
+    config: "Config", startup_log: "Path", slug: str,
+) -> "Path":
+    """Atomically rename the task-id-based startup log to the slug-based main log.
+
+    Returns the final log path.  If the startup log is already at the slug
+    path (resume) or does not exist, returns the slug path unchanged.
+    """
+    slug_log = config.log_path / f"{slug}.log"
+    if startup_log == slug_log or not startup_log.exists():
+        return slug_log
+    slug_log.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(str(startup_log), str(slug_log))
+    return slug_log
+
+
 def extract_content_from_log(log_file: "Path") -> str | None:
     """Scan a JSONL log file for a provider 'result' entry and return its text.
 
@@ -1589,16 +1623,111 @@ def run(
     # Get the provider for this task
     provider = get_provider(task_config)
 
+    # Open a startup log immediately so preflight has a breadcrumb even if the
+    # worker dies before slug generation / worktree creation.
+    startup_log = open_task_startup_log(config, task)
+    task.log_file = str(startup_log.relative_to(config.project_dir))
+    store.update(task)
+    write_worker_start_event(startup_log, resumed=resume)
+    write_log_entry(
+        startup_log,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": f"Task: {task.id} (prompt: {task.prompt[:120]})",
+        },
+    )
+    write_log_entry(
+        startup_log,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": (
+                f"Provider: {provider.name}, Model: {task_config.model or 'default'}, "
+                f"Docker: {bool(task_config.use_docker)}"
+            ),
+        },
+    )
+
+    rc = _colors.RUNNER_COLORS
+
+    write_log_entry(
+        startup_log,
+        {
+            "type": "gza",
+            "subtype": "preflight",
+            "event": "check_credentials_start",
+            "message": f"Checking {provider.name} credentials",
+        },
+    )
     if not provider.check_credentials():
+        write_log_entry(
+            startup_log,
+            {
+                "type": "gza",
+                "subtype": "outcome",
+                "event": "preflight_failed",
+                "message": f"No {provider.name} credentials found. {provider.credential_setup_hint}",
+                "failure_reason": "PROVIDER_UNAVAILABLE",
+            },
+        )
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            branch=task.branch,
+            failure_reason="PROVIDER_UNAVAILABLE",
+        )
         error_message(f"Error: No {provider.name} credentials found")
         console.print(f"  {provider.credential_setup_hint}")
         return 1
+    write_log_entry(
+        startup_log,
+        {
+            "type": "gza",
+            "subtype": "preflight",
+            "event": "check_credentials_done",
+            "message": f"{provider.name} credentials present",
+        },
+    )
 
     # Verify credentials work before proceeding
     console.print(f"Verifying {provider.name} credentials...")
-    if not provider.verify_credentials(task_config):
+    write_log_entry(
+        startup_log,
+        {
+            "type": "gza",
+            "subtype": "preflight",
+            "event": "verify_credentials_start",
+            "message": f"Verifying {provider.name} credentials",
+        },
+    )
+    if not provider.verify_credentials(task_config, log_file=startup_log):
+        write_log_entry(
+            startup_log,
+            {
+                "type": "gza",
+                "subtype": "outcome",
+                "event": "preflight_failed",
+                "message": f"{provider.name} credential verification failed",
+                "failure_reason": "PROVIDER_UNAVAILABLE",
+            },
+        )
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            branch=task.branch,
+            failure_reason="PROVIDER_UNAVAILABLE",
+        )
         return 1
-    rc = _colors.RUNNER_COLORS
+    write_log_entry(
+        startup_log,
+        {
+            "type": "gza",
+            "subtype": "preflight",
+            "event": "verify_credentials_done",
+            "message": "Credentials verified",
+        },
+    )
     console.print(f"[{rc.success}]Credentials verified ✓[/{rc.success}]")
 
     # Setup git on the main repo (for worktree operations)
@@ -1628,6 +1757,12 @@ def run(
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
         )
+
+    # Promote the task-id startup log to the slug log now that slug is known
+    # so the entire task history lives in a single file.
+    startup_log = rename_startup_log_to_slug(config, startup_log, task.slug)
+    task.log_file = str(startup_log.relative_to(config.project_dir))
+    store.update(task)
 
     task_header(
         task.prompt,

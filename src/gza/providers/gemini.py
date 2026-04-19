@@ -18,6 +18,7 @@ from .base import (
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
+    write_preflight_entry,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -99,17 +100,26 @@ class GeminiProvider(Provider):
             return True
         return False
 
-    def verify_credentials(self, config: Config) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
         """Verify Gemini credentials by testing the gemini command."""
         if config.use_docker:
-            return self._verify_docker(config)
-        return self._verify_direct()
+            return self._verify_docker(config, log_file=log_file)
+        return self._verify_direct(log_file=log_file)
 
-    def _verify_docker(self, config: Config) -> bool:
+    def _verify_docker(self, config: Config, log_file: Path | None = None) -> bool:
         """Verify credentials work in Docker."""
         image_name = f"{config.docker_image}-gemini"
         docker_config = _get_docker_config(image_name)
         if not ensure_docker_image(docker_config, config.project_dir):
+            write_preflight_entry(
+                log_file,
+                event="docker_image_build_failed",
+                command=["docker", "build", "-t", docker_config.image_name],
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="Failed to build Gemini Docker image",
+            )
             print("Error: Failed to build Docker image")
             return False
         return verify_docker_credentials(
@@ -120,16 +130,27 @@ class GeminiProvider(Provider):
                 "Error: Invalid or missing Gemini credentials\n"
                 "  Run 'gemini auth' or set GEMINI_API_KEY in .env"
             ),
+            log_file=log_file,
         )
 
-    def _verify_direct(self) -> bool:
+    def _verify_direct(self, log_file: Path | None = None) -> bool:
         """Verify credentials work directly."""
+        cmd = ["gemini", "--version"]
         try:
             result = subprocess.run(
-                ["gemini", "--version"],
+                cmd,
                 capture_output=True,
-                timeout=10,
+                timeout=5,
                 text=True,
+            )
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_direct",
+                command=cmd,
+                returncode=result.returncode,
+                stdout_tail=result.stdout,
+                stderr_tail=result.stderr,
+                message=f"gemini --version exited {result.returncode}",
             )
             if result.returncode == 0:
                 return True
@@ -144,9 +165,27 @@ class GeminiProvider(Provider):
                 print("  Run 'gemini auth' or set GEMINI_API_KEY in .env")
                 return False
         except subprocess.TimeoutExpired:
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_timeout",
+                command=cmd,
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="gemini --version timed out after 5s",
+            )
             print("Error: Gemini CLI timed out")
             return False
         except FileNotFoundError:
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_missing_binary",
+                command=cmd,
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="gemini binary not found on PATH",
+            )
             print("Error: 'gemini' command not found")
             print("  Install with: npm install -g @google/gemini-cli")
             return False
