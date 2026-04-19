@@ -6885,7 +6885,7 @@ class TestForceCompleteRemoval:
         result = run_gza("force-complete", "1", "--project", str(tmp_path))
 
         assert result.returncode != 0
-        assert "invalid choice" in result.stderr
+        assert "is not a gza command" in result.stderr
         assert "force-complete" in result.stderr
 
 

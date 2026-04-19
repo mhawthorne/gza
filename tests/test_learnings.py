@@ -38,7 +38,8 @@ def test_regenerate_learnings_writes_file_from_completed_tasks(tmp_path: Path):
     pending = store.add("Pending task should not be used", task_type="implement")
     assert pending.status == "pending"
 
-    result = regenerate_learnings(store, config, window=10)
+    with patch("gza.runner.run", side_effect=RuntimeError("no provider in tests")):
+        result = regenerate_learnings(store, config, window=10)
 
     assert result.tasks_used == 1
     assert result.added_count >= 1
@@ -61,7 +62,8 @@ def test_regenerate_learnings_dedupes_items(tmp_path: Path):
     t2 = store.add("Task two", task_type="implement")
     store.mark_completed(t2, output_content="- use uv run pytest tests/ -v\n", has_commits=False)
 
-    regenerate_learnings(store, config, window=10)
+    with patch("gza.runner.run", side_effect=RuntimeError("no provider in tests")):
+        regenerate_learnings(store, config, window=10)
     content = (tmp_path / ".gza" / "learnings.md").read_text()
     assert content.lower().count("use uv run pytest tests/ -v") == 1
 
@@ -179,7 +181,8 @@ def test_regenerate_learnings_reports_delta_counts(tmp_path: Path):
         has_commits=False,
     )
 
-    result = regenerate_learnings(store, config, window=10)
+    with patch("gza.runner.run", side_effect=RuntimeError("no provider in tests")):
+        result = regenerate_learnings(store, config, window=10)
     # Fallback preserves existing + appends new: ["Keep old pattern", "Existing stable", "Add new pattern"]
     assert result.retained_count == 2  # both existing items kept
     assert result.added_count == 1     # "Add new pattern" is new
@@ -195,7 +198,8 @@ def test_regenerate_learnings_writes_history_log(tmp_path: Path):
     task = store.add("Task", task_type="implement")
     store.mark_completed(task, output_content="- Keep pattern\n", has_commits=False)
 
-    regenerate_learnings(store, config, window=10)
+    with patch("gza.runner.run", side_effect=RuntimeError("no provider in tests")):
+        regenerate_learnings(store, config, window=10)
 
     history_path = tmp_path / ".gza" / "learnings_history.jsonl"
     assert history_path.exists()

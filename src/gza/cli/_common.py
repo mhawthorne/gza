@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from rich.pager import Pager
 
@@ -1565,6 +1565,24 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
         steps.append(f"gza resume {task.id}")
     steps.append(f"gza retry {task.id}")
     return steps
+
+
+class GzaArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that prints a terse git-style error for unknown subcommands."""
+
+    _INVALID_CHOICE_RE = re.compile(
+        r"argument command: invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
+    )
+
+    def error(self, message: str) -> NoReturn:
+        match = self._INVALID_CHOICE_RE.match(message)
+        if match:
+            cmd = match.group("cmd")
+            self.exit(
+                2,
+                f"{self.prog}: '{cmd}' is not a gza command. See 'gza --help'.\n",
+            )
+        super().error(message)
 
 
 class SortingHelpFormatter(argparse.RawDescriptionHelpFormatter):
