@@ -4476,9 +4476,10 @@ class TestLineageCommand:
         assert result.returncode == 0
         # Arrow marker for the target task
         assert "→" in result.stdout
-        # Both tasks shown
-        assert "Design auth system" in result.stdout
-        assert "Implement auth per plan" in result.stdout
+        # Both tasks shown — collapse whitespace since Rich may wrap long lines
+        normalized = " ".join(result.stdout.split())
+        assert "Design auth system" in normalized
+        assert "Implement auth per plan" in normalized
 
     def test_lineage_shows_failed_task_with_reason(self, tmp_path: Path):
         """Lineage command shows failure_reason for failed tasks."""
@@ -4499,7 +4500,8 @@ class TestLineageCommand:
 
         assert result.returncode == 0
         assert "MAX_STEPS" in result.stdout
-        assert "Implement feature" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert "Implement feature" in normalized
 
     def test_lineage_full_tree(self, tmp_path: Path):
         """Lineage command renders a multi-level tree with parent and children."""
@@ -4528,9 +4530,10 @@ class TestLineageCommand:
         result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Design auth system" in result.stdout
-        assert "Implement auth per plan" in result.stdout
-        assert "Review implementation" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert "Design auth system" in normalized
+        assert "Implement auth per plan" in normalized
+        assert "Review implementation" in normalized
 
     def test_lineage_shows_stats_when_available(self, tmp_path: Path):
         """Lineage command shows duration and cost when available."""
