@@ -6,7 +6,7 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,6 +18,18 @@ from .conftest import (
     setup_git_repo_with_task_branch,
     setup_unmerged_env,
 )
+
+
+def _mock_unmerged_git() -> MagicMock:
+    git = MagicMock()
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.count_commits_ahead.return_value = 1
+    git.get_diff_stat_parsed.return_value = (1, 1, 0)
+    git.can_merge.return_value = True
+    git.is_merged.return_value = False
+    return git
 
 
 class TestHistoryCommand:
@@ -3353,7 +3365,8 @@ class TestUnmergedReviewStatus:
         store.update(review2)
 
         # Run unmerged command - should show approved (most recent)
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+            result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
 
@@ -3455,7 +3468,8 @@ class TestUnmergedReviewStatus:
         store.update(review)
 
         # Before improve: should show changes requested
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+            result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" in result.stdout
 
@@ -3465,7 +3479,8 @@ class TestUnmergedReviewStatus:
         store.clear_review_state(task.id)
 
         # After improve: status should explicitly show stale review
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+            result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review stale" in result.stdout
         assert "last review" in result.stdout
@@ -4025,7 +4040,8 @@ class TestUnmergedImprovedDisplay:
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+            result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Review should be on its own line starting with "review:"
         assert "review:" in result.stdout
