@@ -65,6 +65,10 @@ gza stats iterations --all                         # All-time view
   - Any child improve task activity timestamp.
 - Latest verdict comes from the most recently completed review task.
 
+### Row filtering
+
+Only impls with at least one completed review appear in the table. Failed, in-progress/queued, and no-review impls are excluded so they don't skew the iteration-count distribution (failed impls would otherwise inject 0s into every percentile). Excluded impls are summarized on a single `Excluded:` line below the totals, with a per-verdict breakdown and aggregated cost.
+
 ### Flag compatibility
 
 - `--hours` cannot be combined with `--days`, `--start-date`, or `--end-date`.

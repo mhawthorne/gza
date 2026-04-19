@@ -1430,10 +1430,24 @@ class TestStatsIterationsCommand:
         impl_1 = store.add("Implement one", task_type="implement")
         assert impl_1.id is not None
         store.mark_completed(impl_1, has_commits=False, stats=TaskStats(cost_usd=0.10))
+        review_1 = store.add("Review one", task_type="review", depends_on=impl_1.id)
+        store.mark_completed(
+            review_1,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.01),
+        )
 
         impl_2 = store.add("Implement two", task_type="implement")
         assert impl_2.id is not None
         store.mark_completed(impl_2, has_commits=False, stats=TaskStats(cost_usd=0.20))
+        review_2 = store.add("Review two", task_type="review", depends_on=impl_2.id)
+        store.mark_completed(
+            review_2,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.02),
+        )
 
         result = run_gza("stats", "iterations", "--all", "--last", "1", "--project", str(tmp_path))
 
@@ -1441,7 +1455,7 @@ class TestStatsIterationsCommand:
         assert impl_2.id in result.stdout
         assert impl_1.id not in result.stdout
         assert "1 tasks" in result.stdout
-        assert "Iteration count stats: min 0  |  p10 0  |  p25 0  |  p50 0  |  p75 0  |  p90 0  |  p99 0  |  max 0" in result.stdout
+        assert "Iteration count stats: min 1  |  p10 1  |  p25 1  |  p50 1  |  p75 1  |  p90 1  |  p99 1  |  max 1" in result.stdout
 
     def test_stats_iterations_hours_filters_on_impl_or_child_activity(self, tmp_path: Path):
         """--hours should include rows with recent review/improve activity even for older impls."""
@@ -1651,6 +1665,42 @@ class TestStatsIterationsCommand:
         assert negative_days_result.returncode == 1
         assert "--days must be >= 1" in negative_days_result.stderr
 
+    def test_stats_iterations_excludes_failed_and_no_review_impls(self, tmp_path: Path):
+        """Failed/in-progress/no-review impls are excluded from rows and reported separately."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        reviewed_impl = store.add("Implement reviewed", task_type="implement")
+        assert reviewed_impl.id is not None
+        store.mark_completed(reviewed_impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+        review = store.add("Review", task_type="review", depends_on=reviewed_impl.id)
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.02),
+        )
+
+        failed_impl = store.add("Implement failed", task_type="implement")
+        assert failed_impl.id is not None
+        store.mark_failed(failed_impl, failure_reason="boom", stats=TaskStats(cost_usd=0.05))
+
+        no_review_impl = store.add("Implement no review", task_type="implement")
+        assert no_review_impl.id is not None
+        store.mark_completed(no_review_impl, has_commits=False, stats=TaskStats(cost_usd=0.07))
+
+        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert reviewed_impl.id in result.stdout
+        assert failed_impl.id not in result.stdout
+        assert no_review_impl.id not in result.stdout
+        assert "1 tasks  |  1 iterations  |  0 improves  |  1/1 approved  |  $0.12 total" in result.stdout
+        assert "Excluded: 1 failed, 1 no-review  |  $0.12" in result.stdout
+        assert "Iteration count stats: min 1" in result.stdout
+
     def test_stats_iterations_all_time_alias(self, tmp_path: Path):
         """--all-time alias should behave the same as --all."""
         from gza.db import TaskStats
@@ -1661,6 +1711,13 @@ class TestStatsIterationsCommand:
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
         store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.02),
+        )
 
         result = run_gza("stats", "iterations", "--all-time", "--last", "1", "--project", str(tmp_path))
 
