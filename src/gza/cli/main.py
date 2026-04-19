@@ -19,6 +19,7 @@ from ..db import (
 )
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
 from ._common import (
+    GzaArgumentParser,
     SortingHelpFormatter,
     _add_query_filter_args,
     _add_skills_install_args,
@@ -78,7 +79,7 @@ from .watch import cmd_queue, cmd_watch
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
         formatter_class=SortingHelpFormatter,
     )
