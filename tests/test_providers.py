@@ -2785,6 +2785,23 @@ class TestGetImageCreatedTime:
 class TestEnsureDockerImage:
     """Tests for Docker image build logic."""
 
+    def test_returns_false_when_daemon_not_running(self, tmp_path):
+        """Should short-circuit with a clear error when the Docker daemon is down."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch("gza.providers.base.is_docker_running", return_value=False):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
+                result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is False
+        mock_run.assert_not_called()
+
     def test_returns_true_when_image_up_to_date(self, tmp_path):
         """Should return True without building when image is newer than Dockerfile."""
         docker_config = DockerConfig(
@@ -2805,7 +2822,8 @@ class TestEnsureDockerImage:
         dockerfile_mtime = dockerfile.stat().st_mtime
         image_time = dockerfile_mtime + 100  # Image created after Dockerfile
 
-        with patch("gza.providers.base._get_image_created_time", return_value=image_time):
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=image_time):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 result = ensure_docker_image(docker_config, tmp_path)
 
@@ -2833,7 +2851,8 @@ class TestEnsureDockerImage:
         dockerfile_mtime = dockerfile.stat().st_mtime
         image_time = dockerfile_mtime - 100  # Image created before Dockerfile
 
-        with patch("gza.providers.base._get_image_created_time", return_value=image_time):
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=image_time):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 result = ensure_docker_image(docker_config, tmp_path)
@@ -2855,7 +2874,8 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base._get_image_created_time", return_value=None):
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 result = ensure_docker_image(docker_config, tmp_path)
@@ -2880,7 +2900,8 @@ class TestEnsureDockerImage:
         custom_content = "FROM python:3.12\nRUN pip install pytest"
         dockerfile.write_text(custom_content)
 
-        with patch("gza.providers.base._get_image_created_time", return_value=None):
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 ensure_docker_image(docker_config, tmp_path)
@@ -2898,7 +2919,8 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base._get_image_created_time", return_value=None):
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 ensure_docker_image(docker_config, tmp_path)
@@ -2919,7 +2941,8 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base._get_image_created_time", return_value=None):
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=1)
                 result = ensure_docker_image(docker_config, tmp_path)

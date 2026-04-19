@@ -165,6 +165,11 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     Returns:
         True if image is available, False on failure
     """
+    if not is_docker_running():
+        print("Error: Docker daemon is not running")
+        print("  Start Docker Desktop or use --no-docker flag")
+        return False
+
     etc_dir = project_dir / "etc"
     etc_dir.mkdir(parents=True, exist_ok=True)
     dockerfile_path = etc_dir / f"Dockerfile.{docker_config.cli_command}"
