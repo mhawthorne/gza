@@ -4916,6 +4916,7 @@ class TestIncompleteCommand:
         root = store.add("Implement root", task_type="implement")
         root.status = "completed"
         root.completed_at = datetime.now(UTC)
+        root.has_commits = True
         root.merge_status = "unmerged"
         store.update(root)
         assert root.id is not None
@@ -4923,6 +4924,7 @@ class TestIncompleteCommand:
         improve = store.add("Improve completed", task_type="improve", based_on=root.id, same_branch=True)
         improve.status = "completed"
         improve.completed_at = datetime.now(UTC)
+        improve.has_commits = True
         improve.merge_status = "unmerged"
         store.update(improve)
 
@@ -4951,6 +4953,7 @@ class TestIncompleteCommand:
         third = store.add("Attempt three", task_type="implement", based_on=second.id)
         third.status = "completed"
         third.completed_at = datetime.now(UTC)
+        third.has_commits = True
         third.merge_status = "unmerged"
         store.update(third)
 
@@ -4990,6 +4993,7 @@ class TestIncompleteCommand:
         retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
         retry_completed.status = "completed"
         retry_completed.completed_at = datetime.now(UTC)
+        retry_completed.has_commits = True
         retry_completed.merge_status = "unmerged"
         store.update(retry_completed)
         assert retry_completed.id is not None
@@ -5053,3 +5057,20 @@ class TestIncompleteCommand:
         assert result.returncode == 0
         assert "Implement root" in result.stdout
         assert "Rebase failed" in result.stdout
+
+    def test_incomplete_ignores_completed_no_commit_plan_root(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan complete", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        plan.has_commits = False
+        plan.merge_status = None
+        store.update(plan)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unresolved task lineages" in result.stdout
+        assert "Plan complete" not in result.stdout

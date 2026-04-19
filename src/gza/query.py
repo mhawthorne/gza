@@ -178,6 +178,10 @@ def _has_successful_retry_descendant(task_id: str, by_parent: dict[str, list[Tas
 
 def _get_unresolved_terminal_kind(task: Task) -> str | None:
     """Return unresolved terminal kind for attention queries, else None."""
+    if task.status not in {"failed", "completed", "unmerged"}:
+        return None
+    if is_lineage_complete(task):
+        return None
     if task.status == "failed":
         return "failed"
     if task.status in {"completed", "unmerged"}:

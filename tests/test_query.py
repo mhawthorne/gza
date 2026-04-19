@@ -294,6 +294,8 @@ class TestQueryIncomplete:
         task.status = "completed"
         task.completed_at = datetime.now(UTC)
         task.merge_status = merge_status
+        if task.task_type in {"task", "implement", "improve", "rebase"}:
+            task.has_commits = True
 
     def _fail(self, task: Task) -> None:
         task.status = "failed"
@@ -432,6 +434,19 @@ class TestQueryIncomplete:
         rebase = store.add("rebase done", task_type="rebase", based_on=root.id, same_branch=True)
         self._complete(rebase, merge_status="unmerged")
         store.update(rebase)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_completed_no_commit_plan_root_is_excluded(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        plan = store.add("plan complete", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        plan.has_commits = False
+        plan.merge_status = None
+        store.update(plan)
 
         lineages = query_incomplete(store, HistoryFilter(limit=None))
         assert lineages == []
