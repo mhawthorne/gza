@@ -1039,6 +1039,23 @@ def _build_ps_rows(
     return rows, in_progress_tasks
 
 
+def _task_pid_is_alive(task: DbTask) -> bool:
+    """Return True when task.running_pid points to a live process.
+
+    Foreground flows (e.g. invoke_provider_resolve) mark a task in_progress
+    without registering a worker. Consulting running_pid keeps such tasks
+    from being flagged as orphaned while they are actively running.
+    """
+    pid = task.running_pid
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def _get_orphaned_tasks(registry: WorkerRegistry, store: SqliteTaskStore) -> list[DbTask]:
     """Return in-progress tasks that have no active worker (orphaned/stale)."""
     rows, in_progress = _build_ps_rows(registry, store, include_completed=False)
@@ -1191,6 +1208,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         task is not None
         and task.status == "in_progress"
         and (worker is None or worker.status != "running")
+        and not _task_pid_is_alive(task)
     )
 
     started = _started_at(worker, task)

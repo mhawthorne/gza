@@ -29,6 +29,20 @@ def make_store(tmp_path: Path) -> SqliteTaskStore:
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
 
 
+def mark_orphaned(store: SqliteTaskStore, task: Task) -> None:
+    """Put a task into an orphaned in_progress state for tests.
+
+    Uses running_pid=None and started_at=None so reconciliation skips the task
+    (see reconcile_in_progress_tasks) while orphan detection still classifies it
+    as orphaned (no live PID, no worker). Avoids mark_in_progress because that
+    would set running_pid to the test process's PID, which is alive.
+    """
+    task.status = "in_progress"
+    task.running_pid = None
+    task.started_at = None
+    store.update(task)
+
+
 def get_latest_task(
     store: SqliteTaskStore,
     *,
