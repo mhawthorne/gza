@@ -989,7 +989,7 @@ def _create_improve_task(
     )
 
 
-from ..query import TaskLineageNode as _TaskLineageNode  # noqa: E402
+from ..query import _LINEAGE_REL_LABELS, TaskLineageNode as _TaskLineageNode  # noqa: E402
 
 
 def _format_lineage(
@@ -1064,8 +1064,9 @@ def _format_lineage(
 
     def _node_label(task: DbTask, relationship: str = "root") -> str:
         rel_suffix = ""
-        if relationship in ("resume", "retry"):
-            rel_suffix = f" [{lc.task_type}]\\[{relationship}][/{lc.task_type}]"
+        rel_label = _LINEAGE_REL_LABELS.get(relationship, "")
+        if rel_label and rel_label != task.task_type:
+            rel_suffix = f" [{lc.task_type}]\\[{rel_label}][/{lc.task_type}]"
         if task.id is None:
             return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{rel_suffix}{_annotation(task)}"
         return (

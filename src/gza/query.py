@@ -190,6 +190,22 @@ def get_improves_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]
     return store.get_improve_tasks_by_root(root_task.id)
 
 
+_LINEAGE_REL_LABELS: dict[str, str] = {
+    "review": "review",
+    "improve-from-review": "improve",
+    "improve": "improve",
+    "implement-depends": "implement",
+    "implement-based": "implement",
+    "depends-and-based": "depends",
+    "depends": "depends",
+    "retry": "retry",
+    "resume": "resume",
+    # Relationships not in this map (e.g. "rebase", "plan", "explore", "task",
+    # "internal") silently produce no label — intentional for relationships
+    # whose task_type already conveys everything the UI needs.
+}
+
+
 def _classify_child_relationship(parent: Task, child: Task) -> str:
     """Return a child relationship label for lineage tree rendering/debugging."""
     parent_id = parent.id
@@ -203,6 +219,8 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
             return "resume"
         return "retry"
 
+    if child.task_type == "rebase" and child.based_on == parent_id:
+        return "rebase"
     if child.task_type == "review" and child.depends_on == parent_id:
         return "review"
     if child.task_type == "improve" and child.depends_on == parent_id:
@@ -217,8 +235,6 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
         return "depends-and-based"
     if child.depends_on == parent_id:
         return "depends"
-    if child.based_on == parent_id:
-        return "retry"
     return child.task_type
 
 
@@ -235,7 +251,8 @@ def _lineage_child_sort_key(parent: Task, child: Task) -> tuple[int, datetime, i
         "depends": 6,
         "retry": 7,
         "resume": 7,
-    }.get(relation, 8)
+        "rebase": 8,
+    }.get(relation, 9)
 
     child_time = _normalize_lineage_time(task_time_for_lineage(child))
     # task_id_numeric_key expects str | None; guard against legacy integer IDs

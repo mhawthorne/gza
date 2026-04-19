@@ -40,6 +40,7 @@ from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_i
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
+    _LINEAGE_REL_LABELS,
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
     get_improves_for_root as _get_improves_for_root_task,
@@ -61,20 +62,6 @@ from ._common import (
     pager_context,
     resolve_id,
 )
-
-_LINEAGE_REL_LABELS: dict[str, str] = {
-    "review": "review",
-    "improve-from-review": "improve",
-    "improve": "improve",
-    "implement-depends": "implement",
-    "implement-based": "implement",
-    "depends-and-based": "retry",
-    "depends": "depends",
-    "retry": "retry",
-    "resume": "resume",
-    # Relationships not in this map (e.g. "plan", "explore", "task", "internal")
-    # silently produce no label — this is intentional for unusual/unknown relationships.
-}
 
 
 def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
