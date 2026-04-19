@@ -3355,6 +3355,52 @@ class TestGetHistoryUnmergedStatus:
         assert all(t.id != merged.id for t in results)
 
 
+class TestSearchByPrompt:
+    """Tests for SqliteTaskStore.search()."""
+
+    def test_search_matches_prompt_substring_across_statuses(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        now = datetime.now(UTC)
+
+        pending = store.add("alpha pending task")
+
+        failed_internal = store.add("Alpha internal task", task_type="internal")
+        failed_internal.status = "failed"
+        failed_internal.completed_at = now
+        store.update(failed_internal)
+
+        other = store.add("beta unrelated task")
+
+        completed = store.add("alpha completed task")
+        completed.status = "completed"
+        completed.completed_at = now
+        store.update(completed)
+
+        in_progress = store.add("alpha in progress task")
+        store.mark_in_progress(in_progress)
+
+        results = store.search("alpha")
+        assert [t.id for t in results] == [
+            in_progress.id,
+            completed.id,
+            failed_internal.id,
+            pending.id,
+        ]
+        assert all(t.id != other.id for t in results)
+
+        statuses = {t.status for t in results}
+        assert {"pending", "in_progress", "completed", "failed"} <= statuses
+        assert any(t.task_type == "internal" for t in results)
+
+    def test_search_is_case_insensitive_for_ascii_and_returns_empty_on_no_match(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        store.add("alpha one")
+        store.add("Alpha two")
+
+        assert len(store.search("ALPHA")) == 2
+        assert store.search("nope") == []
+
+
 class TestGetBasedOnChildren:
     """Tests for SqliteTaskStore.get_based_on_children()."""
 

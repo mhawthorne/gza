@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -486,8 +487,8 @@ class TestHistoryCommand:
         result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"completed {review.id}" in result.stdout
-        assert f"completed {improve.id}" in result.stdout
+        assert re.search(rf"completed\s+{re.escape(review.id)}", result.stdout)
+        assert re.search(rf"completed\s+{re.escape(improve.id)}", result.stdout)
         assert f"unmerged  {review.id}" not in result.stdout
         assert f"unmerged  {improve.id}" not in result.stdout
         assert "verdict:" in result.stdout
@@ -970,6 +971,129 @@ class TestHistoryCommand:
         # Reconciliation must have run: task should be shown as failed with WORKER_DIED reason
         assert "failed" in result.stdout
         assert "WORKER_DIED" in result.stdout
+
+
+class TestSearchCommand:
+    """Tests for 'gza search' command."""
+
+    def test_search_matches_pending_and_history_excludes_pending(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        pending = store.add("needle pending task")
+        assert pending.id is not None
+
+        completed = store.add("needle completed task")
+        completed.status = "completed"
+        completed.completed_at = datetime.now(UTC)
+        store.update(completed)
+
+        search_result = run_gza("search", "needle", "--project", str(tmp_path))
+        history_result = run_gza("history", "--project", str(tmp_path))
+
+        assert search_result.returncode == 0
+        assert "needle pending task" in search_result.stdout
+        assert "needle completed task" in search_result.stdout
+        assert history_result.returncode == 0
+        assert "needle pending task" not in history_result.stdout
+
+    def test_search_shows_actual_status_labels_for_in_progress_and_pending(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        pending = store.add("label pending needle")
+        assert pending.id is not None
+
+        in_progress = store.add("label in progress needle")
+        store.mark_in_progress(in_progress)
+
+        result = run_gza("search", "needle", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "pending" in result.stdout
+        assert "in_progress" in result.stdout
+
+    def test_search_aligns_status_column_for_pending_and_in_progress(self, tmp_path: Path):
+        """Search rows should keep task IDs in the same column across status label lengths."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        pending = store.add("align pending needle")
+        assert pending.id is not None
+
+        in_progress = store.add("align in progress needle")
+        assert in_progress.id is not None
+        store.mark_in_progress(in_progress)
+
+        result = run_gza("search", "align", "--last", "0", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        pending_line = next(line for line in result.stdout.splitlines() if "align pending needle" in line)
+        in_progress_line = next(line for line in result.stdout.splitlines() if "align in progress needle" in line)
+        assert pending_line.index(pending.id) == in_progress_line.index(in_progress.id)
+
+    def test_search_empty_state_message(self, tmp_path: Path):
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "alpha task", "status": "completed"},
+        ])
+
+        result = run_gza("search", "missing", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No tasks found matching 'missing'" in result.stdout
+
+    def test_search_last_limit(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("limit needle one")
+        store.add("limit needle two")
+        store.add("limit needle three")
+
+        result = run_gza("search", "needle", "--last", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "limit needle three" in result.stdout
+        assert "limit needle two" in result.stdout
+        assert "limit needle one" not in result.stdout
+
+    def test_search_last_zero_shows_all_matches(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("all needle one")
+        store.add("all needle two")
+        store.add("all needle three")
+
+        result = run_gza("search", "needle", "--last", "0", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "all needle three" in result.stdout
+        assert "all needle two" in result.stdout
+        assert "all needle one" in result.stdout
+
+    def test_search_last_rejects_negative_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("negative needle one")
+
+        result = run_gza("search", "needle", "--last", "-1", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "--last must be >= 0 (use 0 for all matches)" in result.stderr
+
+    def test_search_uses_history_style_row_and_detail_rendering(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("style needle task", task_type="implement")
+        task.branch = "feat/search-style"
+        store.update(task)
+
+        result = run_gza("search", "style needle", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "style needle task" in result.stdout
+        assert "[implement]" in result.stdout
+        assert "branch: feat/search-style" in result.stdout
 
 
 class TestNextCommand:
