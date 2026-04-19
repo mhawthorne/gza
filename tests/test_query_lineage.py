@@ -518,10 +518,10 @@ class TestLineageChildSortKey:
         sorted_keys = sorted([key_with_id, key_no_id])
         assert len(sorted_keys) == 2
 
-        # The third element must be int in both cases
-        assert isinstance(key_with_id[2], int)
-        assert isinstance(key_no_id[2], int)
+        # Tiebreaker element (numeric id key) must be int in both cases.
+        assert isinstance(key_with_id[-1], int)
+        assert isinstance(key_no_id[-1], int)
 
         # id=None maps to numeric key 0; decimal suffix parses directly.
-        assert key_no_id[2] == 0
-        assert key_with_id[2] == 141
+        assert key_no_id[-1] == 0
+        assert key_with_id[-1] == 141

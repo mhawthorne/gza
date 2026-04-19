@@ -238,27 +238,20 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
     return child.task_type
 
 
-def _lineage_child_sort_key(parent: Task, child: Task) -> tuple[int, datetime, int]:
-    """Sort children to keep lineage rendering deterministic and readable."""
-    relation = _classify_child_relationship(parent, child)
-    relation_rank = {
-        "review": 0,
-        "improve-from-review": 1,
-        "implement-depends": 2,
-        "implement-based": 3,
-        "improve": 4,
-        "depends-and-based": 5,
-        "depends": 6,
-        "retry": 7,
-        "resume": 7,
-        "rebase": 8,
-    }.get(relation, 9)
+def _lineage_child_sort_key(parent: Task, child: Task) -> tuple[datetime, int]:
+    """Sort children chronologically so lineage reads as a timeline.
 
+    Tree structure (not sibling order) conveys relationships: review→improve
+    pairs already nest via parent/child edges, so siblings only need to express
+    when things happened. Chronological order also exposes pre-run hooks such
+    as auto-rebase-before-resume honestly, even when they predate their parent.
+    """
+    del parent  # relationship no longer affects sibling ordering
     child_time = _normalize_lineage_time(task_time_for_lineage(child))
     # task_id_numeric_key expects str | None; guard against legacy integer IDs
     id_str = child.id if isinstance(child.id, str) else None
     child_id = task_id_numeric_key(id_str)  # returns int; 0 for None/non-string
-    return (relation_rank, child_time, child_id)
+    return (child_time, child_id)
 
 
 def build_lineage_tree(
