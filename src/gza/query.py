@@ -176,6 +176,22 @@ def _has_successful_retry_descendant(task_id: str, by_parent: dict[str, list[Tas
     return False
 
 
+def _has_merged_retry_descendant(task_id: str, by_parent: dict[str, list[Task]]) -> bool:
+    """Return True when any based_on descendant has merge_status='merged'."""
+    visited: set[str] = {task_id}
+    queue: list[str] = [task_id]
+    while queue:
+        current = queue.pop(0)
+        for child in by_parent.get(current, []):
+            if child.id is None or child.id in visited:
+                continue
+            if child.merge_status == "merged":
+                return True
+            visited.add(child.id)
+            queue.append(child.id)
+    return False
+
+
 def _get_unresolved_terminal_kind(task: Task) -> str | None:
     """Return unresolved terminal kind for attention queries, else None."""
     if task.status not in {"failed", "completed", "unmerged"}:
@@ -266,8 +282,11 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         if shared_descendant:
             if root_merged:
                 continue
-        elif task.merge_status == "merged":
-            continue
+        else:
+            if task.merge_status == "merged":
+                continue
+            if _has_merged_retry_descendant(task.id, by_parent):
+                continue
 
         unresolved_by_root.setdefault(root.id, []).append(task)
         root_by_id[root.id] = root

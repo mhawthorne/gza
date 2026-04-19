@@ -4986,7 +4986,7 @@ class TestIncompleteCommand:
         root = store.add("Root failed", task_type="implement")
         root.status = "failed"
         root.completed_at = datetime.now(UTC)
-        root.failure_reason = "TEST_FAILURE"
+        root.failure_reason = "ROOT_TEST_FAILURE"
         store.update(root)
         assert root.id is not None
 
@@ -5001,7 +5001,7 @@ class TestIncompleteCommand:
         retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
         retry_failed.status = "failed"
         retry_failed.completed_at = datetime.now(UTC)
-        retry_failed.failure_reason = "TEST_FAILURE"
+        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
         store.update(retry_failed)
         assert retry_failed.id is not None
 
@@ -5011,6 +5011,38 @@ class TestIncompleteCommand:
         assert "Root failed" in result.stdout
         assert "Retry completed" in result.stdout
         assert "Retry failed" in result.stdout
+        # The resolved root anchor must not be rendered as a normal failed row:
+        # it should not repeat its own failure reason or retry-as annotation.
+        assert "ROOT_TEST_FAILURE" not in result.stdout
+        # The unresolved retry's own failure reason should still be rendered.
+        assert "RETRY_TEST_FAILURE" in result.stdout
+
+    def test_incomplete_completed_unmerged_root_hidden_when_retry_merges(self, tmp_path: Path):
+        """Regression: a completed-unmerged root should disappear from
+        `gza incomplete` once a later same-lineage retry has merged."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("First attempt unmerged", task_type="implement")
+        first.status = "completed"
+        first.completed_at = datetime.now(UTC)
+        first.has_commits = True
+        first.merge_status = "unmerged"
+        store.update(first)
+        assert first.id is not None
+
+        second = store.add("Second attempt merged", task_type="implement", based_on=first.id)
+        second.status = "completed"
+        second.completed_at = datetime.now(UTC)
+        second.has_commits = True
+        second.merge_status = "merged"
+        store.update(second)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unresolved task lineages" in result.stdout
+        assert "First attempt unmerged" not in result.stdout
 
     def test_incomplete_hides_completed_rebase_under_merged_root(self, tmp_path: Path):
         setup_config(tmp_path)

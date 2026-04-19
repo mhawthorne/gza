@@ -160,23 +160,33 @@ def _render_history_task_line(
     detail_prefix: str = "",
     parent_task: DbTask | None = None,
     compact_child: bool = False,
+    is_resolved_anchor: bool = False,
 ) -> None:
-    """Render a history-style task entry."""
+    """Render a history-style task entry.
+
+    When is_resolved_anchor is True, the task is rendered as a dim lineage
+    anchor rather than a normal history row: no failure reason, no retry
+    annotation, and a distinct "resolved" status label.
+    """
     c = colors
     shares_parent_branch = _task_shares_parent_branch(task, parent_task)
-    use_merge_status = task.merge_status == "unmerged" and not shares_parent_branch
-    if use_merge_status:
-        status_label = "unmerged"
-        status_color = c['unmerged']
-    elif task.status == "completed":
-        status_label = "completed"
-        status_color = c['success']
-    elif task.status == "dropped":
-        status_label = "dropped"
-        status_color = c['failure']
+    if is_resolved_anchor:
+        status_label = "resolved"
+        status_color = c['lineage']
     else:
-        status_label = "failed"
-        status_color = c['failure']
+        use_merge_status = task.merge_status == "unmerged" and not shares_parent_branch
+        if use_merge_status:
+            status_label = "unmerged"
+            status_color = c['unmerged']
+        elif task.status == "completed":
+            status_label = "completed"
+            status_color = c['success']
+        elif task.status == "dropped":
+            status_label = "dropped"
+            status_color = c['failure']
+        else:
+            status_label = "failed"
+            status_color = c['failure']
     status_padded = f"{status_label:<{_HISTORY_STATUS_WIDTH}}"
     status_icon = f"[{status_color}]{status_padded}[/{status_color}]"
     date_str = (
@@ -192,7 +202,7 @@ def _render_history_task_line(
         f"{first_prefix}{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
         f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
     )
-    if task.status == "failed":
+    if task.status == "failed" and not is_resolved_anchor:
         reason = task.failure_reason or "UNKNOWN"
         console.print(f"{detail_prefix}    [{c['failure']}]reason: {reason}[/{c['failure']}]")
         retry_annotation = _resolve_retry_annotation(store, task)
@@ -251,8 +261,13 @@ def _render_lineage_node(
     config: Config,
     store: SqliteTaskStore,
     colors: dict[str, str],
+    unresolved_task_ids: set[str] | None = None,
 ) -> None:
-    """Render a lineage tree using branch connectors."""
+    """Render a lineage tree using branch connectors.
+
+    When unresolved_task_ids is provided, nodes whose id is not in the set
+    are rendered as resolved lineage anchors (dim label, no failure detail).
+    """
     c = colors
 
     def _render_subtree(
@@ -271,6 +286,11 @@ def _render_lineage_node(
             child_prefix_raw = ""
             first_prefix = ""
             detail_prefix = ""
+        is_resolved_anchor = (
+            unresolved_task_ids is not None
+            and current.task.id is not None
+            and current.task.id not in unresolved_task_ids
+        )
         _render_history_task_line(
             current.task,
             config=config,
@@ -280,6 +300,7 @@ def _render_lineage_node(
             detail_prefix=detail_prefix,
             parent_task=parent_task,
             compact_child=parent_task is not None,
+            is_resolved_anchor=is_resolved_anchor,
         )
 
         for index, child in enumerate(current.children):
@@ -544,7 +565,14 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
 
     c = TASK_COLORS
     for lineage in lineages:
-        _render_lineage_node(lineage.tree, config=config, store=store, colors=c)
+        unresolved_ids = {t.id for t in lineage.unresolved_tasks if t.id is not None}
+        _render_lineage_node(
+            lineage.tree,
+            config=config,
+            store=store,
+            colors=c,
+            unresolved_task_ids=unresolved_ids,
+        )
     return 0
 
 

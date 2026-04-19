@@ -468,3 +468,65 @@ class TestQueryIncomplete:
         assert len(lineages) == 1
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {rebase.id}
+
+    def test_completed_unmerged_root_superseded_by_merged_retry_is_hidden(self, tmp_path: Path):
+        """Regression: completed-but-unmerged root should be suppressed once a
+        later same-lineage retry has merged."""
+        store = self._store(tmp_path)
+
+        first = store.add("first attempt", task_type="implement")
+        self._complete(first, merge_status="unmerged")
+        store.update(first)
+        assert first.id is not None
+
+        second = store.add("second attempt", task_type="implement", based_on=first.id)
+        self._complete(second, merge_status="merged")
+        store.update(second)
+        assert second.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_completed_unmerged_chain_resolved_by_descendant_merge(self, tmp_path: Path):
+        """Regression: completed-unmerged ancestors should be suppressed when a
+        deeper descendant has merged (multi-hop rollup)."""
+        store = self._store(tmp_path)
+
+        first = store.add("first", task_type="implement")
+        self._complete(first, merge_status="unmerged")
+        store.update(first)
+        assert first.id is not None
+
+        second = store.add("second", task_type="implement", based_on=first.id)
+        self._complete(second, merge_status="unmerged")
+        store.update(second)
+        assert second.id is not None
+
+        third = store.add("third", task_type="implement", based_on=second.id)
+        self._complete(third, merge_status="merged")
+        store.update(third)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_completed_unmerged_root_with_only_completed_unmerged_retry_remains(self, tmp_path: Path):
+        """Negative: an unmerged retry does not supersede an unmerged ancestor."""
+        store = self._store(tmp_path)
+
+        first = store.add("first", task_type="implement")
+        self._complete(first, merge_status="unmerged")
+        store.update(first)
+        assert first.id is not None
+
+        second = store.add("second", task_type="implement", based_on=first.id)
+        self._complete(second, merge_status="unmerged")
+        store.update(second)
+        assert second.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == first.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        # Root is unresolved, so the unmerged completed retry is suppressed
+        # from the displayed attention rows — the root itself is the attention item.
+        assert unresolved_ids == {first.id}
