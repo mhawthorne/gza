@@ -340,7 +340,7 @@ class TestQueryIncomplete:
         assert improve.id in unresolved_ids
         assert root.id not in unresolved_ids
 
-    def test_unmerged_root_suppresses_completed_improve_descendant(self, tmp_path: Path):
+    def test_unmerged_root_keeps_unresolved_completed_improve_descendant_visible(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         root = store.add("implement root", task_type="implement")
@@ -355,7 +355,10 @@ class TestQueryIncomplete:
         lineages = query_incomplete(store, HistoryFilter(limit=None))
         assert len(lineages) == 1
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        assert unresolved_ids == {root.id}
+        assert unresolved_ids == {root.id, improve.id}
+
+        child_ids = {child.task.id for child in lineages[0].tree.children}
+        assert improve.id in child_ids
 
     def test_retry_chain_failed_failed_completed_keeps_only_latest_unresolved(self, tmp_path: Path):
         store = self._store(tmp_path)
@@ -527,9 +530,9 @@ class TestQueryIncomplete:
         assert len(lineages) == 1
         assert lineages[0].root.id == first.id
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        # Root is unresolved, so the unmerged completed retry is suppressed
-        # from the displayed attention rows — the root itself is the attention item.
-        assert unresolved_ids == {first.id}
+        # Both tasks remain unresolved, so both should stay visible in the
+        # displayed attention rows under the shared root lineage.
+        assert unresolved_ids == {first.id, second.id}
 
     def test_failed_root_is_not_suppressed_by_completed_improve_descendant(self, tmp_path: Path):
         store = self._store(tmp_path)

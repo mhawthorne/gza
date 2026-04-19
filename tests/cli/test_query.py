@@ -4918,7 +4918,7 @@ class TestIncompleteCommand:
         assert "Implement root" in result.stdout
         assert "Improve failed" in result.stdout
 
-    def test_incomplete_shows_unmerged_root_once_without_completed_improve_child(self, tmp_path: Path):
+    def test_incomplete_shows_unmerged_root_with_unresolved_completed_improve_child(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -4941,21 +4941,23 @@ class TestIncompleteCommand:
 
         assert result.returncode == 0
         assert "Implement root" in result.stdout
-        assert "Improve completed" not in result.stdout
+        assert "Improve completed" in result.stdout
 
-    def test_incomplete_retry_chain_is_root_anchored_with_latest_attempt_visible(self, tmp_path: Path):
+    def test_incomplete_retry_chain_keeps_only_latest_attempt_unresolved(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         first = store.add("Attempt one", task_type="implement")
         first.status = "failed"
         first.completed_at = datetime.now(UTC)
+        first.failure_reason = "FIRST_FAILURE"
         store.update(first)
         assert first.id is not None
 
         second = store.add("Attempt two", task_type="implement", based_on=first.id)
         second.status = "failed"
         second.completed_at = datetime.now(UTC)
+        second.failure_reason = "SECOND_FAILURE"
         store.update(second)
         assert second.id is not None
 
@@ -4969,9 +4971,13 @@ class TestIncompleteCommand:
         result = run_gza("incomplete", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "Attempt three" in result.stdout
         assert "Attempt one" in result.stdout
         assert "Attempt two" in result.stdout
-        assert "Attempt three" in result.stdout
+        # Resolved anchors remain for lineage context, but their failure detail
+        # should be suppressed because only the latest attempt is unresolved.
+        assert "FIRST_FAILURE" not in result.stdout
+        assert "SECOND_FAILURE" not in result.stdout
 
     def test_incomplete_includes_legacy_unmerged_status_rows(self, tmp_path: Path):
         setup_config(tmp_path)
