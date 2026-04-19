@@ -22,6 +22,7 @@ from gza.workers import WorkerRegistry
 from .conftest import (
     get_latest_task,
     make_store,
+    mark_orphaned,
     run_gza,
     setup_config,
     setup_db_with_tasks,
@@ -1050,7 +1051,7 @@ class TestWorkCommandMultiTask:
         # "No pending tasks found", so we can observe the orphaned warning without
         # needing to actually execute a task.
         orphaned_task = store.add("Stuck task from yesterday")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         result = run_gza("work", "--no-docker", "--project", str(tmp_path))
 

@@ -677,20 +677,39 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             latest_review_completed = latest_review.completed_at
             assert latest_review_completed is not None
 
-            review_is_stale = False
-            if branch_task.review_cleared_at and branch_task.review_cleared_at >= latest_review_completed:
-                review_is_stale = True
-            if latest_improve and latest_improve.completed_at and latest_improve.completed_at > latest_review_completed:
-                review_is_stale = True
+            stale_by_improve = (
+                latest_improve is not None
+                and latest_improve.completed_at is not None
+                and latest_improve.completed_at > latest_review_completed
+            )
+            stale_by_cleared_at = (
+                branch_task.review_cleared_at is not None
+                and branch_task.review_cleared_at >= latest_review_completed
+            )
+            review_is_stale = stale_by_improve or stale_by_cleared_at
 
             if review_is_stale:
                 review_classification = "review stale"
                 review_status_color = UNMERGED_COLORS["review_changes"]
                 latest_review_id = latest_review.id if latest_review.id is not None else "?"
-                if latest_improve and latest_improve.id is not None:
-                    review_detail = f"last review {latest_review_id} before latest improve {latest_improve.id}"
+                review_time_str = latest_review_completed.strftime("%Y-%m-%d %H:%M")
+                # Prefer the improve-triggered message when both rules fire — an
+                # improve completion naturally bumps review_cleared_at too, so the
+                # improve is the more informative cause to surface.
+                if stale_by_improve and latest_improve is not None and latest_improve.id is not None and latest_improve.completed_at is not None:
+                    improve_time_str = latest_improve.completed_at.strftime("%Y-%m-%d %H:%M")
+                    review_detail = (
+                        f"last review {latest_review_id} at {review_time_str}, "
+                        f"improve {latest_improve.id} at {improve_time_str}"
+                    )
+                elif stale_by_cleared_at and branch_task.review_cleared_at is not None:
+                    cleared_time_str = branch_task.review_cleared_at.strftime("%Y-%m-%d %H:%M")
+                    review_detail = (
+                        f"last review {latest_review_id} at {review_time_str}, "
+                        f"review cleared at {cleared_time_str}"
+                    )
                 else:
-                    review_detail = f"last review {latest_review_id} before latest improve"
+                    review_detail = f"last review {latest_review_id} at {review_time_str}"
             else:
                 review_classification = "reviewed"
                 review_status_color = UNMERGED_COLORS["review_approved"]
@@ -1104,6 +1123,23 @@ def _build_ps_rows(
     return rows, in_progress_tasks
 
 
+def _task_pid_is_alive(task: DbTask) -> bool:
+    """Return True when task.running_pid points to a live process.
+
+    Foreground flows (e.g. invoke_provider_resolve) mark a task in_progress
+    without registering a worker. Consulting running_pid keeps such tasks
+    from being flagged as orphaned while they are actively running.
+    """
+    pid = task.running_pid
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def _get_orphaned_tasks(registry: WorkerRegistry, store: SqliteTaskStore) -> list[DbTask]:
     """Return in-progress tasks that have no active worker (orphaned/stale)."""
     rows, in_progress = _build_ps_rows(registry, store, include_completed=False)
@@ -1256,6 +1292,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         task is not None
         and task.status == "in_progress"
         and (worker is None or worker.status != "running")
+        and not _task_pid_is_alive(task)
     )
 
     started = _started_at(worker, task)

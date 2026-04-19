@@ -13,6 +13,7 @@ import pytest
 
 from .conftest import (
     make_store,
+    mark_orphaned,
     run_gza,
     setup_config,
     setup_db_with_tasks,
@@ -250,7 +251,7 @@ class TestHistoryCommand:
 
         # Create an orphaned (in-progress, no worker) task
         orphaned_task = store.add("Orphaned task needing attention")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         # Create a completed task
         completed_task = store.add("Completed task")
@@ -278,7 +279,7 @@ class TestHistoryCommand:
         store = make_store(tmp_path)
 
         orphaned_task = store.add("Orphaned task")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         result = run_gza("history", "--project", str(tmp_path))
 
@@ -293,7 +294,7 @@ class TestHistoryCommand:
 
         # Create an orphaned task
         orphaned_task = store.add("Orphaned task")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         # Create a completed task
         completed_task = store.add("Completed task")
@@ -1136,7 +1137,7 @@ class TestNextCommand:
 
         # Create an orphaned (in-progress, no active worker) task
         orphaned_task = store.add("Orphaned task that needs attention")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         result = run_gza("next", "--project", str(tmp_path))
 
@@ -1154,7 +1155,7 @@ class TestNextCommand:
 
         # Only an orphaned task, no pending tasks
         orphaned_task = store.add("Stuck orphaned task")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         result = run_gza("next", "--project", str(tmp_path))
 
@@ -1169,7 +1170,7 @@ class TestNextCommand:
         store = make_store(tmp_path)
 
         orphaned_task = store.add("Orphaned task")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         result = run_gza("next", "--project", str(tmp_path))
 
@@ -2005,7 +2006,7 @@ class TestStatusCommand:
         store.update(task1)
 
         orphaned_task = store.add("Orphaned in-progress task", group="my-group")
-        store.mark_in_progress(orphaned_task)
+        mark_orphaned(store, orphaned_task)
 
         result = run_gza("group", "my-group", "--project", str(tmp_path))
 
@@ -2022,7 +2023,7 @@ class TestStatusCommand:
 
         # Create tasks in different groups
         task1 = store.add("Task in group A", group="group-a")
-        store.mark_in_progress(task1)  # orphaned in group-a
+        mark_orphaned(store, task1)  # orphaned in group-a
 
         store.add("Task in group B", group="group-b")  # pending in group-b
 
@@ -2271,6 +2272,28 @@ class TestPsCommand:
         assert rows[0]["task"] != ""
         assert not rows[0]["task"].startswith("task ")
 
+    def test_ps_does_not_flag_foreground_task_with_live_pid_as_orphaned(self, tmp_path: Path):
+        """A foreground in_progress task (running_pid alive, no worker) is not orphaned.
+
+        Internal flows like invoke_provider_resolve run in the foreground and set
+        running_pid via mark_in_progress without registering a worker. As long as
+        the PID is alive, the task should not be classified as orphaned.
+        """
+        import json
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Foreground internal task", task_type="internal")
+        store.mark_in_progress(task)  # sets running_pid to the live test process
+
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["is_orphaned"] is False
+        assert "orphaned" not in rows[0]["flags"]
+
     def test_ps_includes_db_only_in_progress_and_flags_orphaned(self, tmp_path: Path):
         """PS includes in-progress DB rows even when no worker exists."""
         import json
@@ -2279,7 +2302,7 @@ class TestPsCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         task = store.add("DB-only in-progress task")
-        store.mark_in_progress(task)
+        mark_orphaned(store, task)
 
         result = run_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -2368,7 +2391,7 @@ class TestPsCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         task = store.add("Stale worker task")
-        store.mark_in_progress(task)
+        mark_orphaned(store, task)
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)

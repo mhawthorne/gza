@@ -124,12 +124,9 @@ Ask the user if they want to clear the review status so the task can be re-revie
 uv run python -c "
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from datetime import datetime, timezone
 config = Config.load()
 store = SqliteTaskStore(config.db_path)
-task = store.get(<IMPL_TASK_ID>)
-task.review_cleared_at = datetime.now(timezone.utc).isoformat()
-store.update(task)
+store.clear_review_state('<IMPL_TASK_ID>')
 print('Review cleared — task is ready for re-review')
 "
 ```
