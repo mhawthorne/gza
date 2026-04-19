@@ -4851,3 +4851,205 @@ class TestPsSortKey:
 
         sorted_rows = sorted([early, late], key=_ps_sort_key)
         assert [r["task_id"] for r in sorted_rows] == ["gza-1", "gza-2"]
+
+
+class TestIncompleteCommand:
+    """Tests for `gza incomplete` command."""
+
+    def test_incomplete_hides_merged_root_with_completed_review_improve(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        root.merge_status = "merged"
+        store.update(root)
+        assert root.id is not None
+
+        review = store.add("Review done", task_type="review", based_on=root.id, depends_on=root.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.merge_status = "unmerged"
+        store.update(review)
+        assert review.id is not None
+
+        improve = store.add("Improve done", task_type="improve", based_on=root.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime.now(UTC)
+        improve.merge_status = "unmerged"
+        store.update(improve)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unresolved task lineages" in result.stdout
+        assert "Implement root" not in result.stdout
+
+    def test_incomplete_shows_failed_improve_under_merged_root(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        root.merge_status = "merged"
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("Improve failed", task_type="improve", based_on=root.id, same_branch=True)
+        improve.status = "failed"
+        improve.completed_at = datetime.now(UTC)
+        improve.failure_reason = "TEST_FAILURE"
+        store.update(improve)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement root" in result.stdout
+        assert "Improve failed" in result.stdout
+
+    def test_incomplete_shows_unmerged_root_once_without_completed_improve_child(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        root.merge_status = "unmerged"
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("Improve completed", task_type="improve", based_on=root.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime.now(UTC)
+        improve.merge_status = "unmerged"
+        store.update(improve)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement root" in result.stdout
+        assert "Improve completed" not in result.stdout
+
+    def test_incomplete_retry_chain_is_root_anchored_with_latest_attempt_visible(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("Attempt one", task_type="implement")
+        first.status = "failed"
+        first.completed_at = datetime.now(UTC)
+        store.update(first)
+        assert first.id is not None
+
+        second = store.add("Attempt two", task_type="implement", based_on=first.id)
+        second.status = "failed"
+        second.completed_at = datetime.now(UTC)
+        store.update(second)
+        assert second.id is not None
+
+        third = store.add("Attempt three", task_type="implement", based_on=second.id)
+        third.status = "completed"
+        third.completed_at = datetime.now(UTC)
+        third.merge_status = "unmerged"
+        store.update(third)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Attempt one" in result.stdout
+        assert "Attempt two" in result.stdout
+        assert "Attempt three" in result.stdout
+
+    def test_incomplete_includes_legacy_unmerged_status_rows(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        legacy = store.add("Legacy unmerged", task_type="implement")
+        legacy.status = "unmerged"
+        legacy.completed_at = datetime.now(UTC)
+        legacy.has_commits = True
+        store.update(legacy)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Legacy unmerged" in result.stdout
+
+    def test_incomplete_branching_retry_shows_all_unresolved_siblings_under_one_root(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root failed", task_type="implement")
+        root.status = "failed"
+        root.completed_at = datetime.now(UTC)
+        root.failure_reason = "TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
+        retry_completed.status = "completed"
+        retry_completed.completed_at = datetime.now(UTC)
+        retry_completed.merge_status = "unmerged"
+        store.update(retry_completed)
+        assert retry_completed.id is not None
+
+        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC)
+        retry_failed.failure_reason = "TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Root failed" in result.stdout
+        assert "Retry completed" in result.stdout
+        assert "Retry failed" in result.stdout
+
+    def test_incomplete_hides_completed_rebase_under_merged_root(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        root.merge_status = "merged"
+        store.update(root)
+        assert root.id is not None
+
+        rebase = store.add("Rebase done", task_type="rebase", based_on=root.id, same_branch=True)
+        rebase.status = "completed"
+        rebase.completed_at = datetime.now(UTC)
+        rebase.merge_status = "unmerged"
+        store.update(rebase)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No unresolved task lineages" in result.stdout
+        assert "Rebase done" not in result.stdout
+
+    def test_incomplete_shows_failed_rebase_under_merged_root(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        root.merge_status = "merged"
+        store.update(root)
+        assert root.id is not None
+
+        rebase = store.add("Rebase failed", task_type="rebase", based_on=root.id, same_branch=True)
+        rebase.status = "failed"
+        rebase.completed_at = datetime.now(UTC)
+        rebase.failure_reason = "TEST_FAILURE"
+        store.update(rebase)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Implement root" in result.stdout
+        assert "Rebase failed" in result.stdout

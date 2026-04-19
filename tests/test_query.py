@@ -10,6 +10,7 @@ from gza.query import (
     HistoryFilter,
     get_task_lineage,
     is_lineage_complete,
+    query_incomplete,
     query_history,
     query_history_with_lineage,
 )
@@ -281,3 +282,174 @@ class TestQueryHistoryWithLineage:
         f = HistoryFilter(lineage_depth=1, limit=None)
         nodes = query_history_with_lineage(store, f)
         assert nodes == []
+
+
+class TestQueryIncomplete:
+    """Tests for unresolved-lineage query behavior."""
+
+    def _store(self, tmp_path: Path) -> SqliteTaskStore:
+        return SqliteTaskStore(tmp_path / "test.db")
+
+    def _complete(self, task: Task, *, merge_status: str | None = None) -> None:
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.merge_status = merge_status
+
+    def _fail(self, task: Task) -> None:
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+
+    def test_merged_root_hides_completed_review_and_improve(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="merged")
+        store.update(root)
+        assert root.id is not None
+
+        review = store.add("review", task_type="review", based_on=root.id, depends_on=root.id)
+        self._complete(review, merge_status="unmerged")
+        store.update(review)
+        assert review.id is not None
+
+        improve = store.add("improve", task_type="improve", based_on=root.id, depends_on=review.id, same_branch=True)
+        self._complete(improve, merge_status="unmerged")
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_failed_improve_under_merged_root_remains_unresolved(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="merged")
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("improve failed", task_type="improve", based_on=root.id, same_branch=True)
+        self._fail(improve)
+        store.update(improve)
+        assert improve.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert improve.id in unresolved_ids
+        assert root.id not in unresolved_ids
+
+    def test_unmerged_root_suppresses_completed_improve_descendant(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="unmerged")
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("improve done", task_type="improve", based_on=root.id, same_branch=True)
+        self._complete(improve, merge_status="unmerged")
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id}
+
+    def test_retry_chain_failed_failed_completed_keeps_only_latest_unresolved(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        first = store.add("first attempt", task_type="implement")
+        self._fail(first)
+        store.update(first)
+        assert first.id is not None
+
+        second = store.add("second attempt", task_type="implement", based_on=first.id)
+        self._fail(second)
+        store.update(second)
+        assert second.id is not None
+
+        third = store.add("third attempt", task_type="implement", based_on=second.id)
+        self._complete(third, merge_status="unmerged")
+        store.update(third)
+        assert third.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {third.id}
+
+    def test_legacy_unmerged_status_task_remains_visible(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("legacy unmerged root", task_type="implement")
+        root.status = "unmerged"
+        root.completed_at = datetime.now(UTC)
+        root.has_commits = True
+        store.update(root)
+        assert root.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == root.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id}
+
+    def test_branching_retry_lineage_keeps_all_unresolved_siblings_under_root(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("root failed", task_type="implement")
+        self._fail(root)
+        store.update(root)
+        assert root.id is not None
+
+        completed_retry = store.add("retry completed", task_type="implement", based_on=root.id)
+        self._complete(completed_retry, merge_status="unmerged")
+        store.update(completed_retry)
+        assert completed_retry.id is not None
+
+        failed_sibling = store.add("retry failed sibling", task_type="implement", based_on=root.id)
+        self._fail(failed_sibling)
+        store.update(failed_sibling)
+        assert failed_sibling.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        lineage = lineages[0]
+        assert lineage.root.id == root.id
+        unresolved_ids = {task.id for task in lineage.unresolved_tasks}
+        assert unresolved_ids == {completed_retry.id, failed_sibling.id}
+        child_ids = {child.task.id for child in lineage.tree.children}
+        assert {completed_retry.id, failed_sibling.id}.issubset(child_ids)
+
+    def test_completed_rebase_under_merged_root_is_hidden(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="merged")
+        store.update(root)
+        assert root.id is not None
+
+        rebase = store.add("rebase done", task_type="rebase", based_on=root.id, same_branch=True)
+        self._complete(rebase, merge_status="unmerged")
+        store.update(rebase)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_failed_rebase_under_merged_root_remains_visible(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="merged")
+        store.update(root)
+        assert root.id is not None
+
+        rebase = store.add("rebase failed", task_type="rebase", based_on=root.id, same_branch=True)
+        self._fail(rebase)
+        store.update(rebase)
+        assert rebase.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {rebase.id}

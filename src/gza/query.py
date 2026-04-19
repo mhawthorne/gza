@@ -38,6 +38,16 @@ class TaskLineageNode:
     children: list[TaskLineageNode] = field(default_factory=list)
 
 
+@dataclass
+class IncompleteLineage:
+    """Unresolved lineage group anchored on the canonical root task."""
+
+    root: Task
+    tree: TaskLineageNode
+    unresolved_tasks: list[Task]
+    latest_unresolved_at: datetime
+
+
 def is_lineage_complete(task: Task) -> bool:
     """Return True if task represents a fully-resolved outcome (no action needed).
 
@@ -133,6 +143,172 @@ def query_history_with_lineage(
         root_nodes.append(build_lineage_tree(store, root, max_depth=f.lineage_depth))
 
     return root_nodes
+
+
+def _is_shared_branch_descendant(task: Task, root_task: Task) -> bool:
+    """Return whether task is treated as a shared-branch lineage descendant."""
+    if task.id is None or root_task.id is None:
+        return False
+    if task.id == root_task.id:
+        return False
+    if task.task_type == "improve":
+        return task.based_on is not None
+    if task.task_type == "review":
+        return True
+    if task.task_type == "rebase":
+        return task.based_on is not None
+    return bool(task.same_branch)
+
+
+def _has_successful_retry_descendant(task_id: str, by_parent: dict[str, list[Task]]) -> bool:
+    """Return True when any based_on descendant has status='completed'."""
+    visited: set[str] = {task_id}
+    queue: list[str] = [task_id]
+    while queue:
+        current = queue.pop(0)
+        for child in by_parent.get(current, []):
+            if child.id is None or child.id in visited:
+                continue
+            if child.status == "completed":
+                return True
+            visited.add(child.id)
+            queue.append(child.id)
+    return False
+
+
+def _get_unresolved_terminal_kind(task: Task) -> str | None:
+    """Return unresolved terminal kind for attention queries, else None."""
+    if task.status == "failed":
+        return "failed"
+    if task.status in {"completed", "unmerged"}:
+        return "completed_like"
+    return None
+
+
+def _prune_lineage_tree_to_ids(tree: TaskLineageNode, keep_ids: set[str]) -> TaskLineageNode:
+    """Return a lineage tree containing only keep_ids (plus root anchor)."""
+
+    def _filter(node: TaskLineageNode, is_root: bool) -> TaskLineageNode | None:
+        kept_children: list[TaskLineageNode] = []
+        for child in node.children:
+            filtered = _filter(child, False)
+            if filtered is not None:
+                kept_children.append(filtered)
+        task_id = node.task.id
+        should_keep = is_root or (task_id is not None and task_id in keep_ids) or bool(kept_children)
+        if not should_keep:
+            return None
+        return TaskLineageNode(
+            task=node.task,
+            depth=node.depth,
+            relationship=node.relationship,
+            children=kept_children,
+        )
+
+    filtered = _filter(tree, True)
+    assert filtered is not None
+    return filtered
+
+
+def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[IncompleteLineage]:
+    """Return unresolved lineages grouped by canonical root for attention workflows."""
+    filtered = HistoryFilter(
+        limit=None,
+        status=None,
+        task_type=f.task_type,
+        incomplete=False,
+        days=f.days,
+        start_date=f.start_date,
+        end_date=f.end_date,
+    )
+    tasks = query_history(store, filtered)
+    if not tasks:
+        return []
+
+    by_id = {task.id: task for task in tasks if task.id is not None}
+    by_parent: dict[str, list[Task]] = {}
+    for task in tasks:
+        if task.id is None or task.based_on is None:
+            continue
+        by_parent.setdefault(task.based_on, []).append(task)
+
+    unresolved_by_root: dict[str, list[Task]] = {}
+    root_by_id: dict[str, Task] = {}
+
+    for task in tasks:
+        if task.id is None:
+            continue
+
+        unresolved_kind = _get_unresolved_terminal_kind(task)
+        if unresolved_kind is None:
+            continue
+
+        if unresolved_kind == "failed":
+            if _has_successful_retry_descendant(task.id, by_parent):
+                continue
+            root = resolve_lineage_root(store, task)
+            if root.id is None:
+                continue
+            unresolved_by_root.setdefault(root.id, []).append(task)
+            root_by_id[root.id] = root
+            continue
+
+        root = resolve_lineage_root(store, task)
+        if root.id is None:
+            continue
+        root_merged = root.merge_status == "merged"
+        shared_descendant = _is_shared_branch_descendant(task, root)
+
+        if shared_descendant:
+            if root_merged:
+                continue
+        elif task.merge_status == "merged":
+            continue
+
+        unresolved_by_root.setdefault(root.id, []).append(task)
+        root_by_id[root.id] = root
+
+    lineages: list[IncompleteLineage] = []
+    for root_id, unresolved in unresolved_by_root.items():
+        if not unresolved:
+            continue
+        root = root_by_id[root_id]
+        root_unresolved = any(task.id == root_id for task in unresolved)
+        shown_ids: set[str] = set()
+        for task in unresolved:
+            if task.id is None:
+                continue
+            if task.id == root_id:
+                shown_ids.add(task.id)
+                continue
+            if task.status == "failed":
+                shown_ids.add(task.id)
+                continue
+            if not root_unresolved:
+                shown_ids.add(task.id)
+
+        tree = _prune_lineage_tree_to_ids(build_lineage_tree(store, root), shown_ids)
+        latest_unresolved_at = max(task_time_for_lineage(task) for task in unresolved)
+        shown_tasks = [by_id[task_id] for task_id in shown_ids if task_id in by_id]
+        lineages.append(
+            IncompleteLineage(
+                root=root,
+                tree=tree,
+                unresolved_tasks=shown_tasks,
+                latest_unresolved_at=latest_unresolved_at,
+            )
+        )
+
+    lineages.sort(
+        key=lambda item: (
+            _normalize_lineage_time(item.latest_unresolved_at),
+            task_id_numeric_key(item.root.id),
+        ),
+        reverse=True,
+    )
+    if f.limit is not None:
+        lineages = lineages[: f.limit]
+    return lineages
 
 
 # --- Lineage helpers ---

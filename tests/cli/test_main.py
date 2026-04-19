@@ -79,6 +79,19 @@ class TestHelpOutput:
         assert "from each resolved root" in result.stdout
         assert "Expand lineage N levels for each matching task" not in result.stdout
 
+    def test_incomplete_help_mentions_unresolved_lineages(self, tmp_path):
+        """incomplete --help should frame command as unresolved lineage attention view."""
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized_output = " ".join(result.stdout.split())
+        assert "filter tasks by task_type before lineage rollup" in normalized_output.lower()
+        assert "--status" not in result.stdout
+        assert "--incomplete" not in result.stdout
+        assert "--lineage-depth" not in result.stdout
+
     def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
         """advance --help should show --unimplemented/--force and keep --plans hidden."""
         result = subprocess.run(

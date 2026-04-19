@@ -803,6 +803,9 @@ By default, `gza history` excludes `internal` tasks. Use `--type internal` to vi
 gza history [options]
 ```
 
+`gza history` is a flat chronological record. Use `gza incomplete` for a
+lineage-aware unresolved attention view.
+
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
@@ -811,8 +814,26 @@ gza history [options]
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
-| `--incomplete` | Show only unresolved tasks (failed or unmerged) |
+| `--incomplete` | Show only unresolved flat history rows (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
+
+### incomplete
+
+Show unresolved task lineages that need attention now.
+
+```bash
+gza incomplete [options]
+```
+
+`gza incomplete` groups by canonical lineage root and suppresses resolved
+descendants (for example, completed review/improve tasks already rolled up by a
+merged root or successful retry chain).
+
+| Option | Description |
+|--------|-------------|
+| `--last N`, `-n N` | Show last N unresolved lineages (default: 5) |
+| `--type TYPE` | Filter terminal tasks by type before lineage rollup |
+| `--days N` | Show unresolved lineages with activity in the last N days |
 
 ### search
 

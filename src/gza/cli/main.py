@@ -66,6 +66,7 @@ from .query import (
     cmd_delete,
     cmd_groups,
     cmd_history,
+    cmd_incomplete,
     cmd_kill,
     cmd_lineage,
     cmd_next,
@@ -225,6 +226,33 @@ def main() -> int:
         type=_parse_search_last,
         metavar="N",
         help="Show last N matching tasks (default: 10, 0 for all)",
+    )
+
+    # incomplete command
+    incomplete_parser = subparsers.add_parser(
+        "incomplete",
+        help="Show unresolved task lineages that still need attention",
+    )
+    add_common_args(incomplete_parser)
+    incomplete_parser.set_defaults(last=5)
+    incomplete_parser.add_argument(
+        "--last",
+        "-n",
+        type=int,
+        metavar="N",
+        help="Show last N unresolved lineages",
+    )
+    incomplete_parser.add_argument(
+        "--type",
+        type=str,
+        choices=["explore", "plan", "implement", "review", "improve", "rebase", "internal"],
+        help="Filter tasks by task_type before lineage rollup",
+    )
+    incomplete_parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        help="Show only unresolved lineages with activity in the last N days",
     )
 
     # unmerged command
@@ -1627,6 +1655,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "search":
             return cmd_search(args)
+        elif args.command == "incomplete":
+            return cmd_incomplete(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
         elif args.command == "advance":
