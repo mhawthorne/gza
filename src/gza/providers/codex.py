@@ -17,6 +17,7 @@ from .base import (
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
+    write_preflight_entry,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -156,16 +157,25 @@ class CodexProvider(Provider):
             return True
         return False
 
-    def verify_credentials(self, config: Config) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
         """Verify Codex credentials by testing the codex command."""
         if config.use_docker:
-            return self._verify_docker(config)
-        return self._verify_direct()
+            return self._verify_docker(config, log_file=log_file)
+        return self._verify_direct(log_file=log_file)
 
-    def _verify_docker(self, config: Config) -> bool:
+    def _verify_docker(self, config: Config, log_file: Path | None = None) -> bool:
         """Verify credentials work in Docker."""
         docker_config = _get_docker_config(f"{config.docker_image}-codex")
         if not ensure_docker_image(docker_config, config.project_dir):
+            write_preflight_entry(
+                log_file,
+                event="docker_image_build_failed",
+                command=["docker", "build", "-t", docker_config.image_name],
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="Failed to build Codex Docker image",
+            )
             print("Error: Failed to build Docker image")
             return False
         return verify_docker_credentials(
@@ -176,28 +186,59 @@ class CodexProvider(Provider):
                 "Error: Invalid or missing Codex credentials\n"
                 "  Run 'codex login' or set CODEX_API_KEY in .env"
             ),
+            log_file=log_file,
         )
 
-    def _verify_direct(self) -> bool:
+    def _verify_direct(self, log_file: Path | None = None) -> bool:
         """Verify credentials work directly."""
+        cmd = ["codex", "--version"]
         try:
             result = subprocess.run(
-                ["codex", "--version"],
+                cmd,
                 capture_output=True,
-                timeout=10,
+                timeout=5,
                 text=True,
             )
             output = result.stdout + result.stderr
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_direct",
+                command=cmd,
+                returncode=result.returncode,
+                stdout_tail=result.stdout,
+                stderr_tail=result.stderr,
+                message=f"codex --version exited {result.returncode}",
+            )
             if "Invalid API key" in output or "authentication" in output.lower() or "unauthorized" in output.lower():
                 print("Error: Invalid or missing Codex credentials")
                 print("  Run 'codex login' or set CODEX_API_KEY in .env")
                 return False
             if result.returncode == 0:
                 return True
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            if isinstance(e, FileNotFoundError):
-                print("Error: 'codex' command not found")
-                print("  Install with: npm install -g @openai/codex")
+        except subprocess.TimeoutExpired:
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_timeout",
+                command=cmd,
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="codex --version timed out after 5s",
+            )
+            print("Error: 'codex --version' timed out (CLI may be hanging on an update prompt)")
+            return False
+        except FileNotFoundError:
+            write_preflight_entry(
+                log_file,
+                event="verify_credentials_missing_binary",
+                command=cmd,
+                returncode=None,
+                stdout_tail="",
+                stderr_tail="",
+                message="codex binary not found on PATH",
+            )
+            print("Error: 'codex' command not found")
+            print("  Install with: npm install -g @openai/codex")
             return False
         return False
 
@@ -237,7 +278,9 @@ class CodexProvider(Provider):
 
         if resume_session_id:
             cmd.extend([
-                "codex", "exec", "resume", "--json",
+                "codex",
+                "-c", "check_for_update_on_startup=false",
+                "exec", "resume", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
                 resume_session_id,
                 "-",  # Read resume prompt from stdin
@@ -248,7 +291,9 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
         else:
             cmd.extend([
-                "codex", "exec", "--json",
+                "codex",
+                "-c", "check_for_update_on_startup=false",
+                "exec", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
                 "--skip-git-repo-check",  # Worktree metadata may be unavailable inside containers
                 "-C", "/workspace",  # Set working directory explicitly
@@ -284,7 +329,9 @@ class CodexProvider(Provider):
 
         if resume_session_id:
             cmd.extend([
-                "codex", "exec", "resume", "--json",
+                "codex",
+                "-c", "check_for_update_on_startup=false",
+                "exec", "resume", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
                 resume_session_id,
                 "-",  # Read resume prompt from stdin
@@ -295,7 +342,9 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
         else:
             cmd.extend([
-                "codex", "exec", "--json",
+                "codex",
+                "-c", "check_for_update_on_startup=false",
+                "exec", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
                 "--skip-git-repo-check",  # Worktree metadata may be unavailable in detached review contexts
                 "-C", str(work_dir),

@@ -227,7 +227,7 @@ class TestProviderCommandLogging:
             def check_credentials(self) -> bool:
                 return True
 
-            def verify_credentials(self, config: Config) -> bool:
+            def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
                 return True
 
             def run(self, config: Config, prompt: str, log_file: Path, work_dir: Path, resume_session_id: str | None = None) -> RunResult:
@@ -3121,6 +3121,8 @@ class TestCodexProvider:
             "timeout",
             "10m",
             "codex",
+            "-c",
+            "check_for_update_on_startup=false",
             "exec",
             "resume",
             "--json",
@@ -3165,6 +3167,8 @@ class TestCodexProvider:
         cmd = mock_run.call_args.args[0]
         assert cmd == docker_base_cmd + [
             "codex",
+            "-c",
+            "check_for_update_on_startup=false",
             "exec",
             "resume",
             "--json",
@@ -5102,3 +5106,115 @@ class TestGeminiFullConversationSimulation:
         pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
         matches = re.findall(pattern, log_content)
         assert len(matches) == 4
+
+
+class TestPreflightLogging:
+    """verify_credentials should leave a breadcrumb in the task log."""
+
+    def _read_preflight_entries(self, log_file: Path) -> list[dict]:
+        entries: list[dict] = []
+        for line in log_file.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("subtype") == "preflight":
+                entries.append(obj)
+        return entries
+
+    def test_codex_verify_missing_binary_is_logged(self, tmp_path: Path):
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+        provider = CodexProvider()
+
+        with patch("gza.providers.codex.subprocess.run", side_effect=FileNotFoundError()):
+            ok = provider._verify_direct(log_file=log_file)
+
+        assert ok is False
+        entries = self._read_preflight_entries(log_file)
+        assert len(entries) == 1
+        assert entries[0]["event"] == "verify_credentials_missing_binary"
+        assert entries[0]["returncode"] is None
+        assert "codex" in entries[0]["command"]
+
+    def test_codex_verify_timeout_is_logged(self, tmp_path: Path):
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+        provider = CodexProvider()
+
+        with patch(
+            "gza.providers.codex.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["codex", "--version"], timeout=5),
+        ):
+            ok = provider._verify_direct(log_file=log_file)
+
+        assert ok is False
+        entries = self._read_preflight_entries(log_file)
+        assert entries and entries[0]["event"] == "verify_credentials_timeout"
+
+    def test_codex_verify_success_captures_output(self, tmp_path: Path):
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+        provider = CodexProvider()
+
+        fake_result = subprocess.CompletedProcess(
+            args=["codex", "--version"],
+            returncode=0,
+            stdout="codex-cli 0.120.0\n",
+            stderr="",
+        )
+        with patch("gza.providers.codex.subprocess.run", return_value=fake_result):
+            ok = provider._verify_direct(log_file=log_file)
+
+        assert ok is True
+        entries = self._read_preflight_entries(log_file)
+        assert entries and entries[0]["event"] == "verify_credentials_direct"
+        assert entries[0]["returncode"] == 0
+        assert "codex-cli" in entries[0]["stdout_tail"]
+
+    def test_claude_verify_missing_binary_is_logged(self, tmp_path: Path):
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+        provider = ClaudeProvider()
+
+        with patch("gza.providers.claude.subprocess.run", side_effect=FileNotFoundError()):
+            ok = provider._verify_direct(log_file=log_file)
+
+        assert ok is False
+        entries = self._read_preflight_entries(log_file)
+        assert entries and entries[0]["event"] == "verify_credentials_missing_binary"
+
+    def test_codex_exec_cmd_passes_skip_update_flag(self, tmp_path: Path):
+        """Codex exec invocations must set check_for_update_on_startup=false."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="codex",
+            model="gpt-5.2-codex",
+            use_docker=False,
+            timeout_minutes=1,
+        )
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+
+        captured_cmd: list[str] = []
+
+        def fake_run_with_output_parsing(cmd, *args, **kwargs):
+            captured_cmd.extend(cmd)
+            from gza.providers.base import RunResult
+            return RunResult(exit_code=0)
+
+        with patch.object(provider, "_run_with_output_parsing", side_effect=fake_run_with_output_parsing):
+            provider._run_direct(
+                config=config,
+                prompt="hello",
+                log_file=log_file,
+                work_dir=tmp_path,
+            )
+        codex_idx = captured_cmd.index("codex")
+        assert captured_cmd[codex_idx + 1] == "-c"
+        assert captured_cmd[codex_idx + 2] == "check_for_update_on_startup=false"

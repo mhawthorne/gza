@@ -789,7 +789,11 @@ class TestResumeCommand:
         # New task starts with no stats
         assert new_task.num_turns_reported is None
         assert new_task.cost_usd is None
-        assert new_task.log_file is None
+        # A startup log is now opened as soon as the task is claimed, so the
+        # resume task has a log file pointing at its own run's log (not the
+        # original task's log).
+        assert new_task.log_file is not None
+        assert new_task.log_file != ".gza/logs/20260101-implement-feature-x.log"
 
     def test_resume_orphaned_in_progress_task_succeeds(self, tmp_path: Path):
         """Resume command succeeds for an orphaned in_progress task (no live worker)."""
@@ -1579,6 +1583,94 @@ class TestReconciliation:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "WORKER_DIED"
         assert refreshed.has_commits is not True
+
+    def test_reconciliation_marks_silent_live_task_no_activity(self, tmp_path: Path):
+        """An alive-but-silent task (no log writes for > threshold) is marked NO_ACTIVITY."""
+        from datetime import UTC, datetime, timedelta
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Silent task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()  # PID is alive
+        task.started_at = datetime.now(UTC) - timedelta(minutes=2)
+        # Leave task.log_file = None → log absent → stuck
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        # Patch SIGTERM so we don't actually signal our own PID
+        with patch("gza.cli._common.os.kill") as mock_kill:
+            reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "NO_ACTIVITY"
+        # kill called once for the signal check (os.kill(pid, 0)) and once to SIGTERM
+        assert mock_kill.call_count >= 1
+
+    def test_reconciliation_skips_recent_live_task(self, tmp_path: Path):
+        """A live task under the threshold should NOT be marked NO_ACTIVITY."""
+        from datetime import UTC, datetime, timedelta
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Recent task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.started_at = datetime.now(UTC) - timedelta(seconds=5)
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "in_progress"
+
+    def test_reconciliation_skips_live_task_with_recent_log_writes(self, tmp_path: Path):
+        """A live task whose log was written recently should NOT be marked NO_ACTIVITY."""
+        from datetime import UTC, datetime, timedelta
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        log_rel = ".gza/logs/active.log"
+        log_abs = tmp_path / log_rel
+        log_abs.parent.mkdir(parents=True, exist_ok=True)
+        log_abs.write_text('{"subtype":"info","message":"hi"}\n')
+        # Ensure mtime is now (write_text already does this)
+
+        task = store.add("Active task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.started_at = datetime.now(UTC) - timedelta(minutes=5)
+        task.log_file = log_rel
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "in_progress"
 
     def test_prune_terminal_dead_workers_removes_completed_task_worker(self, tmp_path: Path):
         """Terminal task workers with dead PIDs should be pruned from the registry."""

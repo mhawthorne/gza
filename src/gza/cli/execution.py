@@ -1076,6 +1076,7 @@ def _spawn_background_iterate(
     impl_task: DbTask,
     *,
     max_iterations: int | None = None,
+    dry_run: bool = False,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     effective_max_iterations = max_iterations
@@ -1090,6 +1091,7 @@ def _spawn_background_iterate(
         max_iterations=effective_max_iterations,
         resume=getattr(args, "resume", False),
         retry=getattr(args, "retry", False),
+        dry_run=dry_run,
     )
 
 
@@ -1153,14 +1155,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     # Handle background mode: re-exec this command as a detached process.
     if background:
-        if dry_run:
-            print(f"[dry-run] Would run iterate in background for {impl_task.id}")
-            return 0
         return _spawn_background_iterate(
             args,
             config,
             impl_task,
             max_iterations=max_iterations,
+            dry_run=dry_run,
         )
 
     def _run_task_with_resume(task_to_run: DbTask, *, initial_resume: bool = False) -> tuple[DbTask, int]:
