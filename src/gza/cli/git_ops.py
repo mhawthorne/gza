@@ -1457,11 +1457,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if action['type'] == 'improve':
                 review_task = action.get('review_task')
                 if review_task is not None and task.id is not None and review_task.id is not None:
-                    improve_action, failed_task = resolve_improve_action(store, task.id, review_task.id)
-                    if improve_action == "resume" and failed_task is not None:
-                        description = f"Resume improve {failed_task.id} (failed: {failed_task.failure_reason or 'UNKNOWN'})"
-                    elif improve_action == "retry" and failed_task is not None:
-                        description = f"Retry improve {failed_task.id} (failed: {failed_task.failure_reason or 'UNKNOWN'})"
+                    improve_action, failed_improve = resolve_improve_action(store, task.id, review_task.id)
+                    if improve_action == "resume" and failed_improve is not None:
+                        description = f"Resume improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
+                    elif improve_action == "retry" and failed_improve is not None:
+                        description = f"Retry improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
             elif action['type'] == 'merge':
                 commit_count = _auto_squash_commit_count(config, git, task, target_branch)
                 if commit_count is not None:
