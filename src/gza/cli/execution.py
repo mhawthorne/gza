@@ -1568,6 +1568,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if improve_action == "resume" and failed_improve is not None:
                 assert failed_improve.id is not None
                 action_task = _create_resume_task(store, failed_improve)
+                initial_resume = True
                 print(f"  Created improve task {action_task.id} (resume of {failed_improve.id})")
             elif improve_action == "retry" and failed_improve is not None:
                 assert failed_improve.id is not None

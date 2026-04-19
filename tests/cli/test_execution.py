@@ -5010,6 +5010,79 @@ class TestIterateCommand:
         children = store.get_based_on_children(review.id)
         assert len(children) == 1
 
+    def test_iterate_improve_resume_passes_resume_true_to_run_foreground(self, tmp_path: Path):
+        """When iterate picks 'resume' for an improve, _run_foreground must be called with resume=True.
+
+        Otherwise _auto_rebase_before_resume never fires and the resume runs on a stale branch.
+        """
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        failed_improve = store.add(
+            "Improve", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TIMEOUT"
+        failed_improve.session_id = "improve-session"
+        failed_improve.branch = impl.branch
+        store.update(failed_improve)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        improve_action = {"type": "improve", "description": "Create improve", "review_task": review}
+        # First call is initial_action (pre-loop); second is the first loop iteration; third terminates.
+        engine_actions = [improve_action, improve_action, {"type": "skip", "description": "done"}]
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.determine_next_action", side_effect=engine_actions),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        ):
+            cmd_iterate(args)
+
+        assert run_fg.call_count == 1
+        # The improve-resume path must pass resume=True so _auto_rebase_before_resume fires.
+        assert run_fg.call_args_list[0].kwargs.get("resume") is True
+
     def test_iterate_default_resume_budget_is_one(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
