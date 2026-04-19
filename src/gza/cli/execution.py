@@ -1564,7 +1564,25 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             assert review_task.id is not None
 
             # Use shared logic to decide resume/retry/new for this impl+review pair
-            improve_action, failed_improve = resolve_improve_action(store, impl_task.id, review_task.id)
+            improve_action, failed_improve = resolve_improve_action(
+                store, impl_task.id, review_task.id, max_resume_attempts=max_resume_attempts
+            )
+            if improve_action == "give_up" and failed_improve is not None:
+                assert failed_improve.id is not None
+                print(
+                    f"  Improve for {review_task.id} has exceeded max_resume_attempts"
+                    f" ({max_resume_attempts}); latest failure: {failed_improve.id}"
+                )
+                final_status = "blocked"
+                final_stop_reason = "max_improve_attempts"
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="improve",
+                    task=failed_improve,
+                    status="failed",
+                )
+                break
             if improve_action == "resume" and failed_improve is not None:
                 assert failed_improve.id is not None
                 action_task = _create_resume_task(store, failed_improve)

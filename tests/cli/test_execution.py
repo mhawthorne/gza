@@ -4726,6 +4726,90 @@ class TestIterateCommand:
         assert target is not None
         assert target.id == failed_improve.id
 
+    def test_resolve_improve_action_finds_chained_retry_improves(self, tmp_path: Path):
+        """get_improve_tasks_for must find retries whose based_on points at a previous improve."""
+        from gza.cli._common import resolve_improve_action
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        first = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        first.status = "failed"
+        first.failure_reason = "TIMEOUT"
+        first.session_id = "s1"
+        store.update(first)
+
+        # A retry whose based_on points at the previous improve (not the impl).
+        retry = store.add("Improve 2 (retry)", task_type="improve", based_on=first.id, depends_on=review.id)
+        retry.status = "failed"
+        retry.failure_reason = "TIMEOUT"
+        retry.session_id = "s2"
+        store.update(retry)
+
+        # With max_resume_attempts=3 (headroom), resume should win and target the latest.
+        action, target = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=3)
+        assert action == "resume"
+        assert target is not None
+        assert target.id == retry.id
+
+    def test_resolve_improve_action_give_up_when_cap_exceeded(self, tmp_path: Path):
+        """After one resume already failed, max_resume_attempts=1 triggers give_up."""
+        from gza.cli._common import resolve_improve_action
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        first = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        first.status = "failed"
+        first.failure_reason = "TIMEOUT"
+        first.session_id = "s1"
+        store.update(first)
+        second = store.add("Improve 2", task_type="improve", based_on=first.id, depends_on=review.id)
+        second.status = "failed"
+        second.failure_reason = "TIMEOUT"
+        second.session_id = "s2"
+        store.update(second)
+
+        # Two failed attempts: 1 original + 1 resume → cap=1 is met, give up.
+        action, target = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=1)
+        assert action == "give_up"
+        assert target is not None
+        assert target.id == second.id
+
+    def test_resolve_improve_action_still_resumes_within_cap(self, tmp_path: Path):
+        """One failed attempt with max_resume_attempts=1 still resumes (cap not yet exceeded)."""
+        from gza.cli._common import resolve_improve_action
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        first = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        first.status = "failed"
+        first.failure_reason = "TIMEOUT"
+        first.session_id = "s1"
+        store.update(first)
+
+        action, target = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=1)
+        assert action == "resume"
+        assert target is not None
+        assert target.id == first.id
+
     def test_changes_requested_with_dropped_improve_blocks_and_does_not_run_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):

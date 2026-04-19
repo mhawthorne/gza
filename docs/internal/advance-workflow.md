@@ -106,6 +106,17 @@ Conflict detection uses the currently checked-out branch as the merge target (`t
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
 | Verdict = unknown | `needs_discussion` — manual intervention |
 
+When the engine emits `improve`, the caller (iterate) delegates to `resolve_improve_action(store, impl_id, review_id, max_resume_attempts)` to pick one of:
+
+| Condition | Sub-action |
+|-----------|-----------|
+| No prior failed improve for this (impl, review) | `new` — create a fresh improve |
+| Latest failed improve is resumable (`MAX_STEPS`/`MAX_TURNS`/`TIMEOUT`) AND prior attempts `<` cap | `resume` — reopen the failed improve's session |
+| Latest failed improve is not resumable AND prior attempts `<` cap | `retry` — fork a new branch from the previous improve |
+| Prior failed attempts `>=` `max_resume_attempts` | `give_up` — stop iterating; surface `max_improve_attempts` as the stop reason |
+
+The cap counts **all** failed improves for this (impl, review) pair, including chained retries/resumes (see *Improve chain semantics* below), so it protects against unbounded loops when a fix on `main` is needed to break a persistent TIMEOUT.
+
 ### 6. No reviews / all cleared
 
 | Condition | Action |

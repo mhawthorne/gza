@@ -917,6 +917,7 @@ def resolve_improve_action(
     store: SqliteTaskStore,
     impl_task_id: str,
     review_task_id: str,
+    max_resume_attempts: int | None = None,
 ) -> tuple[str, DbTask | None]:
     """Determine the right improve action for an impl+review pair.
 
@@ -924,6 +925,12 @@ def resolve_improve_action(
         ("new", None) — no existing improve, create fresh
         ("resume", failed_task) — resumable failed improve exists
         ("retry", failed_task) — non-resumable failed improve exists
+        ("give_up", failed_task) — retry/resume cap exceeded; stop and surface failure
+
+    The cap counts failed attempts for this (impl, review) pair. When the number
+    of prior failed attempts reaches ``max_resume_attempts``, further resume/retry
+    is suppressed to prevent unbounded loops (e.g. a stale branch that keeps
+    timing out on the same slow test).
     """
     from ..resume_policy import is_resumable_failed_task
 
@@ -933,6 +940,12 @@ def resolve_improve_action(
         return ("new", None)
 
     latest_failed = max(failed_improves, key=lambda t: t.created_at or datetime.min)
+
+    # Count of resume/retry attempts so far = failures beyond the original one.
+    # If this already meets or exceeds the cap, don't spawn another attempt.
+    if max_resume_attempts is not None and (len(failed_improves) - 1) >= max_resume_attempts:
+        return ("give_up", latest_failed)
+
     if is_resumable_failed_task(latest_failed):
         return ("resume", latest_failed)
     return ("retry", latest_failed)
