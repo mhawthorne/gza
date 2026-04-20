@@ -12,6 +12,16 @@ Address review comments for a gza task directly in the current conversation. Thi
 
 ## Process
 
+### Step 0: Capture the starting checkout
+
+Before touching task state, capture where the user started:
+
+```bash
+git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD
+```
+
+Save this as `<START_CHECKOUT>`. You may switch to the implementation branch to make changes, but before finishing you must return the user to `<START_CHECKOUT>`. If `<START_CHECKOUT>` is a detached HEAD, restore it with `git checkout --detach <START_CHECKOUT>`.
+
 ### Step 1: Get task ID and find the review
 
 The user should provide a full prefixed task ID (for example, `gza-1234`). If they provide a review task ID, resolve it to the implementation task. If no task ID is provided, ask the user.
@@ -80,6 +90,8 @@ If the branch is checked out in another worktree, inform the user and ask how to
 - Work in the existing worktree path
 - Create a new worktree
 
+If `<START_CHECKOUT>` already equals `<impl_branch>`, do not switch away and back unnecessarily.
+
 ### Step 4: Address must-fix items
 
 For each must-fix item in the review:
@@ -106,7 +118,7 @@ Run the verify command and fix any errors, up to 3 iterations (same as gza-test-
 
 ### Step 6: Commit changes
 
-Stage and commit all changes:
+Stage and commit all changes. A successful `/gza-task-improve` run always ends with a commit; do not leave review fixes uncommitted.
 
 ```bash
 git add <changed_files>
@@ -117,9 +129,19 @@ git commit -m "Address review feedback for task #<IMPL_TASK_ID>
 ..."
 ```
 
-### Step 7: Persist improve output and clear review state (required)
+### Step 7: Push the implementation branch
 
-After a successful commit, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
+After the commit succeeds, push the implementation branch so the user does not need to manually publish the review fixes:
+
+```bash
+git push -u origin <impl_branch>
+```
+
+If the branch already has an upstream, a plain `git push` is fine. If the push fails, stop and tell the user exactly what happened. Do not report the improve workflow as fully complete when the changes are still only local.
+
+### Step 8: Persist improve output and clear review state (required)
+
+After a successful commit and push, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
 
 Use the `review_task_id` already resolved in Step 1, then call `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`.
 
@@ -140,7 +162,8 @@ store = SqliteTaskStore(config.db_path)
 origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 summary_body = '''Addressed <M_COUNT> must-fix items: <M_ITEMS_SUMMARY>
 Verify: <VERIFY_RESULT>
-Commit: <COMMIT_SHA>'''
+Commit: <COMMIT_SHA>
+Push: pushed to <IMPL_BRANCH>'''
 summary_with_origin = f'<!-- origin: /gza-task-improve (manual, {origin_date}) -->\n' + summary_body
 
 created = store.add(
@@ -185,11 +208,29 @@ print(f'Improve saved as task #{created.id} ({created.report_file}); review stat
 "
 ```
 
+### Step 9: Restore the starting checkout
+
+After persisting the improve task, return the user to the checkout captured in Step 0:
+
+```bash
+git checkout <START_CHECKOUT>
+```
+
+If `<START_CHECKOUT>` was a detached HEAD, restore it with:
+
+```bash
+git checkout --detach <START_CHECKOUT>
+```
+
+If the restore fails, stop and tell the user exactly what checkout you left them on. Do not silently finish on the task branch.
+
 ## Important notes
 
 - **Must-fix items are the priority** — address all must-fix items before considering suggestions.
 - **Read before editing** — always read the source files before making changes, even if the review quotes code. The code may have changed since the review was written.
 - **Verify the review's claims** — review comments can be wrong. If a review item doesn't match the current code state (e.g., the import already exists), skip it and note that to the user.
 - **Scope to branch files** — only modify files that are part of the implementation branch's diff. Use `git diff --name-only main..HEAD` to check.
+- **Commit and push are required** — a successful `/gza-task-improve` run should leave the implementation branch committed and pushed before you restore the user's original checkout.
 - **Ask about suggestions** — don't automatically apply S1/S2/etc. suggestions. Ask the user which ones they want addressed.
 - **Questions section** — if the review has questions, present them to the user for answers before making assumptions.
+- **Restore the user's checkout before exit** — the skill may work on `<impl_branch>`, but the final state should return the user to `<START_CHECKOUT>` and the closing message should name both checkouts explicitly.
