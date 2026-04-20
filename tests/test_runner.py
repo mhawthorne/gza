@@ -1000,6 +1000,59 @@ class TestReviewContextFromChain:
         assert "## Fix Rescue Context" in context
         assert "## Repeated Blockers" not in context
 
+    def test_fix_context_distinguishes_failed_improve_and_implement_retry_attempts(self, tmp_path: Path):
+        """Fix context labels failed improve and failed implement retry attempts accurately."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement retries", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        failed_improve = store.add(
+            prompt="Improve attempt",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_STEPS"
+        failed_improve.completed_at = datetime(2026, 4, 20, 10, 0, tzinfo=UTC)
+        store.update(failed_improve)
+
+        failed_impl_retry = store.add(
+            prompt="Retry implementation attempt",
+            task_type="implement",
+            based_on=impl_task.id,
+        )
+        failed_impl_retry.status = "failed"
+        failed_impl_retry.failure_reason = "TEST_FAILURE"
+        failed_impl_retry.completed_at = datetime(2026, 4, 20, 11, 0, tzinfo=UTC)
+        store.update(failed_impl_retry)
+
+        fix_task = store.add(
+            prompt="Rescue stuck implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert f"Latest failed improve/resume attempt: {failed_improve.id}" in context
+        assert (
+            f"Latest failed implementation retry/resume attempt: {failed_impl_retry.id}"
+            in context
+        )
+        assert f"Latest failed improve/resume attempt: {failed_impl_retry.id}" not in context
+
 
 class TestSummaryDirectory:
     """Tests for summary directory constant."""

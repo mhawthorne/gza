@@ -910,6 +910,211 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == improve.id
 
 
+def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path) -> None:
+    """Improve advance action should resume a resumable failed improve instead of creating a new sibling."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/improve-resume"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_TURNS"
+    failed_improve.session_id = "sess-improve-1"
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    improves = [t for t in store.get_all() if t.task_type == "improve"]
+    resumed = [t for t in improves if t.id != failed_improve.id]
+    assert len(resumed) == 1
+    assert resumed[0].based_on == failed_improve.id
+    assert result.work_done is True
+    assert spawn_resume_worker.call_count == 1
+    assert spawn_worker.call_count == 0
+
+    direct_siblings = [t for t in improves if t.based_on == impl.id]
+    assert len(direct_siblings) == 1
+
+
+def test_watch_cycle_improve_action_retries_non_resumable_failed_improve_chain(tmp_path: Path) -> None:
+    """Improve advance action should create retry improve based on failed improve when not resumable."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/improve-retry"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "TEST_FAILURE"
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    improves = [t for t in store.get_all() if t.task_type == "improve"]
+    retried = [t for t in improves if t.id != failed_improve.id]
+    assert len(retried) == 1
+    assert retried[0].based_on == failed_improve.id
+    assert retried[0].depends_on == review.id
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_resume_worker.call_count == 0
+
+    direct_siblings = [t for t in improves if t.based_on == impl.id]
+    assert len(direct_siblings) == 1
+
+
+def test_watch_cycle_improve_action_respects_max_improve_attempts(tmp_path: Path) -> None:
+    """When improve attempts hit cap, watch logs skip and does not create another improve."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/improve-attempt-cap"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    previous_id = impl.id
+    for attempt in range(config.max_resume_attempts + 1):
+        task = store.add(
+            f"Improve attempt {attempt}",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=previous_id,
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "MAX_STEPS"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        previous_id = task.id
+
+    before_count = _task_count(store)
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert _task_count(store) == before_count
+    assert spawn_worker.call_count == 0
+    assert spawn_resume_worker.call_count == 0
+    text = log_path.read_text()
+    assert "max improve attempts" in text
+    assert f"Run uv run gza fix {impl.id}" in text
+
+
 def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     """Conflict path should create and run rebase tasks in watch cycles."""
     setup_config(tmp_path)

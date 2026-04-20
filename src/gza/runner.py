@@ -987,18 +987,26 @@ def _build_fix_context(
     from gza.query import build_lineage_tree, flatten_lineage_tree
 
     lineage = flatten_lineage_tree(build_lineage_tree(store, impl_task))
-    improve_like = [
+    failed_improves = [t for t in lineage if t.id is not None and t.task_type == "improve" and t.status == "failed"]
+    failed_implement_retries = [
         t
         for t in lineage
-        if t.id is not None and t.task_type in {"improve", "implement"} and t.id != impl_task.id
+        if t.id is not None and t.task_type == "implement" and t.id != impl_task.id and t.status == "failed"
     ]
-    failed_attempts = [t for t in improve_like if t.status == "failed"]
-    latest_failed_attempt = None
-    if failed_attempts:
-        latest_failed_attempt = max(
-            failed_attempts,
+
+    def _latest_failed_task(tasks: list[Task]) -> Task | None:
+        if not tasks:
+            return None
+        return max(
+            tasks,
             key=lambda t: (t.completed_at or t.created_at or datetime.min, task_id_numeric_key(t.id)),
         )
+
+    latest_failed_improve = _latest_failed_task(failed_improves)
+    latest_failed_impl_retry = _latest_failed_task(failed_implement_retries)
+    latest_failed_attempt = _latest_failed_task(
+        [t for t in (latest_failed_improve, latest_failed_impl_retry) if t is not None]
+    )
 
     plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store) if impl_task.based_on else None
     plan_or_request: list[str] = []
@@ -1042,10 +1050,15 @@ def _build_fix_context(
         lines.append(f"- Latest completed review: {latest_review.id}")
     if latest_review_summary:
         lines.append(f"- Latest review summary: {latest_review_summary}")
-    if latest_failed_attempt is not None:
+    if latest_failed_improve is not None:
         lines.append(
-            f"- Latest failed improve/resume attempt: {latest_failed_attempt.id} "
-            f"({latest_failed_attempt.failure_reason or 'UNKNOWN'})"
+            f"- Latest failed improve/resume attempt: {latest_failed_improve.id} "
+            f"({latest_failed_improve.failure_reason or 'UNKNOWN'})"
+        )
+    if latest_failed_impl_retry is not None:
+        lines.append(
+            f"- Latest failed implementation retry/resume attempt: {latest_failed_impl_retry.id} "
+            f"({latest_failed_impl_retry.failure_reason or 'UNKNOWN'})"
         )
 
     if repeated_blocker_lines:
