@@ -972,10 +972,12 @@ def _build_fix_context(
     config: Config | None,
 ) -> str:
     """Build host-assembled stuck-task rescue context for fix tasks."""
-    if not task.based_on:
-        return ""
-    impl_task = store.get(task.based_on)
-    if impl_task is None or impl_task.task_type != "implement":
+    # Walk fix/improve based_on chains so resumed or retried fix tasks (whose
+    # based_on points at the prior fix, not the impl) still get full rescue
+    # context — otherwise the agent sees the fix-rescue prompt header with
+    # nothing underneath it.
+    impl_task = _resolve_impl_ancestor(store, task)
+    if impl_task is None:
         return ""
 
     assert impl_task.id is not None

@@ -4113,6 +4113,39 @@ class TestUnmergedAllFlag:
         assert "Showing tasks unmerged relative to integration" in result.stdout
         assert "No unmerged tasks" in result.stdout
 
+    def test_unmerged_live_target_excludes_same_branch_fix_descendants(self, tmp_path: Path):
+        """Live-target unmerged (--into-current/--target) must not double-list a fix task
+        that shares a branch with its implementation — otherwise the same branch appears
+        twice. See .gza/learnings.md (exclude completed same-branch fix descendants)."""
+        from datetime import UTC, datetime
+
+        store, impl_task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Implement widget",
+            task_id="20260220-impl-widget",
+            branch="feature/widget",
+        )
+
+        fix_task = store.add(
+            "Fix widget churn",
+            task_type="fix",
+        )
+        fix_task.status = "completed"
+        fix_task.completed_at = datetime.now(UTC)
+        fix_task.branch = "feature/widget"
+        fix_task.has_commits = True
+        fix_task.merge_status = "unmerged"
+        fix_task.slug = "20260220-fix-widget-churn"
+        fix_task.based_on = impl_task.id
+        fix_task.same_branch = True
+        store.update(fix_task)
+
+        result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
+        assert result.returncode == 0
+        assert "Implement widget" in result.stdout
+        # The fix must not appear as its own branch row — the impl row already represents the branch.
+        assert "Fix widget churn" not in result.stdout
+
 
 class TestUnmergedImprovedDisplay:
     """Tests for improved unmerged display (diff stats, review prominence, completed-only)."""

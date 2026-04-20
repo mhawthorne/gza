@@ -1053,6 +1053,52 @@ class TestReviewContextFromChain:
         )
         assert f"Latest failed improve/resume attempt: {failed_impl_retry.id}" not in context
 
+    def test_fix_context_resolves_impl_through_resumed_fix_chain(self, tmp_path: Path):
+        """A resumed/retried fix (based_on points at a prior fix, not the impl) must
+        still assemble the full rescue context by walking up the fix/improve chain."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement parser", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Bug\n"
+            "Required fix: handle null.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review)
+
+        failed_fix = store.add(
+            prompt="Rescue attempt",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        failed_fix.status = "failed"
+        failed_fix.failure_reason = "MAX_STEPS"
+        store.update(failed_fix)
+
+        # Resume of the failed fix: based_on points at the prior fix, not the impl.
+        resumed_fix = store.add(
+            prompt="Rescue attempt (resume)",
+            task_type="fix",
+            based_on=failed_fix.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(resumed_fix, store, tmp_path, git=None)
+
+        assert "## Fix Rescue Context" in context
+        assert f"Root implementation: {impl_task.id}" in context
+        assert f"Latest completed review: {review.id}" in context
+
 
 class TestSummaryDirectory:
     """Tests for summary directory constant."""

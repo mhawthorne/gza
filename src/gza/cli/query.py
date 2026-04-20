@@ -632,7 +632,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             if t.status == "completed"
             and t.branch
             and t.has_commits
-            and (t.task_type not in ("improve", "rebase") or t.based_on is None)
+            and (t.task_type not in ("improve", "fix", "rebase") or t.based_on is None)
             and not git.is_merged(t.branch, target_branch)
         ]
         unmerged = all_unmerged
