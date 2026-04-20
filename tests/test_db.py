@@ -1357,6 +1357,28 @@ class TestMergeStatus:
         assert impl_task.id in unmerged_ids
         assert improve_task.id not in unmerged_ids
 
+    def test_get_unmerged_excludes_fix_tasks(self, tmp_path: Path):
+        """get_unmerged does not return same-branch fix tasks."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl_task, has_commits=True, branch="feature/impl")
+
+        fix_task = store.add(
+            prompt="Fix implementation",
+            task_type="fix",
+            same_branch=True,
+            based_on=impl_task.id,
+        )
+        store.mark_completed(fix_task, has_commits=True, branch="feature/impl")
+
+        unmerged = store.get_unmerged()
+        unmerged_ids = [t.id for t in unmerged]
+
+        assert impl_task.id in unmerged_ids
+        assert fix_task.id not in unmerged_ids
+
     def test_migrate_merge_status_logs_when_git_check_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
         """Migration logs a warning and defaults to unmerged when git checks fail."""
         from gza.db import migrate_merge_status

@@ -2550,7 +2550,7 @@ class TestFixCommand:
 
         assert result.returncode == 0
         assert "Created fix task" in result.stdout
-        assert f"Root implementation: {impl_task.id}" in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
         assert f"Latest completed review: {review2.id}" in result.stdout
 
         fix_tasks = [t for t in store.get_all() if t.task_type == "fix"]
@@ -2579,7 +2579,7 @@ class TestFixCommand:
         result = run_gza("fix", str(review_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"Root implementation: {impl_task.id}" in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
         fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
         assert fix_task.based_on == impl_task.id
         assert fix_task.depends_on == review_task.id
@@ -2629,11 +2629,42 @@ class TestFixCommand:
         result = run_gza("fix", str(improve2.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"Root implementation: {impl_task.id}" in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
         assert f"Latest completed review: {review2.id}" in result.stdout
         fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
         assert fix_task.based_on == impl_task.id
         assert fix_task.depends_on == review2.id
+
+    def test_fix_uses_retry_implementation_id_as_selected(self, tmp_path: Path):
+        """Fix command keeps direct retry implementation IDs anchored to that retry implementation."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement parser", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-implement-parser"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        retry_impl = store.add("Retry parser implementation", task_type="implement", based_on=impl_task.id)
+        retry_impl.status = "completed"
+        retry_impl.branch = "test-project/20260130-retry-parser"
+        retry_impl.completed_at = datetime.now(UTC)
+        store.update(retry_impl)
+
+        review_retry = store.add("Review retry", task_type="review", depends_on=retry_impl.id)
+        review_retry.status = "completed"
+        review_retry.completed_at = datetime.now(UTC)
+        store.update(review_retry)
+
+        result = run_gza("fix", str(retry_impl.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"Implementation: {retry_impl.id}" in result.stdout
+        assert f"Latest completed review: {review_retry.id}" in result.stdout
+        fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
+        assert fix_task.based_on == retry_impl.id
+        assert fix_task.depends_on == review_retry.id
 
     def test_fix_rejects_pending_or_in_progress_implementation(self, tmp_path: Path):
         """Fix command rejects active implementation tasks that have not finished yet."""
@@ -2833,6 +2864,39 @@ class TestReviewCommand:
         assert review_task.depends_on == impl_task.id
         assert review_task.group == "auth"
 
+    def test_review_accepts_fix_task_id_and_targets_implementation(self, tmp_path: Path):
+        """Review command accepts fix IDs and resolves to the fix task's implementation."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement auth", task_type="implement", group="auth")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-implement-auth"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        fix_task = store.add(
+            "Fix auth churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+            group="auth",
+        )
+        fix_task.status = "completed"
+        fix_task.completed_at = datetime.now(UTC)
+        store.update(fix_task)
+
+        result = run_gza("review", str(fix_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        all_tasks = store.get_all()
+        review_task = [t for t in all_tasks if t.task_type == "review"][0]
+        assert f"Created review task {review_task.id}" in result.stdout
+        assert f"Implementation: {impl_task.id}" in result.stdout
+        assert review_task.depends_on == impl_task.id
+        assert review_task.group == "auth"
+
     def test_review_accepts_review_task_id_and_targets_implementation(self, tmp_path: Path):
         """Review command accepts a review task ID and creates a new review on the base implementation."""
 
@@ -2891,8 +2955,8 @@ class TestReviewCommand:
         assert result.returncode == 1
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
-    def test_review_resolves_retry_implementation_to_root_implementation(self, tmp_path: Path):
-        """Review command resolves retry implementation IDs to the root implementation lineage."""
+    def test_review_keeps_retry_implementation_id_anchored(self, tmp_path: Path):
+        """Review command keeps direct retry implementation IDs anchored to the selected retry task."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2922,27 +2986,26 @@ class TestReviewCommand:
         assert result.returncode == 0
         assert "Created review task " in result.stdout
 
-        # Review now resolves retry implementation IDs to the root implementation.
         all_tasks = store.get_all()
         review_task = [t for t in all_tasks if t.task_type == "review"][0]
         assert review_task is not None
-        assert review_task.based_on == impl_task.id
-        assert review_task.depends_on == impl_task.id
+        assert review_task.based_on == retry_impl.id
+        assert review_task.depends_on == retry_impl.id
 
         retry_based_children = {t.id for t in store.get_based_on_children(retry_impl.id)}
         parent_based_children = {t.id for t in store.get_based_on_children(impl_task.id)}
-        assert review_task.id not in retry_based_children
-        assert review_task.id in parent_based_children
+        assert review_task.id in retry_based_children
+        assert review_task.id not in parent_based_children
 
-        # Canonical lineage placement stays under the root implementation branch.
+        # Review should now hang directly under the retry implementation branch.
         lineage_tree = build_lineage_tree(store, plan_task)
         assert len(lineage_tree.children) == 1
         parent_impl_node = lineage_tree.children[0]
         assert parent_impl_node.task.id == impl_task.id
-        assert len(parent_impl_node.children) == 2
+        assert len(parent_impl_node.children) == 1
         retry_node = [c for c in parent_impl_node.children if c.task.id == retry_impl.id][0]
         assert retry_node.task.id == retry_impl.id
-        assert any(child.task.id == review_task.id for child in parent_impl_node.children)
+        assert any(child.task.id == review_task.id for child in retry_node.children)
 
     def test_review_runs_by_default(self, tmp_path: Path):
         """Review command runs the review task immediately by default."""

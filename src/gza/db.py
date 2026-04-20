@@ -1479,9 +1479,9 @@ class SqliteTaskStore:
     def get_unmerged(self) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
 
-        Excludes improve and rebase tasks that have a parent (based_on)
+        Excludes improve, fix, and rebase tasks that have a parent (based_on)
         since they use same_branch=True and operate on the parent task's
-        branch. Standalone improve tasks with their own branch are included.
+        branch. Standalone same-type tasks with their own branch are included.
         """
         with self._connect() as conn:
             cur = conn.execute(
@@ -1489,7 +1489,7 @@ class SqliteTaskStore:
                 SELECT * FROM tasks
                 WHERE merge_status = 'unmerged'
                 AND (
-                    task_type NOT IN ('improve', 'rebase')
+                    task_type NOT IN ('improve', 'fix', 'rebase')
                     OR based_on IS NULL
                 )
                 ORDER BY completed_at DESC

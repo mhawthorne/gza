@@ -928,7 +928,7 @@ gza improve <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — resolves to the owning implementation; e.g. `gza-1234`) |
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
@@ -951,7 +951,7 @@ gza fix <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `task_id` | Full prefixed task ID (implement, improve, review, or fix — resolves to the owning implementation; e.g. `gza-1234`) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
@@ -972,7 +972,7 @@ gza review <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `task_id` | Full prefixed task ID (implement, improve, review, or fix — resolves to the owning implementation; e.g. `gza-1234`) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |

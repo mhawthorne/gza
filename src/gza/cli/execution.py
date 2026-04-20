@@ -850,21 +850,6 @@ def _cleanup_worker_registry(config: "Config", task_id: str) -> None:
         registry.mark_completed(worker.worker_id, exit_code=0, status="completed")
 
 
-def _resolve_root_impl_ancestor(store: SqliteTaskStore, impl_task: DbTask) -> DbTask:
-    """Walk based_on implement-retry chain to the oldest implementation ancestor."""
-    current = impl_task
-    seen: set[str] = set()
-    while current.based_on:
-        parent = store.get(current.based_on)
-        if parent is None or parent.task_type != "implement" or parent.id is None:
-            break
-        if parent.id in seen:
-            break
-        seen.add(parent.id)
-        current = parent
-    return current
-
-
 def _latest_completed_review_for_impl(store: SqliteTaskStore, impl_task_id: str) -> DbTask | None:
     reviews = [r for r in store.get_reviews_for_task(impl_task_id) if r.status == "completed"]
     return reviews[0] if reviews else None
@@ -873,13 +858,13 @@ def _latest_completed_review_for_impl(store: SqliteTaskStore, impl_task_id: str)
 def _resolve_impl_task(
     store: SqliteTaskStore, task_id: str
 ) -> tuple[DbTask, None] | tuple[None, str]:
-    """Resolve implement/review/improve/fix IDs to the root implementation task."""
+    """Resolve implement/review/improve/fix IDs to the owning implementation task."""
     task = store.get(task_id)
     if not task:
         return None, f"Task {task_id} not found"
 
     if task.task_type == "implement":
-        return _resolve_root_impl_ancestor(store, task), None
+        return task, None
 
     if task.task_type in {"improve", "fix"}:
         label = "Improve" if task.task_type == "improve" else "Fix"
@@ -912,7 +897,7 @@ def _resolve_impl_task(
                 f"{label} task {task.id} points to task {parent.id}, "
                 "which is not an implementation task"
             )
-        return _resolve_root_impl_ancestor(store, parent), None
+        return parent, None
 
     if task.task_type == "review":
         if not task.depends_on:
@@ -925,7 +910,7 @@ def _resolve_impl_task(
                 f"Review task {task.id} points to task {task.depends_on}, "
                 "which is not an implementation task"
             )
-        return _resolve_root_impl_ancestor(store, parent), None
+        return parent, None
 
     return None, (
         f"Task {task_id} is a {task.task_type} task, not an implementation, improve, review, or fix task"
@@ -1093,7 +1078,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
     assert fix_task.id is not None
 
     print(f"✓ Created fix task {fix_task.id}")
-    print(f"  Root implementation: {impl_task.id}")
+    print(f"  Implementation: {impl_task.id}")
     if review_id:
         print(f"  Latest completed review: {review_id}")
     else:
