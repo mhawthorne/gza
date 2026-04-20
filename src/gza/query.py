@@ -160,14 +160,14 @@ def _is_shared_branch_descendant(task: Task, root_task: Task) -> bool:
     return bool(task.same_branch)
 
 
-def _iter_same_type_retry_descendants(store: SqliteTaskStore, task: Task) -> list[Task]:
-    """Return same-type retry descendants by following based_on edges via the store."""
+def _iter_retry_descendants(store: SqliteTaskStore, task: Task) -> list[Task]:
+    """Return retry descendants by following based_on edges via the store."""
     if task.id is None:
         return []
 
     descendants: list[Task] = []
     visited: set[str] = {task.id}
-    queue: list[Task] = list(store.get_based_on_children_by_type(task.id, task.task_type))
+    queue: list[Task] = list(store.get_based_on_children(task.id))
 
     while queue:
         child = queue.pop(0)
@@ -175,19 +175,23 @@ def _iter_same_type_retry_descendants(store: SqliteTaskStore, task: Task) -> lis
             continue
         visited.add(child.id)
         descendants.append(child)
-        queue.extend(store.get_based_on_children_by_type(child.id, task.task_type))
+        queue.extend(store.get_based_on_children(child.id))
 
     return descendants
 
 
 def _has_successful_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
-    """Return True when any same-type retry descendant has status='completed'."""
-    return any(child.status == "completed" for child in _iter_same_type_retry_descendants(store, task))
+    """Return True when any retry descendant has status='completed'."""
+    return any(child.status == "completed" for child in _iter_retry_descendants(store, task))
 
 
 def _has_merged_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
     """Return True when any same-type retry descendant has merge_status='merged'."""
-    return any(child.merge_status == "merged" for child in _iter_same_type_retry_descendants(store, task))
+    return any(
+        child.merge_status == "merged"
+        for child in _iter_retry_descendants(store, task)
+        if child.task_type == task.task_type
+    )
 
 
 def _get_unresolved_terminal_kind(task: Task) -> str | None:

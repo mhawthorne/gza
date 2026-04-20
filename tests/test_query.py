@@ -534,7 +534,7 @@ class TestQueryIncomplete:
         # displayed attention rows under the shared root lineage.
         assert unresolved_ids == {first.id, second.id}
 
-    def test_failed_root_is_not_suppressed_by_completed_improve_descendant(self, tmp_path: Path):
+    def test_failed_root_is_suppressed_by_completed_descendant_regardless_of_type(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         root = store.add("failed implement", task_type="implement")
@@ -547,10 +547,7 @@ class TestQueryIncomplete:
         store.update(improve)
 
         lineages = query_incomplete(store, HistoryFilter(limit=None))
-        assert len(lineages) == 1
-        assert lineages[0].root.id == root.id
-        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        assert unresolved_ids == {root.id}
+        assert lineages == []
 
     def test_unmerged_root_is_not_suppressed_by_merged_improve_descendant(self, tmp_path: Path):
         store = self._store(tmp_path)
