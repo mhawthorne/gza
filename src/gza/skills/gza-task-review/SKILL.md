@@ -199,10 +199,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.models import Task
+from gza.git import Git
+from gza.runner import _compute_slug_override, generate_slug
 import subprocess
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 
 review_markdown = '''<REVIEW_CONTENT>'''
@@ -210,17 +211,28 @@ origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 origin_header = f'<!-- origin: /gza-task-review (manual, {origin_date}) -->\n'
 file_content = origin_header + review_markdown
 
-review_task = Task(
-    task_type='review',
+created = store.add(
     prompt='Manual review via /gza-task-review',
-    status='completed',
+    task_type='review',
     depends_on='<IMPL_TASK_ID>',
     group=<impl_group_or_None>,
-    output_content=review_markdown,
-    completed_at=datetime.now(timezone.utc).isoformat(),
 )
-created = store.create(review_task)
 assert created.id is not None
+
+if created.slug is None:
+    slug_override = _compute_slug_override(created, store)
+    created.slug = generate_slug(
+        created.prompt,
+        existing_id=None,
+        log_path=config.log_path,
+        git=Git(config.project_dir),
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        slug_override=slug_override,
+        branch_strategy=config.branch_strategy,
+        explicit_type=created.task_type_hint,
+    )
+    store.update(created)
 
 prompt_json = subprocess.check_output(
     ['uv', 'run', 'gza', 'show', '--prompt', created.id],
@@ -232,6 +244,9 @@ report_path.parent.mkdir(parents=True, exist_ok=True)
 report_path.write_text(file_content)
 
 created.report_file = str(report_path.relative_to(config.project_dir))
+created.status = 'completed'
+created.completed_at = datetime.now(timezone.utc)
+created.output_content = review_markdown
 store.update(created)
 print(f'Review saved as task #{created.id} ({created.report_file})')
 "

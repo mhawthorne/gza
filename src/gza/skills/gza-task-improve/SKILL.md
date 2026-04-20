@@ -129,10 +129,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.models import Task
+from gza.git import Git
+from gza.runner import _compute_slug_override, generate_slug
 import subprocess
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 
 origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -141,16 +142,28 @@ Verify: <VERIFY_RESULT>
 Commit: <COMMIT_SHA>'''
 summary_with_origin = f'<!-- origin: /gza-task-improve (manual, {origin_date}) -->\n' + summary_body
 
-improve_task = Task(
-    task_type='improve',
+created = store.add(
     prompt='Manual improve via /gza-task-improve',
-    status='completed',
+    task_type='improve',
+    depends_on='<REVIEW_TASK_ID>',
     based_on='<IMPL_TASK_ID>',
-    output_content=summary_body,
-    completed_at=datetime.now(timezone.utc).isoformat(),
 )
-created = store.create(improve_task)
 assert created.id is not None
+
+if created.slug is None:
+    slug_override = _compute_slug_override(created, store)
+    created.slug = generate_slug(
+        created.prompt,
+        existing_id=None,
+        log_path=config.log_path,
+        git=Git(config.project_dir),
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        slug_override=slug_override,
+        branch_strategy=config.branch_strategy,
+        explicit_type=created.task_type_hint,
+    )
+    store.update(created)
 
 prompt_json = subprocess.check_output(
     ['uv', 'run', 'gza', 'show', '--prompt', created.id],
@@ -162,6 +175,9 @@ summary_path.parent.mkdir(parents=True, exist_ok=True)
 summary_path.write_text(summary_with_origin)
 
 created.report_file = str(summary_path.relative_to(config.project_dir))
+created.status = 'completed'
+created.completed_at = datetime.now(timezone.utc)
+created.output_content = summary_body
 store.update(created)
 store.clear_review_state('<IMPL_TASK_ID>')
 print(f'Improve saved as task #{created.id} ({created.report_file}); review state cleared')
