@@ -22,6 +22,7 @@ __all__ = [
     "KNOWN_COMMENT_SOURCES",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
+    "SchemaIntegrityError",
     "Task",
     "TaskComment",
     "TaskStats",
@@ -139,6 +140,10 @@ class ManualMigrationRequired(Exception):
             f"Database requires manual migration(s): {versions_str}. "
             "Run 'gza migrate' to upgrade."
         )
+
+
+class SchemaIntegrityError(RuntimeError):
+    """Raised when required automatic-migration artifacts are missing."""
 
 
 def _compute_percentiles(values: list[float]) -> dict | None:
@@ -335,6 +340,11 @@ SCHEMA_VERSION = 32
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
 _MANUAL_MIGRATION_VERSIONS: frozenset[int] = frozenset({25, 26, 27})
+_REQUIRED_AUTO_MIGRATION_ARTIFACTS: dict[int, tuple[str, str]] = {
+    30: ("tasks", "urgent_bumped_at"),
+    31: ("tasks", "execution_mode"),
+    32: ("task_comments", "source"),
+}
 
 
 def _is_ignorable_migration_operational_error(exc: sqlite3.OperationalError) -> bool:
@@ -359,12 +369,7 @@ def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool
 
 def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: int) -> None:
     """Validate required schema artifacts for selected automatic migration targets."""
-    required_columns_by_version: dict[int, tuple[str, str]] = {
-        30: ("tasks", "urgent_bumped_at"),
-        31: ("tasks", "execution_mode"),
-        32: ("task_comments", "source"),
-    }
-    requirement = required_columns_by_version.get(target_version)
+    requirement = _REQUIRED_AUTO_MIGRATION_ARTIFACTS.get(target_version)
     if requirement is None:
         return
     table, column = requirement
@@ -372,6 +377,54 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         raise RuntimeError(
             f"Auto-migration to v{target_version} incomplete: missing required column {table}.{column}"
         )
+
+
+def _migration_sql_for_version(target_version: int) -> str | None:
+    """Return migration SQL text for a target version, if available."""
+    for version, migration_sql in _MIGRATIONS:
+        if version == target_version:
+            return migration_sql
+    return None
+
+
+def _apply_migration_sql(conn: sqlite3.Connection, migration_sql: str) -> None:
+    """Execute migration SQL statement-by-statement with duplicate-artifact tolerance."""
+    for stmt in migration_sql.strip().split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if _is_ignorable_migration_operational_error(exc):
+                # Duplicate artifact from partially-applied/idempotent migration.
+                continue
+            raise
+
+
+def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection, current_version: int) -> None:
+    """Validate/repair required auto-migration artifacts for already-current schemas."""
+    missing_versions: list[int] = []
+    for target_version, (table, column) in _REQUIRED_AUTO_MIGRATION_ARTIFACTS.items():
+        if current_version >= target_version and not _table_has_column(conn, table, column):
+            missing_versions.append(target_version)
+    if not missing_versions:
+        return
+
+    for target_version in missing_versions:
+        migration_sql = _migration_sql_for_version(target_version)
+        if migration_sql is None:
+            raise SchemaIntegrityError(
+                f"Database schema integrity check failed: missing required artifacts for v{target_version} "
+                "and no repair migration is available."
+            )
+        try:
+            _apply_migration_sql(conn, migration_sql)
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                f"Database schema integrity check failed while repairing v{target_version}: {exc}"
+            ) from exc
+        _validate_auto_migration_target(conn, target_version)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -817,6 +870,7 @@ class SqliteTaskStore:
                 # Fresh database - create full current schema directly
                 conn.executescript(SCHEMA)
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+                current_version = SCHEMA_VERSION
             else:
                 # Check current version and migrate if needed
                 cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
@@ -831,16 +885,7 @@ class SqliteTaskStore:
                             # Don't advance current_version; stop processing further
                             break
                         if migration_sql is not None:
-                            for stmt in migration_sql.strip().split(";"):
-                                stmt = stmt.strip()
-                                if stmt:
-                                    try:
-                                        conn.execute(stmt)
-                                    except sqlite3.OperationalError as exc:
-                                        if _is_ignorable_migration_operational_error(exc):
-                                            # Duplicate artifact from partially-applied/idempotent migration.
-                                            continue
-                                        raise
+                            _apply_migration_sql(conn, migration_sql)
                         _validate_auto_migration_target(conn, target_version)
                         conn.execute("UPDATE schema_version SET version = ?", (target_version,))
                         current_version = target_version
@@ -850,6 +895,9 @@ class SqliteTaskStore:
 
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+                    current_version = SCHEMA_VERSION
+
+            _ensure_required_auto_migration_artifacts(conn, current_version)
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""

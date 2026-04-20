@@ -9,6 +9,7 @@ from ..db import (
     KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
     ManualMigrationRequired,
+    SchemaIntegrityError,
     SqliteTaskStore,
     check_migration_status,
     preview_v25_migration,
@@ -1839,6 +1840,13 @@ def main() -> int:
         return 1
     except InvalidTaskIdError as e:
         print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except SchemaIntegrityError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print(
+            "Run 'gza migrate' with a writable database (or restore schema artifacts), then retry.",
+            file=sys.stderr,
+        )
         return 1
 
     return 0

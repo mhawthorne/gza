@@ -1392,6 +1392,33 @@ class TestShowCommand:
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
+    def test_show_reports_schema_integrity_error_for_readonly_damaged_db(self, tmp_path: Path):
+        """Show command should fail cleanly if schema repair is needed on a read-only DB."""
+        import sqlite3
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with damaged schema")
+        assert task.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 32")
+        conn.execute("DROP TABLE task_comments")
+        conn.commit()
+        conn.close()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 1
+        assert "schema integrity check failed while repairing v32" in result.stderr.lower()
+        assert "writable database" in result.stderr.lower()
+
     def test_show_nonexistent_task(self, tmp_path: Path):
         """Show command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])

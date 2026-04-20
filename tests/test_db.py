@@ -4495,6 +4495,36 @@ class TestMigrationUtilityFunctions:
         assert version == SCHEMA_VERSION
         assert "task_comments" in tables
 
+    def test_open_current_v32_db_repairs_missing_task_comments_table(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing comment artifacts."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before table damage")
+        assert task.id is not None
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 32")
+        conn.execute("DROP TABLE task_comments")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_comments'"
+            ).fetchall()
+        }
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert "task_comments" in tables
+
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,
         tmp_path: Path,
