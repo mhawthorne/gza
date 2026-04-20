@@ -325,18 +325,21 @@ class TestSkillContentValidation:
         assert "Config.load(Path.cwd())" in content
 
     @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
-    def test_manual_review_improve_persistence_snippets_use_valid_task_imports(
+    def test_manual_review_improve_persistence_snippets_use_valid_store_api(
         self, skill_name: str
     ):
-        """Manual persistence snippets should import Task from gza.db, not a nonexistent module."""
+        """Manual persistence snippets should use SqliteTaskStore.add/update, not nonexistent create()."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / skill_name / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "from gza.db import SqliteTaskStore, Task" in content
+        assert "from gza.db import SqliteTaskStore" in content
         assert "from gza.models import Task" not in content
         assert "config = Config.load(Path.cwd())" in content
+        assert "store.add(" in content
+        assert "store.update(created)" in content
+        assert "store.create(" not in content
 
     def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
         """gza-task-run should not document unsupported mark-completed branch flags."""
