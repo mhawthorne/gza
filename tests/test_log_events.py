@@ -77,3 +77,23 @@ def test_all_three_call_sites_agree_on_fixtures():
         b = _count_steps_via_log_printer(fx)
         c = _count_steps_via_tv_scan(fx)
         assert a == b == c, f"{fx.name}: predicate={a}, log={b}, tv={c}"
+
+
+def test_tv_scan_ignores_non_object_json_lines(tmp_path: Path):
+    path = tmp_path / "mixed.jsonl"
+    path.write_text(
+        '\n'.join(
+            [
+                '"plain string line"',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"first step"}}',
+                "123",
+                '{"type":"assistant","message":{"id":"msg_1","content":"hello"}}',
+            ]
+        )
+        + "\n"
+    )
+
+    lines, stats = _scan_log(path, 1000)
+
+    assert stats.step_count == 2
+    assert "plain string line" in lines
