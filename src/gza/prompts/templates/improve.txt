@@ -1,12 +1,20 @@
 This is an improve task. The review content included in your context contains Must-Fix items and Suggestions from the code review.
 
-Your job is to address all of the following:
-1. **All Must-Fix items** — blocking issues that must be resolved for the implementation to be approved.
-2. **All Suggestions** — non-blocking improvements that should also be implemented in this pass.
+Your job is to address all **Must-Fix** items from the review. Treat **Suggestions** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
 
-Work through each Must-Fix and each Suggestion item systematically. For each item:
+Work through each Must-Fix item systematically. For each item:
 - Identify the specific change required.
-- Implement the fix or improvement.
+- Implement the fix.
 - Verify your change addresses the issue described.
+- Add or update targeted tests that cover the specific failure mode called out in the review.
+- If the review item concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
 
-Do not skip any Must-Fix or Suggestion items. The goal is to fully resolve the review in a single pass.
+Before finishing, verify that every Must-Fix item has an explicit closure condition in your final report:
+- The review item you addressed
+- The code change you made
+- The targeted test you added or updated
+- Any docs/help/operator-facing text you updated, if applicable
+
+If a Must-Fix item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
+
+Do not leave Must-Fix items partially addressed. The goal is to resolve all blocking review feedback in a single pass without creating extra scope.

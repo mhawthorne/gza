@@ -67,9 +67,11 @@ class PromptBuilder:
         # Mention learnings file if it exists and task doesn't opt out.
         # Internal tasks are gza-owned orchestration tasks and should not
         # implicitly inherit learnings context.
+        learnings_available = False
         if task.task_type != "internal" and not task.skip_learnings:
             learnings_path = config.project_dir / ".gza" / "learnings.md"
             if learnings_path.exists():
+                learnings_available = True
                 base_prompt += (
                     "\n\nProject learnings from previous tasks are available at"
                     " `.gza/learnings.md`. Consult it for relevant patterns and conventions."
@@ -113,12 +115,20 @@ class PromptBuilder:
                     report_path=report_path
                 )
         elif task.task_type in ("task", "implement"):
+            learnings_check = (
+                "- Re-read `.gza/learnings.md` for project-specific patterns that apply to this task."
+                if learnings_available
+                else ""
+            )
             if summary_path:
                 base_prompt += _load_template("task_with_summary.txt").format(
-                    summary_path=summary_path
+                    summary_path=summary_path,
+                    learnings_check=learnings_check,
                 )
             else:
-                base_prompt += _load_template("task_without_summary.txt")
+                base_prompt += _load_template("task_without_summary.txt").format(
+                    learnings_check=learnings_check
+                )
 
             if config.verify_command:
                 base_prompt += (
@@ -127,13 +137,21 @@ class PromptBuilder:
                 )
         elif task.task_type == "improve":
             base_prompt += "\n\n" + _load_template("improve.txt")
+            learnings_check = (
+                "- Re-read `.gza/learnings.md` for project-specific patterns that apply to this task."
+                if learnings_available
+                else ""
+            )
 
             if summary_path:
                 base_prompt += _load_template("task_with_summary.txt").format(
-                    summary_path=summary_path
+                    summary_path=summary_path,
+                    learnings_check=learnings_check,
                 )
             else:
-                base_prompt += _load_template("task_without_summary.txt")
+                base_prompt += _load_template("task_without_summary.txt").format(
+                    learnings_check=learnings_check
+                )
 
             if config.verify_command:
                 base_prompt += (

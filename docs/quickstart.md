@@ -91,6 +91,30 @@ gza add "Fix the login button not responding on mobile devices"
 gza work
 ```
 
+Write task prompts with explicit acceptance criteria when you want fewer review/improve iterations. A good implementation prompt usually includes:
+
+- The exact behavior to change
+- Non-goals or out-of-scope areas
+- The files or modules likely to be involved
+- Required tests or failure modes to cover
+- Any docs/help/config updates that must ship with the change
+
+Example:
+
+```bash
+gza add "Fix the login button not responding on mobile devices.
+
+Acceptance criteria:
+- Taps on iOS Safari and Chrome Android submit the login form once.
+- Preserve current desktop behavior and loading-state UI.
+- Add a regression test covering the touch/click path.
+- Update any user-facing help or comments if the interaction contract changes.
+
+Non-goals:
+- Do not redesign the login form.
+- Do not touch password reset flows."
+```
+
 Gza creates a git branch, runs the AI agent in Docker, and commits the changes. When it finishes:
 
 ```bash

@@ -45,8 +45,17 @@ Create a clear, specific prompt that:
 - Includes relevant context (file paths, components, constraints)
 - Is scoped appropriately for the task type
 - For `plan` tasks: Explains what needs to be designed/explored
-- For `implement` tasks: Specifies what to build and acceptance criteria
+- For `implement` tasks: Specifies what to build, clear acceptance criteria, and any important constraints
 - For `review` tasks: Identifies what to review and what to look for
+
+For `implement` tasks, include at least these prompt elements when they are relevant:
+- The exact behavior to change
+- Non-goals or explicitly out-of-scope areas
+- Relevant files, modules, or subsystems when known
+- Required tests or failure modes to cover
+- Required docs/help/config updates when operator-facing behavior changes
+
+If those details are unknown and the work is ambiguous or cross-cutting, recommend a `plan` task first instead of writing a vague `implement` task.
 
 ### Step 4: Run uv run gza add
 
@@ -108,6 +117,7 @@ After running the command:
 - **Be specific**: Reference concrete files, functions, or components when possible
 - **Include context**: Explain the "why" not just the "what"
 - **Set scope**: Make clear what's in scope and what's not
+- **For implement tasks**: Include acceptance criteria, non-goals, required tests, and docs/help impact when relevant
 - **For multi-step work**: Create a `plan` task first, then `implement` tasks based on it
 - **Use dependencies**: Connect related tasks with `--depends-on` or `--based-on`
 - **Enable reviews**: Add `--review` flag for significant implementation work
@@ -126,7 +136,19 @@ uv run gza add --type plan "design a task chaining system that allows tasks to r
 
 **Implementation:**
 ```bash
-uv run gza add --type implement --review "add JWT authentication to the API endpoints in src/api/routes.py"
+uv run gza add --type implement --review "$(cat <<'EOF'
+Add JWT authentication to the API endpoints in src/api/routes.py.
+
+Acceptance criteria:
+- Authenticated endpoints accept valid JWT bearer tokens.
+- Invalid and expired tokens return the expected error response.
+- Add targeted regression coverage for token validation paths.
+
+Non-goals:
+- Do not redesign session management.
+- Do not change unrelated auth middleware behavior.
+EOF
+)"
 ```
 
 **Grouped workflow:**

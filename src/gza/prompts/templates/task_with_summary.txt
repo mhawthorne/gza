@@ -2,6 +2,14 @@
 When you complete this task, write a summary of what you accomplished to:
   {summary_path}
 
+Before finishing:
+- Re-read AGENTS.md for repository-specific rules and conventions.
+{learnings_check}
+- Check that your final changes match the original request or plan exactly; call out any intentional deviation.
+- Add or update targeted tests for each changed behavior, not just broad smoke coverage.
+- If CLI, config, prompts, docs, or other operator-facing behavior changed, update the relevant help text or documentation.
+- Inspect the final diff for accidental scope creep and remove unrelated changes.
+
 The summary should describe:
 - What was accomplished
 - Files changed
