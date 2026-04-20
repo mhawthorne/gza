@@ -41,6 +41,7 @@ from .config_cmds import (
 from .execution import (
     cmd_add,
     cmd_edit,
+    cmd_fix,
     cmd_implement,
     cmd_improve,
     cmd_iterate,
@@ -267,7 +268,7 @@ def main() -> int:
     incomplete_parser.add_argument(
         "--type",
         type=str,
-        choices=["explore", "plan", "implement", "review", "improve", "rebase", "internal"],
+        choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
         help="Filter tasks by task_type before lineage rollup",
     )
     incomplete_parser.add_argument(
@@ -1198,6 +1199,54 @@ def main() -> int:
     )
     add_common_args(improve_parser)
 
+    # fix command
+    fix_parser = subparsers.add_parser(
+        "fix",
+        help="Create and optionally run an interactive fix rescue task for a stuck implementation lifecycle",
+    )
+    fix_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID (implement, improve, review, or fix — resolves to root implementation)",
+    )
+    fix_parser.add_argument(
+        "--queue", "-q",
+        action="store_true",
+        help="Add task to queue without executing immediately",
+    )
+    fix_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    fix_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
+    )
+    fix_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
+    fix_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override the model for this task (e.g. 'claude-opus-4-5')",
+    )
+    fix_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        help="Override the provider for this task (e.g. 'claude', 'gemini', 'codex')",
+    )
+    fix_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the fix task",
+    )
+    add_common_args(fix_parser)
+
     def _add_iterate_args(iterate_parser: argparse.ArgumentParser) -> None:
         iterate_parser.add_argument(
             "impl_task_id",
@@ -1723,6 +1772,8 @@ def main() -> int:
             return cmd_retry(args)
         elif args.command == "improve":
             return cmd_improve(args)
+        elif args.command == "fix":
+            return cmd_fix(args)
         elif args.command in ("iterate", "cycle"):
             return cmd_iterate(args)
         elif args.command == "implement":

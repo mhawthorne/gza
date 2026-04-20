@@ -182,7 +182,7 @@ class Task:
     id: str | None  # None for unsaved tasks; project-prefixed decimal (e.g. "gza-1234")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
-    task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
+    task_type: str = "implement"  # explore, plan, implement, review, improve, fix, rebase, internal
     slug: str | None = None  # YYYYMMDD-slug format (DB column: slug, was task_id)
     branch: str | None = None
     log_file: str | None = None

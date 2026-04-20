@@ -266,7 +266,7 @@ def get_task_output_paths(
     if not task.slug:
         return None, None
 
-    if task.task_type in ("task", "implement", "improve", "rebase"):
+    if task.task_type in ("task", "implement", "improve", "fix", "rebase"):
         summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
     elif task.task_type == "explore":
         report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.slug}.md"
@@ -289,6 +289,8 @@ REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 4
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 COMMIT_SUBJECT_MAX_CHARS = 72
+FIX_REVIEW_HISTORY_LIMIT = 4
+FIX_LOG_TAIL_LINES = 80
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
@@ -432,13 +434,14 @@ def generate_slug(
 
 
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
-    """Compute a slug_override for review/implement/improve tasks.
+    """Compute a slug_override for review/implement/improve/fix tasks.
 
     Uses ``{task_id_suffix}-{type_prefix}-{target_slug}`` where target is the
     direct parent this task operates on:
     - review -> depends_on
     - improve -> based_on
     - implement -> based_on (fallback: depends_on)
+    - fix -> based_on
 
     Returns None for other task types (slug is derived from prompt as usual).
     """
@@ -446,6 +449,7 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
         "review": "rev",
         "implement": "impl",
         "improve": "impr",
+        "fix": "fix",
     }
     prefix = prefix_map.get(task.task_type)
     if prefix is None:
@@ -453,7 +457,7 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
 
     if task.task_type == "review":
         anchor_id = task.depends_on
-    elif task.task_type == "improve":
+    elif task.task_type in {"improve", "fix"}:
         anchor_id = task.based_on
     else:  # implement
         anchor_id = task.based_on or task.depends_on
@@ -553,7 +557,7 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
 
     # Final fallback for code-task summaries when report_file/output_content are absent.
     # This supports older tasks where summary content exists only on disk.
-    if task.slug and task.task_type in {"task", "implement", "improve"}:
+    if task.slug and task.task_type in {"task", "implement", "improve", "fix"}:
         summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
         if summary_path.exists():
             return summary_path.read_text()
@@ -844,6 +848,235 @@ def _build_review_diff_context(
     return "\n".join(parts)
 
 
+def _extract_must_fix_entries(review_content: str) -> list[tuple[str, str]]:
+    """Extract Must-Fix headings and bodies from a review report."""
+    entries: list[tuple[str, str]] = []
+    in_must_fix = False
+    current_heading: str | None = None
+    current_lines: list[str] = []
+
+    for raw_line in review_content.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            section = stripped[3:].strip().lower()
+            if section.startswith("must-fix"):
+                in_must_fix = True
+                current_heading = None
+                current_lines = []
+                continue
+            if in_must_fix:
+                break
+        if not in_must_fix:
+            continue
+        if stripped.startswith("### "):
+            if current_heading is not None:
+                entries.append((current_heading, "\n".join(current_lines).strip()))
+            current_heading = stripped[4:].strip()
+            current_lines = []
+            continue
+        if current_heading is not None:
+            current_lines.append(line)
+
+    if in_must_fix and current_heading is not None:
+        entries.append((current_heading, "\n".join(current_lines).strip()))
+
+    return entries
+
+
+def _normalize_blocker_text(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _must_fix_blocker_key(heading: str, body: str) -> tuple[str, str]:
+    """Return (stable_key, summary) for a Must-Fix entry."""
+    summary = ""
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("required fix:"):
+            summary = stripped.split(":", 1)[1].strip()
+            break
+        if stripped.lower().startswith("impact:"):
+            continue
+        summary = stripped
+        break
+
+    if not summary:
+        summary = heading
+
+    key_source = f"{heading} {summary}"
+    return _normalize_blocker_text(key_source), _truncate_to_word_boundary(summary, 160)
+
+
+def _build_repeated_blocker_lines(
+    reviews: list[Task],
+    project_dir: Path,
+) -> list[str]:
+    """Build repeated-blocker summary lines from recent completed reviews."""
+    per_review: list[tuple[str, dict[str, str]]] = []
+    for review_task in reviews:
+        content = _get_task_output(review_task, project_dir)
+        if not content:
+            continue
+        keys: dict[str, str] = {}
+        for heading, body in _extract_must_fix_entries(content):
+            key, summary = _must_fix_blocker_key(heading, body)
+            if key:
+                keys[key] = summary
+        if keys:
+            per_review.append((str(review_task.id), keys))
+
+    if len(per_review) < 2:
+        return []
+
+    latest_id, latest_keys = per_review[0]
+    previous_id, previous_keys = per_review[1]
+    repeated_keys = [key for key in latest_keys if key in previous_keys]
+    if not repeated_keys:
+        return []
+
+    lines = [
+        "Repeated blockers in the two most recent completed reviews:",
+        f"- Reviews compared: {latest_id} (latest) vs {previous_id}",
+    ]
+    for key in repeated_keys[:8]:
+        summary = latest_keys.get(key) or previous_keys.get(key) or key
+        lines.append(f"- {summary}")
+    return lines
+
+
+def _read_log_tail(project_dir: Path, log_file: str | None, max_lines: int = FIX_LOG_TAIL_LINES) -> str:
+    if not log_file:
+        return ""
+    path = project_dir / log_file
+    if not path.exists():
+        return ""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    tail = lines[-max_lines:]
+    return "\n".join(tail)
+
+
+def _build_fix_context(
+    task: Task,
+    store: SqliteTaskStore,
+    project_dir: Path,
+    git: Git | None,
+    config: Config | None,
+) -> str:
+    """Build host-assembled stuck-task rescue context for fix tasks."""
+    if not task.based_on:
+        return ""
+    impl_task = store.get(task.based_on)
+    if impl_task is None or impl_task.task_type != "implement":
+        return ""
+
+    assert impl_task.id is not None
+    reviews = [r for r in store.get_reviews_for_task(impl_task.id) if r.status == "completed"]
+    latest_review = reviews[0] if reviews else None
+    recent_reviews = reviews[:FIX_REVIEW_HISTORY_LIMIT]
+    repeated_blocker_lines = _build_repeated_blocker_lines(recent_reviews, project_dir)
+
+    from gza.query import build_lineage_tree, flatten_lineage_tree
+
+    lineage = flatten_lineage_tree(build_lineage_tree(store, impl_task))
+    improve_like = [
+        t
+        for t in lineage
+        if t.id is not None and t.task_type in {"improve", "implement"} and t.id != impl_task.id
+    ]
+    failed_attempts = [t for t in improve_like if t.status == "failed"]
+    latest_failed_attempt = None
+    if failed_attempts:
+        latest_failed_attempt = max(
+            failed_attempts,
+            key=lambda t: (t.completed_at or t.created_at or datetime.min, task_id_numeric_key(t.id)),
+        )
+
+    plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store) if impl_task.based_on else None
+    plan_or_request: list[str] = []
+    if plan_task is not None:
+        plan_content = _get_task_output(plan_task, project_dir)
+        plan_or_request.append("## Original plan:")
+        plan_or_request.append(plan_content if plan_content else f"(plan task {plan_task.id} content unavailable)")
+    else:
+        plan_or_request.append("## Original request:")
+        plan_or_request.append(impl_task.prompt)
+
+    branch_state_lines: list[str] = []
+    if impl_task.branch:
+        branch_state_lines.append(f"- Branch: {impl_task.branch}")
+    if impl_task.branch and git is not None:
+        try:
+            default_branch = git.default_branch()
+            ahead = git.count_commits_ahead(impl_task.branch, default_branch)
+            branch_state_lines.append(f"- Ahead of {default_branch}: {ahead} commit(s)")
+            diff_stat = git.get_diff_stat(f"{default_branch}...{impl_task.branch}")
+            if isinstance(diff_stat, str) and diff_stat.strip():
+                branch_state_lines.append("- Diff summary:")
+                branch_state_lines.append(diff_stat.strip())
+        except GitError:
+            pass
+
+    latest_review_content = _get_task_output(latest_review, project_dir) if latest_review else None
+    latest_review_summary = _compact_output_summary(latest_review_content) if latest_review_content else ""
+    latest_failed_tail = (
+        _read_log_tail(project_dir, latest_failed_attempt.log_file) if latest_failed_attempt else ""
+    )
+
+    lines: list[str] = [
+        "## Fix Rescue Context",
+        "",
+        f"- Root implementation: {impl_task.id}",
+        f"- Root implementation status: {impl_task.status}",
+        f"- Verify command: `{getattr(config, 'verify_command', '') or '(not configured)'}`",
+    ]
+    if latest_review is not None:
+        lines.append(f"- Latest completed review: {latest_review.id}")
+    if latest_review_summary:
+        lines.append(f"- Latest review summary: {latest_review_summary}")
+    if latest_failed_attempt is not None:
+        lines.append(
+            f"- Latest failed improve/resume attempt: {latest_failed_attempt.id} "
+            f"({latest_failed_attempt.failure_reason or 'UNKNOWN'})"
+        )
+
+    if repeated_blocker_lines:
+        lines.append("")
+        lines.append("## Repeated Blockers")
+        lines.extend(repeated_blocker_lines)
+
+    if recent_reviews:
+        lines.append("")
+        lines.append("## Recent Completed Reviews")
+        for review_task in recent_reviews:
+            content = _get_task_output(review_task, project_dir)
+            summary = _compact_output_summary(content) if content else "No output content available."
+            lines.append(f"- {review_task.id}: {summary}")
+
+    if branch_state_lines:
+        lines.append("")
+        lines.append("## Branch And Diff State")
+        lines.extend(branch_state_lines)
+
+    lines.append("")
+    lines.extend(plan_or_request)
+
+    if latest_failed_tail:
+        lines.append("")
+        lines.append("## Latest Failed Attempt Log Tail")
+        lines.append(latest_failed_tail)
+
+    return "\n".join(lines)
+
+
 def _build_context_from_chain(
     task: Task,
     store: SqliteTaskStore,
@@ -856,6 +1089,11 @@ def _build_context_from_chain(
 
     def _int_or_default(value: object, default: int) -> int:
         return value if isinstance(value, int) else default
+
+    if task.task_type == "fix":
+        fix_context = _build_fix_context(task, store, project_dir, git, config)
+        if fix_context:
+            context_parts.append(fix_context)
 
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":

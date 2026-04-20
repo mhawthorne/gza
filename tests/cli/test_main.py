@@ -339,6 +339,10 @@ class TestDirectExecutionForceDispatch:
                 "gza.cli.main.cmd_improve",
             ),
             (
+                ["gza", "fix", "testproject-1", "--force"],
+                "gza.cli.main.cmd_fix",
+            ),
+            (
                 ["gza", "iterate", "testproject-1", "--force"],
                 "gza.cli.main.cmd_iterate",
             ),

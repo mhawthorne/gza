@@ -86,6 +86,21 @@ Prompt: "Add JWT authentication to API endpoints"
 
 ---
 
+## gza-task-fix
+
+**Run an escalation rescue workflow for stuck review/improve churn using first-class `gza fix` context and closure-ledger handoff.**
+
+Use `/gza-task-fix` when an implementation is stuck after repeated `CHANGES_REQUESTED`, `max_cycles_reached`, or repeated failed improve attempts.
+
+**Key behaviors:**
+- Starts from a full prefixed task ID (for example, `gza-1234`) and resolves to the root implementation lineage
+- Uses `uv run gza fix <task_id>` instead of ad hoc manual repair steps
+- Enforces bounded blocker-driven scope with explicit rescue guardrails
+- Requires machine-readable closure ledger output (`fix_result` plus blocker entries)
+- Requires a fresh independent review after code-changing rescue runs
+
+---
+
 ## gza-task-debug
 
 **Diagnose why a gza task failed — analyzes logs, detects loops, checks diffs, compares baselines, and suggests fixes.**

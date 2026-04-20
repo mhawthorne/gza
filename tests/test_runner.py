@@ -64,11 +64,11 @@ class TestGetTaskOutputPaths:
         return task
 
     def test_code_task_types_return_summary_path(self, tmp_path: Path):
-        """Code task types (task, implement, improve, rebase) return a summary_path."""
+        """Code task types (task, implement, improve, fix, rebase) return a summary_path."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        for task_type in ("task", "implement", "improve", "rebase"):
+        for task_type in ("task", "implement", "improve", "fix", "rebase"):
             task = self._make_task(store, task_type)
             report_path, summary_path = get_task_output_paths(task, tmp_path)
             assert summary_path is not None, f"{task_type} should have summary_path"
@@ -890,6 +890,115 @@ class TestReviewContextFromChain:
         assert "uv run gza show <id>" not in context
         assert "prior review/improve cycle" not in context
         assert "Lineage:" not in context
+
+    def test_fix_context_includes_repeated_blockers_and_latest_failed_attempt(self, tmp_path: Path):
+        """Fix context includes repeated blockers and failed improve/resume lineage evidence."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement resilient retries", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/retries"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Missing timeout handling\n"
+            "Impact: retries can hang forever.\n"
+            "Required fix: add bounded timeout and propagate cancellation.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Missing timeout handling\n"
+            "Impact: retries can hang forever.\n"
+            "Required fix: add bounded timeout and propagate cancellation.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review2)
+
+        improve = store.add(
+            prompt="Improve attempt",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+        improve.status = "failed"
+        improve.failure_reason = "MAX_STEPS"
+        improve.log_file = ".gza/logs/fix-attempt.log"
+        store.update(improve)
+
+        log_path = tmp_path / ".gza" / "logs"
+        log_path.mkdir(parents=True, exist_ok=True)
+        (log_path / "fix-attempt.log").write_text("line1\nline2\nline3\n")
+
+        fix_task = store.add(
+            prompt="Rescue stuck implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Fix Rescue Context" in context
+        assert f"Root implementation: {impl_task.id}" in context
+        assert "Latest completed review:" in context
+        assert "## Repeated Blockers" in context
+        assert "add bounded timeout and propagate cancellation" in context
+        assert f"Latest failed improve/resume attempt: {improve.id}" in context
+        assert "line1" in context
+        assert "## Original request:" in context
+
+    def test_fix_context_omits_repeated_blockers_when_not_repeated(self, tmp_path: Path):
+        """Fix context omits repeated-blocker section when recent reviews do not repeat blockers."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement parsing", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Missing validation\n"
+            "Required fix: validate empty input.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.output_content = (
+            "## Must-Fix\n\n"
+            "### M2: Missing error mapping\n"
+            "Required fix: return typed parsing errors.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review2)
+
+        fix_task = store.add(
+            prompt="Rescue parser task",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Fix Rescue Context" in context
+        assert "## Repeated Blockers" not in context
 
 
 class TestSummaryDirectory:

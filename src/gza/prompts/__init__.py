@@ -158,6 +158,29 @@ class PromptBuilder:
                     f"\n\nBefore finishing, run the following verification command"
                     f" and fix any errors: `{config.verify_command}`"
                 )
+        elif task.task_type == "fix":
+            base_prompt += "\n\n" + _load_template("fix.txt")
+            learnings_check = (
+                "- Re-read `.gza/learnings.md` for project-specific patterns that apply to this task."
+                if learnings_available
+                else ""
+            )
+
+            if summary_path:
+                base_prompt += _load_template("task_with_summary.txt").format(
+                    summary_path=summary_path,
+                    learnings_check=learnings_check,
+                )
+            else:
+                base_prompt += _load_template("task_without_summary.txt").format(
+                    learnings_check=learnings_check
+                )
+
+            if config.verify_command:
+                base_prompt += (
+                    f"\n\nBefore finishing, run the following verification command"
+                    f" and fix any errors: `{config.verify_command}`"
+                )
         elif task.task_type == "rebase":
             # Rebase tasks get no extra instructions — the task prompt already
             # contains the rebase command. No verify_command, no summary file.
@@ -233,6 +256,12 @@ class PromptBuilder:
             Prompt string for an improve task.
         """
         return f"Improve implementation of task {task_id} based on review {review_id}"
+
+    def fix_task_prompt(self, task_id: str, review_id: str | None = None) -> str:
+        """Build the prompt for a stuck-task rescue fix task."""
+        if review_id:
+            return f"Rescue stuck implementation task {task_id} based on review {review_id}"
+        return f"Rescue stuck implementation task {task_id}"
 
     def review_task_prompt(
         self, impl_task_id: str, impl_prompt: str | None = None

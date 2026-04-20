@@ -1257,7 +1257,7 @@ def _advance_action_color(action_type: str) -> str:
     ac = _colors.ADVANCE_COLORS
     if action_type == 'merge':
         return ac.merge
-    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached'):
+    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'):
         return ac.error
     if action_type in ('skip', 'wait_review', 'wait_improve'):
         return ac.waiting
@@ -1526,7 +1526,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     error_count = 0
     workers_started = 0
     # Track tasks skipped for actionable reasons (needs human attention)
-    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached'})
+    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'})
     attention_tasks: list[tuple[DbTask, dict]] = []
 
     def _worker_args() -> argparse.Namespace:
@@ -1541,7 +1541,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
         action_type = action['type']
 
-        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached'):
+        if action_type in ('wait_review', 'wait_improve', 'needs_discussion', 'skip', 'max_cycles_reached', 'max_improve_attempts'):
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
@@ -1656,7 +1656,31 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
             # Check for existing failed improve for this impl+review pair.
             # Resume if possible, otherwise retry — never create a duplicate sibling.
-            improve_action, failed_improve = resolve_improve_action(store, task.id, review_task.id)
+            improve_action, failed_improve = resolve_improve_action(
+                store,
+                task.id,
+                review_task.id,
+                max_resume_attempts=config.max_resume_attempts,
+            )
+            if improve_action == "give_up" and failed_improve is not None:
+                assert failed_improve.id is not None
+                msg = (
+                    f"SKIP: max improve attempts ({config.max_resume_attempts}) reached for "
+                    f"{task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
+                    f"Run uv run gza fix {task.id}"
+                )
+                console.print(f"      [{_c_warn}]{msg}[/{_c_warn}]")
+                skip_count += 1
+                attention_tasks.append(
+                    (
+                        task,
+                        {
+                            "type": "max_improve_attempts",
+                            "description": msg,
+                        },
+                    )
+                )
+                continue
             if improve_action == "resume" and failed_improve is not None:
                 assert failed_improve.id is not None
                 improve_task = _create_resume_task(store, failed_improve)
@@ -1862,5 +1886,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _color = _advance_action_color(aaction['type'])
             console.print(f"  [{_c_tid}]{atask.id}[/{_c_tid}]  [{pink}]{prompt_display}[/{pink}]")
             console.print(f"       [{_color}]→ {desc}[/{_color}]")
+            if aaction['type'] in {'max_cycles_reached', 'max_improve_attempts'}:
+                console.print(f"       [{_color}]→ Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
     return 0 if error_count == 0 else 1

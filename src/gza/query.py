@@ -157,6 +157,8 @@ def _is_shared_branch_descendant(task: Task, root_task: Task) -> bool:
         return True
     if task.task_type == "rebase":
         return task.based_on is not None
+    if task.task_type == "fix":
+        return task.based_on is not None or bool(task.same_branch)
     return bool(task.same_branch)
 
 
@@ -385,6 +387,8 @@ _LINEAGE_REL_LABELS: dict[str, str] = {
     "review": "review",
     "improve-from-review": "improve",
     "improve": "improve",
+    "fix-from-review": "fix",
+    "fix": "fix",
     "implement-depends": "implement",
     "implement-based": "implement",
     "depends-and-based": "depends",
@@ -418,6 +422,10 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
         return "improve-from-review"
     if child.task_type == "improve" and child.based_on == parent_id:
         return "improve"
+    if child.task_type == "fix" and child.depends_on == parent_id:
+        return "fix-from-review"
+    if child.task_type == "fix" and child.based_on == parent_id:
+        return "fix"
     if child.task_type == "implement" and child.depends_on == parent_id:
         return "implement-depends"
     if child.task_type == "implement" and child.based_on == parent_id:

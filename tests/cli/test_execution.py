@@ -2522,6 +2522,224 @@ class TestImproveCommand:
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
 
+class TestFixCommand:
+    """Tests for 'gza fix' command."""
+
+    def test_fix_creates_task_from_implementation_and_latest_review(self, tmp_path: Path):
+        """Fix command creates a fix task linked to the root implementation and latest completed review."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add retries", task_type="implement", group="infra")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-retries"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        review1 = store.add("Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.completed_at = datetime.now(UTC)
+        store.update(review1)
+
+        review2 = store.add("Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.completed_at = datetime.now(UTC)
+        store.update(review2)
+
+        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Created fix task" in result.stdout
+        assert f"Root implementation: {impl_task.id}" in result.stdout
+        assert f"Latest completed review: {review2.id}" in result.stdout
+
+        fix_tasks = [t for t in store.get_all() if t.task_type == "fix"]
+        assert len(fix_tasks) == 1
+        fix_task = fix_tasks[0]
+        assert fix_task.based_on == impl_task.id
+        assert fix_task.depends_on == review2.id
+        assert fix_task.same_branch is True
+        assert fix_task.group == "infra"
+
+    def test_fix_accepts_review_task_id_and_resolves_implementation(self, tmp_path: Path):
+        """Fix command accepts review IDs and resolves to the base implementation."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement auth", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        review_task = store.add("Review auth", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        store.update(review_task)
+
+        result = run_gza("fix", str(review_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"Root implementation: {impl_task.id}" in result.stdout
+        fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
+        assert fix_task.based_on == impl_task.id
+        assert fix_task.depends_on == review_task.id
+
+    def test_fix_accepts_chained_improve_task_id_and_resolves_root_impl(self, tmp_path: Path):
+        """Fix command resolves chained improve IDs back to the root implementation."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement parser", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        review1 = store.add("Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.completed_at = datetime.now(UTC)
+        store.update(review1)
+
+        improve1 = store.add(
+            "Improve 1",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review1.id,
+            same_branch=True,
+        )
+        improve1.status = "completed"
+        improve1.completed_at = datetime.now(UTC)
+        store.update(improve1)
+
+        review2 = store.add("Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.completed_at = datetime.now(UTC)
+        store.update(review2)
+
+        improve2 = store.add(
+            "Improve 2 retry",
+            task_type="improve",
+            based_on=improve1.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+        improve2.status = "completed"
+        improve2.completed_at = datetime.now(UTC)
+        store.update(improve2)
+
+        result = run_gza("fix", str(improve2.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"Root implementation: {impl_task.id}" in result.stdout
+        assert f"Latest completed review: {review2.id}" in result.stdout
+        fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
+        assert fix_task.based_on == impl_task.id
+        assert fix_task.depends_on == review2.id
+
+    def test_fix_rejects_pending_or_in_progress_implementation(self, tmp_path: Path):
+        """Fix command rejects active implementation tasks that have not finished yet."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement cache", task_type="implement")
+        impl_task.status = "in_progress"
+        store.update(impl_task)
+
+        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert result.returncode == 1
+        assert f"Task {impl_task.id} is in_progress" in result.stdout
+
+    def test_fix_creates_follow_up_review_when_code_changed(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Fix auto-creates a fresh review task when fix run adds commits."""
+        from gza.cli.execution import cmd_fix
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement fixable feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-feature"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        review_task = store.add("Review latest", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        store.update(review_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(impl_task.id),
+            queue=False,
+            background=False,
+            no_docker=True,
+            max_turns=None,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", return_value=0),
+            patch("gza.cli.execution.Git") as mock_git_cls,
+        ):
+            mock_git = mock_git_cls.return_value
+            mock_git.default_branch.return_value = "main"
+            mock_git.count_commits_ahead.side_effect = [1, 2]
+            rc = cmd_fix(args)
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Created follow-up review task" in output
+
+        reviews = [t for t in store.get_all() if t.task_type == "review"]
+        assert len(reviews) == 2
+
+    def test_fix_skips_follow_up_review_when_no_new_commits(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Fix does not auto-create review when no new commits were added by the fix run."""
+        from gza.cli.execution import cmd_fix
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement no-change rescue", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-no-change"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        review_task = store.add("Review latest", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        store.update(review_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(impl_task.id),
+            queue=False,
+            background=False,
+            no_docker=True,
+            max_turns=None,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", return_value=0),
+            patch("gza.cli.execution.Git") as mock_git_cls,
+            patch("gza.cli.execution._create_review_task") as mock_create_review,
+        ):
+            mock_git = mock_git_cls.return_value
+            mock_git.default_branch.return_value = "main"
+            mock_git.count_commits_ahead.side_effect = [2, 2]
+            rc = cmd_fix(args)
+
+        assert rc == 0
+        mock_create_review.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Fix completed without new commits; no follow-up review was auto-created." in output
+
+
 class TestReviewCommand:
     """Tests for the 'gza review' command."""
 
@@ -2575,7 +2793,7 @@ class TestReviewCommand:
         result = run_gza("review", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "is a plan task, not an implementation, improve, or review task" in result.stdout
+        assert "is a plan task, not an implementation, improve, review, or fix task" in result.stdout
 
     def test_review_accepts_improve_task_and_targets_implementation(self, tmp_path: Path):
         """Review command accepts improve tasks and reviews the base implementation."""
@@ -2673,8 +2891,8 @@ class TestReviewCommand:
         assert result.returncode == 1
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
-    def test_review_anchors_lineage_to_reviewed_implementation(self, tmp_path: Path):
-        """Review task uses implementation ID for based_on and lineage placement."""
+    def test_review_resolves_retry_implementation_to_root_implementation(self, tmp_path: Path):
+        """Review command resolves retry implementation IDs to the root implementation lineage."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2704,27 +2922,27 @@ class TestReviewCommand:
         assert result.returncode == 0
         assert "Created review task " in result.stdout
 
-        # Verify the review task is anchored to the reviewed implementation task
+        # Review now resolves retry implementation IDs to the root implementation.
         all_tasks = store.get_all()
         review_task = [t for t in all_tasks if t.task_type == "review"][0]
         assert review_task is not None
-        assert review_task.based_on == retry_impl.id
-        assert review_task.depends_on == retry_impl.id
+        assert review_task.based_on == impl_task.id
+        assert review_task.depends_on == impl_task.id
 
         retry_based_children = {t.id for t in store.get_based_on_children(retry_impl.id)}
         parent_based_children = {t.id for t in store.get_based_on_children(impl_task.id)}
-        assert review_task.id in retry_based_children
-        assert review_task.id not in parent_based_children
+        assert review_task.id not in retry_based_children
+        assert review_task.id in parent_based_children
 
-        # Verify canonical lineage placement is under retry implementation
+        # Canonical lineage placement stays under the root implementation branch.
         lineage_tree = build_lineage_tree(store, plan_task)
         assert len(lineage_tree.children) == 1
         parent_impl_node = lineage_tree.children[0]
         assert parent_impl_node.task.id == impl_task.id
-        assert len(parent_impl_node.children) == 1
-        retry_node = parent_impl_node.children[0]
+        assert len(parent_impl_node.children) == 2
+        retry_node = [c for c in parent_impl_node.children if c.task.id == retry_impl.id][0]
         assert retry_node.task.id == retry_impl.id
-        assert any(child.task.id == review_task.id for child in retry_node.children)
+        assert any(child.task.id == review_task.id for child in parent_impl_node.children)
 
     def test_review_runs_by_default(self, tmp_path: Path):
         """Review command runs the review task immediately by default."""

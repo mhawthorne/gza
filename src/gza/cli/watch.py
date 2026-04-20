@@ -298,7 +298,14 @@ def _run_cycle(
 
         for task, action in action_plan:
             action_type = action.get("type")
-            if action_type in {"skip", "wait_review", "wait_improve", "needs_discussion", "max_cycles_reached"}:
+            if action_type in {
+                "skip",
+                "wait_review",
+                "wait_improve",
+                "needs_discussion",
+                "max_cycles_reached",
+                "max_improve_attempts",
+            }:
                 log.emit(
                     "SKIP",
                     _watch_skip_message(task, action),

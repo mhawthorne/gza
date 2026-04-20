@@ -127,6 +127,26 @@ class TestPromptBuilderBuild:
         assert "The review item you addressed" in result
         assert "If a Must-Fix item no longer applies" in result
 
+    def test_build_fix_type_with_summary(self, tmp_path: Path):
+        """Fix prompts include rescue instructions and summary contract."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Rescue stuck workflow", task_type="fix")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "uv run pytest tests/ -q"
+
+        summary_path = Path("/workspace/.gza/summaries/fix-test.md")
+        result = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert str(summary_path) in result
+        assert "This is a `fix` rescue task for a stuck implementation workflow." in result
+        assert "## Blocker Closure Ledger (Machine Readable)" in result
+        assert "fix_result: repaired_pending_review | needs_user | blocked_external | diagnosed_no_change" in result
+        assert "Before finishing, run the following verification command" in result
+        assert "uv run pytest tests/ -q" in result
+
     def test_build_task_type_with_summary_includes_learnings_check_when_file_exists(self, tmp_path: Path):
         """Task prompts include the learnings checklist line only when the file exists."""
         db_path = tmp_path / "test.db"
@@ -592,6 +612,18 @@ class TestPromptBuilderReviewTask:
         assert "inline diff/context" in result
         assert "provided diff is authoritative" in result
         assert "read unchanged source files" in result
+
+
+class TestPromptBuilderFixTask:
+    """Tests for PromptBuilder.fix_task_prompt()."""
+
+    def test_fix_task_prompt_with_review(self):
+        result = PromptBuilder().fix_task_prompt(task_id="gza-10", review_id="gza-12")
+        assert result == "Rescue stuck implementation task gza-10 based on review gza-12"
+
+    def test_fix_task_prompt_without_review(self):
+        result = PromptBuilder().fix_task_prompt(task_id="gza-10")
+        assert result == "Rescue stuck implementation task gza-10"
 
 
 class TestVerifyCommandConfig:

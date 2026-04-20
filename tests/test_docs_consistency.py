@@ -10,7 +10,7 @@ def test_docs_task_type_use_internal_not_learn() -> None:
     learnings_content = (docs_root / "internal" / "learnings.md").read_text()
 
     # configuration.md should list internal in task type filters
-    assert "explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal`" in config_content
+    assert "explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`" in config_content
 
     # learnings doc should describe internal task mechanics
     assert "skip_learnings=True" in learnings_content
@@ -45,9 +45,9 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `task_id` | Full prefixed task ID to resume",
         "| `task_id` | Full prefixed task ID to retry",
         "| `task_id` | Full prefixed task ID to rebase",
-        "| `impl_task_id` | Full prefixed task ID (implement, improve, or review",
+        "| `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix",
         "| `--review-id ID` | Explicit full prefixed review task ID to base the improve on",
-        "| `task_id` | Full prefixed task ID (implement, improve, or review",
+        "| `task_id` | Full prefixed task ID (implement, improve, review, or fix",
         "| `plan_task_id` | Full prefixed completed plan task ID to implement",
         "| `--depends-on ID` | Set dependency on another task by full prefixed task ID",
         "| `task_id` | Specific full prefixed task ID to advance",
@@ -109,6 +109,7 @@ def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
         "gza-task-run",
         "gza-task-resume",
         "gza-task-improve",
+        "gza-task-fix",
         "gza-task-review",
         "gza-task-info",
         "gza-task-debug",
