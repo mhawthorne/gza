@@ -543,6 +543,42 @@ class TestSkillContentValidation:
         assert "depends_on='<REVIEW_TASK_ID>'" in content
         assert "Use the `review_task_id` already resolved in Step 1" in content
 
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    def test_manual_review_improve_skills_preserve_starting_checkout(self, skill_name: str):
+        """Manual review/improve skills should restore the user's starting checkout before exit."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD" in content
+        assert "<START_CHECKOUT>" in content
+        assert "git checkout --detach <START_CHECKOUT>" in content
+
+    def test_manual_improve_skill_requires_restoring_starting_checkout_before_exit(self):
+        """gza-task-improve should explicitly restore the initial checkout after persisting results."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-improve" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "### Step 9: Restore the starting checkout" in content
+        assert "git checkout <START_CHECKOUT>" in content
+        assert "Do not silently finish on the task branch." in content
+
+    def test_manual_improve_skill_requires_commit_and_push_before_persisting_results(self):
+        """gza-task-improve should require both a commit and a push on the implementation branch."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-improve" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "A successful `/gza-task-improve` run always ends with a commit" in content
+        assert "### Step 7: Push the implementation branch" in content
+        assert "git push -u origin <impl_branch>" in content
+        assert "After a successful commit and push" in content
+        assert "Push: pushed to <IMPL_BRANCH>" in content
+
     def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
         """gza-task-run should not document unsupported mark-completed branch flags."""
         from gza.skills_utils import get_skills_source_path

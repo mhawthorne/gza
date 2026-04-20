@@ -21,6 +21,16 @@ Use the full prefixed task ID as provided.
 
 ## Process
 
+### Step 0: Capture the starting checkout
+
+Before reading task state, capture where the user started:
+
+```bash
+git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD
+```
+
+Save this as `<START_CHECKOUT>`. If you change checkouts at any point during the review, return to `<START_CHECKOUT>` before finishing. If `<START_CHECKOUT>` is a detached HEAD, restore it with `git checkout --detach <START_CHECKOUT>`.
+
 ### Step 1: Resolve the task
 
 Query the task database to get task details and branch:
@@ -260,6 +270,7 @@ After the subagent completes:
 - Print a brief summary of findings
 - If changes were requested, tell the user: "Run `/gza-task-improve <IMPL_TASK_ID>` to address the must-fix items."
 - If a PR was used, include a link to it
+- If you changed checkouts during the workflow, switch back to `<START_CHECKOUT>` before the final message and state explicitly which checkout is now active
 
 ## Important notes
 
@@ -267,3 +278,4 @@ After the subagent completes:
 - **Structured output matters** — the review format (M1, M2, S1, S2) must be compatible with `/gza-task-improve` so the improve workflow can consume it.
 - **Don't duplicate existing reviews** — if there's already a recent review, inform the user and ask before creating another one.
 - **Use authoritative diff context** — do not reconstruct or expand the diff in the reviewing subagent; only use provided diff context plus unchanged-source reads for verification.
+- **Preserve the user's checkout** — `/gza-task-review` should be checkout-neutral. If you switch branches for any reason, restore the starting checkout before returning control to the user.
