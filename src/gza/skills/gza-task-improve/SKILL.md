@@ -21,10 +21,11 @@ Query the task and find its most recent review:
 ```bash
 uv run python -c "
 import json, sys
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
 if not task:

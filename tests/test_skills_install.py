@@ -357,6 +357,19 @@ class TestSkillContentValidation:
         assert "Config.load(Path.cwd())" in content
 
     @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    def test_manual_review_improve_skills_use_explicit_project_dir_for_all_config_loads(
+        self, skill_name: str
+    ):
+        """Manual review/improve skills should not ship zero-arg Config.load() snippets anywhere."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Config.load()" not in content
+        assert content.count("Config.load(Path.cwd())") >= 2
+
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
     def test_manual_review_improve_persistence_snippets_use_valid_store_api(
         self, skill_name: str
     ):
