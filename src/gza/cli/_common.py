@@ -1013,32 +1013,50 @@ def resolve_improve_action(
 def _create_improve_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
-    review_task: DbTask,
+    review_task: DbTask | None,
     create_review: bool = False,
     model: str | None = None,
     provider: str | None = None,
 ) -> DbTask:
-    """Create an improve task for an implementation task based on a review.
+    """Create an improve task for an implementation task.
 
+    Uses review feedback when a review task is supplied; otherwise falls back
+    to unresolved task comments.
     Validates that no duplicate improve task already exists.
     Returns the created improve task, or raises ValueError with an error message.
     """
     assert impl_task.id is not None
-    assert review_task.id is not None
-
-    existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
+    has_comments = bool(store.get_comments(impl_task.id, unresolved_only=True))
+    if review_task is not None:
+        assert review_task.id is not None
+        existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
+    else:
+        existing = [
+            task
+            for task in store.get_improve_tasks_by_root(impl_task.id)
+            if task.depends_on is None
+        ]
     if existing:
         existing_task = existing[0]
+        if review_task is not None and review_task.id is not None:
+            raise ValueError(
+                f"An improve task already exists for implementation {impl_task.id} "
+                f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
+            )
         raise ValueError(
             f"An improve task already exists for implementation {impl_task.id} "
-            f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
+            f"without an attached review: {existing_task.id} (status: {existing_task.status})"
         )
 
-    prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
+    prompt = PromptBuilder().improve_task_prompt(
+        impl_task.id,
+        review_task.id if review_task is not None else None,
+        has_comments=has_comments,
+    )
     return store.add(
         prompt=prompt,
         task_type="improve",
-        depends_on=review_task.id,
+        depends_on=review_task.id if review_task is not None else None,
         based_on=impl_task.id,
         same_branch=True,
         group=impl_task.group,

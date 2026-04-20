@@ -693,6 +693,23 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 
+When task comments exist, `gza show` also includes a `Comments:` section with each
+comment's state (`open` or `resolved`), timestamp, source/author attribution, and content.
+
+### comment
+
+Add a direct comment to a task.
+
+```bash
+gza comment <task_id> <text> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID to comment on (e.g. `gza-1234`) |
+| `text` | Comment text to attach to the task |
+| `--author AUTHOR` | Optional author attribution |
+
 ### resume
 
 Resume a failed task from where it left off. The AI continues with the existing conversation context.
@@ -805,6 +822,9 @@ gza history [options]
 
 `gza history` is a flat chronological record. Use `gza incomplete` for a
 lineage-aware unresolved attention view.
+
+When tasks have comments, `gza history` includes a `comments: N` indicator in
+task detail lines and compact lineage summaries.
 
 | Option | Description |
 |--------|-------------|

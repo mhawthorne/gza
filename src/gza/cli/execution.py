@@ -936,7 +936,10 @@ def cmd_improve(args: argparse.Namespace) -> int:
     assert impl_task is not None
     assert impl_task.id is not None
 
+    unresolved_comments = store.get_comments(impl_task.id, unresolved_only=True)
+
     review_id_override = getattr(args, "review_id", None)
+    review_task: DbTask | None = None
     if review_id_override is not None:
         resolved_review_id = resolve_id(config, review_id_override)
         review_task = store.get(resolved_review_id)
@@ -970,7 +973,12 @@ def cmd_improve(args: argparse.Namespace) -> int:
         ]
 
         if not usable_reviews:
-            if review_tasks:
+            if unresolved_comments:
+                print(
+                    f"Note: Task {impl_task.id} has no usable review; "
+                    "continuing from unresolved comments only."
+                )
+            elif review_tasks:
                 statuses = ", ".join(
                     f"{r.id} ({r.status})" for r in review_tasks
                 )
@@ -982,12 +990,14 @@ def cmd_improve(args: argparse.Namespace) -> int:
             else:
                 print(f"Error: Task {impl_task.id} has no review. Run a review first:")
                 print(f"  gza add --type review --depends-on {impl_task.id}")
-            return 1
+            if not unresolved_comments:
+                return 1
 
-        review_task = usable_reviews[0]
+        if usable_reviews:
+            review_task = usable_reviews[0]
 
         # Warn if the selected review is not yet completed (pending/in_progress).
-        if review_task.status != "completed":
+        if review_task is not None and review_task.status != "completed":
             print(
                 f"Warning: Review {review_task.id} is {review_task.status}. "
                 "The improve task will be blocked until it completes."
@@ -1009,7 +1019,10 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     print(f"✓ Created improve task {improve_task.id}")
     print(f"  Based on: implementation {impl_task.id}")
-    print(f"  Review: {review_task.id}")
+    if review_task is not None:
+        print(f"  Review: {review_task.id}")
+    elif unresolved_comments:
+        print(f"  Comments: {len(unresolved_comments)} unresolved")
     print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
 
     # Handle background mode - spawn worker to run the improve task
@@ -1086,6 +1099,28 @@ def cmd_fix(args: argparse.Namespace) -> int:
 
     print(f"\nRunning fix task {fix_task.id}...")
     return _run_foreground(config, task_id=fix_task.id, force=getattr(args, "force", False))
+
+
+def cmd_comment(args: argparse.Namespace) -> int:
+    """Add a direct comment to a task."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
+    if task is None:
+        print(f"Error: Task {task_id} not found")
+        return 1
+
+    author = getattr(args, "author", None)
+    try:
+        comment = store.add_comment(task_id, args.text, source="direct", author=author)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(f"✓ Added comment {comment.id} to task {task_id}")
+    return 0
 
 
 def cmd_review(args: argparse.Namespace) -> int:

@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
+    "KNOWN_COMMENT_SOURCES",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
     "Task",
+    "TaskComment",
     "TaskStats",
     "SqliteTaskStore",
     "extract_failure_reason",
@@ -57,6 +59,8 @@ KNOWN_EXECUTION_MODES = {
     "manual",
     "skill_inline",
 }
+
+KNOWN_COMMENT_SOURCES = {"direct", "github"}
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
 
@@ -252,6 +256,19 @@ class TaskStats:
     tokens_estimated: bool = False
     cost_estimated: bool = False
 
+
+@dataclass(frozen=True)
+class TaskComment:
+    """A comment attached to a task."""
+
+    id: int
+    task_id: str
+    source: str  # direct | github
+    content: str
+    author: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
 # Migration from v18 to v19
 MIGRATION_V18_TO_V19 = """
 CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
@@ -296,9 +313,20 @@ MIGRATION_V30_TO_V31 = """
 ALTER TABLE tasks ADD COLUMN execution_mode TEXT;
 """
 
-# Migration from v31 to v32: base_branch for retry forking
+# Migration from v31 to v32: base_branch for retry forking + task comments
 MIGRATION_V31_TO_V32 = """
 ALTER TABLE tasks ADD COLUMN base_branch TEXT;
+CREATE TABLE IF NOT EXISTS task_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    source TEXT NOT NULL CHECK(source IN ('direct', 'github')),
+    content TEXT NOT NULL,
+    author TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_id ON task_comments(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_id_resolved_at ON task_comments(task_id, resolved_at);
 """
 
 # Schema version for migrations
@@ -334,6 +362,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
         31: ("tasks", "execution_mode"),
+        32: ("task_comments", "source"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is None:
@@ -414,6 +443,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
 CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
 CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
+
+CREATE TABLE IF NOT EXISTS task_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    source TEXT NOT NULL CHECK(source IN ('direct', 'github')),
+    content TEXT NOT NULL,
+    author TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_id ON task_comments(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_id_resolved_at ON task_comments(task_id, resolved_at);
 
 CREATE TABLE IF NOT EXISTS run_steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -926,6 +968,18 @@ class SqliteTaskStore:
             legacy_event_id=row["legacy_event_id"],
         )
 
+    def _row_to_task_comment(self, row: sqlite3.Row) -> TaskComment:
+        """Convert a database row to a TaskComment."""
+        return TaskComment(
+            id=row["id"],
+            task_id=row["task_id"],
+            source=row["source"],
+            content=row["content"],
+            author=row["author"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
+        )
+
     # === Task CRUD ===
 
     def _next_id(self, conn: sqlite3.Connection) -> str:
@@ -1008,6 +1062,84 @@ class SqliteTaskStore:
             cur = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
             row = cur.fetchone()
             return self._row_to_task(row) if row else None
+
+    def add_comment(
+        self,
+        task_id: str,
+        content: str,
+        source: str = "direct",
+        author: str | None = None,
+    ) -> TaskComment:
+        """Add a comment to a task and return the created row."""
+        if source not in KNOWN_COMMENT_SOURCES:
+            raise ValueError(
+                f"Unknown comment source: {source}. "
+                f"Expected one of: {', '.join(sorted(KNOWN_COMMENT_SOURCES))}"
+            )
+        if not content.strip():
+            raise ValueError("Comment content cannot be empty")
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+                raise ValueError(f"Task {task_id} not found")
+            cur = conn.execute(
+                """
+                INSERT INTO task_comments (task_id, source, content, author, created_at, resolved_at)
+                VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                (task_id, source, content, author, now),
+            )
+            row_id = cur.lastrowid
+            assert row_id is not None
+            row = conn.execute("SELECT * FROM task_comments WHERE id = ?", (row_id,)).fetchone()
+            assert row is not None
+            return self._row_to_task_comment(row)
+
+    def get_comments(
+        self,
+        task_id: str,
+        unresolved_only: bool = False,
+        created_on_or_before: datetime | None = None,
+    ) -> list[TaskComment]:
+        """Get comments for a task with optional unresolved and created-at filters."""
+        with self._connect() as conn:
+            params: list[object] = [task_id]
+            where_clauses = ["task_id = ?"]
+            if unresolved_only:
+                where_clauses.append("resolved_at IS NULL")
+            if created_on_or_before is not None:
+                where_clauses.append("created_at <= ?")
+                params.append(created_on_or_before.isoformat())
+
+            where_sql = " AND ".join(where_clauses)
+            cur = conn.execute(
+                f"""
+                SELECT * FROM task_comments
+                WHERE {where_sql}
+                ORDER BY created_at ASC, id ASC
+                """,
+                tuple(params),
+            )
+            return [self._row_to_task_comment(row) for row in cur.fetchall()]
+
+    def resolve_comments(self, task_id: str, created_on_or_before: datetime | None = None) -> None:
+        """Soft-resolve unresolved comments for a task by setting resolved_at."""
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            params: list[object] = [now, task_id]
+            where_sql = "task_id = ? AND resolved_at IS NULL"
+            if created_on_or_before is not None:
+                where_sql += " AND created_at <= ?"
+                params.append(created_on_or_before.isoformat())
+
+            conn.execute(
+                f"""
+                UPDATE task_comments
+                SET resolved_at = ?
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
 
     def get_by_seq(self, seq_number: int, prefix: str | None = None) -> Task | None:
         """Get task by ordinal sequence number within a project prefix.

@@ -2087,6 +2087,28 @@ class TestImproveCommand:
         assert "has no review" in result.stdout
         assert f"gza add --type review --depends-on {impl_task.id}" in result.stdout
 
+    def test_improve_works_from_unresolved_comments_without_review(self, tmp_path: Path):
+        """Improve command can run from unresolved comments when no review exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Please tighten validation edge cases.")
+
+        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "continuing from unresolved comments only" in result.stdout
+        assert "Comments: 1 unresolved" in result.stdout
+
+        improve_task = next(task for task in store.get_all() if task.task_type == "improve")
+        assert improve_task.depends_on is None
+
     def test_improve_fails_on_non_implement_task(self, tmp_path: Path):
         """Improve command fails if task is not an implementation task."""
 
@@ -2825,6 +2847,35 @@ class TestFixCommand:
         mock_create_review.assert_not_called()
         output = capsys.readouterr().out
         assert "Running fix task" in output
+
+
+class TestCommentCommand:
+    """Tests for `gza comment` command."""
+
+    def test_comment_adds_direct_comment(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Task needing follow-up", task_type="implement")
+        assert task.id is not None
+
+        result = run_gza(
+            "comment",
+            str(task.id),
+            "Please add regression coverage.",
+            "--author",
+            "alice",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "Added comment" in result.stdout
+        comments = store.get_comments(task.id)
+        assert len(comments) == 1
+        assert comments[0].source == "direct"
+        assert comments[0].author == "alice"
+        assert comments[0].content == "Please add regression coverage."
 
 
 class TestReviewCommand:

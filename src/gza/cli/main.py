@@ -40,6 +40,7 @@ from .config_cmds import (
 )
 from .execution import (
     cmd_add,
+    cmd_comment,
     cmd_edit,
     cmd_fix,
     cmd_implement,
@@ -1030,6 +1031,25 @@ def main() -> int:
     )
     add_common_args(edit_parser)
 
+    # comment command
+    comment_parser = subparsers.add_parser("comment", help="Add a comment to a task")
+    comment_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID to comment on",
+    )
+    comment_parser.add_argument(
+        "text",
+        type=str,
+        help="Comment text",
+    )
+    comment_parser.add_argument(
+        "--author",
+        type=str,
+        help="Optional author attribution",
+    )
+    add_common_args(comment_parser)
+
     # learnings command
     learnings_parser = subparsers.add_parser("learnings", help="Manage project learnings")
     learnings_subparsers = learnings_parser.add_subparsers(
@@ -1766,6 +1786,8 @@ def main() -> int:
             return cmd_add(args)
         elif args.command == "edit":
             return cmd_edit(args)
+        elif args.command == "comment":
+            return cmd_comment(args)
         elif args.command == "delete":
             return cmd_delete(args)
         elif args.command == "retry":

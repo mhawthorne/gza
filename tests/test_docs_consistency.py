@@ -91,6 +91,22 @@ def test_skills_docs_do_not_advertise_unsupported_gza_log_task_flag() -> None:
     assert "gza log gza-p --task" not in skills_content
 
 
+def test_configuration_docs_include_comment_command_reference() -> None:
+    """Canonical command reference should document `gza comment` and comment visibility output."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    required_snippets = [
+        "### comment",
+        "gza comment <task_id> <text> [options]",
+        "| `task_id` | Full prefixed task ID to comment on",
+        "When task comments exist, `gza show` also includes a `Comments:` section",
+        "When tasks have comments, `gza history` includes a `comments: N` indicator",
+    ]
+    for snippet in required_snippets:
+        assert snippet in config_content
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

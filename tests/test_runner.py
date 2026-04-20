@@ -875,6 +875,88 @@ class TestReviewContextFromChain:
         assert f"review task {review_task.id} exists but content unavailable" in context
         assert "flag as blocker" in context
 
+    def test_improve_context_includes_unresolved_comments(self, tmp_path: Path):
+        """Improve context should include unresolved comments for the implementation task."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = "Requested changes"
+        store.update(review_task)
+        assert review_task.id is not None
+
+        store.add_comment(impl_task.id, "Please harden input validation.", source="direct", author="alice")
+        store.add_comment(impl_task.id, "nit: simplify helper", source="github")
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Comments:" in context
+        assert "source=direct, author=alice" in context
+        assert "source=github" in context
+        assert "Please harden input validation." in context
+        assert "nit: simplify helper" in context
+
+    def test_improve_retry_context_reads_comments_from_implementation_ancestor(self, tmp_path: Path):
+        """Retry/resume improves should still include unresolved comments from the root implementation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = "Requested changes"
+        store.update(review_task)
+        assert review_task.id is not None
+
+        store.add_comment(impl_task.id, "Please keep this in retry context.", source="direct")
+
+        improve_1 = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+        assert improve_1.id is not None
+        store.add_comment(improve_1.id, "Comment on improve task should not be used.", source="direct")
+
+        improve_retry = store.add(
+            prompt="Retry improve feature",
+            task_type="improve",
+            based_on=improve_1.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_retry, store, tmp_path, git=None)
+
+        assert "## Comments:" in context
+        assert "Please keep this in retry context." in context
+        assert "Comment on improve task should not be used." not in context
+
     def test_first_review_has_no_tool_hints(self, tmp_path: Path):
         """First-time review (no prior cycles) does not include tool hints or lineage."""
         db_path = tmp_path / "test.db"
@@ -5551,6 +5633,92 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "completed"
         assert refreshed.failure_reason is None
+
+    def test_run_pr_required_retry_for_improve_resolves_parent_comments(self, tmp_path: Path):
+        """Improve completion should resolve unresolved comments on the based_on implementation task."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        parent.merge_status = "merged"
+        store.update(parent)
+        assert parent.id is not None
+        store.add_comment(parent.id, "Please tighten error handling.", source="direct")
+        assert store.get_comments(parent.id, unresolved_only=True)
+
+        improve = store.add(
+            prompt="Improve parent implementation",
+            task_type="improve",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        improve.slug = "20260414-retry-improve-pr-required"
+        improve.status = "failed"
+        improve.failure_reason = "PR_REQUIRED"
+        improve.branch = "feature/retry-improve-pr-required"
+        improve.log_file = "logs/retry-improve.log"
+        improve.output_content = "summary"
+        improve.has_commits = True
+        store.update(improve)
+        assert improve.id is not None
+
+        with (
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=improve.id, create_pr=True)
+
+        assert rc == 0
+        assert store.get_comments(parent.id, unresolved_only=True) == []
+
+    def test_run_pr_required_retry_for_improve_only_resolves_comments_in_snapshot(self, tmp_path: Path):
+        """Improve completion should leave comments added after improve creation unresolved."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        store.update(parent)
+        assert parent.id is not None
+
+        store.add_comment(parent.id, "Old comment in improve snapshot", source="direct")
+
+        improve = store.add(
+            prompt="Improve parent implementation",
+            task_type="improve",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        improve.slug = "20260420-retry-improve-comment-snapshot"
+        improve.status = "failed"
+        improve.failure_reason = "PR_REQUIRED"
+        improve.branch = "feature/retry-improve-comment-snapshot"
+        improve.log_file = "logs/retry-improve-snapshot.log"
+        improve.output_content = "summary"
+        improve.has_commits = True
+        store.update(improve)
+        assert improve.id is not None
+
+        store.add_comment(parent.id, "New comment after improve creation", source="direct")
+
+        with (
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=improve.id, create_pr=True)
+
+        assert rc == 0
+        unresolved = store.get_comments(parent.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved] == ["New comment after improve creation"]
 
     def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
         """PR retry completion for rebases should invalidate review state and force-push."""

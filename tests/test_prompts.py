@@ -572,6 +572,16 @@ class TestPromptBuilderImproveTask:
         result = PromptBuilder().improve_task_prompt(task_id=5, review_id=7)
         assert result == "Improve implementation of task 5 based on review 7"
 
+    def test_improve_task_prompt_mentions_comments_when_present(self):
+        """Prompt should mention unresolved comments when comment feedback exists."""
+        result = PromptBuilder().improve_task_prompt(task_id=5, review_id=7, has_comments=True)
+        assert "unresolved comments" in result
+
+    def test_improve_task_prompt_supports_comments_only_feedback(self):
+        """Prompt should support improve tasks with comments and no review."""
+        result = PromptBuilder().improve_task_prompt(task_id=5, review_id=None, has_comments=True)
+        assert result == "Improve implementation of task 5 based on unresolved comments"
+
 
 class TestPromptBuilderReviewTask:
     """Tests for PromptBuilder.review_task_prompt()."""
