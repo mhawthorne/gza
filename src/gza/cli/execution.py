@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import re
 import signal
 import sys
 import time
@@ -1029,14 +1028,6 @@ def cmd_improve(args: argparse.Namespace) -> int:
     return _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
 
 
-def _extract_fix_result(output_content: str | None) -> str | None:
-    """Extract fix_result value from the machine-readable closure ledger."""
-    if not output_content:
-        return None
-    match = re.search(r"^\s*fix_result:\s*([a-z_]+)\s*$", output_content, flags=re.MULTILINE)
-    return match.group(1) if match else None
-
-
 def cmd_fix(args: argparse.Namespace) -> int:
     """Create and run a fix task for a stuck implementation workflow."""
     config = Config.load(args.project_dir)
@@ -1093,61 +1084,8 @@ def cmd_fix(args: argparse.Namespace) -> int:
     if hasattr(args, 'queue') and args.queue:
         return 0
 
-    commits_before: int | None = None
-    default_branch: str | None = None
-    git_runtime: Git | None = None
-    if impl_task.branch:
-        try:
-            git_runtime = Git(config.project_dir)
-            default_branch = git_runtime.default_branch()
-            commits_before = git_runtime.count_commits_ahead(impl_task.branch, default_branch)
-        except Exception:
-            commits_before = None
-            default_branch = None
-            git_runtime = None
-
     print(f"\nRunning fix task {fix_task.id}...")
-    rc = _run_foreground(config, task_id=fix_task.id, force=getattr(args, "force", False))
-    if rc != 0:
-        return rc
-
-    completed_fix = store.get(fix_task.id)
-    if completed_fix is None:
-        return rc
-
-    fix_result = _extract_fix_result(completed_fix.output_content)
-    if fix_result:
-        print(f"Fix result: {fix_result}")
-
-    code_changed: bool | None = None
-    if impl_task.branch and commits_before is not None and default_branch and git_runtime is not None:
-        try:
-            commits_after = git_runtime.count_commits_ahead(impl_task.branch, default_branch)
-            code_changed = commits_after > commits_before
-        except Exception:
-            code_changed = None
-
-    if code_changed is False:
-        print("Fix completed without new commits; no follow-up review was auto-created.")
-        if not fix_result:
-            print("Suggested handoff: diagnosed_no_change or needs_user.")
-        return rc
-
-    try:
-        review_task = _create_review_task(store, impl_task)
-        print(f"✓ Created follow-up review task {review_task.id} for implementation {impl_task.id}")
-        print(f"Next step: uv run gza work {review_task.id}")
-    except DuplicateReviewError as exc:
-        review_task = exc.active_review
-        print(
-            f"Follow-up review already exists: {review_task.id} ({review_task.status}). "
-            "Use `uv run gza work` to execute it."
-        )
-    except ValueError as exc:
-        print(f"Warning: could not create follow-up review automatically: {exc}")
-        print(f"Next step: uv run gza review {impl_task.id}")
-
-    return rc
+    return _run_foreground(config, task_id=fix_task.id, force=getattr(args, "force", False))
 
 
 def cmd_review(args: argparse.Namespace) -> int:

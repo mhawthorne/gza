@@ -1148,7 +1148,7 @@ def main() -> int:
     improve_parser.add_argument(
         "task_id",
         type=str,
-        help="Full prefixed task ID (implement, improve, or review — resolves to owning implementation)",
+        help="Full prefixed task ID (implement, improve, review, or fix — resolves to owning implementation)",
     )
     improve_parser.add_argument(
         "--review",
@@ -1404,7 +1404,7 @@ def main() -> int:
     review_parser.add_argument(
         "task_id",
         type=str,
-        help="Full prefixed task ID (implement, improve, or review — resolves to owning implementation)",
+        help="Full prefixed task ID (implement, improve, review, or fix — resolves to owning implementation)",
     )
     review_parser.add_argument(
         "--queue", "-q",

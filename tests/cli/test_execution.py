@@ -2679,54 +2679,8 @@ class TestFixCommand:
         assert result.returncode == 1
         assert f"Task {impl_task.id} is in_progress" in result.stdout
 
-    def test_fix_creates_follow_up_review_when_code_changed(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """Fix auto-creates a fresh review task when fix run adds commits."""
-        from gza.cli.execution import cmd_fix
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl_task = store.add("Implement fixable feature", task_type="implement")
-        impl_task.status = "completed"
-        impl_task.branch = "test-project/20260129-feature"
-        impl_task.completed_at = datetime.now(UTC)
-        store.update(impl_task)
-
-        review_task = store.add("Review latest", task_type="review", depends_on=impl_task.id)
-        review_task.status = "completed"
-        review_task.completed_at = datetime.now(UTC)
-        store.update(review_task)
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(impl_task.id),
-            queue=False,
-            background=False,
-            no_docker=True,
-            max_turns=None,
-            model=None,
-            provider=None,
-            force=False,
-        )
-
-        with (
-            patch("gza.cli.execution._run_foreground", return_value=0),
-            patch("gza.cli.execution.Git") as mock_git_cls,
-        ):
-            mock_git = mock_git_cls.return_value
-            mock_git.default_branch.return_value = "main"
-            mock_git.count_commits_ahead.side_effect = [1, 2]
-            rc = cmd_fix(args)
-
-        assert rc == 0
-        output = capsys.readouterr().out
-        assert "Created follow-up review task" in output
-
-        reviews = [t for t in store.get_all() if t.task_type == "review"]
-        assert len(reviews) == 2
-
-    def test_fix_skips_follow_up_review_when_no_new_commits(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """Fix does not auto-create review when no new commits were added by the fix run."""
+    def test_fix_defers_follow_up_handoff_to_runner(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Fix command should not run local git probing or create reviews directly."""
         from gza.cli.execution import cmd_fix
 
         setup_config(tmp_path)
@@ -2760,15 +2714,13 @@ class TestFixCommand:
             patch("gza.cli.execution.Git") as mock_git_cls,
             patch("gza.cli.execution._create_review_task") as mock_create_review,
         ):
-            mock_git = mock_git_cls.return_value
-            mock_git.default_branch.return_value = "main"
-            mock_git.count_commits_ahead.side_effect = [2, 2]
             rc = cmd_fix(args)
 
         assert rc == 0
+        mock_git_cls.assert_not_called()
         mock_create_review.assert_not_called()
         output = capsys.readouterr().out
-        assert "Fix completed without new commits; no follow-up review was auto-created." in output
+        assert "Running fix task" in output
 
 
 class TestReviewCommand:

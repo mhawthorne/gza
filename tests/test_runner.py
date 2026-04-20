@@ -5140,6 +5140,205 @@ class TestExtractedRunInnerHelpers:
         assert rc == 7
         assert call_order == ["pr", "review"]
 
+    def test_complete_code_task_fix_with_commit_delta_creates_follow_up_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Shared completion path should create a follow-up review for code-changing fix runs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with churn", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+
+        fix_task = store.add(
+            prompt="Fix the churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260420-fix-follow-up"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 3
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Created follow-up review task" in output
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert len(reviews) == 1
+
+    def test_complete_code_task_fix_without_commit_delta_skips_follow_up_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Shared completion path should not create a follow-up review when fix adds no commits."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with churn", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+
+        fix_task = store.add(
+            prompt="Fix the churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260420-fix-no-delta"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 2
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Fix completed without new commits; no follow-up review was auto-created." in output
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert reviews == []
+
+    def test_complete_code_task_fix_probe_failure_is_reported_and_skips_auto_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Fix commit-delta probe failures should be surfaced and not silently create reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with churn", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+
+        fix_task = store.add(
+            prompt="Fix the churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260420-fix-probe-fail"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.side_effect = GitError("probe failed")
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Warning: Could not determine fix commit delta: probe failed" in output
+        assert "Warning: Could not determine whether the fix run changed code" in output
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert reviews == []
+
     @pytest.mark.parametrize(
         ("failure_mode", "ensure_result"),
         [

@@ -2250,6 +2250,8 @@ def _complete_code_task(
     *,
     skip_commit: bool = False,
     create_pr: bool = False,
+    fix_commits_ahead_before_run: int | None = None,
+    fix_default_branch: str | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -2364,6 +2366,18 @@ def _complete_code_task(
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
 
+    fix_code_changed: bool | None = None
+    if task.task_type == "fix":
+        if fix_commits_ahead_before_run is None or not fix_default_branch:
+            fix_code_changed = None
+        else:
+            try:
+                commits_after = worktree_git.count_commits_ahead(branch_name, fix_default_branch)
+                fix_code_changed = commits_after > fix_commits_ahead_before_run
+            except GitError as exc:
+                print(f"Warning: Could not determine fix commit delta: {exc}")
+                fix_code_changed = None
+
     # Keep branch context on the in-memory task so PR ensure can run before
     # the final completed-state DB transition.
     task.branch = branch_name
@@ -2441,19 +2455,18 @@ def _complete_code_task(
         worktree_git,
         branch_name,
         stats,
+        fix_code_changed=fix_code_changed,
     )
 
 
 def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
-    """Walk up an improve's based_on chain until a non-improve (impl) ancestor is found.
-
-    Retry/resume improves set based_on to the previous improve, not the impl task —
-    so a single hop can land on another improve. Returns None if no ancestor exists.
-    """
+    """Walk up improve/fix based_on chains until the implementation ancestor is found."""
     current: Task | None = task
-    while current is not None and current.task_type == "improve" and current.based_on:
+    while current is not None and current.task_type in {"improve", "fix"} and current.based_on:
         current = store.get(current.based_on)
-    if current is None or current.task_type == "improve":
+    if current is None or current.task_type in {"improve", "fix"}:
+        return None
+    if current.task_type != "implement":
         return None
     return current
 
@@ -2465,6 +2478,7 @@ def _post_complete_code_task(
     worktree_git: Git,
     branch_name: str,
     stats: TaskStats,
+    fix_code_changed: bool | None = None,
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
@@ -2503,6 +2517,34 @@ def _post_complete_code_task(
         learnings=auto_learnings,
         store=store,
     )
+
+    if task.task_type == "fix":
+        impl_ancestor = _resolve_impl_ancestor(store, task)
+        if impl_ancestor is None or impl_ancestor.id is None:
+            print("Warning: Completed fix task has no resolvable implementation ancestor; skip auto review handoff.")
+            return 0
+        if fix_code_changed is None:
+            print("Warning: Could not determine whether the fix run changed code; no follow-up review was auto-created.")
+            print(f"Next step: uv run gza review {impl_ancestor.id}")
+            return 0
+        if not fix_code_changed:
+            print("Fix completed without new commits; no follow-up review was auto-created.")
+            return 0
+
+        try:
+            review_task = create_review_task(store, impl_ancestor)
+            print(f"✓ Created follow-up review task {review_task.id} for implementation {impl_ancestor.id}")
+            print(f"Next step: uv run gza work {review_task.id}")
+        except DuplicateReviewError as exc:
+            review_task = exc.active_review
+            print(
+                f"Follow-up review already exists: {review_task.id} ({review_task.status}). "
+                "Use `uv run gza work` to execute it."
+            )
+        except ValueError as exc:
+            print(f"Warning: could not create follow-up review automatically: {exc}")
+            print(f"Next step: uv run gza review {impl_ancestor.id}")
+        return 0
 
     # Auto-create and run review task if requested
     if task.create_review:
@@ -2763,6 +2805,14 @@ def _run_inner(
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
+    fix_default_branch: str | None = None
+    fix_commits_ahead_before_run: int | None = None
+    if task.task_type == "fix":
+        try:
+            fix_default_branch = worktree_git.default_branch()
+            fix_commits_ahead_before_run = worktree_git.count_commits_ahead(branch_name, fix_default_branch)
+        except GitError as exc:
+            print(f"Warning: Could not read fix commit baseline before run: {exc}")
 
     try:
         result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id, on_step_count=_on_step_count)
@@ -2844,6 +2894,8 @@ def _run_inner(
             summary_dir,
             skip_commit=task.task_type == "rebase",
             create_pr=create_pr,
+            fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+            fix_default_branch=fix_default_branch,
         )
 
     except GitError as e:
