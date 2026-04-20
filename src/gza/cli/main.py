@@ -66,6 +66,7 @@ from .query import (
     cmd_delete,
     cmd_groups,
     cmd_history,
+    cmd_incomplete,
     cmd_kill,
     cmd_lineage,
     cmd_next,
@@ -87,6 +88,28 @@ def _parse_search_last(value: str) -> int:
         raise argparse.ArgumentTypeError("--last must be an integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all matches)")
+    return parsed
+
+
+def _parse_incomplete_last(value: str) -> int:
+    """Parse `incomplete --last` where 0 means unlimited and negatives are invalid."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--last must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all unresolved lineages)")
+    return parsed
+
+
+def _parse_non_negative_int(value: str) -> int:
+    """Parse integer flags that must be zero or positive."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return parsed
 
 
@@ -225,6 +248,33 @@ def main() -> int:
         type=_parse_search_last,
         metavar="N",
         help="Show last N matching tasks (default: 10, 0 for all)",
+    )
+
+    # incomplete command
+    incomplete_parser = subparsers.add_parser(
+        "incomplete",
+        help="Show unresolved task lineages that still need attention",
+    )
+    add_common_args(incomplete_parser)
+    incomplete_parser.set_defaults(last=5)
+    incomplete_parser.add_argument(
+        "--last",
+        "-n",
+        type=_parse_incomplete_last,
+        metavar="N",
+        help="Show last N unresolved lineages (0 for all)",
+    )
+    incomplete_parser.add_argument(
+        "--type",
+        type=str,
+        choices=["explore", "plan", "implement", "review", "improve", "rebase", "internal"],
+        help="Filter tasks by task_type before lineage rollup",
+    )
+    incomplete_parser.add_argument(
+        "--days",
+        type=_parse_non_negative_int,
+        metavar="N",
+        help="Show only unresolved lineages with activity in the last N days",
     )
 
     # unmerged command
@@ -1627,6 +1677,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "search":
             return cmd_search(args)
+        elif args.command == "incomplete":
+            return cmd_incomplete(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
         elif args.command == "advance":

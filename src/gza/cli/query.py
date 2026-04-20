@@ -12,7 +12,6 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -42,10 +41,14 @@ from ..git import Git, GitError, active_worktree_path_for_branch
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
     _LINEAGE_REL_LABELS,
+    HistoryFilter,
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
     get_improves_for_root as _get_improves_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
+    query_history,
+    query_history_with_lineage,
+    query_incomplete,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
@@ -79,86 +82,143 @@ def _task_shares_parent_branch(task: DbTask, parent_task: DbTask | None) -> bool
     return task.same_branch or task.based_on == parent_task.id
 
 
-def _status_label_and_color(
-    task: DbTask,
-    colors: dict[str, str],
-    *,
-    parent_task: DbTask | None = None,
-) -> tuple[str, str]:
-    """Resolve display status label/color for history-style output rows."""
-    shares_parent_branch = _task_shares_parent_branch(task, parent_task)
-    if task.merge_status == "unmerged" and not shares_parent_branch:
-        return ("unmerged", colors["unmerged"])
-    if task.status == "completed":
-        return ("completed", colors["success"])
-    if task.status == "failed":
-        return ("failed", colors["failure"])
-    if task.status == "dropped":
-        return ("dropped", _colors.STATUS_COLORS_DICT.get("dropped", colors["failure"]))
-    if task.status == "pending":
-        return ("pending", _colors.STATUS_COLORS_DICT.get("pending", colors["header"]))
-    if task.status == "in_progress":
-        return ("in_progress", _colors.STATUS_COLORS_DICT.get("in_progress", colors["header"]))
-    if task.status == "unmerged":
-        return ("unmerged", colors["unmerged"])
-    return (task.status, _colors.STATUS_COLORS_DICT.get(task.status, colors["failure"]))
+def _is_resume_attempt(parent_task: DbTask, child_task: DbTask) -> bool:
+    """Best-effort detection for resume attempts based on session + branch reuse."""
+    if not parent_task.session_id or not child_task.session_id:
+        return False
+    if parent_task.session_id != child_task.session_id:
+        return False
+    if not parent_task.branch or not child_task.branch:
+        return False
+    return parent_task.branch == child_task.branch
 
 
-def _render_history_style_task_line(
+def _resolve_retry_annotation(store: SqliteTaskStore, task: DbTask) -> tuple[str, DbTask] | None:
+    """Resolve final retry/resume descendant for failed tasks of the same type."""
+    if task.id is None:
+        return None
+
+    visited: set[str] = {task.id}
+    descendants: list[tuple[str, DbTask]] = []
+    frontier: list[tuple[DbTask, str]] = []
+
+    for child in store.get_based_on_children_by_type(task.id, task.task_type):
+        if child.id is None:
+            continue
+        action = "resumed" if _is_resume_attempt(task, child) else "retried"
+        frontier.append((child, action))
+
+    while frontier:
+        current, root_action = frontier.pop()
+        if current.id is None or current.id in visited:
+            continue
+        visited.add(current.id)
+        descendants.append((root_action, current))
+        for child in store.get_based_on_children_by_type(current.id, task.task_type):
+            frontier.append((child, root_action))
+
+    if not descendants:
+        return None
+    return max(
+        descendants,
+        key=lambda item: (
+            item[1].created_at or datetime.min,
+            _task_id_numeric_key(item[1].id if isinstance(item[1].id, str) else None),
+        ),
+    )
+
+
+def _retry_outcome_annotation(attempt: DbTask, colors: dict[str, str]) -> tuple[str, str] | None:
+    """Return (label, color) for retry/resume final-attempt outcome annotation."""
+    if attempt.status in {"completed", "unmerged"}:
+        return ("✓", colors['success'])
+    if attempt.status in {"failed", "dropped"}:
+        return ("✗", colors['failure'])
+    return None
+
+
+def _render_history_task_line(
     task: DbTask,
     *,
     config: Config,
+    store: SqliteTaskStore,
     colors: dict[str, str],
     first_prefix: str = "",
     detail_prefix: str = "",
     parent_task: DbTask | None = None,
     compact_child: bool = False,
-    resolve_retry_annotation: Callable[[DbTask], tuple[str, DbTask] | None] | None = None,
-    retry_outcome_annotation: Callable[[DbTask], tuple[str, str] | None] | None = None,
+    is_resolved_anchor: bool = False,
 ) -> None:
-    """Render one task row using the gza history visual format."""
+    """Render a history-style task entry.
+
+    When is_resolved_anchor is True, the task is rendered as a dim lineage
+    anchor rather than a normal history row: no failure reason, no retry
+    annotation, and a distinct "resolved" status label.
+    """
+    c = colors
     shares_parent_branch = _task_shares_parent_branch(task, parent_task)
-    status_label, status_color = _status_label_and_color(task, colors, parent_task=parent_task)
+    if is_resolved_anchor:
+        status_label = "resolved"
+        status_color = c['lineage']
+    else:
+        use_merge_status = task.merge_status == "unmerged" and not shares_parent_branch
+        if use_merge_status:
+            status_label = "unmerged"
+            status_color = c['unmerged']
+        elif task.status == "completed":
+            status_label = "completed"
+            status_color = c['success']
+        elif task.status == "pending":
+            status_label = "pending"
+            status_color = _colors.STATUS_COLORS_DICT.get("pending", c['header'])
+        elif task.status == "in_progress":
+            status_label = "in_progress"
+            status_color = _colors.STATUS_COLORS_DICT.get("in_progress", c['header'])
+        elif task.status == "unmerged":
+            status_label = "unmerged"
+            status_color = c['unmerged']
+        elif task.status == "dropped":
+            status_label = "dropped"
+            status_color = c['failure']
+        else:
+            status_label = "failed"
+            status_color = c['failure']
     status_padded = f"{status_label:<{_HISTORY_STATUS_WIDTH}}"
     status_icon = f"[{status_color}]{status_padded}[/{status_color}]"
     date_str = (
-        f"[{colors['date']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{colors['date']}]"
+        f"[{c['date']}]({task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]"
         if task.completed_at
         else ""
     )
-
     task_id_len = len(str(task.id))
     date_len = 19 if task.completed_at else 0
     prefix_len = len(first_prefix) + _HISTORY_STATUS_WIDTH + 1 + task_id_len + date_len
     prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
     console.print(
-        f"{first_prefix}{status_icon} [{colors['task_id']}]{task.id}[/{colors['task_id']}] {date_str}"
-        f" [{colors['prompt']}]{prompt_display}[/{colors['prompt']}]"
+        f"{first_prefix}{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
+        f" [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
     )
-
-    if task.status == "failed":
+    if task.status == "failed" and not is_resolved_anchor:
         reason = task.failure_reason or "UNKNOWN"
-        console.print(f"{detail_prefix}    [{colors['failure']}]reason: {reason}[/{colors['failure']}]")
-        if resolve_retry_annotation is not None:
-            retry_annotation = resolve_retry_annotation(task)
-            if retry_annotation is not None:
-                action, final_attempt = retry_annotation
-                if final_attempt.id is not None:
-                    suffix = ""
-                    if retry_outcome_annotation is not None:
-                        outcome_annotation = retry_outcome_annotation(final_attempt)
-                        if outcome_annotation is not None:
-                            outcome_label, outcome_color = outcome_annotation
-                            suffix = f" [{outcome_color}]{outcome_label}[/{outcome_color}]"
-                    console.print(
-                        f"{detail_prefix}    [{colors['lineage']}]→ {action} as[/{colors['lineage']}] "
-                        f"[{colors['task_id']}]{final_attempt.id}[/{colors['task_id']}]"
-                        f"{suffix}"
-                    )
+        console.print(f"{detail_prefix}    [{c['failure']}]reason: {reason}[/{c['failure']}]")
+        retry_annotation = _resolve_retry_annotation(store, task)
+        if retry_annotation is not None:
+            action, final_attempt = retry_annotation
+            if final_attempt.id is not None:
+                outcome_annotation = _retry_outcome_annotation(final_attempt, c)
+                suffix = ""
+                if outcome_annotation is not None:
+                    outcome_label, outcome_color = outcome_annotation
+                    suffix = f" [{outcome_color}]{outcome_label}[/{outcome_color}]"
+                console.print(
+                    f"{detail_prefix}    [{c['lineage']}]→ {action} as[/{c['lineage']}] "
+                    f"[{c['task_id']}]{final_attempt.id}[/{c['task_id']}]"
+                    f"{suffix}"
+                )
 
     type_label = f"\\[{task.task_type}]"
     merge_label = " \\[merged]" if task.merge_status == "merged" else ""
-    tid = colors["task_id"]
+    tid = c['task_id']
     if task.based_on and task.depends_on:
         parent_label = f" ← [{tid}]{task.based_on}[/{tid}] (dep [{tid}]{task.depends_on}[/{tid}])"
     elif task.based_on:
@@ -176,19 +236,80 @@ def _render_history_style_task_line(
                 compact_parts.append(f"verdict: {verdict}")
         stats_str = format_stats(task)
         if stats_str:
-            compact_parts.append(f"stats: [{colors['stats']}]{stats_str}[/{colors['stats']}]")
+            compact_parts.append(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
         console.print(f"{detail_prefix}    " + " | ".join(compact_parts))
         return
 
     console.print(f"{detail_prefix}    {type_label}{merge_label}{parent_label}")
     show_branch = bool(task.branch) and not shares_parent_branch
     if show_branch:
-        console.print(f"{detail_prefix}    branch: [{colors['branch']}]{task.branch}[/{colors['branch']}]")
+        console.print(f"{detail_prefix}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
     if task.report_file:
-        console.print(f"{detail_prefix}    report: [{colors['file']}]{task.report_file}[/{colors['file']}]")
+        console.print(f"{detail_prefix}    report: [{c['file']}]{task.report_file}[/{c['file']}]")
     stats_str = format_stats(task)
     if stats_str:
-        console.print(f"{detail_prefix}    stats: [{colors['stats']}]{stats_str}[/{colors['stats']}]")
+        console.print(f"{detail_prefix}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
+
+
+def _render_lineage_node(
+    node: TaskLineageNode,
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    colors: dict[str, str],
+    unresolved_task_ids: set[str] | None = None,
+) -> None:
+    """Render a lineage tree using branch connectors.
+
+    When unresolved_task_ids is provided, nodes whose id is not in the set
+    are rendered as resolved lineage anchors (dim label, no failure detail).
+    """
+    c = colors
+
+    def _render_subtree(
+        current: TaskLineageNode,
+        *,
+        parent_task: DbTask | None = None,
+        prefix: str = "",
+        is_last: bool = True,
+    ) -> None:
+        if parent_task is not None:
+            connector = "└── " if is_last else "├── "
+            child_prefix_raw = f"{prefix}{'    ' if is_last else '│   '}"
+            first_prefix = f"[{c['lineage']}]{prefix}{connector}[/{c['lineage']}]"
+            detail_prefix = f"[{c['lineage']}]{child_prefix_raw}[/{c['lineage']}]"
+        else:
+            child_prefix_raw = ""
+            first_prefix = ""
+            detail_prefix = ""
+        is_resolved_anchor = (
+            unresolved_task_ids is not None
+            and current.task.id is not None
+            and current.task.id not in unresolved_task_ids
+        )
+        _render_history_task_line(
+            current.task,
+            config=config,
+            store=store,
+            colors=c,
+            first_prefix=first_prefix,
+            detail_prefix=detail_prefix,
+            parent_task=parent_task,
+            compact_child=parent_task is not None,
+            is_resolved_anchor=is_resolved_anchor,
+        )
+
+        for index, child in enumerate(current.children):
+            _render_subtree(
+                child,
+                parent_task=current.task,
+                prefix=child_prefix_raw,
+                is_last=index == (len(current.children) - 1),
+            )
+
+    _render_subtree(node)
+    print()
+
 
 def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
     """Refresh merge truth and diff stats for tasks currently marked unmerged."""
@@ -311,8 +432,6 @@ def cmd_next(args: argparse.Namespace) -> int:
 
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
-    from gza.query import HistoryFilter, TaskLineageNode, query_history, query_history_with_lineage
-
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -343,117 +462,6 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     c = TASK_COLORS
 
-    def _is_resume_attempt(parent_task: DbTask, child_task: DbTask) -> bool:
-        """Best-effort detection for resume attempts based on session + branch reuse."""
-        if not parent_task.session_id or not child_task.session_id:
-            return False
-        if parent_task.session_id != child_task.session_id:
-            return False
-        if not parent_task.branch or not child_task.branch:
-            return False
-        return parent_task.branch == child_task.branch
-
-    def _resolve_retry_annotation(task: DbTask) -> tuple[str, DbTask] | None:
-        """Resolve final retry/resume descendant for failed tasks of the same type."""
-        if task.id is None:
-            return None
-
-        visited: set[str] = {task.id}
-        descendants: list[tuple[str, DbTask]] = []
-        frontier: list[tuple[DbTask, str]] = []
-
-        for child in store.get_based_on_children_by_type(task.id, task.task_type):
-            if child.id is None:
-                continue
-            action = "resumed" if _is_resume_attempt(task, child) else "retried"
-            frontier.append((child, action))
-
-        while frontier:
-            current, root_action = frontier.pop()
-            if current.id is None or current.id in visited:
-                continue
-            visited.add(current.id)
-            descendants.append((root_action, current))
-            for child in store.get_based_on_children_by_type(current.id, task.task_type):
-                frontier.append((child, root_action))
-
-        if not descendants:
-            return None
-        return max(
-            descendants,
-            key=lambda item: (
-                item[1].created_at or datetime.min,
-                _task_id_numeric_key(item[1].id if isinstance(item[1].id, str) else None),
-            ),
-        )
-
-    def _retry_outcome_annotation(attempt: DbTask) -> tuple[str, str] | None:
-        """Return (label, color) for retry/resume final-attempt outcome annotation."""
-        if attempt.status in {"completed", "unmerged"}:
-            return ("✓", c['success'])
-        if attempt.status in {"failed", "dropped"}:
-            return ("✗", c['failure'])
-        return None
-
-    def _render_task_line(
-        task: DbTask,
-        *,
-        first_prefix: str = "",
-        detail_prefix: str = "",
-        parent_task: DbTask | None = None,
-        compact_child: bool = False,
-    ) -> None:
-        """Render a single task entry."""
-        _render_history_style_task_line(
-            task,
-            config=config,
-            colors=c,
-            first_prefix=first_prefix,
-            detail_prefix=detail_prefix,
-            parent_task=parent_task,
-            compact_child=compact_child,
-            resolve_retry_annotation=_resolve_retry_annotation,
-            retry_outcome_annotation=_retry_outcome_annotation,
-        )
-
-    def _render_lineage_node(node: TaskLineageNode) -> None:
-        """Render a lineage tree using branch connectors."""
-
-        def _render_subtree(
-            current: TaskLineageNode,
-            *,
-            parent_task: DbTask | None = None,
-            prefix: str = "",
-            is_last: bool = True,
-        ) -> None:
-            if parent_task is not None:
-                connector = "└── " if is_last else "├── "
-                child_prefix_raw = f"{prefix}{'    ' if is_last else '│   '}"
-                first_prefix = f"[{c['lineage']}]{prefix}{connector}[/{c['lineage']}]"
-                detail_prefix = f"[{c['lineage']}]{child_prefix_raw}[/{c['lineage']}]"
-            else:
-                child_prefix_raw = ""
-                first_prefix = ""
-                detail_prefix = ""
-            _render_task_line(
-                current.task,
-                first_prefix=first_prefix,
-                detail_prefix=detail_prefix,
-                parent_task=parent_task,
-                compact_child=parent_task is not None,
-            )
-
-            for index, child in enumerate(current.children):
-                _render_subtree(
-                    child,
-                    parent_task=current.task,
-                    prefix=child_prefix_raw,
-                    is_last=index == (len(current.children) - 1),
-                )
-
-        _render_subtree(node)
-        print()
-
     # Check for orphaned tasks (only when no status filter is active)
     orphaned: list[DbTask] = []
     if not status:
@@ -469,7 +477,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         for task in orphaned:
             _render_orphaned_task(task, c)
         for node in nodes:
-            _render_lineage_node(node)
+            _render_lineage_node(node, config=config, store=store, colors=c)
     else:
         recent = query_history(store, f)
         if not recent and not orphaned:
@@ -481,7 +489,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             _render_orphaned_task(task, c)
 
         for task in recent:
-            _render_task_line(task, first_prefix="", detail_prefix="")
+            _render_history_task_line(task, config=config, store=store, colors=c)
             print()
 
     return 0
@@ -503,7 +511,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     c = TASK_COLORS
     for task in matches:
-        _render_history_style_task_line(task, config=config, colors=c)
+        _render_history_task_line(task, config=config, store=store, colors=c)
         print()
 
     return 0
@@ -525,9 +533,50 @@ def _print_history_empty_message(
     )
 
 
+def _print_incomplete_empty_message(task_type: str | None, days: int | None) -> None:
+    """Print an appropriate 'no unresolved lineages' message for gza incomplete."""
+    type_msg = f" with type '{task_type}'" if task_type else ""
+    lookback_msg = f" in the last {days} days" if days is not None else ""
+    console.print(f"No unresolved task lineages{type_msg}{lookback_msg}")
+
+
+def cmd_incomplete(args: argparse.Namespace) -> int:
+    """List unresolved lineages grouped by canonical root."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task_type = getattr(args, "type", None)
+    days = getattr(args, "days", None)
+    limit = getattr(args, "last", None)
+    if limit == 0:
+        limit = None
+
+    filters = HistoryFilter(
+        limit=limit,
+        task_type=task_type,
+        days=days,
+    )
+    lineages = query_incomplete(store, filters)
+    if not lineages:
+        _print_incomplete_empty_message(task_type, days)
+        return 0
+
+    c = TASK_COLORS
+    for lineage in lineages:
+        unresolved_ids = {t.id for t in lineage.unresolved_tasks if t.id is not None}
+        _render_lineage_node(
+            lineage.tree,
+            config=config,
+            store=store,
+            colors=c,
+            unresolved_task_ids=unresolved_ids,
+        )
+    return 0
+
+
 def _render_orphaned_task(task: "DbTask", c: dict) -> None:
     """Render a single orphaned task entry for gza history."""
-    status_padded = f"{'orphaned':<{_HISTORY_STATUS_WIDTH}}"
+    status_padded = f"{'orphaned':<9}"
     status_icon = f"[{c['orphaned']}]⚠ {status_padded}[/{c['orphaned']}]"
     date_str = ""
     if task.started_at:
@@ -538,7 +587,7 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
     # prefix: "⚠ orphaned  ID " + optional date
     task_id_len = len(str(task.id))
     date_len = 28 if task.started_at else 0  # "(started YYYY-MM-DD HH:MM) "
-    prefix_len = 2 + _HISTORY_STATUS_WIDTH + 1 + task_id_len + date_len
+    prefix_len = 2 + 9 + 1 + task_id_len + date_len
     prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
     console.print(
         f"{status_icon} [{c['task_id']}]{task.id}[/{c['task_id']}] {date_str}"
