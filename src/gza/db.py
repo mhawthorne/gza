@@ -1882,6 +1882,31 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def get_fix_tasks_by_root(self, root_task_id: str) -> list[Task]:
+        """Get all fix tasks transitively rooted at root_task_id.
+
+        Walks the based_on chain so retry/resume fix tasks (which set based_on
+        to the previous fix, not the impl) are included. Fix tasks run on the
+        implementation's shared branch and are treated as code-changing
+        post-review work alongside improves in review-freshness logic.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                WITH RECURSIVE fix_chain AS (
+                    SELECT * FROM tasks
+                    WHERE task_type = 'fix' AND based_on = ?
+                    UNION ALL
+                    SELECT t.* FROM tasks t
+                    JOIN fix_chain fc ON t.based_on = fc.id
+                    WHERE t.task_type = 'fix'
+                )
+                SELECT * FROM fix_chain ORDER BY created_at DESC
+                """,
+                (root_task_id,),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
     def get_impl_tasks_by_depends_on_or_based_on(self, task_id: str) -> list[Task]:
         """Get implement tasks that depend on or are based on a given task.
 

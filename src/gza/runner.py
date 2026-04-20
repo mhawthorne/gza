@@ -2508,6 +2508,16 @@ def _post_complete_code_task(
             if impl_ancestor.merge_status == "merged":
                 store.set_merge_status(impl_ancestor.id, "unmerged")
 
+    # Fix tasks run on the impl's shared branch, so a code-changing fix supersedes
+    # the prior review the same way an improve does. Mirror the improve behavior so
+    # shared lifecycle/query code sees the review as stale.
+    if task.task_type == "fix" and fix_code_changed:
+        impl_ancestor = _resolve_impl_ancestor(store, task)
+        if impl_ancestor is not None and impl_ancestor.id is not None:
+            store.clear_review_state(impl_ancestor.id)
+            if impl_ancestor.merge_status == "merged":
+                store.set_merge_status(impl_ancestor.id, "unmerged")
+
     # Invalidate review state after rebase completes, since conflict resolution
     # may have introduced changes not covered by prior reviews.
     if task.task_type == "rebase" and task.based_on:

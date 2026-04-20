@@ -383,6 +383,23 @@ def get_improves_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]
     return store.get_improve_tasks_by_root(root_task.id)
 
 
+def get_fixes_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Get fix tasks transitively based on the given root task."""
+    if root_task.id is None:
+        return []
+    return store.get_fix_tasks_by_root(root_task.id)
+
+
+def get_code_changing_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Return same-branch code-changing descendants (improves + fixes) of a root task.
+
+    Used by review-freshness logic: any completed task here invalidates a prior
+    review the same way an improve does, because the task ran on the impl's
+    shared branch after the review was written.
+    """
+    return [*get_improves_for_root(store, root_task), *get_fixes_for_root(store, root_task)]
+
+
 _LINEAGE_REL_LABELS: dict[str, str] = {
     "review": "review",
     "improve-from-review": "improve",

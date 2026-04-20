@@ -641,6 +641,7 @@ class TestSpawnBackgroundWorkerTmux:
         store = make_store(tmp_path)
         task = store.add("test task")
         task.provider = "codex"
+        task.provider_is_explicit = True
         store.update(task)
 
         args = _make_args(tmp_path)
@@ -677,6 +678,7 @@ class TestSpawnBackgroundWorkerTmux:
         store = make_store(tmp_path)
         task = store.add("test task")
         task.provider = "codex"
+        task.provider_is_explicit = True
         store.update(task)
 
         args = _make_args(tmp_path)
@@ -709,6 +711,7 @@ class TestSpawnBackgroundWorkerTmux:
         store = make_store(tmp_path)
         task = store.add("test task")
         task.provider = "codex"
+        task.provider_is_explicit = True
         store.update(task)
 
         args = _make_args(tmp_path)
@@ -739,6 +742,7 @@ class TestSpawnBackgroundWorkerTmux:
         store = make_store(tmp_path)
         task = store.add("test task")
         task.provider = "codex"
+        task.provider_is_explicit = True
         store.update(task)
 
         args = _make_args(tmp_path)
@@ -769,6 +773,7 @@ class TestSpawnBackgroundWorkerTmux:
         store = make_store(tmp_path)
         task = store.add("test task")
         task.provider = "codex"
+        task.provider_is_explicit = True
         store.update(task)
 
         args = _make_args(tmp_path)

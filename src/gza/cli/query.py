@@ -44,7 +44,7 @@ from ..query import (
     HistoryFilter,
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
-    get_improves_for_root as _get_improves_for_root_task,
+    get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
     query_history,
     query_history_with_lineage,
@@ -699,7 +699,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             )
 
         reviews = _get_reviews_for_root_task(store, branch_task)
-        improve_tasks = _get_improves_for_root_task(store, branch_task)
+        code_changing_tasks = _get_code_changing_descendants_for_root_task(store, branch_task)
         lineage_root = _resolve_lineage_root_task(store, branch_task)
         lineage_tree = _build_lineage_tree_for_root(store, lineage_root)
         c = UNMERGED_COLORS  # shorthand
@@ -709,11 +709,12 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
         )
 
-        # Classify review freshness/status for this implementation.
+        # Classify review freshness/status for this implementation. Fix and improve
+        # tasks both run on the shared impl branch, so either can stale a review.
         latest_review = next((r for r in reviews if r.status == "completed"), None)
-        latest_improve = max(
-            (imp for imp in improve_tasks if imp.completed_at is not None),
-            key=lambda imp: imp.completed_at or datetime.min,
+        latest_code_change = max(
+            (t for t in code_changing_tasks if t.completed_at is not None),
+            key=lambda t: t.completed_at or datetime.min,
             default=None,
         )
 
@@ -726,30 +727,36 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             latest_review_completed = latest_review.completed_at
             assert latest_review_completed is not None
 
-            stale_by_improve = (
-                latest_improve is not None
-                and latest_improve.completed_at is not None
-                and latest_improve.completed_at > latest_review_completed
+            stale_by_code_change = (
+                latest_code_change is not None
+                and latest_code_change.completed_at is not None
+                and latest_code_change.completed_at > latest_review_completed
             )
             stale_by_cleared_at = (
                 branch_task.review_cleared_at is not None
                 and branch_task.review_cleared_at >= latest_review_completed
             )
-            review_is_stale = stale_by_improve or stale_by_cleared_at
+            review_is_stale = stale_by_code_change or stale_by_cleared_at
 
             if review_is_stale:
                 review_classification = "review stale"
                 review_status_color = UNMERGED_COLORS["review_changes"]
                 latest_review_id = latest_review.id if latest_review.id is not None else "?"
                 review_time_str = latest_review_completed.strftime("%Y-%m-%d %H:%M")
-                # Prefer the improve-triggered message when both rules fire — an
-                # improve completion naturally bumps review_cleared_at too, so the
-                # improve is the more informative cause to surface.
-                if stale_by_improve and latest_improve is not None and latest_improve.id is not None and latest_improve.completed_at is not None:
-                    improve_time_str = latest_improve.completed_at.strftime("%Y-%m-%d %H:%M")
+                # Prefer the code-change-triggered message when both rules fire — an
+                # improve/fix completion naturally bumps review_cleared_at too, so the
+                # descendant task is the more informative cause to surface.
+                if (
+                    stale_by_code_change
+                    and latest_code_change is not None
+                    and latest_code_change.id is not None
+                    and latest_code_change.completed_at is not None
+                ):
+                    change_time_str = latest_code_change.completed_at.strftime("%Y-%m-%d %H:%M")
+                    change_kind = latest_code_change.task_type
                     review_detail = (
                         f"last review {latest_review_id} at {review_time_str}, "
-                        f"improve {latest_improve.id} at {improve_time_str}"
+                        f"{change_kind} {latest_code_change.id} at {change_time_str}"
                     )
                 elif stale_by_cleared_at and branch_task.review_cleared_at is not None:
                     cleared_time_str = branch_task.review_cleared_at.strftime("%Y-%m-%d %H:%M")

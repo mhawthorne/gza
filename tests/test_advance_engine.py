@@ -166,3 +166,85 @@ def test_evaluate_returns_skip_when_resume_budget_exhausted(tmp_path: Path):
 
     assert action["type"] == "skip"
     assert action["description"] == "SKIP: max resume attempts (1) reached"
+
+
+def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: Path, monkeypatch):
+    """A completed code-changing fix must stale the prior review so advance creates a new one,
+    instead of looping back on the old review's CHANGES_REQUESTED verdict."""
+    from datetime import timedelta
+
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    impl.status = "completed"
+    review_time = datetime.now(UTC) - timedelta(hours=2)
+    impl.completed_at = review_time - timedelta(hours=1)
+    impl.branch = "feat/fix-supersedes-review"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add(f"Review {impl.id}", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = review_time
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    # The fix completed with code changes AFTER the review and marked review_cleared_at.
+    fix = store.add(f"Fix {impl.id}", task_type="fix", based_on=impl.id, depends_on=review.id, same_branch=True)
+    fix.status = "completed"
+    fix.completed_at = review_time + timedelta(hours=1)
+    fix.has_commits = True
+    store.update(fix)
+
+    store.clear_review_state(impl.id)
+    impl = store.get(impl.id)
+    assert impl is not None
+
+    monkeypatch.setattr(
+        advance_engine_module, "get_review_verdict", lambda project_dir, r: "CHANGES_REQUESTED"
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    assert action["type"] == "create_review", action
+
+
+def test_unmerged_view_shows_fix_after_review_as_stale(tmp_path: Path):
+    """After a code-changing fix completes, the unmerged classifier should treat the
+    prior review as stale and name the fix as the cause."""
+    from datetime import timedelta
+
+    from gza.query import get_code_changing_descendants_for_root
+
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC) - timedelta(hours=3)
+    impl.branch = "feat/unmerged-stale"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add(f"Review {impl.id}", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC) - timedelta(hours=2)
+    store.update(review)
+
+    fix = store.add(f"Fix {impl.id}", task_type="fix", based_on=impl.id, depends_on=review.id, same_branch=True)
+    fix.status = "completed"
+    fix.completed_at = datetime.now(UTC) - timedelta(hours=1)
+    fix.has_commits = True
+    store.update(fix)
+
+    descendants = get_code_changing_descendants_for_root(store, impl)
+    assert fix.id in {t.id for t in descendants}
+
+    latest = max(descendants, key=lambda t: t.completed_at or datetime.min)
+    assert latest.id == fix.id
+    assert review.completed_at is not None
+    assert latest.completed_at is not None
+    assert latest.completed_at > review.completed_at

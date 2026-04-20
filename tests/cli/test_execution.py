@@ -481,6 +481,38 @@ class TestRetryCommand:
         assert retry_task.provider is None
         assert retry_task.provider_is_explicit is False
 
+    def test_resume_freezes_routed_provider_when_session_is_carried(self, tmp_path: Path):
+        """Resume must preserve the originally resolved provider when it reuses a session_id.
+
+        Regression (M3): A failed fix task routed via task_providers.fix could be resumed
+        under a different backend if routing changed between attempts. That breaks the
+        resume invariant — the resume task carries the old session_id, so it must also
+        carry the same backend.
+        """
+        from gza.cli._common import _create_resume_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Fix stuck workflow", task_type="fix")
+        failed.status = "failed"
+        failed.failure_reason = "MAX_STEPS"
+        # Runner persisted the effective provider to the task row during the
+        # first run (provider_is_explicit stays False — see runner.py for why).
+        failed.provider = "codex"
+        failed.provider_is_explicit = False
+        failed.session_id = "sess-codex-1"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        resumed = _create_resume_task(store, failed)
+
+        # With the session_id carried over, the provider must be frozen as an
+        # explicit override so the runner cannot re-route to a different backend.
+        assert resumed.session_id == "sess-codex-1"
+        assert resumed.provider == "codex"
+        assert resumed.provider_is_explicit is True
+
     def test_retry_with_background_flag(self, tmp_path: Path):
         """Retry command with --background spawns a worker for the new task."""
 
@@ -1478,6 +1510,78 @@ class TestBackgroundWorkerCommand:
 
         assert rc == 0
         mock_popen.assert_called_once()
+
+    def test_background_worker_honors_task_providers_routing_for_fix(self, tmp_path: Path):
+        """Fix task routed via task_providers.fix must pick provider-specific worker plumbing
+        that matches what the runner will use at execution time, not the global config.provider.
+
+        Regression: _spawn_background_worker previously derived provider from
+        (task.provider or config.provider), ignoring task-type routing. That caused
+        tmux/attach plumbing to diverge from the actually-executed provider.
+        """
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        worktree_dir = tmp_path / ".gza-test-worktrees"
+        config_path.write_text(
+            "project_name: test-project\n"
+            f"worktree_dir: {worktree_dir}\n"
+            "provider: claude\n"
+            "task_providers:\n"
+            "  fix: codex\n"
+        )
+        store = make_store(tmp_path)
+        fix_task = store.add("Fix stuck workflow", task_type="fix")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = True
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=False,
+            resume=False,
+            force=False,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        mock_run_result = MagicMock()
+        mock_run_result.returncode = 0
+
+        subprocess_run_calls: list[list[str]] = []
+
+        def capture_run(cmd, **kwargs):
+            subprocess_run_calls.append(list(cmd))
+            return mock_run_result
+
+        # Pretend tmux is available so the provider-specific use_tmux decision
+        # is observable in the final command.
+        with (
+            patch("gza.cli.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            patch("gza.cli.subprocess.run", side_effect=capture_run),
+            patch("gza.cli.get_tmux_session_pid", return_value=12345),
+        ):
+            _spawn_background_worker(args, config, task_id=fix_task.id)
+
+        # Global provider is claude (which forces use_tmux=False for worker plumbing),
+        # but fix routes to codex where tmux stays enabled — a `tmux new-session`
+        # invocation is the observable proof the worker picked routed-provider semantics.
+        new_session_calls = [c for c in subprocess_run_calls if len(c) >= 2 and c[0] == "tmux" and c[1] == "new-session"]
+        assert new_session_calls, (
+            "Fix task routed to codex via task_providers.fix should have kept tmux "
+            f"enabled and launched a tmux session; subprocess.run calls were: {subprocess_run_calls}"
+        )
 
 
 class TestReconciliation:

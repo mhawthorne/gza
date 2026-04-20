@@ -34,7 +34,7 @@ from ..review_tasks import (
     create_review_task,
 )
 from ..review_verdict import get_review_verdict as _get_review_verdict, parse_review_verdict
-from ..runner import run
+from ..runner import get_effective_config_for_task, run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
@@ -416,7 +416,13 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     # Add project directory
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
 
-    provider_name = (selected_task.provider or config.provider or "claude").lower()
+    # Resolve provider the same way the runner will at execution time. This respects
+    # task-type routing (task_providers.<type>) so the worker mode (tmux/attach) matches
+    # the provider that will actually run the task — e.g. a fix routed through
+    # task_providers.fix must not use claude-specific worker plumbing when routed to
+    # another provider.
+    _, effective_provider, _ = get_effective_config_for_task(selected_task, config)
+    provider_name = (effective_provider or "claude").lower()
     # The proxy-based tmux auto-accept flow is superseded for Claude attach.
     # Keep a compatibility escape hatch for testing or emergency fallback.
     legacy_tmux_proxy = os.environ.get("GZA_ENABLE_TMUX_PROXY", "").strip() == "1"
@@ -1147,10 +1153,19 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     """Create a new resume task pointing to the original failed task.
 
     Copies prompt, task_type, group, session_id, branch, model, etc.
-    Preserves provider only when the original task had an explicit override.
+    Preserves provider across resumes:
+      - When the original task had an explicit provider override, it carries over.
+      - When the resume will reuse a backend session_id, the originally resolved
+        provider is frozen as an explicit override so the resumed run cannot
+        switch backends under the same session_id even if task-type routing
+        changed between attempts.
     Sets based_on to original_task.id to track resume lineage.
     """
     assert original_task.id is not None
+    carry_session = original_task.session_id is not None
+    preserve_provider = bool(
+        original_task.provider and (original_task.provider_is_explicit or carry_session)
+    )
     new_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
@@ -1162,8 +1177,8 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
         task_type_hint=original_task.task_type_hint,
         based_on=original_task.id,  # Track resume lineage (points to failed task)
         model=original_task.model,
-        provider=original_task.provider if original_task.provider_is_explicit else None,
-        provider_is_explicit=original_task.provider_is_explicit,
+        provider=original_task.provider if preserve_provider else None,
+        provider_is_explicit=preserve_provider,
     )
     # Copy session_id and branch from original task so the resumed run
     # continues the Claude Code session and uses the same branch.
