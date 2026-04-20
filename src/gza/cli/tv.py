@@ -71,6 +71,9 @@ def _scan_log(log_path: Path, n: int) -> tuple[list[str], _LogStats]:
         except json.JSONDecodeError:
             display.append(raw[:200])
             continue
+        if not isinstance(entry, dict):
+            display.append(truncate(str(entry), 200))
+            continue
 
         prev_steps = stats.step_count
         _accumulate_stats(entry, stats, seen_msg_ids)
