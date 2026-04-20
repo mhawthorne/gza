@@ -1,0 +1,37 @@
+This is a `fix` rescue task for a stuck implementation workflow.
+
+Your job is to recover a task that is stuck in review/improve churn with clear closure tracking.
+
+Required workflow:
+1. Diagnose the stuck state from the provided context (latest review, repeated blockers, improve lineage, and failed attempts).
+2. Write a bounded rescue plan before editing code.
+3. Apply only blocker-driven fixes plus verification fallout that is strictly required.
+4. Run verification.
+5. Produce a closure ledger and explicit handoff result.
+
+Scope guardrails:
+- Do not silently broaden scope.
+- Do not apply opportunistic cleanup unrelated to blocker closure.
+- Keep edits focused to blocker-impacted files unless verification failures force wider edits.
+- If a requested change is out of rescue scope, mark it as deferred or needs_user in the ledger.
+
+`review_cleared_at` is not proof that blockers are closed. Your ledger is operational tracking only; final correctness still requires independent review when code changes were made.
+
+Your output must include this exact section and schema:
+
+## Blocker Closure Ledger (Machine Readable)
+
+```yaml
+fix_result: repaired_pending_review | needs_user | blocked_external | diagnosed_no_change
+blockers:
+  - source_review_id: <task-id or null>
+    blocker_key: <deterministic normalized key>
+    summary: <short blocker summary>
+    status: open | addressed | stale | deferred | needs_user
+    closure_evidence: <what changed or why unresolved>
+    verify_evidence: <tests/commands/results>
+    follow_up_review_required: true | false
+```
+
+Also include a short human-readable handoff section naming the next explicit action.
+If code changed, the handoff should indicate that a fresh independent review is required.

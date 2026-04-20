@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from gza.query import get_improves_for_root, get_reviews_for_root
+from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
 from gza.resume_policy import (
     is_resumable_failed_task,
     is_resumable_failure_reason as _is_resumable_failure_reason,
@@ -158,15 +158,15 @@ def _resolve_review_state(
         review_verdict = get_review_verdict(Path(config.project_dir), latest_completed_review)
 
         if review_cleared and latest_completed_review.completed_at is not None:
-            improves = [
+            code_changing = [
                 t
-                for t in get_improves_for_root(store, task)
+                for t in get_code_changing_descendants_for_root(store, task)
                 if t.status == "completed" and t.completed_at is not None
             ]
-            if improves:
-                latest_improve = max(improves, key=lambda t: t.completed_at or datetime.min)
-                if latest_improve.completed_at is not None:
-                    has_improve_after_review = latest_improve.completed_at > latest_completed_review.completed_at
+            if code_changing:
+                latest_code_change = max(code_changing, key=lambda t: t.completed_at or datetime.min)
+                if latest_code_change.completed_at is not None:
+                    has_improve_after_review = latest_code_change.completed_at > latest_completed_review.completed_at
 
         if review_verdict == "CHANGES_REQUESTED":
             assert task.id is not None

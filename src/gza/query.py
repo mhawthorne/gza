@@ -157,6 +157,8 @@ def _is_shared_branch_descendant(task: Task, root_task: Task) -> bool:
         return True
     if task.task_type == "rebase":
         return task.based_on is not None
+    if task.task_type == "fix":
+        return task.based_on is not None or bool(task.same_branch)
     return bool(task.same_branch)
 
 
@@ -381,10 +383,29 @@ def get_improves_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]
     return store.get_improve_tasks_by_root(root_task.id)
 
 
+def get_fixes_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Get fix tasks transitively based on the given root task."""
+    if root_task.id is None:
+        return []
+    return store.get_fix_tasks_by_root(root_task.id)
+
+
+def get_code_changing_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Return same-branch code-changing descendants (improves + fixes) of a root task.
+
+    Used by review-freshness logic: any completed task here invalidates a prior
+    review the same way an improve does, because the task ran on the impl's
+    shared branch after the review was written.
+    """
+    return [*get_improves_for_root(store, root_task), *get_fixes_for_root(store, root_task)]
+
+
 _LINEAGE_REL_LABELS: dict[str, str] = {
     "review": "review",
     "improve-from-review": "improve",
     "improve": "improve",
+    "fix-from-review": "fix",
+    "fix": "fix",
     "implement-depends": "implement",
     "implement-based": "implement",
     "depends-and-based": "depends",
@@ -418,6 +439,10 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
         return "improve-from-review"
     if child.task_type == "improve" and child.based_on == parent_id:
         return "improve"
+    if child.task_type == "fix" and child.depends_on == parent_id:
+        return "fix-from-review"
+    if child.task_type == "fix" and child.based_on == parent_id:
+        return "fix"
     if child.task_type == "implement" and child.depends_on == parent_id:
         return "implement-depends"
     if child.task_type == "implement" and child.based_on == parent_id:

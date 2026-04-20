@@ -64,11 +64,11 @@ class TestGetTaskOutputPaths:
         return task
 
     def test_code_task_types_return_summary_path(self, tmp_path: Path):
-        """Code task types (task, implement, improve, rebase) return a summary_path."""
+        """Code task types (task, implement, improve, fix, rebase) return a summary_path."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        for task_type in ("task", "implement", "improve", "rebase"):
+        for task_type in ("task", "implement", "improve", "fix", "rebase"):
             task = self._make_task(store, task_type)
             report_path, summary_path = get_task_output_paths(task, tmp_path)
             assert summary_path is not None, f"{task_type} should have summary_path"
@@ -890,6 +890,214 @@ class TestReviewContextFromChain:
         assert "uv run gza show <id>" not in context
         assert "prior review/improve cycle" not in context
         assert "Lineage:" not in context
+
+    def test_fix_context_includes_repeated_blockers_and_latest_failed_attempt(self, tmp_path: Path):
+        """Fix context includes repeated blockers and failed improve/resume lineage evidence."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement resilient retries", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/retries"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Missing timeout handling\n"
+            "Impact: retries can hang forever.\n"
+            "Required fix: add bounded timeout and propagate cancellation.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Missing timeout handling\n"
+            "Impact: retries can hang forever.\n"
+            "Required fix: add bounded timeout and propagate cancellation.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review2)
+
+        improve = store.add(
+            prompt="Improve attempt",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+        improve.status = "failed"
+        improve.failure_reason = "MAX_STEPS"
+        improve.log_file = ".gza/logs/fix-attempt.log"
+        store.update(improve)
+
+        log_path = tmp_path / ".gza" / "logs"
+        log_path.mkdir(parents=True, exist_ok=True)
+        (log_path / "fix-attempt.log").write_text("line1\nline2\nline3\n")
+
+        fix_task = store.add(
+            prompt="Rescue stuck implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Fix Rescue Context" in context
+        assert f"Root implementation: {impl_task.id}" in context
+        assert "Latest completed review:" in context
+        assert "## Repeated Blockers" in context
+        assert "add bounded timeout and propagate cancellation" in context
+        assert f"Latest failed improve/resume attempt: {improve.id}" in context
+        assert "line1" in context
+        assert "## Original request:" in context
+
+    def test_fix_context_omits_repeated_blockers_when_not_repeated(self, tmp_path: Path):
+        """Fix context omits repeated-blocker section when recent reviews do not repeat blockers."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement parsing", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Missing validation\n"
+            "Required fix: validate empty input.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.output_content = (
+            "## Must-Fix\n\n"
+            "### M2: Missing error mapping\n"
+            "Required fix: return typed parsing errors.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review2)
+
+        fix_task = store.add(
+            prompt="Rescue parser task",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Fix Rescue Context" in context
+        assert "## Repeated Blockers" not in context
+
+    def test_fix_context_distinguishes_failed_improve_and_implement_retry_attempts(self, tmp_path: Path):
+        """Fix context labels failed improve and failed implement retry attempts accurately."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement retries", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        failed_improve = store.add(
+            prompt="Improve attempt",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_STEPS"
+        failed_improve.completed_at = datetime(2026, 4, 20, 10, 0, tzinfo=UTC)
+        store.update(failed_improve)
+
+        failed_impl_retry = store.add(
+            prompt="Retry implementation attempt",
+            task_type="implement",
+            based_on=impl_task.id,
+        )
+        failed_impl_retry.status = "failed"
+        failed_impl_retry.failure_reason = "TEST_FAILURE"
+        failed_impl_retry.completed_at = datetime(2026, 4, 20, 11, 0, tzinfo=UTC)
+        store.update(failed_impl_retry)
+
+        fix_task = store.add(
+            prompt="Rescue stuck implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert f"Latest failed improve/resume attempt: {failed_improve.id}" in context
+        assert (
+            f"Latest failed implementation retry/resume attempt: {failed_impl_retry.id}"
+            in context
+        )
+        assert f"Latest failed improve/resume attempt: {failed_impl_retry.id}" not in context
+
+    def test_fix_context_resolves_impl_through_resumed_fix_chain(self, tmp_path: Path):
+        """A resumed/retried fix (based_on points at a prior fix, not the impl) must
+        still assemble the full rescue context by walking up the fix/improve chain."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement parser", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = (
+            "## Must-Fix\n\n"
+            "### M1: Bug\n"
+            "Required fix: handle null.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review)
+
+        failed_fix = store.add(
+            prompt="Rescue attempt",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        failed_fix.status = "failed"
+        failed_fix.failure_reason = "MAX_STEPS"
+        store.update(failed_fix)
+
+        # Resume of the failed fix: based_on points at the prior fix, not the impl.
+        resumed_fix = store.add(
+            prompt="Rescue attempt (resume)",
+            task_type="fix",
+            based_on=failed_fix.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(resumed_fix, store, tmp_path, git=None)
+
+        assert "## Fix Rescue Context" in context
+        assert f"Root implementation: {impl_task.id}" in context
+        assert f"Latest completed review: {review.id}" in context
 
 
 class TestSummaryDirectory:
@@ -5030,6 +5238,205 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 7
         assert call_order == ["pr", "review"]
+
+    def test_complete_code_task_fix_with_commit_delta_creates_follow_up_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Shared completion path should create a follow-up review for code-changing fix runs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with churn", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+
+        fix_task = store.add(
+            prompt="Fix the churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260420-fix-follow-up"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 3
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Created follow-up review task" in output
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert len(reviews) == 1
+
+    def test_complete_code_task_fix_without_commit_delta_skips_follow_up_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Shared completion path should not create a follow-up review when fix adds no commits."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with churn", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+
+        fix_task = store.add(
+            prompt="Fix the churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260420-fix-no-delta"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 2
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Fix completed without new commits; no follow-up review was auto-created." in output
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert reviews == []
+
+    def test_complete_code_task_fix_probe_failure_is_reported_and_skips_auto_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Fix commit-delta probe failures should be surfaced and not silently create reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with churn", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+
+        fix_task = store.add(
+            prompt="Fix the churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260420-fix-probe-fail"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.side_effect = GitError("probe failed")
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Warning: Could not determine fix commit delta: probe failed" in output
+        assert "Warning: Could not determine whether the fix run changed code" in output
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert reviews == []
 
     @pytest.mark.parametrize(
         ("failure_mode", "ensure_result"),

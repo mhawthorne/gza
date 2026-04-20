@@ -84,6 +84,40 @@ class TestAdvanceCommand:
         assert "Would advance" in result.stdout
         assert str(task.id) in result.stdout
 
+    def test_advance_dry_run_excludes_same_branch_fix_child_from_roots(self, tmp_path: Path):
+        """advance plans only the implementation root when a completed fix child exists on same branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        impl_task.branch = "feat/impl-root"
+        impl_task.merge_status = "unmerged"
+        impl_task.has_commits = True
+        store.update(impl_task)
+
+        fix_task = store.add(
+            "Fix feature churn",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.status = "completed"
+        fix_task.completed_at = datetime.now(UTC)
+        fix_task.branch = "feat/impl-root"
+        fix_task.merge_status = "unmerged"
+        fix_task.has_commits = True
+        store.update(fix_task)
+
+        with patch("gza.cli.Git", return_value=self._mock_git()):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance 1 task(s)" in result.stdout
+        assert str(impl_task.id) in result.stdout
+        assert str(fix_task.id) not in result.stdout
+
     def test_advance_merges_approved_task(self, tmp_path: Path):
         """advance merges a task whose review is APPROVED."""
         setup_config(tmp_path)

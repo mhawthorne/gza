@@ -65,6 +65,7 @@ project_name: my-project
 # task_providers:
 #   review: claude
 #   implement: codex
+#   fix: codex
 
 # Provider-specific model name (optional)
 # model: ""
@@ -78,6 +79,8 @@ project_name: my-project
 #     model: claude-sonnet-4-20250514
 #     max_steps: 30
 #   review:
+#     model: claude-sonnet-4-20250514
+#   fix:
 #     model: claude-sonnet-4-20250514
 
 # --- Learnings ---

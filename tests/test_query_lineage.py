@@ -310,6 +310,39 @@ class TestBuildLineage:
         tree = build_lineage_tree(store, root)
         assert [child.relationship for child in tree.children] == ["review", "retry"]
 
+    def test_tree_labels_fix_relationships(self):
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        review = _make_task(id=2, task_type="review", depends_on=1, created_at=datetime(2026, 1, 2))
+        fix_from_review = _make_task(
+            id=3,
+            task_type="fix",
+            based_on=1,
+            depends_on=2,
+            created_at=datetime(2026, 1, 3),
+        )
+        fix_from_impl = _make_task(
+            id=4,
+            task_type="fix",
+            based_on=1,
+            depends_on=None,
+            created_at=datetime(2026, 1, 4),
+        )
+
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [review, fix_from_impl, fix_from_review]
+            if task_id == 2:
+                return [fix_from_review]
+            return []
+
+        store.get_lineage_children.side_effect = lineage_children
+        tree = build_lineage_tree(store, root)
+
+        assert [child.relationship for child in tree.children] == ["review", "fix"]
+        assert [child.task.id for child in tree.children[0].children] == [3]
+        assert [child.relationship for child in tree.children[0].children] == ["fix-from-review"]
+
     def test_tree_defers_cross_parent_improve_to_review_parent(self):
         store = MagicMock()
         root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))

@@ -182,7 +182,7 @@ class Task:
     id: str | None  # None for unsaved tasks; project-prefixed decimal (e.g. "gza-1234")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
-    task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
+    task_type: str = "implement"  # explore, plan, implement, review, improve, fix, rebase, internal
     slug: str | None = None  # YYYYMMDD-slug format (DB column: slug, was task_id)
     branch: str | None = None
     log_file: str | None = None
@@ -1479,9 +1479,9 @@ class SqliteTaskStore:
     def get_unmerged(self) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
 
-        Excludes improve and rebase tasks that have a parent (based_on)
+        Excludes improve, fix, and rebase tasks that have a parent (based_on)
         since they use same_branch=True and operate on the parent task's
-        branch. Standalone improve tasks with their own branch are included.
+        branch. Standalone same-type tasks with their own branch are included.
         """
         with self._connect() as conn:
             cur = conn.execute(
@@ -1489,7 +1489,7 @@ class SqliteTaskStore:
                 SELECT * FROM tasks
                 WHERE merge_status = 'unmerged'
                 AND (
-                    task_type NOT IN ('improve', 'rebase')
+                    task_type NOT IN ('improve', 'fix', 'rebase')
                     OR based_on IS NULL
                 )
                 ORDER BY completed_at DESC
@@ -1877,6 +1877,31 @@ class SqliteTaskStore:
                     WHERE t.task_type = 'improve'
                 )
                 SELECT * FROM improve_chain ORDER BY created_at DESC
+                """,
+                (root_task_id,),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def get_fix_tasks_by_root(self, root_task_id: str) -> list[Task]:
+        """Get all fix tasks transitively rooted at root_task_id.
+
+        Walks the based_on chain so retry/resume fix tasks (which set based_on
+        to the previous fix, not the impl) are included. Fix tasks run on the
+        implementation's shared branch and are treated as code-changing
+        post-review work alongside improves in review-freshness logic.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                WITH RECURSIVE fix_chain AS (
+                    SELECT * FROM tasks
+                    WHERE task_type = 'fix' AND based_on = ?
+                    UNION ALL
+                    SELECT t.* FROM tasks t
+                    JOIN fix_chain fc ON t.based_on = fc.id
+                    WHERE t.task_type = 'fix'
+                )
+                SELECT * FROM fix_chain ORDER BY created_at DESC
                 """,
                 (root_task_id,),
             )

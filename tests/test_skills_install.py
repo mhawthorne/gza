@@ -688,6 +688,7 @@ class TestSkillContentValidation:
             "gza-plan-review",
             "gza-task-resume",
             "gza-task-improve",
+            "gza-task-fix",
             "gza-task-info",
             "gza-task-debug",
         ],

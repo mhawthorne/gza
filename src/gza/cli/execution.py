@@ -1,4 +1,4 @@
-"""Task execution commands: run, add, edit, retry, resume, review, improve, iterate."""
+"""Task execution commands: run, add, edit, retry, resume, review, improve, fix, iterate."""
 
 import argparse
 import json
@@ -22,6 +22,7 @@ from ..db import (
     validate_prompt,
 )
 from ..git import Git
+from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
 from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -848,15 +849,15 @@ def _cleanup_worker_registry(config: "Config", task_id: str) -> None:
         registry.mark_completed(worker.worker_id, exit_code=0, status="completed")
 
 
+def _latest_completed_review_for_impl(store: SqliteTaskStore, impl_task_id: str) -> DbTask | None:
+    reviews = [r for r in store.get_reviews_for_task(impl_task_id) if r.status == "completed"]
+    return reviews[0] if reviews else None
+
+
 def _resolve_impl_task(
     store: SqliteTaskStore, task_id: str
 ) -> tuple[DbTask, None] | tuple[None, str]:
-    """Walk up the lineage chain to find the root implement task.
-
-    Accepts implement, review, or improve task IDs and resolves to the
-    root implement task.  Returns ``(impl_task, None)`` on success or
-    ``(None, error_message)`` on failure.
-    """
+    """Resolve implement/review/improve/fix IDs to the owning implementation task."""
     task = store.get(task_id)
     if not task:
         return None, f"Task {task_id} not found"
@@ -864,15 +865,35 @@ def _resolve_impl_task(
     if task.task_type == "implement":
         return task, None
 
-    if task.task_type == "improve":
+    if task.task_type in {"improve", "fix"}:
+        label = "Improve" if task.task_type == "improve" else "Fix"
         if not task.based_on:
-            return None, f"Improve task {task.id} has no based_on implementation task"
+            return None, f"{label} task {task.id} has no based_on implementation task"
         parent = store.get(task.based_on)
         if parent is None:
-            return None, f"Improve task {task.id} points to task {task.based_on}, which was not found"
+            return None, f"{label} task {task.id} points to task {task.based_on}, which was not found"
+        seen: set[str] = set()
+        while parent.task_type in {"improve", "fix"}:
+            if parent.id is None:
+                return None, f"{label} task {task.id} points to an invalid retry ancestor"
+            if parent.id in seen:
+                return None, f"{label} task {task.id} has a cycle in its based_on chain"
+            seen.add(parent.id)
+            if not parent.based_on:
+                return None, (
+                    f"{label} task {task.id} points to task {parent.id}, "
+                    "which has no based_on implementation task"
+                )
+            next_parent = store.get(parent.based_on)
+            if next_parent is None:
+                return None, (
+                    f"{label} task {task.id} points to task {parent.based_on}, "
+                    "which was not found"
+                )
+            parent = next_parent
         if parent.task_type != "implement":
             return None, (
-                f"Improve task {task.id} points to task {task.based_on}, "
+                f"{label} task {task.id} points to task {parent.id}, "
                 "which is not an implementation task"
             )
         return parent, None
@@ -891,7 +912,7 @@ def _resolve_impl_task(
         return parent, None
 
     return None, (
-        f"Task {task_id} is a {task.task_type} task, not an implementation, improve, or review task"
+        f"Task {task_id} is a {task.task_type} task, not an implementation, improve, review, or fix task"
     )
 
 
@@ -1005,6 +1026,66 @@ def cmd_improve(args: argparse.Namespace) -> int:
     # Default: run the improve task immediately
     print(f"\nRunning improve task {improve_task.id}...")
     return _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
+
+
+def cmd_fix(args: argparse.Namespace) -> int:
+    """Create and run a fix task for a stuck implementation workflow."""
+    config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    store = get_store(config)
+    impl_task, err = _resolve_impl_task(store, resolve_id(config, args.task_id))
+    if err:
+        print(f"Error: {err}")
+        return 1
+    assert impl_task is not None
+    assert impl_task.id is not None
+
+    if impl_task.status in {"pending", "in_progress"}:
+        print(
+            f"Error: Task {impl_task.id} is {impl_task.status}. "
+            "Run/finish the implementation first, then run fix for stuck review/improve churn."
+        )
+        return 1
+
+    latest_review = _latest_completed_review_for_impl(store, impl_task.id)
+    review_id = latest_review.id if latest_review is not None else None
+    fix_prompt = PromptBuilder().fix_task_prompt(impl_task.id, review_id)
+    fix_task = store.add(
+        fix_prompt,
+        task_type="fix",
+        based_on=impl_task.id,
+        depends_on=review_id,
+        same_branch=True,
+        group=impl_task.group,
+        model=args.model if hasattr(args, "model") and args.model else None,
+        provider=args.provider if hasattr(args, "provider") and args.provider else None,
+    )
+    assert fix_task.id is not None
+
+    print(f"✓ Created fix task {fix_task.id}")
+    print(f"  Implementation: {impl_task.id}")
+    if review_id:
+        print(f"  Latest completed review: {review_id}")
+    else:
+        print("  Latest completed review: (none found)")
+    print("  Handoff policy: changed code requires a fresh independent review")
+
+    if hasattr(args, 'background') and args.background:
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [fix_task.id]
+        return _spawn_background_worker(worker_args, config, task_id=fix_task.id)
+
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    print(f"\nRunning fix task {fix_task.id}...")
+    return _run_foreground(config, task_id=fix_task.id, force=getattr(args, "force", False))
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -1737,6 +1818,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         return 2
     if final_stop_reason in {"review_in_progress", "improve_in_progress"}:
         print(f"Iterate waiting: {final_stop_reason}. Existing task is already in progress.")
+        return 3
+    if final_stop_reason in {"max_cycles_reached", "max_improve_attempts"}:
+        print(f"Iterate blocked: {final_stop_reason}.")
+        print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
     print(f"Iterate blocked: {final_stop_reason}. Manual review required.")
     return 3

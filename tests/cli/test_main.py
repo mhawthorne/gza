@@ -187,6 +187,26 @@ class TestHelpOutput:
         assert "Substring to match in task prompt text" in normalized_output
         assert "Show last N matching tasks" in normalized_output
 
+    def test_improve_help_mentions_fix_ids(self, tmp_path):
+        """`improve --help` should advertise fix-task ID resolution support."""
+        setup_config(tmp_path)
+
+        result = run_gza("improve", "--help", "--project", str(tmp_path))
+        normalized_output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "implement, improve, review, or fix" in normalized_output
+
+    def test_review_help_mentions_fix_ids(self, tmp_path):
+        """`review --help` should advertise fix-task ID resolution support."""
+        setup_config(tmp_path)
+
+        result = run_gza("review", "--help", "--project", str(tmp_path))
+        normalized_output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "implement, improve, review, or fix" in normalized_output
+
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
 
@@ -337,6 +357,10 @@ class TestDirectExecutionForceDispatch:
             (
                 ["gza", "improve", "testproject-1", "--force"],
                 "gza.cli.main.cmd_improve",
+            ),
+            (
+                ["gza", "fix", "testproject-1", "--force"],
+                "gza.cli.main.cmd_fix",
             ),
             (
                 ["gza", "iterate", "testproject-1", "--force"],
