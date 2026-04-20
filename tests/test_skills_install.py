@@ -1,7 +1,9 @@
 """Tests for the skills-install command."""
 
+import json
 import os
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,6 +32,36 @@ def setup_config(tmp_path: Path) -> None:
     """Set up a minimal gza config file."""
     config_path = tmp_path / "gza.yaml"
     config_path.write_text("project_name: test-project\n")
+
+
+def _create_store_for_project(tmp_path: Path):
+    from gza.config import Config
+    from gza.db import SqliteTaskStore
+
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+    return config, store
+
+
+def _assign_slug_like_runner(task, store, config) -> None:
+    from gza.git import Git
+    from gza.runner import _compute_slug_override, generate_slug
+
+    if task.slug is not None:
+        return
+    slug_override = _compute_slug_override(task, store)
+    task.slug = generate_slug(
+        task.prompt,
+        existing_id=None,
+        log_path=config.log_path,
+        git=Git(config.project_dir),
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        slug_override=slug_override,
+        branch_strategy=config.branch_strategy,
+        explicit_type=task.task_type_hint,
+    )
+    store.update(task)
 
 
 class TestSkillsInstallClaudeTarget:
@@ -323,6 +355,193 @@ class TestSkillContentValidation:
 
         assert "Config.load()" not in content
         assert "Config.load(Path.cwd())" in content
+
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    def test_manual_review_improve_skills_use_explicit_project_dir_for_all_config_loads(
+        self, skill_name: str
+    ):
+        """Manual review/improve skills should not ship zero-arg Config.load() snippets anywhere."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Config.load()" not in content
+        assert content.count("Config.load(Path.cwd())") >= 2
+
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    def test_manual_review_improve_persistence_snippets_use_valid_store_api(
+        self, skill_name: str
+    ):
+        """Manual persistence snippets should use SqliteTaskStore.add/update, not nonexistent create()."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "from gza.db import SqliteTaskStore" in content
+        assert "from gza.models import Task" not in content
+        assert "config = Config.load(Path.cwd())" in content
+        assert "store.add(" in content
+        assert "store.update(created)" in content
+        assert "store.create(" not in content
+
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    def test_manual_review_improve_persistence_snippets_assign_slug_before_show_prompt(
+        self, skill_name: str
+    ):
+        """Manual persistence snippets should assign/persist slug before calling gza show --prompt."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "from gza.git import Git" in content
+        assert "from gza.runner import _compute_slug_override, generate_slug" in content
+        assert "if created.slug is None:" in content
+        assert "store.update(created)" in content
+        assert "['uv', 'run', 'gza', 'show', '--prompt', created.id]" in content
+        assert content.find("if created.slug is None:") < content.find(
+            "['uv', 'run', 'gza', 'show', '--prompt', created.id]"
+        )
+
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    def test_manual_review_improve_persistence_snippets_keep_completed_at_as_datetime(
+        self, skill_name: str
+    ):
+        """Manual persistence snippets should keep completed_at as datetime for SqliteTaskStore.update()."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "created.completed_at = datetime.now(timezone.utc)" in content
+        assert "created.completed_at = datetime.now(timezone.utc).isoformat()" not in content
+
+    def test_manual_review_persistence_flow_works_for_fresh_task(self, tmp_path: Path):
+        """Fresh manual review persistence should produce a slug-backed prompt path and store update cleanly."""
+        setup_config(tmp_path)
+        config, store = _create_store_for_project(tmp_path)
+
+        impl_task = store.add("Implement feature for manual review flow", task_type="implement")
+        assert impl_task.id is not None
+
+        review_markdown = "## Summary\n\n- Manual review body\n"
+        origin_date = datetime.now(UTC).strftime("%Y-%m-%d")
+        file_content = f"<!-- origin: /gza-task-review (manual, {origin_date}) -->\n{review_markdown}"
+
+        created = store.add(
+            prompt="Manual review via /gza-task-review",
+            task_type="review",
+            depends_on=impl_task.id,
+            group="qa",
+        )
+        assert created.id is not None
+
+        prompt_before = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
+        assert prompt_before.returncode == 0
+        prompt_before_data = json.loads(prompt_before.stdout)
+        assert prompt_before_data["report_path"] is None
+
+        _assign_slug_like_runner(created, store, config)
+
+        prompt_after = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
+        assert prompt_after.returncode == 0
+        prompt_after_data = json.loads(prompt_after.stdout)
+        report_path_value = prompt_after_data["report_path"]
+        assert report_path_value is not None
+
+        report_path = Path(report_path_value)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(file_content)
+
+        created.report_file = str(report_path.relative_to(config.project_dir))
+        created.status = "completed"
+        created.completed_at = datetime.now(UTC)
+        created.output_content = review_markdown
+        store.update(created)
+
+        persisted = store.get(created.id)
+        assert persisted is not None
+        assert persisted.report_file == created.report_file
+        assert isinstance(persisted.completed_at, datetime)
+        assert persisted.output_content == review_markdown
+        assert report_path.read_text() == file_content
+
+    def test_manual_improve_persistence_flow_works_for_fresh_task(self, tmp_path: Path):
+        """Fresh manual improve persistence should produce a slug-backed prompt path and clear review state."""
+        setup_config(tmp_path)
+        config, store = _create_store_for_project(tmp_path)
+
+        impl_task = store.add("Implement feature for manual improve flow", task_type="implement")
+        assert impl_task.id is not None
+        review_task = store.add(
+            "Review task for manual improve flow",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        assert review_task.id is not None
+
+        summary_body = "Addressed 2 must-fix items."
+        origin_date = datetime.now(UTC).strftime("%Y-%m-%d")
+        summary_with_origin = (
+            f"<!-- origin: /gza-task-improve (manual, {origin_date}) -->\n{summary_body}"
+        )
+
+        created = store.add(
+            prompt="Manual improve via /gza-task-improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=impl_task.id,
+        )
+        assert created.id is not None
+
+        prompt_before = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
+        assert prompt_before.returncode == 0
+        prompt_before_data = json.loads(prompt_before.stdout)
+        assert prompt_before_data["summary_path"] is None
+
+        _assign_slug_like_runner(created, store, config)
+
+        prompt_after = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
+        assert prompt_after.returncode == 0
+        prompt_after_data = json.loads(prompt_after.stdout)
+        summary_path_value = prompt_after_data["summary_path"]
+        assert summary_path_value is not None
+
+        summary_path = Path(summary_path_value)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(summary_with_origin)
+
+        created.report_file = str(summary_path.relative_to(config.project_dir))
+        created.status = "completed"
+        created.completed_at = datetime.now(UTC)
+        created.output_content = summary_body
+        store.update(created)
+        store.clear_review_state(impl_task.id)
+
+        persisted = store.get(created.id)
+        assert persisted is not None
+        assert persisted.report_file == created.report_file
+        assert persisted.depends_on == review_task.id
+        assert isinstance(persisted.completed_at, datetime)
+        assert persisted.output_content == summary_body
+        assert summary_path.read_text() == summary_with_origin
+        assert store.get_improve_tasks_for(impl_task.id, review_task.id) == [persisted]
+
+        impl_refreshed = store.get(impl_task.id)
+        assert impl_refreshed is not None
+        assert impl_refreshed.review_cleared_at is not None
+
+    def test_manual_improve_skill_documents_review_linkage(self):
+        """gza-task-improve should document persists with depends_on review linkage."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-improve" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "depends_on='<REVIEW_TASK_ID>'" in content
+        assert "Use the `review_task_id` already resolved in Step 1" in content
 
     def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
         """gza-task-run should not document unsupported mark-completed branch flags."""

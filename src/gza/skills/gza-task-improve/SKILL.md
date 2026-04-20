@@ -21,10 +21,11 @@ Query the task and find its most recent review:
 ```bash
 uv run python -c "
 import json, sys
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
 if not task:
@@ -116,18 +117,71 @@ git commit -m "Address review feedback for task #<IMPL_TASK_ID>
 ..."
 ```
 
-### Step 7: Clear review status (optional)
+### Step 7: Persist improve output and clear review state (required)
 
-Ask the user if they want to clear the review status so the task can be re-reviewed:
+After a successful commit, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
+
+Use the `review_task_id` already resolved in Step 1, then call `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`.
 
 ```bash
 uv run python -c "
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
-config = Config.load()
+from gza.git import Git
+from gza.runner import _compute_slug_override, generate_slug
+import subprocess
+
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
+
+origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+summary_body = '''Addressed <M_COUNT> must-fix items: <M_ITEMS_SUMMARY>
+Verify: <VERIFY_RESULT>
+Commit: <COMMIT_SHA>'''
+summary_with_origin = f'<!-- origin: /gza-task-improve (manual, {origin_date}) -->\n' + summary_body
+
+created = store.add(
+    prompt='Manual improve via /gza-task-improve',
+    task_type='improve',
+    depends_on='<REVIEW_TASK_ID>',
+    based_on='<IMPL_TASK_ID>',
+)
+assert created.id is not None
+
+if created.slug is None:
+    slug_override = _compute_slug_override(created, store)
+    created.slug = generate_slug(
+        created.prompt,
+        existing_id=None,
+        log_path=config.log_path,
+        git=Git(config.project_dir),
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        slug_override=slug_override,
+        branch_strategy=config.branch_strategy,
+        explicit_type=created.task_type_hint,
+    )
+    store.update(created)
+
+prompt_json = subprocess.check_output(
+    ['uv', 'run', 'gza', 'show', '--prompt', created.id],
+    text=True,
+)
+prompt_data = json.loads(prompt_json)
+summary_path = Path(prompt_data['summary_path'])
+summary_path.parent.mkdir(parents=True, exist_ok=True)
+summary_path.write_text(summary_with_origin)
+
+created.report_file = str(summary_path.relative_to(config.project_dir))
+created.status = 'completed'
+created.completed_at = datetime.now(timezone.utc)
+created.output_content = summary_body
+store.update(created)
 store.clear_review_state('<IMPL_TASK_ID>')
-print('Review cleared — task is ready for re-review')
+print(f'Improve saved as task #{created.id} ({created.report_file}); review state cleared')
 "
 ```
 

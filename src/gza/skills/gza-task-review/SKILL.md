@@ -28,10 +28,11 @@ Query the task database to get task details and branch:
 ```bash
 uv run python -c "
 import json, sys
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 task = store.get(<TASK_ID>)
 if not task:
@@ -186,33 +187,69 @@ If no PR number is provided, just output the review directly.
 
 Pass the branch name, authoritative diff context, and the canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available) to the subagent, plus PR number if `--pr` was used.
 
-### Step 7: Save the review to the task database (optional)
+### Step 7: Persist review output (required)
 
-If the review found must-fix items (verdict is CHANGES_REQUESTED), ask the user if they want to record this as a review in the task database so `/gza-task-improve` can consume it:
+After the review agent returns markdown, always persist it as a canonical review artifact and completed review task row.
+
+Use `gza show --prompt` on the newly created review task ID to get the canonical `report_path` (same source of truth as `get_task_output_paths()`), write the file there, and persist `report_file` + `output_content`:
 
 ```bash
 uv run python -c "
-import sys
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.git import Git
+from gza.runner import _compute_slug_override, generate_slug
+import subprocess
 
-config = Config.load()
+config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 
-# Create a review task linked to the implementation
-from gza.models import Task
-review_task = Task(
+review_markdown = '''<REVIEW_CONTENT>'''
+origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+origin_header = f'<!-- origin: /gza-task-review (manual, {origin_date}) -->\n'
+file_content = origin_header + review_markdown
+
+created = store.add(
+    prompt='Manual review via /gza-task-review',
     task_type='review',
-    prompt='Interactive review via /gza-task-review',
-    status='completed',
-    depends_on=<IMPL_TASK_ID>,
+    depends_on='<IMPL_TASK_ID>',
     group=<impl_group_or_None>,
-    output_content='''<REVIEW_CONTENT>''',
-    completed_at=datetime.now(timezone.utc).isoformat(),
 )
-created = store.create(review_task)
-print(f'Review saved as task #{created.id}')
+assert created.id is not None
+
+if created.slug is None:
+    slug_override = _compute_slug_override(created, store)
+    created.slug = generate_slug(
+        created.prompt,
+        existing_id=None,
+        log_path=config.log_path,
+        git=Git(config.project_dir),
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        slug_override=slug_override,
+        branch_strategy=config.branch_strategy,
+        explicit_type=created.task_type_hint,
+    )
+    store.update(created)
+
+prompt_json = subprocess.check_output(
+    ['uv', 'run', 'gza', 'show', '--prompt', created.id],
+    text=True,
+)
+prompt_data = json.loads(prompt_json)
+report_path = Path(prompt_data['report_path'])
+report_path.parent.mkdir(parents=True, exist_ok=True)
+report_path.write_text(file_content)
+
+created.report_file = str(report_path.relative_to(config.project_dir))
+created.status = 'completed'
+created.completed_at = datetime.now(timezone.utc)
+created.output_content = review_markdown
+store.update(created)
+print(f'Review saved as task #{created.id} ({created.report_file})')
 "
 ```
 
