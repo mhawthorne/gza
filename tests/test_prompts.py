@@ -72,6 +72,9 @@ class TestPromptBuilderBuild:
         assert str(summary_path) in result
         assert "What was accomplished" in result
         assert "Files changed" in result
+        assert "Re-read AGENTS.md for repository-specific rules and conventions." in result
+        assert "Add or update targeted tests for each changed behavior" in result
+        assert "Inspect the final diff for accidental scope creep" in result
 
     def test_build_task_type_without_summary(self, tmp_path: Path):
         """Test that task type without summary includes fallback message."""
@@ -86,6 +89,10 @@ class TestPromptBuilderBuild:
 
         assert "report what you accomplished" in result
         assert "write a summary" not in result.lower()
+        assert "Re-read AGENTS.md for repository-specific rules and conventions." in result
+        assert ".gza/learnings.md" not in result
+        assert "Add or update targeted tests for each changed behavior" in result
+        assert "Inspect the final diff for accidental scope creep" in result
 
     def test_build_implement_type_with_summary(self, tmp_path: Path):
         """Test that implement type includes summary instructions."""
@@ -101,6 +108,7 @@ class TestPromptBuilderBuild:
 
         assert str(summary_path) in result
         assert "write a summary" in result.lower()
+        assert "update the relevant help text or documentation" in result
 
     def test_build_improve_type_with_summary(self, tmp_path: Path):
         """Test that improve type includes summary instructions."""
@@ -115,6 +123,27 @@ class TestPromptBuilderBuild:
         result = PromptBuilder().build(task, config, store, summary_path=summary_path)
 
         assert str(summary_path) in result
+        assert "Treat **Suggestions** as optional follow-up work" in result
+        assert "The review item you addressed" in result
+        assert "If a Must-Fix item no longer applies" in result
+
+    def test_build_task_type_with_summary_includes_learnings_check_when_file_exists(self, tmp_path: Path):
+        """Task prompts include the learnings checklist line only when the file exists."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature L", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        gza_dir = tmp_path / ".gza"
+        gza_dir.mkdir(parents=True, exist_ok=True)
+        (gza_dir / "learnings.md").write_text("Use fixtures.")
+
+        summary_path = Path("/workspace/.gza/summaries/test.md")
+        result = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert "Re-read `.gza/learnings.md` for project-specific patterns" in result
 
     def test_build_explore_type_with_report_path(self, tmp_path: Path):
         """Test that explore type includes exploration instructions."""

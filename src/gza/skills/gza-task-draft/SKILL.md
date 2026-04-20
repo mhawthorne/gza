@@ -35,13 +35,32 @@ Draft a task prompt that:
 - References file paths, modules, or components when known
 - Sets scope (what's in and out)
 - Includes acceptance criteria for implement tasks
+- Includes non-goals for implement tasks so the agent does not expand scope silently
+- Names required tests or concrete failure modes to cover when known
+- Calls out docs/help/config updates when operator-facing behavior changes
 - Is appropriately sized (one task, one objective)
+
+For `implement` tasks, push toward a prompt shape like:
+- Objective
+- Acceptance criteria
+- Non-goals
+- Relevant files/modules or affected subsystem
+- Required tests
+- Required docs/help/config updates, if applicable
+
+If too many of those fields are unknown, ambiguous, or cross-cutting, recommend splitting the work or creating a `plan` task first rather than drafting a vague `implement` prompt.
 
 Also identify and surface:
 - **Risks**: What could go wrong or cause rework?
 - **Ambiguities**: Unclear requirements that could derail the task
 - **Alternatives**: Different approaches worth considering
 - **Sequencing**: Should this be split (plan first, then implement)? Does it need `--depends-on` or `--based-on`?
+
+When reviewing the draft with the user, explicitly check for:
+- Missing acceptance criteria
+- Missing non-goals or scope boundaries
+- Missing targeted test expectations
+- Missing docs/help/config expectations for operator-facing changes
 
 Present the draft prompt and concerns clearly to the user.
 
@@ -83,3 +102,4 @@ Once approved, run the command. Show the created task ID and confirm type/group 
 - **Plan before implement** — for complex features, suggest a `--type plan` task first
 - **Proactively flag risks** — better to surface ambiguity now than after the task runs
 - **Keep prompts specific** — vague prompts produce vague results
+- **Implement prompts need closure conditions** — acceptance criteria, non-goals, tests, and docs/help impact should be explicit whenever relevant
