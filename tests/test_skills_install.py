@@ -3,7 +3,7 @@
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -414,7 +414,7 @@ class TestSkillContentValidation:
         assert impl_task.id is not None
 
         review_markdown = "## Summary\n\n- Manual review body\n"
-        origin_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        origin_date = datetime.now(UTC).strftime("%Y-%m-%d")
         file_content = f"<!-- origin: /gza-task-review (manual, {origin_date}) -->\n{review_markdown}"
 
         created = store.add(
@@ -444,7 +444,7 @@ class TestSkillContentValidation:
 
         created.report_file = str(report_path.relative_to(config.project_dir))
         created.status = "completed"
-        created.completed_at = datetime.now(timezone.utc)
+        created.completed_at = datetime.now(UTC)
         created.output_content = review_markdown
         store.update(created)
 
@@ -462,9 +462,15 @@ class TestSkillContentValidation:
 
         impl_task = store.add("Implement feature for manual improve flow", task_type="implement")
         assert impl_task.id is not None
+        review_task = store.add(
+            "Review task for manual improve flow",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        assert review_task.id is not None
 
         summary_body = "Addressed 2 must-fix items."
-        origin_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        origin_date = datetime.now(UTC).strftime("%Y-%m-%d")
         summary_with_origin = (
             f"<!-- origin: /gza-task-improve (manual, {origin_date}) -->\n{summary_body}"
         )
@@ -472,6 +478,7 @@ class TestSkillContentValidation:
         created = store.add(
             prompt="Manual improve via /gza-task-improve",
             task_type="improve",
+            depends_on=review_task.id,
             based_on=impl_task.id,
         )
         assert created.id is not None
@@ -495,7 +502,7 @@ class TestSkillContentValidation:
 
         created.report_file = str(summary_path.relative_to(config.project_dir))
         created.status = "completed"
-        created.completed_at = datetime.now(timezone.utc)
+        created.completed_at = datetime.now(UTC)
         created.output_content = summary_body
         store.update(created)
         store.clear_review_state(impl_task.id)
@@ -503,13 +510,25 @@ class TestSkillContentValidation:
         persisted = store.get(created.id)
         assert persisted is not None
         assert persisted.report_file == created.report_file
+        assert persisted.depends_on == review_task.id
         assert isinstance(persisted.completed_at, datetime)
         assert persisted.output_content == summary_body
         assert summary_path.read_text() == summary_with_origin
+        assert store.get_improve_tasks_for(impl_task.id, review_task.id) == [persisted]
 
         impl_refreshed = store.get(impl_task.id)
         assert impl_refreshed is not None
         assert impl_refreshed.review_cleared_at is not None
+
+    def test_manual_improve_skill_documents_review_linkage(self):
+        """gza-task-improve should document persists with depends_on review linkage."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-improve" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "depends_on='<REVIEW_TASK_ID>'" in content
+        assert "Use the `review_task_id` already resolved in Step 1" in content
 
     def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
         """gza-task-run should not document unsupported mark-completed branch flags."""

@@ -120,7 +120,7 @@ git commit -m "Address review feedback for task #<IMPL_TASK_ID>
 
 After a successful commit, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
 
-Use `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`.
+Use the `review_task_id` already resolved in Step 1, then call `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`.
 
 ```bash
 uv run python -c "
