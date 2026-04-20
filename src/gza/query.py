@@ -196,12 +196,14 @@ def _has_merged_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
 
 def _get_unresolved_terminal_kind(task: Task) -> str | None:
     """Return unresolved terminal kind for attention queries, else None."""
-    if task.status not in {"failed", "completed", "unmerged"}:
+    if task.status not in {"failed", "completed", "unmerged", "dropped"}:
         return None
     if is_lineage_complete(task):
         return None
     if task.status == "failed":
         return "failed"
+    if task.status == "dropped":
+        return "dropped"
     if task.status in {"completed", "unmerged"}:
         return "completed_like"
     return None
@@ -246,8 +248,6 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
     tasks = query_history(store, filtered)
     if not tasks:
         return []
-
-    by_id = {task.id: task for task in tasks if task.id is not None}
 
     unresolved_by_root: dict[str, list[Task]] = {}
     root_by_id: dict[str, Task] = {}
@@ -301,7 +301,10 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
 
         tree = _prune_lineage_tree_to_ids(build_lineage_tree(store, root), shown_ids)
         latest_unresolved_at = max(task_time_for_lineage(task) for task in unresolved)
-        shown_tasks = [by_id[task_id] for task_id in shown_ids if task_id in by_id]
+        shown_tasks = [
+            task for task in flatten_lineage_tree(tree)
+            if task.id is not None and task.id in shown_ids
+        ]
         lineages.append(
             IncompleteLineage(
                 root=root,

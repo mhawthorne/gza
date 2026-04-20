@@ -4994,6 +4994,22 @@ class TestIncompleteCommand:
         assert result.returncode == 0
         assert "Legacy unmerged" in result.stdout
 
+    def test_incomplete_includes_dropped_status_rows(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dropped = store.add("Dropped lineage", task_type="implement")
+        dropped.status = "dropped"
+        dropped.completed_at = datetime.now(UTC)
+        dropped.has_commits = True
+        store.update(dropped)
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Dropped lineage" in result.stdout
+        assert "dropped" in result.stdout
+
     def test_incomplete_branching_retry_shows_all_unresolved_siblings_under_one_root(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

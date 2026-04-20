@@ -399,6 +399,22 @@ class TestQueryIncomplete:
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {root.id}
 
+    def test_dropped_root_task_remains_visible(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("dropped root", task_type="implement")
+        root.status = "dropped"
+        root.completed_at = datetime.now(UTC)
+        root.has_commits = True
+        store.update(root)
+        assert root.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == root.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id}
+
     def test_branching_retry_lineage_keeps_all_unresolved_siblings_under_root(self, tmp_path: Path):
         store = self._store(tmp_path)
 

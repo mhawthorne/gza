@@ -831,7 +831,7 @@ merged root or successful retry chain).
 
 | Option | Description |
 |--------|-------------|
-| `--last N`, `-n N` | Show last N unresolved lineages (default: 5) |
+| `--last N`, `-n N` | Show last N unresolved lineages (default: 5, `0` for all) |
 | `--type TYPE` | Filter terminal tasks by type before lineage rollup |
 | `--days N` | Show unresolved lineages with activity in the last N days |
 
