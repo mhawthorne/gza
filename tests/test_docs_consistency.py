@@ -107,6 +107,16 @@ def test_configuration_docs_include_comment_command_reference() -> None:
         assert snippet in config_content
 
 
+def test_configuration_docs_describe_comments_only_improve_path() -> None:
+    """Improve docs should reflect comments-only fallback when no review exists."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    assert "unresolved task comments as feedback context" in config_content
+    assert "review exists but unresolved comments do" in config_content
+    assert "improve still runs using comments-only feedback" in config_content
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

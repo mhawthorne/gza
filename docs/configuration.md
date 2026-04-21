@@ -940,7 +940,7 @@ gza clean [options]
 
 ### improve
 
-Create an improve task to address review feedback on an implementation.
+Create an improve task to address feedback on an implementation.
 
 ```bash
 gza improve <impl_task_id> [options]
@@ -959,7 +959,9 @@ gza improve <impl_task_id> [options]
 | `--provider PROVIDER` | Override provider for this task |
 | `--force` | Skip dependency merge precondition checks when running the improve task |
 
-The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
+The improve command resolves the owning implementation, gathers the most recent completed
+review when available, and also includes unresolved task comments as feedback context. If no
+review exists but unresolved comments do, improve still runs using comments-only feedback.
 
 ### fix
 

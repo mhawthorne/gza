@@ -1165,7 +1165,10 @@ def main() -> int:
     add_common_args(resume_parser)
 
     # improve command
-    improve_parser = subparsers.add_parser("improve", help="Create an improve task based on implementation and review")
+    improve_parser = subparsers.add_parser(
+        "improve",
+        help="Create an improve task from review feedback and/or unresolved task comments",
+    )
     improve_parser.add_argument(
         "task_id",
         type=str,
