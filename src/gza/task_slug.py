@@ -55,21 +55,26 @@ def get_base_task_slug(slug: str | None) -> str | None:
     return _TRAILING_REVISION_SUFFIX_RE.sub("", extracted)
 
 
-def get_slug_display_text(slug: str | None, project_prefix: str | None = None) -> str | None:
+def get_slug_display_text(
+    slug: str | None,
+    project_prefix: str | None = None,
+    *,
+    strip_project_prefix: bool = False,
+) -> str | None:
     """Return a human-friendly slug body for operator-facing output.
 
-    Supports both generated slug shapes:
-    - ``YYYYMMDD-{project_prefix}-{slug}``
-    - ``YYYYMMDD-{semantic-slug}``
+    By default, this strips only the date prefix from ``YYYYMMDD-<slug>`` and
+    leaves the semantic slug body unchanged.
 
-    For the prefix-bearing shape, strips ``{project_prefix}-`` so displays show
-    only the semantic body.
+    ``strip_project_prefix=True`` is available for call sites that have
+    independent metadata proving the ``{project_prefix}`` token is structural
+    (not semantic) and should be removed from display.
     """
     extracted = get_task_slug(slug)
     if extracted is None:
         return None
 
-    if not project_prefix:
+    if not strip_project_prefix or not project_prefix:
         return extracted
 
     if extracted.startswith(f"{project_prefix}-"):

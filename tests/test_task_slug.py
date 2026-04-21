@@ -26,9 +26,26 @@ def test_slug_helpers_return_none_for_missing_task_id() -> None:
 
 
 def test_get_slug_display_text_handles_prefix_and_prefixless_shapes() -> None:
-    """Display helper should preserve semantic body for both slug formats."""
-    assert get_slug_display_text("20260421-gza-add-feature", project_prefix="gza") == "add-feature"
+    """Display helper preserves extracted slug text unless metadata says to strip."""
+    assert get_slug_display_text("20260421-gza-add-feature", project_prefix="gza") == "gza-add-feature"
     assert get_slug_display_text("20260421-add-feature", project_prefix="gza") == "add-feature"
+
+
+def test_get_slug_display_text_preserves_ambiguous_prefixless_semantic_slug() -> None:
+    """Without metadata, semantic tokens matching project_prefix are preserved."""
+    assert get_slug_display_text("20260421-gza-rollout", project_prefix="gza") == "gza-rollout"
+
+
+def test_get_slug_display_text_can_strip_prefix_with_explicit_metadata() -> None:
+    """Prefix stripping remains available when a caller has explicit provenance."""
+    assert (
+        get_slug_display_text(
+            "20260421-gza-add-feature",
+            project_prefix="gza",
+            strip_project_prefix=True,
+        )
+        == "add-feature"
+    )
 
 
 def test_strip_derived_implement_prefixes_strips_nested_chain() -> None:
