@@ -37,6 +37,7 @@ MAX_SLOTS = 8
 DEFAULT_MIN_SLOTS = 1
 DEFAULT_MAX_SLOTS = 4
 SHRINK_TICKS = 5
+NON_PANEL_LINES = 3
 
 
 def _status_color(status: str) -> str:
@@ -231,9 +232,9 @@ def _lines_per_panel(n_tasks: int) -> int:
     except OSError:
         term_height = 40
     # Each panel has 2 lines of border (top + bottom) + content lines.
-    # Reserve 2 lines: one for Rich Live's trailing newline, one for the shell
-    # cursor. Without this the bottom row of the bottom panel gets clipped.
-    available = term_height - 2
+    # Reserve 3 non-panel lines: the status header row, Rich Live's trailing
+    # newline, and the shell cursor. Without this the bottom row can clip.
+    available = term_height - NON_PANEL_LINES
     if n_tasks <= 0:
         return 10
     # panel overhead: top border + bottom border = 2 lines per panel
@@ -333,23 +334,36 @@ def _render_all(
     running_count: int,
     min_slots: int,
     max_slots: int,
-    slot_count: int,
+    explicit_ids: bool,
 ) -> Group:
     """Render all task panels as a Rich Group."""
+    slot_count = len(tasks)
+
+    if explicit_ids:
+        slot_text = Text.assemble(
+            ("slots: ", _colors.RUNNER_COLORS.label),
+            (str(slot_count), _colors.RUNNER_COLORS.value),
+            (" (explicit)", _colors.RUNNER_COLORS.label),
+        )
+    else:
+        slot_text = Text.assemble(
+            ("slots: ", _colors.RUNNER_COLORS.label),
+            (str(slot_count), _colors.RUNNER_COLORS.value),
+            (" (", _colors.RUNNER_COLORS.label),
+            ("min ", _colors.RUNNER_COLORS.label),
+            (str(min_slots), _colors.RUNNER_COLORS.value),
+            (", ", _colors.RUNNER_COLORS.label),
+            ("max ", _colors.RUNNER_COLORS.label),
+            (str(max_slots), _colors.RUNNER_COLORS.value),
+            (")", _colors.RUNNER_COLORS.label),
+        )
+
     header = Text.assemble(
         ("Running: ", _colors.RUNNER_COLORS.label),
         (str(running_count), _colors.RUNNER_COLORS.value),
         ("  |  ", _colors.RUNNER_COLORS.label),
-        ("slots: ", _colors.RUNNER_COLORS.label),
-        (str(slot_count), _colors.RUNNER_COLORS.value),
-        (" (", _colors.RUNNER_COLORS.label),
-        ("min ", _colors.RUNNER_COLORS.label),
-        (str(min_slots), _colors.RUNNER_COLORS.value),
-        (", ", _colors.RUNNER_COLORS.label),
-        ("max ", _colors.RUNNER_COLORS.label),
-        (str(max_slots), _colors.RUNNER_COLORS.value),
-        (")", _colors.RUNNER_COLORS.label),
     )
+    header.append_text(slot_text)
 
     if not tasks:
         return Group(
@@ -544,7 +558,7 @@ def cmd_tv(args: argparse.Namespace) -> int:
                 running_count=running_count,
                 min_slots=min_slots,
                 max_slots=max_slots,
-                slot_count=rendered_slots,
+                explicit_ids=explicit_ids,
             ),
             console=console,
             refresh_per_second=2,
@@ -597,7 +611,7 @@ def cmd_tv(args: argparse.Namespace) -> int:
                         running_count=running_count,
                         min_slots=min_slots,
                         max_slots=max_slots,
-                        slot_count=rendered_slots,
+                        explicit_ids=explicit_ids,
                     )
                 )
 

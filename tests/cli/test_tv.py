@@ -1,6 +1,7 @@
 """Tests for the ``gza tv`` command."""
 
 import argparse
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,6 +38,11 @@ def _set_in_progress(task, started_at: datetime) -> None:
 
 def _render_task_ids(tasks, _log_paths, _n_lines, **_kwargs):
     return [task.id for task in tasks]
+
+
+def _header_text(renderable) -> str:
+    header = renderable.renderables[0]
+    return header.plain
 
 
 def test_slot_bounds_defaults_to_min_1_max_4():
@@ -372,3 +378,60 @@ def test_tv_auto_mode_does_not_exit_on_finished_fallback(monkeypatch, tmp_path: 
     assert _FakeLive.instance.updates[0] == [finished_task.id]
     assert _FakeLive.instance.updates[1] == [finished_task.id]
     assert _FakeLive.instance.updates[2] == [finished_task.id]
+
+
+def test_tv_header_explicit_mode_does_not_claim_min_max(monkeypatch, tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    created = [store.add(f"Pinned task {idx}", task_type="implement") for idx in range(1, 6)]
+    task_ids = [task.id for task in created]
+    assert all(task_ids)
+
+    def fake_sleep(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+
+    args = argparse.Namespace(project_dir=tmp_path, task_ids=task_ids, number=None, min_slots=None, max_slots=None)
+    rc = tv_module.cmd_tv(args)
+
+    assert rc == 0
+    assert _FakeLive.instance is not None
+    header = _header_text(_FakeLive.instance.updates[0])
+    assert "slots: 5 (explicit)" in header
+    assert "min" not in header
+    assert "max" not in header
+
+
+def test_tv_header_auto_mode_uses_visible_panel_count_when_slots_are_sparse(monkeypatch, tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_1 = store.add("Task one", task_type="implement")
+    task_2 = store.add("Task two", task_type="implement")
+    assert task_1.id and task_2.id
+    task_1.status = "completed"
+    task_2.status = "completed"
+    store.update(task_1)
+    store.update(task_2)
+
+    def fake_sleep(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+
+    args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=4, min_slots=None, max_slots=None)
+    rc = tv_module.cmd_tv(args)
+
+    assert rc == 0
+    assert _FakeLive.instance is not None
+    header = _header_text(_FakeLive.instance.updates[0])
+    assert "slots: 2 (min 4, max 4)" in header
+
+
+def test_lines_per_panel_reserves_header_row(monkeypatch):
+    monkeypatch.setattr(tv_module.os, "get_terminal_size", lambda: os.terminal_size((120, 20)))
+    assert tv_module._lines_per_panel(2) == 6
