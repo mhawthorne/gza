@@ -34,7 +34,10 @@ class _LogStats:
 
 # Sensible upper bound — beyond this the rows become unreadable.
 MAX_SLOTS = 8
-DEFAULT_SLOTS = 4
+DEFAULT_MIN_SLOTS = 1
+DEFAULT_MAX_SLOTS = 4
+SHRINK_TICKS = 5
+NON_PANEL_LINES = 3
 
 
 def _status_color(status: str) -> str:
@@ -229,9 +232,9 @@ def _lines_per_panel(n_tasks: int) -> int:
     except OSError:
         term_height = 40
     # Each panel has 2 lines of border (top + bottom) + content lines.
-    # Reserve 2 lines: one for Rich Live's trailing newline, one for the shell
-    # cursor. Without this the bottom row of the bottom panel gets clipped.
-    available = term_height - 2
+    # Reserve 3 non-panel lines: the status header row, Rich Live's trailing
+    # newline, and the shell cursor. Without this the bottom row can clip.
+    available = term_height - NON_PANEL_LINES
     if n_tasks <= 0:
         return 10
     # panel overhead: top border + bottom border = 2 lines per panel
@@ -327,10 +330,44 @@ def _render_all(
     tasks: list[DbTask],
     log_paths: list[Path | None],
     n_lines: int,
+    *,
+    running_count: int,
+    min_slots: int,
+    max_slots: int,
+    explicit_ids: bool,
 ) -> Group:
     """Render all task panels as a Rich Group."""
+    slot_count = len(tasks)
+
+    if explicit_ids:
+        slot_text = Text.assemble(
+            ("slots: ", _colors.RUNNER_COLORS.label),
+            (str(slot_count), _colors.RUNNER_COLORS.value),
+            (" (explicit)", _colors.RUNNER_COLORS.label),
+        )
+    else:
+        slot_text = Text.assemble(
+            ("slots: ", _colors.RUNNER_COLORS.label),
+            (str(slot_count), _colors.RUNNER_COLORS.value),
+            (" (", _colors.RUNNER_COLORS.label),
+            ("min ", _colors.RUNNER_COLORS.label),
+            (str(min_slots), _colors.RUNNER_COLORS.value),
+            (", ", _colors.RUNNER_COLORS.label),
+            ("max ", _colors.RUNNER_COLORS.label),
+            (str(max_slots), _colors.RUNNER_COLORS.value),
+            (")", _colors.RUNNER_COLORS.label),
+        )
+
+    header = Text.assemble(
+        ("Running: ", _colors.RUNNER_COLORS.label),
+        (str(running_count), _colors.RUNNER_COLORS.value),
+        ("  |  ", _colors.RUNNER_COLORS.label),
+    )
+    header.append_text(slot_text)
+
     if not tasks:
         return Group(
+            header,
             Panel(
                 Text("Waiting for in-progress tasks...", justify="center"),
                 title="gza tv",
@@ -345,7 +382,7 @@ def _render_all(
         _build_task_panel(task, lp, n_lines, width)
         for task, lp in zip(tasks, log_paths)
     ]
-    return Group(*panels)
+    return Group(header, *panels)
 
 
 def _auto_select_tasks(
@@ -374,6 +411,84 @@ def _auto_select_tasks(
     return selected
 
 
+def _resolve_slot_bounds(
+    number: int | None,
+    min_slots: int | None,
+    max_slots: int | None,
+) -> tuple[int, int]:
+    """Resolve slot bounds from CLI flags."""
+    if number is not None and (min_slots is not None or max_slots is not None):
+        raise ValueError("`-n/--number` cannot be combined with `--min` or `--max`.")
+
+    if number is not None:
+        min_resolved = number
+        max_resolved = number
+    else:
+        min_resolved = min_slots if min_slots is not None else DEFAULT_MIN_SLOTS
+        max_resolved = max_slots if max_slots is not None else DEFAULT_MAX_SLOTS
+
+    if min_resolved < 1:
+        raise ValueError("`--min` must be >= 1.")
+    if max_resolved < min_resolved:
+        raise ValueError("`--max` must be >= `--min`.")
+    if max_resolved > MAX_SLOTS:
+        raise ValueError(f"`--max` cannot exceed {MAX_SLOTS}.")
+
+    return min_resolved, max_resolved
+
+
+def _can_pad_to_min(store: SqliteTaskStore, running_count: int, min_slots: int) -> bool:
+    """Whether auto-select mode can fill up to min slots with fallback tasks."""
+    if running_count == 0:
+        return True
+    if min_slots <= running_count:
+        return True
+    return len(_auto_select_tasks(store, min_slots)) >= min_slots
+
+
+def _desired_slot_count(
+    running_count: int,
+    min_slots: int,
+    max_slots: int,
+    can_pad_to_min: bool,
+) -> int:
+    """Compute desired slot count before hysteresis."""
+    if running_count > max_slots:
+        return max_slots
+    if running_count < min_slots:
+        if running_count > 0 and not can_pad_to_min:
+            return running_count
+        return min_slots
+    return running_count
+
+
+def _next_slot_count(
+    running_count: int,
+    current_rendered_count: int,
+    ticks_below: int,
+    *,
+    min_slots: int,
+    max_slots: int,
+    can_pad_to_min: bool,
+) -> tuple[int, int]:
+    """Apply asymmetric hysteresis to slot resizing."""
+    desired_count = _desired_slot_count(
+        running_count=running_count,
+        min_slots=min_slots,
+        max_slots=max_slots,
+        can_pad_to_min=can_pad_to_min,
+    )
+
+    if desired_count > current_rendered_count:
+        return desired_count, 0
+    if desired_count < current_rendered_count:
+        next_ticks_below = ticks_below + 1
+        if next_ticks_below >= SHRINK_TICKS:
+            return desired_count, 0
+        return current_rendered_count, next_ticks_below
+    return current_rendered_count, 0
+
+
 def _resolve_log_paths(
     config: Config,
     registry: WorkerRegistry,
@@ -394,7 +509,15 @@ def cmd_tv(args: argparse.Namespace) -> int:
     registry = WorkerRegistry(config.workers_path)
 
     task_ids_raw: list[str] = args.task_ids or []
-    max_slots: int = args.number or DEFAULT_SLOTS
+    number: int | None = getattr(args, "number", None)
+    min_arg: int | None = getattr(args, "min_slots", None)
+    max_arg: int | None = getattr(args, "max_slots", None)
+    try:
+        min_slots, max_slots = _resolve_slot_bounds(number, min_arg, max_arg)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
     explicit_ids = len(task_ids_raw) > 0
 
     if explicit_ids:
@@ -410,9 +533,15 @@ def cmd_tv(args: argparse.Namespace) -> int:
                 print(f"Error: task {raw_id} not found")
                 return 1
             tasks.append(task)
+        rendered_slots = len(tasks)
+        ticks_below = 0
+        running_count = len(store.get_in_progress())
     else:
-        # Auto-select running tasks
-        tasks = _auto_select_tasks(store, max_slots)
+        running_count = len(store.get_in_progress())
+        can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
+        rendered_slots = _desired_slot_count(running_count, min_slots, max_slots, can_pad_to_min)
+        ticks_below = 0
+        tasks = _auto_select_tasks(store, rendered_slots)
 
     n_tasks = len(tasks)
     n_lines = _lines_per_panel(n_tasks)
@@ -422,7 +551,15 @@ def cmd_tv(args: argparse.Namespace) -> int:
 
     try:
         with Live(
-            _render_all(tasks, log_paths, n_lines),
+            _render_all(
+                tasks,
+                log_paths,
+                n_lines,
+                running_count=running_count,
+                min_slots=min_slots,
+                max_slots=max_slots,
+                explicit_ids=explicit_ids,
+            ),
             console=console,
             refresh_per_second=2,
             screen=True,
@@ -439,13 +576,22 @@ def cmd_tv(args: argparse.Namespace) -> int:
                         refreshed = store.get(current_task_id)
                         if refreshed:
                             tasks[i] = refreshed
+                    running_count = len(store.get_in_progress())
                 else:
+                    running_count = len(store.get_in_progress())
+                    can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
+                    rendered_slots, ticks_below = _next_slot_count(
+                        running_count,
+                        rendered_slots,
+                        ticks_below,
+                        min_slots=min_slots,
+                        max_slots=max_slots,
+                        can_pad_to_min=can_pad_to_min,
+                    )
                     # In auto-select mode, repoll the live task set so finished
                     # tasks fall off the screen and newly running tasks replace them.
-                    refreshed_tasks = _auto_select_tasks(store, max_slots)
-                    if refreshed_tasks:
-                        tasks = refreshed_tasks
-                        log_paths = _resolve_log_paths(config, registry, tasks)
+                    tasks = _auto_select_tasks(store, rendered_slots)
+                    log_paths = _resolve_log_paths(config, registry, tasks)
 
                 # Recalculate lines (terminal may have resized)
                 n_lines = _lines_per_panel(len(tasks))
@@ -457,7 +603,17 @@ def cmd_tv(args: argparse.Namespace) -> int:
                         lp, _ = _resolve_task_log_path(config, registry, tasks[i])
                         log_paths[i] = lp
 
-                live.update(_render_all(tasks, log_paths, n_lines))
+                live.update(
+                    _render_all(
+                        tasks,
+                        log_paths,
+                        n_lines,
+                        running_count=running_count,
+                        min_slots=min_slots,
+                        max_slots=max_slots,
+                        explicit_ids=explicit_ids,
+                    )
+                )
 
     except KeyboardInterrupt:
         pass

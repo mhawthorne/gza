@@ -508,6 +508,26 @@ gza log <identifier> [options]
 By default, the identifier is treated as a full task ID (for example `gza-1234`).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
 
+### tv
+
+Live multi-task dashboard for active and recent task logs.
+
+```bash
+gza tv [task_ids...] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_ids...` | Optional explicit full prefixed task IDs to pin in the dashboard (up to 8) |
+| `-n, --number N` | Fixed slot count (equivalent to `--min N --max N`) |
+| `--min N` | Minimum slot count in auto-select mode (default: `1`) |
+| `--max N` | Maximum slot count in auto-select mode (default: `4`, hard cap: `8`) |
+
+`gza tv` header semantics:
+- Auto-select mode shows `slots: <visible> (min <min>, max <max>)`.
+- Explicit-ID mode shows `slots: <visible> (explicit)`.
+- Slot count always reflects the visible panel count on screen.
+
 ### stats
 
 Show analytics subcommands for reviews and iteration activity.

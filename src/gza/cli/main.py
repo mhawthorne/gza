@@ -867,7 +867,21 @@ def main() -> int:
         "--number", "-n",
         type=int,
         metavar="N",
-        help="Max number of tasks to show in auto-select mode (default: 4)",
+        help="Fixed slot count (equivalent to --min N --max N)",
+    )
+    tv_parser.add_argument(
+        "--min",
+        dest="min_slots",
+        type=int,
+        metavar="N",
+        help="Minimum slot count in auto-select mode (default: 1)",
+    )
+    tv_parser.add_argument(
+        "--max",
+        dest="max_slots",
+        type=int,
+        metavar="N",
+        help="Maximum slot count in auto-select mode (default: 4)",
     )
     add_common_args(tv_parser)
 
