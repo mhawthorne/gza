@@ -2,6 +2,7 @@
 
 from gza.task_slug import (
     get_base_task_slug,
+    get_slug_display_text,
     get_task_slug,
     strip_derived_implement_prefixes,
 )
@@ -21,6 +22,13 @@ def test_slug_helpers_return_none_for_missing_task_id() -> None:
     """Helpers return None when task_id is not present."""
     assert get_task_slug(None) is None
     assert get_base_task_slug(None) is None
+    assert get_slug_display_text(None, project_prefix="gza") is None
+
+
+def test_get_slug_display_text_handles_prefix_and_prefixless_shapes() -> None:
+    """Display helper should preserve semantic body for both slug formats."""
+    assert get_slug_display_text("20260421-gza-add-feature", project_prefix="gza") == "add-feature"
+    assert get_slug_display_text("20260421-add-feature", project_prefix="gza") == "add-feature"
 
 
 def test_strip_derived_implement_prefixes_strips_nested_chain() -> None:

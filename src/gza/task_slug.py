@@ -55,6 +55,30 @@ def get_base_task_slug(slug: str | None) -> str | None:
     return _TRAILING_REVISION_SUFFIX_RE.sub("", extracted)
 
 
+def get_slug_display_text(slug: str | None, project_prefix: str | None = None) -> str | None:
+    """Return a human-friendly slug body for operator-facing output.
+
+    Supports both generated slug shapes:
+    - ``YYYYMMDD-{project_prefix}-{slug}``
+    - ``YYYYMMDD-{semantic-slug}``
+
+    For the prefix-bearing shape, strips ``{project_prefix}-`` so displays show
+    only the semantic body.
+    """
+    extracted = get_task_slug(slug)
+    if extracted is None:
+        return None
+
+    if not project_prefix:
+        return extracted
+
+    if extracted.startswith(f"{project_prefix}-"):
+        return extracted[len(project_prefix) + 1:]
+    if extracted == project_prefix:
+        return ""
+    return extracted
+
+
 def strip_derived_implement_prefixes(
     slug: str | None,
     known_task_id_suffixes: set[str] | None = None,
