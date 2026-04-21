@@ -4,6 +4,8 @@ import argparse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from gza.cli import tv as tv_module
 
 from .conftest import make_store, setup_config
@@ -31,6 +33,77 @@ class _FakeLive:
 def _set_in_progress(task, started_at: datetime) -> None:
     task.status = "in_progress"
     task.started_at = started_at
+
+
+def _render_task_ids(tasks, _log_paths, _n_lines, **_kwargs):
+    return [task.id for task in tasks]
+
+
+def test_slot_bounds_defaults_to_min_1_max_4():
+    assert tv_module._resolve_slot_bounds(None, None, None) == (1, 4)
+
+
+def test_slot_bounds_n_equivalent_to_fixed_min_max():
+    assert tv_module._resolve_slot_bounds(3, None, None) == (3, 3)
+    assert tv_module._resolve_slot_bounds(None, 3, 3) == (3, 3)
+
+
+def test_slot_bounds_rejects_number_with_min_max():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        tv_module._resolve_slot_bounds(3, 1, None)
+
+
+def test_slot_bounds_validation_errors():
+    with pytest.raises(ValueError, match="--min"):
+        tv_module._resolve_slot_bounds(None, 0, None)
+    with pytest.raises(ValueError, match="--max"):
+        tv_module._resolve_slot_bounds(None, 3, 2)
+
+
+def test_tv_rejects_n_with_min_max(capsys, tmp_path: Path):
+    setup_config(tmp_path)
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[],
+        number=3,
+        min_slots=1,
+        max_slots=None,
+    )
+    rc = tv_module.cmd_tv(args)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "cannot be combined" in captured.out
+
+
+def test_next_slot_count_caps_scales_and_floors_with_padding():
+    # Cap at max when running exceeds max.
+    assert tv_module._next_slot_count(8, 4, 0, min_slots=1, max_slots=4, can_pad_to_min=True) == (4, 0)
+    # Scale to running count between min and max.
+    assert tv_module._next_slot_count(3, 3, 0, min_slots=1, max_slots=4, can_pad_to_min=True) == (3, 0)
+    # Floor at min when running is below min and fallback padding exists.
+    assert tv_module._next_slot_count(1, 2, 4, min_slots=3, max_slots=5, can_pad_to_min=True) == (3, 0)
+
+
+def test_next_slot_count_edge_case_no_finished_padding_uses_running():
+    assert tv_module._next_slot_count(2, 2, 0, min_slots=4, max_slots=6, can_pad_to_min=False) == (2, 0)
+
+
+def test_next_slot_count_hysteresis_grow_immediately_shrink_after_threshold():
+    # Grow on first tick.
+    assert tv_module._next_slot_count(4, 2, 0, min_slots=1, max_slots=5, can_pad_to_min=True) == (4, 0)
+
+    # Shrink waits until SHRINK_TICKS consecutive lower ticks.
+    slots = 4
+    ticks_below = 0
+    for _ in range(tv_module.SHRINK_TICKS - 1):
+        slots, ticks_below = tv_module._next_slot_count(
+            2, slots, ticks_below, min_slots=1, max_slots=5, can_pad_to_min=True
+        )
+        assert slots == 4
+    slots, ticks_below = tv_module._next_slot_count(
+        2, slots, ticks_below, min_slots=1, max_slots=5, can_pad_to_min=True
+    )
+    assert (slots, ticks_below) == (2, 0)
 
 
 def test_tv_auto_mode_repolls_live_tasks(monkeypatch, tmp_path: Path):
@@ -73,7 +146,7 @@ def test_tv_auto_mode_repolls_live_tasks(monkeypatch, tmp_path: Path):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
-    monkeypatch.setattr(tv_module, "_render_all", lambda tasks, _log_paths, _n_lines: [task.id for task in tasks])
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
 
@@ -124,7 +197,7 @@ def test_tv_auto_mode_backfills_finished_tasks_when_live_count_drops(monkeypatch
             raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
-    monkeypatch.setattr(tv_module, "_render_all", lambda tasks, _log_paths, _n_lines: [task.id for task in tasks])
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
 
@@ -173,7 +246,7 @@ def test_tv_explicit_ids_stay_fixed(monkeypatch, tmp_path: Path):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
-    monkeypatch.setattr(tv_module, "_render_all", lambda tasks, _log_paths, _n_lines: [task.id for task in tasks])
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
 
@@ -213,7 +286,7 @@ def test_tv_auto_mode_starts_with_recent_finished_tasks(monkeypatch, tmp_path: P
         raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
-    monkeypatch.setattr(tv_module, "_render_all", lambda tasks, _log_paths, _n_lines: [task.id for task in tasks])
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
 
@@ -253,7 +326,7 @@ def test_tv_auto_mode_promotes_live_tasks_over_finished_fallback(monkeypatch, tm
             raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
-    monkeypatch.setattr(tv_module, "_render_all", lambda tasks, _log_paths, _n_lines: [task.id for task in tasks])
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
 
@@ -287,7 +360,7 @@ def test_tv_auto_mode_does_not_exit_on_finished_fallback(monkeypatch, tmp_path: 
             raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
-    monkeypatch.setattr(tv_module, "_render_all", lambda tasks, _log_paths, _n_lines: [task.id for task in tasks])
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
 
