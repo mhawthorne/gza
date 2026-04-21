@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from gza.cli import _determine_advance_action, cmd_advance
 from gza.config import Config
+from gza.review_verdict import ReviewFinding
 
 from .conftest import (
     make_store,
@@ -146,6 +147,74 @@ class TestAdvanceCommand:
         updated_task = store.get(task.id)
         assert updated_task is not None
         assert updated_task.merge_status == "merged"
+
+    def test_advance_merge_with_followups_creates_idempotent_followup_tasks(self, tmp_path: Path):
+        """merge_with_followups creates one implement follow-up per finding and reuses on rerun."""
+        from gza.cli import cmd_advance
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+        review_task = store.add("Review", task_type="review", depends_on=task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        store.update(review_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        action = {
+            "type": "merge_with_followups",
+            "description": "Merge (review APPROVED_WITH_FOLLOWUPS)",
+            "review_task": review_task,
+            "followup_findings": (
+                ReviewFinding(
+                    id="F1",
+                    severity="FOLLOWUP",
+                    title="Hardening",
+                    body="",
+                    evidence=None,
+                    impact=None,
+                    fix_or_followup="add malformed input guard",
+                    tests=None,
+                ),
+            ),
+        }
+
+        with patch("gza.cli._determine_advance_action", return_value=action), patch(
+            "gza.cli._merge_single_task", return_value=1
+        ):
+            rc1 = cmd_advance(args)
+            rc2 = cmd_advance(args)
+
+        assert rc1 == 1
+        assert rc2 == 1
+        followups = [
+            t for t in store.get_all()
+            if t.task_type == "implement"
+            and t.based_on == review_task.id
+            and t.prompt.startswith(f"Follow-up F1 from review {review_task.id} for task {task.id}:")
+        ]
+        assert len(followups) == 1
 
     def test_advance_spawns_rebase_worker_on_conflicts(self, tmp_path: Path):
         """advance spawns a background rebase --resolve worker when conflicts are detected."""

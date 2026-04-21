@@ -97,7 +97,7 @@ def test_unmerged_colors_dict_keys() -> None:
     from gza.colors import UNMERGED_COLORS_DICT
 
     expected_keys = {"task_id", "prompt", "stats", "branch", "date",
-                     "review_approved", "review_changes", "review_discussion", "review_none"}
+                     "review_approved", "review_followups", "review_changes", "review_discussion", "review_none"}
     assert set(UNMERGED_COLORS_DICT.keys()) == expected_keys
 
 

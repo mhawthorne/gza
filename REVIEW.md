@@ -34,7 +34,21 @@ You are only seeing a diff of changed files. If changes reference or depend on c
 
 ## Output Format
 
-- Summary (1-3 bullets)
-- Must-fix issues
-- Suggestions
-- Questions/assumptions (include what files/context would help verify your assumptions)
+Use this exact section order and headings:
+
+1. `## Summary`
+2. `## Blockers`
+3. `## Follow-Ups`
+4. `## Questions / Assumptions`
+5. `## Verdict`
+
+Section rules:
+- `## Blockers`: if none, write exactly `None.`
+- `## Follow-Ups`: if none, write exactly `None.`
+- `## Questions / Assumptions`: if none, write exactly `None.`
+
+Verdict line (final line must be exactly one of):
+- `Verdict: APPROVED`
+- `Verdict: APPROVED_WITH_FOLLOWUPS`
+- `Verdict: CHANGES_REQUESTED`
+- `Verdict: NEEDS_DISCUSSION`

@@ -14,7 +14,7 @@ from gza.resume_policy import (
     is_resumable_failed_task,
     is_resumable_failure_reason as _is_resumable_failure_reason,
 )
-from gza.review_verdict import get_review_verdict
+from gza.review_verdict import ParsedReviewReport, ReviewFinding, get_review_report
 
 WORKER_CONSUMING_ACTIONS = frozenset(
     {
@@ -54,6 +54,8 @@ class AdvanceContext:
     latest_completed_review: DbTask | None = None
     review_cleared: bool = False
     review_verdict: str | None = None
+    review_report: ParsedReviewReport | None = None
+    followup_findings: tuple[ReviewFinding, ...] = ()
 
     completed_review_cycles: int = 0
     active_improve_running: DbTask | None = None
@@ -130,6 +132,8 @@ def _resolve_review_state(
     DbTask | None,
     bool,
     str | None,
+    ParsedReviewReport | None,
+    tuple[ReviewFinding, ...],
     int,
     DbTask | None,
     DbTask | None,
@@ -149,13 +153,19 @@ def _resolve_review_state(
     )
 
     review_verdict: str | None = None
+    review_report: ParsedReviewReport | None = None
+    followup_findings: tuple[ReviewFinding, ...] = ()
     completed_review_cycles = 0
     active_improve_running: DbTask | None = None
     active_improve_pending: DbTask | None = None
     has_improve_after_review = False
 
     if latest_completed_review is not None:
-        review_verdict = get_review_verdict(Path(config.project_dir), latest_completed_review)
+        review_report = get_review_report(Path(config.project_dir), latest_completed_review)
+        review_verdict = review_report.verdict
+        followup_findings = tuple(
+            finding for finding in review_report.findings if finding.severity == "FOLLOWUP"
+        )
 
         if review_cleared and latest_completed_review.completed_at is not None:
             code_changing = [
@@ -182,6 +192,8 @@ def _resolve_review_state(
         latest_completed_review,
         review_cleared,
         review_verdict,
+        review_report,
+        followup_findings,
         completed_review_cycles,
         active_improve_running,
         active_improve_pending,
@@ -265,6 +277,8 @@ def resolve_advance_context(
         latest_completed_review,
         review_cleared,
         review_verdict,
+        review_report,
+        followup_findings,
         completed_review_cycles,
         active_improve_running,
         active_improve_pending,
@@ -297,6 +311,8 @@ def resolve_advance_context(
         latest_completed_review=latest_completed_review,
         review_cleared=review_cleared,
         review_verdict=review_verdict,
+        review_report=review_report,
+        followup_findings=followup_findings,
         completed_review_cycles=completed_review_cycles,
         active_improve_running=active_improve_running,
         active_improve_pending=active_improve_pending,
@@ -435,6 +451,18 @@ ADVANCE_RULES: list[AdvanceRule] = [
             "type": "wait_review",
             "description": f"SKIP: review {_task_id(ctx.active_review)} is in_progress",
             "review_task": ctx.active_review,
+        },
+    ),
+    AdvanceRule(
+        name="review_approved_with_followups",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.latest_completed_review is not None
+        and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS",
+        action=lambda ctx: {
+            "type": "merge_with_followups",
+            "description": "Merge (review APPROVED_WITH_FOLLOWUPS)",
+            "review_task": ctx.latest_completed_review,
+            "followup_findings": ctx.followup_findings,
         },
     ),
     AdvanceRule(

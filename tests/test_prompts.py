@@ -11,12 +11,12 @@ from gza.prompts import PromptBuilder
 REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
-    "Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
-    "Treat unexplained deviations from the provided plan or request as Must-Fix.",
-    "Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.",
-    "Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.",
-    "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.",
-    "Push style, cleanup, and non-risky refactors to Suggestions.",
+    "Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
+    "Treat unexplained deviations from the provided plan or request as BLOCKER.",
+    "Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.",
+    "Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.",
+    "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.",
+    "Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.",
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
 ]
 
@@ -40,6 +40,16 @@ def _assert_summary_checklist_contract(text: str) -> None:
     assert f"exactly {REVIEW_SUMMARY_CHECKLIST_COUNT} bullets" in text
     for item in REVIEW_SUMMARY_CHECKLIST_ITEMS:
         assert item in text
+
+
+def _extract_ai_review_fallback_prompt(script_content: str) -> str:
+    match = re.search(
+        r"read -r -d '' PROMPT <<'EOF' \|\| true\n(.*?)\nEOF",
+        script_content,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group(1)
 
 
 class TestPromptBuilderBuild:
@@ -123,9 +133,9 @@ class TestPromptBuilderBuild:
         result = PromptBuilder().build(task, config, store, summary_path=summary_path)
 
         assert str(summary_path) in result
-        assert "Treat **Suggestions** as optional follow-up work" in result
+        assert "Your job is to address all **Blockers** only." in result
         assert "The review item you addressed" in result
-        assert "If a Must-Fix item no longer applies" in result
+        assert "If a Blocker item no longer applies" in result
 
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
         self, tmp_path: Path
@@ -280,17 +290,18 @@ class TestPromptBuilderBuild:
         assert str(report_path) in result
         assert "AGENTS.md" in result
         assert "APPROVED" in result
+        assert "APPROVED_WITH_FOLLOWUPS" in result
         assert "CHANGES_REQUESTED" in result
         assert "Verdict:" in result
         assert "## Summary" in result
-        assert "## Must-Fix" in result
-        assert "## Suggestions" in result
+        assert "## Blockers" in result
+        assert "## Follow-Ups" in result
         assert "## Questions / Assumptions" in result
         assert "## Verdict" in result
         assert "Do not rename, omit, or reorder these sections." in result
         assert "write exactly: None." in result
-        assert "### M1" in result
-        assert "### S1" in result
+        assert "### B1" in result
+        assert "### F1" in result
         assert "Evidence:" in result
         assert "Impact:" in result
         assert "Required fix:" in result
@@ -306,7 +317,7 @@ class TestPromptBuilderBuild:
         assert "read unchanged source files" in result
         assert "No plan or request provided." in result
         assert "unexplained deviations from the provided plan or request" in result
-        assert "Reserve Must-Fix for:" in result
+        assert "Reserve BLOCKER for:" in result
         _assert_summary_checklist_contract(result)
         checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
         assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT
@@ -328,19 +339,19 @@ class TestPromptBuilderBuild:
         assert "<1-2 sentence overview of the changes>" not in content
         _assert_summary_checklist_contract(content)
         assert (
-            "<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
+            "<Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
             in content
         )
         assert (
-            "<Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>"
+            "<Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>"
             in content
         )
         assert (
-            "<Treat unexplained deviations from the provided plan or request as Must-Fix.>"
+            "<Treat unexplained deviations from the provided plan or request as BLOCKER.>"
             in content
         )
         assert (
-            "<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>"
+            "<Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.>"
             in content
         )
 
@@ -467,6 +478,30 @@ class TestPromptBuilderBuild:
 
         assert "Review Guidelines" in result
         assert "Check for security issues." in result
+
+    def test_review_guidance_surfaces_match_blockers_followups_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        review_md_content = (root / "REVIEW.md").read_text()
+        ai_review_script_content = (root / "bin" / "ai_review.sh").read_text()
+        fallback_prompt = _extract_ai_review_fallback_prompt(ai_review_script_content)
+        example_doc_content = (
+            root / "docs" / "examples" / "plan-implement-review.md"
+        ).read_text()
+
+        assert "## Blockers" in review_md_content
+        assert "## Follow-Ups" in review_md_content
+        assert "Verdict: APPROVED_WITH_FOLLOWUPS" in review_md_content
+        assert "Must-fix issues" not in review_md_content
+        assert "Suggestions" not in review_md_content
+
+        assert "## Blockers" in fallback_prompt
+        assert "## Follow-Ups" in fallback_prompt
+        assert "Verdict: APPROVED_WITH_FOLLOWUPS" in fallback_prompt
+        assert "Must-fix issues" not in fallback_prompt
+        assert "Suggestions" not in fallback_prompt
+
+        assert "## Blockers" in example_doc_content
+        assert "## Must-Fix" not in example_doc_content
 
     def test_build_spec_file_included(self, tmp_path: Path):
         """Test that spec file content is included when task.spec is set."""

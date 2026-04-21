@@ -58,11 +58,19 @@ Review priorities:
 
 Important: You are only seeing a diff of changed files. If changes reference or depend on code in files not shown (e.g., imports, function calls, database schemas), explicitly note what additional files you would need to see to complete the review. Flag incomplete implementations where a feature is partially added but dependent code paths are not updated.
 
-Output format:
-- Summary (1-3 bullets)
-- Must-fix issues
-- Suggestions
-- Questions/assumptions (include what files/context would help verify your assumptions)
+Output format (exact section order and headings):
+1. ## Summary
+2. ## Blockers
+3. ## Follow-Ups
+4. ## Questions / Assumptions
+5. ## Verdict
+
+If Blockers/Follow-Ups/Questions are empty, write exactly: None.
+Final line must be exactly one of:
+- Verdict: APPROVED
+- Verdict: APPROVED_WITH_FOLLOWUPS
+- Verdict: CHANGES_REQUESTED
+- Verdict: NEEDS_DISCUSSION
 
 Now review the following content:
 EOF
@@ -397,5 +405,4 @@ if [[ "$USE_PAGER" == "1" || ( "$USE_PAGER" == "auto" && -t 1 ) ]]; then
 fi
 
 printf "%s" "$OUTPUT"
-
 

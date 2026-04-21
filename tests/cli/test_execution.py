@@ -4308,6 +4308,104 @@ class TestIterateCommand:
         assert improve_task.depends_on == review1.id
         assert store.get_improve_tasks_for(impl.id, review2.id) == []
 
+    def test_iterate_first_pass_approved_with_followups_creates_followup_and_rerun_reuses(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+
+        review_output = (
+            "## Summary\n\n"
+            "- Looks good overall.\n\n"
+            "## Blockers\n\n"
+            "None.\n\n"
+            "## Follow-Ups\n\n"
+            "### F1\n"
+            "Evidence: Edge case currently uncovered.\n"
+            "Impact: Rare invalid input may pass through silently.\n"
+            "Recommended follow-up: add malformed-input validation.\n"
+            "Recommended tests: add a CLI regression for malformed input.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Verdict: APPROVED_WITH_FOLLOWUPS\n"
+        )
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.id == review.id
+            task.status = "completed"
+            task.output_content = review_output
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=3,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            result_first = cmd_iterate(args)
+        output_first = capsys.readouterr().out
+
+        followups_after_first = [
+            task for task in store.get_based_on_children(review.id) if task.task_type == "implement"
+        ]
+        assert result_first == 0
+        assert len(followups_after_first) == 1
+        first_followup = followups_after_first[0]
+        assert first_followup.prompt.startswith(
+            f"Follow-up F1 from review {review.id} for task {impl.id}:"
+        )
+        assert "Iterate complete: APPROVED (approved_with_followups)" in output_first
+        assert first_followup.id in output_first
+        assert "followup" in output_first
+        assert "created" in output_first
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground") as run_foreground_rerun,
+        ):
+            result_second = cmd_iterate(args)
+        output_second = capsys.readouterr().out
+
+        followups_after_second = [
+            task for task in store.get_based_on_children(review.id) if task.task_type == "implement"
+        ]
+        assert result_second == 0
+        run_foreground_rerun.assert_not_called()
+        assert len(followups_after_second) == 1
+        assert followups_after_second[0].id == first_followup.id
+        assert first_followup.id in output_second
+        assert "followup" in output_second
+        assert "reused" in output_second
+
     def test_pending_impl_all_changes_requested_with_iterations_four_ends_on_review(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
@@ -8347,6 +8445,15 @@ class TestGetReviewVerdict:
         store.update(task)
         assert get_review_verdict(config, task) == "NEEDS_DISCUSSION"
 
+    def test_heading_verdict_approved_with_followups(self, tmp_path: Path):
+        """Parses APPROVED_WITH_FOLLOWUPS verdict token."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = "## Verdict\n\nAPPROVED_WITH_FOLLOWUPS\n"
+        store.update(task)
+        assert get_review_verdict(config, task) == "APPROVED_WITH_FOLLOWUPS"
+
     def test_bold_label_only_verdict(self, tmp_path: Path):
         """Parses **Verdict**: CHANGES_REQUESTED format (bold wraps only label)."""
         get_review_verdict, config, store = self._setup(tmp_path)
@@ -8373,9 +8480,9 @@ class TestGetReviewVerdict:
         task.output_content = (
             "## Summary\n\n"
             "- Reviewed the implementation.\n\n"
-            "## Must-Fix\n\n"
+            "## Blockers\n\n"
             "None.\n\n"
-            "## Suggestions\n\n"
+            "## Follow-Ups\n\n"
             "None.\n\n"
             "## Questions / Assumptions\n\n"
             "None.\n\n"

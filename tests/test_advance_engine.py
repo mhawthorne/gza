@@ -12,6 +12,7 @@ from gza.advance_engine import (
 )
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.review_verdict import ParsedReviewReport
 
 
 class _FakeGit:
@@ -205,7 +206,13 @@ def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: P
     assert impl is not None
 
     monkeypatch.setattr(
-        advance_engine_module, "get_review_verdict", lambda project_dir, r: "CHANGES_REQUESTED"
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
@@ -248,3 +255,49 @@ def test_unmerged_view_shows_fix_after_review_as_stale(tmp_path: Path):
     assert review.completed_at is not None
     assert latest.completed_at is not None
     assert latest.completed_at > review.completed_at
+
+
+def test_approved_with_followups_returns_merge_with_followups(tmp_path: Path, monkeypatch):
+    from gza import advance_engine as advance_engine_module
+    from gza.review_verdict import ParsedReviewReport, ReviewFinding
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/followups"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            findings=(
+                ReviewFinding(
+                    id="F1",
+                    severity="FOLLOWUP",
+                    title="title",
+                    body="body",
+                    evidence=None,
+                    impact=None,
+                    fix_or_followup="add check",
+                    tests=None,
+                ),
+            ),
+            format_version="v2",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "merge_with_followups"
+    assert len(action["followup_findings"]) == 1

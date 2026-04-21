@@ -31,9 +31,10 @@ from ..prompts import PromptBuilder
 from ..resume_policy import is_resumable_failure
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
+    create_or_reuse_followup_task,
     create_review_task,
 )
-from ..review_verdict import get_review_verdict as _get_review_verdict, parse_review_verdict
+from ..review_verdict import ReviewFinding, get_review_verdict as _get_review_verdict, parse_review_verdict
 from ..runner import get_effective_config_for_task, run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -947,7 +948,7 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
         review_task: Review task
 
     Returns:
-        Verdict string ('APPROVED', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
+        Verdict string ('APPROVED', 'APPROVED_WITH_FOLLOWUPS', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
     """
     return _get_review_verdict(config.project_dir, review_task)
 
@@ -970,6 +971,34 @@ def _create_review_task(
         model=model,
         provider=provider,
     )
+
+
+def _create_or_reuse_followup_tasks(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+) -> tuple[list[DbTask], list[DbTask]]:
+    """Create/reuse follow-up implement tasks for parsed FOLLOWUP findings.
+
+    Returns:
+        (created_tasks, reused_tasks)
+    """
+    created: list[DbTask] = []
+    reused: list[DbTask] = []
+    for finding in findings:
+        task, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+        )
+        if created_now:
+            created.append(task)
+        else:
+            reused.append(task)
+    return created, reused
 
 
 def resolve_improve_action(
@@ -1200,6 +1229,7 @@ def _format_lineage(
             )
             verdict_map = {
                 "APPROVED": "approved",
+                "APPROVED_WITH_FOLLOWUPS": "approved_with_followups",
                 "CHANGES_REQUESTED": "changes_requested",
                 "NEEDS_DISCUSSION": "needs_discussion",
             }

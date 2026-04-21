@@ -84,22 +84,23 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <- Did I require targeted regression tests that match each failure mode (not generic "add tests")?>
 <- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>
 
-## Must-Fix
+## Blockers
 
-<Use ### M1, ### M2, ... for blockers. If none, write "None.">
+<Use ### B1, ### B2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
-<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
-<Treat unexplained deviations from the provided plan or request as Must-Fix.>
-<Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
-<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
-<If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
-<Push style, cleanup, and non-risky refactors to Suggestions.>
+<Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat unexplained deviations from the provided plan or request as BLOCKER.>
+<Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>
+<Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.>
+<If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.>
+<Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 
-## Suggestions
+## Follow-Ups
 
-<Use ### S1, ### S2, ... for non-blocking suggestions. If none, write "None.">
-<Each suggestion should include Suggestion: and Why it helps:. Evidence: is optional but encouraged.>
+<Use ### F1, ### F2, ... for non-blocking actionable follow-ups. If none, write "None.">
+<Each follow-up should include Evidence:, Impact:, Recommended follow-up:, Recommended tests:>
+<Do not include NIT findings in canonical output.>
 
 ## Questions / Assumptions
 
@@ -108,7 +109,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 ## Verdict
 
 <Brief justification>
-Verdict: APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION
+Verdict: APPROVED|APPROVED_WITH_FOLLOWUPS|CHANGES_REQUESTED|NEEDS_DISCUSSION
 ```
 
 Do not rename, omit, or reorder these sections.
@@ -129,7 +130,7 @@ Pass the authoritative diff context (`## Implementation diff context`), canonica
 ### Step 5: Report back
 
 After the subagent completes:
-- Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
+- Print the review verdict (APPROVED / APPROVED_WITH_FOLLOWUPS / CHANGES_REQUESTED / NEEDS_DISCUSSION)
 - Print a brief summary of findings
 - If changes were requested, tell the user: "Fix the issues above, commit, push, then run `/gza-code-review-interactive` again."
 - If a PR was used, include a link to it

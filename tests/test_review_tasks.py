@@ -7,9 +7,14 @@ import pytest
 from gza.db import Task
 from gza.review_tasks import (
     DuplicateReviewError,
+    build_followup_prompt,
+    build_followup_prompt_prefix,
     build_auto_review_prompt,
+    create_or_reuse_followup_task,
     create_review_task,
+    find_existing_followup_task,
 )
+from gza.review_verdict import ReviewFinding
 
 
 def _task(**overrides) -> Task:
@@ -285,3 +290,100 @@ class TestCreateReviewTask:
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["depends_on"] == "gza-12"
         assert call_kwargs["based_on"] == "gza-12"
+
+
+class TestFollowupTasks:
+    def test_build_followup_prompt_prefix(self):
+        assert (
+            build_followup_prompt_prefix("gza-200", "gza-101", "F1")
+            == "Follow-up F1 from review gza-200 for task gza-101:"
+        )
+
+    def test_build_followup_prompt(self):
+        assert (
+            build_followup_prompt("gza-200", "gza-101", "F1", "add malformed input validation")
+            == "Follow-up F1 from review gza-200 for task gza-101: add malformed input validation"
+        )
+
+    def test_find_existing_followup_task_matches_prefix(self):
+        store = MagicMock()
+        existing = _task(
+            id="gza-301",
+            task_type="implement",
+            prompt="Follow-up F1 from review gza-200 for task gza-101: add validation",
+        )
+        store.get_based_on_children.return_value = [existing]
+
+        found = find_existing_followup_task(
+            store,
+            review_task_id="gza-200",
+            impl_task_id="gza-101",
+            finding_id="F1",
+        )
+        assert found is existing
+
+    def test_create_or_reuse_followup_task_is_idempotent(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", group="grp-a")
+        finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Title",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add validation",
+            tests=None,
+        )
+
+        existing = _task(
+            id="gza-401",
+            task_type="implement",
+            prompt="Follow-up F1 from review gza-200 for task gza-101: add validation",
+        )
+        store.get_based_on_children.return_value = [existing]
+        reused, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+        )
+        assert reused is existing
+        assert created_now is False
+        store.add.assert_not_called()
+
+    def test_create_or_reuse_followup_task_creates_when_missing(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", group="grp-a")
+        finding = ReviewFinding(
+            id="F2",
+            severity="FOLLOWUP",
+            title="Title",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="update docs",
+            tests=None,
+        )
+        created_task = _task(
+            id="gza-402",
+            task_type="implement",
+            prompt="Follow-up F2 from review gza-200 for task gza-101: update docs",
+        )
+        store.get_based_on_children.return_value = []
+        store.add.return_value = created_task
+
+        created, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+        )
+        assert created is created_task
+        assert created_now is True
+        kwargs = store.add.call_args.kwargs
+        assert kwargs["task_type"] == "implement"
+        assert kwargs["based_on"] == "gza-200"
+        assert kwargs["group"] == "grp-a"

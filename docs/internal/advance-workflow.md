@@ -100,6 +100,7 @@ Conflict detection uses the currently checked-out branch as the merge target (`t
 | Latest review is `pending` | `run_review` — spawn worker |
 | Latest review is `in_progress` | `wait_review` — skip |
 | Verdict = `APPROVED` | `merge` |
+| Verdict = `APPROVED_WITH_FOLLOWUPS` | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
 | Verdict = `CHANGES_REQUESTED` AND cycles >= `max_review_cycles` | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND improve is `in_progress` | `wait_improve` — skip |
 | Verdict = `CHANGES_REQUESTED` AND improve is `pending` | `run_improve` — spawn worker |
@@ -176,6 +177,7 @@ These actions create background workers and count toward the batch limit. The so
 | Action | What it does |
 |--------|-------------|
 | `merge` | Merges the task's branch synchronously. Respects `merge_squash_threshold`. |
+| `merge_with_followups` | Creates/reuses follow-up `implement` tasks from parsed `## Follow-Ups` findings, then merges synchronously. |
 
 ### Skip actions
 

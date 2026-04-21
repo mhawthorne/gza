@@ -858,7 +858,10 @@ def _build_review_diff_context(
 
 
 def _extract_must_fix_entries(review_content: str) -> list[tuple[str, str]]:
-    """Extract Must-Fix headings and bodies from a review report."""
+    """Extract blocker headings and bodies from a review report.
+
+    Supports both legacy ``## Must-Fix`` and current ``## Blockers`` sections.
+    """
     entries: list[tuple[str, str]] = []
     in_must_fix = False
     current_heading: str | None = None
@@ -869,7 +872,7 @@ def _extract_must_fix_entries(review_content: str) -> list[tuple[str, str]]:
         stripped = line.strip()
         if stripped.startswith("## "):
             section = stripped[3:].strip().lower()
-            if section.startswith("must-fix"):
+            if section.startswith("must-fix") or section.startswith("blockers"):
                 in_must_fix = True
                 current_heading = None
                 current_lines = []

@@ -10,8 +10,8 @@ Project-specific guidance:
 
 Output format contract (use this exact section order and exact headings):
 1. ## Summary
-2. ## Must-Fix
-3. ## Suggestions
+2. ## Blockers
+3. ## Follow-Ups
 4. ## Questions / Assumptions
 5. ## Verdict
 
@@ -27,27 +27,28 @@ Section requirements:
     - Was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence (plan decisions reflected in the diff, or request coverage) while calling out intentional deviations? If neither was provided, did I state "No plan or request provided."?
     - Did I require targeted regression tests that match each failure mode (not generic "add tests")?
     - If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?
-- ## Must-Fix
+- ## Blockers
   - If there are no blocking issues, write exactly: None.
-  - Otherwise list issues ordered by severity with headings:
-    - ### M1
-    - ### M2
+  - Otherwise list blockers ordered by severity with headings:
+    - ### B1
+    - ### B2
     - ...
-  - Each must-fix item must include these labeled fields:
+  - Each blocker item must include these labeled fields:
     - Evidence:
     - Impact:
     - Required fix:
     - Required tests: (name targeted regression coverage tied to the failure mode; avoid generic test asks)
-- ## Suggestions
-  - If there are no non-blocking suggestions, write exactly: None.
-  - Otherwise list suggestions with headings:
-    - ### S1
-    - ### S2
+- ## Follow-Ups
+  - If there are no non-blocking follow-ups, write exactly: None.
+  - Otherwise list follow-ups with headings:
+    - ### F1
+    - ### F2
     - ...
-  - Each suggestion item must include:
-    - Evidence: (optional but encouraged)
-    - Suggestion:
-    - Why it helps:
+  - Each follow-up item must include:
+    - Evidence:
+    - Impact:
+    - Recommended follow-up:
+    - Recommended tests:
 - ## Questions / Assumptions
   - If there are none, write exactly: None.
   - Otherwise provide bullets.
@@ -55,17 +56,24 @@ Section requirements:
   - Include a brief rationale.
   - Final line must be exactly one of:
     - Verdict: APPROVED
+    - Verdict: APPROVED_WITH_FOLLOWUPS
     - Verdict: CHANGES_REQUESTED
     - Verdict: NEEDS_DISCUSSION
 
+Severity discipline:
+- Use exactly three severity tiers conceptually: BLOCKER, FOLLOWUP, NIT.
+- BLOCKER findings go in `## Blockers` and are the only gating findings.
+- FOLLOWUP findings go in `## Follow-Ups` and are actionable but non-gating.
+- Omit NIT findings from the canonical output entirely (do not add a nits section).
+
 Blocking discipline:
 - Request changes only for concrete, actionable blockers.
-- Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.
-- Treat unexplained deviations from the provided plan or request as Must-Fix.
-- Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.
-- Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.
-- If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.
-- Push style, cleanup, and non-risky refactors to Suggestions.
+- Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.
+- Treat unexplained deviations from the provided plan or request as BLOCKER.
+- Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.
+- Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.
+- If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.
+- Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.
 - For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.
 
 Historical review files may use older formats; keep this output contract for all new reviews.

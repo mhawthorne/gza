@@ -795,6 +795,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if review_verdict == "APPROVED":
             verdict_label = "✓ approved"
             review_status_color = UNMERGED_COLORS["review_approved"]
+        elif review_verdict == "APPROVED_WITH_FOLLOWUPS":
+            verdict_label = "↺ approved with follow-ups"
+            review_status_color = UNMERGED_COLORS["review_followups"]
         elif review_verdict == "CHANGES_REQUESTED":
             verdict_label = "⚠ changes requested"
             review_status_color = UNMERGED_COLORS["review_changes"]

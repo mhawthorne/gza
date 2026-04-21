@@ -6148,6 +6148,9 @@ class TestExtractReviewVerdict:
     def test_heading_verdict_without_bold_token(self) -> None:
         assert _extract_review_verdict("### Verdict\n\nNEEDS_DISCUSSION\n") == "NEEDS_DISCUSSION"
 
+    def test_heading_verdict_approved_with_followups(self) -> None:
+        assert _extract_review_verdict("## Verdict\n\nAPPROVED_WITH_FOLLOWUPS\n") == "APPROVED_WITH_FOLLOWUPS"
+
     def test_none_content(self) -> None:
         assert _extract_review_verdict(None) is None
 
@@ -6158,9 +6161,9 @@ class TestExtractReviewVerdict:
         content = (
             "## Summary\n\n"
             "- Reviewed implementation and tests.\n\n"
-            "## Must-Fix\n\n"
+            "## Blockers\n\n"
             "None.\n\n"
-            "## Suggestions\n\n"
+            "## Follow-Ups\n\n"
             "None.\n\n"
             "## Questions / Assumptions\n\n"
             "None.\n\n"
