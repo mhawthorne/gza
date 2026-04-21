@@ -302,7 +302,9 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
             shown_ids.add(task.id)
 
         tree = _prune_lineage_tree_to_ids(build_lineage_tree(store, root), shown_ids)
-        latest_unresolved_at = max(task_time_for_lineage(task) for task in unresolved)
+        latest_unresolved_at = max(
+            _normalize_lineage_time(task_time_for_lineage(task)) for task in unresolved
+        )
         shown_tasks = [
             task for task in flatten_lineage_tree(tree)
             if task.id is not None and task.id in shown_ids
