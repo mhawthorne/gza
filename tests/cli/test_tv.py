@@ -9,7 +9,7 @@ import pytest
 
 from gza.cli import tv as tv_module
 
-from .conftest import make_store, setup_config
+from .conftest import make_store, run_gza, setup_config
 
 
 class _FakeLive:
@@ -405,6 +405,43 @@ def test_tv_header_explicit_mode_does_not_claim_min_max(monkeypatch, tmp_path: P
     assert "max" not in header
 
 
+def test_tv_header_explicit_mode_running_count_is_global(monkeypatch, tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pinned_done = store.add("Pinned done", task_type="implement")
+    pinned_pending = store.add("Pinned pending", task_type="implement")
+    unrelated_running = store.add("Unrelated running", task_type="implement")
+    assert pinned_done.id and pinned_pending.id and unrelated_running.id
+
+    pinned_done.status = "completed"
+    store.update(pinned_done)
+    store.update(pinned_pending)
+    _set_in_progress(unrelated_running, datetime(2026, 4, 15, 12, 0, tzinfo=UTC))
+    store.update(unrelated_running)
+
+    def fake_sleep(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[pinned_done.id, pinned_pending.id],
+        number=None,
+        min_slots=None,
+        max_slots=None,
+    )
+    rc = tv_module.cmd_tv(args)
+
+    assert rc == 0
+    assert _FakeLive.instance is not None
+    header = _header_text(_FakeLive.instance.updates[0])
+    assert "Running: 1" in header
+    assert "slots: 2 (explicit)" in header
+
+
 def test_tv_header_auto_mode_uses_visible_panel_count_when_slots_are_sparse(monkeypatch, tmp_path: Path):
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -430,6 +467,34 @@ def test_tv_header_auto_mode_uses_visible_panel_count_when_slots_are_sparse(monk
     assert _FakeLive.instance is not None
     header = _header_text(_FakeLive.instance.updates[0])
     assert "slots: 2 (min 4, max 4)" in header
+
+
+def test_tv_parser_path_renders_header_for_fixed_slot_flag(monkeypatch, tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    in_progress = store.add("Running task", task_type="implement")
+    fallback_done = store.add("Fallback done", task_type="implement")
+    assert in_progress.id and fallback_done.id
+
+    _set_in_progress(in_progress, datetime(2026, 4, 15, 12, 0, tzinfo=UTC))
+    fallback_done.status = "completed"
+    store.update(in_progress)
+    store.update(fallback_done)
+
+    def fake_sleep(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+
+    result = run_gza("tv", "-n", "2", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert _FakeLive.instance is not None
+    header = _header_text(_FakeLive.instance.updates[0])
+    assert "Running: 1" in header
+    assert "slots: 2 (min 2, max 2)" in header
 
 
 def test_lines_per_panel_reserves_header_row(monkeypatch):

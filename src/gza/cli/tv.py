@@ -535,7 +535,7 @@ def cmd_tv(args: argparse.Namespace) -> int:
             tasks.append(task)
         rendered_slots = len(tasks)
         ticks_below = 0
-        running_count = sum(1 for task in tasks if task.status == "in_progress")
+        running_count = len(store.get_in_progress())
     else:
         running_count = len(store.get_in_progress())
         can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
@@ -576,7 +576,7 @@ def cmd_tv(args: argparse.Namespace) -> int:
                         refreshed = store.get(current_task_id)
                         if refreshed:
                             tasks[i] = refreshed
-                    running_count = sum(1 for task in tasks if task.status == "in_progress")
+                    running_count = len(store.get_in_progress())
                 else:
                     running_count = len(store.get_in_progress())
                     can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
