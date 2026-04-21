@@ -502,6 +502,7 @@ class TestPromptBuilderBuild:
 
         assert "## Blockers" in example_doc_content
         assert "## Must-Fix" not in example_doc_content
+        assert "## Verdict:" not in example_doc_content
 
     def test_build_spec_file_included(self, tmp_path: Path):
         """Test that spec file content is included when task.spec is set."""

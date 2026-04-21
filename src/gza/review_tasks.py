@@ -1,5 +1,6 @@
 """Shared helpers for creating review and follow-up tasks."""
 
+import re
 from collections.abc import Iterable
 from typing import Literal
 
@@ -10,6 +11,10 @@ from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
     strip_derived_implement_prefixes,
+)
+
+_FOLLOWUP_PROMPT_PREFIX_RE = re.compile(
+    r"^Follow-up\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
 
 
@@ -141,15 +146,40 @@ def build_followup_prompt_prefix(review_task_id: str, impl_task_id: str, finding
 def build_followup_prompt(
     review_task_id: str,
     impl_task_id: str,
-    finding_id: str,
-    recommendation: str | None,
+    finding: ReviewFinding,
 ) -> str:
     """Build full prompt for an auto-created follow-up implementation task."""
-    prefix = build_followup_prompt_prefix(review_task_id, impl_task_id, finding_id)
-    tail = (recommendation or "").strip()
-    if tail:
-        return f"{prefix} {tail}"
-    return prefix
+    prefix = build_followup_prompt_prefix(review_task_id, impl_task_id, finding.id)
+    tail = (finding.fix_or_followup or "").strip()
+    heading = f"{prefix} {tail}" if tail else prefix
+    return f"{heading}\n\n## Follow-up finding to implement:\n\n{format_followup_finding_context(finding)}"
+
+
+def format_followup_finding_context(finding: ReviewFinding) -> str:
+    """Format canonical finding context for follow-up implementation tasks."""
+    title = f" {finding.title}" if finding.title and finding.title != finding.id else ""
+    if finding.body.strip():
+        body = finding.body.strip()
+    else:
+        lines: list[str] = []
+        if finding.evidence:
+            lines.append(f"Evidence: {finding.evidence}")
+        if finding.impact:
+            lines.append(f"Impact: {finding.impact}")
+        if finding.fix_or_followup:
+            lines.append(f"Recommended follow-up: {finding.fix_or_followup}")
+        if finding.tests:
+            lines.append(f"Recommended tests: {finding.tests}")
+        body = "\n".join(lines)
+    return f"### {finding.id}{title}\n{body}".strip()
+
+
+def extract_followup_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
+    """Return (finding_id, review_task_id, impl_task_id) for follow-up prompts."""
+    match = _FOLLOWUP_PROMPT_PREFIX_RE.match(prompt.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
 
 
 def find_existing_followup_task(
@@ -198,8 +228,7 @@ def create_or_reuse_followup_task(
     prompt = build_followup_prompt(
         review_task.id,
         impl_task.id,
-        finding.id,
-        finding.fix_or_followup,
+        finding,
     )
     created = store.add(
         prompt=prompt,

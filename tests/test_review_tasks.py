@@ -12,7 +12,9 @@ from gza.review_tasks import (
     build_auto_review_prompt,
     create_or_reuse_followup_task,
     create_review_task,
+    extract_followup_prompt_parts,
     find_existing_followup_task,
+    format_followup_finding_context,
 )
 from gza.review_verdict import ReviewFinding
 
@@ -300,10 +302,56 @@ class TestFollowupTasks:
         )
 
     def test_build_followup_prompt(self):
-        assert (
-            build_followup_prompt("gza-200", "gza-101", "F1", "add malformed input validation")
-            == "Follow-up F1 from review gza-200 for task gza-101: add malformed input validation"
+        finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Validate malformed input handling",
+            body=(
+                "Evidence: malformed optional value is currently accepted.\n"
+                "Impact: Low-risk hardening opportunity.\n"
+                "Recommended follow-up: add malformed input validation.\n"
+                "Recommended tests: add malformed input CLI regression."
+            ),
+            evidence="malformed optional value is currently accepted.",
+            impact="Low-risk hardening opportunity.",
+            fix_or_followup="add malformed input validation",
+            tests="add malformed input CLI regression.",
         )
+        assert (
+            build_followup_prompt("gza-200", "gza-101", finding)
+            == "Follow-up F1 from review gza-200 for task gza-101: add malformed input validation\n\n"
+            "## Follow-up finding to implement:\n\n"
+            "### F1 Validate malformed input handling\n"
+            "Evidence: malformed optional value is currently accepted.\n"
+            "Impact: Low-risk hardening opportunity.\n"
+            "Recommended follow-up: add malformed input validation.\n"
+            "Recommended tests: add malformed input CLI regression."
+        )
+
+    def test_format_followup_finding_context_falls_back_to_structured_fields(self):
+        finding = ReviewFinding(
+            id="F2",
+            severity="FOLLOWUP",
+            title="",
+            body="",
+            evidence="legacy path misses normalization.",
+            impact="untrusted optional input can slip through.",
+            fix_or_followup="normalize optional claims",
+            tests="add malformed-claim regression",
+        )
+        assert format_followup_finding_context(finding) == (
+            "### F2\n"
+            "Evidence: legacy path misses normalization.\n"
+            "Impact: untrusted optional input can slip through.\n"
+            "Recommended follow-up: normalize optional claims\n"
+            "Recommended tests: add malformed-claim regression"
+        )
+
+    def test_extract_followup_prompt_parts(self):
+        assert extract_followup_prompt_parts(
+            "Follow-up F1 from review gza-200 for task gza-101: add malformed input validation"
+        ) == ("F1", "gza-200", "gza-101")
+        assert extract_followup_prompt_parts("Implement feature") is None
 
     def test_find_existing_followup_task_matches_prefix(self):
         store = MagicMock()
@@ -370,7 +418,12 @@ class TestFollowupTasks:
         created_task = _task(
             id="gza-402",
             task_type="implement",
-            prompt="Follow-up F2 from review gza-200 for task gza-101: update docs",
+            prompt=(
+                "Follow-up F2 from review gza-200 for task gza-101: update docs\n\n"
+                "## Follow-up finding to implement:\n\n"
+                "### F2 Title\n"
+                "Body"
+            ),
         )
         store.get_based_on_children.return_value = []
         store.add.return_value = created_task
