@@ -17,7 +17,7 @@ from gza.git import Git, GitError
 from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
 from gza.review_tasks import create_or_reuse_followup_task
-from gza.review_verdict import parse_review_report
+from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
@@ -28,6 +28,7 @@ from gza.runner import (
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
+    _check_dependency_merge_precondition,
     _complete_code_task,
     _compute_slug_override,
     _copy_learnings_to_worktree,
@@ -6810,6 +6811,53 @@ class TestDependencyMergePrecondition:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "GIT_ERROR"
+
+    def test_followup_task_dependency_is_merge_gated_by_reviewed_implementation(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feat/impl"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review implementation", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        store.update(review)
+
+        finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Hardening",
+            body="",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add malformed-input validation",
+            tests=None,
+        )
+        followup, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review,
+            impl_task=impl,
+            finding=finding,
+        )
+        assert created_now is True
+        assert followup.depends_on == impl.id
+
+        git = Mock()
+        git.branch_exists.return_value = True
+        git._run.return_value = Mock(returncode=1, stdout="", stderr="")
+
+        dep, target_branch, git_error = _check_dependency_merge_precondition(
+            followup,
+            store,
+            git,
+            default_branch="main",
+        )
+        assert dep is not None
+        assert dep.id == impl.id
+        assert target_branch == "main"
+        assert git_error is None
 
 
 class TestFindTaskOfTypeInChain:

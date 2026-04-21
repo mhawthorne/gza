@@ -1592,7 +1592,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         *,
         iteration_index: int,
         findings: tuple[Any, ...] | None = None,
-    ) -> None:
+    ) -> bool:
         followup_findings = findings
         if followup_findings is None:
             parsed_report = get_review_report(config.project_dir, review_task)
@@ -1600,7 +1600,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 finding for finding in parsed_report.findings if finding.severity == "FOLLOWUP"
             )
         if not followup_findings:
-            return
+            return False
 
         assert impl_task is not None
         created_tasks, reused_tasks = _create_or_reuse_followup_tasks(
@@ -1625,6 +1625,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 task=followup_task,
                 status="reused",
             )
+        return True
 
     iterate_started_at = time.monotonic()
     summary_rows: list[IterateSummaryRow] = []
@@ -1665,11 +1666,23 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             maybe_review = action.get("review_task")
             if action_type == "merge_with_followups" and isinstance(maybe_review, DbTask):
                 followup_findings = action.get("followup_findings")
-                _materialize_followup_tasks(
+                materialized = _materialize_followup_tasks(
                     maybe_review,
                     iteration_index=iteration,
                     findings=followup_findings if isinstance(followup_findings, tuple) else None,
                 )
+                if not materialized:
+                    maybe_review_verdict = "APPROVED_WITH_FOLLOWUPS"
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="review",
+                        task=maybe_review,
+                        verdict=maybe_review_verdict,
+                    )
+                    final_status = "blocked"
+                    final_stop_reason = "needs_discussion"
+                    break
             if isinstance(maybe_review, DbTask):
                 maybe_review_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
                 _append_summary_row(
@@ -1936,7 +1949,11 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 verdict=verdict,
             )
             if verdict == "APPROVED_WITH_FOLLOWUPS":
-                _materialize_followup_tasks(action_task, iteration_index=iteration)
+                materialized = _materialize_followup_tasks(action_task, iteration_index=iteration)
+                if not materialized:
+                    final_status = "blocked"
+                    final_stop_reason = "needs_discussion"
+                    break
                 final_status = "approved"
                 final_stop_reason = "approved_with_followups"
                 break

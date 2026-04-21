@@ -100,7 +100,8 @@ Conflict detection uses the currently checked-out branch as the merge target (`t
 | Latest review is `pending` | `run_review` — spawn worker |
 | Latest review is `in_progress` | `wait_review` — skip |
 | Verdict = `APPROVED` | `merge` |
-| Verdict = `APPROVED_WITH_FOLLOWUPS` | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
+| Verdict = `APPROVED_WITH_FOLLOWUPS` with at least one parsed `FOLLOWUP` finding | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
+| Verdict = `APPROVED_WITH_FOLLOWUPS` with zero parsed `FOLLOWUP` findings | `needs_discussion` — fail closed; review output is inconsistent |
 | Verdict = `CHANGES_REQUESTED` AND cycles >= `max_review_cycles` | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND improve is `in_progress` | `wait_improve` — skip |
 | Verdict = `CHANGES_REQUESTED` AND improve is `pending` | `run_improve` — spawn worker |

@@ -457,7 +457,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="review_approved_with_followups",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.latest_completed_review is not None
-        and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS",
+        and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS"
+        and bool(ctx.followup_findings),
         action=lambda ctx: {
             "type": "merge_with_followups",
             "description": "Merge (review APPROVED_WITH_FOLLOWUPS)",

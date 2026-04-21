@@ -234,6 +234,7 @@ def create_or_reuse_followup_task(
         prompt=prompt,
         task_type="implement",
         based_on=review_task.id,
+        depends_on=impl_task.id,
         group=impl_task.group,
     )
     return created, True

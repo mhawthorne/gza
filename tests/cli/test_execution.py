@@ -4406,6 +4406,71 @@ class TestIterateCommand:
         assert "followup" in output_second
         assert "reused" in output_second
 
+    def test_iterate_first_pass_approved_with_followups_without_findings_is_blocked(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+
+        review_output = (
+            "## Summary\n\n"
+            "- Looks good overall.\n\n"
+            "## Blockers\n\n"
+            "None.\n\n"
+            "## Follow-Ups\n\n"
+            "None.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Verdict: APPROVED_WITH_FOLLOWUPS\n"
+        )
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.id == review.id
+            task.status = "completed"
+            task.output_content = review_output
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=3,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        followups = [task for task in store.get_based_on_children(review.id) if task.task_type == "implement"]
+        assert result == 3
+        assert followups == []
+        assert "Iterate complete: BLOCKED (needs_discussion)" in output
+
     def test_pending_impl_all_changes_requested_with_iterations_four_ends_on_review(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

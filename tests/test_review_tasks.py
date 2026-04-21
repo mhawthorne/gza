@@ -439,4 +439,5 @@ class TestFollowupTasks:
         kwargs = store.add.call_args.kwargs
         assert kwargs["task_type"] == "implement"
         assert kwargs["based_on"] == "gza-200"
+        assert kwargs["depends_on"] == "gza-101"
         assert kwargs["group"] == "grp-a"

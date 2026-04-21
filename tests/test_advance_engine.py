@@ -301,3 +301,36 @@ def test_approved_with_followups_returns_merge_with_followups(tmp_path: Path, mo
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
     assert action["type"] == "merge_with_followups"
     assert len(action["followup_findings"]) == 1
+
+
+def test_approved_with_followups_without_followup_findings_needs_discussion(tmp_path: Path, monkeypatch):
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/no-followups"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            findings=(),
+            format_version="v2",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "needs_discussion"

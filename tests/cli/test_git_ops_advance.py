@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from gza.cli import _determine_advance_action, cmd_advance
 from gza.config import Config
-from gza.review_verdict import ReviewFinding
+from gza.review_verdict import ParsedReviewReport, ReviewFinding
 
 from .conftest import (
     make_store,
@@ -215,6 +215,47 @@ class TestAdvanceCommand:
             and t.prompt.startswith(f"Follow-up F1 from review {review_task.id} for task {task.id}:")
         ]
         assert len(followups) == 1
+
+    def test_advance_approved_with_followups_without_findings_needs_discussion(self, tmp_path: Path):
+        """APPROVED_WITH_FOLLOWUPS without FOLLOWUP findings must not be merge-ready."""
+        from gza import advance_engine as advance_engine_module
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/no-followups"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        with (
+            patch(
+                "gza.cli.Git",
+                return_value=self._mock_git(current_branch="main", can_merge=True),
+            ),
+            patch.object(
+                advance_engine_module,
+                "get_review_report",
+                return_value=ParsedReviewReport(
+                    verdict="APPROVED_WITH_FOLLOWUPS",
+                    findings=(),
+                    format_version="v2",
+                ),
+            ),
+        ):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "needs manual attention" in result.stdout
+        assert "Merge (review APPROVED_WITH_FOLLOWUPS)" not in result.stdout
 
     def test_advance_spawns_rebase_worker_on_conflicts(self, tmp_path: Path):
         """advance spawns a background rebase --resolve worker when conflicts are detected."""
