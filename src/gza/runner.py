@@ -39,7 +39,6 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task
 from .review_verdict import parse_review_verdict
-from .task_slug import extract_task_id_suffix, get_base_task_slug
 
 logger = logging.getLogger(__name__)
 
@@ -408,9 +407,8 @@ def generate_slug(
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
         if slug_override is not None:
-            # slug_override already encodes full lineage context
-            # (e.g. "0000mr-rev-myproj-add-feature")
-            # so do not prepend project_prefix — it would double-embed the prefix for chained tasks
+            # slug_override is a semantic lineage slug body (already slugified),
+            # so do not prepend project_prefix.
             base_id = f"{date_prefix}-{slug_override}"
         else:
             slug = slugify(prompt)
@@ -434,58 +432,69 @@ def generate_slug(
 
 
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
-    """Compute a slug_override for review/implement/improve/fix tasks.
-
-    Uses ``{task_id_suffix}-{type_prefix}-{target_slug}`` where target is the
-    direct parent this task operates on:
-    - review -> depends_on
-    - improve -> based_on
-    - implement -> based_on (fallback: depends_on)
-    - fix -> based_on
+    """Compute a slug_override for review/implement/improve tasks.
+    Returns a semantic slug body anchored to the task lineage:
+    - implement/improve -> prompt from the top ``based_on`` ancestor (lineage root)
+    - review -> prompt from direct ``depends_on`` target
 
     Returns None for other task types (slug is derived from prompt as usual).
     """
-    prefix_map = {
-        "review": "rev",
-        "implement": "impl",
-        "improve": "impr",
-        "fix": "fix",
-    }
-    prefix = prefix_map.get(task.task_type)
-    if prefix is None:
+    if task.task_type not in {"review", "implement", "improve"}:
         return None
 
     if task.task_type == "review":
-        anchor_id = task.depends_on
-    elif task.task_type in {"improve", "fix"}:
-        anchor_id = task.based_on
-    else:  # implement
-        anchor_id = task.based_on or task.depends_on
-
-    anchor_task = None
-    if anchor_id is not None:
-        anchor_task = store.get(anchor_id)
-        if anchor_task is None:
+        if task.depends_on is None:
+            return slugify(task.prompt)
+        target = store.get(task.depends_on)
+        if target is None:
             logger.warning(
-                "Slug override anchor task missing for task #%s (%s): anchor_id=%s; "
-                "falling back to the child task prompt",
+                "Slug override review target missing for task #%s: depends_on=%s; "
+                "falling back to review task prompt",
                 task.id,
-                task.task_type,
-                anchor_id,
+                task.depends_on,
             )
+            return slugify(task.prompt)
+        return slugify(target.prompt)
 
-    # get_base_task_slug strips the YYYYMMDD date prefix and any trailing
-    # "-N" revision suffix from the anchor task's slug. The returned override
-    # has no date prefix; generate_slug re-prepends today's date later, so
-    # passing a bare override keeps the final slug from gaining a double date.
-    target_slug = (
-        get_base_task_slug(anchor_task.slug)
-        if anchor_task and anchor_task.slug
-        else slugify(anchor_task.prompt if anchor_task else task.prompt)
-    )
-    task_id_suffix = extract_task_id_suffix(task.id)
+    if task.based_on is None:
+        return slugify(task.prompt)
 
-    return "-".join(part for part in (task_id_suffix, prefix, target_slug) if part)
+    current = store.get(task.based_on)
+    if current is None:
+        logger.warning(
+            "Slug override ancestor missing for task #%s: based_on=%s; "
+            "falling back to child task prompt",
+            task.id,
+            task.based_on,
+        )
+        return slugify(task.prompt)
+
+    seen = {current.id} if current.id else set()
+    while current.based_on is not None:
+        next_parent = store.get(current.based_on)
+        if next_parent is None:
+            logger.warning(
+                "Slug override ancestor missing for task #%s while walking based_on chain: "
+                "missing_parent=%s; using last resolved ancestor #%s",
+                task.id,
+                current.based_on,
+                current.id,
+            )
+            break
+        if next_parent.id in seen:
+            logger.warning(
+                "Slug override cycle detected for task #%s while walking based_on chain: "
+                "ancestor=%s; using last resolved ancestor #%s",
+                task.id,
+                next_parent.id,
+                current.id,
+            )
+            break
+        current = next_parent
+        if current.id is not None:
+            seen.add(current.id)
+
+    return slugify(current.prompt)
 
 
 def _slug_exists(

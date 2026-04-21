@@ -1,6 +1,7 @@
 """Tests for configuration, setup, and admin CLI commands."""
 
 
+import re
 import json
 import os
 import subprocess
@@ -1419,6 +1420,78 @@ class TestStatsIterationsCommand:
         assert f"{date.today():%Y-%m-%d}" in result.stdout
         assert "1 tasks  |  2 iterations  |  1 improves  |  1/1 approved  |  $0.19 total" in result.stdout
         assert "Iteration count stats: min 2  |  p10 2  |  p25 2  |  p50 2  |  p75 2  |  p90 2  |  p99 2  |  max 2" in result.stdout
+
+    def test_stats_iterations_preserves_override_semantic_slug_label(self, tmp_path: Path):
+        """Prefixless override-backed slugs should display full semantic labels."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement add feature", task_type="implement")
+        assert impl.id is not None
+        impl.slug = "20260421-add-feature"
+        store.update(impl)
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        review = store.add("Review add feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: CHANGES_REQUESTED",
+            stats=TaskStats(cost_usd=0.02),
+        )
+
+        improve = store.add("Improve add feature", task_type="improve", based_on=impl.id, depends_on=review.id)
+        assert improve.id is not None
+        store.mark_completed(improve, has_commits=False, stats=TaskStats(cost_usd=0.03))
+
+        final_review = store.add("Review add feature final", task_type="review", depends_on=impl.id)
+        store.mark_completed(
+            final_review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.01),
+        )
+
+        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        label_match = re.search(rf"^{re.escape(impl.id)}\s+(?P<label>\S+)", result.stdout, re.MULTILINE)
+        assert label_match is not None
+        assert label_match.group("label") == "add-feature"
+
+    def test_stats_iterations_preserves_ambiguous_prefix_token_in_semantic_slug(
+        self, tmp_path: Path
+    ):
+        """Semantic slugs that start with project_prefix token are not truncated."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement gza rollout", task_type="implement")
+        assert impl.id is not None
+        impl.slug = "20260421-gza-rollout"
+        store.update(impl)
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        review = store.add("Review gza rollout", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(
+            review,
+            has_commits=False,
+            output_content="Verdict: APPROVED",
+            stats=TaskStats(cost_usd=0.01),
+        )
+
+        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        label_match = re.search(rf"^{re.escape(impl.id)}\s+(?P<label>\S+)", result.stdout, re.MULTILINE)
+        assert label_match is not None
+        assert label_match.group("label") == "gza-rollout"
 
     def test_stats_iterations_last_limits_to_recent_implementations(self, tmp_path: Path):
         """--last N should keep only the N newest implementation rows."""

@@ -69,6 +69,10 @@ gza stats iterations --all                         # All-time view
 
 Only impls with at least one completed review appear in the table. Failed, in-progress/queued, and no-review impls are excluded so they don't skew the iteration-count distribution (failed impls would otherwise inject 0s into every percentile). Excluded impls are summarized on a single `Excluded:` line below the totals, with a per-verdict breakdown and aggregated cost.
 
+Row task labels display the stored slug body after removing only the date prefix (`YYYYMMDD-`).
+This avoids ambiguous prefix stripping when a semantic slug itself starts with the
+project prefix token (for example, `YYYYMMDD-gza-rollout`).
+
 ### Flag compatibility
 
 - `--hours` cannot be combined with `--days`, `--start-date`, or `--end-date`.

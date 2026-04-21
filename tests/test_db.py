@@ -4163,7 +4163,7 @@ class TestMigrationUtilityFunctions:
         slug_override = _compute_slug_override(review_task, store)
         assert slug_override is not None
         assert "00000a" not in slug_override
-        assert slug_override.endswith("rev-10-impl-add-feature")
+        assert slug_override == "add-feature"
 
     def test_run_v26_migration_preserves_semantic_slug_prefixes(self, tmp_path: Path) -> None:
         import sqlite3

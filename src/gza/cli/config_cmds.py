@@ -19,6 +19,7 @@ from ..db import SqliteTaskStore, Task, task_id_numeric_key
 from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
+from ..task_slug import get_slug_display_text
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
 
@@ -471,11 +472,7 @@ def _cmd_stats_iterations(
     def _task_label(task: Task) -> str:
         slug_display: str | None = None
         if task.slug:
-            parts = task.slug.split("-", 2)
-            if len(parts) == 3 and len(parts[0]) == 8 and parts[0].isdigit():
-                slug_display = parts[2]
-            else:
-                slug_display = task.slug
+            slug_display = get_slug_display_text(task.slug, config.project_prefix)
         elif task.prompt:
             slug_display = re.sub(r"[^a-z0-9]+", "-", task.prompt.lower()).strip("-")
         return f"{task.id}  {slug_display}" if slug_display else (task.id or "(unknown)")
