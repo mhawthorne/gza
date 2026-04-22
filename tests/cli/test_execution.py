@@ -458,6 +458,25 @@ class TestRetryCommand:
         assert new_task.based_on == task.id
         assert new_task.status == "pending"
 
+    def test_retry_same_branch_task_uses_base_branch_for_fresh_retry(self, tmp_path: Path):
+        """Retries of same-branch tasks fork a fresh branch from the failed branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Improve with shared branch", task_type="improve", same_branch=True)
+        task.status = "failed"
+        task.branch = "feature/impl-branch"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_task = get_latest_task(store, based_on=task.id, task_type="improve")
+        assert retry_task is not None
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == "feature/impl-branch"
+
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
 

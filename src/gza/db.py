@@ -27,6 +27,7 @@ __all__ = [
     "InvalidTaskIdError",
     "ManualMigrationRequired",
     "Task",
+    "TaskComment",
     "TaskStats",
     "SqliteTaskStore",
     "extract_failure_reason",
@@ -208,6 +209,7 @@ class Task:
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
     same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
+    base_branch: str | None = None  # Optional branch ref used when creating a fresh retry branch
     task_type_hint: str | None = None  # Explicit branch type hint (e.g., "fix", "feature")
     output_content: str | None = None  # Actual content of report/plan/review (for persistence)
     session_id: str | None = None  # Claude session ID for resume capability
@@ -249,6 +251,19 @@ class TaskStats:
     output_tokens: int | None = None  # Total output tokens
     tokens_estimated: bool = False
     cost_estimated: bool = False
+
+
+@dataclass(frozen=True)
+class TaskComment:
+    """A user/operator comment attached to a task."""
+
+    id: int
+    task_id: str
+    content: str
+    source: str
+    author: str | None
+    created_at: datetime
+    resolved_at: datetime | None
 
 # Migration from v18 to v19
 MIGRATION_V18_TO_V19 = """
@@ -294,8 +309,23 @@ MIGRATION_V30_TO_V31 = """
 ALTER TABLE tasks ADD COLUMN execution_mode TEXT;
 """
 
+# Migration from v31 to v32: task comments table
+MIGRATION_V31_TO_V32 = """
+CREATE TABLE IF NOT EXISTS task_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    source TEXT NOT NULL,
+    author TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -322,6 +352,15 @@ def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool
     return any(_column_name(row) == column for row in rows)
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Return True when a table exists in sqlite_master."""
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
 def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: int) -> None:
     """Validate required schema artifacts for selected automatic migration targets."""
     required_columns_by_version: dict[int, tuple[str, str]] = {
@@ -336,6 +375,8 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         raise RuntimeError(
             f"Auto-migration to v{target_version} incomplete: missing required column {table}.{column}"
         )
+    if target_version == 32 and not _table_exists(conn, "task_comments"):
+        raise RuntimeError("Auto-migration to v32 incomplete: missing required table task_comments")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -397,7 +438,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_lines_removed INTEGER,
     review_cleared_at TEXT,
     log_schema_version INTEGER DEFAULT 1,
-    execution_mode TEXT
+    execution_mode TEXT,
+    base_branch TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -448,6 +490,17 @@ CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
+CREATE TABLE IF NOT EXISTS task_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    source TEXT NOT NULL,
+    author TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at);
 """
 
 # Migration from v1 to v2
@@ -726,6 +779,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (29, MIGRATION_V28_TO_V29),
     (30, MIGRATION_V29_TO_V30),
     (31, MIGRATION_V30_TO_V31),
+    (32, MIGRATION_V31_TO_V32),
 ]
 
 
@@ -800,6 +854,25 @@ class SqliteTaskStore:
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
+            # Repair required artifacts for current schemas when external damage
+            # or partial migrations removed them.
+            if not _table_exists(conn, "task_comments"):
+                try:
+                    conn.executescript(MIGRATION_V31_TO_V32)
+                except sqlite3.OperationalError as exc:
+                    raise SchemaIntegrityError(
+                        "Schema integrity check failed while repairing v32: "
+                        "missing task_comments table; use a writable database."
+                    ) from exc
+            if not _table_has_column(conn, "tasks", "base_branch"):
+                try:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN base_branch TEXT")
+                except sqlite3.OperationalError as exc:
+                    raise SchemaIntegrityError(
+                        "Schema integrity check failed while repairing base_branch column: "
+                        "use a writable database."
+                    ) from exc
+
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
         conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
@@ -846,6 +919,7 @@ class SqliteTaskStore:
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
             same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
+            base_branch=row["base_branch"] if "base_branch" in keys else None,
             task_type_hint=row["task_type_hint"] if "task_type_hint" in keys else None,
             output_content=row["output_content"] if "output_content" in keys else None,
             session_id=row["session_id"] if "session_id" in keys else None,
@@ -911,6 +985,18 @@ class SqliteTaskStore:
             legacy_event_id=row["legacy_event_id"],
         )
 
+    def _row_to_task_comment(self, row: sqlite3.Row) -> TaskComment:
+        """Convert a database row to a TaskComment."""
+        return TaskComment(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            content=row["content"],
+            source=row["source"],
+            author=row["author"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
+        )
+
     # === Task CRUD ===
 
     def _next_id(self, conn: sqlite3.Connection) -> str:
@@ -944,6 +1030,7 @@ class SqliteTaskStore:
         spec: str | None = None,
         create_review: bool = False,
         same_branch: bool = False,
+        base_branch: str | None = None,
         task_type_hint: str | None = None,
         model: str | None = None,
         provider: str | None = None,
@@ -959,8 +1046,8 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_id,
@@ -973,6 +1060,7 @@ class SqliteTaskStore:
                     spec,
                     1 if create_review else 0,
                     1 if same_branch else 0,
+                    base_branch,
                     task_type_hint,
                     model,
                     provider,
@@ -1072,6 +1160,8 @@ class SqliteTaskStore:
                     spec = ?,
                     create_review = ?,
                     same_branch = ?,
+                    base_branch = ?,
+                    task_type_hint = ?,
                     output_content = ?,
                     session_id = ?,
                     pr_number = ?,
@@ -1119,6 +1209,8 @@ class SqliteTaskStore:
                     task.spec,
                     1 if task.create_review else 0,
                     1 if task.same_branch else 0,
+                    task.base_branch,
+                    task.task_type_hint,
                     task.output_content,
                     task.session_id,
                     task.pr_number,
@@ -1472,7 +1564,7 @@ class SqliteTaskStore:
                 SELECT * FROM tasks
                 WHERE merge_status = 'unmerged'
                 AND (
-                    task_type NOT IN ('improve', 'rebase')
+                    task_type NOT IN ('improve', 'rebase', 'fix')
                     OR based_on IS NULL
                 )
                 ORDER BY completed_at DESC
@@ -1820,16 +1912,30 @@ class SqliteTaskStore:
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT * FROM tasks
-                WHERE task_type = 'improve' AND based_on = ? AND depends_on = ?
+                WITH RECURSIVE improve_chain(id) AS (
+                    SELECT id
+                    FROM tasks
+                    WHERE task_type = 'improve'
+                      AND based_on = ?
+                      AND depends_on = ?
+                    UNION ALL
+                    SELECT child.id
+                    FROM tasks child
+                    JOIN improve_chain parent ON child.based_on = parent.id
+                    WHERE child.task_type = 'improve'
+                      AND child.depends_on = ?
+                )
+                SELECT t.*
+                FROM tasks t
+                JOIN improve_chain c ON c.id = t.id
                 ORDER BY created_at DESC
                 """,
-                (impl_task_id, review_task_id),
+                (impl_task_id, review_task_id, review_task_id),
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
     def get_improve_tasks_by_root(self, root_task_id: str) -> list[Task]:
-        """Get all improve tasks whose based_on points to root_task_id.
+        """Get all improve tasks transitively rooted at the given implementation.
 
         This remains for review/improve workflow logic; lineage display should
         use get_lineage_children() via gza.query.build_lineage_tree().
@@ -1837,13 +1943,126 @@ class SqliteTaskStore:
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT * FROM tasks
-                WHERE task_type = 'improve' AND based_on = ?
+                WITH RECURSIVE improve_chain(id) AS (
+                    SELECT id
+                    FROM tasks
+                    WHERE task_type = 'improve' AND based_on = ?
+                    UNION ALL
+                    SELECT child.id
+                    FROM tasks child
+                    JOIN improve_chain parent ON child.based_on = parent.id
+                    WHERE child.task_type = 'improve'
+                )
+                SELECT t.*
+                FROM tasks t
+                JOIN improve_chain c ON c.id = t.id
                 ORDER BY created_at DESC
                 """,
                 (root_task_id,),
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def get_fix_tasks_by_root(self, root_task_id: str) -> list[Task]:
+        """Get fix tasks transitively rooted at the given implementation."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                WITH RECURSIVE code_chain(id, task_type) AS (
+                    SELECT id, task_type
+                    FROM tasks
+                    WHERE based_on = ?
+                      AND task_type IN ('improve', 'fix')
+                    UNION ALL
+                    SELECT child.id, child.task_type
+                    FROM tasks child
+                    JOIN code_chain parent ON child.based_on = parent.id
+                    WHERE child.task_type IN ('improve', 'fix')
+                )
+                SELECT t.*
+                FROM tasks t
+                JOIN code_chain c ON c.id = t.id
+                WHERE t.task_type = 'fix'
+                ORDER BY t.created_at DESC
+                """,
+                (root_task_id,),
+            )
+            return [self._row_to_task(row) for row in cur.fetchall()]
+
+    def add_comment(
+        self,
+        task_id: str,
+        content: str,
+        *,
+        source: str = "direct",
+        author: str | None = None,
+    ) -> TaskComment:
+        """Persist a task comment and return it."""
+        if source not in {"direct", "github"}:
+            raise ValueError(f"Unknown comment source: {source}")
+        normalized = content.strip()
+        if not normalized:
+            raise ValueError("Comment content cannot be empty")
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO task_comments (task_id, content, source, author, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (task_id, normalized, source, author, created_at),
+            )
+            row = conn.execute(
+                "SELECT * FROM task_comments WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_task_comment(row)
+
+    def get_comments(
+        self,
+        task_id: str,
+        *,
+        unresolved_only: bool = False,
+        created_on_or_before: datetime | None = None,
+    ) -> list[TaskComment]:
+        """Return comments for a task in creation order."""
+        query = "SELECT * FROM task_comments WHERE task_id = ?"
+        params: list[Any] = [task_id]
+        if unresolved_only:
+            query += " AND resolved_at IS NULL"
+        if created_on_or_before is not None:
+            cutoff = created_on_or_before
+            if cutoff.tzinfo is not None:
+                cutoff = cutoff.astimezone(UTC)
+            query += " AND created_at <= ?"
+            params.append(cutoff.isoformat())
+        query += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as conn:
+            cur = conn.execute(query, tuple(params))
+            return [self._row_to_task_comment(row) for row in cur.fetchall()]
+
+    def resolve_comments(
+        self,
+        task_id: str,
+        *,
+        created_on_or_before: datetime | None = None,
+    ) -> None:
+        """Mark unresolved comments as resolved for a task."""
+        resolved_at = datetime.now(UTC).isoformat()
+        query = (
+            "UPDATE task_comments "
+            "SET resolved_at = ? "
+            "WHERE task_id = ? AND resolved_at IS NULL"
+        )
+        params: list[Any] = [resolved_at, task_id]
+        if created_on_or_before is not None:
+            cutoff = created_on_or_before
+            if cutoff.tzinfo is not None:
+                cutoff = cutoff.astimezone(UTC)
+            query += " AND created_at <= ?"
+            params.append(cutoff.isoformat())
+        with self._connect() as conn:
+            conn.execute(query, tuple(params))
 
     def get_impl_tasks_by_depends_on_or_based_on(self, task_id: str) -> list[Task]:
         """Get implement tasks that depend on or are based on a given task.

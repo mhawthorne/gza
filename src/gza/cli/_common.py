@@ -323,14 +323,23 @@ def _run_foreground(
             if rebase_exit_code != 0:
                 registry.mark_completed(worker_id, exit_code=rebase_exit_code, status="failed")
                 return rebase_exit_code
-        exit_code = run(
-            config,
-            task_id=task_id,
-            resume=resume,
-            open_after=open_after,
-            skip_precondition_check=force,
-            invocation=invocation,
-        )
+        if invocation is None:
+            exit_code = run(
+                config,
+                task_id=task_id,
+                resume=resume,
+                open_after=open_after,
+                skip_precondition_check=force,
+            )
+        else:
+            exit_code = run(
+                config,
+                task_id=task_id,
+                resume=resume,
+                open_after=open_after,
+                skip_precondition_check=force,
+                invocation=invocation,
+            )
         status = "completed" if exit_code == 0 else "failed"
         registry.mark_completed(worker_id, exit_code=exit_code, status=status)
         return exit_code

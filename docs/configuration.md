@@ -292,7 +292,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal`
+Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`
 
 Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
 
@@ -711,6 +711,8 @@ gza run-inline <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the run |
 
+`run-inline` currently runs in observe-only mode for all providers. Claude interactive inline session telemetry is temporarily disabled for tracked runner-managed runs until session/step callback persistence is fully wired.
+
 ### resume
 
 Resume a failed task from where it left off. The AI continues with the existing conversation context.
@@ -902,6 +904,23 @@ gza clean [options]
 | `--force` | Skip confirmation prompt before removing worktrees |
 | `--dry-run` | Show what would be cleaned without doing it |
 
+### comment
+
+Add a comment to a task.
+
+```bash
+gza comment <task_id> <text> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID to comment on (e.g. `gza-1234`) |
+| `text` | Comment text to add |
+| `--author NAME` | Optional author name recorded with the comment |
+
+When task comments exist, `gza show` also includes a `Comments:` section.
+When tasks have comments, `gza history` includes a `comments: N` indicator.
+
 ### improve
 
 Create an improve task to address review feedback on an implementation.
@@ -912,7 +931,7 @@ gza improve <impl_task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `impl_task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
@@ -924,6 +943,27 @@ gza improve <impl_task_id> [options]
 | `--force` | Skip dependency merge precondition checks when running the improve task |
 
 The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
+When no completed review exists, improve can use unresolved task comments as feedback context.
+If no completed review exists, or a review exists but unresolved comments do, improve still runs using comments-only feedback.
+
+### fix
+
+Create and optionally run a fix rescue task for a stuck implementation lifecycle.
+
+```bash
+gza fix <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
+| `--force` | Skip dependency precondition checks when running the fix task |
 
 ### review
 
@@ -935,7 +975,7 @@ gza review <task_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID (implement, improve, or review — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
