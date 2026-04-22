@@ -3,9 +3,10 @@ This is an improve task. Your feedback context can come from two sources:
 - A completed review with **Must-Fix** items (blockers) and **Suggestions** (follow-ups).
 - Unresolved task **Comments** attached to the implementation.
 
-One or both of these sections may appear above. If a review is present, it will be under a `## Review feedback to address:` heading. If comments are present, they will be under a `## Comments:` heading. Treat whichever sections are present as the authoritative feedback for this pass. If no review section is present, the comments alone are sufficient to drive this improve.
+One or both of these sections may appear above. If a review is present, it will be under a `## Review feedback to address:` heading. If comments are present, they will be under a `## Comments:` heading. Treat whichever sections are present as the authoritative feedback for this pass. If no review section is present, comments alone are sufficient to drive this improve — you are not required to fabricate Must-Fix structure when the feedback source is comments only.
 
 Your job is to address every blocking feedback item presented:
+Your job is to address all **Blockers** only.
 - Address all **Must-Fix**/**Blocker** items from the review, when a review section is present.
 - Address every unresolved entry in the Comments section, when it is present.
 - Treat review **Suggestions**/**Follow-Ups** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
@@ -18,11 +19,13 @@ Work through each blocking item systematically. For each item:
 - If the feedback concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
 
 Before finishing, verify that every blocking item has an explicit closure condition in your final report:
-- The review item and/or comment you addressed
+- The review item you addressed
+- The comment you addressed (when comments are present)
 - The code change you made
 - The targeted test you added or updated
 - Any docs/help/operator-facing text you updated, if applicable
 
+If a Blocker item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
 If a Must-Fix/Blocker item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes. Apply the same rule to comments.
 
 Do not leave blocking feedback items partially addressed. The goal is to resolve all gating feedback in a single pass without creating extra scope.
