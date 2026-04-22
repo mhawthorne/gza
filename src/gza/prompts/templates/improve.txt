@@ -1,20 +1,27 @@
-This is an improve task. The review content included in your context contains Must-Fix items and Suggestions from the code review.
+This is an improve task. Your feedback context can come from two sources:
 
-Your job is to address all **Must-Fix** items from the review. Treat **Suggestions** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
+- A completed review with **Must-Fix** items (blockers) and **Suggestions** (optional follow-up).
+- Unresolved task **Comments** attached to the implementation.
 
-Work through each Must-Fix item systematically. For each item:
+One or both of these sections may appear above. If a review is present, it will be under a `## Review feedback to address:` heading. If comments are present, they will be under a `## Comments:` heading. Treat whichever sections are present as the authoritative feedback for this pass. If no review section is present, the comments alone are sufficient to drive this improve — you are not required to fabricate Must-Fix structure when the feedback source is comments only.
+
+Your job is to address every feedback item presented:
+- Address all **Must-Fix** items from the review, when a review section is present. Treat **Suggestions** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
+- Address every unresolved entry in the Comments section, when it is present.
+
+Work through each feedback item systematically. For each item:
 - Identify the specific change required.
 - Implement the fix.
 - Verify your change addresses the issue described.
-- Add or update targeted tests that cover the specific failure mode called out in the review.
-- If the review item concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
+- Add or update targeted tests that cover the specific failure mode called out in the feedback.
+- If the feedback concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
 
-Before finishing, verify that every Must-Fix item has an explicit closure condition in your final report:
-- The review item you addressed
+Before finishing, verify that every feedback item has an explicit closure condition in your final report:
+- The review item you addressed, or the comment you addressed
 - The code change you made
 - The targeted test you added or updated
 - Any docs/help/operator-facing text you updated, if applicable
 
-If a Must-Fix item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
+If a Must-Fix item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes. Apply the same rule to comments — if an unresolved comment is already addressed by the current code, say so and cite the evidence rather than making a redundant change.
 
-Do not leave Must-Fix items partially addressed. The goal is to resolve all blocking review feedback in a single pass without creating extra scope.
+Do not leave feedback items partially addressed. The goal is to resolve all blocking feedback in a single pass without creating extra scope.

@@ -127,6 +127,57 @@ class TestPromptBuilderBuild:
         assert "The review item you addressed" in result
         assert "If a Must-Fix item no longer applies" in result
 
+    def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
+        self, tmp_path: Path
+    ):
+        """Comments-only improve instructions must accept comments as the sole feedback source.
+
+        Regression: the improve template previously opened with "The review content included
+        in your context contains Must-Fix items and Suggestions from the code review", which
+        contradicts comments-only improve runs where no review exists.
+        """
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement comment-addressed change", task_type="implement")
+        assert impl_task.id is not None
+        store.add_comment(impl_task.id, content="Rename helper for clarity", source="direct")
+
+        improve_task = store.add(
+            prompt="Improve from unresolved comments",
+            task_type="improve",
+            based_on=impl_task.id,
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = None
+
+        summary_path = tmp_path / ".gza" / "summaries" / "improve-comments-only.md"
+        result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
+
+        # Context assembly: comments-only path should inject a Comments section and
+        # no Review feedback section. The improve template mentions both headings in
+        # its explanation, so assert on occurrence counts: the Review heading must
+        # appear only as a template mention (1x), and the Comments heading must
+        # appear as both template mention and injected section (2x).
+        assert "Rename helper for clarity" in result
+        assert result.count("## Review feedback to address:") == 1
+        assert result.count("## Comments:") == 2
+
+        # Template: must describe comments as a first-class feedback source and not force
+        # Must-Fix/Suggestions structure when no review is present.
+        assert "Unresolved task **Comments** attached to the implementation." in result
+        assert (
+            "comments alone are sufficient to drive this improve — you are not required "
+            "to fabricate Must-Fix structure when the feedback source is comments only."
+            in result
+        )
+        assert (
+            "The review content included in your context contains Must-Fix items"
+            not in result
+        )
+
     def test_build_fix_type_with_summary(self, tmp_path: Path):
         """Fix prompts include rescue instructions and summary contract."""
         db_path = tmp_path / "test.db"
@@ -571,6 +622,16 @@ class TestPromptBuilderImproveTask:
         """Test the exact format of improve task prompt."""
         result = PromptBuilder().improve_task_prompt(task_id=5, review_id=7)
         assert result == "Improve implementation of task 5 based on review 7"
+
+    def test_improve_task_prompt_mentions_comments_when_present(self):
+        """Prompt should mention unresolved comments when comment feedback exists."""
+        result = PromptBuilder().improve_task_prompt(task_id=5, review_id=7, has_comments=True)
+        assert "unresolved comments" in result
+
+    def test_improve_task_prompt_supports_comments_only_feedback(self):
+        """Prompt should support improve tasks with comments and no review."""
+        result = PromptBuilder().improve_task_prompt(task_id=5, review_id=None, has_comments=True)
+        assert result == "Improve implementation of task 5 based on unresolved comments"
 
 
 class TestPromptBuilderReviewTask:

@@ -37,6 +37,7 @@ from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task, load_dotenv
 from ._common import (
     DuplicateReviewError,
+    _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
     _create_review_task,
@@ -1703,15 +1704,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 )
                 console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (retry of {failed_improve.id})[/{_c_ok}]")
             else:
-                improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task.id)
-                improve_task = store.add(
-                    prompt=improve_prompt,
-                    task_type='improve',
-                    depends_on=review_task.id,
-                    based_on=task.id,
-                    same_branch=True,
-                    group=task.group,
-                )
+                try:
+                    improve_task = _create_improve_task(store, task, review_task)
+                except ValueError as exc:
+                    console.print(f"      [{_c_err}]✗ Failed to create improve task: {exc}[/{_c_err}]")
+                    error_count += 1
+                    continue
                 console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
 
             # Spawn background worker — use resume worker if this is a resume task

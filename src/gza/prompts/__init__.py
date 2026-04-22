@@ -245,17 +245,33 @@ class PromptBuilder:
             diff_stat=diff_stat,
         )
 
-    def improve_task_prompt(self, task_id: str, review_id: str) -> str:
+    def improve_task_prompt(
+        self,
+        task_id: str,
+        review_id: str | None,
+        *,
+        has_comments: bool = False,
+    ) -> str:
         """Build the prompt for an improve task.
 
         Args:
             task_id: The ID of the implementation task being improved.
-            review_id: The ID of the review task being addressed.
+            review_id: The ID of the review task being addressed (if any).
+            has_comments: Whether unresolved task comments exist for feedback context.
 
         Returns:
             Prompt string for an improve task.
         """
-        return f"Improve implementation of task {task_id} based on review {review_id}"
+        if review_id is not None and has_comments:
+            return (
+                f"Improve implementation of task {task_id} "
+                f"based on review {review_id} and unresolved comments"
+            )
+        if review_id is not None:
+            return f"Improve implementation of task {task_id} based on review {review_id}"
+        if has_comments:
+            return f"Improve implementation of task {task_id} based on unresolved comments"
+        return f"Improve implementation of task {task_id}"
 
     def fix_task_prompt(self, task_id: str, review_id: str | None = None) -> str:
         """Build the prompt for a stuck-task rescue fix task."""

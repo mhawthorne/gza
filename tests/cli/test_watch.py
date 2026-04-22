@@ -910,6 +910,54 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == improve.id
 
 
+def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp_path: Path) -> None:
+    """Watch-created improve prompts should include unresolved comments when present."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-improve-comments"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    store.add_comment(impl.id, "Please fix edge-case validation from QA feedback.")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    improves = store.get_improve_tasks_for(impl.id, review.id)
+    assert len(improves) == 1
+    assert "unresolved comments" in improves[0].prompt
+
+
 def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path) -> None:
     """Improve advance action should resume a resumable failed improve instead of creating a new sibling."""
     setup_config(tmp_path)

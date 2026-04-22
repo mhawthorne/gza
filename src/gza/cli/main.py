@@ -9,6 +9,7 @@ from ..db import (
     KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
     ManualMigrationRequired,
+    SchemaIntegrityError,
     SqliteTaskStore,
     check_migration_status,
     preview_v25_migration,
@@ -40,6 +41,7 @@ from .config_cmds import (
 )
 from .execution import (
     cmd_add,
+    cmd_comment,
     cmd_edit,
     cmd_fix,
     cmd_implement,
@@ -1044,6 +1046,25 @@ def main() -> int:
     )
     add_common_args(edit_parser)
 
+    # comment command
+    comment_parser = subparsers.add_parser("comment", help="Add a comment to a task")
+    comment_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID to comment on",
+    )
+    comment_parser.add_argument(
+        "text",
+        type=str,
+        help="Comment text",
+    )
+    comment_parser.add_argument(
+        "--author",
+        type=str,
+        help="Optional author attribution",
+    )
+    add_common_args(comment_parser)
+
     # learnings command
     learnings_parser = subparsers.add_parser("learnings", help="Manage project learnings")
     learnings_subparsers = learnings_parser.add_subparsers(
@@ -1158,7 +1179,10 @@ def main() -> int:
     add_common_args(resume_parser)
 
     # improve command
-    improve_parser = subparsers.add_parser("improve", help="Create an improve task based on implementation and review")
+    improve_parser = subparsers.add_parser(
+        "improve",
+        help="Create an improve task from review feedback and/or unresolved task comments",
+    )
     improve_parser.add_argument(
         "task_id",
         type=str,
@@ -1780,6 +1804,8 @@ def main() -> int:
             return cmd_add(args)
         elif args.command == "edit":
             return cmd_edit(args)
+        elif args.command == "comment":
+            return cmd_comment(args)
         elif args.command == "delete":
             return cmd_delete(args)
         elif args.command == "retry":
@@ -1831,6 +1857,13 @@ def main() -> int:
         return 1
     except InvalidTaskIdError as e:
         print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except SchemaIntegrityError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print(
+            "Run 'gza migrate' with a writable database (or restore schema artifacts), then retry.",
+            file=sys.stderr,
+        )
         return 1
 
     return 0

@@ -923,6 +923,24 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert f"← {parent.id}" in result.stdout
 
+    def test_history_shows_comment_count_indicator_when_present(self, tmp_path: Path):
+        """History detail lines should include a comment count when task comments exist."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Task with comments", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        store.add_comment(task.id, "Follow-up 1")
+        store.add_comment(task.id, "Follow-up 2")
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "comments: 2" in result.stdout
+
     def test_history_shows_both_based_on_and_depends_on(self, tmp_path: Path):
         """History shows both based_on and depends_on when a task has both set."""
 
@@ -1354,6 +1372,52 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Execution Mode: skill_inline" in result.stdout
+
+    def test_show_displays_task_comments(self, tmp_path: Path):
+        """Show command prints task comments, including source and author."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with comments")
+        assert task.id is not None
+        store.add_comment(task.id, "First note", source="direct", author="alice")
+        store.add_comment(task.id, "Second note", source="github")
+        store.resolve_comments(task.id)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Comments:" in result.stdout
+        assert "source=direct, author=alice" in result.stdout
+        assert "source=github" in result.stdout
+        assert "First note" in result.stdout
+        assert "Second note" in result.stdout
+
+    def test_show_reports_schema_integrity_error_for_readonly_damaged_db(self, tmp_path: Path):
+        """Show command should fail cleanly if schema repair is needed on a read-only DB."""
+        import sqlite3
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with damaged schema")
+        assert task.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 32")
+        conn.execute("DROP TABLE task_comments")
+        conn.commit()
+        conn.close()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 1
+        assert "schema integrity check failed while repairing v32" in result.stderr.lower()
+        assert "writable database" in result.stderr.lower()
 
     def test_show_nonexistent_task(self, tmp_path: Path):
         """Show command handles nonexistent task."""

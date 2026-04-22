@@ -1135,6 +1135,29 @@ def _build_context_from_chain(
                         f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
                     )
 
+        impl_ancestor = _resolve_impl_ancestor(store, task)
+        comment_task_id = (
+            impl_ancestor.id
+            if impl_ancestor and impl_ancestor.id
+            else (task.based_on if task.based_on else task.id)
+        )
+        if comment_task_id is not None:
+            unresolved_comments = store.get_comments(
+                comment_task_id,
+                unresolved_only=True,
+                created_on_or_before=task.created_at,
+            )
+            if unresolved_comments:
+                context_parts.append("\n## Comments:\n")
+                for comment in unresolved_comments:
+                    attribution = f"source={comment.source}"
+                    if comment.author:
+                        attribution += f", author={comment.author}"
+                    context_parts.append(
+                        f"- [{comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC] ({attribution})\n"
+                        f"{comment.content}"
+                    )
+
         # Get the original plan (via based_on chain)
         if task.based_on:
             impl_task = store.get(task.based_on)
@@ -2514,6 +2537,7 @@ def _post_complete_code_task(
         impl_ancestor = _resolve_impl_ancestor(store, task)
         if impl_ancestor is not None and impl_ancestor.id is not None:
             store.clear_review_state(impl_ancestor.id)
+            store.resolve_comments(impl_ancestor.id, created_on_or_before=task.created_at)
             # If parent was already merged, flip it back to unmerged — the improve
             # task added commits to the shared branch after the merge.
             if impl_ancestor.merge_status == "merged":

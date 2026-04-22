@@ -1227,6 +1227,77 @@ class TestGetImproveTasksByRoot:
         assert [t.id for t in results] == [improve_a.id]
 
 
+class TestTaskComments:
+    """Tests for task comment storage and resolution helpers."""
+
+    def test_add_get_and_resolve_comments(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with comments", task_type="implement")
+        assert task.id is not None
+
+        first = store.add_comment(task.id, "Address API edge case.", source="direct", author="alice")
+        second = store.add_comment(task.id, "nit: rename helper", source="github")
+
+        all_comments = store.get_comments(task.id)
+        assert [c.id for c in all_comments] == [first.id, second.id]
+        assert all_comments[0].author == "alice"
+        assert all_comments[1].author is None
+        assert all_comments[0].resolved_at is None
+
+        unresolved = store.get_comments(task.id, unresolved_only=True)
+        assert len(unresolved) == 2
+
+        store.resolve_comments(task.id)
+        unresolved_after = store.get_comments(task.id, unresolved_only=True)
+        assert unresolved_after == []
+        resolved = store.get_comments(task.id)
+        assert all(comment.resolved_at is not None for comment in resolved)
+
+    def test_add_comment_rejects_unknown_source(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with bad comment source")
+        assert task.id is not None
+
+        with pytest.raises(ValueError, match="Unknown comment source"):
+            store.add_comment(task.id, "Invalid source", source="email")
+
+    def test_add_comment_rejects_empty_content(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with empty comment")
+        assert task.id is not None
+
+        with pytest.raises(ValueError, match="cannot be empty"):
+            store.add_comment(task.id, "   ")
+
+    def test_get_and_resolve_comments_can_be_scoped_by_created_at(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with scoped comments", task_type="implement")
+        assert task.id is not None
+
+        store.add_comment(task.id, "Old comment", source="direct")
+        snapshot = datetime.now(UTC)
+        store.add_comment(task.id, "New comment", source="direct")
+
+        scoped_unresolved = store.get_comments(
+            task.id,
+            unresolved_only=True,
+            created_on_or_before=snapshot,
+        )
+        assert [comment.content for comment in scoped_unresolved] == ["Old comment"]
+
+        store.resolve_comments(task.id, created_on_or_before=snapshot)
+        unresolved_after = store.get_comments(task.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_after] == ["New comment"]
+
+
 class TestMergeStatus:
     """Tests for merge_status field and related functionality."""
 
@@ -4393,6 +4464,66 @@ class TestMigrationUtilityFunctions:
         assert version == SCHEMA_VERSION
         assert "urgent_bumped_at" in columns
         assert "execution_mode" in columns
+
+    def test_auto_migration_v31_to_v32_adds_task_comments_table(self, tmp_path: Path) -> None:
+        """Opening a v31 DB should migrate to v32 and create task_comments."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before downgrade")
+        assert task.id is not None
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 31")
+        conn.execute("DROP TABLE task_comments")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_comments'"
+            ).fetchall()
+        }
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert "task_comments" in tables
+
+    def test_open_current_v32_db_repairs_missing_task_comments_table(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing comment artifacts."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before table damage")
+        assert task.id is not None
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 32")
+        conn.execute("DROP TABLE task_comments")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_comments'"
+            ).fetchall()
+        }
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert "task_comments" in tables
 
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,

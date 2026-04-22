@@ -713,6 +713,23 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 
+When task comments exist, `gza show` also includes a `Comments:` section with each
+comment's state (`open` or `resolved`), timestamp, source/author attribution, and content.
+
+### comment
+
+Add a direct comment to a task.
+
+```bash
+gza comment <task_id> <text> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID to comment on (e.g. `gza-1234`) |
+| `text` | Comment text to attach to the task |
+| `--author AUTHOR` | Optional author attribution |
+
 ### resume
 
 Resume a failed task from where it left off. The AI continues with the existing conversation context.
@@ -825,6 +842,9 @@ gza history [options]
 
 `gza history` is a flat chronological record. Use `gza incomplete` for a
 lineage-aware unresolved attention view.
+
+When tasks have comments, `gza history` includes a `comments: N` indicator in
+task detail lines and compact lineage summaries.
 
 | Option | Description |
 |--------|-------------|
@@ -940,7 +960,7 @@ gza clean [options]
 
 ### improve
 
-Create an improve task to address review feedback on an implementation.
+Create an improve task to address feedback on an implementation.
 
 ```bash
 gza improve <impl_task_id> [options]
@@ -959,7 +979,12 @@ gza improve <impl_task_id> [options]
 | `--provider PROVIDER` | Override provider for this task |
 | `--force` | Skip dependency merge precondition checks when running the improve task |
 
-The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
+The improve command resolves the owning implementation, gathers the most recent completed
+review when available, and also includes unresolved task comments as feedback context. If no
+review exists but unresolved comments do, improve still runs using comments-only feedback.
+Comments-only improve runs follow normal improve lifecycle semantics: existing pending tasks are
+reused, failed attempts are resumed/retried up to `max_resume_attempts`, and completed prior
+rounds do not block creating a fresh comments-only improve when new unresolved comments exist.
 
 ### fix
 

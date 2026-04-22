@@ -234,6 +234,10 @@ def _render_history_task_line(
             verdict = get_review_verdict(config, task)
             if verdict:
                 compact_parts.append(f"verdict: {verdict}")
+        if task.id is not None:
+            comment_count = len(store.get_comments(task.id))
+            if comment_count > 0:
+                compact_parts.append(f"comments: {comment_count}")
         stats_str = format_stats(task)
         if stats_str:
             compact_parts.append(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -246,6 +250,10 @@ def _render_history_task_line(
         console.print(f"{detail_prefix}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
     if task.report_file:
         console.print(f"{detail_prefix}    report: [{c['file']}]{task.report_file}[/{c['file']}]")
+    if task.id is not None:
+        comment_count = len(store.get_comments(task.id))
+        if comment_count > 0:
+            console.print(f"{detail_prefix}    comments: [{c['stats']}]{comment_count}[/{c['stats']}]")
     stats_str = format_stats(task)
     if stats_str:
         console.print(f"{detail_prefix}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -1813,6 +1821,26 @@ def _cmd_show_output(
                     console.print("[yellow]Warning: Report on disk has been modified since task completion[/yellow]")
     if task.session_id:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
+
+    if task.id is not None:
+        comments = store.get_comments(task.id)
+        if comments:
+            console.print()
+            console.print(f"[{c['label']}]Comments:[/{c['label']}]")
+            console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+            for comment in comments:
+                state = "resolved" if comment.resolved_at else "open"
+                created = comment.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                source_author = f"source={comment.source}"
+                if comment.author:
+                    source_author += f", author={comment.author}"
+                if comment.resolved_at is not None:
+                    resolved = comment.resolved_at.strftime("%Y-%m-%d %H:%M:%S")
+                    source_author += f", resolved_at={resolved}"
+                console.print(
+                    f"[{c['value']}]#{comment.id} [{state}] {created} UTC ({source_author})[/{c['value']}]"
+                )
+                console.print(f"[{c['prompt']}]{comment.content}[/{c['prompt']}]")
 
     root_task = _resolve_lineage_root_task(store, task)
     lineage_tree = _build_lineage_tree_for_root(store, root_task)

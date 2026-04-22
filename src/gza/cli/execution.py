@@ -42,6 +42,7 @@ from ._common import (
     get_review_verdict,
     get_store,
     get_task_step_count,
+    resolve_comments_improve_action,
     resolve_id,
     resolve_improve_action,
     run_with_resume,
@@ -936,7 +937,10 @@ def cmd_improve(args: argparse.Namespace) -> int:
     assert impl_task is not None
     assert impl_task.id is not None
 
+    unresolved_comments = store.get_comments(impl_task.id, unresolved_only=True)
+
     review_id_override = getattr(args, "review_id", None)
+    review_task: DbTask | None = None
     if review_id_override is not None:
         resolved_review_id = resolve_id(config, review_id_override)
         review_task = store.get(resolved_review_id)
@@ -954,62 +958,158 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 f"not implementation {impl_task.id}."
             )
             return 1
+        if review_task.status in ("failed", "dropped"):
+            # Terminal review statuses never produce feedback. Binding an
+            # improve to one creates a permanently blocked task, so reject
+            # rather than warn.
+            print(
+                f"Error: Review {review_task.id} is {review_task.status}; "
+                "terminal reviews cannot produce feedback."
+            )
+            if unresolved_comments:
+                print(
+                    f"Omit --review-id to run a comments-only improve from the "
+                    f"{len(unresolved_comments)} unresolved comment(s)."
+                )
+            else:
+                print(
+                    "Run a new review, or add comments with "
+                    f"`gza comment {impl_task.id} <text>`."
+                )
+            return 1
         if review_task.status != "completed":
             print(
                 f"Warning: Review {review_task.id} is {review_task.status}. "
                 "The improve task will be blocked until it completes."
             )
     else:
-        # Auto-pick the most recent usable review. Dropped/failed reviews are
-        # terminal bad states — they cannot produce a usable report, and binding
-        # an improve task to one creates an unrunnable dependency. Pending and
-        # in_progress reviews are still eligible since they may yet complete.
+        # Auto-pick considers only completed reviews. Non-completed reviews
+        # (pending/in_progress/failed/dropped) are not eligible: terminal
+        # statuses never produce feedback, and a pending/in_progress review
+        # has no report yet. When no completed review exists but unresolved
+        # comments do, fall back to a comments-only improve. To target an
+        # incomplete review explicitly, use --review-id.
         review_tasks = store.get_reviews_for_task(impl_task.id)
-        usable_reviews = [
-            r for r in review_tasks if r.status not in ("dropped", "failed")
-        ]
+        completed_reviews = [r for r in review_tasks if r.status == "completed"]
 
-        if not usable_reviews:
-            if review_tasks:
-                statuses = ", ".join(
-                    f"{r.id} ({r.status})" for r in review_tasks
-                )
-                print(
-                    f"Error: Task {impl_task.id} has no usable review "
-                    f"(all existing reviews are dropped or failed: {statuses})."
-                )
-                print("Run a new review, or pass --review-id <id> to pick a specific one.")
-            else:
-                print(f"Error: Task {impl_task.id} has no review. Run a review first:")
-                print(f"  gza add --type review --depends-on {impl_task.id}")
+        if completed_reviews:
+            review_task = completed_reviews[0]
+        elif unresolved_comments:
+            print(
+                f"Note: Task {impl_task.id} has no completed review; "
+                "continuing from unresolved comments only."
+            )
+        elif review_tasks:
+            statuses = ", ".join(
+                f"{r.id} ({r.status})" for r in review_tasks
+            )
+            print(
+                f"Error: Task {impl_task.id} has no completed review "
+                f"(existing reviews: {statuses})."
+            )
+            print(
+                "Wait for a review to complete, add comments via "
+                f"`gza comment {impl_task.id} <text>`, or pass --review-id <id> "
+                "to target a specific review."
+            )
+            return 1
+        else:
+            print(f"Error: Task {impl_task.id} has no review. Run a review first:")
+            print(f"  gza add --type review --depends-on {impl_task.id}")
             return 1
 
-        review_task = usable_reviews[0]
+    create_review = args.review if hasattr(args, 'review') and args.review else False
+    model = args.model if hasattr(args, 'model') and args.model else None
+    provider = args.provider if hasattr(args, 'provider') and args.provider else None
 
-        # Warn if the selected review is not yet completed (pending/in_progress).
-        if review_task.status != "completed":
-            print(
-                f"Warning: Review {review_task.id} is {review_task.status}. "
-                "The improve task will be blocked until it completes."
-            )
+    improve_task: DbTask
+    action_message: str | None = None
 
-    # Create improve task (using shared helper)
-    try:
-        improve_task = _create_improve_task(
+    if review_task is None:
+        comments_action, existing_comments_improve = resolve_comments_improve_action(
             store,
-            impl_task,
-            review_task,
-            create_review=args.review if hasattr(args, 'review') and args.review else False,
-            model=args.model if hasattr(args, 'model') and args.model else None,
-            provider=args.provider if hasattr(args, 'provider') and args.provider else None,
+            impl_task.id,
+            max_resume_attempts=config.max_resume_attempts,
         )
-    except ValueError as e:
-        print(f"Error: {e}")
-        return 1
+        if comments_action == "wait_in_progress":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            print(
+                f"Error: Comments-only improve {existing_comments_improve.id} is already in progress. "
+                "Wait for it to finish."
+            )
+            return 1
+        if comments_action == "reuse_pending":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            improve_task = existing_comments_improve
+            action_message = f"Reusing pending improve task {improve_task.id}"
+        elif comments_action == "give_up":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            print(
+                f"Error: Comments-only improve retries exceeded max_resume_attempts "
+                f"({config.max_resume_attempts}); latest failure: {existing_comments_improve.id}"
+            )
+            return 1
+        elif comments_action == "resume":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            improve_task = _create_resume_task(store, existing_comments_improve)
+            action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
+        elif comments_action == "retry":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            retry_same_branch = existing_comments_improve.same_branch
+            retry_base_branch: str | None = None
+            if existing_comments_improve.same_branch and existing_comments_improve.branch:
+                retry_same_branch = False
+                retry_base_branch = existing_comments_improve.branch
+            improve_task = store.add(
+                prompt=existing_comments_improve.prompt,
+                task_type="improve",
+                depends_on=None,
+                based_on=existing_comments_improve.id,
+                same_branch=retry_same_branch,
+                group=existing_comments_improve.group,
+                base_branch=retry_base_branch,
+                create_review=create_review,
+                model=model,
+                provider=provider,
+            )
+            action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
+        else:
+            try:
+                improve_task = _create_improve_task(
+                    store,
+                    impl_task,
+                    None,
+                    create_review=create_review,
+                    model=model,
+                    provider=provider,
+                )
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 1
+    else:
+        # Create improve task (using shared helper)
+        try:
+            improve_task = _create_improve_task(
+                store,
+                impl_task,
+                review_task,
+                create_review=create_review,
+                model=model,
+                provider=provider,
+            )
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
 
-    print(f"✓ Created improve task {improve_task.id}")
+    if action_message is not None:
+        print(f"✓ {action_message}")
+    else:
+        print(f"✓ Created improve task {improve_task.id}")
     print(f"  Based on: implementation {impl_task.id}")
-    print(f"  Review: {review_task.id}")
+    if review_task is not None:
+        print(f"  Review: {review_task.id}")
+    elif unresolved_comments:
+        print(f"  Comments: {len(unresolved_comments)} unresolved")
     print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
 
     # Handle background mode - spawn worker to run the improve task
@@ -1086,6 +1186,28 @@ def cmd_fix(args: argparse.Namespace) -> int:
 
     print(f"\nRunning fix task {fix_task.id}...")
     return _run_foreground(config, task_id=fix_task.id, force=getattr(args, "force", False))
+
+
+def cmd_comment(args: argparse.Namespace) -> int:
+    """Add a direct comment to a task."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
+    if task is None:
+        print(f"Error: Task {task_id} not found")
+        return 1
+
+    author = getattr(args, "author", None)
+    try:
+        comment = store.add_comment(task_id, args.text, source="direct", author=author)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(f"✓ Added comment {comment.id} to task {task_id}")
+    return 0
 
 
 def cmd_review(args: argparse.Namespace) -> int:

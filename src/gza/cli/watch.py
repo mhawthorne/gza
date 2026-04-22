@@ -20,6 +20,7 @@ from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..workers import WorkerRegistry
 from ._common import (
+    _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
     _spawn_background_resume_worker,
@@ -473,17 +474,15 @@ def _run_cycle(
                         base_branch=retry_base_branch,
                     )
                 else:
-                    from ..prompts import PromptBuilder
-
-                    improve_prompt = PromptBuilder().improve_task_prompt(task.id, review_task_obj.id)
-                    improve_task = store.add(
-                        prompt=improve_prompt,
-                        task_type="improve",
-                        depends_on=review_task_obj.id,
-                        based_on=task.id,
-                        same_branch=True,
-                        group=task.group,
-                    )
+                    try:
+                        improve_task = _create_improve_task(store, task, review_task_obj)
+                    except ValueError as exc:
+                        log.emit(
+                            "ERROR",
+                            f"{task.id}: unable to create improve task: {exc}",
+                            dedupe_key=f"improve-create-error:{task.id}:{review_task_obj.id}",
+                        )
+                        continue
                 assert improve_task.id is not None
                 improve_task_id = improve_task.id
                 step1_handled_child_task_ids.add(improve_task_id)

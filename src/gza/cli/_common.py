@@ -1010,35 +1010,123 @@ def resolve_improve_action(
     return ("retry", latest_failed)
 
 
+def resolve_comments_improve_action(
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    max_resume_attempts: int | None = None,
+) -> tuple[str, DbTask | None]:
+    """Determine improve action for comments-only (no-review) improve flows.
+
+    Returns:
+        ("new", None) — create a fresh comments-only improve
+        ("reuse_pending", pending_task) — reuse existing pending comments-only improve
+        ("wait_in_progress", in_progress_task) — existing in-progress comments-only improve is still running
+        ("resume", failed_task) — resumable failed comments-only improve exists
+        ("retry", failed_task) — non-resumable failed comments-only improve exists
+        ("give_up", failed_task) — retry/resume cap exceeded
+    """
+    from ..resume_policy import is_resumable_failed_task
+
+    def _normalize_time(value: datetime | None) -> datetime:
+        if value is None:
+            return datetime.min
+        if value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+
+    def _time_key(task: DbTask) -> tuple[datetime, int]:
+        return (_normalize_time(task.created_at), task_id_numeric_key(task.id))
+
+    unresolved_comments = store.get_comments(impl_task_id, unresolved_only=True)
+    latest_unresolved_comment_time: datetime | None = None
+    if unresolved_comments:
+        latest_unresolved_comment_time = max(
+            _normalize_time(comment.created_at)
+            for comment in unresolved_comments
+        )
+
+    def _candidate_is_fresh(task: DbTask) -> bool:
+        # Improves consume a comment snapshot as-of improve.created_at.
+        # If a newer unresolved comment exists, this candidate is stale.
+        if latest_unresolved_comment_time is None:
+            return True
+        return _normalize_time(task.created_at) >= latest_unresolved_comment_time
+
+    existing = [
+        task for task in store.get_improve_tasks_by_root(impl_task_id)
+        if task.depends_on is None
+    ]
+    if not existing:
+        return ("new", None)
+
+    in_progress = [
+        task for task in existing
+        if task.status == "in_progress" and _candidate_is_fresh(task)
+    ]
+    if in_progress:
+        return ("wait_in_progress", max(in_progress, key=_time_key))
+
+    pending = [
+        task for task in existing
+        if task.status == "pending" and _candidate_is_fresh(task)
+    ]
+    if pending:
+        return ("reuse_pending", max(pending, key=_time_key))
+
+    failed = [
+        task for task in existing
+        if task.status == "failed" and _candidate_is_fresh(task)
+    ]
+    if not failed:
+        return ("new", None)
+
+    latest_failed = max(failed, key=_time_key)
+    if max_resume_attempts is not None and (len(failed) - 1) >= max_resume_attempts:
+        return ("give_up", latest_failed)
+
+    if is_resumable_failed_task(latest_failed):
+        return ("resume", latest_failed)
+    return ("retry", latest_failed)
+
+
 def _create_improve_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
-    review_task: DbTask,
+    review_task: DbTask | None,
     create_review: bool = False,
     model: str | None = None,
     provider: str | None = None,
 ) -> DbTask:
-    """Create an improve task for an implementation task based on a review.
+    """Create an improve task for an implementation task.
 
-    Validates that no duplicate improve task already exists.
+    Uses review feedback when a review task is supplied; otherwise falls back
+    to unresolved task comments.
+    Validates that no duplicate improve task already exists for review-backed
+    improves. Comments-only improve lifecycle selection is handled by
+    ``resolve_comments_improve_action``.
     Returns the created improve task, or raises ValueError with an error message.
     """
     assert impl_task.id is not None
-    assert review_task.id is not None
+    has_comments = bool(store.get_comments(impl_task.id, unresolved_only=True))
+    if review_task is not None:
+        assert review_task.id is not None
+        existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
+        if existing:
+            existing_task = existing[0]
+            raise ValueError(
+                f"An improve task already exists for implementation {impl_task.id} "
+                f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
+            )
 
-    existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
-    if existing:
-        existing_task = existing[0]
-        raise ValueError(
-            f"An improve task already exists for implementation {impl_task.id} "
-            f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
-        )
-
-    prompt = PromptBuilder().improve_task_prompt(impl_task.id, review_task.id)
+    prompt = PromptBuilder().improve_task_prompt(
+        impl_task.id,
+        review_task.id if review_task is not None else None,
+        has_comments=has_comments,
+    )
     return store.add(
         prompt=prompt,
         task_type="improve",
-        depends_on=review_task.id,
+        depends_on=review_task.id if review_task is not None else None,
         based_on=impl_task.id,
         same_branch=True,
         group=impl_task.group,
