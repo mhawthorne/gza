@@ -104,15 +104,29 @@ $ cat .gza/reviews/20260108-review-implementation.md
 
 # Review: 20260108-implement-the-jwt-authentication
 
-## Verdict: CHANGES_REQUESTED
-
 ## Summary
 Implementation follows the plan but needs improvements...
 
-## Findings
-- Token refresh logic is correct
-- Missing: rate limiting on refresh endpoint
-- Missing: input validation on token claims
+## Blockers
+### B1
+Evidence: Missing rate limiting on refresh endpoint.
+Impact: Allows brute-force refresh abuse and can degrade service.
+Required fix: Add request throttling for refresh attempts.
+Required tests: Add a targeted test proving rate limits trigger on repeated refresh calls.
+
+## Follow-Ups
+### F1
+Evidence: Token claim validation could be hardened for malformed optional claims.
+Impact: Low-risk hardening opportunity; supported path remains correct.
+Recommended follow-up: Add stricter optional-claim normalization and validation.
+Recommended tests: Add malformed-claim regression cases.
+
+## Questions / Assumptions
+None.
+
+## Verdict
+Blocking security issue exists.
+Verdict: CHANGES_REQUESTED
 ```
 
 ## Phase 4: Address review feedback
@@ -158,11 +172,11 @@ $ cat .gza/reviews/20260108-review-implementation-2.md
 - Tests cover the updated auth path.
 - No new regressions found in touched areas.
 
-## Must-Fix
+## Blockers
 
 None.
 
-## Suggestions
+## Follow-Ups
 
 None.
 

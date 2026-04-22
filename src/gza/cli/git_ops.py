@@ -38,6 +38,7 @@ from ..runner import get_effective_config_for_task, load_dotenv
 from ._common import (
     DuplicateReviewError,
     _create_improve_task,
+    _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
     _create_review_task,
@@ -1218,7 +1219,7 @@ def _cmd_advance_unimplemented(
 # 'merge' actions are fast and synchronous; running them first ensures freshly
 # merged code is on the current branch before any review/improve workers are
 # spawned, reducing rebase conflicts for those workers.
-_ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0}
+_ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0, 'merge_with_followups': 0}
 
 
 @dataclass
@@ -1256,7 +1257,7 @@ def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _Crea
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
     ac = _colors.ADVANCE_COLORS
-    if action_type == 'merge':
+    if action_type in {'merge', 'merge_with_followups'}:
         return ac.merge
     if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'):
         return ac.error
@@ -1463,7 +1464,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         description = f"Resume improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
                     elif improve_action == "retry" and failed_improve is not None:
                         description = f"Retry improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
-            elif action['type'] == 'merge':
+            elif action['type'] in {'merge', 'merge_with_followups'}:
                 commit_count = _auto_squash_commit_count(config, git, task, target_branch)
                 if commit_count is not None:
                     description = f"{description} (auto-squash, {commit_count} commits)"
@@ -1564,7 +1565,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
-        if action_type == 'merge':
+        if action_type in {'merge', 'merge_with_followups'}:
+            if action_type == "merge_with_followups":
+                review_task = action.get("review_task")
+                followup_findings = action.get("followup_findings")
+                if isinstance(review_task, DbTask) and isinstance(followup_findings, tuple):
+                    created_followups, reused_followups = _create_or_reuse_followup_tasks(
+                        store,
+                        review_task=review_task,
+                        impl_task=task,
+                        findings=followup_findings,
+                    )
+                    if created_followups:
+                        created_ids = ", ".join(str(t.id) for t in created_followups if t.id is not None)
+                        console.print(f"      [{_c_ok}]✓ Created follow-up task(s): {created_ids}[/{_c_ok}]")
+                    if reused_followups:
+                        reused_ids = ", ".join(str(t.id) for t in reused_followups if t.id is not None)
+                        console.print(f"      [{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
             merge_args = _build_auto_merge_args(config, git, task, target_branch)
             rc = _merge_single_task(task.id, config, store, git, merge_args, target_branch)
             if rc == 0:

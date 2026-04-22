@@ -82,7 +82,7 @@ If neither a usable review nor unresolved comments exist, stop and ask the user 
 
 Feedback may be review-only, comments-only, or both. Read whichever sources are present:
 
-- If `review_task_id` is set, read the review report file (`review_report_file`). If the report file doesn't exist on disk, fall back to `review_output`. The review file follows a structured format with **Must-Fix** items (M1, M2, etc.) as blockers, **Suggestions** (S1, S2, etc.) as optional improvements, and **Questions/Assumptions** that may need user input.
+- If `review_task_id` is set, read the review report file (`review_report_file`). If the report file doesn't exist on disk, fall back to `review_output`. The review file follows a structured format with **Must-Fix/Blocker** items (M1/B1, M2/B2, etc.) as blockers, **Suggestions/Follow-Ups** (S1/F1, S2/F2, etc.) as optional improvements, and **Questions/Assumptions** that may need user input.
 - If `unresolved_comments` is non-empty, treat each comment as a blocker to address in this pass. Comments are plain prose; there is no Must-Fix/Suggestions structure.
 - If both are present, address both.
 
@@ -171,7 +171,7 @@ config = Config.load(Path.cwd())
 store = SqliteTaskStore(config.db_path)
 
 origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-summary_body = '''Addressed <M_COUNT> must-fix items: <M_ITEMS_SUMMARY>
+summary_body = '''Addressed <B_COUNT> blocker items: <B_ITEMS_SUMMARY>
 Verify: <VERIFY_RESULT>
 Commit: <COMMIT_SHA>
 Push: pushed to <IMPL_BRANCH>'''
@@ -243,6 +243,6 @@ If the restore fails, stop and tell the user exactly what checkout you left them
 - **Verify the feedback's claims** — review items and comments can be wrong or stale. If a feedback item doesn't match the current code state (e.g., the import already exists), skip it and note that to the user.
 - **Scope to branch files** — only modify files that are part of the implementation branch's diff. Use `git diff --name-only main..HEAD` to check.
 - **Commit and push are required** — a successful `/gza-task-improve` run should leave the implementation branch committed and pushed before you restore the user's original checkout.
-- **Ask about suggestions** — don't automatically apply S1/S2/etc. suggestions. Ask the user which ones they want addressed.
+- **Do not absorb follow-ups by default** — follow-up items should be handled in separate follow-up tasks unless the user explicitly asks otherwise.
 - **Questions section** — if the review has questions, present them to the user for answers before making assumptions.
 - **Restore the user's checkout before exit** — the skill may work on `<impl_branch>`, but the final state should return the user to `<START_CHECKOUT>` and the closing message should name both checkouts explicitly.

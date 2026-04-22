@@ -16,6 +16,8 @@ from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
 from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
+from gza.review_tasks import create_or_reuse_followup_task
+from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
@@ -26,6 +28,7 @@ from gza.runner import (
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
+    _check_dependency_merge_precondition,
     _complete_code_task,
     _compute_slug_override,
     _copy_learnings_to_worktree,
@@ -956,6 +959,65 @@ class TestReviewContextFromChain:
         assert "## Comments:" in context
         assert "Please keep this in retry context." in context
         assert "Comment on improve task should not be used." not in context
+
+    def test_followup_implement_context_includes_parent_finding_details(self, tmp_path: Path):
+        """Auto-created follow-up implement prompts include full finding context and tests."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan auth changes", task_type="plan")
+        plan_task.output_content = "# Plan\nShip auth flow with validation."
+        store.update(plan_task)
+
+        impl_task = store.add(prompt="Implement auth flow", task_type="implement", based_on=plan_task.id)
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review auth flow",
+            task_type="review",
+            depends_on=impl_task.id,
+            based_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n"
+            "Looks good overall.\n\n"
+            "## Blockers\n\n"
+            "None.\n\n"
+            "## Follow-Ups\n\n"
+            "### F1 Harden malformed optional claims\n"
+            "Evidence: malformed optional claim can bypass normalization.\n"
+            "Impact: edge-case hardening gap in validation.\n"
+            "Recommended follow-up: normalize optional claim parsing.\n"
+            "Recommended tests: add malformed optional-claim regression tests.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Verdict: APPROVED_WITH_FOLLOWUPS\n"
+        )
+        store.update(review_task)
+
+        parsed = parse_review_report(review_task.output_content)
+        followup_finding = next(item for item in parsed.findings if item.severity == "FOLLOWUP")
+        followup_task, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=followup_finding,
+        )
+        assert created_now is True
+
+        context = _build_context_from_chain(followup_task, store, tmp_path, git=None)
+        assert "## Follow-up finding to implement:" in context
+        assert "### F1 Harden malformed optional claims" in context
+        assert "Recommended tests: add malformed optional-claim regression tests." in context
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        prompt = build_prompt(followup_task, config, store, git=None)
+        assert "## Follow-up finding to implement:" in prompt
+        assert "Recommended tests: add malformed optional-claim regression tests." in prompt
 
     def test_first_review_has_no_tool_hints(self, tmp_path: Path):
         """First-time review (no prior cycles) does not include tool hints or lineage."""
@@ -6148,6 +6210,9 @@ class TestExtractReviewVerdict:
     def test_heading_verdict_without_bold_token(self) -> None:
         assert _extract_review_verdict("### Verdict\n\nNEEDS_DISCUSSION\n") == "NEEDS_DISCUSSION"
 
+    def test_heading_verdict_approved_with_followups(self) -> None:
+        assert _extract_review_verdict("## Verdict\n\nAPPROVED_WITH_FOLLOWUPS\n") == "APPROVED_WITH_FOLLOWUPS"
+
     def test_none_content(self) -> None:
         assert _extract_review_verdict(None) is None
 
@@ -6158,9 +6223,9 @@ class TestExtractReviewVerdict:
         content = (
             "## Summary\n\n"
             "- Reviewed implementation and tests.\n\n"
-            "## Must-Fix\n\n"
+            "## Blockers\n\n"
             "None.\n\n"
-            "## Suggestions\n\n"
+            "## Follow-Ups\n\n"
             "None.\n\n"
             "## Questions / Assumptions\n\n"
             "None.\n\n"
@@ -6746,6 +6811,53 @@ class TestDependencyMergePrecondition:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "GIT_ERROR"
+
+    def test_followup_task_dependency_is_merge_gated_by_reviewed_implementation(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feat/impl"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review implementation", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        store.update(review)
+
+        finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Hardening",
+            body="",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add malformed-input validation",
+            tests=None,
+        )
+        followup, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review,
+            impl_task=impl,
+            finding=finding,
+        )
+        assert created_now is True
+        assert followup.depends_on == impl.id
+
+        git = Mock()
+        git.branch_exists.return_value = True
+        git._run.return_value = Mock(returncode=1, stdout="", stderr="")
+
+        dep, target_branch, git_error = _check_dependency_merge_precondition(
+            followup,
+            store,
+            git,
+            default_branch="main",
+        )
+        assert dep is not None
+        assert dep.id == impl.id
+        assert target_branch == "main"
+        assert git_error is None
 
 
 class TestFindTaskOfTypeInChain:

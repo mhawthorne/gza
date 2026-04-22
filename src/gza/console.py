@@ -316,6 +316,7 @@ def task_footer(
         from .colors import UNMERGED_COLORS_DICT
         verdict_key = {
             "APPROVED": "review_approved",
+            "APPROVED_WITH_FOLLOWUPS": "review_followups",
             "CHANGES_REQUESTED": "review_changes",
             "NEEDS_DISCUSSION": "review_discussion",
         }.get(verdict)

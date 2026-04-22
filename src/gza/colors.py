@@ -182,6 +182,7 @@ class UnmergedColors:
     branch: str = default_color
     date: str = default_color
     review_approved: str = default_color
+    review_followups: str = default_color
     review_changes: str = default_color
     review_discussion: str = default_color
     review_none: str = default_color
@@ -371,6 +372,7 @@ _THEME_MINIMAL = Theme(
         "review_discussion": blue,
         "review_none": yellow_warning,
         "review_approved": green_success,
+        "review_followups": cyan,
     },
     task_stream={
         "step_header": f"{pink_light} bold",
@@ -633,5 +635,4 @@ def build_rich_theme() -> Any:
         return None
     from rich.theme import Theme as RichTheme
     return RichTheme(dict(RICH_STYLES_DICT))
-
 

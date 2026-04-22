@@ -24,12 +24,14 @@ from ..db import (
 from ..git import Git
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
+from ..review_verdict import get_review_report
 from ..runner import run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     DuplicateReviewError,
     _allow_pr_required_retry,
     _create_improve_task,
+    _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
     _create_review_task,
@@ -1585,6 +1587,46 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             ),
         )
 
+    def _materialize_followup_tasks(
+        review_task: DbTask,
+        *,
+        iteration_index: int,
+        findings: tuple[Any, ...] | None = None,
+    ) -> bool:
+        followup_findings = findings
+        if followup_findings is None:
+            parsed_report = get_review_report(config.project_dir, review_task)
+            followup_findings = tuple(
+                finding for finding in parsed_report.findings if finding.severity == "FOLLOWUP"
+            )
+        if not followup_findings:
+            return False
+
+        assert impl_task is not None
+        created_tasks, reused_tasks = _create_or_reuse_followup_tasks(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            findings=followup_findings,
+        )
+        for followup_task in created_tasks:
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration_index,
+                task_type="followup",
+                task=followup_task,
+                status="created",
+            )
+        for followup_task in reused_tasks:
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration_index,
+                task_type="followup",
+                task=followup_task,
+                status="reused",
+            )
+        return True
+
     iterate_started_at = time.monotonic()
     summary_rows: list[IterateSummaryRow] = []
     final_status = "maxed_out"
@@ -1617,11 +1659,30 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         else:
             print(f"\nNext action: {action_type}")
 
-        if action_type == "merge":
+        if action_type in {"merge", "merge_with_followups"}:
             final_status = "merge_ready"
             final_stop_reason = "merge_ready"
             maybe_review_verdict: str | None = None
             maybe_review = action.get("review_task")
+            if action_type == "merge_with_followups" and isinstance(maybe_review, DbTask):
+                followup_findings = action.get("followup_findings")
+                materialized = _materialize_followup_tasks(
+                    maybe_review,
+                    iteration_index=iteration,
+                    findings=followup_findings if isinstance(followup_findings, tuple) else None,
+                )
+                if not materialized:
+                    maybe_review_verdict = "APPROVED_WITH_FOLLOWUPS"
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="review",
+                        task=maybe_review,
+                        verdict=maybe_review_verdict,
+                    )
+                    final_status = "blocked"
+                    final_stop_reason = "needs_discussion"
+                    break
             if isinstance(maybe_review, DbTask):
                 maybe_review_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
                 _append_summary_row(
@@ -1631,9 +1692,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     task=maybe_review,
                     verdict=maybe_review_verdict,
                 )
-            if maybe_review_verdict == "APPROVED":
+            if maybe_review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}:
                 final_status = "approved"
-                final_stop_reason = "approved"
+                final_stop_reason = "approved" if maybe_review_verdict == "APPROVED" else "approved_with_followups"
             else:
                 merge_desc = action.get("description")
                 if isinstance(merge_desc, str) and merge_desc:
@@ -1887,6 +1948,15 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 task=action_task,
                 verdict=verdict,
             )
+            if verdict == "APPROVED_WITH_FOLLOWUPS":
+                materialized = _materialize_followup_tasks(action_task, iteration_index=iteration)
+                if not materialized:
+                    final_status = "blocked"
+                    final_stop_reason = "needs_discussion"
+                    break
+                final_status = "approved"
+                final_stop_reason = "approved_with_followups"
+                break
             if verdict == "APPROVED":
                 final_status = "approved"
                 final_stop_reason = "approved"

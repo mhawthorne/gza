@@ -1,14 +1,20 @@
-"""Shared helpers for creating review tasks."""
+"""Shared helpers for creating review and follow-up tasks."""
 
+import re
 from collections.abc import Iterable
 from typing import Literal
 
 from .db import SqliteTaskStore, Task
 from .prompts import PromptBuilder
+from .review_verdict import ReviewFinding
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
     strip_derived_implement_prefixes,
+)
+
+_FOLLOWUP_PROMPT_PREFIX_RE = re.compile(
+    r"^Follow-up\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
 
 
@@ -130,3 +136,105 @@ def create_review_task(
         model=model,
         provider=provider,
     )
+
+
+def build_followup_prompt_prefix(review_task_id: str, impl_task_id: str, finding_id: str) -> str:
+    """Build deterministic prompt prefix for auto-created follow-up tasks."""
+    return f"Follow-up {finding_id} from review {review_task_id} for task {impl_task_id}:"
+
+
+def build_followup_prompt(
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+) -> str:
+    """Build full prompt for an auto-created follow-up implementation task."""
+    prefix = build_followup_prompt_prefix(review_task_id, impl_task_id, finding.id)
+    tail = (finding.fix_or_followup or "").strip()
+    heading = f"{prefix} {tail}" if tail else prefix
+    return f"{heading}\n\n## Follow-up finding to implement:\n\n{format_followup_finding_context(finding)}"
+
+
+def format_followup_finding_context(finding: ReviewFinding) -> str:
+    """Format canonical finding context for follow-up implementation tasks."""
+    title = f" {finding.title}" if finding.title and finding.title != finding.id else ""
+    if finding.body.strip():
+        body = finding.body.strip()
+    else:
+        lines: list[str] = []
+        if finding.evidence:
+            lines.append(f"Evidence: {finding.evidence}")
+        if finding.impact:
+            lines.append(f"Impact: {finding.impact}")
+        if finding.fix_or_followup:
+            lines.append(f"Recommended follow-up: {finding.fix_or_followup}")
+        if finding.tests:
+            lines.append(f"Recommended tests: {finding.tests}")
+        body = "\n".join(lines)
+    return f"### {finding.id}{title}\n{body}".strip()
+
+
+def extract_followup_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
+    """Return (finding_id, review_task_id, impl_task_id) for follow-up prompts."""
+    match = _FOLLOWUP_PROMPT_PREFIX_RE.match(prompt.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def find_existing_followup_task(
+    store: SqliteTaskStore,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    finding_id: str,
+) -> Task | None:
+    """Return an existing auto-created follow-up task for (review, finding), if any."""
+    prefix = build_followup_prompt_prefix(review_task_id, impl_task_id, finding_id)
+    for child in store.get_based_on_children(review_task_id):
+        if child.task_type != "implement":
+            continue
+        if child.prompt.strip().startswith(prefix):
+            return child
+    return None
+
+
+def create_or_reuse_followup_task(
+    store: SqliteTaskStore,
+    *,
+    review_task: Task,
+    impl_task: Task,
+    finding: ReviewFinding,
+) -> tuple[Task, bool]:
+    """Create or reuse an idempotent follow-up task for a parsed FOLLOWUP finding.
+
+    Returns:
+        (task, created_now) where created_now is True only when a new row was created.
+    """
+    if review_task.id is None:
+        raise ValueError("Cannot create follow-up for review without an ID.")
+    if impl_task.id is None:
+        raise ValueError("Cannot create follow-up for implementation without an ID.")
+
+    existing = find_existing_followup_task(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        finding_id=finding.id,
+    )
+    if existing is not None:
+        return existing, False
+
+    prompt = build_followup_prompt(
+        review_task.id,
+        impl_task.id,
+        finding,
+    )
+    created = store.add(
+        prompt=prompt,
+        task_type="implement",
+        based_on=review_task.id,
+        depends_on=impl_task.id,
+        group=impl_task.group,
+    )
+    return created, True

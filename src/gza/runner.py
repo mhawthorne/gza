@@ -37,8 +37,13 @@ from .learnings import maybe_auto_regenerate_learnings
 from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
-from .review_tasks import DuplicateReviewError, create_review_task
-from .review_verdict import parse_review_verdict
+from .review_tasks import (
+    DuplicateReviewError,
+    create_review_task,
+    extract_followup_prompt_parts,
+    format_followup_finding_context,
+)
+from .review_verdict import parse_review_report, parse_review_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -858,7 +863,10 @@ def _build_review_diff_context(
 
 
 def _extract_must_fix_entries(review_content: str) -> list[tuple[str, str]]:
-    """Extract Must-Fix headings and bodies from a review report."""
+    """Extract blocker headings and bodies from a review report.
+
+    Supports both legacy ``## Must-Fix`` and current ``## Blockers`` sections.
+    """
     entries: list[tuple[str, str]] = []
     in_must_fix = False
     current_heading: str | None = None
@@ -869,7 +877,7 @@ def _extract_must_fix_entries(review_content: str) -> list[tuple[str, str]]:
         stripped = line.strip()
         if stripped.startswith("## "):
             section = stripped[3:].strip().lower()
-            if section.startswith("must-fix"):
+            if section.startswith("must-fix") or section.startswith("blockers"):
                 in_must_fix = True
                 current_heading = None
                 current_lines = []
@@ -1176,6 +1184,36 @@ def _build_context_from_chain(
 
     # For implement tasks, include plan from based_on chain
     if task.task_type == "implement" and task.based_on:
+        parent_task = store.get(task.based_on)
+        if parent_task and parent_task.task_type == "review":
+            review_content = _get_task_output(parent_task, project_dir)
+            if review_content:
+                followup_parts = extract_followup_prompt_parts(task.prompt or "")
+                finding = None
+                if followup_parts is not None:
+                    finding_id, review_id, _ = followup_parts
+                    if review_id == parent_task.id:
+                        report = parse_review_report(review_content)
+                        finding = next(
+                            (
+                                item
+                                for item in report.findings
+                                if item.severity == "FOLLOWUP" and item.id == finding_id
+                            ),
+                            None,
+                        )
+                if finding is not None:
+                    context_parts.append("## Follow-up finding to implement:\n")
+                    context_parts.append(format_followup_finding_context(finding))
+                else:
+                    context_parts.append("## Parent review context:\n")
+                    context_parts.append(review_content)
+            else:
+                context_parts.append(
+                    "## Parent review context:\n"
+                    f"(review task {parent_task.id} exists but content unavailable on this machine - flag as blocker)"
+                )
+
         plan_task = _find_task_of_type_in_chain(task.based_on, "plan", store)
         if plan_task:
             plan_content = _get_task_output(plan_task, project_dir)

@@ -3467,10 +3467,11 @@ class TestUnmergedReviewStatus:
         "review_output, expected_text",
         [
             ("# Review\n\nCode looks good!\n\n**Verdict: APPROVED**", "✓ approved"),
+            ("# Review\n\nShip now; track follow-ups.\n\nVerdict: APPROVED_WITH_FOLLOWUPS", "↺ approved with follow-ups"),
             ("# Review\n\nNeeds some fixes.\n\nVerdict: CHANGES_REQUESTED", "⚠ changes requested"),
             ("# Review\n\nThis requires team discussion.\n\n**Verdict: NEEDS_DISCUSSION**", "💬 needs discussion"),
         ],
-        ids=["approved", "changes_requested", "needs_discussion"],
+        ids=["approved", "approved_with_followups", "changes_requested", "needs_discussion"],
     )
     def test_unmerged_shows_review_verdict(self, tmp_path: Path, review_output, expected_text):
         """Unmerged output shows the correct review verdict."""

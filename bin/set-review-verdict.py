@@ -20,16 +20,16 @@ regex-based extractors can find the verdict reliably.
 """
 
 import argparse
-import re
 import sqlite3
 import sys
 from pathlib import Path
 
 from gza.config import Config
 from gza.db import InvalidTaskIdError, resolve_task_id
+from gza.review_verdict import parse_review_verdict
 from gza.runner import extract_content_from_log
 
-VALID_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION")
+VALID_VERDICTS = ("APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION")
 
 
 def get_db_path() -> Path:
@@ -38,21 +38,7 @@ def get_db_path() -> Path:
 
 def extract_verdict(content: str) -> str | None:
     """Extract verdict using the same logic as the codebase."""
-    match = re.search(
-        r"\*{0,2}Verdict\*{0,2}:\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
-        content,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).upper()
-    match = re.search(
-        r"##\s+Verdict\s*\n+\s*\*{0,2}(APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)\*{0,2}",
-        content,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).upper()
-    return None
+    return parse_review_verdict(content)
 
 
 def main() -> int:

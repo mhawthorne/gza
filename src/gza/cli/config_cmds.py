@@ -71,16 +71,16 @@ def _count_section_items(content: str, header_pattern: str) -> int:
 
 
 def _count_review_issues(content: str) -> tuple[int, int]:
-    """Parse review markdown and return (must_fix_count, suggestion_count)."""
+    """Parse review markdown and return (blocker_count, followup_count)."""
     if not content:
         return 0, 0
-    must_fix = len(re.findall(r"^###\s+(?:M?\d+[\.\s\u2014\u2013-]|Issue\s+\d+)", content, re.MULTILINE))
-    suggestions = len(re.findall(r"^###\s+S\d+[\.\s\u2014\u2013-]", content, re.MULTILINE))
-    if must_fix == 0:
-        must_fix = _count_section_items(content, r"^(?:#+\s*)?must[- ]?fix(?:\s+issues?)?$")
-    if suggestions == 0:
-        suggestions = _count_section_items(content, r"^(?:#+\s*)?suggestions?$")
-    return must_fix, suggestions
+    blockers = len(re.findall(r"^###\s+(?:B\d+[\.\s\u2014\u2013-]|M?\d+[\.\s\u2014\u2013-]|Issue\s+\d+)", content, re.MULTILINE))
+    followups = len(re.findall(r"^###\s+(?:F\d+[\.\s\u2014\u2013-]|S\d+[\.\s\u2014\u2013-])", content, re.MULTILINE))
+    if blockers == 0:
+        blockers = _count_section_items(content, r"^(?:#+\s*)?(?:blockers?|must[- ]?fix(?:\s+issues?)?)$")
+    if followups == 0:
+        followups = _count_section_items(content, r"^(?:#+\s*)?(?:follow[- ]?ups?|suggestions?)$")
+    return blockers, followups
 
 
 def _cmd_stats_reviews(
@@ -401,7 +401,7 @@ def _cmd_stats_reviews(
                 return f"{int(median(vals))}/{_percentile(vals, 75)}/{_percentile(vals, 90)}/{max(vals)}"
 
             print("\nIssue counts per review (parsed from markdown)")
-            print(f"{'Review model':<35} {'Rvws':>5}  {'Must-fix':>16}  {'Suggestions':>16}")
+            print(f"{'Review model':<35} {'Rvws':>5}  {'Blockers':>16}  {'Follow-ups':>16}")
             print(f"{'':35} {'':>5}  {'med/p75/p90/max':>16}  {'med/p75/p90/max':>16}")
             print("-" * 77)
             all_fixes: list[int] = []

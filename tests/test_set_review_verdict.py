@@ -149,6 +149,9 @@ class TestVerdict:
         # output_content must remain unchanged.
         assert _get_output_content(db_path, task_id) == existing_content
 
+    def test_extract_verdict_supports_approved_with_followups(self) -> None:
+        assert extract_verdict("## Verdict\n\nVerdict: APPROVED_WITH_FOLLOWUPS\n") == "APPROVED_WITH_FOLLOWUPS"
+
 
 class TestMutualExclusivity:
     def test_verdict_and_from_log_are_mutually_exclusive(self, tmp_path: Path) -> None:

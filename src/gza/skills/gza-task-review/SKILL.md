@@ -155,22 +155,23 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 <- Did I require targeted regression tests that match each failure mode (not generic "add tests")?>
 <- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>
 
-## Must-Fix
+## Blockers
 
-<Use ### M1, ### M2, ... for blockers. If none, write "None.">
+<Use ### B1, ### B2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
-<Reserve Must-Fix for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
-<Treat unexplained deviations from the provided plan or request as Must-Fix.>
-<Treat silent broad-exception fallbacks as Must-Fix when they can alter user/agent-visible state without clear warning/error surfacing.>
-<Treat misleading output (UI/prompt/context contradictions) as Must-Fix when it can cause incorrect operator or agent decisions.>
-<If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are Must-Fix when they can mislead operators.>
-<Push style, cleanup, and non-risky refactors to Suggestions.>
+<Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
+<Treat unexplained deviations from the provided plan or request as BLOCKER.>
+<Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>
+<Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.>
+<If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.>
+<Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 
-## Suggestions
+## Follow-Ups
 
-<Use ### S1, ### S2, ... for non-blocking suggestions. If none, write "None.">
-<Each suggestion should include Suggestion: and Why it helps:. Evidence: is optional but encouraged.>
+<Use ### F1, ### F2, ... for non-blocking actionable follow-ups. If none, write "None.">
+<Each follow-up should include Evidence:, Impact:, Recommended follow-up:, Recommended tests:>
+<Do not include NIT findings in canonical output.>
 
 ## Questions / Assumptions
 
@@ -179,7 +180,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 ## Verdict
 
 <Brief justification>
-Verdict: APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION
+Verdict: APPROVED|APPROVED_WITH_FOLLOWUPS|CHANGES_REQUESTED|NEEDS_DISCUSSION
 ```
 
 Do not rename, omit, or reorder these sections.
@@ -266,16 +267,16 @@ print(f'Review saved as task #{created.id} ({created.report_file})')
 ### Step 8: Report back
 
 After the subagent completes:
-- Print the review verdict (APPROVED / CHANGES_REQUESTED / NEEDS_DISCUSSION)
+- Print the review verdict (APPROVED / APPROVED_WITH_FOLLOWUPS / CHANGES_REQUESTED / NEEDS_DISCUSSION)
 - Print a brief summary of findings
-- If changes were requested, tell the user: "Run `/gza-task-improve <IMPL_TASK_ID>` to address the must-fix items."
+- If changes were requested, tell the user: "Run `/gza-task-improve <IMPL_TASK_ID>` to address the blocker items."
 - If a PR was used, include a link to it
 - If you changed checkouts during the workflow, switch back to `<START_CHECKOUT>` before the final message and state explicitly which checkout is now active
 
 ## Important notes
 
-- **Ask-adherence is mandatory** — use the Summary checklist item for `## Original plan:` or `## Original request:` to confirm the implementation matches the requested behavior, and treat unexplained deviations as must-fix blockers.
-- **Structured output matters** — the review format (M1, M2, S1, S2) must be compatible with `/gza-task-improve` so the improve workflow can consume it.
+- **Ask-adherence is mandatory** — use the Summary checklist item for `## Original plan:` or `## Original request:` to confirm the implementation matches the requested behavior, and treat unexplained deviations as blocker findings.
+- **Structured output matters** — the review format (B1, B2, F1, F2) must be compatible with `/gza-task-improve` and follow-up automation.
 - **Don't duplicate existing reviews** — if there's already a recent review, inform the user and ask before creating another one.
 - **Use authoritative diff context** — do not reconstruct or expand the diff in the reviewing subagent; only use provided diff context plus unchanged-source reads for verification.
 - **Preserve the user's checkout** — `/gza-task-review` should be checkout-neutral. If you switch branches for any reason, restore the starting checkout before returning control to the user.
