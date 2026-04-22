@@ -4785,14 +4785,14 @@ class TestTaskClaimSafety:
         assert '"subtype": "execution"' in log_content
         assert "Preflight failed" in log_content
 
-    def test_run_inline_forces_observe_only_until_interactive_session_telemetry_exists(
+    def test_run_inline_requests_interactive_for_capable_provider(
         self,
         tmp_path: Path,
     ):
-        """Inline invocation should not request provider interactive mode yet."""
+        """Inline invocation should request provider interactive mode when supported."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Inline mode downgrade", task_type="implement")
+        task = store.add(prompt="Inline mode interactive", task_type="implement")
         task.status = "failed"
         task.session_id = "sess-123"
         store.update(task)
@@ -4825,7 +4825,103 @@ class TestTaskClaimSafety:
 
         assert result == 0
         assert mock_run_inner.call_count == 1
-        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "observe_only"
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "interactive"
+
+    def test_run_inline_interactive_interrupt_keeps_session_for_resume(self, tmp_path: Path):
+        """Inline interactive runs should keep session_id persisted when interrupted."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Interruptible inline task", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+
+        def _simulate_interrupt(task: Task, *_args, **kwargs) -> int:
+            assert kwargs["interaction_mode"] == "interactive"
+            task.session_id = "sess-inline-1"
+            store.update(task)
+            store.mark_failed(
+                task,
+                log_file=task.log_file,
+                branch=task.branch,
+                failure_reason="INTERRUPTED",
+            )
+            return 130
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", side_effect=_simulate_interrupt),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INTERRUPTED"
+        assert refreshed.session_id == "sess-inline-1"
+
+    def test_successful_run_keeps_preflight_and_runner_entries_in_one_log(self, tmp_path: Path):
+        """Successful run should keep preflight and provider-run entries in one canonical log."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Single canonical log", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+
+        def _verify_credentials(_cfg, log_file: Path | None = None) -> bool:
+            assert log_file is not None
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            write_log_entry(log_file, {"type": "gza", "subtype": "preflight", "message": "preflight-ok"})
+            return True
+
+        def _run_inner_success(task: Task, *_args, **kwargs) -> int:
+            assert kwargs["interaction_mode"] == "observe_only"
+            assert task.log_file is not None
+            log_path = config.project_dir / task.log_file
+            write_log_entry(log_path, {"type": "gza", "subtype": "provider", "message": "provider-run"})
+            return 0
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", side_effect=_run_inner_success),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Codex"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.side_effect = _verify_credentials
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, task_id=task.id)
+
+        assert result == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.log_file is not None
+        assert refreshed.log_file.endswith(".log")
+        assert not refreshed.log_file.endswith(".startup.log")
+        log_content = (config.project_dir / refreshed.log_file).read_text()
+        assert "preflight-ok" in log_content
+        assert "provider-run" in log_content
 
 
 class TestSameBranchLineageWalk:

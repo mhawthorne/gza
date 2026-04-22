@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
@@ -80,6 +80,16 @@ class InvalidTaskIdError(ValueError):
 
 class SchemaIntegrityError(RuntimeError):
     """Raised when persisted DB artifacts are internally inconsistent."""
+
+
+class _ClosingSqliteConnection(sqlite3.Connection):
+    """sqlite3 connection that always closes when exiting a context manager."""
+
+    def __exit__(self, exc_type, exc, tb) -> Literal[False]:
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
 
 
 def _encode_v25_base36(n: int) -> str:
@@ -893,7 +903,12 @@ class SqliteTaskStore:
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
-        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
+        conn = sqlite3.connect(
+            self.db_path,
+            isolation_level=None,
+            timeout=5,
+            factory=_ClosingSqliteConnection,
+        )
         conn.row_factory = sqlite3.Row
         return conn
 

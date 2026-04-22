@@ -159,11 +159,6 @@ def _resolve_interaction_mode(
     else:
         resolved = requested
 
-    # Foreground inline runs currently cannot preserve session telemetry in the
-    # interactive Claude shell path, so keep run-inline observe-only until the
-    # interactive path can stream session/step callbacks into runner state.
-    if invocation.execution_mode == "foreground_inline" and resolved == "interactive":
-        return "observe_only"
     return resolved
 
 
@@ -210,14 +205,15 @@ def _mark_preflight_provider_unavailable(
     message: str,
 ) -> None:
     """Persist preflight credential failures as provider-unavailable task failures."""
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    if task.slug:
-        log_file = config.log_path / f"{task.slug}.log"
-    else:
-        fallback_name = (task.id or "unknown-task").replace("/", "-")
-        log_file = config.log_path / f"{fallback_name}.log"
-    task.log_file = str(log_file.relative_to(config.project_dir))
-    store.update(task)
+    log_file = (
+        config.project_dir / Path(task.log_file)
+        if task.log_file
+        else open_task_startup_log(config, task)
+    )
+    log_file_relative = str(log_file.relative_to(config.project_dir))
+    if task.log_file != log_file_relative:
+        task.log_file = log_file_relative
+        store.update(task)
 
     write_worker_start_event(log_file, resumed=resume)
     write_log_entry(
@@ -1947,14 +1943,10 @@ def run(
     # Get the provider for this task
     provider = get_provider(task_config)
     resolved_interaction_mode = _resolve_interaction_mode(invocation_context, provider)
-    if task.log_file is None:
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        if task.slug:
-            preflight_log = config.log_path / f"{task.slug}.log"
-        else:
-            fallback_name = (task.id or "unknown-task").replace("/", "-")
-            preflight_log = config.log_path / f"{fallback_name}.log"
-        task.log_file = str(preflight_log.relative_to(config.project_dir))
+    preflight_log = open_task_startup_log(config, task)
+    preflight_log_relative = str(preflight_log.relative_to(config.project_dir))
+    if task.log_file != preflight_log_relative:
+        task.log_file = preflight_log_relative
         store.update(task)
 
     if not provider.check_credentials():
@@ -2019,6 +2011,14 @@ def run(
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
         )
+    if task.slug and task.log_file:
+        startup_log = config.project_dir / Path(task.log_file)
+        if startup_log.name.endswith(".startup.log"):
+            slug_log = rename_startup_log_to_slug(config, startup_log, task.slug)
+            slug_log_relative = str(slug_log.relative_to(config.project_dir))
+            if task.log_file != slug_log_relative:
+                task.log_file = slug_log_relative
+                store.update(task)
 
     task_header(
         task.prompt,
@@ -2027,10 +2027,16 @@ def run(
         slug=task.slug,
     )
     if invocation_context.execution_mode == "foreground_inline":
-        console.print(
-            f"Foreground inline execution: observe-only for provider '{provider.name.lower()}'. "
-            "Interrupt to redirect.",
-        )
+        if resolved_interaction_mode == "interactive":
+            console.print(
+                f"Foreground inline execution: interactive mode for provider '{provider.name.lower()}'. "
+                "Press Ctrl-C to interrupt.",
+            )
+        else:
+            console.print(
+                f"Foreground inline execution: observe-only for provider '{provider.name.lower()}'. "
+                "Interrupt to redirect.",
+            )
 
     return _run_inner(
         task,
@@ -2721,12 +2727,14 @@ def _run_inner(
 
     store.update(task)
 
-    # Setup logging - use task_id for naming (logs stay in main project)
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_path / f"{task.slug}.log"
-    # Persist log_file early so it's available if the process is killed before completion
-    task.log_file = str(log_file.relative_to(config.project_dir))
-    store.update(task)
+    # Setup logging using the canonical task log path selected during preflight.
+    if task.log_file:
+        log_file = config.project_dir / Path(task.log_file)
+    else:
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        log_file = config.log_path / f"{task.slug}.log"
+        task.log_file = str(log_file.relative_to(config.project_dir))
+        store.update(task)
 
     # Write orchestration pre-run entries
     write_worker_start_event(log_file, resumed=resume)
@@ -2999,12 +3007,14 @@ def _run_non_code_task(
     if resume and task.session_id:
         console.print(f"Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
 
-    # Setup logging
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_path / f"{task.slug}.log"
-    # Persist log_file early so it's available if the process is killed before completion
-    task.log_file = str(log_file.relative_to(config.project_dir))
-    store.update(task)
+    # Setup logging using the canonical task log path selected during preflight.
+    if task.log_file:
+        log_file = config.project_dir / Path(task.log_file)
+    else:
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        log_file = config.log_path / f"{task.slug}.log"
+        task.log_file = str(log_file.relative_to(config.project_dir))
+        store.update(task)
 
     # Write orchestration pre-run entries
     write_worker_start_event(log_file, resumed=resume)
