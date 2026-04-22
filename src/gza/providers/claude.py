@@ -294,7 +294,7 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
-        """Run Claude in true foreground interactive mode (no stream-json pipe mode)."""
+        """Run Claude in foreground mode while preserving runner telemetry callbacks."""
         if config.use_docker:
             return self._run_docker_interactive(
                 config,
@@ -362,8 +362,7 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
-        """Run Claude interactively inside Docker with a TTY."""
-        _ = (log_file, on_step_count)
+        """Run Claude foreground execution in Docker with stream parsing/callbacks."""
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
         docker_config = _get_docker_config(f"{config.docker_image}-claude")
@@ -378,14 +377,19 @@ class ClaudeProvider(Provider):
             config.timeout_minutes,
             config.docker_volumes,
             config.docker_setup_command,
-            interactive=True,
         )
         cmd.append("claude")
-        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
-        result = subprocess.run(cmd)
-        if resume_session_id and on_session_id is not None:
-            on_session_id(resume_session_id)
-        return RunResult(exit_code=result.returncode, session_id=resume_session_id)
+        cmd.extend(self._build_claude_args(config, resume_session_id))
+        return self._run_with_output_parsing(
+            cmd,
+            log_file,
+            config.timeout_minutes,
+            stdin_input=prompt,
+            model=config.model,
+            chat_text_display_length=config.chat_text_display_length,
+            on_session_id=on_session_id,
+            on_step_count=on_step_count,
+        )
 
     def _run_direct_interactive(
         self,
@@ -397,14 +401,20 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
-        """Run Claude interactively on host with inherited TTY stdio."""
-        _ = (log_file, on_step_count)
+        """Run Claude foreground execution on host with stream parsing/callbacks."""
         cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
-        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
-        result = subprocess.run(cmd, cwd=work_dir)
-        if resume_session_id and on_session_id is not None:
-            on_session_id(resume_session_id)
-        return RunResult(exit_code=result.returncode, session_id=resume_session_id)
+        cmd.extend(self._build_claude_args(config, resume_session_id))
+        return self._run_with_output_parsing(
+            cmd,
+            log_file,
+            config.timeout_minutes,
+            cwd=work_dir,
+            stdin_input=prompt,
+            model=config.model,
+            chat_text_display_length=config.chat_text_display_length,
+            on_session_id=on_session_id,
+            on_step_count=on_step_count,
+        )
 
     def _run_docker(
         self,

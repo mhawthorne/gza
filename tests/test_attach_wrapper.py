@@ -57,6 +57,30 @@ def test_attach_wrapper_normal_exit_auto_resumes_when_task_incomplete(tmp_path: 
     assert "resume" in names
 
 
+def test_attach_wrapper_sets_foreground_attach_resume_execution_mode(tmp_path: Path) -> None:
+    """Interactive attach/resume should stamp foreground_attach_resume provenance on the task."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    refreshed = store.get(task_id)
+    assert refreshed is not None
+    assert refreshed.execution_mode == "foreground_attach_resume"
+
+
 def test_attach_wrapper_sigterm_detach_auto_resumes(tmp_path: Path) -> None:
     """SIGTERM detach path should auto-resume in background and emit lifecycle events."""
     task_id, log_path = _setup_task_with_log(tmp_path)

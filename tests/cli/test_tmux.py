@@ -831,8 +831,8 @@ class TestClaudeProviderTmuxMode:
         assert "-p" in cmd, "Non-tmux mode should use -p flag"
         assert "--output-format" in cmd, "Non-tmux mode should use --output-format"
 
-    def test_claude_provider_interactive_foreground_non_tmux_uses_interactive_launch(self, tmp_path: Path):
-        """Interactive foreground mode must not use stream-json pipe invocation."""
+    def test_claude_provider_interactive_foreground_non_tmux_preserves_stream_callbacks(self, tmp_path: Path):
+        """Interactive foreground mode should keep stream-json parsing for session/step telemetry."""
         from gza.providers.claude import ClaudeProvider
 
         config = self._make_config(tmp_path, tmux_session=None)
@@ -841,21 +841,19 @@ class TestClaudeProviderTmuxMode:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         provider = ClaudeProvider()
 
-        fake_result = MagicMock()
-        fake_result.returncode = 0
-
         with (
-            patch("gza.providers.claude.subprocess.run", return_value=fake_result) as mock_run,
             patch.object(provider, "_run_with_output_parsing") as mock_stream,
+            patch("gza.providers.claude.subprocess.run") as mock_run,
         ):
             provider.run(config, "interactive task prompt", log_file, tmp_path, interactive=True)
 
-        mock_stream.assert_not_called()
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        assert "-p" not in cmd
-        assert "--output-format" not in cmd
-        assert "interactive task prompt" in cmd
+        mock_stream.assert_called_once()
+        mock_run.assert_not_called()
+        cmd = mock_stream.call_args[0][0]
+        assert "-p" in cmd
+        assert "--output-format" in cmd
+        assert "interactive task prompt" not in cmd
+        assert mock_stream.call_args.kwargs["stdin_input"] == "interactive task prompt"
 
     def test_claude_provider_uses_interactive_mode_in_tmux_session(self, tmp_path: Path):
         """ClaudeProvider omits -p flag and uses interactive mode when tmux session is set (M1)."""

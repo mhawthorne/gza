@@ -949,6 +949,35 @@ class TestReviewContextFromChain:
         assert "Please harden input validation." in context
         assert "nit: simplify helper" in context
 
+    def test_improve_context_excludes_comments_added_after_improve_creation(self, tmp_path: Path):
+        """Improve context should include only unresolved comments present at improve creation time."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Comment in improve snapshot", source="direct")
+        first_comment = store.get_comments(impl_task.id, unresolved_only=True)[0]
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+        )
+        improve_task.created_at = first_comment.created_at
+        store.update(improve_task)
+
+        store.add_comment(impl_task.id, "Comment added after improve creation", source="direct")
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Comments:" in context
+        assert "Comment in improve snapshot" in context
+        assert "Comment added after improve creation" not in context
+
     def test_improve_retry_context_reads_comments_from_implementation_ancestor(self, tmp_path: Path):
         """Retry/resume improves should still include unresolved comments from the root implementation."""
         db_path = tmp_path / "test.db"
@@ -3452,6 +3481,77 @@ class TestRunStepPersistenceIntegration:
         # The callback should have been called for each step (1, then 2)
         assert 1 in intermediate_counts
         assert 2 in intermediate_counts
+
+    def test_non_code_interrupt_persists_session_and_step_callbacks_before_failure(self, tmp_path: Path):
+        """Interrupted non-code runs should keep callback-persisted session and step state."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260422-plan-interrupt"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.model = ""
+        config.chat_text_display_length = 80
+        config.claude = Mock(args=[])
+        config.tmux = Mock(session_name=None)
+
+        def _interrupting_run(
+            _config,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del resume_session_id, interactive
+            assert on_session_id is not None
+            assert on_step_count is not None
+            on_session_id("sess-interrupted-inline")
+            on_step_count(3)
+            raise KeyboardInterrupt
+
+        mock_provider = Mock()
+        mock_provider.name = "Claude"
+        mock_provider.run.side_effect = _interrupting_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=1)
+
+        with (
+            patch("gza.runner.console"),
+            patch("gza.runner._snapshot_task_db_to_worktree"),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._create_local_dep_symlinks"),
+        ):
+            exit_code = _run_non_code_task(
+                task,
+                config,
+                store,
+                mock_provider,
+                mock_git,
+                resume=False,
+                interaction_mode="interactive",
+            )
+
+        assert exit_code == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INTERRUPTED"
+        assert refreshed.session_id == "sess-interrupted-inline"
+        assert refreshed.num_steps_computed == 3
 
 
 class TestResumeVerificationPrompt:
