@@ -1052,6 +1052,7 @@ class TestProviderRunMethods:
         assert "-p" not in cmd
         assert "--output-format" not in cmd
         assert "interactive prompt" in cmd
+        assert mock_run.call_args.kwargs["timeout_minutes"] == 5
 
     def test_claude_docker_interactive_does_not_use_stream_json_flags(self, tmp_path):
         """Foreground interactive Claude Docker mode must not use -p/stream-json args."""
@@ -1082,6 +1083,7 @@ class TestProviderRunMethods:
         assert "-p" not in cmd
         assert "--output-format" not in cmd
         assert "interactive prompt" in cmd
+        assert mock_run.call_args.kwargs["timeout_minutes"] == 5
 
     def test_gemini_routes_to_docker_when_enabled(self, tmp_path):
         """Gemini should route to Docker when use_docker is True."""
@@ -1751,8 +1753,10 @@ class TestClaudeStepMapping:
 
         assert captured == ["ses_once"]
 
-    def test_interactive_run_uses_true_foreground_launch_without_stream_callbacks(self, tmp_path):
-        """Foreground interactive runs should not go through stream-json callback parsing."""
+    def test_interactive_run_uses_pty_stdio_and_parses_callbacks(self, tmp_path):
+        """Foreground interactive runs should use PTY stdio and still parse callbacks."""
+        import json
+
         from gza.config import Config
         from gza.providers.claude import ClaudeProvider
 
@@ -1772,9 +1776,26 @@ class TestClaudeStepMapping:
         captured_sessions: list[str] = []
         captured_steps: list[int] = []
 
-        mock_completed = MagicMock()
-        mock_completed.returncode = 0
-        with patch("gza.providers.claude.subprocess.run", return_value=mock_completed) as mock_run:
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "sess-interactive-42"}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_1"}}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_2"}}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "result": "# Review\\n\\nVerdict: APPROVED"}) + "\n",
+        ]
+
+        mock_process = MagicMock()
+        mock_process.wait.return_value = None
+        mock_process.returncode = 0
+        mock_process.poll.side_effect = [None, 0]
+
+        with (
+            patch("gza.providers.claude.pty.openpty", return_value=(10, 11)),
+            patch("gza.providers.claude.select.select", side_effect=[([10], [], []), ([10], [], [])]),
+            patch("gza.providers.claude.os.read", side_effect=["".join(json_lines).encode("utf-8"), b""]),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.isatty", return_value=False),
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process) as mock_popen,
+        ):
             result = provider.run(
                 config,
                 prompt="Interactive callback test",
@@ -1785,14 +1806,105 @@ class TestClaudeStepMapping:
                 interactive=True,
             )
 
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
+        mock_popen.assert_called_once()
+        popen_args = mock_popen.call_args
+        cmd = popen_args.args[0]
         assert "-p" not in cmd
         assert "--output-format" not in cmd
+        assert popen_args.kwargs["stdin"] == 11
+        assert popen_args.kwargs["stdout"] == 11
+        assert popen_args.kwargs["stderr"] == 11
         assert result.exit_code == 0
-        assert result.session_id is None
-        assert captured_sessions == []
-        assert captured_steps == []
+        assert result.session_id == "sess-interactive-42"
+        assert captured_sessions == ["sess-interactive-42"]
+        assert captured_steps == [1, 2]
+        assert '"type": "result"' in log_file.read_text()
+
+    def test_interactive_launch_log_redacts_prompt_for_direct_mode(self, tmp_path):
+        """Interactive launch log must not include seeded prompt text in direct mode."""
+        from gza.config import Config
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "interactive-direct.log"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        config = Config(project_dir=tmp_path, project_name="test-project", provider="claude")
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        prompt = "Sensitive project context should never appear in logs"
+
+        mock_process = MagicMock()
+        mock_process.wait.return_value = None
+        mock_process.returncode = 0
+        mock_process.poll.return_value = 0
+
+        with (
+            patch("gza.providers.claude.pty.openpty", return_value=(20, 21)),
+            patch("gza.providers.claude.select.select", side_effect=[([20], [], [])]),
+            patch("gza.providers.claude.os.read", side_effect=[b""]),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.isatty", return_value=False),
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
+        ):
+            provider.run(
+                config,
+                prompt=prompt,
+                log_file=log_file,
+                work_dir=work_dir,
+                interactive=True,
+            )
+
+        log_text = log_file.read_text()
+        assert '"subtype": "interactive_launch"' in log_text
+        assert prompt not in log_text
+        assert "<prompt_redacted>" in log_text
+
+    def test_interactive_launch_log_redacts_prompt_for_docker_mode(self, tmp_path):
+        """Interactive launch log must not include seeded prompt text in Docker mode."""
+        from gza.config import Config
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "interactive-docker.log"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        config = Config(project_dir=tmp_path, project_name="test-project", provider="claude", use_docker=True)
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.docker_image = "test-image"
+        prompt = "Sensitive injected review context should be redacted"
+
+        mock_process = MagicMock()
+        mock_process.wait.return_value = None
+        mock_process.returncode = 0
+        mock_process.poll.return_value = 0
+
+        with (
+            patch("gza.providers.claude.ensure_docker_image", return_value=True),
+            patch("gza.providers.claude.build_docker_cmd", return_value=["docker", "run"]),
+            patch("gza.providers.claude.pty.openpty", return_value=(30, 31)),
+            patch("gza.providers.claude.select.select", side_effect=[([30], [], [])]),
+            patch("gza.providers.claude.os.read", side_effect=[b""]),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.isatty", return_value=False),
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
+        ):
+            provider.run(
+                config,
+                prompt=prompt,
+                log_file=log_file,
+                work_dir=work_dir,
+                interactive=True,
+            )
+
+        log_text = log_file.read_text()
+        assert '"subtype": "interactive_launch"' in log_text
+        assert prompt not in log_text
+        assert "<prompt_redacted>" in log_text
 
     def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
         """session_id should still be captured from result event when no system/init event is present."""

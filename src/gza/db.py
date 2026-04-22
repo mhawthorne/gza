@@ -371,8 +371,81 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
+_TASK_COMMENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "id",
+    "task_id",
+    "content",
+    "source",
+    "author",
+    "created_at",
+    "resolved_at",
+)
+
+
+def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
+    """Return required columns missing from a table."""
+    return [column for column in required_columns if not _table_has_column(conn, table, column)]
+
+
+def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
+    """Rebuild task_comments with the required schema, preserving existing rows."""
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")}
+    conn.execute("ALTER TABLE task_comments RENAME TO task_comments_damaged")
+    conn.execute(
+        """
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            author TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    select_exprs = {
+        "id": "id" if "id" in existing_columns else "NULL",
+        "task_id": "task_id" if "task_id" in existing_columns else "''",
+        "content": "content" if "content" in existing_columns else "''",
+        "source": "source" if "source" in existing_columns else "'direct'",
+        "author": "author" if "author" in existing_columns else "NULL",
+        "created_at": (
+            "created_at" if "created_at" in existing_columns else "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
+        ),
+        "resolved_at": "resolved_at" if "resolved_at" in existing_columns else "NULL",
+    }
+    conn.execute(
+        """
+        INSERT INTO task_comments (id, task_id, content, source, author, created_at, resolved_at)
+        SELECT
+            {id},
+            {task_id},
+            {content},
+            {source},
+            {author},
+            {created_at},
+            {resolved_at}
+        FROM task_comments_damaged
+        """.format(**select_exprs)
+    )
+    conn.execute("DROP TABLE task_comments_damaged")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at)")
+
+
 def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: int) -> None:
     """Validate required schema artifacts for selected automatic migration targets."""
+    if target_version == 32:
+        if not _table_exists(conn, "task_comments"):
+            raise RuntimeError("Auto-migration to v32 incomplete: missing required table task_comments")
+        missing_comment_columns = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+        if missing_comment_columns:
+            raise RuntimeError(
+                "Auto-migration to v32 incomplete: missing required column "
+                f"task_comments.{missing_comment_columns[0]}"
+            )
+
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
         31: ("tasks", "execution_mode"),
@@ -385,8 +458,6 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         raise RuntimeError(
             f"Auto-migration to v{target_version} incomplete: missing required column {table}.{column}"
         )
-    if target_version == 32 and not _table_exists(conn, "task_comments"):
-        raise RuntimeError("Auto-migration to v32 incomplete: missing required table task_comments")
 
 
 def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
@@ -404,6 +475,23 @@ def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
                 "Schema integrity check failed while repairing v32: "
                 "missing task_comments table; use a writable database."
             ) from exc
+
+    missing_comment_columns = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+    if missing_comment_columns:
+        missing_column = missing_comment_columns[0]
+        try:
+            _rebuild_task_comments_table(conn)
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required column "
+                f"task_comments.{missing_column}: use a writable database."
+            ) from exc
+        remaining_missing = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+        if remaining_missing:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required column "
+                f"task_comments.{remaining_missing[0]}: use a writable database."
+            )
 
     required_columns: tuple[tuple[str, str, str], ...] = (
         ("tasks", "urgent_bumped_at", "ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT"),

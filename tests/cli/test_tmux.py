@@ -833,6 +833,8 @@ class TestClaudeProviderTmuxMode:
 
     def test_claude_provider_interactive_foreground_non_tmux_uses_true_interactive_cli(self, tmp_path: Path):
         """Interactive foreground mode should launch Claude without stream-json flags."""
+        import io
+
         from gza.providers.claude import ClaudeProvider
 
         config = self._make_config(tmp_path, tmux_session=None)
@@ -843,13 +845,19 @@ class TestClaudeProviderTmuxMode:
 
         with (
             patch.object(provider, "_run_with_output_parsing") as mock_stream,
-            patch("gza.providers.claude.subprocess.run") as mock_run,
+            patch("gza.providers.claude.subprocess.Popen") as mock_popen,
+            patch("gza.providers.claude.sys.stdout", new=io.StringIO()),
         ):
+            mock_process = MagicMock()
+            mock_process.stdout = iter([])
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
             provider.run(config, "interactive task prompt", log_file, tmp_path, interactive=True)
 
         mock_stream.assert_not_called()
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
+        mock_popen.assert_called_once()
+        cmd = mock_popen.call_args[0][0]
         assert "-p" not in cmd
         assert "--output-format" not in cmd
         assert "interactive task prompt" in cmd
