@@ -339,8 +339,19 @@ class ClaudeProvider(Provider):
         config: Config,
         resume_session_id: str | None = None,
     ) -> list[str]:
-        """Build interactive Claude args with machine-readable stream output."""
-        return ClaudeProvider._build_claude_args(config, resume_session_id)
+        """Build args for true interactive Claude foreground sessions."""
+        args: list[str] = []
+
+        if resume_session_id:
+            args.extend(["--resume", resume_session_id])
+
+        if config.model:
+            args.extend(["--model", config.model])
+
+        args.extend(config.claude.args)
+        args.extend(["--max-turns", str(config.max_steps)])
+
+        return args
 
     def _run_docker_interactive(
         self,
@@ -635,12 +646,12 @@ class ClaudeProvider(Provider):
             slave_fd = None
 
             # Seed the initial task prompt via PTY stdin so it is never exposed in argv.
-            # Appending EOT signals prompt EOF for -p - without closing the session fd.
+            # For true interactive mode, send only a newline-terminated prompt and
+            # keep stdin connected for the rest of the live session.
             if stdin_input:
                 seeded_prompt = stdin_input
                 if not seeded_prompt.endswith("\n"):
                     seeded_prompt += "\n"
-                seeded_prompt += "\x04"
                 try:
                     os.write(master_fd, seeded_prompt.encode("utf-8", errors="replace"))
                 except OSError:
