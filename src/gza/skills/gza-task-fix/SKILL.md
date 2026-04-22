@@ -2,7 +2,7 @@
 name: gza-task-fix
 description: Rescue a stuck gza task inline — diagnoses review/improve churn, verifies each blocker against current code, addresses the open ones, runs verify, and commits. Runs entirely in Claude Code, no background worker.
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), Bash(cd:*), AskUserQuestion
-version: 2.0.0
+version: 2.0.1
 public: true
 ---
 
@@ -85,7 +85,7 @@ Present a one-paragraph loop-diagnosis summary to the user. If the situation is 
 git checkout <impl_branch>
 ```
 
-If the branch is checked out in another worktree, ask the user whether to work in that worktree path or switch this one. Do not create duplicate worktrees.
+If the branch is checked out in another worktree, **default to working in that existing worktree path** and continue there without asking. Treat this as an interactive task rescue: prefer the active task worktree over switching the user's current checkout. Ask only if the existing worktree path is unavailable or there are multiple plausible task worktrees and the right target is ambiguous. Do not create duplicate worktrees.
 
 If `<START_CHECKOUT>` already equals `<impl_branch>`, do not switch away and back.
 
