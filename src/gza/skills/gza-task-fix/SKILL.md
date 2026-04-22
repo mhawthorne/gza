@@ -26,7 +26,7 @@ Save as `<START_CHECKOUT>`. You must return the user here before finishing. If d
 
 ### Step 1: Resolve the target task and recent review history
 
-The user provides a full prefixed task ID (implementation, review, improve, or prior fix). Resolve to the implementation task and fetch the last three reviews so you can detect churn:
+The user provides a full prefixed task ID (for example, `gza-1234`) — implementation, review, improve, or prior fix. Resolve to the implementation task and fetch the last three reviews so you can detect churn:
 
 ```bash
 uv run python -c "

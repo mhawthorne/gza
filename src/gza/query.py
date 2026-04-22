@@ -428,7 +428,13 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
 
     # Detect resume/retry first: same task_type + based_on pointing to parent
     # indicates a re-execution of the same work, not a lifecycle transition.
-    if child.based_on == parent_id and child.task_type == parent.task_type:
+    # An explicit depends_on edge to the same parent means the child is a
+    # follow-on dependent — classify by the depends_on rules below instead.
+    if (
+        child.based_on == parent_id
+        and child.task_type == parent.task_type
+        and child.depends_on != parent_id
+    ):
         if child.session_id and child.session_id == parent.session_id:
             return "resume"
         return "retry"

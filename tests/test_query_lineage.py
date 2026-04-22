@@ -310,6 +310,29 @@ class TestBuildLineage:
         tree = build_lineage_tree(store, root)
         assert [child.relationship for child in tree.children] == ["review", "retry"]
 
+    def test_same_type_child_with_depends_on_is_not_retry(self):
+        # A child that shares task_type with its parent AND has based_on pointing
+        # to the parent is only a retry when it is re-executing the parent's work.
+        # An explicit depends_on edge means it is a follow-on dependent, not a retry.
+        store = MagicMock()
+        root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        dependent = _make_task(
+            id=2,
+            task_type="implement",
+            based_on=1,
+            depends_on=1,
+            created_at=datetime(2026, 1, 2),
+        )
+
+        def lineage_children(task_id):
+            if task_id == 1:
+                return [dependent]
+            return []
+
+        store.get_lineage_children.side_effect = lineage_children
+        tree = build_lineage_tree(store, root)
+        assert [child.relationship for child in tree.children] == ["implement-depends"]
+
     def test_tree_labels_fix_relationships(self):
         store = MagicMock()
         root = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
