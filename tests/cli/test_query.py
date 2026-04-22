@@ -3944,6 +3944,58 @@ class TestUnmergedReviewStatus:
         assert sibling_impl.id in lineage_output
         assert sibling_impl.id in unmerged_output
 
+    def test_unmerged_uses_latest_retry_resume_implementation_as_representative(self, tmp_path: Path):
+        """Shared-branch retry/resume chains summarize the newest implementation attempt."""
+        store, root_impl, git = setup_unmerged_env(tmp_path)
+
+        retry_impl = store.add("Retry implementation", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/test"
+        retry_impl.same_branch = True
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        retry_impl.session_id = "sess-retry"
+        store.update(retry_impl)
+
+        retry_review = store.add("Review retry", task_type="review")
+        retry_review.status = "completed"
+        retry_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        retry_review.depends_on = retry_impl.id
+        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(retry_review)
+
+        resumed_impl = store.add("Resume retry implementation", task_type="implement")
+        resumed_impl.status = "completed"
+        resumed_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        resumed_impl.based_on = retry_impl.id
+        resumed_impl.branch = "feature/test"
+        resumed_impl.same_branch = True
+        resumed_impl.has_commits = True
+        resumed_impl.merge_status = "unmerged"
+        resumed_impl.session_id = "sess-retry"
+        store.update(resumed_impl)
+
+        resumed_review = store.add("Review resumed implementation", task_type="review")
+        resumed_review.status = "completed"
+        resumed_review.completed_at = datetime(2026, 2, 12, 14, 0, tzinfo=UTC)
+        resumed_review.depends_on = resumed_impl.id
+        resumed_review.output_content = "Verdict: APPROVED"
+        store.update(resumed_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert f"⚡ {resumed_impl.id}" in normalized
+        assert "review: reviewed [✓ approved]" in normalized
+        assert root_impl.id in normalized
+        assert retry_impl.id in normalized
+        assert resumed_impl.id in normalized
+        assert resumed_review.id in normalized
+        assert "⚠ changes requested" not in normalized
+
     def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
         """The most recent review node is annotated with the latest marker."""
         store, impl, git = setup_unmerged_env(tmp_path)
@@ -4298,6 +4350,34 @@ class TestUnmergedImprovedDisplay:
         assert result.returncode == 0
         # Cached stats should be displayed in +N/-N LOC, N files format
         assert "+42/-7 LOC, 5 files" in result.stdout
+
+    def test_unmerged_target_branch_ignores_default_branch_cached_stats(self, tmp_path: Path):
+        """When `--target` is used, unmerged recomputes diff stats for that merge target."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Target-aware stats task",
+            branch="feature/target-aware",
+        )
+
+        # Seed cached stats (computed against default branch) with a sentinel value.
+        task.diff_files_changed = 999
+        task.diff_lines_added = 999
+        task.diff_lines_removed = 999
+        store.update(task)
+
+        git._run("checkout", "-b", "target/base", "main")
+        (tmp_path / "target.txt").write_text("target-branch-change\n")
+        git._run("add", "target.txt")
+        git._run("commit", "-m", "Target branch baseline commit")
+        git._run("checkout", "main")
+
+        default_result = run_gza("unmerged", "--project", str(tmp_path))
+        assert default_result.returncode == 0
+        assert "+999/-999 LOC, 999 files" in default_result.stdout
+
+        target_result = run_gza("unmerged", "--target", "target/base", "--project", str(tmp_path))
+        assert target_result.returncode == 0
+        assert "+999/-999 LOC, 999 files" not in target_result.stdout
 
     def test_unmerged_review_shown_on_own_line(self, tmp_path: Path):
         """Review status appears on its own 'review:' line."""
