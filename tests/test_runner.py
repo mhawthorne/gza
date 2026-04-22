@@ -336,7 +336,7 @@ class TestWorkerLifecycleLogging:
         import json
 
         event = json.loads(log_file.read_text().strip())
-        assert event["execution_mode"] == "foreground_worker"
+        assert event["execution_mode"] == "worker_foreground"
         assert event["worker_mode"] is True
 
     def test_build_prompt_skips_learnings_when_skip_learnings_true(self, tmp_path: Path):
@@ -4288,6 +4288,7 @@ class TestNonCodeReportArtifactContract:
             ),
             patch("gza.providers.claude.os.close"),
             patch("gza.providers.claude.os.isatty", return_value=False),
+            patch("gza.providers.claude.os.write"),
             patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
             patch("gza.runner.post_review_to_pr"),
             patch("gza.runner.console"),
@@ -5160,12 +5161,79 @@ class TestTaskClaimSafety:
         ]
         assert execution_events
         execution_event = execution_events[-1]
-        expected_mode = invocation.execution_mode if invocation is not None else "foreground_worker"
+        expected_mode = refreshed.execution_mode
+        assert expected_mode is not None
         assert execution_event["execution_mode"] == expected_mode
-        if expected_mode in {"background_worker", "foreground_worker"}:
+        if expected_mode in {"worker_background", "worker_foreground"}:
             assert execution_event["worker_mode"] is True
         else:
             assert execution_event["worker_mode"] is False
+
+    @pytest.mark.parametrize(
+        ("command", "resume"),
+        [
+            ("implement", False),
+            ("resume", True),
+        ],
+    )
+    def test_foreground_worker_commands_log_canonical_execution_mode(
+        self,
+        tmp_path: Path,
+        command: str,
+        resume: bool,
+    ):
+        """Foreground worker command provenance should match the persisted task execution mode."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt=f"{command} provenance parity", task_type="implement")
+        if resume:
+            task.status = "failed"
+            task.session_id = "resume-session-123"
+            store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = False
+            mock_provider.credential_setup_hint = "set creds"
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                resume=resume,
+                invocation=RunInvocationContext(
+                    command=command,
+                    execution_mode="foreground_worker",
+                    interaction_mode="observe_only",
+                ),
+            )
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.execution_mode == "worker_foreground"
+        assert refreshed.log_file is not None
+
+        import json
+
+        log_content = (tmp_path / refreshed.log_file).read_text()
+        execution_events = [
+            json.loads(line)
+            for line in log_content.splitlines()
+            if line.strip() and '"subtype": "execution"' in line
+        ]
+        assert execution_events
+        execution_event = execution_events[-1]
+        assert execution_event["command"] == command
+        assert execution_event["execution_mode"] == refreshed.execution_mode
+        assert execution_event["worker_mode"] is True
 
     def test_run_inline_requests_interactive_for_capable_provider(
         self,

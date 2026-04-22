@@ -655,7 +655,35 @@ class ClaudeProvider(Provider):
                 try:
                     os.write(master_fd, seeded_prompt.encode("utf-8", errors="replace"))
                 except OSError:
-                    logger.warning("Failed to seed interactive stdin prompt", exc_info=True)
+                    error_message = "Failed to seed interactive stdin prompt; aborting interactive run."
+                    logger.error(error_message, exc_info=True)
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps({
+                                "type": "gza",
+                                "subtype": "outcome",
+                                "message": error_message,
+                                "exit_code": 1,
+                                "failure_reason": "UNKNOWN",
+                            }) + "\n"
+                        )
+                        f.flush()
+                    sys.stderr.write(f"{error_message}\n")
+                    sys.stderr.flush()
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                    return RunResult(
+                        exit_code=1,
+                        duration_seconds=round(time.time() - start_time, 1),
+                        session_id=session_id,
+                        num_steps_computed=computed_steps or None,
+                        error_type="startup_failed",
+                    )
 
             try:
                 maybe_stdin_fd = sys.stdin.fileno()

@@ -172,9 +172,10 @@ def write_execution_provenance_event(
 ) -> None:
     """Write structured runner execution provenance before provider launch."""
     provider_name = provider.name.lower()
-    worker_mode = invocation.execution_mode in {"background_worker", "foreground_worker"}
+    canonical_execution_mode = _task_execution_mode_from_invocation(invocation)
+    worker_mode = canonical_execution_mode in {"worker_background", "worker_foreground"}
     message = (
-        f"Execution: command={invocation.command}, mode={invocation.execution_mode}, "
+        f"Execution: command={invocation.command}, mode={canonical_execution_mode}, "
         f"interaction={interaction_mode}, provider={provider_name}, resumed={resumed}"
     )
     write_log_entry(
@@ -184,7 +185,7 @@ def write_execution_provenance_event(
             "subtype": "execution",
             "message": message,
             "command": invocation.command,
-            "execution_mode": invocation.execution_mode,
+            "execution_mode": canonical_execution_mode,
             "interaction_mode": interaction_mode,
             "provider": provider_name,
             "worker_mode": worker_mode,
