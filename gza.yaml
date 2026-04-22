@@ -12,10 +12,12 @@ learnings_max_items: 50
 
 merge_squash_threshold: 1
 
-max_review_cycles: 12
+max_review_cycles: 10
 
-provider: claude
-model: claude-sonnet-4-6
+#provider: claude
+#model: claude-sonnet-4-6
+provider: codex
+model: gpt-5.3-codex
 
 #task_types:
 #  plan:
