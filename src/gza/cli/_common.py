@@ -40,6 +40,11 @@ from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
 
+def _stdout_is_tty() -> bool:
+    """Seam for tests: whether stdout is a terminal. Tests patch this, not ``sys.stdout.isatty``."""
+    return sys.stdout.isatty()
+
+
 def get_store(config: Config) -> SqliteTaskStore:
     """Get the SQLite task store.
 
@@ -1918,7 +1923,7 @@ def pager_context(use_page: bool, project_dir: Path) -> contextlib.AbstractConte
     Returns:
         A context manager; use it as ``with pager_context(...): ...``.
     """
-    if use_page and sys.stdout.isatty():
+    if use_page and _stdout_is_tty():
         from ..console import console
         pager_cmd = _get_pager(project_dir)
         return console.pager(pager=_GzaPager(pager_cmd), styles=True)

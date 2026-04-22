@@ -1585,8 +1585,6 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_provides_default_for_implement_with_based_on(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt provides a default prompt for implement tasks with based_on."""
-        import subprocess
-
         from gza.db import edit_prompt
 
         # Mock subprocess.run to capture what would be written to the editor
@@ -1602,7 +1600,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
 
         # Call edit_prompt with implement type and based_on
         # Note: This will still try to open editor, but our mock will capture the content
@@ -1619,7 +1617,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run_with_write)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run_with_write)
 
         result = edit_prompt(
             initial_content="",
@@ -1636,8 +1634,6 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_includes_slug_when_provided(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt includes the slug in the default prompt when provided."""
-        import subprocess
-
         from gza.db import edit_prompt
 
         editor_content = []
@@ -1651,7 +1647,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run_with_write)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run_with_write)
 
         result = edit_prompt(
             initial_content="",
@@ -1666,8 +1662,6 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_no_default_for_other_task_types(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for non-implement tasks with based_on."""
-        import subprocess
-
         from gza.db import edit_prompt
 
         editor_content = []
@@ -1682,7 +1676,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
 
         result = edit_prompt(
             initial_content="",
@@ -1699,8 +1693,6 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_no_default_for_implement_without_based_on(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not provide default for implement tasks without based_on."""
-        import subprocess
-
         from gza.db import edit_prompt
 
         editor_content = []
@@ -1714,7 +1706,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
 
         result = edit_prompt(
             initial_content="",
@@ -1729,8 +1721,6 @@ class TestEditPromptDefaultContent:
 
     def test_edit_prompt_preserves_custom_initial_content(self, tmp_path: Path, monkeypatch):
         """Test that edit_prompt does not override custom initial_content."""
-        import subprocess
-
         from gza.db import edit_prompt
 
         editor_content = []
@@ -1745,7 +1735,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
 
         result = edit_prompt(
             initial_content=custom_content,
@@ -1762,8 +1752,6 @@ class TestEditPromptDefaultContent:
 
     def test_add_task_interactive_includes_slug_from_based_on(self, tmp_path: Path, monkeypatch):
         """Test that add_task_interactive looks up the slug from the based_on task."""
-        import subprocess
-
         from gza.db import SqliteTaskStore, add_task_interactive
 
         db_path = tmp_path / "test.db"
@@ -1785,7 +1773,7 @@ class TestEditPromptDefaultContent:
                 returncode = 0
             return Result()
 
-        monkeypatch.setattr(subprocess, 'run', mock_run)
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
 
         add_task_interactive(store, task_type="implement", based_on=plan_task.id)
 

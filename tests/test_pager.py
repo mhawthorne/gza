@@ -1,7 +1,6 @@
 """Tests for --page flag on gza show and gza log commands."""
 
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -56,7 +55,7 @@ class TestPagerContext:
 
     def test_returns_nullcontext_when_not_a_tty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """When stdout is not a TTY, pager_context is a no-op even if use_page=True."""
-        monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+        monkeypatch.setattr("gza.cli._common._stdout_is_tty", lambda: False)
         ctx = pager_context(True, tmp_path)
         with ctx:
             pass  # no exception expected
@@ -65,7 +64,7 @@ class TestPagerContext:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """When use_page=True and stdout is a TTY, _GzaPager is used."""
-        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        monkeypatch.setattr("gza.cli._common._stdout_is_tty", lambda: True)
 
         pager_shown: list[str] = []
 
