@@ -1030,7 +1030,11 @@ def _build_context_from_chain(
     if task.task_type == "improve":
         impl_ancestor = _resolve_impl_ancestor(store, task)
         if impl_ancestor is not None and impl_ancestor.id is not None:
-            unresolved_comments = store.get_comments(impl_ancestor.id, unresolved_only=True)
+            unresolved_comments = store.get_comments(
+                impl_ancestor.id,
+                unresolved_only=True,
+                created_on_or_before=task.created_at,
+            )
             if unresolved_comments:
                 context_parts.append("## Comments:\n")
                 for comment in unresolved_comments:

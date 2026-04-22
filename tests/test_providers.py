@@ -1697,6 +1697,58 @@ class TestClaudeStepMapping:
 
         assert captured == ["ses_once"]
 
+    def test_interactive_run_invokes_session_and_step_callbacks_for_fresh_session(self, tmp_path):
+        """Foreground interactive runs must still emit session and step callbacks."""
+        import json
+
+        from gza.config import Config
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "interactive.log"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        config = Config(project_dir=tmp_path, project_name="test-project", provider="claude")
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.chat_text_display_length = 80
+        config.model = ""
+        config.claude.args = []
+
+        captured_sessions: list[str] = []
+        captured_steps: list[int] = []
+
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "sess-interactive-1", "tools": []}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_1", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "assistant", "message": {"id": "msg_2", "content": [], "usage": {}}}) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 2, "total_cost_usd": 0.0}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider.run(
+                config,
+                prompt="Interactive callback test",
+                log_file=log_file,
+                work_dir=work_dir,
+                on_session_id=captured_sessions.append,
+                on_step_count=captured_steps.append,
+                interactive=True,
+            )
+
+        assert result.exit_code == 0
+        assert result.session_id == "sess-interactive-1"
+        assert captured_sessions == ["sess-interactive-1"]
+        assert captured_steps == [1, 2]
+
     def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
         """session_id should still be captured from result event when no system/init event is present."""
         import json
