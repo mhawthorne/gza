@@ -691,7 +691,6 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: worker_background` for detached worker runs
 - `Execution Mode: worker_foreground` for foreground worker runs
 - `Execution Mode: foreground_inline` for `gza run-inline` runner-managed foreground runs
-- `Execution Mode: foreground_attach_resume` for attach-resume handoff execution
 - `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 
@@ -711,7 +710,7 @@ gza run-inline <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the run |
 
-`run-inline` currently runs in observe-only mode for all providers. Claude interactive inline session telemetry is temporarily disabled for tracked runner-managed runs until session/step callback persistence is fully wired.
+`run-inline` uses provider capabilities: Claude runs in interactive foreground mode, while providers without interactive foreground support run in observe-only mode.
 
 ### resume
 

@@ -1,6 +1,7 @@
 """Tests for database operations and task chaining."""
 
 import subprocess
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -271,6 +272,41 @@ class TestTaskChaining:
         assert groups["group-a"]["completed"] == 1
         assert groups["group-a"]["pending"] == 1
         assert groups["group-b"]["pending"] == 1
+
+
+class TestConnectionLifecycle:
+    """Targeted regressions for connection cleanup in context-managed store paths."""
+
+    def test_connect_context_closes_connection(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        conn = store._connect()
+        with conn as active:
+            active.execute("SELECT 1")
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+    def test_repeated_store_operations_close_each_connection(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        seen_connections: list[sqlite3.Connection] = []
+        original_connect = store._connect
+
+        def _tracking_connect() -> sqlite3.Connection:
+            conn = original_connect()
+            seen_connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(store, "_connect", _tracking_connect)
+
+        for i in range(25):
+            store.add(f"Task {i}")
+
+        for conn in seen_connections:
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
 
     def test_get_by_group(self, tmp_path: Path):
         """Test get_by_group returns tasks in correct order."""

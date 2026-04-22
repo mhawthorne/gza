@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.cli import _run_as_worker, _run_foreground
+from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
 from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
@@ -7613,6 +7613,40 @@ class TestRunForeground:
         assert mock_mark.call_count == 1
         assert mock_mark.call_args.kwargs.get("status") == "failed"
         assert mock_mark.call_args.kwargs.get("exit_code") == 130
+
+
+class TestRunInlineCommand:
+    """Tests for run-inline command wiring."""
+
+    def test_cmd_run_inline_passes_foreground_inline_auto_invocation(self, tmp_path: Path):
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=False,
+            max_turns=None,
+            task_id="testproject-1",
+            resume=True,
+            force=True,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.resolve_id", return_value="testproject-1"),
+            patch("gza.cli._run_foreground", return_value=130) as mock_run_foreground,
+        ):
+            rc = cmd_run_inline(args)
+
+        assert rc == 130
+        mock_run_foreground.assert_called_once()
+        assert mock_run_foreground.call_args.kwargs["task_id"] == "testproject-1"
+        assert mock_run_foreground.call_args.kwargs["resume"] is True
+        assert mock_run_foreground.call_args.kwargs["force"] is True
+        invocation = mock_run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "run-inline"
+        assert invocation.execution_mode == "foreground_inline"
+        assert invocation.interaction_mode == "auto"
 
 
 class TestRunAsWorker:
