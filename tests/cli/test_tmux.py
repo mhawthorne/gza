@@ -831,6 +831,32 @@ class TestClaudeProviderTmuxMode:
         assert "-p" in cmd, "Non-tmux mode should use -p flag"
         assert "--output-format" in cmd, "Non-tmux mode should use --output-format"
 
+    def test_claude_provider_interactive_foreground_non_tmux_uses_interactive_launch(self, tmp_path: Path):
+        """Interactive foreground mode must not use stream-json pipe invocation."""
+        from gza.providers.claude import ClaudeProvider
+
+        config = self._make_config(tmp_path, tmux_session=None)
+        config.use_docker = False
+        log_file = tmp_path / ".gza" / "logs" / "test.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        provider = ClaudeProvider()
+
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+
+        with (
+            patch("gza.providers.claude.subprocess.run", return_value=fake_result) as mock_run,
+            patch.object(provider, "_run_with_output_parsing") as mock_stream,
+        ):
+            provider.run(config, "interactive task prompt", log_file, tmp_path, interactive=True)
+
+        mock_stream.assert_not_called()
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "interactive task prompt" in cmd
+
     def test_claude_provider_uses_interactive_mode_in_tmux_session(self, tmp_path: Path):
         """ClaudeProvider omits -p flag and uses interactive mode when tmux session is set (M1)."""
         from gza.providers.claude import ClaudeProvider

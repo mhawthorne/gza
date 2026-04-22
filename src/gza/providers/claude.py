@@ -294,9 +294,9 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
-        """Run Claude in foreground mode while preserving session/step telemetry."""
+        """Run Claude in true foreground interactive mode (no stream-json pipe mode)."""
         if config.use_docker:
-            return self._run_docker(
+            return self._run_docker_interactive(
                 config,
                 prompt,
                 log_file,
@@ -305,7 +305,7 @@ class ClaudeProvider(Provider):
                 on_session_id,
                 on_step_count,
             )
-        return self._run_direct(
+        return self._run_direct_interactive(
             config,
             prompt,
             log_file,
@@ -330,6 +330,81 @@ class ClaudeProvider(Provider):
         args.extend(["--max-turns", str(config.max_steps)])
 
         return args
+
+    @staticmethod
+    def _build_claude_interactive_args(
+        config: Config,
+        prompt: str,
+        resume_session_id: str | None = None,
+    ) -> list[str]:
+        """Build arguments for true interactive Claude foreground runs."""
+        args: list[str] = []
+        if resume_session_id:
+            args.extend(["--resume", resume_session_id])
+        elif prompt:
+            # Interactive non-resume runs seed the first user message directly.
+            args.append(prompt)
+
+        if config.model:
+            args.extend(["--model", config.model])
+
+        args.extend(config.claude.args)
+        args.extend(["--max-turns", str(config.max_steps)])
+        return args
+
+    def _run_docker_interactive(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
+    ) -> RunResult:
+        """Run Claude interactively inside Docker with a TTY."""
+        _ = (log_file, on_step_count)
+        if config.claude.fetch_auth_token_from_keychain:
+            sync_keychain_credentials()
+        docker_config = _get_docker_config(f"{config.docker_image}-claude")
+
+        if not ensure_docker_image(docker_config, config.project_dir):
+            print("Error: Failed to build Docker image")
+            return RunResult(exit_code=1)
+
+        cmd = build_docker_cmd(
+            docker_config,
+            work_dir,
+            config.timeout_minutes,
+            config.docker_volumes,
+            config.docker_setup_command,
+            interactive=True,
+        )
+        cmd.append("claude")
+        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
+        result = subprocess.run(cmd)
+        if resume_session_id and on_session_id is not None:
+            on_session_id(resume_session_id)
+        return RunResult(exit_code=result.returncode, session_id=resume_session_id)
+
+    def _run_direct_interactive(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
+    ) -> RunResult:
+        """Run Claude interactively on host with inherited TTY stdio."""
+        _ = (log_file, on_step_count)
+        cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
+        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
+        result = subprocess.run(cmd, cwd=work_dir)
+        if resume_session_id and on_session_id is not None:
+            on_session_id(resume_session_id)
+        return RunResult(exit_code=result.returncode, session_id=resume_session_id)
 
     def _run_docker(
         self,
