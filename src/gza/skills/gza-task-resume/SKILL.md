@@ -19,7 +19,7 @@ Require a full prefixed task ID (for example, `gza-1234`).
 If no task ID is provided, list recent failed tasks and ask which one to resume:
 
 ```bash
-uv run gza history --status failed --limit 10
+uv run gza history --status failed --last 10
 ```
 
 ### Step 2: Choose resume path

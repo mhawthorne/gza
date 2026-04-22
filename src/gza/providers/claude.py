@@ -362,7 +362,8 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
-        """Run Claude foreground execution in Docker with stream parsing/callbacks."""
+        """Run Claude in true foreground interactive mode in Docker."""
+        del on_session_id, on_step_count
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
         docker_config = _get_docker_config(f"{config.docker_image}-claude")
@@ -377,19 +378,11 @@ class ClaudeProvider(Provider):
             config.timeout_minutes,
             config.docker_volumes,
             config.docker_setup_command,
+            interactive=True,
         )
         cmd.append("claude")
-        cmd.extend(self._build_claude_args(config, resume_session_id))
-        return self._run_with_output_parsing(
-            cmd,
-            log_file,
-            config.timeout_minutes,
-            stdin_input=prompt,
-            model=config.model,
-            chat_text_display_length=config.chat_text_display_length,
-            on_session_id=on_session_id,
-            on_step_count=on_step_count,
-        )
+        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
+        return self._run_interactive_command(cmd, log_file)
 
     def _run_direct_interactive(
         self,
@@ -401,20 +394,11 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
-        """Run Claude foreground execution on host with stream parsing/callbacks."""
+        """Run Claude in true foreground interactive mode on host."""
+        del on_session_id, on_step_count
         cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
-        cmd.extend(self._build_claude_args(config, resume_session_id))
-        return self._run_with_output_parsing(
-            cmd,
-            log_file,
-            config.timeout_minutes,
-            cwd=work_dir,
-            stdin_input=prompt,
-            model=config.model,
-            chat_text_display_length=config.chat_text_display_length,
-            on_session_id=on_session_id,
-            on_step_count=on_step_count,
-        )
+        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
+        return self._run_interactive_command(cmd, log_file, cwd=work_dir)
 
     def _run_docker(
         self,
@@ -531,6 +515,25 @@ class ClaudeProvider(Provider):
                 "exit_code": result.returncode,
             }) + "\n")
 
+        return RunResult(exit_code=result.returncode)
+
+    def _run_interactive_command(
+        self,
+        cmd: list[str],
+        log_file: Path,
+        *,
+        cwd: Path | None = None,
+    ) -> RunResult:
+        """Run an interactive Claude command in the foreground terminal."""
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "a") as f:
+            f.write(json.dumps({
+                "type": "gza",
+                "subtype": "interactive_launch",
+                "command": cmd,
+            }) + "\n")
+
+        result = subprocess.run(cmd, cwd=cwd)
         return RunResult(exit_code=result.returncode)
 
     def _run_with_output_parsing(
