@@ -2,7 +2,7 @@
 
 project_name: gza
 
-verify_command: 'uv run ruff check src/gza/ && uv run ty check src/gza/ && uv run mypy src/ && uv run pytest tests/ -x -q'
+verify_command: 'uv run ruff check src/gza/ && uv run ty check src/gza/ && uv run mypy src/ && uv run python -m checks && uv run pytest tests/ -x -q'
 
 branch_strategy: date_slug
 
@@ -11,6 +11,8 @@ max_steps: 100
 learnings_max_items: 50
 
 merge_squash_threshold: 1
+
+max_review_cycles: 12
 
 provider: claude
 model: claude-sonnet-4-6
