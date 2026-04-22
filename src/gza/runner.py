@@ -2590,9 +2590,18 @@ def _handle_fix_follow_up_review(
 
     try:
         review_task = create_review_task(store, root_impl, prompt_mode="auto")
-    except DuplicateReviewError:
+    except DuplicateReviewError as exc:
+        active = exc.active_review
+        print(
+            f"Follow-up review already exists for implementation {root_impl.id}: "
+            f"{active.id} ({active.status})."
+        )
         return
-    except ValueError:
+    except ValueError as exc:
+        print(
+            f"Warning: Could not auto-create follow-up review for implementation {root_impl.id}: {exc}"
+        )
+        print(f"Next step: run `uv run gza review {root_impl.id}` after validating task state.")
         return
     print(f"Created follow-up review task {review_task.id} for implementation {root_impl.id}")
 

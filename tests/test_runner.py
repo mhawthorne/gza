@@ -16,7 +16,7 @@ from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
 from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
-from gza.review_tasks import create_or_reuse_followup_task
+from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
@@ -4827,6 +4827,85 @@ class TestTaskClaimSafety:
         assert mock_run_inner.call_count == 1
         assert mock_run_inner.call_args.kwargs["interaction_mode"] == "interactive"
 
+    def test_run_inline_prints_interactive_message_only_when_interactive_mode_used(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """run-inline should print interactive foreground messaging only for interactive-capable providers."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline message semantics", task_type="implement")
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Codex"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 0
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "observe_only"
+        output = capsys.readouterr().out
+        assert "Foreground inline execution: observe-only for provider 'codex'" in output
+        assert "interactive mode" not in output
+
+    def test_run_inline_prints_interactive_message_when_interactive_mode_is_used(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """run-inline should announce interactive mode when runner will launch provider interactively."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline message interactive", task_type="implement")
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 0
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "interactive"
+        output = capsys.readouterr().out
+        assert "Foreground inline execution: interactive mode for provider 'claude'" in output
+
     def test_run_inline_interactive_interrupt_keeps_session_for_resume(self, tmp_path: Path):
         """Inline interactive runs should keep session_id persisted when interrupted."""
         db_path = tmp_path / "test.db"
@@ -5963,6 +6042,156 @@ class TestExtractedRunInnerHelpers:
         assert "Warning: Could not determine whether the fix run changed code" in output
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
         assert reviews == []
+
+    def test_complete_code_task_fix_duplicate_follow_up_review_reports_existing_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Fix follow-up handoff must surface duplicate review reuse instead of silently returning."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implementation for duplicate review", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        fix_task = store.add(
+            prompt="Fix duplicate review path",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260422-fix-duplicate-followup"
+        store.mark_in_progress(fix_task)
+
+        existing_review = store.add(
+            prompt="Existing pending review",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        store.mark_in_progress(existing_review)
+
+        config = self._make_config(tmp_path)
+        log_file = tmp_path / "logs" / f"{fix_task.slug}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 3
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.create_review_task",
+                side_effect=DuplicateReviewError(existing_review),
+            ),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert f"Follow-up review already exists for implementation {impl_task.id}" in output
+        assert f"{existing_review.id} ({existing_review.status})" in output
+
+    def test_complete_code_task_fix_follow_up_review_value_error_is_reported(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Fix follow-up handoff must surface review creation errors with next-step guidance."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implementation for value error", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        fix_task = store.add(
+            prompt="Fix value error path",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260422-fix-followup-value-error"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_file = tmp_path / "logs" / f"{fix_task.slug}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 4
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.create_review_task",
+                side_effect=ValueError("implementation task is not reviewable"),
+            ),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert f"Warning: Could not auto-create follow-up review for implementation {impl_task.id}" in output
+        assert "implementation task is not reviewable" in output
+        assert f"uv run gza review {impl_task.id}" in output
 
     @pytest.mark.parametrize(
         ("failure_mode", "ensure_result"),
