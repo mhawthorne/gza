@@ -25,6 +25,10 @@ from ..workers import WorkerRegistry
 from ._common import get_store, resolve_id
 from .log import _resolve_task_log_path
 
+# Module-local bindings so tests can patch without touching stdlib globals.
+_sleep = time.sleep
+_get_terminal_size = os.get_terminal_size
+
 
 @dataclass
 class _LogStats:
@@ -228,7 +232,7 @@ def _task_elapsed_seconds(task: DbTask) -> float | None:
 def _lines_per_panel(n_tasks: int) -> int:
     """Compute how many log lines each panel gets based on terminal height."""
     try:
-        term_height = os.get_terminal_size().lines
+        term_height = _get_terminal_size().lines
     except OSError:
         term_height = 40
     # Each panel has 2 lines of border (top + bottom) + content lines.
@@ -565,7 +569,7 @@ def cmd_tv(args: argparse.Namespace) -> int:
             screen=True,
         ) as live:
             while True:
-                time.sleep(0.5)
+                _sleep(0.5)
 
                 if explicit_ids:
                     # Refresh task metadata for the fixed set of requested tasks.

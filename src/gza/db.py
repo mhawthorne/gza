@@ -16,6 +16,11 @@ from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_re
 
 logger = logging.getLogger(__name__)
 
+
+def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
+    """Seam for tests: invoke the user's editor. Tests patch this, not ``subprocess.run``."""
+    return subprocess.run(cmd)
+
 __all__ = [
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
@@ -2570,7 +2575,7 @@ def edit_prompt(
         tmp_path = f.name
 
     try:
-        result = subprocess.run([editor, tmp_path])
+        result = _launch_editor([editor, tmp_path])
         if result.returncode != 0:
             return None
 

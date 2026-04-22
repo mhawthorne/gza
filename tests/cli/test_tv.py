@@ -154,7 +154,7 @@ def test_tv_auto_mode_repolls_live_tasks(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=2)
     rc = tv_module.cmd_tv(args)
@@ -205,7 +205,7 @@ def test_tv_auto_mode_backfills_finished_tasks_when_live_count_drops(monkeypatch
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=4)
     rc = tv_module.cmd_tv(args)
@@ -254,7 +254,7 @@ def test_tv_explicit_ids_stay_fixed(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[task_1.id, task_2.id], number=2)
     rc = tv_module.cmd_tv(args)
@@ -294,7 +294,7 @@ def test_tv_auto_mode_starts_with_recent_finished_tasks(monkeypatch, tmp_path: P
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=2)
     rc = tv_module.cmd_tv(args)
@@ -334,7 +334,7 @@ def test_tv_auto_mode_promotes_live_tasks_over_finished_fallback(monkeypatch, tm
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=1)
     rc = tv_module.cmd_tv(args)
@@ -368,7 +368,7 @@ def test_tv_auto_mode_does_not_exit_on_finished_fallback(monkeypatch, tmp_path: 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=1)
     rc = tv_module.cmd_tv(args)
@@ -392,7 +392,7 @@ def test_tv_header_explicit_mode_does_not_claim_min_max(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=task_ids, number=None, min_slots=None, max_slots=None)
     rc = tv_module.cmd_tv(args)
@@ -424,7 +424,7 @@ def test_tv_header_explicit_mode_running_count_is_global(monkeypatch, tmp_path: 
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -458,7 +458,7 @@ def test_tv_header_auto_mode_uses_visible_panel_count_when_slots_are_sparse(monk
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=4, min_slots=None, max_slots=None)
     rc = tv_module.cmd_tv(args)
@@ -486,7 +486,7 @@ def test_tv_parser_path_renders_header_for_fixed_slot_flag(monkeypatch, tmp_path
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(tv_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
     result = run_gza("tv", "-n", "2", "--project", str(tmp_path))
 
@@ -498,5 +498,5 @@ def test_tv_parser_path_renders_header_for_fixed_slot_flag(monkeypatch, tmp_path
 
 
 def test_lines_per_panel_reserves_header_row(monkeypatch):
-    monkeypatch.setattr(tv_module.os, "get_terminal_size", lambda: os.terminal_size((120, 20)))
+    monkeypatch.setattr(tv_module, "_get_terminal_size", lambda: os.terminal_size((120, 20)))
     assert tv_module._lines_per_panel(2) == 6
