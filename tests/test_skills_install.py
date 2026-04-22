@@ -336,8 +336,6 @@ class TestSkillContentValidation:
         content = skill_file.read_text()
 
         assert "uv run gza run-inline <TASK_ID>" in content
-        assert "uv run gza set-status" not in content
-        assert "uv run gza mark-completed" not in content
         assert "write_log_entry" not in content
 
     def test_gza_task_run_mentions_runner_owned_lifecycle(self):

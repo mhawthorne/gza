@@ -1227,6 +1227,21 @@ class TestGetImproveTasksByRoot:
         assert [t.id for t in results] == [improve_a.id]
 
 
+class TestGetFixTasksByRoot:
+    """Tests for get_fix_tasks_by_root transitive traversal."""
+
+    def test_direct_and_chained_fixes_are_returned(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Impl", task_type="implement")
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        improve = store.add("Improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        fix1 = store.add("Fix 1", task_type="fix", based_on=improve.id, depends_on=review.id)
+        fix2 = store.add("Fix 2", task_type="fix", based_on=fix1.id, depends_on=review.id)
+
+        results = store.get_fix_tasks_by_root(impl.id)
+        assert {task.id for task in results} == {fix1.id, fix2.id}
+
+
 class TestTaskComments:
     """Tests for task comment storage and resolution helpers."""
 

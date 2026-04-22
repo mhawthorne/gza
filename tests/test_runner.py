@@ -4724,6 +4724,109 @@ class TestTaskClaimSafety:
         assert refreshed is not None
         assert refreshed.execution_mode == "foreground_inline"
 
+    @pytest.mark.parametrize(
+        ("failure_stage", "invocation"),
+        [
+            ("check", None),
+            ("verify", None),
+            (
+                "check",
+                RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            ),
+            (
+                "verify",
+                RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            ),
+        ],
+    )
+    def test_preflight_failures_mark_task_failed_with_provider_unavailable(
+        self,
+        tmp_path: Path,
+        failure_stage: str,
+        invocation: RunInvocationContext | None,
+    ):
+        """Credential preflight failures must persist failed state + provenance/outcome logs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt=f"Task preflight {failure_stage}", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = failure_stage != "check"
+            mock_provider.verify_credentials.return_value = failure_stage != "verify"
+            mock_provider.credential_setup_hint = "set creds"
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, task_id=task.id, invocation=invocation)
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+        assert refreshed.log_file is not None
+        log_content = (tmp_path / refreshed.log_file).read_text()
+        assert "PROVIDER_UNAVAILABLE" in log_content
+        assert '"subtype": "execution"' in log_content
+        assert "Preflight failed" in log_content
+
+    def test_run_inline_forces_observe_only_until_interactive_session_telemetry_exists(
+        self,
+        tmp_path: Path,
+    ):
+        """Inline invocation should not request provider interactive mode yet."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline mode downgrade", task_type="implement")
+        task.status = "failed"
+        task.session_id = "sess-123"
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                resume=True,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="interactive",
+                ),
+            )
+
+        assert result == 0
+        assert mock_run_inner.call_count == 1
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "observe_only"
+
 
 class TestSameBranchLineageWalk:
     """Tests for same_branch resolution walking the based_on lineage chain."""

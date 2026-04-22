@@ -39,12 +39,30 @@ uv run gza run-inline <TASK_ID> --max-turns <N>
 uv run gza run-inline <TASK_ID> --force
 ```
 
+Legacy provenance-only fallback (compatibility only):
+
+```bash
+uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline
+```
+
 ### Step 3: Report outcome
 
 Report the command exit status and tell the user to use `gza log <TASK_ID>` if they want full runner/provider logs.
 
+If an operator explicitly asks for manual completion recovery (outside normal runner completion), use:
+
+```bash
+uv run gza mark-completed <TASK_ID>
+```
+
+and only then record:
+
+```
+Outcome: completed (inline skill)
+```
+
 ## Notes
 
 - `run-inline` is runner-managed task execution (prompt building, worktree setup, provider launch, status transitions, artifacts, and provenance).
-- Do not run `gza set-status`, `gza mark-completed`, synthetic `write_log_entry(...)`, or manual branch/log orchestration in this skill.
+- Do not run synthetic lifecycle logging steps or manual branch/log orchestration in this skill.
 - Keep this skill as compatibility guidance only; lifecycle ownership stays in the runner.
