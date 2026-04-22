@@ -957,51 +957,65 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 f"not implementation {impl_task.id}."
             )
             return 1
+        if review_task.status in ("failed", "dropped"):
+            # Terminal review statuses never produce feedback. Binding an
+            # improve to one creates a permanently blocked task, so reject
+            # rather than warn.
+            print(
+                f"Error: Review {review_task.id} is {review_task.status}; "
+                "terminal reviews cannot produce feedback."
+            )
+            if unresolved_comments:
+                print(
+                    f"Omit --review-id to run a comments-only improve from the "
+                    f"{len(unresolved_comments)} unresolved comment(s)."
+                )
+            else:
+                print(
+                    "Run a new review, or add comments with "
+                    f"`gza comment {impl_task.id} <text>`."
+                )
+            return 1
         if review_task.status != "completed":
             print(
                 f"Warning: Review {review_task.id} is {review_task.status}. "
                 "The improve task will be blocked until it completes."
             )
     else:
-        # Auto-pick the most recent usable review. Dropped/failed reviews are
-        # terminal bad states — they cannot produce a usable report, and binding
-        # an improve task to one creates an unrunnable dependency. Pending and
-        # in_progress reviews are still eligible since they may yet complete.
+        # Auto-pick considers only completed reviews. Non-completed reviews
+        # (pending/in_progress/failed/dropped) are not eligible: terminal
+        # statuses never produce feedback, and a pending/in_progress review
+        # has no report yet. When no completed review exists but unresolved
+        # comments do, fall back to a comments-only improve. To target an
+        # incomplete review explicitly, use --review-id.
         review_tasks = store.get_reviews_for_task(impl_task.id)
-        usable_reviews = [
-            r for r in review_tasks if r.status not in ("dropped", "failed")
-        ]
+        completed_reviews = [r for r in review_tasks if r.status == "completed"]
 
-        if not usable_reviews:
-            if unresolved_comments:
-                print(
-                    f"Note: Task {impl_task.id} has no usable review; "
-                    "continuing from unresolved comments only."
-                )
-            elif review_tasks:
-                statuses = ", ".join(
-                    f"{r.id} ({r.status})" for r in review_tasks
-                )
-                print(
-                    f"Error: Task {impl_task.id} has no usable review "
-                    f"(all existing reviews are dropped or failed: {statuses})."
-                )
-                print("Run a new review, or pass --review-id <id> to pick a specific one.")
-            else:
-                print(f"Error: Task {impl_task.id} has no review. Run a review first:")
-                print(f"  gza add --type review --depends-on {impl_task.id}")
-            if not unresolved_comments:
-                return 1
-
-        if usable_reviews:
-            review_task = usable_reviews[0]
-
-        # Warn if the selected review is not yet completed (pending/in_progress).
-        if review_task is not None and review_task.status != "completed":
+        if completed_reviews:
+            review_task = completed_reviews[0]
+        elif unresolved_comments:
             print(
-                f"Warning: Review {review_task.id} is {review_task.status}. "
-                "The improve task will be blocked until it completes."
+                f"Note: Task {impl_task.id} has no completed review; "
+                "continuing from unresolved comments only."
             )
+        elif review_tasks:
+            statuses = ", ".join(
+                f"{r.id} ({r.status})" for r in review_tasks
+            )
+            print(
+                f"Error: Task {impl_task.id} has no completed review "
+                f"(existing reviews: {statuses})."
+            )
+            print(
+                "Wait for a review to complete, add comments via "
+                f"`gza comment {impl_task.id} <text>`, or pass --review-id <id> "
+                "to target a specific review."
+            )
+            return 1
+        else:
+            print(f"Error: Task {impl_task.id} has no review. Run a review first:")
+            print(f"  gza add --type review --depends-on {impl_task.id}")
+            return 1
 
     # Create improve task (using shared helper)
     try:

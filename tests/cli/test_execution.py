@@ -2239,32 +2239,37 @@ class TestImproveCommand:
         assert result.returncode == 1
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
-    def test_improve_warns_on_incomplete_review(self, tmp_path: Path):
-        """Improve command warns if the review is not yet completed."""
+    def test_improve_errors_when_only_pending_review_and_no_comments(self, tmp_path: Path):
+        """Auto-pick must not bind to a pending review when no comments fallback exists.
 
+        Regression for the trap where auto-pick would silently create an
+        improve task tied to a non-completed review, leaving the improve
+        permanently blocked if the review never completes (or surfacing a
+        warning the operator may miss). Non-completed reviews are only
+        selectable via explicit --review-id now.
+        """
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        # Create a completed implementation task
         impl_task = store.add("Add feature", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "test-project/20260129-add-feature"
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        # Create a pending review task (not completed)
-        store.add("Review", task_type="review", depends_on=impl_task.id)
-        # Leave status as 'pending' (default)
+        # Only a pending review exists; no unresolved comments.
+        pending_review = store.add("Review", task_type="review", depends_on=impl_task.id)
 
-        # Run improve command with --queue to only create (not run)
         result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
-        # Should succeed but warn about incomplete review
-        assert result.returncode == 0
-        assert "Warning: Review " in result.stdout
-        assert "is pending" in result.stdout
-        assert "blocked until it completes" in result.stdout
-        assert "Created improve task " in result.stdout
+        assert result.returncode == 1
+        assert "no completed review" in result.stdout
+        assert f"{pending_review.id} (pending)" in result.stdout
+        assert "--review-id" in result.stdout
+
+        # No improve task should have been created.
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert improves == []
 
     def test_improve_prevents_duplicate(self, tmp_path: Path):
         """Improve command refuses to create a duplicate improve task."""
@@ -2483,8 +2488,183 @@ class TestImproveCommand:
         result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert "no usable review" in result.stdout
+        assert "no completed review" in result.stdout
         assert "--review-id" in result.stdout
+
+    def test_improve_auto_pick_falls_back_to_comments_when_only_pending_review(
+        self, tmp_path: Path
+    ):
+        """Comments-only fallback must kick in when the only review is pending.
+
+        Regression for review gza-1276 M1: auto-pick previously treated pending
+        reviews as usable, which suppressed the comments-only fallback when
+        unresolved comments were the real runnable feedback source.
+        """
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        pending_review = store.add("Review", task_type="review", depends_on=impl_task.id)
+        # Leave status as default 'pending'.
+        store.add_comment(impl_task.id, "Tighten validation edge cases.")
+
+        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert "no completed review" in result.stdout
+        assert "continuing from unresolved comments only" in result.stdout
+        # Must not have bound to the pending review.
+        assert f"is pending" not in result.stdout
+        assert "blocked until it completes" not in result.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves) == 1
+        assert improves[0].depends_on is None
+        # Pending review remains, unbound.
+        assert pending_review.status == "pending"
+
+    def test_improve_auto_pick_falls_back_to_comments_when_only_in_progress_review(
+        self, tmp_path: Path
+    ):
+        """Same fallback for an in_progress review: comments-only improve wins."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        in_progress_review = store.add("Review", task_type="review", depends_on=impl_task.id)
+        in_progress_review.status = "in_progress"
+        store.update(in_progress_review)
+        store.add_comment(impl_task.id, "Revisit error wording.")
+
+        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert "continuing from unresolved comments only" in result.stdout
+        assert "blocked until it completes" not in result.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves) == 1
+        assert improves[0].depends_on is None
+
+    def test_improve_rejects_failed_review_id(self, tmp_path: Path):
+        """--review-id must reject terminal failed reviews rather than warn.
+
+        Regression for review gza-1276 M2: previously --review-id accepted
+        failed/dropped statuses and printed "blocked until it completes",
+        creating a permanently unrunnable improve tied to a review that will
+        never complete.
+        """
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        failed_review = store.add("Failed review", task_type="review", depends_on=impl_task.id)
+        failed_review.status = "failed"
+        failed_review.completed_at = datetime.now(UTC)
+        store.update(failed_review)
+
+        result = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--review-id",
+            str(failed_review.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert f"Review {failed_review.id} is failed" in result.stdout
+        assert "terminal reviews cannot produce feedback" in result.stdout
+        assert "blocked until it completes" not in result.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert improves == []
+
+    def test_improve_rejects_dropped_review_id(self, tmp_path: Path):
+        """--review-id must also reject terminal dropped reviews."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        dropped_review = store.add("Dropped review", task_type="review", depends_on=impl_task.id)
+        dropped_review.status = "dropped"
+        dropped_review.completed_at = datetime.now(UTC)
+        store.update(dropped_review)
+
+        result = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--review-id",
+            str(dropped_review.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert f"Review {dropped_review.id} is dropped" in result.stdout
+        assert "terminal reviews cannot produce feedback" in result.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert improves == []
+
+    def test_improve_rejects_failed_review_id_suggests_comments_fallback_when_available(
+        self, tmp_path: Path
+    ):
+        """When comments exist, rejection message should suggest omitting --review-id."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-feature"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        failed_review = store.add("Failed review", task_type="review", depends_on=impl_task.id)
+        failed_review.status = "failed"
+        failed_review.completed_at = datetime.now(UTC)
+        store.update(failed_review)
+
+        store.add_comment(impl_task.id, "Please address this edge case.")
+
+        result = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--review-id",
+            str(failed_review.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Omit --review-id to run a comments-only improve" in result.stdout
+        assert "1 unresolved comment" in result.stdout
 
     def test_improve_review_id_flag_picks_explicit_review(self, tmp_path: Path):
         """--review-id overrides auto-pick and uses the specified review."""
