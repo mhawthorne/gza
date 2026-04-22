@@ -722,7 +722,7 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
 
     # Final fallback for code-task summaries when report_file/output_content are absent.
     # This supports older tasks where summary content exists only on disk.
-    if task.slug and task.task_type in {"task", "implement", "improve"}:
+    if task.slug and task.task_type in {"task", "implement", "improve", "fix"}:
         summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
         if summary_path.exists():
             return summary_path.read_text()

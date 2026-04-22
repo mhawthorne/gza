@@ -1029,8 +1029,8 @@ class TestProviderRunMethods:
                 mock_direct.assert_called_once()
                 mock_docker.assert_not_called()
 
-    def test_claude_direct_interactive_uses_stream_json_flags_and_stdin_prompt(self, tmp_path):
-        """Foreground interactive Claude direct mode should use stream-json args and stdin prompt."""
+    def test_claude_direct_interactive_uses_true_interactive_args_and_stdin_prompt(self, tmp_path):
+        """Foreground interactive Claude direct mode should not use print-mode stream-json flags."""
         config = Config(
             project_dir=tmp_path,
             project_name="test",
@@ -1049,14 +1049,15 @@ class TestProviderRunMethods:
             )
 
         cmd = mock_run.call_args[0][0]
-        assert "-p" in cmd
-        assert "--output-format" in cmd
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "--max-turns" in cmd
         assert "interactive prompt" not in cmd
         assert mock_run.call_args.kwargs["stdin_input"] == "interactive prompt"
         assert mock_run.call_args.kwargs["timeout_minutes"] == 5
 
-    def test_claude_docker_interactive_uses_stream_json_flags_and_stdin_prompt(self, tmp_path):
-        """Foreground interactive Claude Docker mode should use stream-json args and stdin prompt."""
+    def test_claude_docker_interactive_uses_true_interactive_args_and_stdin_prompt(self, tmp_path):
+        """Foreground interactive Claude Docker mode should not use print-mode stream-json flags."""
         config = Config(
             project_dir=tmp_path,
             project_name="test",
@@ -1081,8 +1082,9 @@ class TestProviderRunMethods:
 
         assert mock_build_docker_cmd.call_args.kwargs["interactive"] is True
         cmd = mock_run.call_args[0][0]
-        assert "-p" in cmd
-        assert "--output-format" in cmd
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "--max-turns" in cmd
         assert "interactive prompt" not in cmd
         assert mock_run.call_args.kwargs["stdin_input"] == "interactive prompt"
         assert mock_run.call_args.kwargs["timeout_minutes"] == 5
@@ -1755,8 +1757,8 @@ class TestClaudeStepMapping:
 
         assert captured == ["ses_once"]
 
-    def test_interactive_run_uses_stream_json_pty_stdio_and_parses_callbacks(self, tmp_path):
-        """Foreground interactive runs should use PTY stdio and stream-json telemetry."""
+    def test_interactive_run_uses_true_interactive_pty_stdio_and_parses_callbacks(self, tmp_path):
+        """Foreground interactive runs should keep PTY stdio without print-mode flags."""
         import json
 
         from gza.config import Config
@@ -1811,10 +1813,9 @@ class TestClaudeStepMapping:
         mock_popen.assert_called_once()
         popen_args = mock_popen.call_args
         cmd = popen_args.args[0]
-        assert "-p" in cmd
-        assert "-" in cmd
-        assert "--output-format" in cmd
-        assert "stream-json" in cmd
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "--max-turns" in cmd
         assert "Interactive callback test" not in cmd
         assert popen_args.kwargs["stdin"] == 11
         assert popen_args.kwargs["stdout"] == 11
@@ -1864,9 +1865,9 @@ class TestClaudeStepMapping:
 
         launched_cmd = mock_popen.call_args.args[0]
         assert prompt not in launched_cmd
-        assert "-p" in launched_cmd
-        assert "-" in launched_cmd
-        assert "--output-format" in launched_cmd
+        assert "-p" not in launched_cmd
+        assert "--output-format" not in launched_cmd
+        assert "--max-turns" in launched_cmd
         log_text = log_file.read_text()
         assert '"subtype": "interactive_launch"' in log_text
         assert prompt not in log_text
@@ -1912,9 +1913,9 @@ class TestClaudeStepMapping:
 
         launched_cmd = mock_popen.call_args.args[0]
         assert prompt not in launched_cmd
-        assert "-p" in launched_cmd
-        assert "-" in launched_cmd
-        assert "--output-format" in launched_cmd
+        assert "-p" not in launched_cmd
+        assert "--output-format" not in launched_cmd
+        assert "--max-turns" in launched_cmd
         log_text = log_file.read_text()
         assert '"subtype": "interactive_launch"' in log_text
         assert prompt not in log_text
@@ -1963,7 +1964,69 @@ class TestClaudeStepMapping:
         assert mock_write.call_count >= 1
         seeded_bytes = mock_write.call_args_list[0].args[1]
         assert large_prompt.encode("utf-8") in seeded_bytes
-        assert seeded_bytes.endswith(b"\x04")
+        assert seeded_bytes.endswith(b"\n")
+
+    def test_interactive_run_keeps_stdin_connected_after_prompt_seed(self, tmp_path):
+        """Interactive run should forward live stdin input to Claude after seeding."""
+        from gza.config import Config
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "interactive-stdin-forward.log"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        config = Config(project_dir=tmp_path, project_name="test-project", provider="claude")
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+
+        prompt = "seed prompt"
+        live_input = b"follow-up from user\n"
+
+        mock_process = MagicMock()
+        mock_process.wait.return_value = None
+        mock_process.returncode = 0
+        mock_process.poll.side_effect = [None, None, 0]
+
+        def _fake_os_read(fd: int, _size: int) -> bytes:
+            if fd == 50:
+                if not _fake_os_read.master_reads:
+                    _fake_os_read.master_reads += 1
+                    return b'{"type":"result","result":"ok"}\n'
+                return b""
+            if fd == 60:
+                return live_input
+            return b""
+
+        _fake_os_read.master_reads = 0  # type: ignore[attr-defined]
+
+        class _FakeStdin:
+            def fileno(self) -> int:
+                return 60
+
+        with (
+            patch("gza.providers.claude.pty.openpty", return_value=(50, 51)),
+            patch("gza.providers.claude.select.select", side_effect=[([50], [], []), ([60], [], []), ([50], [], [])]),
+            patch("gza.providers.claude.os.read", side_effect=_fake_os_read),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.isatty", return_value=True),
+            patch("gza.providers.claude.os.write") as mock_write,
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
+            patch("gza.providers.claude.sys.stdin", new=_FakeStdin()),
+        ):
+            result = provider.run(
+                config,
+                prompt=prompt,
+                log_file=log_file,
+                work_dir=work_dir,
+                interactive=True,
+            )
+
+        assert result.exit_code == 0
+        writes = [call.args[1] for call in mock_write.call_args_list]
+        assert any(prompt.encode("utf-8") in written for written in writes)
+        assert live_input in writes
 
     def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
         """session_id should still be captured from result event when no system/init event is present."""

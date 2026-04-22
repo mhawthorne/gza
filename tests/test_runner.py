@@ -34,6 +34,7 @@ from gza.runner import (
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
     _find_task_of_type_in_chain,
+    _get_task_output,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
     _run_non_code_task,
@@ -100,6 +101,26 @@ class TestGetTaskOutputPaths:
         report_path, summary_path = get_task_output_paths(task, tmp_path)
         assert report_path is None
         assert summary_path is None
+
+
+class TestGetTaskOutput:
+    """Tests for _get_task_output fallback semantics."""
+
+    def test_fix_task_reads_legacy_summary_fallback(self, tmp_path: Path):
+        """Completed fix tasks should still read on-disk summary when DB fields are absent."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add(prompt="Fix regression", task_type="fix")
+        task.slug = "20260422-fix-fallback"
+        task.status = "completed"
+        task.output_content = None
+        task.report_file = None
+        store.update(task)
+
+        summary_path = tmp_path / SUMMARY_DIR / f"{task.slug}.md"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text("- Fixed output fallback\n")
+
+        assert _get_task_output(task, tmp_path) == "- Fixed output fallback\n"
 
 
 class TestBuildPrompt:
