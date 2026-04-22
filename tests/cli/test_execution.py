@@ -5282,7 +5282,11 @@ class TestIterateCommand:
              patch("gza.cli._create_improve_task") as create_improve:
             result = cmd_iterate(args)
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id, force=False)
+        run_foreground.assert_called_once()
+        call_kwargs = run_foreground.call_args.kwargs
+        assert call_kwargs["task_id"] == pending_review.id
+        assert call_kwargs["force"] is False
+        assert call_kwargs["invocation"].command == "iterate"
         create_review.assert_not_called()
         create_improve.assert_not_called()
 
@@ -5309,7 +5313,11 @@ class TestIterateCommand:
             result = cmd_iterate(args)
 
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id, force=False)
+        run_foreground.assert_called_once()
+        call_kwargs = run_foreground.call_args.kwargs
+        assert call_kwargs["task_id"] == pending_review.id
+        assert call_kwargs["force"] is False
+        assert call_kwargs["invocation"].command == "iterate"
         create_review.assert_not_called()
 
     def test_in_progress_review_is_reported_instead_of_creating_another(
@@ -5650,7 +5658,11 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=next_review.id, force=False)
+        run_foreground.assert_called_once()
+        call_kwargs = run_foreground.call_args.kwargs
+        assert call_kwargs["task_id"] == next_review.id
+        assert call_kwargs["force"] is False
+        assert call_kwargs["invocation"].command == "iterate"
         create_improve.assert_not_called()
         assert not re.search(
             rf"1\s+implement\s+{re.escape(impl.id)}\s+",
@@ -6016,7 +6028,11 @@ class TestIterateCommand:
             result = cmd_iterate(args)
 
         assert result == 0
-        run_foreground.assert_called_once_with(mock_config, task_id=pending_review.id, force=False)
+        run_foreground.assert_called_once()
+        call_kwargs = run_foreground.call_args.kwargs
+        assert call_kwargs["task_id"] == pending_review.id
+        assert call_kwargs["force"] is False
+        assert call_kwargs["invocation"].command == "iterate"
 
     def test_iterate_improve_duplicate_blocks_instead_of_raising(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7647,6 +7663,244 @@ class TestRunInlineCommand:
         assert invocation.command == "run-inline"
         assert invocation.execution_mode == "foreground_inline"
         assert invocation.interaction_mode == "auto"
+
+
+class TestForegroundInvocationContextWiring:
+    """Foreground command entrypoints should pass command-specific runner invocation metadata."""
+
+    def test_cmd_implement_passes_implement_invocation(self, tmp_path: Path):
+        from gza.cli.execution import cmd_implement
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan feature", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            plan_task_id=plan.id,
+            prompt=None,
+            group=None,
+            depends_on=None,
+            review=False,
+            same_branch=False,
+            branch_type=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._run_foreground", return_value=0) as mock_run_foreground:
+            rc = cmd_implement(args)
+
+        assert rc == 0
+        invocation = mock_run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "implement"
+        assert invocation.execution_mode == "foreground_worker"
+
+    def test_cmd_review_passes_review_invocation(self, tmp_path: Path):
+        from gza.cli.execution import cmd_review
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement auth", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            model=None,
+            provider=None,
+            background=False,
+            queue=False,
+            open=False,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._run_foreground", return_value=0) as mock_run_foreground:
+            rc = cmd_review(args)
+
+        assert rc == 0
+        invocation = mock_run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "review"
+        assert invocation.execution_mode == "foreground_worker"
+
+    def test_cmd_improve_passes_improve_invocation(self, tmp_path: Path):
+        from gza.cli.execution import cmd_improve
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement api", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        review = store.add("Review api", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            max_turns=None,
+            review=False,
+            review_id=None,
+            model=None,
+            provider=None,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._run_foreground", return_value=0) as mock_run_foreground:
+            rc = cmd_improve(args)
+
+        assert rc == 0
+        invocation = mock_run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "improve"
+        assert invocation.execution_mode == "foreground_worker"
+
+    def test_cmd_fix_passes_fix_invocation(self, tmp_path: Path):
+        from gza.cli.execution import cmd_fix
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement parser", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            queue=False,
+            background=False,
+            no_docker=True,
+            max_turns=None,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._run_foreground", return_value=0) as mock_run_foreground:
+            rc = cmd_fix(args)
+
+        assert rc == 0
+        invocation = mock_run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "fix"
+        assert invocation.execution_mode == "foreground_worker"
+
+    def test_cmd_resume_passes_resume_invocation(self, tmp_path: Path):
+        from gza.cli.execution import cmd_resume
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implement", task_type="implement")
+        failed.status = "failed"
+        failed.session_id = "resume-session-123"
+        store.update(failed)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._run_foreground", return_value=0) as mock_run_foreground:
+            rc = cmd_resume(args)
+
+        assert rc == 0
+        assert mock_run_foreground.call_args.kwargs["resume"] is True
+        invocation = mock_run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "resume"
+        assert invocation.execution_mode == "foreground_worker"
+
+    def test_cmd_iterate_passes_iterate_invocation_to_run_foreground(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+
+        def fake_run_foreground(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            invocation = kwargs["invocation"]
+            assert invocation.command == "iterate"
+            assert invocation.execution_mode == "foreground_worker"
+            task.status = "completed"
+            task.branch = "testproject/20260101-impl"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+        )
+
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            iterate_max_iterations=3,
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch(
+                "gza.cli.execution.determine_next_action",
+                side_effect=[
+                    {"type": "merge", "description": "merge ready"},
+                    {"type": "merge", "description": "merge ready"},
+                ],
+            ),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 0
+        assert run_foreground.call_count == 1
 
 
 class TestRunAsWorker:

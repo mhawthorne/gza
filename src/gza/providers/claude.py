@@ -337,23 +337,10 @@ class ClaudeProvider(Provider):
     @staticmethod
     def _build_claude_interactive_args(
         config: Config,
-        prompt: str,
         resume_session_id: str | None = None,
     ) -> list[str]:
-        """Build arguments for true interactive Claude foreground runs."""
-        args: list[str] = []
-        if resume_session_id:
-            args.extend(["--resume", resume_session_id])
-        elif prompt:
-            # Interactive non-resume runs seed the first user message directly.
-            args.append(prompt)
-
-        if config.model:
-            args.extend(["--model", config.model])
-
-        args.extend(config.claude.args)
-        args.extend(["--max-turns", str(config.max_steps)])
-        return args
+        """Build interactive Claude args with machine-readable stream output."""
+        return ClaudeProvider._build_claude_args(config, resume_session_id)
 
     def _run_docker_interactive(
         self,
@@ -383,14 +370,14 @@ class ClaudeProvider(Provider):
             interactive=True,
         )
         cmd.append("claude")
-        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
+        cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
         return self._run_interactive_command(
             cmd,
             log_file,
             timeout_minutes=config.timeout_minutes,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
-            prompt_seed=prompt,
+            stdin_input=prompt,
             resume_session_id=resume_session_id,
         )
 
@@ -406,7 +393,7 @@ class ClaudeProvider(Provider):
     ) -> RunResult:
         """Run Claude in foreground interactive mode on host."""
         cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
-        cmd.extend(self._build_claude_interactive_args(config, prompt, resume_session_id))
+        cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
         return self._run_interactive_command(
             cmd,
             log_file,
@@ -414,7 +401,7 @@ class ClaudeProvider(Provider):
             timeout_minutes=config.timeout_minutes,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
-            prompt_seed=prompt,
+            stdin_input=prompt,
             resume_session_id=resume_session_id,
         )
 
@@ -561,14 +548,14 @@ class ClaudeProvider(Provider):
         timeout_minutes: int,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
-        prompt_seed: str | None = None,
+        stdin_input: str | None = None,
         resume_session_id: str | None = None,
     ) -> RunResult:
         """Run an interactive Claude command in the foreground terminal."""
         log_file.parent.mkdir(parents=True, exist_ok=True)
         launch_cmd = self._redact_interactive_launch_command(
             cmd,
-            prompt_seed=prompt_seed,
+            prompt_seed=stdin_input,
             resume_session_id=resume_session_id,
         )
         with open(log_file, "a") as f:
@@ -646,6 +633,18 @@ class ClaudeProvider(Provider):
             )
             os.close(slave_fd)
             slave_fd = None
+
+            # Seed the initial task prompt via PTY stdin so it is never exposed in argv.
+            # Appending EOT signals prompt EOF for -p - without closing the session fd.
+            if stdin_input:
+                seeded_prompt = stdin_input
+                if not seeded_prompt.endswith("\n"):
+                    seeded_prompt += "\n"
+                seeded_prompt += "\x04"
+                try:
+                    os.write(master_fd, seeded_prompt.encode("utf-8", errors="replace"))
+                except OSError:
+                    logger.warning("Failed to seed interactive stdin prompt", exc_info=True)
 
             try:
                 maybe_stdin_fd = sys.stdin.fileno()
