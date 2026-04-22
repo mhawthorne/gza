@@ -9,6 +9,7 @@ import pytest
 from gza.db import (
     SCHEMA_VERSION,
     ManualMigrationRequired,
+    SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
     Task,
@@ -4022,6 +4023,37 @@ def _make_v29_db_without_urgent_bumped_at(db_path: Path) -> None:
     conn.close()
 
 
+def _drop_tasks_column(db_path: Path, column_name: str) -> None:
+    """Rebuild the tasks table without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    _quote = lambda c: f'"{c}"' if c in ("group",) else c
+    cols_str = ", ".join(_quote(c) for c in kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(tasks_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        quoted_name = f'"{name}"' if name in ("group",) else name
+        parts = [quoted_name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
+    conn.execute("DROP TABLE tasks_old")
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -4527,6 +4559,76 @@ class TestMigrationUtilityFunctions:
 
         assert version == SCHEMA_VERSION
         assert "task_comments" in tables
+
+    def test_open_current_v32_db_repairs_missing_execution_mode_column(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing tasks.execution_mode."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "execution_mode")
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "execution_mode" in columns
+
+    def test_open_current_v32_db_repairs_missing_urgent_bumped_at_column(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing tasks.urgent_bumped_at."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "urgent_bumped_at")
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "urgent_bumped_at" in columns
+
+    def test_open_current_v32_db_missing_execution_mode_column_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v32 damage should fail early with SchemaIntegrityError for execution_mode."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "execution_mode")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.execution_mode",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_open_current_v32_db_missing_urgent_bumped_at_column_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v32 damage should fail early with SchemaIntegrityError for urgent_bumped_at."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "urgent_bumped_at")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.urgent_bumped_at",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
 
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,

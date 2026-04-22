@@ -5551,6 +5551,92 @@ class TestExtractedRunInnerHelpers:
         assert rc == 7
         assert call_order == ["pr", "review"]
 
+    def test_complete_code_task_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
+        """Chained improve completion should clear review state on the implementation root, not the prior improve."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement root", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/root-impl"
+        impl_task.merge_status = "merged"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Old implementation comment", source="direct")
+
+        improve1 = store.add(
+            prompt="Improve once",
+            task_type="improve",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        assert improve1.id is not None
+        store.add_comment(improve1.id, "Improve comment should remain unresolved", source="direct")
+
+        improve2 = store.add(
+            prompt="Improve retry",
+            task_type="improve",
+            based_on=improve1.id,
+            same_branch=True,
+        )
+        improve2.slug = "20260420-improve-chain"
+        store.mark_in_progress(improve2)
+
+        store.add_comment(impl_task.id, "New implementation comment", source="direct")
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{improve2.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/impl.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/impl.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{improve2.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{improve2.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                improve2,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/root-impl",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        unresolved_impl_comments = store.get_comments(impl_task.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_impl_comments] == ["New implementation comment"]
+
+        refreshed_improve1 = store.get(improve1.id)
+        assert refreshed_improve1 is not None
+        assert refreshed_improve1.review_cleared_at is None
+        unresolved_improve_comments = store.get_comments(improve1.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_improve_comments] == [
+            "Improve comment should remain unresolved"
+        ]
+
     def test_complete_code_task_fix_with_commit_delta_creates_follow_up_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -5561,7 +5647,19 @@ class TestExtractedRunInnerHelpers:
         impl_task = store.add(prompt="Implement with churn", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "feature/fix-target"
+        impl_task.merge_status = "merged"
         store.update(impl_task)
+        assert impl_task.id is not None
+
+        prior_review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
+        assert prior_review.completed_at is not None
 
         fix_task = store.add(
             prompt="Fix the churn",
@@ -5614,8 +5712,13 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         output = capsys.readouterr().out
         assert "Created follow-up review task" in output
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.review_cleared_at >= prior_review.completed_at
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
-        assert len(reviews) == 1
+        assert len(reviews) == 2
 
     def test_complete_code_task_fix_without_commit_delta_skips_follow_up_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -5627,7 +5730,18 @@ class TestExtractedRunInnerHelpers:
         impl_task = store.add(prompt="Implement with churn", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "feature/fix-target"
+        impl_task.merge_status = "merged"
         store.update(impl_task)
+        assert impl_task.id is not None
+
+        prior_review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
 
         fix_task = store.add(
             prompt="Fix the churn",
@@ -5680,8 +5794,12 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         output = capsys.readouterr().out
         assert "Fix completed without new commits; no follow-up review was auto-created." in output
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "merged"
+        assert refreshed_impl.review_cleared_at is None
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
-        assert reviews == []
+        assert len(reviews) == 1
 
     def test_complete_code_task_fix_probe_failure_is_reported_and_skips_auto_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -5949,6 +6067,70 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         unresolved = store.get_comments(parent.id, unresolved_only=True)
         assert [comment.content for comment in unresolved] == ["New comment after improve creation"]
+
+    def test_run_pr_required_retry_for_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
+        """PR-required improve retries should apply completion side effects to the implementation root."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        impl = store.add(prompt="Implement parent", task_type="implement")
+        impl.merge_status = "merged"
+        store.update(impl)
+        assert impl.id is not None
+        store.add_comment(impl.id, "Old root comment", source="direct")
+
+        improve1 = store.add(
+            prompt="Improve parent implementation",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert improve1.id is not None
+        store.add_comment(improve1.id, "Intermediate improve comment", source="direct")
+
+        improve2 = store.add(
+            prompt="Retry improve parent implementation",
+            task_type="improve",
+            based_on=improve1.id,
+            same_branch=True,
+        )
+        improve2.slug = "20260422-retry-improve-chain-pr-required"
+        improve2.status = "failed"
+        improve2.failure_reason = "PR_REQUIRED"
+        improve2.branch = "feature/retry-improve-chain-pr-required"
+        improve2.log_file = "logs/retry-improve-chain.log"
+        improve2.output_content = "summary"
+        improve2.has_commits = True
+        store.update(improve2)
+        assert improve2.id is not None
+
+        store.add_comment(impl.id, "New root comment after retry creation", source="direct")
+
+        with (
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=improve2.id, create_pr=True)
+
+        assert rc == 0
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        unresolved_impl = store.get_comments(impl.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_impl] == ["New root comment after retry creation"]
+
+        refreshed_improve1 = store.get(improve1.id)
+        assert refreshed_improve1 is not None
+        assert refreshed_improve1.review_cleared_at is None
+        unresolved_improve1 = store.get_comments(improve1.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_improve1] == ["Intermediate improve comment"]
 
     def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
         """PR retry completion for rebases should invalidate review state and force-push."""
