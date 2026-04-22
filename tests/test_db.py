@@ -4097,6 +4097,37 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
+    """Rebuild task_comments table without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE task_comments RENAME TO task_comments_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(task_comments_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(task_comments_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE task_comments ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO task_comments ({cols_str}) SELECT {cols_str} FROM task_comments_old")
+    conn.execute("DROP TABLE task_comments_old")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at)")
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -4637,6 +4668,30 @@ class TestMigrationUtilityFunctions:
 
         assert "urgent_bumped_at" in columns
 
+    def test_open_current_v32_db_repairs_missing_task_comments_source_column(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing task_comments.source."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before task_comments source damage")
+        store.add_comment(task.id, "Existing comment before repair", source="direct")
+
+        _drop_task_comments_column(db_path, "source")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        repaired_store.add_comment(task.id, "Comment after repair", source="github")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_comments)")}
+        conn.close()
+
+        assert "source" in columns
+        comments = repaired_store.get_comments(task.id)
+        assert len(comments) == 2
+        assert comments[0].source == "direct"
+        assert comments[1].source == "github"
+
     def test_open_current_v32_db_missing_execution_mode_column_fails_on_read_only_db(
         self, tmp_path: Path
     ) -> None:
@@ -4673,6 +4728,26 @@ class TestMigrationUtilityFunctions:
         finally:
             db_path.chmod(0o644)
 
+    def test_open_current_v32_db_missing_task_comments_source_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v32 damage should fail early with SchemaIntegrityError for task_comments.source."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before read-only source damage")
+        store.add_comment(task.id, "Existing comment", source="direct")
+        _drop_task_comments_column(db_path, "source")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column task_comments\.source",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,
         tmp_path: Path,
@@ -4702,6 +4777,63 @@ class TestMigrationUtilityFunctions:
 
         assert version == 29
         assert "urgent_bumped_at" not in columns
+
+    def test_auto_migration_v32_validation_requires_task_comments_source(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """v32 auto-migration must fail if task_comments.source is missing and keep schema_version at v31."""
+        import sqlite3
+
+        import gza.db as db_module
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (31)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        broken_migrations = [
+            (
+                version,
+                """
+                CREATE TABLE IF NOT EXISTS task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    author TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                """ if version == 32 else sql,
+            )
+            for version, sql in db_module._MIGRATIONS
+        ]
+        monkeypatch.setattr(db_module, "_MIGRATIONS", broken_migrations)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"Auto-migration to v32 incomplete: missing required column task_comments\.source",
+        ):
+            SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        conn.close()
+        assert version == 31
 
     def test_run_v27_migration_drops_cycle_schema_and_preserves_task_data(self, tmp_path: Path) -> None:
         import sqlite3

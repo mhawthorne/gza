@@ -710,7 +710,7 @@ gza run-inline <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the run |
 
-`run-inline` uses provider capabilities: Claude runs in interactive foreground mode, while providers without interactive foreground support run in observe-only mode.
+`run-inline` uses provider capabilities: Claude runs in terminal-attached interactive foreground mode, while providers without interactive foreground support run in observe-only mode.
 
 ### resume
 

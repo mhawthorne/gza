@@ -4045,6 +4045,70 @@ class TestNonCodeReportArtifactContract:
         assert host_report.exists()
         assert host_report.read_text() == review_text
 
+    def test_missing_report_artifact_recovered_from_interactive_plaintext_log(self, tmp_path: Path):
+        """Interactive plaintext output should be captured as result text for artifact recovery."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review feature interactive", task_type="review")
+        review_task.slug = "20260213-review-feature-interactive"
+        store.update(review_task)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="claude",
+            use_docker=False,
+            timeout_minutes=10,
+            max_steps=20,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        provider = ClaudeProvider()
+
+        mock_process = MagicMock()
+        mock_process.wait.return_value = None
+        mock_process.returncode = 0
+        mock_process.poll.side_effect = [None, 0]
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.worktree_remove = Mock()
+
+        with (
+            patch("gza.providers.claude.pty.openpty", return_value=(40, 41)),
+            patch("gza.providers.claude.select.select", side_effect=[([40], [], []), ([40], [], [])]),
+            patch(
+                "gza.providers.claude.os.read",
+                side_effect=[b"# Review\n\nVerdict: APPROVED\n", b""],
+            ),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.isatty", return_value=False),
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
+            patch("gza.runner.post_review_to_pr"),
+            patch("gza.runner.console"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            exit_code = _run_non_code_task(
+                review_task,
+                config,
+                store,
+                provider,
+                mock_git,
+                resume=False,
+                interaction_mode="interactive",
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.output_content is not None
+        assert "# Review" in refreshed.output_content
+        assert "Verdict: APPROVED" in refreshed.output_content
+
     def test_missing_report_artifact_no_result_in_log_still_fails(self, tmp_path: Path):
         """If the expected report is missing and the log has no 'result' entry, the task still fails."""
         db_path = tmp_path / "test.db"
@@ -5007,37 +5071,51 @@ class TestTaskClaimSafety:
         assert "Foreground inline execution: interactive mode for provider 'claude'" in output
 
     def test_run_inline_interactive_interrupt_keeps_session_for_resume(self, tmp_path: Path):
-        """Inline interactive runs should keep session_id persisted when interrupted."""
+        """Inline interactive runs should persist callback session_id on interrupt."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-        task = store.add(prompt="Interruptible inline task", task_type="implement")
+        task = store.add(prompt="Interruptible inline task", task_type="plan")
+        task.slug = "20260422-inline-interrupt-plan"
+        store.update(task)
 
         config = self._make_config(tmp_path, db_path)
 
-        def _simulate_interrupt(task: Task, *_args, **kwargs) -> int:
-            assert kwargs["interaction_mode"] == "interactive"
-            task.session_id = "sess-inline-1"
-            store.update(task)
-            store.mark_failed(
-                task,
-                log_file=task.log_file,
-                branch=task.branch,
-                failure_reason="INTERRUPTED",
-            )
-            return 130
+        def _interrupting_provider_run(
+            _cfg,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del resume_session_id, on_step_count
+            assert interactive is True
+            assert on_session_id is not None
+            on_session_id("sess-inline-1")
+            raise KeyboardInterrupt
 
         with (
             patch("gza.runner.load_dotenv"),
             patch("gza.runner.backup_database"),
-            patch("gza.runner._run_inner", side_effect=_simulate_interrupt),
             patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
         ):
             mock_provider = Mock()
             mock_provider.name = "Claude"
             mock_provider.supports_interactive_foreground = True
             mock_provider.check_credentials.return_value = True
             mock_provider.verify_credentials.return_value = True
+            mock_provider.run.side_effect = _interrupting_provider_run
             mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.worktree_remove = Mock()
+            mock_git.branch_exists.return_value = False
+            mock_git_class.return_value = mock_git
 
             result = run(
                 config,
@@ -5055,6 +5133,76 @@ class TestTaskClaimSafety:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "INTERRUPTED"
         assert refreshed.session_id == "sess-inline-1"
+
+    def test_run_inline_resume_interactive_interrupt_preserves_resume_session_id(self, tmp_path: Path):
+        """Interrupted inline --resume runs should keep resumable session state for Claude interactive mode."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Resume inline task", task_type="plan")
+        task.slug = "20260422-inline-resume-interrupt-plan"
+        task.session_id = "sess-inline-resume-1"
+        store.update(task)
+        store.mark_failed(task, log_file="logs/failed.log", stats=None)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def _interrupting_provider_run(
+            _cfg,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del on_step_count
+            assert interactive is True
+            assert resume_session_id == "sess-inline-resume-1"
+            assert on_session_id is not None
+            # Foreground interactive resume path must persist the known session id
+            # even if no stream-json events are emitted before interruption.
+            on_session_id(resume_session_id)
+            raise KeyboardInterrupt
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run.side_effect = _interrupting_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.worktree_remove = Mock()
+            mock_git.branch_exists.return_value = False
+            mock_git_class.return_value = mock_git
+
+            result = run(
+                config,
+                task_id=task.id,
+                resume=True,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INTERRUPTED"
+        assert refreshed.session_id == "sess-inline-resume-1"
 
     def test_successful_run_keeps_preflight_and_runner_entries_in_one_log(self, tmp_path: Path):
         """Successful run should keep preflight and provider-run entries in one canonical log."""
