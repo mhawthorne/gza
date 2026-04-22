@@ -55,6 +55,14 @@ from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
 
+def _foreground_command_invocation(command: str) -> RunInvocationContext:
+    """Build command-specific invocation metadata for foreground runner calls."""
+    return RunInvocationContext(
+        command=command,
+        execution_mode="foreground_worker",
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the next pending task(s) or specific tasks."""
     config = Config.load(args.project_dir)
@@ -324,7 +332,12 @@ def cmd_implement(args: argparse.Namespace) -> int:
 
     # Default: run the implement task immediately
     print(f"\nRunning implement task {impl_task.id}...")
-    return _run_foreground(config, task_id=impl_task.id, force=getattr(args, "force", False))
+    return _run_foreground(
+        config,
+        task_id=impl_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("implement"),
+    )
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -698,7 +711,12 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     # Default: run the new task immediately
     print(f"\nRunning task {new_task.id}...")
-    return _run_foreground(config, task_id=new_task.id, force=getattr(args, "force", False))
+    return _run_foreground(
+        config,
+        task_id=new_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("retry"),
+    )
 
 
 def _default_mark_completed_mode(task_type: str) -> str:
@@ -1152,7 +1170,12 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     # Default: run the improve task immediately
     print(f"\nRunning improve task {improve_task.id}...")
-    return _run_foreground(config, task_id=improve_task.id, force=getattr(args, "force", False))
+    return _run_foreground(
+        config,
+        task_id=improve_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("improve"),
+    )
 
 
 def cmd_fix(args: argparse.Namespace) -> int:
@@ -1212,7 +1235,12 @@ def cmd_fix(args: argparse.Namespace) -> int:
         return 0
 
     print(f"\nRunning fix task {fix_task.id}...")
-    return _run_foreground(config, task_id=fix_task.id, force=getattr(args, "force", False))
+    return _run_foreground(
+        config,
+        task_id=fix_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("fix"),
+    )
 
 
 def cmd_comment(args: argparse.Namespace) -> int:
@@ -1297,6 +1325,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         task_id=review_task.id,
         open_after=open_after,
         force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("review"),
     )
 
 
@@ -1398,8 +1427,19 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             assert t.id is not None
             force = getattr(args, "force", False)
             if resume_flag or initial_resume:
-                return _run_foreground(config, task_id=t.id, resume=True, force=force)
-            return _run_foreground(config, task_id=t.id, force=force)
+                return _run_foreground(
+                    config,
+                    task_id=t.id,
+                    resume=True,
+                    force=force,
+                    invocation=_foreground_command_invocation("iterate"),
+                )
+            return _run_foreground(
+                config,
+                task_id=t.id,
+                force=force,
+                invocation=_foreground_command_invocation("iterate"),
+            )
 
         def _on_resume(
             failed_task: DbTask,
@@ -2106,4 +2146,5 @@ def cmd_resume(args: argparse.Namespace) -> int:
         task_id=new_task.id,
         resume=True,
         force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("resume"),
     )
