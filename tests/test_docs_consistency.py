@@ -117,6 +117,30 @@ def test_configuration_docs_describe_comments_only_improve_path() -> None:
     assert "improve still runs using comments-only feedback" in config_content
 
 
+def test_improve_related_skills_describe_comments_as_feedback_source() -> None:
+    """Bundled improve-related skills should mention unresolved task comments as a first-class
+    feedback source and describe the comments-only fallback when no review exists.
+
+    Regression: `gza-task-improve/SKILL.md` and `gza-task-add/SKILL.md` previously framed improve
+    purely around review feedback, which steered operators and agents away from valid
+    comments-only improve flows after the feature landed.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+
+    improve_skill_content = (
+        repo_root / "src" / "gza" / "skills" / "gza-task-improve" / "SKILL.md"
+    ).read_text()
+    assert "unresolved task comments" in improve_skill_content
+    assert "comments-only" in improve_skill_content
+    assert "resolve_comments" in improve_skill_content
+
+    add_skill_content = (
+        repo_root / "src" / "gza" / "skills" / "gza-task-add" / "SKILL.md"
+    ).read_text()
+    assert "unresolved task comments" in add_skill_content
+    assert "comments-only improve is supported" in add_skill_content
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

@@ -1,6 +1,6 @@
 ---
 name: gza-task-improve
-description: Address review comments for a gza task inline — reads the most recent review, checks out the branch, fixes must-fix items, runs verify, and commits
+description: Address feedback for a gza task inline — reads review findings and/or unresolved comments, checks out the branch, fixes must-fix items and comments, runs verify, and commits
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), Bash(cd:*), AskUserQuestion
 version: 1.0.0
 public: true
@@ -8,7 +8,7 @@ public: true
 
 # Improve Gza Task Inline
 
-Address review comments for a gza task directly in the current conversation. This is useful when a task has reached max review/improve cycles and needs human-guided fixes, or when you want to interactively resolve review feedback.
+Address feedback for a gza task directly in the current conversation. Feedback can come from two sources: a completed review (Must-Fix items plus Suggestions) and/or unresolved task comments attached to the implementation. If no review exists but unresolved comments do, improve still runs — comments alone are a valid feedback source. This skill is useful when a task has reached max review/improve cycles and needs human-guided fixes, or when you want to interactively resolve feedback.
 
 ## Process
 
@@ -22,11 +22,11 @@ git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD
 
 Save this as `<START_CHECKOUT>`. You may switch to the implementation branch to make changes, but before finishing you must return the user to `<START_CHECKOUT>`. If `<START_CHECKOUT>` is a detached HEAD, restore it with `git checkout --detach <START_CHECKOUT>`.
 
-### Step 1: Get task ID and find the review
+### Step 1: Get task ID and find the feedback (review and/or unresolved comments)
 
 The user should provide a full prefixed task ID (for example, `gza-1234`). If they provide a review task ID, resolve it to the implementation task. If no task ID is provided, ask the user.
 
-Query the task and find its most recent review:
+Query the task, its most recent review, and any unresolved task comments:
 
 ```bash
 uv run python -c "
@@ -54,6 +54,9 @@ assert impl_task.id is not None
 reviews = store.get_reviews_for_task(impl_task.id)
 latest_review = reviews[0] if reviews else None
 
+# Find unresolved task comments (comments-only improve runs when no usable review exists)
+unresolved_comments = store.get_comments(impl_task.id, unresolved_only=True)
+
 print(json.dumps({
     'impl_task_id': impl_task.id,
     'impl_task_type': impl_task.task_type,
@@ -62,6 +65,10 @@ print(json.dumps({
     'review_task_id': latest_review.id if latest_review else None,
     'review_report_file': latest_review.report_file if latest_review else None,
     'review_output': latest_review.output_content if latest_review else None,
+    'unresolved_comments': [
+        {'id': c.id, 'source': c.source, 'author': c.author, 'content': c.content, 'created_at': str(c.created_at)}
+        for c in unresolved_comments
+    ],
     'verify_command': config.verify_command,
 }, default=str))
 "
@@ -69,16 +76,17 @@ print(json.dumps({
 
 Replace `<TASK_ID>` with the actual full prefixed task ID.
 
-### Step 2: Read the review
+If neither a usable review nor unresolved comments exist, stop and ask the user what feedback you should address — there is nothing to improve from.
 
-Read the review report file (from `review_report_file` in Step 1 output). If the report file doesn't exist on disk, use `review_output` from the database.
+### Step 2: Read the feedback
 
-The review file follows a structured format with:
-- **Must-Fix** items (M1, M2, etc.) — these are blockers that must be resolved
-- **Suggestions** (S1, S2, etc.) — optional improvements
-- **Questions/Assumptions** — may need user input
+Feedback may be review-only, comments-only, or both. Read whichever sources are present:
 
-Present a summary of the must-fix items to the user before proceeding.
+- If `review_task_id` is set, read the review report file (`review_report_file`). If the report file doesn't exist on disk, fall back to `review_output`. The review file follows a structured format with **Must-Fix** items (M1, M2, etc.) as blockers, **Suggestions** (S1, S2, etc.) as optional improvements, and **Questions/Assumptions** that may need user input.
+- If `unresolved_comments` is non-empty, treat each comment as a blocker to address in this pass. Comments are plain prose; there is no Must-Fix/Suggestions structure.
+- If both are present, address both.
+
+Present a summary of the items to address (must-fix items plus unresolved comments) to the user before proceeding. If only comments exist, say so explicitly — the run is a comments-only improve and does not require a review.
 
 ### Step 3: Check out the implementation branch
 
@@ -92,15 +100,15 @@ If the branch is checked out in another worktree, inform the user and ask how to
 
 If `<START_CHECKOUT>` already equals `<impl_branch>`, do not switch away and back unnecessarily.
 
-### Step 4: Address must-fix items
+### Step 4: Address feedback items
 
-For each must-fix item in the review:
+For each feedback item (must-fix items from the review plus every unresolved comment):
 
-1. **Read the relevant source files** mentioned in the review
-2. **Make the fix** as described in the review's "Required fix" section
-3. **Mark progress** — tell the user which item you're working on (e.g., "Fixing M1: Missing logging import")
+1. **Read the relevant source files** mentioned in the review or comment
+2. **Make the fix** as described in the review's "Required fix" section, or as requested by the comment
+3. **Mark progress** — tell the user which item you're working on (e.g., "Fixing M1: Missing logging import" or "Addressing comment C1: Rename helper for clarity")
 
-Focus on must-fix items first. Only address suggestions if the user asks.
+Focus on must-fix items and unresolved comments first. Only address review suggestions if the user asks. Comments are always first-class feedback, not optional — resolve each one explicitly.
 
 ### Step 5: Run verify command
 
@@ -118,16 +126,19 @@ Run the verify command and fix any errors, up to 3 iterations (same as gza-test-
 
 ### Step 6: Commit changes
 
-Stage and commit all changes. A successful `/gza-task-improve` run always ends with a commit; do not leave review fixes uncommitted.
+Stage and commit all changes. A successful `/gza-task-improve` run always ends with a commit; do not leave feedback fixes uncommitted.
 
 ```bash
 git add <changed_files>
-git commit -m "Address review feedback for task #<IMPL_TASK_ID>
+git commit -m "Address feedback for task #<IMPL_TASK_ID>
 
 - M1: <brief description of fix>
 - M2: <brief description of fix>
+- comment <id>: <brief description of fix>
 ..."
 ```
+
+If the run was comments-only (no review), reference the addressed comment IDs in the commit body and omit Must-Fix lines.
 
 ### Step 7: Push the implementation branch
 
@@ -143,7 +154,7 @@ If the branch already has an upstream, a plain `git push` is fine. If the push f
 
 After a successful commit and push, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
 
-Use the `review_task_id` already resolved in Step 1, then call `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`.
+Use the `review_task_id` already resolved in Step 1 (pass `None` for `depends_on` when this was a comments-only improve), then call `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`. Also call `store.resolve_comments(<IMPL_TASK_ID>)` so the unresolved comments you addressed are marked resolved.
 
 ```bash
 uv run python -c "
@@ -226,9 +237,10 @@ If the restore fails, stop and tell the user exactly what checkout you left them
 
 ## Important notes
 
-- **Must-fix items are the priority** — address all must-fix items before considering suggestions.
-- **Read before editing** — always read the source files before making changes, even if the review quotes code. The code may have changed since the review was written.
-- **Verify the review's claims** — review comments can be wrong. If a review item doesn't match the current code state (e.g., the import already exists), skip it and note that to the user.
+- **Feedback sources** — improve may run from a review, from unresolved task comments, or from both. Comments-only improve is a valid flow when no review exists; do not require Must-Fix structure in that case.
+- **Must-fix items and comments are the priority** — address every Must-Fix item (when a review exists) and every unresolved comment before considering review Suggestions.
+- **Read before editing** — always read the source files before making changes, even if the review or comment quotes code. The code may have changed since the feedback was written.
+- **Verify the feedback's claims** — review items and comments can be wrong or stale. If a feedback item doesn't match the current code state (e.g., the import already exists), skip it and note that to the user.
 - **Scope to branch files** — only modify files that are part of the implementation branch's diff. Use `git diff --name-only main..HEAD` to check.
 - **Commit and push are required** — a successful `/gza-task-improve` run should leave the implementation branch committed and pushed before you restore the user's original checkout.
 - **Ask about suggestions** — don't automatically apply S1/S2/etc. suggestions. Ask the user which ones they want addressed.
