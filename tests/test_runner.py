@@ -14,18 +14,15 @@ import pytest
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
-from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
-    RunInvocationContext,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
-    open_task_startup_log,
-    rename_startup_log_to_slug,
+    RunInvocationContext,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
@@ -38,7 +35,6 @@ from gza.runner import (
     _extract_review_verdict,
     _find_task_of_type_in_chain,
     _resolve_code_task_branch_name,
-    _snapshot_task_db_to_worktree,
     _restore_wip_changes,
     _run_non_code_task,
     _run_result_to_stats,
@@ -46,11 +42,14 @@ from gza.runner import (
     _select_worktree_base_ref,
     _setup_code_task_worktree,
     _slug_exists,
+    _snapshot_task_db_to_worktree,
     _squash_wip_commits,
     backup_database,
     build_prompt,
     generate_slug,
     get_task_output_paths,
+    open_task_startup_log,
+    rename_startup_log_to_slug,
     run,
     write_execution_provenance_event,
     write_log_entry,
@@ -293,6 +292,31 @@ class TestWorkerLifecycleLogging:
         assert event["provider"] == "claude"
         assert event["worker_mode"] is False
         assert event["resumed"] is True
+
+    def test_write_execution_provenance_event_marks_foreground_work_as_worker_mode(self, tmp_path: Path):
+        """Foreground gza work runs should be marked as worker mode in execution provenance."""
+        log_file = tmp_path / "exec-work.log"
+        provider = Mock()
+        provider.name = "Codex"
+        context = RunInvocationContext(
+            command="work",
+            execution_mode="foreground_worker",
+            interaction_mode="observe_only",
+        )
+
+        write_execution_provenance_event(
+            log_file,
+            invocation=context,
+            provider=provider,
+            interaction_mode="observe_only",
+            resumed=False,
+        )
+
+        import json
+
+        event = json.loads(log_file.read_text().strip())
+        assert event["execution_mode"] == "foreground_worker"
+        assert event["worker_mode"] is True
 
     def test_build_prompt_skips_learnings_when_skip_learnings_true(self, tmp_path: Path):
         """Test that build_prompt skips learnings reference when task.skip_learnings is True."""
@@ -1270,6 +1294,98 @@ class TestReviewContextFromChain:
 
         assert "## Fix Rescue Context" in context
         assert "## Repeated Blockers" not in context
+
+    def test_fix_context_repeated_blockers_read_from_review_report_file(self, tmp_path: Path):
+        """Repeated blocker extraction should read review content from report files when DB output is empty."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement report fallback", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        report_body = (
+            "## Blockers\n\n"
+            "### B1 Missing timeout\n"
+            "Evidence: hangs under retry storms.\n"
+            "Impact: requests can block forever.\n"
+            "Required fix: add bounded timeout and cancellation propagation.\n"
+            "Required tests: timeout + cancellation regression.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        (reports_dir / "review-1.md").write_text(report_body)
+        (reports_dir / "review-2.md").write_text(report_body)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.report_file = "reports/review-1.md"
+        review1.output_content = None
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.report_file = "reports/review-2.md"
+        review2.output_content = None
+        store.update(review2)
+
+        fix_task = store.add(
+            prompt="Rescue report-only review context",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Repeated Blockers" in context
+        assert "add bounded timeout and cancellation propagation" in context
+
+    def test_fix_context_repeated_blockers_supports_canonical_blocker_body_without_required_fix_label(self, tmp_path: Path):
+        """Repeated blocker extraction should not require an exact `Required fix:` line."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement canonical blocker extraction", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        blocker_text = "Add bounded timeout and cancellation propagation."
+        review_body = (
+            "## Blockers\n\n"
+            "### B1 Missing timeout\n"
+            "Evidence: hangs under retry storms.\n"
+            "Impact: requests can block forever.\n"
+            f"Action: {blocker_text}\n"
+            "Required tests: timeout + cancellation regression.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = review_body
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.output_content = review_body
+        store.update(review2)
+
+        fix_task = store.add(
+            prompt="Rescue canonical blocker body",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Repeated Blockers" in context
+        assert blocker_text in context
 
     def test_fix_context_distinguishes_failed_improve_and_implement_retry_attempts(self, tmp_path: Path):
         """Fix context labels failed improve and failed implement retry attempts accurately."""
@@ -5013,6 +5129,22 @@ class TestTaskClaimSafety:
         assert "PROVIDER_UNAVAILABLE" in log_content
         assert '"subtype": "execution"' in log_content
         assert "Preflight failed" in log_content
+
+        import json
+
+        execution_events = [
+            json.loads(line)
+            for line in log_content.splitlines()
+            if line.strip() and '"subtype": "execution"' in line
+        ]
+        assert execution_events
+        execution_event = execution_events[-1]
+        expected_mode = invocation.execution_mode if invocation is not None else "foreground_worker"
+        assert execution_event["execution_mode"] == expected_mode
+        if expected_mode in {"background_worker", "foreground_worker"}:
+            assert execution_event["worker_mode"] is True
+        else:
+            assert execution_event["worker_mode"] is False
 
     def test_run_inline_requests_interactive_for_capable_provider(
         self,

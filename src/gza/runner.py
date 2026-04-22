@@ -39,7 +39,7 @@ from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
-from .review_verdict import parse_review_verdict
+from .review_verdict import parse_review_report, parse_review_verdict
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -172,7 +172,7 @@ def write_execution_provenance_event(
 ) -> None:
     """Write structured runner execution provenance before provider launch."""
     provider_name = provider.name.lower()
-    worker_mode = invocation.execution_mode == "background_worker"
+    worker_mode = invocation.execution_mode in {"background_worker", "foreground_worker"}
     message = (
         f"Execution: command={invocation.command}, mode={invocation.execution_mode}, "
         f"interaction={interaction_mode}, provider={provider_name}, resumed={resumed}"
@@ -1095,7 +1095,7 @@ def _build_context_from_chain(
                     context_parts.append("\n## Review feedback to address:\n")
                     context_parts.append(latest_review_content)
 
-            repeated = _extract_repeated_required_fixes(reviews[:2])
+            repeated = _extract_repeated_required_fixes(reviews[:2], project_dir)
             if repeated:
                 context_parts.append("\n## Repeated Blockers\n")
                 context_parts.extend(f"- {item}" for item in repeated)
@@ -1272,23 +1272,74 @@ def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
     return None
 
 
-def _extract_repeated_required_fixes(reviews: list[Task]) -> list[str]:
-    """Extract repeated `Required fix:` lines from the most recent completed reviews."""
+def _normalize_repeated_blocker_text(text: str) -> str:
+    """Normalize blocker text for repeated-fix matching."""
+    return " ".join(text.split()).strip().lower()
+
+
+def _extract_blocker_signal_lines(blocker_body: str) -> list[str]:
+    """Extract potential blocker-fix signal lines from canonical blocker body text."""
+    signals: list[str] = []
+    for raw_line in blocker_body.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("required tests:") or lowered.startswith("recommended tests:"):
+            continue
+        if lowered.startswith("evidence:") or lowered.startswith("impact:"):
+            continue
+        if ":" in stripped:
+            _, value = stripped.split(":", 1)
+            if value.strip():
+                signals.append(value.strip())
+                continue
+        signals.append(stripped)
+    return signals
+
+
+def _extract_required_fix_candidates(content: str) -> dict[str, str]:
+    """Extract blocker/fix candidates from parsed review markdown plus legacy fallbacks."""
+    candidates: dict[str, str] = {}
+
+    parsed = parse_review_report(content)
+    for finding in parsed.findings:
+        if finding.severity != "BLOCKER":
+            continue
+
+        signals: list[str] = []
+        if finding.fix_or_followup:
+            signals.append(finding.fix_or_followup)
+        signals.extend(_extract_blocker_signal_lines(finding.body))
+        signals.append(finding.title)
+
+        for signal in signals:
+            normalized = _normalize_repeated_blocker_text(signal)
+            if normalized:
+                candidates.setdefault(normalized, signal.strip())
+
+    for match in re.finditer(r"(?im)^Required fix:\s*(.+)$", content):
+        signal = match.group(1).strip()
+        normalized = _normalize_repeated_blocker_text(signal)
+        if normalized:
+            candidates.setdefault(normalized, signal)
+
+    return candidates
+
+
+def _extract_repeated_required_fixes(reviews: list[Task], project_dir: Path) -> list[str]:
+    """Extract repeated blockers from the most recent completed reviews."""
     if len(reviews) < 2:
         return []
 
-    required_sets: list[set[str]] = []
+    required_by_review: list[dict[str, str]] = []
     for review in reviews:
-        content = review.output_content or ""
-        matches = {
-            match.group(1).strip()
-            for match in re.finditer(r"(?im)^Required fix:\s*(.+)$", content)
-            if match.group(1).strip()
-        }
-        required_sets.append(matches)
+        content = _get_task_output(review, project_dir) or ""
+        required_by_review.append(_extract_required_fix_candidates(content))
 
-    repeated = required_sets[0].intersection(required_sets[1])
-    return sorted(repeated)
+    repeated_keys = set(required_by_review[0]).intersection(required_by_review[1])
+    repeated = [required_by_review[0][key] for key in repeated_keys]
+    return sorted(repeated, key=str.lower)
 
 
 def _extract_failure_context(task: Task, project_dir: Path) -> str:
