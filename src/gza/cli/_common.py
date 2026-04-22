@@ -1027,13 +1027,30 @@ def resolve_comments_improve_action(
     """
     from ..resume_policy import is_resumable_failed_task
 
+    def _normalize_time(value: datetime | None) -> datetime:
+        if value is None:
+            return datetime.min
+        if value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+
     def _time_key(task: DbTask) -> tuple[datetime, int]:
-        created = task.created_at
-        if created is None:
-            created = datetime.min
-        elif created.tzinfo is not None:
-            created = created.astimezone(UTC).replace(tzinfo=None)
-        return (created, task_id_numeric_key(task.id))
+        return (_normalize_time(task.created_at), task_id_numeric_key(task.id))
+
+    unresolved_comments = store.get_comments(impl_task_id, unresolved_only=True)
+    latest_unresolved_comment_time: datetime | None = None
+    if unresolved_comments:
+        latest_unresolved_comment_time = max(
+            _normalize_time(comment.created_at)
+            for comment in unresolved_comments
+        )
+
+    def _candidate_is_fresh(task: DbTask) -> bool:
+        # Improves consume a comment snapshot as-of improve.created_at.
+        # If a newer unresolved comment exists, this candidate is stale.
+        if latest_unresolved_comment_time is None:
+            return True
+        return _normalize_time(task.created_at) >= latest_unresolved_comment_time
 
     existing = [
         task for task in store.get_improve_tasks_by_root(impl_task_id)
@@ -1042,15 +1059,24 @@ def resolve_comments_improve_action(
     if not existing:
         return ("new", None)
 
-    in_progress = [task for task in existing if task.status == "in_progress"]
+    in_progress = [
+        task for task in existing
+        if task.status == "in_progress" and _candidate_is_fresh(task)
+    ]
     if in_progress:
         return ("wait_in_progress", max(in_progress, key=_time_key))
 
-    pending = [task for task in existing if task.status == "pending"]
+    pending = [
+        task for task in existing
+        if task.status == "pending" and _candidate_is_fresh(task)
+    ]
     if pending:
         return ("reuse_pending", max(pending, key=_time_key))
 
-    failed = [task for task in existing if task.status == "failed"]
+    failed = [
+        task for task in existing
+        if task.status == "failed" and _candidate_is_fresh(task)
+    ]
     if not failed:
         return ("new", None)
 

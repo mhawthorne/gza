@@ -585,6 +585,48 @@ class TestAdvanceCommand:
         assert len(improve_tasks) == 1
         assert improve_tasks[0].task_type == "improve"
 
+    def test_advance_improve_prompt_mentions_unresolved_comments(self, tmp_path: Path):
+        """Advance-created improve prompts should mention unresolved comments when present."""
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli import cmd_advance
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+        assert task.id is not None
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease address reviewer notes."
+        store.update(review_task)
+
+        store.add_comment(task.id, "Unresolved note from operator feedback.")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+        )
+
+        with patch("gza.cli._spawn_background_worker", return_value=0):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        improve_tasks = store.get_improve_tasks_for(task.id, review_task.id)
+        assert len(improve_tasks) == 1
+        assert "unresolved comments" in improve_tasks[0].prompt
+
     def test_advance_orchestrates_implement_review_improve_merge_in_local_repo(self, tmp_path: Path):
         """advance orchestrates implement -> review -> improve -> merge in a local fixture repo."""
         import argparse
