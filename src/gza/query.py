@@ -302,7 +302,9 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
             shown_ids.add(task.id)
 
         tree = _prune_lineage_tree_to_ids(build_lineage_tree(store, root), shown_ids)
-        latest_unresolved_at = max(task_time_for_lineage(task) for task in unresolved)
+        latest_unresolved_at = max(
+            _normalize_lineage_time(task_time_for_lineage(task)) for task in unresolved
+        )
         shown_tasks = [
             task for task in flatten_lineage_tree(tree)
             if task.id is not None and task.id in shown_ids
@@ -426,7 +428,13 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
 
     # Detect resume/retry first: same task_type + based_on pointing to parent
     # indicates a re-execution of the same work, not a lifecycle transition.
-    if child.based_on == parent_id and child.task_type == parent.task_type:
+    # An explicit depends_on edge to the same parent means the child is a
+    # follow-on dependent — classify by the depends_on rules below instead.
+    if (
+        child.based_on == parent_id
+        and child.task_type == parent.task_type
+        and child.depends_on != parent_id
+    ):
         if child.session_id and child.session_id == parent.session_id:
             return "resume"
         return "retry"
