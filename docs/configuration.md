@@ -962,6 +962,9 @@ gza improve <impl_task_id> [options]
 The improve command resolves the owning implementation, gathers the most recent completed
 review when available, and also includes unresolved task comments as feedback context. If no
 review exists but unresolved comments do, improve still runs using comments-only feedback.
+Comments-only improve runs follow normal improve lifecycle semantics: existing pending tasks are
+reused, failed attempts are resumed/retried up to `max_resume_attempts`, and completed prior
+rounds do not block creating a fresh comments-only improve when new unresolved comments exist.
 
 ### fix
 

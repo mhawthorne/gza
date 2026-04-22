@@ -14,7 +14,7 @@ import pytest
 
 from gza.cli import _run_as_worker, _run_foreground
 from gza.config import Config
-from gza.db import SqliteTaskStore
+from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
 from gza.query import build_lineage_tree
 from gza.workers import WorkerRegistry
@@ -2108,6 +2108,109 @@ class TestImproveCommand:
 
         improve_task = next(task for task in store.get_all() if task.task_type == "improve")
         assert improve_task.depends_on is None
+
+    def test_improve_comments_only_reuses_pending_task(self, tmp_path: Path):
+        """Second comments-only improve should reuse an existing pending improve."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Address form validation gaps.")
+
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves) == 1
+        first_improve = improves[0]
+        assert first_improve.id is not None
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"Reusing pending improve task {first_improve.id}" in second.stdout
+
+        improves_after = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves_after) == 1
+        assert improves_after[0].id == first_improve.id
+
+    def test_improve_comments_only_resumes_failed_task(self, tmp_path: Path):
+        """Failed comments-only improve should create a resume task, not duplicate-error."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Handle edge-case parsing.")
+
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves) == 1
+        failed_improve = improves[0]
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TIMEOUT"
+        failed_improve.session_id = "improve-session-1"
+        store.update(failed_improve)
+        assert failed_improve.id is not None
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"(resume of {failed_improve.id})" in second.stdout
+
+        improves_after = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves_after) == 2
+        resumed = max(improves_after, key=lambda t: task_id_numeric_key(t.id))
+        assert resumed.based_on == failed_improve.id
+        assert resumed.depends_on is None
+
+    def test_improve_comments_only_completed_then_new_comments_creates_fresh_task(self, tmp_path: Path):
+        """Completed comments-only improves should not block fresh improves for new comments."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Round 1: tighten API validation.")
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves) == 1
+        completed_improve = improves[0]
+        assert completed_improve.id is not None
+        assert completed_improve.created_at is not None
+        completed_improve.status = "completed"
+        completed_improve.completed_at = datetime.now(UTC)
+        store.update(completed_improve)
+
+        # Mirror runner completion semantics: resolve only comments in the improve snapshot.
+        store.resolve_comments(impl_task.id, created_on_or_before=completed_improve.created_at)
+
+        store.add_comment(impl_task.id, "Round 2: improve timeout handling.")
+        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert "Created improve task" in second.stdout
+
+        improves_after = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves_after) == 2
+        newest = max(improves_after, key=lambda t: task_id_numeric_key(t.id))
+        assert newest.id != completed_improve.id
+        assert newest.based_on == impl_task.id
+        assert newest.depends_on is None
 
     def test_improve_fails_on_non_implement_task(self, tmp_path: Path):
         """Improve command fails if task is not an implementation task."""

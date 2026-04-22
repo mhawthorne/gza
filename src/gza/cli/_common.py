@@ -1010,6 +1010,59 @@ def resolve_improve_action(
     return ("retry", latest_failed)
 
 
+def resolve_comments_improve_action(
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    max_resume_attempts: int | None = None,
+) -> tuple[str, DbTask | None]:
+    """Determine improve action for comments-only (no-review) improve flows.
+
+    Returns:
+        ("new", None) — create a fresh comments-only improve
+        ("reuse_pending", pending_task) — reuse existing pending comments-only improve
+        ("wait_in_progress", in_progress_task) — existing in-progress comments-only improve is still running
+        ("resume", failed_task) — resumable failed comments-only improve exists
+        ("retry", failed_task) — non-resumable failed comments-only improve exists
+        ("give_up", failed_task) — retry/resume cap exceeded
+    """
+    from ..resume_policy import is_resumable_failed_task
+
+    def _time_key(task: DbTask) -> tuple[datetime, int]:
+        created = task.created_at
+        if created is None:
+            created = datetime.min
+        elif created.tzinfo is not None:
+            created = created.astimezone(UTC).replace(tzinfo=None)
+        return (created, task_id_numeric_key(task.id))
+
+    existing = [
+        task for task in store.get_improve_tasks_by_root(impl_task_id)
+        if task.depends_on is None
+    ]
+    if not existing:
+        return ("new", None)
+
+    in_progress = [task for task in existing if task.status == "in_progress"]
+    if in_progress:
+        return ("wait_in_progress", max(in_progress, key=_time_key))
+
+    pending = [task for task in existing if task.status == "pending"]
+    if pending:
+        return ("reuse_pending", max(pending, key=_time_key))
+
+    failed = [task for task in existing if task.status == "failed"]
+    if not failed:
+        return ("new", None)
+
+    latest_failed = max(failed, key=_time_key)
+    if max_resume_attempts is not None and (len(failed) - 1) >= max_resume_attempts:
+        return ("give_up", latest_failed)
+
+    if is_resumable_failed_task(latest_failed):
+        return ("resume", latest_failed)
+    return ("retry", latest_failed)
+
+
 def _create_improve_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
@@ -1022,7 +1075,9 @@ def _create_improve_task(
 
     Uses review feedback when a review task is supplied; otherwise falls back
     to unresolved task comments.
-    Validates that no duplicate improve task already exists.
+    Validates that no duplicate improve task already exists for review-backed
+    improves. Comments-only improve lifecycle selection is handled by
+    ``resolve_comments_improve_action``.
     Returns the created improve task, or raises ValueError with an error message.
     """
     assert impl_task.id is not None
@@ -1030,23 +1085,12 @@ def _create_improve_task(
     if review_task is not None:
         assert review_task.id is not None
         existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
-    else:
-        existing = [
-            task
-            for task in store.get_improve_tasks_by_root(impl_task.id)
-            if task.depends_on is None
-        ]
-    if existing:
-        existing_task = existing[0]
-        if review_task is not None and review_task.id is not None:
+        if existing:
+            existing_task = existing[0]
             raise ValueError(
                 f"An improve task already exists for implementation {impl_task.id} "
                 f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
             )
-        raise ValueError(
-            f"An improve task already exists for implementation {impl_task.id} "
-            f"without an attached review: {existing_task.id} (status: {existing_task.status})"
-        )
 
     prompt = PromptBuilder().improve_task_prompt(
         impl_task.id,

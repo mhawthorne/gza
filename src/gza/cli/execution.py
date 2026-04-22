@@ -42,6 +42,7 @@ from ._common import (
     get_review_verdict,
     get_store,
     get_task_step_count,
+    resolve_comments_improve_action,
     resolve_id,
     resolve_improve_action,
     run_with_resume,
@@ -1017,21 +1018,93 @@ def cmd_improve(args: argparse.Namespace) -> int:
             print(f"  gza add --type review --depends-on {impl_task.id}")
             return 1
 
-    # Create improve task (using shared helper)
-    try:
-        improve_task = _create_improve_task(
-            store,
-            impl_task,
-            review_task,
-            create_review=args.review if hasattr(args, 'review') and args.review else False,
-            model=args.model if hasattr(args, 'model') and args.model else None,
-            provider=args.provider if hasattr(args, 'provider') and args.provider else None,
-        )
-    except ValueError as e:
-        print(f"Error: {e}")
-        return 1
+    create_review = args.review if hasattr(args, 'review') and args.review else False
+    model = args.model if hasattr(args, 'model') and args.model else None
+    provider = args.provider if hasattr(args, 'provider') and args.provider else None
 
-    print(f"✓ Created improve task {improve_task.id}")
+    improve_task: DbTask
+    action_message: str | None = None
+
+    if review_task is None:
+        comments_action, existing_comments_improve = resolve_comments_improve_action(
+            store,
+            impl_task.id,
+            max_resume_attempts=config.max_resume_attempts,
+        )
+        if comments_action == "wait_in_progress":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            print(
+                f"Error: Comments-only improve {existing_comments_improve.id} is already in progress. "
+                "Wait for it to finish."
+            )
+            return 1
+        if comments_action == "reuse_pending":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            improve_task = existing_comments_improve
+            action_message = f"Reusing pending improve task {improve_task.id}"
+        elif comments_action == "give_up":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            print(
+                f"Error: Comments-only improve retries exceeded max_resume_attempts "
+                f"({config.max_resume_attempts}); latest failure: {existing_comments_improve.id}"
+            )
+            return 1
+        elif comments_action == "resume":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            improve_task = _create_resume_task(store, existing_comments_improve)
+            action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
+        elif comments_action == "retry":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            retry_same_branch = existing_comments_improve.same_branch
+            retry_base_branch: str | None = None
+            if existing_comments_improve.same_branch and existing_comments_improve.branch:
+                retry_same_branch = False
+                retry_base_branch = existing_comments_improve.branch
+            improve_task = store.add(
+                prompt=existing_comments_improve.prompt,
+                task_type="improve",
+                depends_on=None,
+                based_on=existing_comments_improve.id,
+                same_branch=retry_same_branch,
+                group=existing_comments_improve.group,
+                base_branch=retry_base_branch,
+                create_review=create_review,
+                model=model,
+                provider=provider,
+            )
+            action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
+        else:
+            try:
+                improve_task = _create_improve_task(
+                    store,
+                    impl_task,
+                    None,
+                    create_review=create_review,
+                    model=model,
+                    provider=provider,
+                )
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 1
+    else:
+        # Create improve task (using shared helper)
+        try:
+            improve_task = _create_improve_task(
+                store,
+                impl_task,
+                review_task,
+                create_review=create_review,
+                model=model,
+                provider=provider,
+            )
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+
+    if action_message is not None:
+        print(f"✓ {action_message}")
+    else:
+        print(f"✓ Created improve task {improve_task.id}")
     print(f"  Based on: implementation {impl_task.id}")
     if review_task is not None:
         print(f"  Review: {review_task.id}")
