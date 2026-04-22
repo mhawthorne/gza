@@ -251,8 +251,10 @@ class CodexProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        interactive: bool = False,
     ) -> RunResult:
         """Run Codex to execute a task."""
+        _ = interactive
         if config.use_docker:
             return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
         return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)

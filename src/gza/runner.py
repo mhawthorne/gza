@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -37,25 +38,45 @@ from .learnings import maybe_auto_regenerate_learnings
 from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
-from .review_tasks import (
-    DuplicateReviewError,
-    create_review_task,
-    extract_followup_prompt_parts,
-    format_followup_finding_context,
-)
+from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import parse_review_report, parse_review_verdict
+from .task_slug import (
+    extract_task_id_suffix,
+    get_base_task_slug,
+    strip_derived_implement_prefixes,
+)
 
 logger = logging.getLogger(__name__)
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 
+
+@dataclass(frozen=True)
+class RunInvocationContext:
+    """Execution invocation metadata for runner UX/provenance behavior."""
+
+    command: str
+    execution_mode: str
+    interaction_mode: str = "observe_only"
+
+
+_TASK_EXECUTION_MODE_BY_INVOCATION_MODE: dict[str, str] = {
+    "background_worker": "worker_background",
+    "foreground_worker": "worker_foreground",
+    "foreground_inline": "foreground_inline",
+    "foreground_attach_resume": "foreground_attach_resume",
+}
+
 __all__ = [
+    "RunInvocationContext",
     "run",
     "build_prompt",
     "write_log_entry",
     "extract_content_from_log",
     "get_effective_config_for_task",
     "post_review_to_pr",
+    "open_task_startup_log",
+    "rename_startup_log_to_slug",
 ]
 
 
@@ -67,6 +88,30 @@ def write_log_entry(log_file: "Path", entry: dict) -> None:
             f.flush()
     except Exception:
         logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
+
+
+def open_task_startup_log(config: Config, task: Task) -> Path:
+    """Return the startup log path for a task, creating parent directories."""
+    if task.log_file:
+        path = config.project_dir / Path(task.log_file)
+    else:
+        suffix = task.id or "unknown-task"
+        path = config.log_path / f"{suffix}.startup.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.touch()
+    return path
+
+
+def rename_startup_log_to_slug(config: Config, startup_log: Path, slug: str) -> Path:
+    """Rename a startup log file to the final slug log path."""
+    final_log = config.log_path / f"{slug}.log"
+    if startup_log == final_log:
+        return final_log
+    final_log.parent.mkdir(parents=True, exist_ok=True)
+    if startup_log.exists():
+        startup_log.replace(final_log)
+    return final_log
 
 
 def write_worker_start_event(log_file: "Path", *, resumed: bool) -> None:
@@ -89,38 +134,122 @@ def write_worker_start_event(log_file: "Path", *, resumed: bool) -> None:
     )
 
 
-def open_task_startup_log(config: "Config", task: "Task") -> "Path":
-    """Return the path of the task's startup log, creating the file if needed.
+def _resolve_default_invocation_context() -> "RunInvocationContext":
+    """Build default invocation context from process mode."""
+    if os.environ.get("GZA_WORKER_MODE") == "1":
+        return RunInvocationContext(command="work", execution_mode="background_worker")
+    return RunInvocationContext(command="work", execution_mode="foreground_worker")
 
-    For a brand-new task (no ``task.log_file`` yet), uses
-    ``{task.id}.startup.log`` under ``config.log_path``.  On resume the
-    existing ``task.log_file`` path is reused.  The file is always touched so
-    reconciliation can observe that a task began writing.
-    """
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    if task.log_file:
-        log_path = config.project_dir / task.log_file
+
+def _task_execution_mode_from_invocation(invocation: "RunInvocationContext") -> str:
+    """Map runner invocation mode to persisted task execution mode."""
+    return _TASK_EXECUTION_MODE_BY_INVOCATION_MODE.get(invocation.execution_mode, "worker_foreground")
+
+
+def _resolve_interaction_mode(
+    invocation: "RunInvocationContext",
+    provider: "Provider",
+) -> str:
+    """Resolve actual interaction mode using provider capabilities."""
+    requested = invocation.interaction_mode
+    if requested == "auto":
+        resolved = "interactive" if provider.supports_interactive_foreground else "observe_only"
+    elif requested == "interactive" and not provider.supports_interactive_foreground:
+        resolved = "observe_only"
     else:
-        log_path = config.log_path / f"{task.id}.startup.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.touch(exist_ok=True)
-    return log_path
+        resolved = requested
+
+    return resolved
 
 
-def rename_startup_log_to_slug(
-    config: "Config", startup_log: "Path", slug: str,
-) -> "Path":
-    """Atomically rename the task-id-based startup log to the slug-based main log.
+def write_execution_provenance_event(
+    log_file: Path,
+    *,
+    invocation: "RunInvocationContext",
+    provider: "Provider",
+    interaction_mode: str,
+    resumed: bool,
+) -> None:
+    """Write structured runner execution provenance before provider launch."""
+    provider_name = provider.name.lower()
+    canonical_execution_mode = _task_execution_mode_from_invocation(invocation)
+    worker_mode = canonical_execution_mode in {"worker_background", "worker_foreground"}
+    message = (
+        f"Execution: command={invocation.command}, mode={canonical_execution_mode}, "
+        f"interaction={interaction_mode}, provider={provider_name}, resumed={resumed}"
+    )
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "execution",
+            "message": message,
+            "command": invocation.command,
+            "execution_mode": canonical_execution_mode,
+            "interaction_mode": interaction_mode,
+            "provider": provider_name,
+            "worker_mode": worker_mode,
+            "resumed": resumed,
+        },
+    )
 
-    Returns the final log path.  If the startup log is already at the slug
-    path (resume) or does not exist, returns the slug path unchanged.
-    """
-    slug_log = config.log_path / f"{slug}.log"
-    if startup_log == slug_log or not startup_log.exists():
-        return slug_log
-    slug_log.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(str(startup_log), str(slug_log))
-    return slug_log
+
+def _mark_preflight_provider_unavailable(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: Provider,
+    invocation: "RunInvocationContext",
+    interaction_mode: str,
+    resume: bool,
+    message: str,
+) -> None:
+    """Persist preflight credential failures as provider-unavailable task failures."""
+    log_file = (
+        config.project_dir / Path(task.log_file)
+        if task.log_file
+        else open_task_startup_log(config, task)
+    )
+    log_file_relative = str(log_file.relative_to(config.project_dir))
+    if task.log_file != log_file_relative:
+        task.log_file = log_file_relative
+        store.update(task)
+
+    write_worker_start_event(log_file, resumed=resume)
+    write_log_entry(
+        log_file,
+        {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug or ''}".strip()},
+    )
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": f"Provider: {provider.name}, Model: {config.model or 'default'}",
+        },
+    )
+    write_execution_provenance_event(
+        log_file,
+        invocation=invocation,
+        provider=provider,
+        interaction_mode=interaction_mode,
+        resumed=resume,
+    )
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "outcome",
+            "message": message,
+            "failure_reason": "PROVIDER_UNAVAILABLE",
+        },
+    )
+    store.mark_failed(
+        task,
+        log_file=str(log_file.relative_to(config.project_dir)),
+        failure_reason="PROVIDER_UNAVAILABLE",
+    )
 
 
 def extract_content_from_log(log_file: "Path") -> str | None:
@@ -293,8 +422,6 @@ REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 4
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 COMMIT_SUBJECT_MAX_CHARS = 72
-FIX_REVIEW_HISTORY_LIMIT = 4
-FIX_LOG_TAIL_LINES = 80
 
 
 def _extract_review_verdict(content: str | None) -> str | None:
@@ -412,8 +539,9 @@ def generate_slug(
         # Fresh task - generate base ID
         date_prefix = datetime.now().strftime("%Y%m%d")
         if slug_override is not None:
-            # slug_override is a semantic lineage slug body (already slugified),
-            # so do not prepend project_prefix.
+            # slug_override already encodes full lineage context
+            # (e.g. "0000mr-rev-myproj-add-feature")
+            # so do not prepend project_prefix — it would double-embed the prefix for chained tasks
             base_id = f"{date_prefix}-{slug_override}"
         else:
             slug = slugify(prompt)
@@ -437,15 +565,35 @@ def generate_slug(
 
 
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
-    """Compute a slug_override for review/implement/improve tasks.
-    Returns a semantic slug body anchored to the task lineage:
-    - implement/improve -> prompt from the top ``based_on`` ancestor (lineage root)
-    - review -> prompt from direct ``depends_on`` target
-
-    Returns None for other task types (slug is derived from prompt as usual).
-    """
+    """Compute a semantic slug override for review/implement/improve tasks."""
     if task.task_type not in {"review", "implement", "improve"}:
         return None
+
+    def _known_lineage_suffixes(candidate: Task) -> set[str]:
+        suffixes: set[str] = set()
+        current: Task | None = candidate
+        visited: set[str] = set()
+        while current is not None and current.id is not None and current.id not in visited:
+            visited.add(current.id)
+            suffix = extract_task_id_suffix(current.id)
+            if suffix:
+                suffixes.add(suffix)
+            if current.based_on is None:
+                break
+            current = store.get(current.based_on)
+        return suffixes
+
+    def _slug_from_task(candidate: Task) -> str:
+        base_slug = get_base_task_slug(candidate.slug) if candidate.slug else None
+        if base_slug:
+            normalized = strip_derived_implement_prefixes(
+                base_slug,
+                known_task_id_suffixes=_known_lineage_suffixes(candidate),
+            )
+            if normalized:
+                return normalized
+            return base_slug
+        return slugify(candidate.prompt)
 
     if task.task_type == "review":
         if task.depends_on is None:
@@ -459,47 +607,51 @@ def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None
                 task.depends_on,
             )
             return slugify(task.prompt)
-        return slugify(target.prompt)
+        return _slug_from_task(target)
 
-    if task.based_on is None:
+    anchor_id = task.based_on or task.depends_on
+    if anchor_id is None:
         return slugify(task.prompt)
 
-    current = store.get(task.based_on)
-    if current is None:
+    root = store.get(anchor_id)
+    if root is None:
         logger.warning(
-            "Slug override ancestor missing for task #%s: based_on=%s; "
-            "falling back to child task prompt",
+            "Slug override ancestor missing for task #%s while walking based_on chain: "
+            "missing_parent=%s; using task prompt",
             task.id,
-            task.based_on,
+            anchor_id,
         )
         return slugify(task.prompt)
 
-    seen = {current.id} if current.id else set()
-    while current.based_on is not None:
-        next_parent = store.get(current.based_on)
-        if next_parent is None:
-            logger.warning(
-                "Slug override ancestor missing for task #%s while walking based_on chain: "
-                "missing_parent=%s; using last resolved ancestor #%s",
-                task.id,
-                current.based_on,
-                current.id,
-            )
-            break
-        if next_parent.id in seen:
+    seen: set[str] = set()
+    last_resolved = root
+    while root.based_on:
+        next_id = root.based_on
+        if root.id is not None:
+            seen.add(root.id)
+        if next_id in seen:
             logger.warning(
                 "Slug override cycle detected for task #%s while walking based_on chain: "
                 "ancestor=%s; using last resolved ancestor #%s",
                 task.id,
-                next_parent.id,
-                current.id,
+                next_id,
+                last_resolved.id,
             )
             break
-        current = next_parent
-        if current.id is not None:
-            seen.add(current.id)
+        parent = store.get(next_id)
+        if parent is None:
+            logger.warning(
+                "Slug override ancestor missing for task #%s while walking based_on chain: "
+                "missing_parent=%s; using last resolved ancestor #%s",
+                task.id,
+                next_id,
+                last_resolved.id,
+            )
+            break
+        last_resolved = parent
+        root = parent
 
-    return slugify(current.prompt)
+    return _slug_from_task(last_resolved)
 
 
 def _slug_exists(
@@ -862,253 +1014,6 @@ def _build_review_diff_context(
     return "\n".join(parts)
 
 
-def _extract_must_fix_entries(review_content: str) -> list[tuple[str, str]]:
-    """Extract blocker headings and bodies from a review report.
-
-    Supports both legacy ``## Must-Fix`` and current ``## Blockers`` sections.
-    """
-    entries: list[tuple[str, str]] = []
-    in_must_fix = False
-    current_heading: str | None = None
-    current_lines: list[str] = []
-
-    for raw_line in review_content.splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            section = stripped[3:].strip().lower()
-            if section.startswith("must-fix") or section.startswith("blockers"):
-                in_must_fix = True
-                current_heading = None
-                current_lines = []
-                continue
-            if in_must_fix:
-                break
-        if not in_must_fix:
-            continue
-        if stripped.startswith("### "):
-            if current_heading is not None:
-                entries.append((current_heading, "\n".join(current_lines).strip()))
-            current_heading = stripped[4:].strip()
-            current_lines = []
-            continue
-        if current_heading is not None:
-            current_lines.append(line)
-
-    if in_must_fix and current_heading is not None:
-        entries.append((current_heading, "\n".join(current_lines).strip()))
-
-    return entries
-
-
-def _normalize_blocker_text(text: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-    return re.sub(r"\s+", " ", normalized)
-
-
-def _must_fix_blocker_key(heading: str, body: str) -> tuple[str, str]:
-    """Return (stable_key, summary) for a Must-Fix entry."""
-    summary = ""
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.lower().startswith("required fix:"):
-            summary = stripped.split(":", 1)[1].strip()
-            break
-        if stripped.lower().startswith("impact:"):
-            continue
-        summary = stripped
-        break
-
-    if not summary:
-        summary = heading
-
-    key_source = f"{heading} {summary}"
-    return _normalize_blocker_text(key_source), _truncate_to_word_boundary(summary, 160)
-
-
-def _build_repeated_blocker_lines(
-    reviews: list[Task],
-    project_dir: Path,
-) -> list[str]:
-    """Build repeated-blocker summary lines from recent completed reviews."""
-    per_review: list[tuple[str, dict[str, str]]] = []
-    for review_task in reviews:
-        content = _get_task_output(review_task, project_dir)
-        if not content:
-            continue
-        keys: dict[str, str] = {}
-        for heading, body in _extract_must_fix_entries(content):
-            key, summary = _must_fix_blocker_key(heading, body)
-            if key:
-                keys[key] = summary
-        if keys:
-            per_review.append((str(review_task.id), keys))
-
-    if len(per_review) < 2:
-        return []
-
-    latest_id, latest_keys = per_review[0]
-    previous_id, previous_keys = per_review[1]
-    repeated_keys = [key for key in latest_keys if key in previous_keys]
-    if not repeated_keys:
-        return []
-
-    lines = [
-        "Repeated blockers in the two most recent completed reviews:",
-        f"- Reviews compared: {latest_id} (latest) vs {previous_id}",
-    ]
-    for key in repeated_keys[:8]:
-        summary = latest_keys.get(key) or previous_keys.get(key) or key
-        lines.append(f"- {summary}")
-    return lines
-
-
-def _read_log_tail(project_dir: Path, log_file: str | None, max_lines: int = FIX_LOG_TAIL_LINES) -> str:
-    if not log_file:
-        return ""
-    path = project_dir / log_file
-    if not path.exists():
-        return ""
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return ""
-    if not lines:
-        return ""
-    tail = lines[-max_lines:]
-    return "\n".join(tail)
-
-
-def _build_fix_context(
-    task: Task,
-    store: SqliteTaskStore,
-    project_dir: Path,
-    git: Git | None,
-    config: Config | None,
-) -> str:
-    """Build host-assembled stuck-task rescue context for fix tasks."""
-    # Walk fix/improve based_on chains so resumed or retried fix tasks (whose
-    # based_on points at the prior fix, not the impl) still get full rescue
-    # context — otherwise the agent sees the fix-rescue prompt header with
-    # nothing underneath it.
-    impl_task = _resolve_impl_ancestor(store, task)
-    if impl_task is None:
-        return ""
-
-    assert impl_task.id is not None
-    reviews = [r for r in store.get_reviews_for_task(impl_task.id) if r.status == "completed"]
-    latest_review = reviews[0] if reviews else None
-    recent_reviews = reviews[:FIX_REVIEW_HISTORY_LIMIT]
-    repeated_blocker_lines = _build_repeated_blocker_lines(recent_reviews, project_dir)
-
-    from gza.query import build_lineage_tree, flatten_lineage_tree
-
-    lineage = flatten_lineage_tree(build_lineage_tree(store, impl_task))
-    failed_improves = [t for t in lineage if t.id is not None and t.task_type == "improve" and t.status == "failed"]
-    failed_implement_retries = [
-        t
-        for t in lineage
-        if t.id is not None and t.task_type == "implement" and t.id != impl_task.id and t.status == "failed"
-    ]
-
-    def _latest_failed_task(tasks: list[Task]) -> Task | None:
-        if not tasks:
-            return None
-        return max(
-            tasks,
-            key=lambda t: (t.completed_at or t.created_at or datetime.min, task_id_numeric_key(t.id)),
-        )
-
-    latest_failed_improve = _latest_failed_task(failed_improves)
-    latest_failed_impl_retry = _latest_failed_task(failed_implement_retries)
-    latest_failed_attempt = _latest_failed_task(
-        [t for t in (latest_failed_improve, latest_failed_impl_retry) if t is not None]
-    )
-
-    plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store) if impl_task.based_on else None
-    plan_or_request: list[str] = []
-    if plan_task is not None:
-        plan_content = _get_task_output(plan_task, project_dir)
-        plan_or_request.append("## Original plan:")
-        plan_or_request.append(plan_content if plan_content else f"(plan task {plan_task.id} content unavailable)")
-    else:
-        plan_or_request.append("## Original request:")
-        plan_or_request.append(impl_task.prompt)
-
-    branch_state_lines: list[str] = []
-    if impl_task.branch:
-        branch_state_lines.append(f"- Branch: {impl_task.branch}")
-    if impl_task.branch and git is not None:
-        try:
-            default_branch = git.default_branch()
-            ahead = git.count_commits_ahead(impl_task.branch, default_branch)
-            branch_state_lines.append(f"- Ahead of {default_branch}: {ahead} commit(s)")
-            diff_stat = git.get_diff_stat(f"{default_branch}...{impl_task.branch}")
-            if isinstance(diff_stat, str) and diff_stat.strip():
-                branch_state_lines.append("- Diff summary:")
-                branch_state_lines.append(diff_stat.strip())
-        except GitError:
-            pass
-
-    latest_review_content = _get_task_output(latest_review, project_dir) if latest_review else None
-    latest_review_summary = _compact_output_summary(latest_review_content) if latest_review_content else ""
-    latest_failed_tail = (
-        _read_log_tail(project_dir, latest_failed_attempt.log_file) if latest_failed_attempt else ""
-    )
-
-    lines: list[str] = [
-        "## Fix Rescue Context",
-        "",
-        f"- Root implementation: {impl_task.id}",
-        f"- Root implementation status: {impl_task.status}",
-        f"- Verify command: `{getattr(config, 'verify_command', '') or '(not configured)'}`",
-    ]
-    if latest_review is not None:
-        lines.append(f"- Latest completed review: {latest_review.id}")
-    if latest_review_summary:
-        lines.append(f"- Latest review summary: {latest_review_summary}")
-    if latest_failed_improve is not None:
-        lines.append(
-            f"- Latest failed improve/resume attempt: {latest_failed_improve.id} "
-            f"({latest_failed_improve.failure_reason or 'UNKNOWN'})"
-        )
-    if latest_failed_impl_retry is not None:
-        lines.append(
-            f"- Latest failed implementation retry/resume attempt: {latest_failed_impl_retry.id} "
-            f"({latest_failed_impl_retry.failure_reason or 'UNKNOWN'})"
-        )
-
-    if repeated_blocker_lines:
-        lines.append("")
-        lines.append("## Repeated Blockers")
-        lines.extend(repeated_blocker_lines)
-
-    if recent_reviews:
-        lines.append("")
-        lines.append("## Recent Completed Reviews")
-        for review_task in recent_reviews:
-            content = _get_task_output(review_task, project_dir)
-            summary = _compact_output_summary(content) if content else "No output content available."
-            lines.append(f"- {review_task.id}: {summary}")
-
-    if branch_state_lines:
-        lines.append("")
-        lines.append("## Branch And Diff State")
-        lines.extend(branch_state_lines)
-
-    lines.append("")
-    lines.extend(plan_or_request)
-
-    if latest_failed_tail:
-        lines.append("")
-        lines.append("## Latest Failed Attempt Log Tail")
-        lines.append(latest_failed_tail)
-
-    return "\n".join(lines)
-
-
 def _build_context_from_chain(
     task: Task,
     store: SqliteTaskStore,
@@ -1122,13 +1027,26 @@ def _build_context_from_chain(
     def _int_or_default(value: object, default: int) -> int:
         return value if isinstance(value, int) else default
 
-    if task.task_type == "fix":
-        fix_context = _build_fix_context(task, store, project_dir, git, config)
-        if fix_context:
-            context_parts.append(fix_context)
-
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":
+        impl_ancestor = _resolve_impl_ancestor(store, task)
+        if impl_ancestor is not None and impl_ancestor.id is not None:
+            unresolved_comments = store.get_comments(
+                impl_ancestor.id,
+                unresolved_only=True,
+                created_on_or_before=task.created_at,
+            )
+            if unresolved_comments:
+                context_parts.append("## Comments:\n")
+                for comment in unresolved_comments:
+                    source_author = f"source={comment.source}"
+                    if comment.author:
+                        source_author += f", author={comment.author}"
+                    context_parts.append(
+                        f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
+                    )
+                    context_parts.append(comment.content)
+
         # Get the review we're addressing
         if task.depends_on:
             review_task = store.get(task.depends_on)
@@ -1141,29 +1059,6 @@ def _build_context_from_chain(
                     context_parts.append(
                         "## Review feedback to address:\n"
                         f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
-                    )
-
-        impl_ancestor = _resolve_impl_ancestor(store, task)
-        comment_task_id = (
-            impl_ancestor.id
-            if impl_ancestor and impl_ancestor.id
-            else (task.based_on if task.based_on else task.id)
-        )
-        if comment_task_id is not None:
-            unresolved_comments = store.get_comments(
-                comment_task_id,
-                unresolved_only=True,
-                created_on_or_before=task.created_at,
-            )
-            if unresolved_comments:
-                context_parts.append("\n## Comments:\n")
-                for comment in unresolved_comments:
-                    attribution = f"source={comment.source}"
-                    if comment.author:
-                        attribution += f", author={comment.author}"
-                    context_parts.append(
-                        f"- [{comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC] ({attribution})\n"
-                        f"{comment.content}"
                     )
 
         # Get the original plan (via based_on chain)
@@ -1182,38 +1077,84 @@ def _build_context_from_chain(
                             f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
                         )
 
+    if task.task_type == "fix":
+        root_impl = _resolve_root_implementation_for_fix(task, store)
+        if root_impl is not None and root_impl.id is not None:
+            context_parts.append("## Fix Rescue Context\n")
+            context_parts.append(f"Root implementation: {root_impl.id}")
+
+            reviews = [
+                candidate
+                for candidate in store.get_reviews_for_task(root_impl.id)
+                if candidate.status == "completed"
+            ]
+            latest_review = reviews[0] if reviews else None
+            if latest_review is not None and latest_review.id is not None:
+                context_parts.append(f"Latest completed review: {latest_review.id}")
+                latest_review_content = _get_task_output(latest_review, project_dir)
+                if latest_review_content:
+                    context_parts.append("\n## Review feedback to address:\n")
+                    context_parts.append(latest_review_content)
+
+            repeated = _extract_repeated_required_fixes(reviews[:2], project_dir)
+            if repeated:
+                context_parts.append("\n## Repeated Blockers\n")
+                context_parts.extend(f"- {item}" for item in repeated)
+
+            failed_improves = [
+                candidate
+                for candidate in store.get_improve_tasks_by_root(root_impl.id)
+                if candidate.status == "failed"
+            ]
+            if failed_improves:
+                latest_failed_improve = max(
+                    failed_improves,
+                    key=lambda candidate: candidate.completed_at or candidate.created_at or datetime.min.replace(tzinfo=UTC),
+                )
+                if latest_failed_improve.id is not None:
+                    context_parts.append(f"\nLatest failed improve/resume attempt: {latest_failed_improve.id}")
+                    context_parts.append(_extract_failure_context(latest_failed_improve, project_dir))
+
+            failed_impl_retries = [
+                candidate
+                for candidate in store.get_based_on_children(root_impl.id)
+                if candidate.task_type == "implement" and candidate.status == "failed"
+            ]
+            if failed_impl_retries:
+                latest_failed_impl = max(
+                    failed_impl_retries,
+                    key=lambda candidate: candidate.completed_at or candidate.created_at or datetime.min.replace(tzinfo=UTC),
+                )
+                if latest_failed_impl.id is not None:
+                    context_parts.append(
+                        f"Latest failed implementation retry/resume attempt: {latest_failed_impl.id}"
+                    )
+
+            plan_task = None
+            if root_impl.based_on:
+                plan_task = _find_task_of_type_in_chain(root_impl.based_on, "plan", store)
+
+            if plan_task:
+                plan_content = _get_task_output(plan_task, project_dir)
+                if plan_content:
+                    context_parts.append("\n## Original plan:\n")
+                    context_parts.append(plan_content)
+                else:
+                    context_parts.append(
+                        "\n## Original plan:\n"
+                        f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
+                    )
+            elif root_impl.prompt:
+                context_parts.append("\n## Original request:\n")
+                context_parts.append(root_impl.prompt)
+
     # For implement tasks, include plan from based_on chain
     if task.task_type == "implement" and task.based_on:
-        parent_task = store.get(task.based_on)
-        if parent_task and parent_task.task_type == "review":
-            review_content = _get_task_output(parent_task, project_dir)
-            if review_content:
-                followup_parts = extract_followup_prompt_parts(task.prompt or "")
-                finding = None
-                if followup_parts is not None:
-                    finding_id, review_id, _ = followup_parts
-                    if review_id == parent_task.id:
-                        report = parse_review_report(review_content)
-                        finding = next(
-                            (
-                                item
-                                for item in report.findings
-                                if item.severity == "FOLLOWUP" and item.id == finding_id
-                            ),
-                            None,
-                        )
-                if finding is not None:
-                    context_parts.append("## Follow-up finding to implement:\n")
-                    context_parts.append(format_followup_finding_context(finding))
-                else:
-                    context_parts.append("## Parent review context:\n")
-                    context_parts.append(review_content)
-            else:
-                context_parts.append(
-                    "## Parent review context:\n"
-                    f"(review task {parent_task.id} exists but content unavailable on this machine - flag as blocker)"
-                )
-
+        followup_parts = extract_followup_prompt_parts(task.prompt)
+        if followup_parts is not None:
+            marker = "## Follow-up finding to implement:"
+            if marker in task.prompt:
+                context_parts.append(task.prompt[task.prompt.index(marker):].strip())
         plan_task = _find_task_of_type_in_chain(task.based_on, "plan", store)
         if plan_task:
             plan_content = _get_task_output(plan_task, project_dir)
@@ -1294,6 +1235,131 @@ def _build_context_from_chain(
             context_parts.append(f"This task is a follow-up to task {parent_task.id}: {parent_task.prompt[:100]}")
 
     return "\n".join(context_parts) if context_parts else ""
+
+
+def _resolve_root_implementation_for_fix(task: Task, store: SqliteTaskStore) -> Task | None:
+    """Resolve the implementation root for fix and resumed/retried fix chains."""
+    visited: set[str] = set()
+    current: Task | None = task
+    while current is not None:
+        if current.id is not None:
+            if current.id in visited:
+                return None
+            visited.add(current.id)
+        if current.task_type == "implement":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+    return None
+
+
+def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
+    """Resolve the implementation ancestor by walking based_on lineage."""
+    if task.task_type == "implement":
+        return task
+    visited: set[str] = set()
+    current: Task | None = task
+    while current is not None:
+        if current.id is not None:
+            if current.id in visited:
+                return None
+            visited.add(current.id)
+        if current.task_type == "implement":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+    return None
+
+
+def _normalize_repeated_blocker_text(text: str) -> str:
+    """Normalize blocker text for repeated-fix matching."""
+    return " ".join(text.split()).strip().lower()
+
+
+def _extract_blocker_signal_lines(blocker_body: str) -> list[str]:
+    """Extract potential blocker-fix signal lines from canonical blocker body text."""
+    signals: list[str] = []
+    for raw_line in blocker_body.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("required tests:") or lowered.startswith("recommended tests:"):
+            continue
+        if lowered.startswith("evidence:") or lowered.startswith("impact:"):
+            continue
+        if ":" in stripped:
+            _, value = stripped.split(":", 1)
+            if value.strip():
+                signals.append(value.strip())
+                continue
+        signals.append(stripped)
+    return signals
+
+
+def _extract_required_fix_candidates(content: str) -> dict[str, str]:
+    """Extract blocker/fix candidates from parsed review markdown plus legacy fallbacks."""
+    candidates: dict[str, str] = {}
+
+    parsed = parse_review_report(content)
+    for finding in parsed.findings:
+        if finding.severity != "BLOCKER":
+            continue
+
+        signals: list[str] = []
+        if finding.fix_or_followup:
+            signals.append(finding.fix_or_followup)
+        signals.extend(_extract_blocker_signal_lines(finding.body))
+        signals.append(finding.title)
+
+        for signal in signals:
+            normalized = _normalize_repeated_blocker_text(signal)
+            if normalized:
+                candidates.setdefault(normalized, signal.strip())
+
+    for match in re.finditer(r"(?im)^Required fix:\s*(.+)$", content):
+        signal = match.group(1).strip()
+        normalized = _normalize_repeated_blocker_text(signal)
+        if normalized:
+            candidates.setdefault(normalized, signal)
+
+    return candidates
+
+
+def _extract_repeated_required_fixes(reviews: list[Task], project_dir: Path) -> list[str]:
+    """Extract repeated blockers from the most recent completed reviews."""
+    if len(reviews) < 2:
+        return []
+
+    required_by_review: list[dict[str, str]] = []
+    for review in reviews:
+        content = _get_task_output(review, project_dir) or ""
+        required_by_review.append(_extract_required_fix_candidates(content))
+
+    repeated_keys = set(required_by_review[0]).intersection(required_by_review[1])
+    repeated = [required_by_review[0][key] for key in repeated_keys]
+    return sorted(repeated, key=str.lower)
+
+
+def _extract_failure_context(task: Task, project_dir: Path) -> str:
+    """Return a compact failed-attempt context block for fix rescue prompts."""
+    lines: list[str] = []
+    if task.failure_reason:
+        lines.append(f"failure_reason={task.failure_reason}")
+    if task.log_file:
+        log_path = project_dir / Path(task.log_file)
+        if log_path.exists():
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            except OSError:
+                tail = []
+            if tail:
+                lines.extend(tail[-20:])
+    if not lines:
+        return "(no failed-attempt context available)"
+    return "\n".join(lines)
 
 
 def _find_task_of_type_in_chain(task_id: str, task_type: str, store: SqliteTaskStore, visited: set[str] | None = None) -> Task | None:
@@ -1797,6 +1863,7 @@ def run(
     skip_precondition_check: bool = False,
     on_task_claimed: Callable[[Task], None] | None = None,
     create_pr: bool = False,
+    invocation: RunInvocationContext | None = None,
 ) -> int:
     """Run Gza on the next pending task or a specific task.
 
@@ -1811,6 +1878,7 @@ def run(
         skip_precondition_check: If True, skip dependency merge precondition checks.
         on_task_claimed: Optional callback invoked after task ownership is established.
         create_pr: If True, create/reuse a PR after successful code-task completion.
+        invocation: Optional execution invocation context for UX/provenance.
     """
     load_dotenv(config.project_dir)
 
@@ -1819,9 +1887,8 @@ def run(
 
     # Load tasks from SQLite
     store = SqliteTaskStore(config.db_path)
-    execution_mode = (
-        "worker_background" if os.environ.get("GZA_WORKER_MODE") == "1" else "worker_foreground"
-    )
+    invocation_context = invocation or _resolve_default_invocation_context()
+    task_execution_mode = _task_execution_mode_from_invocation(invocation_context)
 
     pr_retry_mode = False
     if task_id:
@@ -1848,16 +1915,16 @@ def run(
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
-                task.execution_mode = execution_mode
+                task.execution_mode = task_execution_mode
                 assert task.id is not None
-                store.set_execution_mode(task.id, execution_mode)
+                store.set_execution_mode(task.id, task_execution_mode)
             else:
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
                 task.failure_reason = None
                 task.running_pid = os.getpid()
-                task.execution_mode = execution_mode
+                task.execution_mode = task_execution_mode
                 store.update(task)
         else:
             # Check if task is blocked by dependencies
@@ -1872,14 +1939,14 @@ def run(
             )
             if task.status == "in_progress":
                 task.running_pid = os.getpid()
-                task.execution_mode = execution_mode
+                task.execution_mode = task_execution_mode
                 store.update(task)
             elif allow_pr_retry:
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
                 task.running_pid = os.getpid()
-                task.execution_mode = execution_mode
+                task.execution_mode = task_execution_mode
                 store.update(task)
                 pr_retry_mode = True
             elif task.status != "pending":
@@ -1894,9 +1961,9 @@ def run(
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
-                task.execution_mode = execution_mode
+                task.execution_mode = task_execution_mode
                 assert task.id is not None
-                store.set_execution_mode(task.id, execution_mode)
+                store.set_execution_mode(task.id, task_execution_mode)
     else:
         if resume:
             error_message("Error: Cannot resume without specifying a task ID")
@@ -1911,9 +1978,9 @@ def run(
             if claimed is None:
                 continue
             task = claimed
-            task.execution_mode = execution_mode
+            task.execution_mode = task_execution_mode
             assert task.id is not None
-            store.set_execution_mode(task.id, execution_mode)
+            store.set_execution_mode(task.id, task_execution_mode)
             break
 
     if not task:
@@ -1945,112 +2012,46 @@ def run(
 
     # Get the provider for this task
     provider = get_provider(task_config)
+    resolved_interaction_mode = _resolve_interaction_mode(invocation_context, provider)
+    preflight_log = open_task_startup_log(config, task)
+    preflight_log_relative = str(preflight_log.relative_to(config.project_dir))
+    if task.log_file != preflight_log_relative:
+        task.log_file = preflight_log_relative
+        store.update(task)
 
-    # Open a startup log immediately so preflight has a breadcrumb even if the
-    # worker dies before slug generation / worktree creation.
-    startup_log = open_task_startup_log(config, task)
-    task.log_file = str(startup_log.relative_to(config.project_dir))
-    store.update(task)
-    write_worker_start_event(startup_log, resumed=resume)
-    write_log_entry(
-        startup_log,
-        {
-            "type": "gza",
-            "subtype": "info",
-            "message": f"Task: {task.id} (prompt: {task.prompt[:120]})",
-        },
-    )
-    write_log_entry(
-        startup_log,
-        {
-            "type": "gza",
-            "subtype": "info",
-            "message": (
-                f"Provider: {provider.name}, Model: {task_config.model or 'default'}, "
-                f"Docker: {bool(task_config.use_docker)}"
-            ),
-        },
-    )
-
-    rc = _colors.RUNNER_COLORS
-
-    write_log_entry(
-        startup_log,
-        {
-            "type": "gza",
-            "subtype": "preflight",
-            "event": "check_credentials_start",
-            "message": f"Checking {provider.name} credentials",
-        },
-    )
     if not provider.check_credentials():
-        write_log_entry(
-            startup_log,
-            {
-                "type": "gza",
-                "subtype": "outcome",
-                "event": "preflight_failed",
-                "message": f"No {provider.name} credentials found. {provider.credential_setup_hint}",
-                "failure_reason": "PROVIDER_UNAVAILABLE",
-            },
-        )
-        store.mark_failed(
-            task,
-            log_file=task.log_file,
-            branch=task.branch,
-            failure_reason="PROVIDER_UNAVAILABLE",
-        )
         error_message(f"Error: No {provider.name} credentials found")
         console.print(f"  {provider.credential_setup_hint}")
+        _mark_preflight_provider_unavailable(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation_context,
+            interaction_mode=resolved_interaction_mode,
+            resume=resume,
+            message=f"Preflight failed: missing {provider.name} credentials",
+        )
         return 1
-    write_log_entry(
-        startup_log,
-        {
-            "type": "gza",
-            "subtype": "preflight",
-            "event": "check_credentials_done",
-            "message": f"{provider.name} credentials present",
-        },
-    )
 
     # Verify credentials work before proceeding
     console.print(f"Verifying {provider.name} credentials...")
-    write_log_entry(
-        startup_log,
-        {
-            "type": "gza",
-            "subtype": "preflight",
-            "event": "verify_credentials_start",
-            "message": f"Verifying {provider.name} credentials",
-        },
-    )
-    if not provider.verify_credentials(task_config, log_file=startup_log):
-        write_log_entry(
-            startup_log,
-            {
-                "type": "gza",
-                "subtype": "outcome",
-                "event": "preflight_failed",
-                "message": f"{provider.name} credential verification failed",
-                "failure_reason": "PROVIDER_UNAVAILABLE",
-            },
-        )
-        store.mark_failed(
-            task,
-            log_file=task.log_file,
-            branch=task.branch,
-            failure_reason="PROVIDER_UNAVAILABLE",
+    preflight_log_path: Path | None = None
+    if task.log_file:
+        preflight_log_path = config.project_dir / Path(task.log_file)
+    if not provider.verify_credentials(task_config, log_file=preflight_log_path):
+        _mark_preflight_provider_unavailable(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation_context,
+            interaction_mode=resolved_interaction_mode,
+            resume=resume,
+            message=f"Preflight failed: {provider.name} credential verification failed",
         )
         return 1
-    write_log_entry(
-        startup_log,
-        {
-            "type": "gza",
-            "subtype": "preflight",
-            "event": "verify_credentials_done",
-            "message": "Credentials verified",
-        },
-    )
+    rc = _colors.RUNNER_COLORS
     console.print(f"[{rc.success}]Credentials verified ✓[/{rc.success}]")
 
     # Setup git on the main repo (for worktree operations)
@@ -2080,12 +2081,14 @@ def run(
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
         )
-
-    # Promote the task-id startup log to the slug log now that slug is known
-    # so the entire task history lives in a single file.
-    startup_log = rename_startup_log_to_slug(config, startup_log, task.slug)
-    task.log_file = str(startup_log.relative_to(config.project_dir))
-    store.update(task)
+    if task.slug and task.log_file:
+        startup_log = config.project_dir / Path(task.log_file)
+        if startup_log.name.endswith(".startup.log"):
+            slug_log = rename_startup_log_to_slug(config, startup_log, task.slug)
+            slug_log_relative = str(slug_log.relative_to(config.project_dir))
+            if task.log_file != slug_log_relative:
+                task.log_file = slug_log_relative
+                store.update(task)
 
     task_header(
         task.prompt,
@@ -2093,6 +2096,17 @@ def run(
         task.task_type,
         slug=task.slug,
     )
+    if invocation_context.execution_mode == "foreground_inline":
+        if resolved_interaction_mode == "interactive":
+            console.print(
+                f"Foreground inline execution: interactive mode for provider '{provider.name.lower()}'. "
+                "Press Ctrl-C to interrupt.",
+            )
+        else:
+            console.print(
+                f"Foreground inline execution: observe-only for provider '{provider.name.lower()}'. "
+                "Interrupt to redirect.",
+            )
 
     return _run_inner(
         task,
@@ -2105,6 +2119,8 @@ def run(
         open_after=open_after,
         skip_precondition_check=skip_precondition_check,
         create_pr=create_pr,
+        invocation=invocation_context,
+        interaction_mode=resolved_interaction_mode,
     )
 
 
@@ -2306,11 +2322,9 @@ def _setup_code_task_worktree(
         git._run("branch", "-D", branch_name, check=False)
 
     try:
+        base_ref = task.base_branch or _select_worktree_base_ref(git, default_branch)
         if task.base_branch:
-            base_ref = task.base_branch
-            console.print(f"Forking from branch: [blue]{base_ref}[/blue]")
-        else:
-            base_ref = _select_worktree_base_ref(git, default_branch)
+            console.print(f"Creating retry branch from base branch: [blue]{task.base_branch}[/blue]")
         console.print(f"Creating worktree: {worktree_path}")
         git.worktree_add(worktree_path, branch_name, base_ref)
         return True
@@ -2451,18 +2465,6 @@ def _complete_code_task(
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
 
-    fix_code_changed: bool | None = None
-    if task.task_type == "fix":
-        if fix_commits_ahead_before_run is None or not fix_default_branch:
-            fix_code_changed = None
-        else:
-            try:
-                commits_after = worktree_git.count_commits_ahead(branch_name, fix_default_branch)
-                fix_code_changed = commits_after > fix_commits_ahead_before_run
-            except GitError as exc:
-                print(f"Warning: Could not determine fix commit delta: {exc}")
-                fix_code_changed = None
-
     # Keep branch context on the in-memory task so PR ensure can run before
     # the final completed-state DB transition.
     task.branch = branch_name
@@ -2540,20 +2542,9 @@ def _complete_code_task(
         worktree_git,
         branch_name,
         stats,
-        fix_code_changed=fix_code_changed,
+        fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+        fix_default_branch=fix_default_branch,
     )
-
-
-def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
-    """Walk up improve/fix based_on chains until the implementation ancestor is found."""
-    current: Task | None = task
-    while current is not None and current.task_type in {"improve", "fix"} and current.based_on:
-        current = store.get(current.based_on)
-    if current is None or current.task_type in {"improve", "fix"}:
-        return None
-    if current.task_type != "implement":
-        return None
-    return current
 
 
 def _post_complete_code_task(
@@ -2563,33 +2554,29 @@ def _post_complete_code_task(
     worktree_git: Git,
     branch_name: str,
     stats: TaskStats,
-    fix_code_changed: bool | None = None,
+    *,
+    fix_commits_ahead_before_run: int | None = None,
+    fix_default_branch: str | None = None,
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
-    # Clear review state on the implementation task after improve completes.
-    # The improve task has addressed the review feedback, so the old review no longer
-    # reflects the current code state.
+    # Clear review state on the root implementation task after improve completes.
+    # Improve retries/resumes may chain based_on through previous improves, so
+    # resolve the implementation ancestor first.
     if task.task_type == "improve":
         impl_ancestor = _resolve_impl_ancestor(store, task)
-        if impl_ancestor is not None and impl_ancestor.id is not None:
+        if impl_ancestor and impl_ancestor.id is not None:
             store.clear_review_state(impl_ancestor.id)
-            store.resolve_comments(impl_ancestor.id, created_on_or_before=task.created_at)
-            # If parent was already merged, flip it back to unmerged — the improve
-            # task added commits to the shared branch after the merge.
-            if impl_ancestor.merge_status == "merged":
-                store.set_merge_status(impl_ancestor.id, "unmerged")
-
-    # Fix tasks run on the impl's shared branch, so a code-changing fix supersedes
-    # the prior review the same way an improve does. Mirror the improve behavior so
-    # shared lifecycle/query code sees the review as stale.
-    if task.task_type == "fix" and fix_code_changed:
-        impl_ancestor = _resolve_impl_ancestor(store, task)
-        if impl_ancestor is not None and impl_ancestor.id is not None:
-            store.clear_review_state(impl_ancestor.id)
-            if impl_ancestor.merge_status == "merged":
-                store.set_merge_status(impl_ancestor.id, "unmerged")
+            store.resolve_comments(
+                impl_ancestor.id,
+                created_on_or_before=task.created_at,
+            )
+            # If the implementation was already merged, flip it back to unmerged:
+            # improve writes add commits on the shared implementation branch.
+            refreshed_impl = store.get(impl_ancestor.id)
+            if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+                store.set_merge_status(refreshed_impl.id, "unmerged")
 
     # Invalidate review state after rebase completes, since conflict resolution
     # may have introduced changes not covered by prior reviews.
@@ -2604,6 +2591,16 @@ def _post_complete_code_task(
     if task.task_type == "rebase":
         worktree_git.push_force_with_lease(branch_name)
 
+    if task.task_type == "fix":
+        _handle_fix_follow_up_review(
+            task,
+            store,
+            worktree_git,
+            branch_name,
+            fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+            fix_default_branch=fix_default_branch,
+        )
+
     console.print("")
     task_footer(
         task,
@@ -2614,39 +2611,73 @@ def _post_complete_code_task(
         store=store,
     )
 
-    if task.task_type == "fix":
-        impl_ancestor = _resolve_impl_ancestor(store, task)
-        if impl_ancestor is None or impl_ancestor.id is None:
-            print("Warning: Completed fix task has no resolvable implementation ancestor; skip auto review handoff.")
-            return 0
-        if fix_code_changed is None:
-            print("Warning: Could not determine whether the fix run changed code; no follow-up review was auto-created.")
-            print(f"Next step: uv run gza review {impl_ancestor.id}")
-            return 0
-        if not fix_code_changed:
-            print("Fix completed without new commits; no follow-up review was auto-created.")
-            return 0
-
-        try:
-            review_task = create_review_task(store, impl_ancestor)
-            print(f"✓ Created follow-up review task {review_task.id} for implementation {impl_ancestor.id}")
-            print(f"Next step: uv run gza work {review_task.id}")
-        except DuplicateReviewError as exc:
-            review_task = exc.active_review
-            print(
-                f"Follow-up review already exists: {review_task.id} ({review_task.status}). "
-                "Use `uv run gza work` to execute it."
-            )
-        except ValueError as exc:
-            print(f"Warning: could not create follow-up review automatically: {exc}")
-            print(f"Next step: uv run gza review {impl_ancestor.id}")
-        return 0
-
     # Auto-create and run review task if requested
     if task.create_review:
         return _create_and_run_review_task(task, config, store)
 
     return 0
+
+
+def _handle_fix_follow_up_review(
+    task: Task,
+    store: SqliteTaskStore,
+    worktree_git: Git,
+    branch_name: str,
+    *,
+    fix_commits_ahead_before_run: int | None,
+    fix_default_branch: str | None,
+) -> None:
+    """Create a follow-up review task for fix runs when the run added commits."""
+    root_impl = _resolve_root_implementation_for_fix(task, store)
+    if root_impl is None or root_impl.id is None:
+        return
+    if fix_commits_ahead_before_run is None:
+        print("Warning: Could not determine fix commit baseline before run")
+        print("Warning: Could not determine whether the fix run changed code")
+        return
+
+    default_branch = fix_default_branch
+    if not default_branch:
+        try:
+            default_branch = worktree_git.default_branch()
+        except GitError as exc:
+            print(f"Warning: Could not determine fix commit delta: {exc}")
+            print("Warning: Could not determine whether the fix run changed code")
+            return
+
+    try:
+        commits_after = worktree_git.count_commits_ahead(branch_name, default_branch)
+    except GitError as exc:
+        print(f"Warning: Could not determine fix commit delta: {exc}")
+        print("Warning: Could not determine whether the fix run changed code")
+        return
+
+    commits_before = fix_commits_ahead_before_run
+    if commits_after <= commits_before:
+        print("Fix completed without new commits; no follow-up review was auto-created.")
+        return
+
+    store.clear_review_state(root_impl.id)
+    refreshed_impl = store.get(root_impl.id)
+    if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+        store.set_merge_status(refreshed_impl.id, "unmerged")
+
+    try:
+        review_task = create_review_task(store, root_impl, prompt_mode="auto")
+    except DuplicateReviewError as exc:
+        active = exc.active_review
+        print(
+            f"Follow-up review already exists for implementation {root_impl.id}: "
+            f"{active.id} ({active.status})."
+        )
+        return
+    except ValueError as exc:
+        print(
+            f"Warning: Could not auto-create follow-up review for implementation {root_impl.id}: {exc}"
+        )
+        print(f"Next step: run `uv run gza review {root_impl.id}` after validating task state.")
+        return
+    print(f"Created follow-up review task {review_task.id} for implementation {root_impl.id}")
 
 
 def _retry_pr_required_code_task_completion(task: Task, config: Config, store: SqliteTaskStore) -> int:
@@ -2718,12 +2749,24 @@ def _run_inner(
     open_after: bool = False,
     skip_precondition_check: bool = False,
     create_pr: bool = False,
+    invocation: RunInvocationContext | None = None,
+    interaction_mode: str = "observe_only",
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
     # For explore, plan, review, and internal tasks, run without creating a branch.
     # Keep temporary "learn" compatibility for pre-migration rows.
     if task.task_type in ("explore", "plan", "review", "internal", "learn"):
-        return _run_non_code_task(task, task_config, store, provider, git, resume=resume, open_after=open_after)
+        return _run_non_code_task(
+            task,
+            task_config,
+            store,
+            provider,
+            git,
+            resume=resume,
+            open_after=open_after,
+            invocation=invocation,
+            interaction_mode=interaction_mode,
+        )
 
     # Code tasks (implement/improve) require git
     assert git is not None, "git is required for code tasks"
@@ -2767,18 +2810,27 @@ def _run_inner(
 
     store.update(task)
 
-    # Setup logging - use task_id for naming (logs stay in main project)
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_path / f"{task.slug}.log"
-    # Persist log_file early so it's available if the process is killed before completion
-    task.log_file = str(log_file.relative_to(config.project_dir))
-    store.update(task)
+    # Setup logging using the canonical task log path selected during preflight.
+    if task.log_file:
+        log_file = config.project_dir / Path(task.log_file)
+    else:
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        log_file = config.log_path / f"{task.slug}.log"
+        task.log_file = str(log_file.relative_to(config.project_dir))
+        store.update(task)
 
     # Write orchestration pre-run entries
     write_worker_start_event(log_file, resumed=resume)
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "branch", "message": f"Branch: {branch_name}", "branch": branch_name})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {task_config.model or 'default'}"})
+    write_execution_provenance_event(
+        log_file,
+        invocation=invocation or _resolve_default_invocation_context(),
+        provider=provider,
+        interaction_mode=interaction_mode,
+        resumed=resume,
+    )
 
     if skip_precondition_check and task.depends_on and not task.same_branch:
         write_log_entry(
@@ -2901,17 +2953,24 @@ def _run_inner(
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
-    fix_default_branch: str | None = None
     fix_commits_ahead_before_run: int | None = None
+    fix_default_branch: str | None = None
     if task.task_type == "fix":
+        fix_default_branch = worktree_git.default_branch()
         try:
-            fix_default_branch = worktree_git.default_branch()
             fix_commits_ahead_before_run = worktree_git.count_commits_ahead(branch_name, fix_default_branch)
-        except GitError as exc:
-            print(f"Warning: Could not read fix commit baseline before run: {exc}")
+        except GitError:
+            fix_commits_ahead_before_run = None
 
     try:
-        result = provider.run(task_config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id, on_step_count=_on_step_count)
+        provider_run_kwargs: dict[str, Any] = {
+            "resume_session_id": task.session_id if resume else None,
+            "on_session_id": _on_session_id,
+            "on_step_count": _on_step_count,
+        }
+        if interaction_mode == "interactive":
+            provider_run_kwargs["interactive"] = True
+        result = provider.run(task_config, prompt, log_file, worktree_path, **provider_run_kwargs)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
@@ -3014,6 +3073,8 @@ def _run_non_code_task(
     git: Git | None = None,
     resume: bool = False,
     open_after: bool = False,
+    invocation: RunInvocationContext | None = None,
+    interaction_mode: str = "observe_only",
 ) -> int:
     """Run a non-code task (explore, plan, review, internal) in a worktree (no branch creation).
 
@@ -3029,17 +3090,26 @@ def _run_non_code_task(
     if resume and task.session_id:
         console.print(f"Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
 
-    # Setup logging
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_path / f"{task.slug}.log"
-    # Persist log_file early so it's available if the process is killed before completion
-    task.log_file = str(log_file.relative_to(config.project_dir))
-    store.update(task)
+    # Setup logging using the canonical task log path selected during preflight.
+    if task.log_file:
+        log_file = config.project_dir / Path(task.log_file)
+    else:
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        log_file = config.log_path / f"{task.slug}.log"
+        task.log_file = str(log_file.relative_to(config.project_dir))
+        store.update(task)
 
     # Write orchestration pre-run entries
     write_worker_start_event(log_file, resumed=resume)
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"})
     write_log_entry(log_file, {"type": "gza", "subtype": "info", "message": f"Provider: {provider.name}, Model: {config.model or 'default'}"})
+    write_execution_provenance_event(
+        log_file,
+        invocation=invocation or _resolve_default_invocation_context(),
+        provider=provider,
+        interaction_mode=interaction_mode,
+        resumed=resume,
+    )
 
     # Setup report file based on task type
     report_path, _ = get_task_output_paths(task, config.project_dir)
@@ -3143,7 +3213,14 @@ def _run_non_code_task(
             host_git_file.rename(hidden_git_file)
 
         try:
-            result = provider.run(config, prompt, log_file, worktree_path, resume_session_id=task.session_id if resume else None, on_session_id=_on_session_id_non_code, on_step_count=_on_step_count_non_code)
+            provider_run_kwargs: dict[str, Any] = {
+                "resume_session_id": task.session_id if resume else None,
+                "on_session_id": _on_session_id_non_code,
+                "on_step_count": _on_step_count_non_code,
+            }
+            if interaction_mode == "interactive":
+                provider_run_kwargs["interactive"] = True
+            result = provider.run(config, prompt, log_file, worktree_path, **provider_run_kwargs)
         except KeyboardInterrupt:
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason="INTERRUPTED")
             console.print("\nInterrupted")

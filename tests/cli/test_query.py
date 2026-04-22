@@ -1359,6 +1359,27 @@ class TestShowCommand:
         assert "A detailed task prompt" in result.stdout
         assert "Status: pending" in result.stdout
 
+    def test_show_output_reads_legacy_fix_summary_fallback(self, tmp_path: Path):
+        """--output should surface legacy fix summaries stored only on disk."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Fix legacy output", task_type="fix")
+        assert task.id is not None
+        task.status = "completed"
+        task.slug = "20260422-fix-show-output"
+        task.output_content = None
+        task.report_file = None
+        store.update(task)
+
+        summary_path = tmp_path / ".gza" / "summaries" / f"{task.slug}.md"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text("- Restored legacy fix output\n")
+
+        result = run_gza("show", str(task.id), "--output", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "- Restored legacy fix output" in result.stdout
+
     def test_show_displays_execution_mode_when_set(self, tmp_path: Path):
         """Show command includes execution provenance mode when present."""
         setup_config(tmp_path)

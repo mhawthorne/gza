@@ -131,6 +131,10 @@ def main() -> int:
     if task is None:
         return 1
 
+    if task.id is not None and task.execution_mode != "foreground_attach_resume":
+        task.execution_mode = "foreground_attach_resume"
+        store.set_execution_mode(task.id, task.execution_mode)
+
     log_file = _task_log_path(config, task)
     started = time.monotonic()
     if log_file is not None:
@@ -138,6 +142,7 @@ def main() -> int:
             log_file,
             {
                 "type": "gza",
+                "execution_mode": "foreground_attach_resume",
                 "subtype": "worker_lifecycle",
                 "event": "attach",
                 "message": f"Interactive session started (session: {args.session_id[:12]}...)",

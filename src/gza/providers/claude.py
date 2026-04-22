@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
@@ -155,6 +158,10 @@ class ClaudeProvider(Provider):
         return "Claude"
 
     @property
+    def supports_interactive_foreground(self) -> bool:
+        return True
+
+    @property
     def credential_setup_hint(self) -> str:
         return "Set ANTHROPIC_API_KEY in ~/.gza/.env or run 'claude login' to authenticate via OAuth"
 
@@ -263,11 +270,53 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        interactive: bool = False,
     ) -> RunResult:
         """Run Claude to execute a task."""
+        if interactive:
+            return self._run_interactive(
+                config,
+                prompt,
+                log_file,
+                work_dir,
+                resume_session_id=resume_session_id,
+                on_session_id=on_session_id,
+                on_step_count=on_step_count,
+            )
         if config.use_docker:
             return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
         return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
+
+    def _run_interactive(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
+    ) -> RunResult:
+        """Run Claude in foreground mode while preserving runner telemetry callbacks."""
+        if config.use_docker:
+            return self._run_docker_interactive(
+                config,
+                prompt,
+                log_file,
+                work_dir,
+                resume_session_id,
+                on_session_id,
+                on_step_count,
+            )
+        return self._run_direct_interactive(
+            config,
+            prompt,
+            log_file,
+            work_dir,
+            resume_session_id,
+            on_session_id,
+            on_step_count,
+        )
 
     @staticmethod
     def _build_claude_args(config: Config, resume_session_id: str | None = None) -> list[str]:
@@ -284,6 +333,88 @@ class ClaudeProvider(Provider):
         args.extend(["--max-turns", str(config.max_steps)])
 
         return args
+
+    @staticmethod
+    def _build_claude_interactive_args(
+        config: Config,
+        resume_session_id: str | None = None,
+    ) -> list[str]:
+        """Build args for true interactive Claude foreground sessions."""
+        args: list[str] = []
+
+        if resume_session_id:
+            args.extend(["--resume", resume_session_id])
+
+        if config.model:
+            args.extend(["--model", config.model])
+
+        args.extend(config.claude.args)
+        args.extend(["--max-turns", str(config.max_steps)])
+
+        return args
+
+    def _run_docker_interactive(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
+    ) -> RunResult:
+        """Run Claude in foreground interactive mode in Docker."""
+        if config.claude.fetch_auth_token_from_keychain:
+            sync_keychain_credentials()
+        docker_config = _get_docker_config(f"{config.docker_image}-claude")
+
+        if not ensure_docker_image(docker_config, config.project_dir):
+            print("Error: Failed to build Docker image")
+            return RunResult(exit_code=1)
+
+        cmd = build_docker_cmd(
+            docker_config,
+            work_dir,
+            config.timeout_minutes,
+            config.docker_volumes,
+            config.docker_setup_command,
+            interactive=True,
+        )
+        cmd.append("claude")
+        cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
+        return self._run_interactive_command(
+            cmd,
+            log_file,
+            timeout_minutes=config.timeout_minutes,
+            on_session_id=on_session_id,
+            on_step_count=on_step_count,
+            stdin_input=prompt,
+            resume_session_id=resume_session_id,
+        )
+
+    def _run_direct_interactive(
+        self,
+        config: Config,
+        prompt: str,
+        log_file: Path,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
+    ) -> RunResult:
+        """Run Claude in foreground interactive mode on host."""
+        cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
+        cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
+        return self._run_interactive_command(
+            cmd,
+            log_file,
+            cwd=work_dir,
+            timeout_minutes=config.timeout_minutes,
+            on_session_id=on_session_id,
+            on_step_count=on_step_count,
+            stdin_input=prompt,
+            resume_session_id=resume_session_id,
+        )
 
     def _run_docker(
         self,
@@ -401,6 +532,243 @@ class ClaudeProvider(Provider):
             }) + "\n")
 
         return RunResult(exit_code=result.returncode)
+
+    @staticmethod
+    def _redact_interactive_launch_command(
+        cmd: list[str],
+        *,
+        prompt_seed: str | None = None,
+        resume_session_id: str | None = None,
+    ) -> list[str]:
+        """Return a log-safe command view for interactive launch events."""
+        if not prompt_seed or resume_session_id:
+            return cmd
+        redacted = cmd.copy()
+        for idx, arg in enumerate(redacted):
+            if arg == prompt_seed:
+                redacted[idx] = "<prompt_redacted>"
+                break
+        return redacted
+
+    def _run_interactive_command(
+        self,
+        cmd: list[str],
+        log_file: Path,
+        *,
+        cwd: Path | None = None,
+        timeout_minutes: int,
+        on_session_id: Callable[[str], None] | None = None,
+        on_step_count: Callable[[int], None] | None = None,
+        stdin_input: str | None = None,
+        resume_session_id: str | None = None,
+    ) -> RunResult:
+        """Run an interactive Claude command in the foreground terminal."""
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        launch_cmd = self._redact_interactive_launch_command(
+            cmd,
+            prompt_seed=stdin_input,
+            resume_session_id=resume_session_id,
+        )
+        with open(log_file, "a") as f:
+            f.write(json.dumps({
+                "type": "gza",
+                "subtype": "interactive_launch",
+                "command": launch_cmd,
+            }) + "\n")
+
+        start_time = time.time()
+        session_id: str | None = resume_session_id
+        if resume_session_id and on_session_id:
+            on_session_id(resume_session_id)
+        seen_message_ids: set[str] = set()
+        computed_steps = 0
+        recovered_result_text: str | None = None
+        transcript_lines: list[str] = []
+
+        def _process_interactive_line(line: str) -> None:
+            nonlocal session_id, computed_steps, recovered_result_text
+            stripped = line.strip()
+            if not stripped:
+                return
+            transcript_lines.append(stripped)
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(event, dict):
+                return
+
+            event_type = event.get("type")
+            if event_type == "system" and event.get("subtype") == "init":
+                init_session_id = event.get("session_id")
+                if isinstance(init_session_id, str) and init_session_id and not session_id:
+                    session_id = init_session_id
+                    if on_session_id:
+                        on_session_id(session_id)
+            elif event_type == "assistant":
+                msg = event.get("message")
+                if isinstance(msg, dict):
+                    msg_id = msg.get("id")
+                    if isinstance(msg_id, str) and msg_id and msg_id not in seen_message_ids:
+                        seen_message_ids.add(msg_id)
+                        computed_steps = len(seen_message_ids)
+                        if on_step_count:
+                            on_step_count(computed_steps)
+            elif event_type == "result":
+                result_session_id = event.get("session_id")
+                if isinstance(result_session_id, str) and result_session_id and not session_id:
+                    session_id = result_session_id
+                    if on_session_id:
+                        on_session_id(session_id)
+                result_text = event.get("result")
+                if isinstance(result_text, str) and result_text.strip():
+                    recovered_result_text = result_text
+
+        process: subprocess.Popen[bytes] | None = None
+        master_fd: int | None = None
+        slave_fd: int | None = None
+        stdin_fd: int | None = None
+        line_buffer = ""
+        pty_eof = False
+        try:
+            master_fd, slave_fd = pty.openpty()
+            process = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=False,
+                bufsize=0,
+                env=os.environ.copy(),
+            )
+            os.close(slave_fd)
+            slave_fd = None
+
+            # Seed the initial task prompt via PTY stdin so it is never exposed in argv.
+            # For true interactive mode, send only a newline-terminated prompt and
+            # keep stdin connected for the rest of the live session.
+            if stdin_input:
+                seeded_prompt = stdin_input
+                if not seeded_prompt.endswith("\n"):
+                    seeded_prompt += "\n"
+                try:
+                    os.write(master_fd, seeded_prompt.encode("utf-8", errors="replace"))
+                except OSError:
+                    error_message = "Failed to seed interactive stdin prompt; aborting interactive run."
+                    logger.error(error_message, exc_info=True)
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps({
+                                "type": "gza",
+                                "subtype": "outcome",
+                                "message": error_message,
+                                "exit_code": 1,
+                                "failure_reason": "UNKNOWN",
+                            }) + "\n"
+                        )
+                        f.flush()
+                    sys.stderr.write(f"{error_message}\n")
+                    sys.stderr.flush()
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                    return RunResult(
+                        exit_code=1,
+                        duration_seconds=round(time.time() - start_time, 1),
+                        session_id=session_id,
+                        num_steps_computed=computed_steps or None,
+                        error_type="startup_failed",
+                    )
+
+            try:
+                maybe_stdin_fd = sys.stdin.fileno()
+            except (AttributeError, io.UnsupportedOperation, ValueError):
+                maybe_stdin_fd = None
+            if isinstance(maybe_stdin_fd, int) and os.isatty(maybe_stdin_fd):
+                stdin_fd = maybe_stdin_fd
+
+            with open(log_file, "a", encoding="utf-8") as f:
+                while True:
+                    read_fds = [master_fd]
+                    if stdin_fd is not None:
+                        read_fds.append(stdin_fd)
+                    ready, _, _ = select.select(read_fds, [], [], 0.1)
+
+                    if master_fd in ready:
+                        try:
+                            chunk = os.read(master_fd, 4096)
+                        except OSError:
+                            chunk = b""
+                        if not chunk:
+                            pty_eof = True
+                        else:
+                            text = chunk.decode("utf-8", errors="replace")
+                            f.write(text)
+                            f.flush()
+                            sys.stdout.write(text)
+                            sys.stdout.flush()
+                            line_buffer += text
+                            while "\n" in line_buffer:
+                                line, line_buffer = line_buffer.split("\n", 1)
+                                _process_interactive_line(line)
+
+                    if stdin_fd is not None and stdin_fd in ready:
+                        try:
+                            user_input = os.read(stdin_fd, 1024)
+                        except OSError:
+                            stdin_fd = None
+                        else:
+                            if user_input:
+                                try:
+                                    os.write(master_fd, user_input)
+                                except OSError:
+                                    pty_eof = True
+
+                    if process.poll() is not None and pty_eof:
+                        break
+
+                process.wait()
+                if line_buffer.strip():
+                    _process_interactive_line(line_buffer.strip())
+                if not recovered_result_text:
+                    transcript_text = "\n".join(transcript_lines).strip()
+                    if transcript_text:
+                        recovered_result_text = transcript_text
+                if recovered_result_text:
+                    f.write(
+                        json.dumps({
+                            "type": "result",
+                            "subtype": "interactive_capture",
+                            "result": recovered_result_text,
+                        }) + "\n"
+                    )
+        except KeyboardInterrupt:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            raise
+        finally:
+            if slave_fd is not None:
+                os.close(slave_fd)
+            if master_fd is not None:
+                os.close(master_fd)
+
+        duration_seconds = round(time.time() - start_time, 1)
+        return RunResult(
+            exit_code=process.returncode if process is not None else 1,
+            duration_seconds=duration_seconds,
+            session_id=session_id,
+            num_steps_computed=computed_steps or None,
+        )
 
     def _run_with_output_parsing(
         self,

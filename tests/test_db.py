@@ -1,6 +1,7 @@
 """Tests for database operations and task chaining."""
 
 import subprocess
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 from gza.db import (
     SCHEMA_VERSION,
     ManualMigrationRequired,
+    SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
     Task,
@@ -270,6 +272,41 @@ class TestTaskChaining:
         assert groups["group-a"]["completed"] == 1
         assert groups["group-a"]["pending"] == 1
         assert groups["group-b"]["pending"] == 1
+
+
+class TestConnectionLifecycle:
+    """Targeted regressions for connection cleanup in context-managed store paths."""
+
+    def test_connect_context_closes_connection(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        conn = store._connect()
+        with conn as active:
+            active.execute("SELECT 1")
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+    def test_repeated_store_operations_close_each_connection(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        seen_connections: list[sqlite3.Connection] = []
+        original_connect = store._connect
+
+        def _tracking_connect() -> sqlite3.Connection:
+            conn = original_connect()
+            seen_connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(store, "_connect", _tracking_connect)
+
+        for i in range(25):
+            store.add(f"Task {i}")
+
+        for conn in seen_connections:
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
 
     def test_get_by_group(self, tmp_path: Path):
         """Test get_by_group returns tasks in correct order."""
@@ -1227,6 +1264,21 @@ class TestGetImproveTasksByRoot:
         assert [t.id for t in results] == [improve_a.id]
 
 
+class TestGetFixTasksByRoot:
+    """Tests for get_fix_tasks_by_root transitive traversal."""
+
+    def test_direct_and_chained_fixes_are_returned(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Impl", task_type="implement")
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        improve = store.add("Improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        fix1 = store.add("Fix 1", task_type="fix", based_on=improve.id, depends_on=review.id)
+        fix2 = store.add("Fix 2", task_type="fix", based_on=fix1.id, depends_on=review.id)
+
+        results = store.get_fix_tasks_by_root(impl.id)
+        assert {task.id for task in results} == {fix1.id, fix2.id}
+
+
 class TestTaskComments:
     """Tests for task comment storage and resolution helpers."""
 
@@ -1274,6 +1326,13 @@ class TestTaskComments:
 
         with pytest.raises(ValueError, match="cannot be empty"):
             store.add_comment(task.id, "   ")
+
+    def test_add_comment_rejects_unknown_task_id(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        with pytest.raises(KeyError, match="Task gza-9999 not found"):
+            store.add_comment("gza-9999", "orphan?")
 
     def test_get_and_resolve_comments_can_be_scoped_by_created_at(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -4007,6 +4066,68 @@ def _make_v29_db_without_urgent_bumped_at(db_path: Path) -> None:
     conn.close()
 
 
+def _drop_tasks_column(db_path: Path, column_name: str) -> None:
+    """Rebuild the tasks table without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    _quote = lambda c: f'"{c}"' if c in ("group",) else c
+    cols_str = ", ".join(_quote(c) for c in kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(tasks_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        quoted_name = f'"{name}"' if name in ("group",) else name
+        parts = [quoted_name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
+    conn.execute("DROP TABLE tasks_old")
+    conn.commit()
+    conn.close()
+
+
+def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
+    """Rebuild task_comments table without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE task_comments RENAME TO task_comments_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(task_comments_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(task_comments_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE task_comments ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO task_comments ({cols_str}) SELECT {cols_str} FROM task_comments_old")
+    conn.execute("DROP TABLE task_comments_old")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at)")
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -4513,6 +4634,120 @@ class TestMigrationUtilityFunctions:
         assert version == SCHEMA_VERSION
         assert "task_comments" in tables
 
+    def test_open_current_v32_db_repairs_missing_execution_mode_column(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing tasks.execution_mode."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "execution_mode")
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "execution_mode" in columns
+
+    def test_open_current_v32_db_repairs_missing_urgent_bumped_at_column(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing tasks.urgent_bumped_at."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "urgent_bumped_at")
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "urgent_bumped_at" in columns
+
+    def test_open_current_v32_db_repairs_missing_task_comments_source_column(self, tmp_path: Path) -> None:
+        """Opening an already-v32 DB should repair missing task_comments.source."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before task_comments source damage")
+        store.add_comment(task.id, "Existing comment before repair", source="direct")
+
+        _drop_task_comments_column(db_path, "source")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        repaired_store.add_comment(task.id, "Comment after repair", source="github")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_comments)")}
+        conn.close()
+
+        assert "source" in columns
+        comments = repaired_store.get_comments(task.id)
+        assert len(comments) == 2
+        assert comments[0].source == "direct"
+        assert comments[1].source == "github"
+
+    def test_open_current_v32_db_missing_execution_mode_column_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v32 damage should fail early with SchemaIntegrityError for execution_mode."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "execution_mode")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.execution_mode",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_open_current_v32_db_missing_urgent_bumped_at_column_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v32 damage should fail early with SchemaIntegrityError for urgent_bumped_at."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "urgent_bumped_at")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.urgent_bumped_at",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_open_current_v32_db_missing_task_comments_source_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v32 damage should fail early with SchemaIntegrityError for task_comments.source."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before read-only source damage")
+        store.add_comment(task.id, "Existing comment", source="direct")
+        _drop_task_comments_column(db_path, "source")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column task_comments\.source",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,
         tmp_path: Path,
@@ -4542,6 +4777,63 @@ class TestMigrationUtilityFunctions:
 
         assert version == 29
         assert "urgent_bumped_at" not in columns
+
+    def test_auto_migration_v32_validation_requires_task_comments_source(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """v32 auto-migration must fail if task_comments.source is missing and keep schema_version at v31."""
+        import sqlite3
+
+        import gza.db as db_module
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (31)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        broken_migrations = [
+            (
+                version,
+                """
+                CREATE TABLE IF NOT EXISTS task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    author TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                """ if version == 32 else sql,
+            )
+            for version, sql in db_module._MIGRATIONS
+        ]
+        monkeypatch.setattr(db_module, "_MIGRATIONS", broken_migrations)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"Auto-migration to v32 incomplete: missing required column task_comments\.source",
+        ):
+            SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        conn.close()
+        assert version == 31
 
     def test_run_v27_migration_drops_cycle_schema_and_preserves_task_data(self, tmp_path: Path) -> None:
         import sqlite3

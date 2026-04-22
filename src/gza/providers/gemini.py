@@ -200,8 +200,10 @@ class GeminiProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        interactive: bool = False,
     ) -> RunResult:
         """Run Gemini to execute a task."""
+        _ = interactive
         # Note: Gemini doesn't currently support session resumption
         if config.use_docker:
             return self._run_docker(config, prompt, log_file, work_dir, on_step_count=on_step_count)

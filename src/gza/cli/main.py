@@ -52,6 +52,7 @@ from .execution import (
     cmd_retry,
     cmd_review,
     cmd_run,
+    cmd_run_inline,
     cmd_set_status,
 )
 from .git_ops import (
@@ -184,6 +185,39 @@ def main() -> int:
         dest="create_pr",
         help="Create/reuse a GitHub PR after successful code-task completion (when branch has commits)",
     )
+
+    # run-inline command
+    run_inline_parser = subparsers.add_parser(
+        "run-inline",
+        help="Run a specific task in the foreground through runner-managed execution",
+    )
+    run_inline_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID to run inline",
+    )
+    run_inline_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the stored provider session instead of starting fresh",
+    )
+    run_inline_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run provider directly instead of in Docker",
+    )
+    run_inline_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
+    run_inline_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when starting the inline run",
+    )
+    add_common_args(run_inline_parser)
 
     # attach command
     attach_parser = subparsers.add_parser("attach", help="Attach to a running task (interactive for Claude, observe-only for Codex/Gemini)")
@@ -1735,7 +1769,7 @@ def main() -> int:
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
         "work", "ps", "status", "kill", "advance", "retry",
-        "mark-completed", "set-status", "history",
+        "mark-completed", "run-inline", "set-status", "history",
     }
 
     try:
@@ -1758,6 +1792,8 @@ def main() -> int:
             return cmd_attach(args)
         elif args.command == "work":
             return cmd_run(args)
+        elif args.command == "run-inline":
+            return cmd_run_inline(args)
         elif args.command == "next":
             return cmd_next(args)
         elif args.command == "history":

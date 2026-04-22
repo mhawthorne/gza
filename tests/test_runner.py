@@ -14,17 +14,15 @@ import pytest
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
-from gza.github import GitHubError
 from gza.providers import ClaudeProvider, RunResult
-from gza.review_tasks import create_or_reuse_followup_task
+from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
-    open_task_startup_log,
-    rename_startup_log_to_slug,
+    RunInvocationContext,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
@@ -36,8 +34,8 @@ from gza.runner import (
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
     _find_task_of_type_in_chain,
+    _get_task_output,
     _resolve_code_task_branch_name,
-    _snapshot_task_db_to_worktree,
     _restore_wip_changes,
     _run_non_code_task,
     _run_result_to_stats,
@@ -45,12 +43,16 @@ from gza.runner import (
     _select_worktree_base_ref,
     _setup_code_task_worktree,
     _slug_exists,
+    _snapshot_task_db_to_worktree,
     _squash_wip_commits,
     backup_database,
     build_prompt,
     generate_slug,
     get_task_output_paths,
+    open_task_startup_log,
+    rename_startup_log_to_slug,
     run,
+    write_execution_provenance_event,
     write_log_entry,
     write_worker_start_event,
 )
@@ -99,6 +101,26 @@ class TestGetTaskOutputPaths:
         report_path, summary_path = get_task_output_paths(task, tmp_path)
         assert report_path is None
         assert summary_path is None
+
+
+class TestGetTaskOutput:
+    """Tests for _get_task_output fallback semantics."""
+
+    def test_fix_task_reads_legacy_summary_fallback(self, tmp_path: Path):
+        """Completed fix tasks should still read on-disk summary when DB fields are absent."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add(prompt="Fix regression", task_type="fix")
+        task.slug = "20260422-fix-fallback"
+        task.status = "completed"
+        task.output_content = None
+        task.report_file = None
+        store.update(task)
+
+        summary_path = tmp_path / SUMMARY_DIR / f"{task.slug}.md"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text("- Fixed output fallback\n")
+
+        assert _get_task_output(task, tmp_path) == "- Fixed output fallback\n"
 
 
 class TestBuildPrompt:
@@ -260,6 +282,62 @@ class TestWorkerLifecycleLogging:
         assert event["event"] == "start"
         assert event["worker_id"] == "w-20260411-1"
         assert "resumed" in event["message"]
+
+    def test_write_execution_provenance_event_logs_structured_entry(self, tmp_path: Path):
+        """Execution provenance should include command/mode/interaction metadata."""
+        log_file = tmp_path / "exec.log"
+        provider = Mock()
+        provider.name = "Claude"
+        context = RunInvocationContext(
+            command="run-inline",
+            execution_mode="foreground_inline",
+            interaction_mode="auto",
+        )
+
+        write_execution_provenance_event(
+            log_file,
+            invocation=context,
+            provider=provider,
+            interaction_mode="interactive",
+            resumed=True,
+        )
+
+        import json
+
+        event = json.loads(log_file.read_text().strip())
+        assert event["type"] == "gza"
+        assert event["subtype"] == "execution"
+        assert event["command"] == "run-inline"
+        assert event["execution_mode"] == "foreground_inline"
+        assert event["interaction_mode"] == "interactive"
+        assert event["provider"] == "claude"
+        assert event["worker_mode"] is False
+        assert event["resumed"] is True
+
+    def test_write_execution_provenance_event_marks_foreground_work_as_worker_mode(self, tmp_path: Path):
+        """Foreground gza work runs should be marked as worker mode in execution provenance."""
+        log_file = tmp_path / "exec-work.log"
+        provider = Mock()
+        provider.name = "Codex"
+        context = RunInvocationContext(
+            command="work",
+            execution_mode="foreground_worker",
+            interaction_mode="observe_only",
+        )
+
+        write_execution_provenance_event(
+            log_file,
+            invocation=context,
+            provider=provider,
+            interaction_mode="observe_only",
+            resumed=False,
+        )
+
+        import json
+
+        event = json.loads(log_file.read_text().strip())
+        assert event["execution_mode"] == "worker_foreground"
+        assert event["worker_mode"] is True
 
     def test_build_prompt_skips_learnings_when_skip_learnings_true(self, tmp_path: Path):
         """Test that build_prompt skips learnings reference when task.skip_learnings is True."""
@@ -916,6 +994,35 @@ class TestReviewContextFromChain:
         assert "Please harden input validation." in context
         assert "nit: simplify helper" in context
 
+    def test_improve_context_excludes_comments_added_after_improve_creation(self, tmp_path: Path):
+        """Improve context should include only unresolved comments present at improve creation time."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Comment in improve snapshot", source="direct")
+        first_comment = store.get_comments(impl_task.id, unresolved_only=True)[0]
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+        )
+        improve_task.created_at = first_comment.created_at
+        store.update(improve_task)
+
+        store.add_comment(impl_task.id, "Comment added after improve creation", source="direct")
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Comments:" in context
+        assert "Comment in improve snapshot" in context
+        assert "Comment added after improve creation" not in context
+
     def test_improve_retry_context_reads_comments_from_implementation_ancestor(self, tmp_path: Path):
         """Retry/resume improves should still include unresolved comments from the root implementation."""
         db_path = tmp_path / "test.db"
@@ -1101,6 +1208,71 @@ class TestReviewContextFromChain:
         assert f"Latest failed improve/resume attempt: {improve.id}" in context
         assert "line1" in context
         assert "## Original request:" in context
+        assert "## Original plan:" not in context
+
+    def test_fix_context_includes_original_plan_when_root_impl_is_plan_backed(self, tmp_path: Path):
+        """Fix context must include original plan (not request) when the implementation has a plan ancestor."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Create rollout plan", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Add retries.\n2. Add bounded timeout."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement retry behavior",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review retries", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        fix_task = store.add(
+            prompt="Rescue retries implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Original plan:" in context
+        assert "Add bounded timeout." in context
+        assert "## Original request:" not in context
+
+    def test_fix_context_falls_back_to_original_request_when_no_plan_exists(self, tmp_path: Path):
+        """Fix context should include the root implementation request when no plan ancestor exists."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement parser rescue path", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review parser rescue", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        fix_task = store.add(
+            prompt="Rescue parser implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Original request:" in context
+        assert "Implement parser rescue path" in context
+        assert "## Original plan:" not in context
 
     def test_fix_context_omits_repeated_blockers_when_not_repeated(self, tmp_path: Path):
         """Fix context omits repeated-blocker section when recent reviews do not repeat blockers."""
@@ -1143,6 +1315,98 @@ class TestReviewContextFromChain:
 
         assert "## Fix Rescue Context" in context
         assert "## Repeated Blockers" not in context
+
+    def test_fix_context_repeated_blockers_read_from_review_report_file(self, tmp_path: Path):
+        """Repeated blocker extraction should read review content from report files when DB output is empty."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement report fallback", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        report_body = (
+            "## Blockers\n\n"
+            "### B1 Missing timeout\n"
+            "Evidence: hangs under retry storms.\n"
+            "Impact: requests can block forever.\n"
+            "Required fix: add bounded timeout and cancellation propagation.\n"
+            "Required tests: timeout + cancellation regression.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        (reports_dir / "review-1.md").write_text(report_body)
+        (reports_dir / "review-2.md").write_text(report_body)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.report_file = "reports/review-1.md"
+        review1.output_content = None
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.report_file = "reports/review-2.md"
+        review2.output_content = None
+        store.update(review2)
+
+        fix_task = store.add(
+            prompt="Rescue report-only review context",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Repeated Blockers" in context
+        assert "add bounded timeout and cancellation propagation" in context
+
+    def test_fix_context_repeated_blockers_supports_canonical_blocker_body_without_required_fix_label(self, tmp_path: Path):
+        """Repeated blocker extraction should not require an exact `Required fix:` line."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement canonical blocker extraction", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        blocker_text = "Add bounded timeout and cancellation propagation."
+        review_body = (
+            "## Blockers\n\n"
+            "### B1 Missing timeout\n"
+            "Evidence: hangs under retry storms.\n"
+            "Impact: requests can block forever.\n"
+            f"Action: {blocker_text}\n"
+            "Required tests: timeout + cancellation regression.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = review_body
+        store.update(review1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+        review2.status = "completed"
+        review2.output_content = review_body
+        store.update(review2)
+
+        fix_task = store.add(
+            prompt="Rescue canonical blocker body",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review2.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Repeated Blockers" in context
+        assert blocker_text in context
 
     def test_fix_context_distinguishes_failed_improve_and_implement_retry_attempts(self, tmp_path: Path):
         """Fix context labels failed improve and failed implement retry attempts accurately."""
@@ -3420,6 +3684,77 @@ class TestRunStepPersistenceIntegration:
         assert 1 in intermediate_counts
         assert 2 in intermediate_counts
 
+    def test_non_code_interrupt_persists_session_and_step_callbacks_before_failure(self, tmp_path: Path):
+        """Interrupted non-code runs should keep callback-persisted session and step state."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260422-plan-interrupt"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.model = ""
+        config.chat_text_display_length = 80
+        config.claude = Mock(args=[])
+        config.tmux = Mock(session_name=None)
+
+        def _interrupting_run(
+            _config,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del resume_session_id, interactive
+            assert on_session_id is not None
+            assert on_step_count is not None
+            on_session_id("sess-interrupted-inline")
+            on_step_count(3)
+            raise KeyboardInterrupt
+
+        mock_provider = Mock()
+        mock_provider.name = "Claude"
+        mock_provider.run.side_effect = _interrupting_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=1)
+
+        with (
+            patch("gza.runner.console"),
+            patch("gza.runner._snapshot_task_db_to_worktree"),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._create_local_dep_symlinks"),
+        ):
+            exit_code = _run_non_code_task(
+                task,
+                config,
+                store,
+                mock_provider,
+                mock_git,
+                resume=False,
+                interaction_mode="interactive",
+            )
+
+        assert exit_code == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INTERRUPTED"
+        assert refreshed.session_id == "sess-interrupted-inline"
+        assert refreshed.num_steps_computed == 3
+
 
 class TestResumeVerificationPrompt:
     """Tests for resume verification prompt injection."""
@@ -3911,6 +4246,71 @@ class TestNonCodeReportArtifactContract:
         host_report = tmp_path / ".gza" / "reviews" / f"{review_task.slug}.md"
         assert host_report.exists()
         assert host_report.read_text() == review_text
+
+    def test_missing_report_artifact_recovered_from_interactive_plaintext_log(self, tmp_path: Path):
+        """Interactive plaintext output should be captured as result text for artifact recovery."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review feature interactive", task_type="review")
+        review_task.slug = "20260213-review-feature-interactive"
+        store.update(review_task)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="claude",
+            use_docker=False,
+            timeout_minutes=10,
+            max_steps=20,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        provider = ClaudeProvider()
+
+        mock_process = MagicMock()
+        mock_process.wait.return_value = None
+        mock_process.returncode = 0
+        mock_process.poll.side_effect = [None, 0]
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+        mock_git.worktree_remove = Mock()
+
+        with (
+            patch("gza.providers.claude.pty.openpty", return_value=(40, 41)),
+            patch("gza.providers.claude.select.select", side_effect=[([40], [], []), ([40], [], [])]),
+            patch(
+                "gza.providers.claude.os.read",
+                side_effect=[b"# Review\n\nVerdict: APPROVED\n", b""],
+            ),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.isatty", return_value=False),
+            patch("gza.providers.claude.os.write"),
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
+            patch("gza.runner.post_review_to_pr"),
+            patch("gza.runner.console"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            exit_code = _run_non_code_task(
+                review_task,
+                config,
+                store,
+                provider,
+                mock_git,
+                resume=False,
+                interaction_mode="interactive",
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.output_content is not None
+        assert "# Review" in refreshed.output_content
+        assert "Verdict: APPROVED" in refreshed.output_content
 
     def test_missing_report_artifact_no_result_in_log_still_fails(self, tmp_path: Path):
         """If the expected report is missing and the log has no 'result' entry, the task still fails."""
@@ -4658,6 +5058,484 @@ class TestTaskClaimSafety:
         assert second_refreshed.status == "failed"
         assert second_refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
 
+    def test_invocation_context_sets_foreground_inline_execution_mode(self, tmp_path: Path):
+        """run() should persist foreground_inline mode when inline invocation is requested."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline run task", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = False
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.execution_mode == "foreground_inline"
+
+    @pytest.mark.parametrize(
+        ("failure_stage", "invocation"),
+        [
+            ("check", None),
+            ("verify", None),
+            (
+                "check",
+                RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            ),
+            (
+                "verify",
+                RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            ),
+        ],
+    )
+    def test_preflight_failures_mark_task_failed_with_provider_unavailable(
+        self,
+        tmp_path: Path,
+        failure_stage: str,
+        invocation: RunInvocationContext | None,
+    ):
+        """Credential preflight failures must persist failed state + provenance/outcome logs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt=f"Task preflight {failure_stage}", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = failure_stage != "check"
+            mock_provider.verify_credentials.return_value = failure_stage != "verify"
+            mock_provider.credential_setup_hint = "set creds"
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, task_id=task.id, invocation=invocation)
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+        assert refreshed.log_file is not None
+        log_content = (tmp_path / refreshed.log_file).read_text()
+        assert "PROVIDER_UNAVAILABLE" in log_content
+        assert '"subtype": "execution"' in log_content
+        assert "Preflight failed" in log_content
+
+        import json
+
+        execution_events = [
+            json.loads(line)
+            for line in log_content.splitlines()
+            if line.strip() and '"subtype": "execution"' in line
+        ]
+        assert execution_events
+        execution_event = execution_events[-1]
+        expected_mode = refreshed.execution_mode
+        assert expected_mode is not None
+        assert execution_event["execution_mode"] == expected_mode
+        if expected_mode in {"worker_background", "worker_foreground"}:
+            assert execution_event["worker_mode"] is True
+        else:
+            assert execution_event["worker_mode"] is False
+
+    @pytest.mark.parametrize(
+        ("command", "resume"),
+        [
+            ("implement", False),
+            ("resume", True),
+        ],
+    )
+    def test_foreground_worker_commands_log_canonical_execution_mode(
+        self,
+        tmp_path: Path,
+        command: str,
+        resume: bool,
+    ):
+        """Foreground worker command provenance should match the persisted task execution mode."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt=f"{command} provenance parity", task_type="implement")
+        if resume:
+            task.status = "failed"
+            task.session_id = "resume-session-123"
+            store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = False
+            mock_provider.credential_setup_hint = "set creds"
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                resume=resume,
+                invocation=RunInvocationContext(
+                    command=command,
+                    execution_mode="foreground_worker",
+                    interaction_mode="observe_only",
+                ),
+            )
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.execution_mode == "worker_foreground"
+        assert refreshed.log_file is not None
+
+        import json
+
+        log_content = (tmp_path / refreshed.log_file).read_text()
+        execution_events = [
+            json.loads(line)
+            for line in log_content.splitlines()
+            if line.strip() and '"subtype": "execution"' in line
+        ]
+        assert execution_events
+        execution_event = execution_events[-1]
+        assert execution_event["command"] == command
+        assert execution_event["execution_mode"] == refreshed.execution_mode
+        assert execution_event["worker_mode"] is True
+
+    def test_run_inline_requests_interactive_for_capable_provider(
+        self,
+        tmp_path: Path,
+    ):
+        """Inline invocation should request provider interactive mode when supported."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline mode interactive", task_type="implement")
+        task.status = "failed"
+        task.session_id = "sess-123"
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                resume=True,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="interactive",
+                ),
+            )
+
+        assert result == 0
+        assert mock_run_inner.call_count == 1
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "interactive"
+
+    def test_run_inline_prints_interactive_message_only_when_interactive_mode_used(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """run-inline should print interactive foreground messaging only for interactive-capable providers."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline message semantics", task_type="implement")
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Codex"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 0
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "observe_only"
+        output = capsys.readouterr().out
+        assert "Foreground inline execution: observe-only for provider 'codex'" in output
+        assert "interactive mode" not in output
+
+    def test_run_inline_prints_interactive_message_when_interactive_mode_is_used(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """run-inline should announce interactive mode when runner will launch provider interactively."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Inline message interactive", task_type="implement")
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 0
+        assert mock_run_inner.call_args.kwargs["interaction_mode"] == "interactive"
+        output = capsys.readouterr().out
+        assert "Foreground inline execution: interactive mode for provider 'claude'" in output
+
+    def test_run_inline_interactive_interrupt_keeps_session_for_resume(self, tmp_path: Path):
+        """Inline interactive runs should persist callback session_id on interrupt."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Interruptible inline task", task_type="plan")
+        task.slug = "20260422-inline-interrupt-plan"
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def _interrupting_provider_run(
+            _cfg,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del resume_session_id, on_step_count
+            assert interactive is True
+            assert on_session_id is not None
+            on_session_id("sess-inline-1")
+            raise KeyboardInterrupt
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run.side_effect = _interrupting_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.worktree_remove = Mock()
+            mock_git.branch_exists.return_value = False
+            mock_git_class.return_value = mock_git
+
+            result = run(
+                config,
+                task_id=task.id,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INTERRUPTED"
+        assert refreshed.session_id == "sess-inline-1"
+
+    def test_run_inline_resume_interactive_interrupt_preserves_resume_session_id(self, tmp_path: Path):
+        """Interrupted inline --resume runs should keep resumable session state for Claude interactive mode."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Resume inline task", task_type="plan")
+        task.slug = "20260422-inline-resume-interrupt-plan"
+        task.session_id = "sess-inline-resume-1"
+        store.update(task)
+        store.mark_failed(task, log_file="logs/failed.log", stats=None)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def _interrupting_provider_run(
+            _cfg,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del on_step_count
+            assert interactive is True
+            assert resume_session_id == "sess-inline-resume-1"
+            assert on_session_id is not None
+            # Foreground interactive resume path must persist the known session id
+            # even if no stream-json events are emitted before interruption.
+            on_session_id(resume_session_id)
+            raise KeyboardInterrupt
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run.side_effect = _interrupting_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.worktree_remove = Mock()
+            mock_git.branch_exists.return_value = False
+            mock_git_class.return_value = mock_git
+
+            result = run(
+                config,
+                task_id=task.id,
+                resume=True,
+                invocation=RunInvocationContext(
+                    command="run-inline",
+                    execution_mode="foreground_inline",
+                    interaction_mode="auto",
+                ),
+            )
+
+        assert result == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INTERRUPTED"
+        assert refreshed.session_id == "sess-inline-resume-1"
+
+    def test_successful_run_keeps_preflight_and_runner_entries_in_one_log(self, tmp_path: Path):
+        """Successful run should keep preflight and provider-run entries in one canonical log."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Single canonical log", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+
+        def _verify_credentials(_cfg, log_file: Path | None = None) -> bool:
+            assert log_file is not None
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            write_log_entry(log_file, {"type": "gza", "subtype": "preflight", "message": "preflight-ok"})
+            return True
+
+        def _run_inner_success(task: Task, *_args, **kwargs) -> int:
+            assert kwargs["interaction_mode"] == "observe_only"
+            assert task.log_file is not None
+            log_path = config.project_dir / task.log_file
+            write_log_entry(log_path, {"type": "gza", "subtype": "provider", "message": "provider-run"})
+            return 0
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", side_effect=_run_inner_success),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Codex"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.side_effect = _verify_credentials
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, task_id=task.id)
+
+        assert result == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.log_file is not None
+        assert refreshed.log_file.endswith(".log")
+        assert not refreshed.log_file.endswith(".startup.log")
+        log_content = (config.project_dir / refreshed.log_file).read_text()
+        assert "preflight-ok" in log_content
+        assert "provider-run" in log_content
+
 
 class TestSameBranchLineageWalk:
     """Tests for same_branch resolution walking the based_on lineage chain."""
@@ -5382,6 +6260,92 @@ class TestExtractedRunInnerHelpers:
         assert rc == 7
         assert call_order == ["pr", "review"]
 
+    def test_complete_code_task_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
+        """Chained improve completion should clear review state on the implementation root, not the prior improve."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement root", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/root-impl"
+        impl_task.merge_status = "merged"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Old implementation comment", source="direct")
+
+        improve1 = store.add(
+            prompt="Improve once",
+            task_type="improve",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        assert improve1.id is not None
+        store.add_comment(improve1.id, "Improve comment should remain unresolved", source="direct")
+
+        improve2 = store.add(
+            prompt="Improve retry",
+            task_type="improve",
+            based_on=improve1.id,
+            same_branch=True,
+        )
+        improve2.slug = "20260420-improve-chain"
+        store.mark_in_progress(improve2)
+
+        store.add_comment(impl_task.id, "New implementation comment", source="direct")
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{improve2.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/impl.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/impl.py\n"
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{improve2.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{improve2.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                improve2,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/root-impl",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        unresolved_impl_comments = store.get_comments(impl_task.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_impl_comments] == ["New implementation comment"]
+
+        refreshed_improve1 = store.get(improve1.id)
+        assert refreshed_improve1 is not None
+        assert refreshed_improve1.review_cleared_at is None
+        unresolved_improve_comments = store.get_comments(improve1.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_improve_comments] == [
+            "Improve comment should remain unresolved"
+        ]
+
     def test_complete_code_task_fix_with_commit_delta_creates_follow_up_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -5392,7 +6356,19 @@ class TestExtractedRunInnerHelpers:
         impl_task = store.add(prompt="Implement with churn", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "feature/fix-target"
+        impl_task.merge_status = "merged"
         store.update(impl_task)
+        assert impl_task.id is not None
+
+        prior_review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
+        assert prior_review.completed_at is not None
 
         fix_task = store.add(
             prompt="Fix the churn",
@@ -5445,8 +6421,13 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         output = capsys.readouterr().out
         assert "Created follow-up review task" in output
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.review_cleared_at >= prior_review.completed_at
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
-        assert len(reviews) == 1
+        assert len(reviews) == 2
 
     def test_complete_code_task_fix_without_commit_delta_skips_follow_up_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -5458,7 +6439,18 @@ class TestExtractedRunInnerHelpers:
         impl_task = store.add(prompt="Implement with churn", task_type="implement")
         impl_task.status = "completed"
         impl_task.branch = "feature/fix-target"
+        impl_task.merge_status = "merged"
         store.update(impl_task)
+        assert impl_task.id is not None
+
+        prior_review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
 
         fix_task = store.add(
             prompt="Fix the churn",
@@ -5511,8 +6503,12 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         output = capsys.readouterr().out
         assert "Fix completed without new commits; no follow-up review was auto-created." in output
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "merged"
+        assert refreshed_impl.review_cleared_at is None
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
-        assert reviews == []
+        assert len(reviews) == 1
 
     def test_complete_code_task_fix_probe_failure_is_reported_and_skips_auto_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -5580,6 +6576,240 @@ class TestExtractedRunInnerHelpers:
         assert "Warning: Could not determine whether the fix run changed code" in output
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
         assert reviews == []
+
+    def test_complete_code_task_fix_unknown_before_baseline_skips_auto_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Unknown pre-run baseline must not be coerced to zero for follow-up review creation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with existing ahead commits", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        impl_task.merge_status = "merged"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        prior_review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
+
+        fix_task = store.add(
+            prompt="Fix baseline probe edge case",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260422-fix-unknown-baseline"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        # Post-run probe succeeds, but pre-run baseline is unknown.
+        worktree_git.count_commits_ahead.return_value = 3
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=None,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Warning: Could not determine fix commit baseline before run" in output
+        assert "Warning: Could not determine whether the fix run changed code" in output
+
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "merged"
+        assert refreshed_impl.review_cleared_at is None
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert len(reviews) == 1
+
+    def test_complete_code_task_fix_duplicate_follow_up_review_reports_existing_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Fix follow-up handoff must surface duplicate review reuse instead of silently returning."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implementation for duplicate review", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        fix_task = store.add(
+            prompt="Fix duplicate review path",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260422-fix-duplicate-followup"
+        store.mark_in_progress(fix_task)
+
+        existing_review = store.add(
+            prompt="Existing pending review",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        store.mark_in_progress(existing_review)
+
+        config = self._make_config(tmp_path)
+        log_file = tmp_path / "logs" / f"{fix_task.slug}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 3
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.create_review_task",
+                side_effect=DuplicateReviewError(existing_review),
+            ),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert f"Follow-up review already exists for implementation {impl_task.id}" in output
+        assert f"{existing_review.id} ({existing_review.status})" in output
+
+    def test_complete_code_task_fix_follow_up_review_value_error_is_reported(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Fix follow-up handoff must surface review creation errors with next-step guidance."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implementation for value error", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        fix_task = store.add(
+            prompt="Fix value error path",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260422-fix-followup-value-error"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_file = tmp_path / "logs" / f"{fix_task.slug}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        worktree_git.count_commits_ahead.return_value = 4
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.create_review_task",
+                side_effect=ValueError("implementation task is not reviewable"),
+            ),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert f"Warning: Could not auto-create follow-up review for implementation {impl_task.id}" in output
+        assert "implementation task is not reviewable" in output
+        assert f"uv run gza review {impl_task.id}" in output
 
     @pytest.mark.parametrize(
         ("failure_mode", "ensure_result"),
@@ -5780,6 +7010,70 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         unresolved = store.get_comments(parent.id, unresolved_only=True)
         assert [comment.content for comment in unresolved] == ["New comment after improve creation"]
+
+    def test_run_pr_required_retry_for_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
+        """PR-required improve retries should apply completion side effects to the implementation root."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        impl = store.add(prompt="Implement parent", task_type="implement")
+        impl.merge_status = "merged"
+        store.update(impl)
+        assert impl.id is not None
+        store.add_comment(impl.id, "Old root comment", source="direct")
+
+        improve1 = store.add(
+            prompt="Improve parent implementation",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert improve1.id is not None
+        store.add_comment(improve1.id, "Intermediate improve comment", source="direct")
+
+        improve2 = store.add(
+            prompt="Retry improve parent implementation",
+            task_type="improve",
+            based_on=improve1.id,
+            same_branch=True,
+        )
+        improve2.slug = "20260422-retry-improve-chain-pr-required"
+        improve2.status = "failed"
+        improve2.failure_reason = "PR_REQUIRED"
+        improve2.branch = "feature/retry-improve-chain-pr-required"
+        improve2.log_file = "logs/retry-improve-chain.log"
+        improve2.output_content = "summary"
+        improve2.has_commits = True
+        store.update(improve2)
+        assert improve2.id is not None
+
+        store.add_comment(impl.id, "New root comment after retry creation", source="direct")
+
+        with (
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=improve2.id, create_pr=True)
+
+        assert rc == 0
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        unresolved_impl = store.get_comments(impl.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_impl] == ["New root comment after retry creation"]
+
+        refreshed_improve1 = store.get(improve1.id)
+        assert refreshed_improve1 is not None
+        assert refreshed_improve1.review_cleared_at is None
+        unresolved_improve1 = store.get_comments(improve1.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_improve1] == ["Intermediate improve comment"]
 
     def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
         """PR retry completion for rebases should invalidate review state and force-push."""

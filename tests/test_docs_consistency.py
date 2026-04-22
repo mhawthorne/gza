@@ -107,6 +107,30 @@ def test_configuration_docs_include_comment_command_reference() -> None:
         assert snippet in config_content
 
 
+def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
+    """run-inline docs additions must not replace existing fix/comment operator docs."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    required_snippets = [
+        "### run-inline",
+        "gza run-inline <task_id> [options]",
+        "### search",
+        "gza search <term> [options]",
+        "### incomplete",
+        "gza incomplete [options]",
+        "### tv",
+        "gza tv [task_id ...] [options]",
+        "### comment",
+        "gza comment <task_id> <text> [options]",
+        "### fix",
+        "gza fix <task_id> [options]",
+        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
+    ]
+    for snippet in required_snippets:
+        assert snippet in config_content
+
+
 def test_configuration_docs_describe_comments_only_improve_path() -> None:
     """Improve docs should reflect comments-only fallback when no review exists."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
