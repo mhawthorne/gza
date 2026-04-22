@@ -378,6 +378,39 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
     if target_version == 32 and not _table_exists(conn, "task_comments"):
         raise RuntimeError("Auto-migration to v32 incomplete: missing required table task_comments")
 
+
+def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
+    """Repair required current-schema artifacts removed by external damage.
+
+    For writable databases, missing artifacts are recreated in place.
+    For read-only/damaged databases where repair cannot be applied, raise
+    SchemaIntegrityError with deterministic remediation guidance.
+    """
+    if not _table_exists(conn, "task_comments"):
+        try:
+            conn.executescript(MIGRATION_V31_TO_V32)
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing v32: "
+                "missing task_comments table; use a writable database."
+            ) from exc
+
+    required_columns: tuple[tuple[str, str, str], ...] = (
+        ("tasks", "urgent_bumped_at", "ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT"),
+        ("tasks", "execution_mode", "ALTER TABLE tasks ADD COLUMN execution_mode TEXT"),
+        ("tasks", "base_branch", "ALTER TABLE tasks ADD COLUMN base_branch TEXT"),
+    )
+    for table, column, alter_sql in required_columns:
+        if _table_has_column(conn, table, column):
+            continue
+        try:
+            conn.execute(alter_sql)
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                f"Schema integrity check failed while repairing required column "
+                f"{table}.{column}: use a writable database."
+            ) from exc
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
@@ -856,22 +889,7 @@ class SqliteTaskStore:
 
             # Repair required artifacts for current schemas when external damage
             # or partial migrations removed them.
-            if not _table_exists(conn, "task_comments"):
-                try:
-                    conn.executescript(MIGRATION_V31_TO_V32)
-                except sqlite3.OperationalError as exc:
-                    raise SchemaIntegrityError(
-                        "Schema integrity check failed while repairing v32: "
-                        "missing task_comments table; use a writable database."
-                    ) from exc
-            if not _table_has_column(conn, "tasks", "base_branch"):
-                try:
-                    conn.execute("ALTER TABLE tasks ADD COLUMN base_branch TEXT")
-                except sqlite3.OperationalError as exc:
-                    raise SchemaIntegrityError(
-                        "Schema integrity check failed while repairing base_branch column: "
-                        "use a writable database."
-                    ) from exc
+            _ensure_required_auto_migration_artifacts(conn)
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""

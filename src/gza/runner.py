@@ -2485,20 +2485,22 @@ def _post_complete_code_task(
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
 
-    # Clear review state on the based_on implementation task after improve completes.
-    # The improve task has addressed the review feedback, so the old review no longer
-    # reflects the current code state.
-    if task.task_type == "improve" and task.based_on:
-        store.clear_review_state(task.based_on)
-        store.resolve_comments(
-            task.based_on,
-            created_on_or_before=task.created_at,
-        )
-        # If parent was already merged, flip it back to unmerged — the improve
-        # task added commits to the shared branch after the merge.
-        parent = store.get(task.based_on)
-        if parent and parent.id is not None and parent.merge_status == "merged":
-            store.set_merge_status(parent.id, "unmerged")
+    # Clear review state on the root implementation task after improve completes.
+    # Improve retries/resumes may chain based_on through previous improves, so
+    # resolve the implementation ancestor first.
+    if task.task_type == "improve":
+        impl_ancestor = _resolve_impl_ancestor(store, task)
+        if impl_ancestor and impl_ancestor.id is not None:
+            store.clear_review_state(impl_ancestor.id)
+            store.resolve_comments(
+                impl_ancestor.id,
+                created_on_or_before=task.created_at,
+            )
+            # If the implementation was already merged, flip it back to unmerged:
+            # improve writes add commits on the shared implementation branch.
+            refreshed_impl = store.get(impl_ancestor.id)
+            if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+                store.set_merge_status(refreshed_impl.id, "unmerged")
 
     # Invalidate review state after rebase completes, since conflict resolution
     # may have introduced changes not covered by prior reviews.
@@ -2551,7 +2553,7 @@ def _handle_fix_follow_up_review(
 ) -> None:
     """Create a follow-up review task for fix runs when the run added commits."""
     root_impl = _resolve_root_implementation_for_fix(task, store)
-    if root_impl is None:
+    if root_impl is None or root_impl.id is None:
         return
 
     default_branch = fix_default_branch
@@ -2574,6 +2576,11 @@ def _handle_fix_follow_up_review(
     if commits_after <= commits_before:
         print("Fix completed without new commits; no follow-up review was auto-created.")
         return
+
+    store.clear_review_state(root_impl.id)
+    refreshed_impl = store.get(root_impl.id)
+    if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+        store.set_merge_status(refreshed_impl.id, "unmerged")
 
     try:
         review_task = create_review_task(store, root_impl, prompt_mode="auto")

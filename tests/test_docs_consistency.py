@@ -115,10 +115,17 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
     required_snippets = [
         "### run-inline",
         "gza run-inline <task_id> [options]",
+        "### search",
+        "gza search <term> [options]",
+        "### incomplete",
+        "gza incomplete [options]",
+        "### tv",
+        "gza tv [task_id ...] [options]",
         "### comment",
         "gza comment <task_id> <text> [options]",
         "### fix",
         "gza fix <task_id> [options]",
+        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
     ]
     for snippet in required_snippets:
         assert snippet in config_content

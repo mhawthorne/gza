@@ -826,13 +826,40 @@ gza history [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
 | `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
+
+### search
+
+Search task prompts by substring.
+
+```bash
+gza search <term> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `term` | Substring to match in task prompt text |
+| `--last N`, `-n N` | Show last N matching tasks (default: 10; use `0` for all) |
+
+### incomplete
+
+Show unresolved task lineages that still need attention.
+
+```bash
+gza incomplete [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--last N`, `-n N` | Show last N unresolved lineages (default: 5; use `0` for all) |
+| `--type TYPE` | Filter tasks by task type before lineage rollup: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--days N` | Show only unresolved lineages with activity in the last N days |
 
 ### checkout
 
@@ -1126,6 +1153,21 @@ gza refresh [task_id] [options]
 | `task_id` | Full prefixed task ID to refresh (e.g. `gza-1234`; omit to refresh all unmerged tasks) |
 | `--include-failed` | Also refresh failed tasks that have branches |
 
+### tv
+
+Live multi-task log dashboard.
+
+```bash
+gza tv [task_id ...] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Optional task IDs to watch (default: auto-select running tasks) |
+| `--number N`, `-n N` | Fixed slot count (equivalent to `--min N --max N`) |
+| `--min N` | Minimum slot count in auto-select mode (default: 1) |
+| `--max N` | Maximum slot count in auto-select mode (default: 4) |
+
 ### migrate
 
 Run pending manual database migrations. This includes v25 (INTEGER primary keys to project-prefixed base36 TEXT IDs) and v26 (base36 TEXT IDs to project-prefixed decimal IDs like `gza-1234`).
@@ -1190,6 +1232,7 @@ Gza supports several task types, each with distinct behavior:
 | `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
+| `fix` | Rescue stuck implementation lifecycle or repeated review regressions | Code changes on implementation branch |
 | `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
 
 **Typical workflow:**
