@@ -1163,6 +1163,71 @@ class TestReviewContextFromChain:
         assert f"Latest failed improve/resume attempt: {improve.id}" in context
         assert "line1" in context
         assert "## Original request:" in context
+        assert "## Original plan:" not in context
+
+    def test_fix_context_includes_original_plan_when_root_impl_is_plan_backed(self, tmp_path: Path):
+        """Fix context must include original plan (not request) when the implementation has a plan ancestor."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Create rollout plan", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Add retries.\n2. Add bounded timeout."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement retry behavior",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review retries", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        fix_task = store.add(
+            prompt="Rescue retries implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Original plan:" in context
+        assert "Add bounded timeout." in context
+        assert "## Original request:" not in context
+
+    def test_fix_context_falls_back_to_original_request_when_no_plan_exists(self, tmp_path: Path):
+        """Fix context should include the root implementation request when no plan ancestor exists."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement parser rescue path", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review = store.add(prompt="Review parser rescue", task_type="review", depends_on=impl_task.id)
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        fix_task = store.add(
+            prompt="Rescue parser implementation",
+            task_type="fix",
+            based_on=impl_task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+
+        context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
+
+        assert "## Original request:" in context
+        assert "Implement parser rescue path" in context
+        assert "## Original plan:" not in context
 
     def test_fix_context_omits_repeated_blockers_when_not_repeated(self, tmp_path: Path):
         """Fix context omits repeated-blocker section when recent reviews do not repeat blockers."""
@@ -6290,6 +6355,90 @@ class TestExtractedRunInnerHelpers:
         assert "Warning: Could not determine whether the fix run changed code" in output
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
         assert reviews == []
+
+    def test_complete_code_task_fix_unknown_before_baseline_skips_auto_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Unknown pre-run baseline must not be coerced to zero for follow-up review creation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement with existing ahead commits", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/fix-target"
+        impl_task.merge_status = "merged"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        prior_review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.completed_at = datetime.now(UTC)
+        store.update(prior_review)
+
+        fix_task = store.add(
+            prompt="Fix baseline probe edge case",
+            task_type="fix",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        fix_task.slug = "20260422-fix-unknown-baseline"
+        store.mark_in_progress(fix_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{fix_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/fix.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/fix.py\n"
+        # Post-run probe succeeds, but pre-run baseline is unknown.
+        worktree_git.count_commits_ahead.return_value = 3
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{fix_task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{fix_task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                fix_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/fix-target",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                fix_commits_ahead_before_run=None,
+                fix_default_branch="main",
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Warning: Could not determine fix commit baseline before run" in output
+        assert "Warning: Could not determine whether the fix run changed code" in output
+
+        refreshed_impl = store.get(impl_task.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "merged"
+        assert refreshed_impl.review_cleared_at is None
+        reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
+        assert len(reviews) == 1
 
     def test_complete_code_task_fix_duplicate_follow_up_review_reports_existing_review(
         self,

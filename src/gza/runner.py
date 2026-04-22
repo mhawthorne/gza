@@ -1129,7 +1129,21 @@ def _build_context_from_chain(
                         f"Latest failed implementation retry/resume attempt: {latest_failed_impl.id}"
                     )
 
-            if root_impl.prompt:
+            plan_task = None
+            if root_impl.based_on:
+                plan_task = _find_task_of_type_in_chain(root_impl.based_on, "plan", store)
+
+            if plan_task:
+                plan_content = _get_task_output(plan_task, project_dir)
+                if plan_content:
+                    context_parts.append("\n## Original plan:\n")
+                    context_parts.append(plan_content)
+                else:
+                    context_parts.append(
+                        "\n## Original plan:\n"
+                        f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
+                    )
+            elif root_impl.prompt:
                 context_parts.append("\n## Original request:\n")
                 context_parts.append(root_impl.prompt)
 
@@ -2565,6 +2579,10 @@ def _handle_fix_follow_up_review(
     root_impl = _resolve_root_implementation_for_fix(task, store)
     if root_impl is None or root_impl.id is None:
         return
+    if fix_commits_ahead_before_run is None:
+        print("Warning: Could not determine fix commit baseline before run")
+        print("Warning: Could not determine whether the fix run changed code")
+        return
 
     default_branch = fix_default_branch
     if not default_branch:
@@ -2582,7 +2600,7 @@ def _handle_fix_follow_up_review(
         print("Warning: Could not determine whether the fix run changed code")
         return
 
-    commits_before = fix_commits_ahead_before_run or 0
+    commits_before = fix_commits_ahead_before_run
     if commits_after <= commits_before:
         print("Fix completed without new commits; no follow-up review was auto-created.")
         return
