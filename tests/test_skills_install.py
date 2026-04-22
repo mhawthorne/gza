@@ -571,40 +571,24 @@ class TestSkillContentValidation:
         assert "After a successful commit and push" in content
         assert "Push: pushed to <IMPL_BRANCH>" in content
 
-    def test_gza_task_run_completion_guidance_matches_mark_completed_cli_contract(self):
-        """gza-task-run should not document unsupported mark-completed branch flags."""
+    def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
+        """gza-task-run should route only through run-inline, without manual completion recovery steps."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "uv run gza mark-completed <TASK_ID> --branch <BRANCH_NAME>" not in content
-        assert "uv run gza mark-completed <TASK_ID>" in content
+        assert "uv run gza mark-completed <TASK_ID>" not in content
+        assert "Outcome: completed (inline skill)" not in content
 
-    def test_gza_task_run_logs_success_outcome_only_after_mark_completed_step(self):
-        """gza-task-run should document success outcome logging after mark-completed succeeds."""
+    def test_gza_task_run_does_not_document_skill_inline_set_status_fallback(self):
+        """gza-task-run should not document synthetic skill_inline lifecycle mutations."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
         content = skill_file.read_text()
 
-        mark_completed_cmd = "uv run gza mark-completed <TASK_ID>"
-        success_outcome = "Outcome: completed (inline skill)"
-
-        mark_idx = content.find(mark_completed_cmd)
-        outcome_idx = content.find(success_outcome)
-        assert mark_idx != -1
-        assert outcome_idx != -1
-        assert outcome_idx > mark_idx
-
-    def test_gza_task_run_marks_in_progress_with_skill_inline_execution_mode(self):
-        """gza-task-run should stamp in-progress inline runs with skill_inline provenance."""
-        from gza.skills_utils import get_skills_source_path
-
-        skill_file = get_skills_source_path() / "gza-task-run" / "SKILL.md"
-        content = skill_file.read_text()
-
-        assert "uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline" in content
+        assert "uv run gza set-status <TASK_ID> in_progress --execution-mode skill_inline" not in content
 
     def test_gza_task_resume_routes_to_resume_or_run_inline_resume(self):
         """gza-task-resume should route users to first-class CLI resume flows."""
