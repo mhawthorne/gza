@@ -77,6 +77,10 @@ class InvalidTaskIdError(ValueError):
     """Raised when a user-supplied task ID is not a full prefixed ID."""
 
 
+class SchemaIntegrityError(RuntimeError):
+    """Raised when persisted DB artifacts are internally inconsistent."""
+
+
 def _encode_v25_base36(n: int) -> str:
     """Encode integer IDs the same way v25 migration encoded them."""
     chars = "0123456789abcdefghijklmnopqrstuvwxyz"
