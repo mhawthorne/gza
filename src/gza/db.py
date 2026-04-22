@@ -2037,6 +2037,12 @@ class SqliteTaskStore:
             raise ValueError("Comment content cannot be empty")
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"Task {task_id} not found")
             cur = conn.execute(
                 """
                 INSERT INTO task_comments (task_id, content, source, author, created_at)

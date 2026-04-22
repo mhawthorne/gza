@@ -1029,6 +1029,60 @@ class TestProviderRunMethods:
                 mock_direct.assert_called_once()
                 mock_docker.assert_not_called()
 
+    def test_claude_direct_interactive_does_not_use_stream_json_flags(self, tmp_path):
+        """Foreground interactive Claude direct mode must not use -p/stream-json args."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="claude",
+            use_docker=False,
+            timeout_minutes=5,
+        )
+        provider = ClaudeProvider()
+
+        with patch.object(provider, "_run_interactive_command", return_value=MagicMock(exit_code=0)) as mock_run:
+            provider._run_direct_interactive(
+                config,
+                "interactive prompt",
+                tmp_path / "log.txt",
+                tmp_path,
+            )
+
+        cmd = mock_run.call_args[0][0]
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "interactive prompt" in cmd
+
+    def test_claude_docker_interactive_does_not_use_stream_json_flags(self, tmp_path):
+        """Foreground interactive Claude Docker mode must not use -p/stream-json args."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="claude",
+            use_docker=True,
+            timeout_minutes=5,
+        )
+        config.docker_image = "test-image"
+        provider = ClaudeProvider()
+
+        with (
+            patch("gza.providers.claude.ensure_docker_image", return_value=True),
+            patch("gza.providers.claude.build_docker_cmd", return_value=["docker", "run"]) as mock_build_docker_cmd,
+            patch.object(provider, "_run_interactive_command", return_value=MagicMock(exit_code=0)) as mock_run,
+        ):
+            provider._run_docker_interactive(
+                config,
+                "interactive prompt",
+                tmp_path / "log.txt",
+                tmp_path,
+            )
+
+        assert mock_build_docker_cmd.call_args.kwargs["interactive"] is True
+        cmd = mock_run.call_args[0][0]
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "interactive prompt" in cmd
+
     def test_gemini_routes_to_docker_when_enabled(self, tmp_path):
         """Gemini should route to Docker when use_docker is True."""
         config = Config(
@@ -1697,10 +1751,8 @@ class TestClaudeStepMapping:
 
         assert captured == ["ses_once"]
 
-    def test_interactive_run_invokes_session_and_step_callbacks_for_fresh_session(self, tmp_path):
-        """Foreground interactive runs must still emit session and step callbacks."""
-        import json
-
+    def test_interactive_run_uses_true_foreground_launch_without_stream_callbacks(self, tmp_path):
+        """Foreground interactive runs should not go through stream-json callback parsing."""
         from gza.config import Config
         from gza.providers.claude import ClaudeProvider
 
@@ -1720,20 +1772,9 @@ class TestClaudeStepMapping:
         captured_sessions: list[str] = []
         captured_steps: list[int] = []
 
-        json_lines = [
-            json.dumps({"type": "system", "subtype": "init", "session_id": "sess-interactive-1", "tools": []}) + "\n",
-            json.dumps({"type": "assistant", "message": {"id": "msg_1", "content": [], "usage": {}}}) + "\n",
-            json.dumps({"type": "assistant", "message": {"id": "msg_2", "content": [], "usage": {}}}) + "\n",
-            json.dumps({"type": "result", "subtype": "success", "num_turns": 2, "total_cost_usd": 0.0}) + "\n",
-        ]
-
-        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
-            mock_process = MagicMock()
-            mock_process.stdout = iter(json_lines)
-            mock_process.wait.return_value = None
-            mock_process.returncode = 0
-            mock_popen.return_value = mock_process
-
+        mock_completed = MagicMock()
+        mock_completed.returncode = 0
+        with patch("gza.providers.claude.subprocess.run", return_value=mock_completed) as mock_run:
             result = provider.run(
                 config,
                 prompt="Interactive callback test",
@@ -1744,10 +1785,14 @@ class TestClaudeStepMapping:
                 interactive=True,
             )
 
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
         assert result.exit_code == 0
-        assert result.session_id == "sess-interactive-1"
-        assert captured_sessions == ["sess-interactive-1"]
-        assert captured_steps == [1, 2]
+        assert result.session_id is None
+        assert captured_sessions == []
+        assert captured_steps == []
 
     def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
         """session_id should still be captured from result event when no system/init event is present."""

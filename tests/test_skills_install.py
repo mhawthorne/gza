@@ -617,6 +617,16 @@ class TestSkillContentValidation:
         assert "uv run gza run-inline <TASK_ID> --resume" in content
         assert "gza set-status" not in content
 
+    def test_gza_task_resume_uses_supported_history_flags(self):
+        """gza-task-resume should use supported gza history flags in examples."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-resume" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza history --status failed --last 10" in content
+        assert "--status failed --limit 10" not in content
+
     @pytest.mark.parametrize(
         "skill_name",
         [

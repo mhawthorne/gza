@@ -1327,6 +1327,13 @@ class TestTaskComments:
         with pytest.raises(ValueError, match="cannot be empty"):
             store.add_comment(task.id, "   ")
 
+    def test_add_comment_rejects_unknown_task_id(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        with pytest.raises(KeyError, match="Task gza-9999 not found"):
+            store.add_comment("gza-9999", "orphan?")
+
     def test_get_and_resolve_comments_can_be_scoped_by_created_at(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
