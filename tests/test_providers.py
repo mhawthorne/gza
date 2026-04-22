@@ -2028,6 +2028,48 @@ class TestClaudeStepMapping:
         assert any(prompt.encode("utf-8") in written for written in writes)
         assert live_input in writes
 
+    def test_interactive_prompt_seed_failure_aborts_run_and_logs_outcome(self, tmp_path):
+        """Prompt seed failure should abort the interactive run instead of continuing silently."""
+        from gza.config import Config
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "interactive-seed-failure.log"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        config = Config(project_dir=tmp_path, project_name="test-project", provider="claude")
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+
+        mock_process = MagicMock()
+        mock_process.poll.return_value = None
+        mock_process.wait.return_value = None
+
+        with (
+            patch("gza.providers.claude.pty.openpty", return_value=(70, 71)),
+            patch("gza.providers.claude.os.close"),
+            patch("gza.providers.claude.os.write", side_effect=OSError("pty write failed")),
+            patch("gza.providers.claude.subprocess.Popen", return_value=mock_process),
+            patch("gza.providers.claude.sys.stderr"),
+        ):
+            result = provider.run(
+                config,
+                prompt="seed me",
+                log_file=log_file,
+                work_dir=work_dir,
+                interactive=True,
+            )
+
+        assert result.exit_code == 1
+        assert result.error_type == "startup_failed"
+        mock_process.terminate.assert_called_once()
+        mock_process.wait.assert_called_once_with(timeout=2)
+        log_text = log_file.read_text()
+        assert "Failed to seed interactive stdin prompt; aborting interactive run." in log_text
+        assert '"subtype": "outcome"' in log_text
+
     def test_session_id_captured_from_result_when_no_system_init(self, tmp_path):
         """session_id should still be captured from result event when no system/init event is present."""
         import json
