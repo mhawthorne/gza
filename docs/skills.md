@@ -185,6 +185,36 @@ Use `/gza-plan-review` to evaluate a completed plan task before creating an impl
 
 ---
 
+## gza-plan-improve
+
+**Refine a draft plan by asking targeted questions, resolving gaps, and rewriting it into an implementation-ready plan.**
+
+Use `/gza-plan-improve` when a plan exists but is still rough. It asks the smallest useful set of follow-up questions, sharpens scope and acceptance criteria, and produces a stronger revised plan instead of only grading the current one.
+
+**Key behaviors:**
+- Accepts either a full prefixed plan task ID like `gza-1234` or pasted draft plan text
+- Reuses the same core quality dimensions as plan review: scope, acceptance criteria, risks, dependencies, and test strategy
+- Focuses the question loop on the highest-leverage gaps first
+- Rewrites the plan into a clearer structure with explicit assumptions, sequencing, and open questions
+- Points the user to `/gza-plan-review` afterward when they want a final go/no-go decision
+
+---
+
+## gza-explore-summarize
+
+**Summarize an explore task, extract the important findings, and suggest concrete next steps.**
+
+Use `/gza-explore-summarize` when an explore task produced useful markdown but you want a faster handoff into action. It reads the explore task output, identifies the decision-relevant findings, and recommends whether the next move should be `plan`, `implement`, or a narrower follow-up `explore` task.
+
+**Key behaviors:**
+- Starts from a full prefixed explore task ID like `gza-1234`
+- Synthesizes the report into key findings, implications, and remaining uncertainty
+- Avoids raw dump output in favor of operator-facing summary
+- Recommends the most likely next workflow and concrete `uv run gza add --based-on <TASK_ID>` commands
+- Falls back to clarifying questions only when the report is too thin or the desired decision is unclear
+
+---
+
 ## gza-docs-review
 
 **Review documentation for accuracy, completeness, and missing information that users may need.**
