@@ -1759,11 +1759,16 @@ def cmd_lineage(args: argparse.Namespace) -> int:
             return "failed"
         return t.status or "unknown"
 
+    def _format_utc_timestamp(value: datetime) -> str:
+        ts = value.astimezone(UTC) if value.tzinfo is not None else value
+        return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
     def _node_label(node: TaskLineageNode) -> str:
         t = node.task
         is_target = t.id == task_id
 
         status = _status_text(t)
+        when = t.completed_at or t.started_at or t.created_at
         type_str = t.task_type or "implement"
         first_line = t.prompt.split("\n")[0].strip()
         prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
@@ -1774,6 +1779,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
         stats = format_stats(t)
         stats_part = f" [{lc.stats}]({stats})[/{lc.stats}]" if stats else ""
+        when_part = f" [{lc.stats}]({_format_utc_timestamp(when)})[/{lc.stats}]" if when else ""
 
         status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
 
@@ -1781,6 +1787,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
             f"[{lc.task_id}]{t.id}[/{lc.task_id}]"
             f" [{lc.type_label}]{rich_escape(type_str)}[/{lc.type_label}]"
             f" [{status_color}]{rich_escape(status)}[/{status_color}]"
+            f"{when_part}"
             f"{rel_part}"
             f"  [{lc.prompt}]'{rich_escape(prompt_short)}'[/{lc.prompt}]"
             f"{stats_part}"
@@ -1902,6 +1909,10 @@ def _cmd_show_output(
     }
     status_color = status_color_map.get(task.status, c["status_default"])
 
+    def _format_utc_timestamp(value: datetime) -> str:
+        ts = value.astimezone(UTC) if value.tzinfo is not None else value
+        return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
     console.print(f"[{c['heading']}]Task {task.id}[/{c['heading']}]")
     console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
     console.print(f"[{c['label']}]Status:[/{c['label']}] [{status_color}]{task.status}[/{status_color}]")
@@ -1969,11 +1980,17 @@ def _cmd_show_output(
         if comments:
             console.print(f"[{c['label']}]Comments:[/{c['label']}]")
             for comment in comments:
-                meta_parts = [f"source={comment.source}"]
+                state = "resolved" if comment.resolved_at is not None else "open"
+                meta_parts = [
+                    f"id={comment.id}",
+                    f"source={comment.source}",
+                    f"state={state}",
+                    f"created={_format_utc_timestamp(comment.created_at)}",
+                ]
                 if comment.author:
                     meta_parts.append(f"author={comment.author}")
                 if comment.resolved_at is not None:
-                    meta_parts.append("resolved")
+                    meta_parts.append(f"resolved={_format_utc_timestamp(comment.resolved_at)}")
                 meta = ", ".join(meta_parts)
                 console.print(f"  [{c['stats']}]({meta})[/{c['stats']}] {comment.content}")
             console.print()

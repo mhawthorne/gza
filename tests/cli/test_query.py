@@ -1403,21 +1403,40 @@ class TestShowCommand:
         assert "Execution Mode: skill_inline" in result.stdout
 
     def test_show_displays_task_comments(self, tmp_path: Path):
-        """Show command prints task comments, including source and author."""
+        """Show command prints full comment metadata, including audit timestamps/state."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         task = store.add("Task with comments")
         assert task.id is not None
-        store.add_comment(task.id, "First note", source="direct", author="alice")
+
+        resolved_seed = store.add_comment(task.id, "First note", source="direct", author="alice")
+        store.resolve_comments(task.id, created_on_or_before=resolved_seed.created_at)
         store.add_comment(task.id, "Second note", source="github")
-        store.resolve_comments(task.id)
+
+        comments = store.get_comments(task.id)
+        assert len(comments) == 2
+        resolved_comment, open_comment = comments
+        assert resolved_comment.resolved_at is not None
+        assert open_comment.resolved_at is None
+
+        resolved_created = f"{resolved_comment.created_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        resolved_at = f"{resolved_comment.resolved_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        open_created = f"{open_comment.created_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Comments:" in result.stdout
-        assert "source=direct, author=alice" in result.stdout
+        assert f"id={resolved_comment.id}" in result.stdout
+        assert "source=direct" in result.stdout
+        assert "author=alice" in result.stdout
+        assert "state=resolved" in result.stdout
+        assert f"created={resolved_created}" in result.stdout
+        assert f"resolved={resolved_at}" in result.stdout
+        assert f"id={open_comment.id}" in result.stdout
         assert "source=github" in result.stdout
+        assert "state=open" in result.stdout
+        assert f"created={open_created}" in result.stdout
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
@@ -5181,6 +5200,47 @@ class TestLineageCommand:
         assert "plan" in result.stdout
         assert "completed" in result.stdout
 
+    def test_lineage_includes_node_timestamp(self, tmp_path: Path):
+        """Lineage command renders node timestamp using completed/started/created fallback."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        created_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        started_at = datetime(2026, 1, 2, 4, 5, 6, tzinfo=UTC)
+        completed_at = datetime(2026, 1, 2, 5, 6, 7, tzinfo=UTC)
+
+        root = store.add("Root task", task_type="implement")
+        root.status = "pending"
+        root.started_at = None
+        root.completed_at = None
+        store.update(root)
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET created_at = ? WHERE id = ?",
+                (created_at.isoformat(), root.id),
+            )
+
+        child = store.add("Started child", task_type="task", based_on=root.id)
+        child.status = "in_progress"
+        child.created_at = created_at
+        child.started_at = started_at
+        child.completed_at = None
+        store.update(child)
+
+        grandchild = store.add("Completed grandchild", task_type="review", depends_on=child.id)
+        grandchild.status = "completed"
+        grandchild.created_at = created_at
+        grandchild.started_at = started_at
+        grandchild.completed_at = completed_at
+        store.update(grandchild)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "2026-01-02 03:04:05 UTC" in result.stdout
+        assert "2026-01-02 04:05:06 UTC" in result.stdout
+        assert "2026-01-02 05:06:07 UTC" in result.stdout
+
     def test_lineage_task_not_found(self, tmp_path: Path):
         """Lineage command returns error for missing task ID."""
         setup_db_with_tasks(tmp_path, [])
@@ -5328,9 +5388,10 @@ class TestLineageCommand:
         result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Review feature impl" in result.stdout
-        assert "[review]" not in result.stdout
-        assert "[depends]" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert re.search(r"Review feature\s+[|│]?\s*impl", normalized)
+        assert "[review]" not in normalized
+        assert "[depends]" in normalized
 
     def test_lineage_rel_label_brackets_are_rendered_literally(self, tmp_path: Path):
         """Relationship labels render as [rel] text, not as Rich markup tags."""

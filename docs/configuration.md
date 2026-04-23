@@ -75,6 +75,8 @@ Inspect effective values and source attribution:
 ```bash
 gza config
 gza config --json
+gza config keys
+gza config keys --json
 ```
 
 ### Themes and Colors
@@ -667,6 +669,85 @@ Show effective configuration and source attribution (`base`, `local`, `env`, `de
 ```bash
 gza config
 gza config --json
+gza config keys
+gza config keys --json
+```
+
+`gza config keys` prints the discoverable config-key registry in a readable table with these columns:
+- `KEY`
+- `TYPE`
+- `DEFAULT`
+- `DESCRIPTION`
+
+`gza config keys --json` prints a machine-readable payload:
+- `keys[]` entries with `key`, `type`, `required`, `default`, and `description`
+
+#### Discoverable Config Keys
+
+The following keys are currently discoverable via `gza config keys`:
+
+```text
+advance_create_reviews
+advance_mode
+advance_requires_review
+branch_mode
+branch_strategy
+branch_strategy.default_type
+branch_strategy.pattern
+chat_text_display_length
+claude.args
+claude.fetch_auth_token_from_keychain
+claude_args
+cleanup_days
+colors.*
+defaults.max_steps
+defaults.max_turns
+defaults.model
+docker_image
+docker_setup_command
+docker_volumes
+interactive_worktree_dir
+iterate_max_iterations
+learnings_interval
+learnings_max_items
+learnings_window
+log_dir
+max_resume_attempts
+max_review_cycles
+max_steps
+max_turns
+merge_squash_threshold
+model
+project_name
+project_prefix
+provider
+providers.*.model
+providers.*.task_types.*.max_steps
+providers.*.task_types.*.max_turns
+providers.*.task_types.*.model
+review_context_file_limit
+review_diff_medium_threshold
+review_diff_small_threshold
+task_providers.*
+task_types.*.max_steps
+task_types.*.max_turns
+task_types.*.model
+tasks_file
+theme
+timeout_minutes
+tmux.auto_accept_timeout
+tmux.detach_grace
+tmux.enabled
+tmux.max_idle_timeout
+tmux.terminal_size
+use_docker
+verify_command
+watch.batch
+watch.max_idle
+watch.max_iterations
+watch.poll
+work_count
+worktree_dir
 ```
 
 ### show
