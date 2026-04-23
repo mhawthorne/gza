@@ -328,6 +328,17 @@ class TestSkillContentValidation:
         assert "supports `42` or `#42`" not in content
         assert "strip the leading `#`" not in content
 
+    def test_gza_explore_summarize_requires_full_prefixed_task_id(self):
+        """gza-explore-summarize should require full prefixed IDs instead of numeric shorthand."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-explore-summarize" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "full prefixed explore task ID" in content
+        assert "supports `42` or `#42`" not in content
+        assert "strip the leading `#`" not in content
+
     def test_gza_task_run_routes_to_first_class_run_inline_command(self):
         """gza-task-run should delegate execution to `gza run-inline` instead of synthetic lifecycle steps."""
         from gza.skills_utils import get_skills_source_path
@@ -614,6 +625,7 @@ class TestSkillContentValidation:
     @pytest.mark.parametrize(
         "skill_name",
         [
+            "gza-explore-summarize",
             "gza-plan-review",
             "gza-task-review",
             "gza-summary",
@@ -632,6 +644,7 @@ class TestSkillContentValidation:
     @pytest.mark.parametrize(
         "skill_name",
         [
+            "gza-explore-summarize",
             "gza-task-run",
             "gza-task-review",
             "gza-plan-review",

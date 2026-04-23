@@ -179,7 +179,9 @@ def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     assert "gza-1a2b" not in config_cmds_content
 
     skill_names = [
+        "gza-explore-summarize",
         "gza-plan-review",
+        "gza-plan-improve",
         "gza-task-run",
         "gza-task-resume",
         "gza-task-improve",
