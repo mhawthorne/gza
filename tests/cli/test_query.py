@@ -34,6 +34,14 @@ def _mock_unmerged_git() -> MagicMock:
     return git
 
 
+def _unmerged_branch_block(output: str, branch: str) -> str:
+    """Return the rendered unmerged output block for a specific branch."""
+    for block in output.split("-" * 32):
+        if f"branch: {branch}" in block:
+            return block
+    raise AssertionError(f"Branch block not found for {branch}")
+
+
 class TestHistoryCommand:
     """Tests for 'gza history' command."""
 

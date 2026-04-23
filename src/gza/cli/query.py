@@ -44,7 +44,7 @@ from ..query import (
     IncompleteLineage,
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
-    get_improves_for_root as _get_improves_for_root_task,
+    get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
     query_incomplete,
     resolve_lineage_root as _resolve_lineage_root_task,
