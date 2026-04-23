@@ -59,6 +59,7 @@ from ._common import (
     _parse_iso,
     _spawn_background_worker,
     format_stats,
+    get_review_score,
     get_review_verdict,
     get_store,
     pager_context,
@@ -391,7 +392,10 @@ def cmd_history(args: argparse.Namespace) -> int:
             if task.task_type == "review":
                 verdict = get_review_verdict(config, task)
                 if verdict:
-                    compact_parts.append(f"verdict: {verdict}")
+                    verdict_part = f"verdict: {verdict}"
+                    if task.review_score is not None:
+                        verdict_part = f"{verdict_part} ({task.review_score})"
+                    compact_parts.append(verdict_part)
             stats_str = format_stats(task)
             if stats_str:
                 compact_parts.append(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -875,6 +879,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         review_status_color = UNMERGED_COLORS["review_none"]
         review_detail = None
         review_verdict = None
+        review_score: int | None = None
 
         if latest_review:
             latest_review_completed = latest_review.completed_at
@@ -920,6 +925,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                     verdict = get_review_verdict(config, review)
                     if verdict:
                         review_verdict = verdict
+                        review_score = review.review_score
                         break
 
         verdict_label = None
@@ -935,6 +941,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         elif review_verdict == "NEEDS_DISCUSSION":
             verdict_label = "💬 needs discussion"
             review_status_color = UNMERGED_COLORS["review_discussion"]
+
+        if verdict_label and review_score is not None:
+            verdict_label = f"{verdict_label} ({review_score})"
 
         review_line = review_classification
         if review_detail:
@@ -1959,6 +1968,15 @@ def _cmd_show_output(
                 file_mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=UTC)
                 if file_mtime > task.completed_at:
                     console.print("[yellow]Warning: Report on disk has been modified since task completion[/yellow]")
+    if task.task_type == "review":
+        verdict = get_review_verdict(config, task)
+        if verdict:
+            console.print(f"[{c['label']}]Verdict:[/{c['label']}] [{c['value']}]{verdict}[/{c['value']}]")
+        score = task.review_score
+        if score is None and task.status == "completed":
+            score = get_review_score(config, task)
+        if score is not None:
+            console.print(f"[{c['label']}]Score:[/{c['label']}] [{c['value']}]{score}/100[/{c['value']}]")
     if task.session_id:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 

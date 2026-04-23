@@ -775,6 +775,10 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 
+For completed `review` tasks, `gza show` also includes:
+- `Verdict: <APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION|...>` when parseable from review output.
+- `Score: <N>/100` when a derived `review_score` is available.
+
 ### run-inline
 
 Run a specific task in the foreground through the same runner path used by workers.
@@ -884,6 +888,7 @@ For each unmerged implementation, output includes:
   - `no review` when no completed review exists.
   - `reviewed` when the latest completed review still reflects current code.
   - `review stale` when code-changing work (for example an improve task) happened after the latest review.
+- When a completed review has a stored derived score, verdict badges include it as `(<score>)`, for example `✓ approved (82)`.
 
 ### groups
 

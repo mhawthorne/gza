@@ -236,6 +236,7 @@ class Task:
     diff_lines_added: int | None = None    # Lines added vs. main (v13)
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
+    review_score: int | None = None  # Derived deterministic score for completed review tasks (v33)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
     execution_mode: str | None = None  # worker_background, worker_foreground, foreground_inline, foreground_attach_resume, manual, skill_inline
 
@@ -334,8 +335,13 @@ CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_
 CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at);
 """
 
+# Migration from v32 to v33: derived review score persistence
+MIGRATION_V32_TO_V33 = """
+ALTER TABLE tasks ADD COLUMN review_score INTEGER;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -449,6 +455,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
         31: ("tasks", "execution_mode"),
+        33: ("tasks", "review_score"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is None:
@@ -497,6 +504,7 @@ def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
         ("tasks", "urgent_bumped_at", "ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT"),
         ("tasks", "execution_mode", "ALTER TABLE tasks ADD COLUMN execution_mode TEXT"),
         ("tasks", "base_branch", "ALTER TABLE tasks ADD COLUMN base_branch TEXT"),
+        ("tasks", "review_score", "ALTER TABLE tasks ADD COLUMN review_score INTEGER"),
     )
     for table, column, alter_sql in required_columns:
         if _table_has_column(conn, table, column):
@@ -568,6 +576,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_lines_added INTEGER,
     diff_lines_removed INTEGER,
     review_cleared_at TEXT,
+    review_score INTEGER,
     log_schema_version INTEGER DEFAULT 1,
     execution_mode TEXT,
     base_branch TEXT
@@ -911,6 +920,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (30, MIGRATION_V29_TO_V30),
     (31, MIGRATION_V30_TO_V31),
     (32, MIGRATION_V31_TO_V32),
+    (33, MIGRATION_V32_TO_V33),
 ]
 
 
@@ -1057,6 +1067,7 @@ class SqliteTaskStore:
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in keys else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in keys else None,
             review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in keys and row["review_cleared_at"] else None,
+            review_score=row["review_score"] if "review_score" in keys else None,
             log_schema_version=(
                 row["log_schema_version"]
                 if "log_schema_version" in keys and row["log_schema_version"] is not None
@@ -1298,6 +1309,7 @@ class SqliteTaskStore:
                     diff_lines_added = ?,
                     diff_lines_removed = ?,
                     review_cleared_at = ?,
+                    review_score = ?,
                     log_schema_version = ?,
                     execution_mode = ?
                 WHERE id = ?
@@ -1347,6 +1359,7 @@ class SqliteTaskStore:
                     task.diff_lines_added,
                     task.diff_lines_removed,
                     task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+                    task.review_score,
                     task.log_schema_version,
                     task.execution_mode,
                     task.id,
@@ -2859,6 +2872,7 @@ def _task_to_dict(task: "Task") -> dict:
         "diff_lines_added": task.diff_lines_added,
         "diff_lines_removed": task.diff_lines_removed,
         "review_cleared_at": task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+        "review_score": task.review_score,
         "log_schema_version": task.log_schema_version,
         "execution_mode": task.execution_mode,
     }
