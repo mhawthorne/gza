@@ -196,6 +196,39 @@ def _has_merged_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
     )
 
 
+def _resolve_effective_shared_branch_retry_head(store: SqliteTaskStore, root_task: Task) -> Task:
+    """Return the effective same-branch retry/resume head for a root lineage task.
+
+    Canonical lineage roots stay anchored to the earliest task for display.
+    For shared-branch merge truth, prefer the latest same-type retry/resume
+    attempt on that branch.
+    """
+    if root_task.id is None:
+        return root_task
+
+    candidates: list[Task] = [root_task]
+    for child in _iter_retry_descendants(store, root_task):
+        if child.task_type != root_task.task_type:
+            continue
+        if root_task.branch and child.branch and child.branch != root_task.branch:
+            continue
+        candidates.append(child)
+
+    return max(
+        candidates,
+        key=lambda candidate: (
+            _normalize_lineage_time(task_time_for_lineage(candidate)),
+            task_id_numeric_key(candidate.id),
+        ),
+    )
+
+
+def _is_effective_shared_branch_lineage_merged(store: SqliteTaskStore, root_task: Task) -> bool:
+    """Return merge truth for shared-branch descendants under a canonical root."""
+    effective_head = _resolve_effective_shared_branch_retry_head(store, root_task)
+    return effective_head.merge_status == "merged"
+
+
 def _get_unresolved_terminal_kind(task: Task) -> str | None:
     """Return unresolved terminal kind for attention queries, else None."""
     if task.status not in {"failed", "completed", "unmerged", "dropped"}:
@@ -253,6 +286,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
 
     unresolved_by_root: dict[str, list[Task]] = {}
     root_by_id: dict[str, Task] = {}
+    effective_shared_merge_by_root: dict[str, bool] = {}
 
     for task in tasks:
         if task.id is None:
@@ -275,7 +309,10 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         root = resolve_lineage_root(store, task)
         if root.id is None:
             continue
-        root_merged = root.merge_status == "merged"
+        root_merged = effective_shared_merge_by_root.get(root.id)
+        if root_merged is None:
+            root_merged = _is_effective_shared_branch_lineage_merged(store, root)
+            effective_shared_merge_by_root[root.id] = root_merged
         shared_descendant = _is_shared_branch_descendant(task, root)
 
         if shared_descendant:
