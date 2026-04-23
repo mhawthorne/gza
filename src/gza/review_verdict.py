@@ -5,11 +5,21 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from gza.db import Task
 
 ReviewSeverity = Literal["BLOCKER", "FOLLOWUP", "NIT"]
+ReviewTemplateVerdict = Literal["APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"]
+ReviewParseError = Literal[
+    "empty_content",
+    "missing_required_sections",
+    "malformed_checklist",
+    "malformed_must_fix_section",
+    "malformed_suggestions_section",
+    "missing_verdict",
+    "multiple",
+]
 
 _VERDICT_TOKEN = r"(APPROVED_WITH_FOLLOWUPS|APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION)"
 
@@ -33,6 +43,17 @@ _HEADING_VERDICT_PATTERN = re.compile(
 
 _H2_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 _H3_PATTERN = re.compile(r"^###\s+(.+?)\s*$", re.MULTILINE)
+_CHECKLIST_LINE_PATTERN = re.compile(
+    r"^\s*(?:[-*]|\d+[.)])?\s*(yes|no)\s*[-:]\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+MUST_FIX_WEIGHT = 20
+SUGGESTION_WEIGHT = 3
+SUMMARY_NO_WEIGHT = 10
+SCORE_MIN = 0
+SCORE_MAX = 100
 
 
 @dataclass(frozen=True)
@@ -56,6 +77,18 @@ class ParsedReviewReport:
     verdict: str | None
     findings: tuple[ReviewFinding, ...]
     format_version: Literal["legacy", "v2", "unknown"]
+
+
+@dataclass(frozen=True)
+class ParsedReview:
+    """Parsed review-template sections used for derived review scoring."""
+
+    must_fix_count: int
+    suggestion_count: int
+    summary_checklist: tuple[tuple[str, bool], ...]
+    verdict: ReviewTemplateVerdict | None
+    unparseable: bool
+    parse_error: ReviewParseError | None = None
 
 
 def _extract_verdict(content: str) -> str | None:
@@ -155,6 +188,129 @@ def _parse_finding_entries(
     return findings
 
 
+def _section_is_none_literal(text: str) -> bool:
+    return text.strip().rstrip(".").strip().lower() == "none"
+
+
+def _parse_checklist(summary_body: str) -> tuple[tuple[tuple[str, bool], ...], bool]:
+    checklist: list[tuple[str, bool]] = []
+    malformed = False
+    saw_list_marker = False
+    for line in summary_body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("-", "*")):
+            saw_list_marker = True
+        matched = _CHECKLIST_LINE_PATTERN.match(line)
+        if matched is None:
+            continue
+        text = matched.group(2).strip()
+        is_yes = matched.group(1).strip().lower() == "yes"
+        checklist.append((text, is_yes))
+
+    if saw_list_marker and not checklist:
+        malformed = True
+    return tuple(checklist), malformed
+
+
+def _section_entries_and_malformed(
+    sections: dict[str, str],
+    keys: tuple[str, ...],
+) -> tuple[list[tuple[str, str]], bool]:
+    """Parse H3 entries from the first-present section keys and detect malformed bodies."""
+    entries: list[tuple[str, str]] = []
+    malformed = False
+    for key in keys:
+        body = sections.get(key, "")
+        section_entries = _split_h3_entries(body)
+        entries.extend(section_entries)
+        if body.strip() and not section_entries and not _section_is_none_literal(body):
+            malformed = True
+    return entries, malformed
+
+
+def parse_review_template(content: str | None) -> ParsedReview:
+    """Parse review-template fields used for deterministic quality scoring."""
+    if not content or not content.strip():
+        return ParsedReview(0, 0, (), None, True, "empty_content")
+
+    sections = _split_h2_sections(content)
+    summary_body = sections.get("summary", "")
+    must_fix_entries, malformed_must_fix_section = _section_entries_and_malformed(
+        sections, ("blockers", "mustfix")
+    )
+    suggestion_entries, malformed_suggestions_section = _section_entries_and_malformed(
+        sections, ("followups", "suggestions")
+    )
+
+    checklist, checklist_malformed = _parse_checklist(summary_body)
+    verdict = _extract_verdict(content)
+    normalized_verdict: ReviewTemplateVerdict | None = None
+    if verdict in {"APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}:
+        normalized_verdict = cast(ReviewTemplateVerdict, verdict)
+
+    parse_errors: list[ReviewParseError] = []
+    missing_required_sections = (
+        "summary" not in sections
+        or not any(key in sections for key in ("blockers", "mustfix"))
+        or not any(key in sections for key in ("followups", "suggestions"))
+    )
+    if missing_required_sections:
+        parse_errors.append("missing_required_sections")
+    if malformed_must_fix_section:
+        parse_errors.append("malformed_must_fix_section")
+    if malformed_suggestions_section:
+        parse_errors.append("malformed_suggestions_section")
+    if checklist_malformed:
+        parse_errors.append("malformed_checklist")
+    if normalized_verdict is None:
+        parse_errors.append("missing_verdict")
+
+    unparseable = bool(parse_errors)
+    parse_error: ReviewParseError | None = None
+    if len(parse_errors) == 1:
+        parse_error = parse_errors[0]
+    elif parse_errors:
+        parse_error = "multiple"
+
+    return ParsedReview(
+        must_fix_count=len(must_fix_entries),
+        suggestion_count=len(suggestion_entries),
+        summary_checklist=checklist,
+        verdict=normalized_verdict,
+        unparseable=unparseable,
+        parse_error=parse_error,
+    )
+
+
+def compute_review_score(parsed: ParsedReview) -> int:
+    """Compute deterministic 0-100 review quality score from parsed review output.
+
+    Weight constants are intentionally heuristic and expected to be tuned over time
+    as real review analytics data accumulates.
+    """
+    has_structured_signals = bool(
+        parsed.must_fix_count > 0
+        or parsed.suggestion_count > 0
+        or parsed.summary_checklist
+    )
+    if parsed.unparseable:
+        # Fail closed for malformed or incomplete parsing outcomes, with one
+        # explicit exception: missing verdict only.
+        if parsed.parse_error != "missing_verdict" or not has_structured_signals:
+            return 0
+
+    no_count = sum(1 for _, is_yes in parsed.summary_checklist if not is_yes)
+    score = (
+        100
+        - (MUST_FIX_WEIGHT * parsed.must_fix_count)
+        - (SUGGESTION_WEIGHT * parsed.suggestion_count)
+        - (SUMMARY_NO_WEIGHT * no_count)
+    )
+    return max(SCORE_MIN, min(SCORE_MAX, score))
+
+
 def parse_review_report(content: str | None) -> ParsedReviewReport:
     """Parse verdict and structured findings from review markdown."""
     if not content:
@@ -231,3 +387,21 @@ def get_review_report(project_dir: Path, review_task: Task) -> ParsedReviewRepor
 def get_review_verdict(project_dir: Path, review_task: Task) -> str | None:
     """Extract the review verdict from cached output or the report file."""
     return get_review_report(project_dir, review_task).verdict
+
+
+def get_review_score(project_dir: Path, review_task: Task) -> int | None:
+    """Compute a deterministic review score from cached output or the report file.
+
+    Returns ``None`` when no score source exists (no output content and no readable report).
+    """
+    if review_task.output_content:
+        return compute_review_score(parse_review_template(review_task.output_content))
+
+    if not review_task.report_file:
+        return None
+
+    review_path = project_dir / review_task.report_file
+    if not review_path.exists():
+        return None
+
+    return compute_review_score(parse_review_template(review_path.read_text()))
