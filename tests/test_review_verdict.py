@@ -1,6 +1,12 @@
 """Tests for shared review verdict/report parsing."""
 
-from gza.review_verdict import parse_review_report, parse_review_verdict
+from gza.review_verdict import (
+    ParsedReview,
+    compute_review_score,
+    parse_review_report,
+    parse_review_template,
+    parse_review_verdict,
+)
 
 
 class TestParseReviewVerdict:
@@ -73,3 +79,163 @@ class TestParseReviewReport:
         assert report.format_version == "legacy"
         assert len(report.findings) == 1
         assert report.findings[0].severity == "BLOCKER"
+
+
+def _template_review(
+    *,
+    checklist: list[str] | None = None,
+    must_fix: str = "None.",
+    suggestions: str = "None.",
+    verdict: str = "Verdict: APPROVED",
+) -> str:
+    checklist_lines = checklist or [
+        "- Yes - Requirement 1",
+        "- Yes - Requirement 2",
+        "- Yes - Requirement 3",
+        "- Yes - Requirement 4",
+        "- Yes - Requirement 5",
+    ]
+    return (
+        "## Summary\n\n"
+        + "\n".join(checklist_lines)
+        + "\n\n## Must-Fix\n\n"
+        + must_fix
+        + "\n\n## Suggestions\n\n"
+        + suggestions
+        + "\n\n## Questions / Assumptions\n\nNone.\n\n## Verdict\n\n"
+        + verdict
+        + "\n"
+    )
+
+
+class TestParseReviewTemplate:
+    def test_parses_happy_path(self) -> None:
+        parsed = parse_review_template(_template_review())
+        assert parsed.must_fix_count == 0
+        assert parsed.suggestion_count == 0
+        assert len(parsed.summary_checklist) == 5
+        assert parsed.verdict == "APPROVED"
+        assert parsed.unparseable is False
+
+    def test_handles_none_without_trailing_period(self) -> None:
+        parsed = parse_review_template(_template_review(must_fix="None", suggestions="None"))
+        assert parsed.must_fix_count == 0
+        assert parsed.suggestion_count == 0
+        assert parsed.unparseable is False
+
+    def test_handles_mis_cased_yes_no_and_whitespace(self) -> None:
+        parsed = parse_review_template(
+            _template_review(
+                checklist=[
+                    " - yEs - item one  ",
+                    " - nO - item two  ",
+                ]
+            )
+        )
+        assert parsed.summary_checklist[0] == ("item one", True)
+        assert parsed.summary_checklist[1] == ("item two", False)
+
+    def test_missing_section_marks_unparseable(self) -> None:
+        parsed = parse_review_template(
+            "## Summary\n\n- Yes - ok\n\n## Must-Fix\n\nNone.\n\n## Verdict\n\nVerdict: APPROVED\n"
+        )
+        assert parsed.unparseable is True
+
+    def test_missing_verdict_marks_unparseable_but_keeps_counts(self) -> None:
+        parsed = parse_review_template(
+            _template_review(
+                must_fix="### M1 Missing check\nRequired fix: add it",
+                verdict="No verdict line here",
+            )
+        )
+        assert parsed.unparseable is True
+        assert parsed.parse_error == "missing_verdict"
+        assert parsed.verdict is None
+        assert parsed.must_fix_count == 1
+
+
+class TestComputeReviewScore:
+    def test_clean_approved_scores_100(self) -> None:
+        parsed = parse_review_template(_template_review())
+        assert compute_review_score(parsed) == 100
+
+    def test_must_fix_penalties_and_clamp(self) -> None:
+        one = ParsedReview(must_fix_count=1, suggestion_count=0, summary_checklist=(), verdict="CHANGES_REQUESTED", unparseable=False)
+        five = ParsedReview(must_fix_count=5, suggestion_count=0, summary_checklist=(), verdict="CHANGES_REQUESTED", unparseable=False)
+        six = ParsedReview(must_fix_count=6, suggestion_count=0, summary_checklist=(), verdict="CHANGES_REQUESTED", unparseable=False)
+        assert compute_review_score(one) == 80
+        assert compute_review_score(five) == 0
+        assert compute_review_score(six) == 0
+
+    def test_suggestion_penalties(self) -> None:
+        three = ParsedReview(must_fix_count=0, suggestion_count=3, summary_checklist=(), verdict="APPROVED", unparseable=False)
+        ten = ParsedReview(must_fix_count=0, suggestion_count=10, summary_checklist=(), verdict="APPROVED", unparseable=False)
+        assert compute_review_score(three) == 91
+        assert compute_review_score(ten) == 70
+
+    def test_mixed_penalties(self) -> None:
+        parsed = ParsedReview(
+            must_fix_count=2,
+            suggestion_count=4,
+            summary_checklist=(("Checklist item", False),),
+            verdict="CHANGES_REQUESTED",
+            unparseable=False,
+        )
+        assert compute_review_score(parsed) == 38
+
+    def test_unparseable_review_without_signals_scores_zero(self) -> None:
+        parsed = parse_review_template("this is garbage")
+        assert parsed.unparseable is True
+        assert compute_review_score(parsed) == 0
+
+    def test_malformed_must_fix_body_scores_zero(self) -> None:
+        parsed = parse_review_template(
+            _template_review(
+                must_fix="- broken freeform content without expected H3 entries",
+                suggestions="None.",
+                verdict="Verdict: APPROVED",
+            )
+        )
+        assert parsed.unparseable is True
+        assert parsed.parse_error == "malformed_must_fix_section"
+        assert compute_review_score(parsed) == 0
+
+    def test_malformed_suggestions_body_scores_zero(self) -> None:
+        parsed = parse_review_template(
+            _template_review(
+                must_fix="None.",
+                suggestions="- broken freeform suggestion content",
+                verdict="Verdict: APPROVED",
+            )
+        )
+        assert parsed.unparseable is True
+        assert parsed.parse_error == "malformed_suggestions_section"
+        assert compute_review_score(parsed) == 0
+
+    def test_malformed_checklist_list_markers_without_yes_no_scores_zero(self) -> None:
+        parsed = parse_review_template(
+            _template_review(
+                checklist=[
+                    "- maybe - unclear checklist item one",
+                    "- pending - unclear checklist item two",
+                ],
+                must_fix="None.",
+                suggestions="None.",
+                verdict="Verdict: CHANGES_REQUESTED",
+            )
+        )
+        assert parsed.unparseable is True
+        assert parsed.parse_error == "malformed_checklist"
+        assert compute_review_score(parsed) == 0
+
+    def test_missing_verdict_still_scores_from_parsed_fields(self) -> None:
+        parsed = parse_review_template(
+            _template_review(
+                checklist=["- No - one missing"],
+                suggestions="### S1 Follow-up\nSuggestion: update docs",
+                verdict="No final verdict section",
+            )
+        )
+        assert parsed.unparseable is True
+        assert parsed.parse_error == "missing_verdict"
+        assert compute_review_score(parsed) == 87

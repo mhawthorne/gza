@@ -438,7 +438,6 @@ class TestLocalConfigOverrides:
     def test_config_keys_table_lists_all_registered_keys_and_columns(self, tmp_path: Path):
         """`gza config keys` should render a tabular registry with stable columns."""
         from gza.config_schema import CONFIG_KEY_REGISTRY
-
         setup_config(tmp_path)
 
         result = subprocess.run(

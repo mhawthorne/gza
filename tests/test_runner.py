@@ -4247,6 +4247,76 @@ class TestNonCodeReportArtifactContract:
         assert host_report.exists()
         assert host_report.read_text() == review_text
 
+    def test_completed_review_persists_derived_review_score(self, tmp_path: Path):
+        """Review completion path should persist derived deterministic review score."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review score persistence", task_type="review")
+        review_task.slug = "20260213-review-score-persistence"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        review_text = (
+            "## Summary\n\n"
+            "- Yes - Correctness preserved\n"
+            "- No - Edge case is not covered\n\n"
+            "## Must-Fix\n\n"
+            "### M1 Add empty-input guard\n"
+            "Required fix: return early when input is empty\n\n"
+            "## Suggestions\n\n"
+            "### S1 Improve docs\n"
+            "Suggestion: add quick-start example\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Verdict: CHANGES_REQUESTED\n"
+        )
+
+        def provider_run(_config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            import json as _json
+
+            with open(log_file, "a") as f:
+                f.write(_json.dumps({"type": "result", "subtype": "success", "result": review_text}) + "\n")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id="session-score",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console"), patch(
+            "gza.runner.maybe_auto_regenerate_learnings", return_value=None
+        ):
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.review_score == 67
+
     def test_missing_report_artifact_recovered_from_interactive_plaintext_log(self, tmp_path: Path):
         """Interactive plaintext output should be captured as result text for artifact recovery."""
         db_path = tmp_path / "test.db"

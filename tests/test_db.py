@@ -4140,7 +4140,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4152,7 +4152,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -4604,6 +4604,28 @@ class TestMigrationUtilityFunctions:
         assert version == SCHEMA_VERSION
         assert "task_comments" in tables
 
+    def test_auto_migration_v32_to_v33_adds_review_score_column(self, tmp_path: Path) -> None:
+        """Opening a v32 DB should migrate to v33 and create tasks.review_score."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 32")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert "review_score" in columns
+
     def test_open_current_v32_db_repairs_missing_task_comments_table(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing comment artifacts."""
         import sqlite3
@@ -4910,7 +4932,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

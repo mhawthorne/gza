@@ -1402,6 +1402,57 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Execution Mode: skill_inline" in result.stdout
 
+    def test_show_review_displays_verdict_and_score(self, tmp_path: Path):
+        """Show command includes derived review verdict and score metadata."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        review = store.add("Review output", task_type="review")
+        assert review.id is not None
+        review.status = "completed"
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        review.review_score = 34
+        store.update(review)
+
+        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Verdict: CHANGES_REQUESTED" in result.stdout
+        assert "Score: 34/100" in result.stdout
+
+    def test_show_review_hides_score_when_source_unavailable(self, tmp_path: Path):
+        """Show command must not render score when no derivation source exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        review = store.add("Review output", task_type="review")
+        assert review.id is not None
+        review.status = "completed"
+        review.output_content = None
+        review.report_file = None
+        review.review_score = None
+        store.update(review)
+
+        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Score:" not in result.stdout
+
+    def test_show_review_displays_zero_score_for_malformed_present_content(self, tmp_path: Path):
+        """Show command should render 0/100 when malformed review content is present."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        review = store.add("Malformed review output", task_type="review")
+        assert review.id is not None
+        review.status = "completed"
+        review.output_content = "not a structured review"
+        review.report_file = None
+        review.review_score = None
+        store.update(review)
+
+        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Score: 0/100" in result.stdout
+
     def test_show_displays_task_comments(self, tmp_path: Path):
         """Show command prints full comment metadata, including audit timestamps/state."""
         setup_config(tmp_path)
@@ -1451,7 +1502,7 @@ class TestShowCommand:
 
         db_path = tmp_path / ".gza" / "gza.db"
         conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE schema_version SET version = 32")
+        conn.execute("UPDATE schema_version SET version = 33")
         conn.execute("DROP TABLE task_comments")
         conn.commit()
         conn.close()
@@ -3536,6 +3587,22 @@ class TestUnmergedReviewStatus:
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert expected_text in result.stdout
+
+    def test_unmerged_appends_review_score_when_present(self, tmp_path: Path):
+        """Unmerged verdict badge should append stored review score."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        review = store.add("Review implementation", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.depends_on = task.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        review.review_score = 34
+        store.update(review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "⚠ changes requested (34)" in result.stdout
 
     def test_unmerged_without_review_shows_no_status(self, tmp_path: Path):
         """Unmerged output shows no review status when no review exists."""

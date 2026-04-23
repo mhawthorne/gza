@@ -39,7 +39,12 @@ from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
-from .review_verdict import parse_review_report, parse_review_verdict
+from .review_verdict import (
+    compute_review_score,
+    parse_review_report,
+    parse_review_template,
+    parse_review_verdict,
+)
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -3368,6 +3373,8 @@ def _run_non_code_task(
 
         # Read output content for storage in DB
         output_content = report_path.read_text()
+        if task.task_type == "review":
+            task.review_score = compute_review_score(parse_review_template(output_content))
 
         # Clean up non-code worktree on success — report has been copied back, no further use
         if git:

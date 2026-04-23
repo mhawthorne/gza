@@ -34,7 +34,12 @@ from ..review_tasks import (
     create_or_reuse_followup_task,
     create_review_task,
 )
-from ..review_verdict import ReviewFinding, get_review_verdict as _get_review_verdict, parse_review_verdict
+from ..review_verdict import (
+    ReviewFinding,
+    get_review_score as _get_review_score,
+    get_review_verdict as _get_review_verdict,
+    parse_review_verdict,
+)
 from ..runner import RunInvocationContext, get_effective_config_for_task, run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -968,6 +973,11 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
         Verdict string ('APPROVED', 'APPROVED_WITH_FOLLOWUPS', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
     """
     return _get_review_verdict(config.project_dir, review_task)
+
+
+def get_review_score(config: Config, review_task: DbTask) -> int | None:
+    """Compute deterministic review score from review output content/report file."""
+    return _get_review_score(config.project_dir, review_task)
 
 
 def _create_review_task(
