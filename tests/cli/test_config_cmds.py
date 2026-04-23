@@ -435,6 +435,57 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["task_providers"]["review"] == "claude"
         assert payload["sources"]["task_providers.review"] == "base"
 
+    def test_config_keys_table_lists_all_registered_keys_and_columns(self, tmp_path: Path):
+        """`gza config keys` should render a tabular registry with stable columns."""
+        from gza.config_schema import CONFIG_KEY_REGISTRY
+
+        setup_config(tmp_path)
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "keys", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "KEY" in result.stdout
+        assert "TYPE" in result.stdout
+        assert "DEFAULT" in result.stdout
+        assert "DESCRIPTION" in result.stdout
+
+        rendered_keys: set[str] = set()
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("KEY") or stripped.startswith("---"):
+                continue
+            parts = re.split(r"\s{2,}", stripped)
+            if parts:
+                rendered_keys.add(parts[0])
+        expected_keys = {spec.key for spec in CONFIG_KEY_REGISTRY}
+        assert rendered_keys == expected_keys
+
+    def test_config_keys_json_emits_valid_machine_readable_registry(self, tmp_path: Path):
+        """`gza config keys --json` should emit a full machine-readable registry payload."""
+        from gza.config_schema import CONFIG_KEY_REGISTRY
+
+        setup_config(tmp_path)
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "keys", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert "keys" in payload
+        keys = payload["keys"]
+        assert isinstance(keys, list)
+        assert keys
+        assert {entry["key"] for entry in keys} == {spec.key for spec in CONFIG_KEY_REGISTRY}
+        for entry in keys:
+            assert set(entry.keys()) == {"key", "type", "required", "default", "description"}
+
 
 class TestInitCommand:
     """Tests for 'gza init' command."""

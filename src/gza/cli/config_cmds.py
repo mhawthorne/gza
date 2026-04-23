@@ -14,6 +14,7 @@ from statistics import median
 from rich.table import Table
 
 from ..config import Config
+from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
 from ..db import SqliteTaskStore, Task, task_id_numeric_key
 from ..git import Git
@@ -904,6 +905,57 @@ def cmd_config(args: argparse.Namespace) -> int:
     for task_type, provider, model_display in model_rows:
         print(f"{task_type:<{type_width}}  {provider:<{prov_width}}  {model_display}")
 
+    return 0
+
+
+def _format_config_key_default(default: object | None, required: bool) -> str:
+    if required:
+        return "(required)"
+    return json.dumps(default)
+
+
+def cmd_config_keys(args: argparse.Namespace) -> int:
+    """List discoverable configuration keys from the single-source registry."""
+    rows = sorted(CONFIG_KEY_REGISTRY, key=lambda spec: spec.key)
+    if args.json:
+        payload = {
+            "keys": [
+                {
+                    "key": spec.key,
+                    "type": spec.value_type,
+                    "required": spec.required,
+                    "default": spec.default,
+                    "description": spec.description,
+                }
+                for spec in rows
+            ]
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    key_width = max(len(spec.key) for spec in rows)
+    type_width = max(len(spec.value_type) for spec in rows)
+    default_width = max(len(_format_config_key_default(spec.default, spec.required)) for spec in rows)
+    print(
+        f"{'KEY':<{key_width}}  "
+        f"{'TYPE':<{type_width}}  "
+        f"{'DEFAULT':<{default_width}}  "
+        "DESCRIPTION"
+    )
+    print(
+        f"{'-' * key_width}  "
+        f"{'-' * type_width}  "
+        f"{'-' * default_width}  "
+        f"{'-' * len('DESCRIPTION')}"
+    )
+    for spec in rows:
+        default_display = _format_config_key_default(spec.default, spec.required)
+        print(
+            f"{spec.key:<{key_width}}  "
+            f"{spec.value_type:<{type_width}}  "
+            f"{default_display:<{default_width}}  "
+            f"{spec.description}"
+        )
     return 0
 
 

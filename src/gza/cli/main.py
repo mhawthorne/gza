@@ -31,6 +31,7 @@ from ._common import (
 from .config_cmds import (
     cmd_clean,
     cmd_config,
+    cmd_config_keys,
     cmd_import,
     cmd_init,
     cmd_learnings,
@@ -759,6 +760,14 @@ def main() -> int:
 
     # config command
     config_parser = subparsers.add_parser("config", help="Show effective config with source attribution")
+    config_subparsers = config_parser.add_subparsers(dest="config_action")
+    config_keys_parser = config_subparsers.add_parser("keys", help="List discoverable configuration keys")
+    config_keys_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output config key registry as JSON",
+    )
+    add_common_args(config_keys_parser)
     config_parser.add_argument(
         "--json",
         action="store_true",
@@ -1827,6 +1836,8 @@ def main() -> int:
         elif args.command == "validate":
             return cmd_validate(args)
         elif args.command == "config":
+            if getattr(args, "config_action", None) == "keys":
+                return cmd_config_keys(args)
             return cmd_config(args)
         elif args.command == "clean":
             return cmd_clean(args)
