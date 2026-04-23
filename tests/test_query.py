@@ -7,6 +7,7 @@ import pytest
 
 from gza.db import SqliteTaskStore, Task
 from gza.query import (
+    _resolve_effective_shared_branch_retry_head,
     HistoryFilter,
     get_task_lineage,
     is_lineage_complete,
@@ -582,3 +583,95 @@ class TestQueryIncomplete:
         assert lineages[0].root.id == root.id
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {root.id}
+
+    def test_failed_root_with_merged_resume_hides_shared_branch_completed_descendants(self, tmp_path: Path):
+        """Regression: failed root should use merged resume head merge truth."""
+        store = self._store(tmp_path)
+
+        root = store.add("failed implement root", task_type="implement")
+        root.branch = "feat/shared"
+        self._fail(root)
+        store.update(root)
+        assert root.id is not None
+
+        resumed = store.add("resumed implement", task_type="implement", based_on=root.id)
+        resumed.branch = "feat/shared"
+        self._complete(resumed, merge_status="merged")
+        store.update(resumed)
+        assert resumed.id is not None
+
+        review = store.add("completed review", task_type="review", based_on=resumed.id, depends_on=resumed.id)
+        self._complete(review, merge_status="unmerged")
+        review.branch = "feat/shared"
+        store.update(review)
+
+        improve = store.add("completed improve", task_type="improve", based_on=resumed.id, same_branch=True)
+        improve.branch = "feat/shared"
+        self._complete(improve, merge_status="unmerged")
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_failed_root_with_merged_retry_hides_lineage(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("failed implement root", task_type="implement")
+        root.branch = "feat/retry"
+        self._fail(root)
+        store.update(root)
+        assert root.id is not None
+
+        retry = store.add("retry implement", task_type="implement", based_on=root.id)
+        retry.branch = "feat/retry"
+        self._complete(retry, merge_status="merged")
+        store.update(retry)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert lineages == []
+
+    def test_failed_root_with_unmerged_resume_keeps_lineage_visible(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("failed implement root", task_type="implement")
+        root.branch = "feat/unmerged-resume"
+        self._fail(root)
+        store.update(root)
+        assert root.id is not None
+
+        resumed = store.add("resumed implement", task_type="implement", based_on=root.id)
+        resumed.branch = "feat/unmerged-resume"
+        self._complete(resumed, merge_status="unmerged")
+        store.update(resumed)
+        assert resumed.id is not None
+
+        improve = store.add("completed improve", task_type="improve", based_on=resumed.id, same_branch=True)
+        improve.branch = "feat/unmerged-resume"
+        self._complete(improve, merge_status="unmerged")
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == root.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {resumed.id, improve.id}
+
+    def test_effective_shared_branch_head_distinguishes_canonical_root_from_merged_resume(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("failed implement root", task_type="implement")
+        root.branch = "feat/effective-head"
+        self._fail(root)
+        store.update(root)
+        assert root.id is not None
+
+        resumed = store.add("resumed implement", task_type="implement", based_on=root.id)
+        resumed.branch = "feat/effective-head"
+        self._complete(resumed, merge_status="merged")
+        store.update(resumed)
+        assert resumed.id is not None
+
+        effective_head = _resolve_effective_shared_branch_retry_head(store, root)
+        assert effective_head.id == resumed.id
+        resolved_root_id = get_task_lineage(store, resumed.id, 0).task.id
+        assert resolved_root_id == root.id
