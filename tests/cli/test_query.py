@@ -3718,6 +3718,109 @@ class TestUnmergedReviewStatus:
         assert "review stale" in result.stdout
         assert "last review" in result.stdout
 
+    def test_unmerged_marks_review_stale_after_completed_fix(self, tmp_path: Path):
+        """A completed same-branch fix after review marks review stale in unmerged output."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        review = store.add("Review implementation", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        review.depends_on = task.id
+        review.output_content = "Verdict: APPROVED"
+        store.update(review)
+
+        fix_task = store.add("Fix follow-up", task_type="fix")
+        fix_task.status = "completed"
+        fix_task.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        fix_task.based_on = task.id
+        fix_task.depends_on = review.id
+        fix_task.branch = "feature/test"
+        fix_task.same_branch = True
+        store.update(fix_task)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "review: review stale" in normalized
+        assert f"latest fix {fix_task.id}" in normalized
+        assert "review: reviewed [✓ approved]" not in normalized
+
+    def test_unmerged_uses_review_attached_to_same_branch_improve(self, tmp_path: Path):
+        """A same-branch improve review should drive the branch review status."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        improve = store.add("Improve implementation", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        improve.based_on = task.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        review = store.add("Review improve", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        review.depends_on = improve.id
+        review.output_content = "Verdict: APPROVED"
+        store.update(review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert "review: reviewed [✓ approved]" in normalized
+        assert review.id in normalized
+        assert "review: no review" not in normalized
+        assert "review stale" not in normalized
+
+    def test_unmerged_uses_review_attached_to_same_branch_fix(self, tmp_path: Path):
+        """A same-branch fix review should drive the branch review status."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        fix_task = store.add("Fix implementation", task_type="fix")
+        fix_task.status = "completed"
+        fix_task.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        fix_task.based_on = task.id
+        fix_task.branch = "feature/test"
+        fix_task.same_branch = True
+        store.update(fix_task)
+
+        review = store.add("Review fix", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        review.depends_on = fix_task.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert "review: reviewed [⚠ changes requested]" in normalized
+        assert review.id in normalized
+        assert "review: no review" not in normalized
+        assert "review stale" not in normalized
+
+    def test_unmerged_stale_detail_from_review_cleared_state_is_truthful(self, tmp_path: Path):
+        """review_cleared_at stale state should not claim an improve task exists."""
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        review = store.add("Review implementation", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.depends_on = task.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        assert task.id is not None
+        store.clear_review_state(task.id)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "review: review stale" in normalized
+        assert "latest improve" not in normalized
+        assert "review state cleared after last review" in normalized
     def test_unmerged_shows_new_review_status_after_improve_and_re_review(self, tmp_path: Path):
         """After improve clears review state, a newer review's verdict is shown."""
         import time
@@ -3996,6 +4099,267 @@ class TestUnmergedReviewStatus:
         assert resumed_review.id in normalized
         assert "⚠ changes requested" not in normalized
 
+    def test_unmerged_marks_review_stale_when_newer_same_branch_implement_has_no_review(self, tmp_path: Path):
+        """A newer same-branch implementation retry must stale prior review verdicts."""
+        store, root_impl, git = setup_unmerged_env(tmp_path)
+        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(root_impl)
+
+        review_a = store.add("Review first implementation", task_type="review")
+        review_a.status = "completed"
+        review_a.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        review_a.depends_on = root_impl.id
+        review_a.output_content = "Verdict: APPROVED"
+        store.update(review_a)
+
+        impl_retry = store.add("Retry implementation without review", task_type="implement")
+        impl_retry.status = "completed"
+        impl_retry.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        impl_retry.based_on = root_impl.id
+        impl_retry.branch = "feature/test"
+        impl_retry.same_branch = True
+        impl_retry.has_commits = True
+        impl_retry.merge_status = "unmerged"
+        store.update(impl_retry)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert f"⚡ {impl_retry.id}" in normalized
+        assert "review: review stale" in normalized
+        assert f"latest implement {impl_retry.id}" in normalized
+        assert "review: reviewed [✓ approved]" not in normalized
+
+    def test_unmerged_prefers_newer_same_branch_descendant_review_over_older_implementation_review(
+        self, tmp_path: Path
+    ):
+        """A newer review on same-branch descendant work should override older impl review state."""
+        store, root_impl, git = setup_unmerged_env(tmp_path)
+        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(root_impl)
+
+        older_review = store.add("Review root implementation", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        older_review.depends_on = root_impl.id
+        older_review.output_content = "Verdict: APPROVED"
+        store.update(older_review)
+
+        improve = store.add("Improve implementation", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        improve.based_on = root_impl.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        newer_review = store.add("Review improve", task_type="review")
+        newer_review.status = "completed"
+        newer_review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        newer_review.depends_on = improve.id
+        newer_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(newer_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert "review: reviewed [⚠ changes requested]" in normalized
+        assert "review: reviewed [✓ approved]" not in normalized
+        assert newer_review.id in normalized
+
+    def test_unmerged_retry_resume_uses_root_review_clear_state_for_staleness(self, tmp_path: Path):
+        """Shared-branch representative should still show stale review after root clear."""
+        store, root_impl, git = setup_unmerged_env(tmp_path)
+        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(root_impl)
+
+        retry_impl = store.add("Retry implementation", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/test"
+        retry_impl.same_branch = True
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        retry_impl.session_id = "sess-retry"
+        store.update(retry_impl)
+
+        retry_review = store.add("Review retry", task_type="review")
+        retry_review.status = "completed"
+        retry_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        retry_review.depends_on = retry_impl.id
+        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(retry_review)
+
+        assert root_impl.id is not None
+        store.clear_review_state(root_impl.id)
+
+        resumed_impl = store.add("Resume retry implementation", task_type="implement")
+        resumed_impl.status = "completed"
+        resumed_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        resumed_impl.based_on = retry_impl.id
+        resumed_impl.branch = "feature/test"
+        resumed_impl.same_branch = True
+        resumed_impl.has_commits = True
+        resumed_impl.merge_status = "unmerged"
+        resumed_impl.session_id = "sess-retry"
+        store.update(resumed_impl)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert f"⚡ {resumed_impl.id}" in normalized
+        assert "review: review stale" in normalized
+        assert f"review state cleared after last review {retry_review.id}" in normalized
+        assert "review: no review" not in normalized
+        assert "⚠ changes requested" not in normalized
+
+    def test_unmerged_does_not_inherit_root_review_across_branches(self, tmp_path: Path):
+        """A descendant branch row must not inherit review verdict from root branch."""
+        store, root_impl, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Root implementation",
+            branch="feature/root",
+        )
+        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(root_impl)
+
+        root_review = store.add("Root branch review", task_type="review")
+        root_review.status = "completed"
+        root_review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        root_review.depends_on = root_impl.id
+        root_review.output_content = "Verdict: APPROVED"
+        store.update(root_review)
+
+        git._run("checkout", "-b", "feature/retry", "main")
+        (tmp_path / "retry.txt").write_text("retry branch content\n")
+        git._run("add", "retry.txt")
+        git._run("commit", "-m", "Retry branch commit")
+        git._run("checkout", "main")
+
+        retry_impl = store.add("Retry on new branch", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/retry"
+        retry_impl.same_branch = False
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        store.update(retry_impl)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
+        root_block = _unmerged_branch_block(result.stdout, "feature/root")
+        assert "review: no review" in retry_block
+        assert "✓ approved" not in retry_block
+        assert "review: reviewed [✓ approved]" in root_block
+
+    def test_unmerged_branch_review_uses_branch_specific_review_source(self, tmp_path: Path):
+        """When branch has its own review, root-branch review must not override it."""
+        store, root_impl, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Root implementation",
+            branch="feature/root",
+        )
+        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(root_impl)
+
+        git._run("checkout", "-b", "feature/retry", "main")
+        (tmp_path / "retry.txt").write_text("retry branch content\n")
+        git._run("add", "retry.txt")
+        git._run("commit", "-m", "Retry branch commit")
+        git._run("checkout", "main")
+
+        retry_impl = store.add("Retry on new branch", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/retry"
+        retry_impl.same_branch = False
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        store.update(retry_impl)
+
+        retry_review = store.add("Retry review", task_type="review")
+        retry_review.status = "completed"
+        retry_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        retry_review.depends_on = retry_impl.id
+        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(retry_review)
+
+        root_review = store.add("Root review", task_type="review")
+        root_review.status = "completed"
+        root_review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        root_review.depends_on = root_impl.id
+        root_review.output_content = "Verdict: APPROVED"
+        store.update(root_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
+        root_block = _unmerged_branch_block(result.stdout, "feature/root")
+        assert "review: reviewed [⚠ changes requested]" in retry_block
+        assert "✓ approved" not in retry_block
+        assert "review: reviewed [✓ approved]" in root_block
+
+    def test_unmerged_split_branch_keeps_branch_local_review_after_root_review_clear(self, tmp_path: Path):
+        """Root review-clear state must not stale a split descendant branch row."""
+        store, root_impl, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Root implementation",
+            branch="feature/root",
+        )
+        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(root_impl)
+
+        root_review = store.add("Root review", task_type="review")
+        root_review.status = "completed"
+        root_review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        root_review.depends_on = root_impl.id
+        root_review.output_content = "Verdict: APPROVED"
+        store.update(root_review)
+
+        git._run("checkout", "-b", "feature/retry", "main")
+        (tmp_path / "retry.txt").write_text("retry branch content\n")
+        git._run("add", "retry.txt")
+        git._run("commit", "-m", "Retry branch commit")
+        git._run("checkout", "main")
+
+        retry_impl = store.add("Retry on new branch", task_type="implement")
+        retry_impl.status = "completed"
+        retry_impl.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        retry_impl.based_on = root_impl.id
+        retry_impl.branch = "feature/retry"
+        retry_impl.same_branch = False
+        retry_impl.has_commits = True
+        retry_impl.merge_status = "unmerged"
+        store.update(retry_impl)
+
+        retry_review = store.add("Retry review", task_type="review")
+        retry_review.status = "completed"
+        retry_review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        retry_review.depends_on = retry_impl.id
+        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(retry_review)
+
+        assert root_impl.id is not None
+        store.clear_review_state(root_impl.id)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
+        root_block = _unmerged_branch_block(result.stdout, "feature/root")
+        assert "review: reviewed [⚠ changes requested]" in retry_block
+        assert "review stale" not in retry_block
+        assert "review state cleared after last review" not in retry_block
+        assert "review: review stale" in root_block
     def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
         """The most recent review node is annotated with the latest marker."""
         store, impl, git = setup_unmerged_env(tmp_path)

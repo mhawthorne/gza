@@ -779,10 +779,83 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             representative_task = max(tasks, key=_task_recency_key)
 
         representative_branch = representative_task.branch or branch
-        reviews = _get_reviews_for_root_task(store, representative_task)
-        improve_tasks = _get_improves_for_root_task(store, representative_task)
         lineage_root = _resolve_lineage_root_task(store, representative_task)
         lineage_tree = _build_lineage_tree_for_root(store, lineage_root)
+        code_changing_tasks = _get_code_changing_descendants_for_root_task(store, lineage_root)
+
+        review_source_task_ids: set[str] = set()
+        root_branch = lineage_root.branch
+        include_root_review_fallback = bool(
+            lineage_root.id is not None
+            and (
+                lineage_root.id == representative_task.id
+                or not representative_branch
+                or not root_branch
+                or root_branch == representative_branch
+            )
+        )
+        effective_review_cleared_at = (
+            lineage_root.review_cleared_at if include_root_review_fallback else None
+        )
+        same_branch_code_changing_tasks: list[DbTask] = []
+        same_branch_code_change_ids: set[str] = set()
+        for task in code_changing_tasks:
+            if not task.branch or task.branch != representative_branch:
+                continue
+            if task.id is not None:
+                if task.id in same_branch_code_change_ids:
+                    continue
+                same_branch_code_change_ids.add(task.id)
+            same_branch_code_changing_tasks.append(task)
+
+        stack = [lineage_tree]
+        while stack:
+            node = stack.pop()
+            task = node.task
+            if (
+                task.task_type == "implement"
+                and task.branch
+                and task.branch == representative_branch
+                and task.id != lineage_root.id
+            ):
+                if task.id is None or task.id not in same_branch_code_change_ids:
+                    if task.id is not None:
+                        same_branch_code_change_ids.add(task.id)
+                    same_branch_code_changing_tasks.append(task)
+            if (
+                task.id is not None
+                and task.task_type == "implement"
+                and (
+                    (representative_branch and task.branch == representative_branch)
+                    or (include_root_review_fallback and task.id == lineage_root.id)
+                )
+            ):
+                review_source_task_ids.add(task.id)
+            stack.extend(node.children)
+
+        for task in same_branch_code_changing_tasks:
+            if task.id is not None:
+                review_source_task_ids.add(task.id)
+
+        reviews: list[DbTask] = []
+        seen_review_ids: set[str] = set()
+        for task_id in review_source_task_ids:
+            for review in store.get_reviews_for_task(task_id):
+                if review.id is None or review.id in seen_review_ids:
+                    continue
+                seen_review_ids.add(review.id)
+                reviews.append(review)
+        if reviews:
+            reviews.sort(
+                key=lambda review: (
+                    review.completed_at or datetime.min,
+                    _task_id_numeric_key(review.id if isinstance(review.id, str) else None),
+                ),
+                reverse=True,
+            )
+        elif include_root_review_fallback:
+            # Keep manual/unlinked review fallback for root-slug review tasks.
+            reviews = _get_reviews_for_root_task(store, lineage_root)
         c = UNMERGED_COLORS  # shorthand
         lineage_str = _format_lineage(
             lineage_tree,
@@ -792,9 +865,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
         # Classify review freshness/status for this implementation.
         latest_review = next((r for r in reviews if r.status == "completed"), None)
-        latest_improve = max(
-            (imp for imp in improve_tasks if imp.completed_at is not None),
-            key=lambda imp: imp.completed_at or datetime.min,
+        latest_code_change = max(
+            (task for task in same_branch_code_changing_tasks if task.completed_at is not None),
+            key=lambda task: task.completed_at or datetime.min,
             default=None,
         )
 
@@ -807,20 +880,31 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             latest_review_completed = latest_review.completed_at
             assert latest_review_completed is not None
 
-            review_is_stale = False
-            if representative_task.review_cleared_at and representative_task.review_cleared_at >= latest_review_completed:
-                review_is_stale = True
-            if latest_improve and latest_improve.completed_at and latest_improve.completed_at > latest_review_completed:
-                review_is_stale = True
+            review_cleared_stale = bool(
+                effective_review_cleared_at and effective_review_cleared_at >= latest_review_completed
+            )
+            latest_code_change_stale = bool(
+                latest_code_change
+                and latest_code_change.completed_at
+                and latest_code_change.completed_at > latest_review_completed
+            )
+            review_is_stale = review_cleared_stale or latest_code_change_stale
 
             if review_is_stale:
                 review_classification = "review stale"
                 review_status_color = UNMERGED_COLORS["review_changes"]
                 latest_review_id = latest_review.id if latest_review.id is not None else "?"
-                if latest_improve and latest_improve.id is not None:
-                    review_detail = f"last review {latest_review_id} before latest improve {latest_improve.id}"
+                if review_cleared_stale:
+                    review_detail = f"review state cleared after last review {latest_review_id}"
+                elif latest_code_change_stale and latest_code_change and latest_code_change.id is not None:
+                    review_detail = (
+                        f"last review {latest_review_id} before latest "
+                        f"{latest_code_change.task_type} {latest_code_change.id}"
+                    )
+                elif latest_code_change_stale:
+                    review_detail = f"last review {latest_review_id} before latest code-changing task"
                 else:
-                    review_detail = f"last review {latest_review_id} before latest improve"
+                    review_detail = f"last review {latest_review_id} is stale"
             else:
                 review_classification = "reviewed"
                 review_status_color = UNMERGED_COLORS["review_approved"]
@@ -831,7 +915,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 for review in reviews:
                     if review.status != "completed" or review.completed_at is None:
                         continue
-                    if representative_task.review_cleared_at and representative_task.review_cleared_at >= review.completed_at:
+                    if effective_review_cleared_at and effective_review_cleared_at >= review.completed_at:
                         continue
                     verdict = get_review_verdict(config, review)
                     if verdict:
