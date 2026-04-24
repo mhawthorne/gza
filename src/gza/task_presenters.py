@@ -62,27 +62,45 @@ def _render_grouped(result: TaskQueryResult) -> str:
 
 def _render_tree(result: TaskQueryResult) -> str:
     lines: list[str] = []
+    incomplete_view = bool(
+        result.query.lifecycle_state and "incomplete" in result.query.lifecycle_state
+    )
     for index, row in enumerate(result.rows):
         if not isinstance(row, LineageRow) or row.tree is None:
             continue
         if index > 0:
             lines.append("-" * 32)
 
-        def _walk(node: TaskLineageNode, prefix: str = "", is_last: bool = True) -> None:
+        unresolved_ids = {
+            task.id for task in row.unresolved_tasks
+            if task.id is not None
+        }
+
+        def _walk(
+            node: TaskLineageNode,
+            prefix: str = "",
+            *,
+            is_last: bool = True,
+            is_root: bool = False,
+        ) -> None:
             task = node.task
-            connector = ""
-            child_prefix = ""
-            if prefix:
-                connector = "└── " if is_last else "├── "
-                child_prefix = prefix + ("    " if is_last else "│   ")
+            connector = "" if is_root else ("└── " if is_last else "├── ")
+            child_prefix = prefix + ("    " if is_last else "│   ")
             task_id = task.id or "unknown"
             status = task.status
+            if incomplete_view and task.id is not None and task.id not in unresolved_ids:
+                status = "resolved"
             prompt = shorten_prompt(task.prompt, 90)
             lines.append(f"{prefix}{connector}{status:<11} {task_id} {prompt}")
             for child_index, child in enumerate(node.children):
-                _walk(child, child_prefix, child_index == len(node.children) - 1)
+                _walk(
+                    child,
+                    child_prefix,
+                    is_last=child_index == len(node.children) - 1,
+                    is_root=False,
+                )
 
-        _walk(row.tree)
+        _walk(row.tree, is_root=True)
     return "\n".join(lines)
 
 

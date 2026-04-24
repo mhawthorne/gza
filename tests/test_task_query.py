@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from gza.db import SqliteTaskStore
 from gza.task_query import (
     DateFilter,
@@ -203,3 +205,26 @@ def test_incomplete_date_field_completed_excludes_missing_completed_at(tmp_path:
 
     assert len(created_result.rows) == 1
     assert len(completed_result.rows) == 0
+
+
+def test_lineages_incomplete_rejects_multi_task_type_filter(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    failed = store.add("failed unresolved", task_type="implement")
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.failure_reason = "TEST_FAILURE"
+    store.update(failed)
+
+    service = TaskQueryService(store)
+    query = TaskQuery(
+        scope="lineages",
+        lifecycle_state=("incomplete",),
+        task_types=("implement", "review"),
+        limit=None,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="lineages scope with lifecycle_state=incomplete supports at most one task type",
+    ):
+        service.run(query)

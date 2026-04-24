@@ -290,6 +290,10 @@ class TaskQueryService:
 
         rows: list[LineageRow]
         if use_incomplete_rollup:
+            if query.task_types and len(query.task_types) > 1:
+                raise ValueError(
+                    "lineages scope with lifecycle_state=incomplete supports at most one task type"
+                )
             f = _history_filter_cls()(
                 limit=query.limit,
                 task_type=(query.task_types[0] if query.task_types and len(query.task_types) == 1 else None),

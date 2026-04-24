@@ -5914,6 +5914,72 @@ class TestIncompleteCommand:
         # The unresolved retry's own failure reason should still be rendered.
         assert "RETRY_TEST_FAILURE" in result.stdout
 
+    def test_incomplete_tree_renders_connectors_for_root_children(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root failed", task_type="implement")
+        root.status = "failed"
+        root.completed_at = datetime.now(UTC)
+        root.failure_reason = "ROOT_TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
+        retry_completed.status = "completed"
+        retry_completed.completed_at = datetime.now(UTC)
+        retry_completed.has_commits = True
+        retry_completed.merge_status = "unmerged"
+        store.update(retry_completed)
+        assert retry_completed.id is not None
+
+        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC)
+        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        result = run_gza("incomplete", "--tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "├──" in result.stdout
+        assert "└──" in result.stdout
+
+    def test_incomplete_tree_marks_context_nodes_resolved(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root failed", task_type="implement")
+        root.status = "failed"
+        root.completed_at = datetime.now(UTC)
+        root.failure_reason = "ROOT_TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
+        retry_completed.status = "completed"
+        retry_completed.completed_at = datetime.now(UTC)
+        retry_completed.has_commits = True
+        retry_completed.merge_status = "unmerged"
+        store.update(retry_completed)
+        assert retry_completed.id is not None
+
+        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC)
+        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        result = run_gza("incomplete", "--tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert re.search(rf"resolved\s+{re.escape(root.id)}\s+Root failed", result.stdout)
+        assert not re.search(rf"failed\s+{re.escape(root.id)}\s+Root failed", result.stdout)
+        assert "ROOT_TEST_FAILURE" not in result.stdout
+        assert re.search(rf"failed\s+{re.escape(retry_failed.id)}\s+Retry failed", result.stdout)
+
     def test_incomplete_hides_failed_root_when_completed_descendant_has_different_type(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
