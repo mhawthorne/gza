@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal, cast
 
 from rich.markup import escape as rich_escape
 
@@ -41,15 +42,26 @@ from ..git import Git, GitError, active_worktree_path_for_branch
 from ..pickup import get_runnable_pending_tasks
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
-    IncompleteLineage,
     TaskLineageNode,
+    _is_shared_branch_descendant as _is_query_shared_branch_descendant,
     build_lineage_tree as _build_lineage_tree_for_root,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
-    query_incomplete,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
+from ..task_query import (
+    DateFilter as _TaskDateFilter,
+    LineageRow as _LineageRow,
+    PresentationSpec as _TaskPresentationSpec,
+    ProjectionSpec as _TaskProjectionSpec,
+    TaskQuery as _TaskQuery,
+    TaskQueryPresets as _TaskQueryPresets,
+    TaskQueryResult as _TaskQueryResult,
+    TaskQueryService as _TaskQueryService,
+    TaskRow as _TaskRow,
+    parse_csv as _parse_csv,
+)
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     TASK_COLORS,
@@ -67,6 +79,13 @@ from ._common import (
 )
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
+_QueryDateField = Literal["created", "completed", "effective"]
+_PresentationMode = Literal["flat", "grouped", "tree", "one_line", "json"]
+
+
+def _parse_cli_date(value: str | None) -> _dt.date | None:
+    parsed = _parse_iso(value) if value else None
+    return parsed.date() if parsed else None
 
 
 def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
@@ -225,6 +244,7 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     config = Config.load(args.project_dir)
     store = get_store(config)
+    service = _TaskQueryService(store)
 
     status = getattr(args, 'status', None)
     task_type = getattr(args, 'type', None)
@@ -232,7 +252,15 @@ def cmd_history(args: argparse.Namespace) -> int:
     days = getattr(args, 'days', None)
     start_date = getattr(args, 'start_date', None)
     end_date = getattr(args, 'end_date', None)
+    date_field = cast(_QueryDateField, getattr(args, 'date_field', "effective"))
     lineage_depth = getattr(args, 'lineage_depth', 0)
+    projection_fields = _parse_csv(getattr(args, "fields", None))
+    projection_preset = getattr(args, "preset", None)
+    use_json = bool(getattr(args, "json", False))
+
+    if not use_json and (projection_fields is not None or projection_preset):
+        print("error: --fields and --preset require --json for gza history", file=sys.stderr)
+        return 2
 
     # If a date-based filter is active and --last/-n wasn't explicitly provided,
     # don't cap results with the default limit.
@@ -248,8 +276,35 @@ def cmd_history(args: argparse.Namespace) -> int:
         days=days,
         start_date=start_date,
         end_date=end_date,
+        date_field=date_field,
         lineage_depth=lineage_depth,
     )
+
+    if use_json:
+        selected_tasks = query_history(store, f)
+        selected_ids = [task.id for task in selected_tasks if task.id is not None]
+        if not selected_ids:
+            print("[]")
+            return 0
+
+        query = _TaskQuery(
+            scope="tasks",
+            limit=None,
+            projection=_TaskProjectionSpec(
+                preset=projection_preset or "history_default",
+                fields=projection_fields,
+            ),
+            presentation=_TaskPresentationSpec(mode="json"),
+        )
+        all_rows = tuple(row for row in service.run(query).rows if isinstance(row, _TaskRow))
+        rows_by_id = {row.task.id: row for row in all_rows if row.task.id is not None}
+        ordered_rows = tuple(rows_by_id[task_id] for task_id in selected_ids if task_id in rows_by_id)
+        result = _TaskQueryResult(query=query, rows=ordered_rows)
+
+        import json
+
+        print(json.dumps(result.to_json(), indent=2, default=str))
+        return 0
 
     c = TASK_COLORS
 
@@ -328,7 +383,13 @@ def cmd_history(args: argparse.Namespace) -> int:
     ) -> None:
         """Render a single task entry."""
         shares_parent_branch = _task_shares_parent_branch(task, parent_task)
-        use_merge_status = task.merge_status == "unmerged" and not shares_parent_branch
+        lineage_root = _resolve_lineage_root_task(store, task)
+        shares_owner_branch = _is_query_shared_branch_descendant(task, lineage_root)
+        use_merge_status = (
+            task.merge_status == "unmerged"
+            and not shares_parent_branch
+            and not shares_owner_branch
+        )
         if use_merge_status:
             status_label = "unmerged"
             status_color = c['unmerged']
@@ -534,16 +595,74 @@ def cmd_search(args: argparse.Namespace) -> int:
     """Search tasks by substring in prompt text."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    service = _TaskQueryService(store)
     term = args.term
-    limit = args.last
-    matches = store.search(term)
+    limit = None if args.last == 0 else args.last
+    projection_fields = _parse_csv(getattr(args, "fields", None))
+    projection_preset = getattr(args, "preset", None)
+    use_json = bool(getattr(args, "json", False))
+
+    if not use_json and (projection_fields is not None or projection_preset):
+        print("error: --fields and --preset require --json for gza search", file=sys.stderr)
+        return 2
+
+    date_filter = _TaskDateFilter(
+        field=cast(_QueryDateField, getattr(args, "date_field", "created")),
+        days=getattr(args, "days", None),
+        start=_parse_cli_date(getattr(args, "start_date", None)),
+        end=_parse_cli_date(getattr(args, "end_date", None)),
+    )
+    related_to = resolve_id(config, args.related_to) if getattr(args, "related_to", None) else None
+    lineage_of = resolve_id(config, args.lineage_of) if getattr(args, "lineage_of", None) else None
+    root_ids = None
+    if getattr(args, "root", None):
+        parsed_roots = _parse_csv(args.root)
+        root_ids = tuple(resolve_id(config, value) for value in parsed_roots) if parsed_roots else None
+
+    query = _TaskQueryPresets.search(
+        term=term,
+        limit=limit,
+        statuses=_parse_csv(getattr(args, "status", None)),
+        task_types=_parse_csv(getattr(args, "type", None)),
+        date_filter=date_filter,
+        related_to=related_to,
+        lineage_of=lineage_of,
+        root_ids=root_ids,
+    )
+    if projection_preset or projection_fields is not None:
+        query = _TaskQuery(
+            scope=query.scope,
+            limit=query.limit,
+            text=query.text,
+            statuses=query.statuses,
+            task_types=query.task_types,
+            lifecycle_state=query.lifecycle_state,
+            merge_chain_state=query.merge_chain_state,
+            dependency_state=query.dependency_state,
+            related_to=query.related_to,
+            lineage_of=query.lineage_of,
+            root_ids=query.root_ids,
+            branch_owner_ids=query.branch_owner_ids,
+            date_filter=query.date_filter,
+            sort=query.sort,
+            projection=_TaskProjectionSpec(
+                preset=projection_preset or query.projection.preset,
+                fields=projection_fields,
+            ),
+            presentation=query.presentation,
+        )
+    result = service.run(query)
+    matches = [row.task for row in result.rows if isinstance(row, _TaskRow)]
+
+    if use_json:
+        import json
+
+        print(json.dumps(result.to_json(), indent=2, default=str))
+        return 0
 
     if not matches:
         console.print(f"No tasks found matching '{term}'")
         return 0
-
-    if limit > 0:
-        matches = matches[:limit]
 
     c = TASK_COLORS
     STATUS_WIDTH = 11  # Align pending/in_progress task IDs in one column.
@@ -592,99 +711,60 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_incomplete(args: argparse.Namespace) -> int:
     """Show unresolved task lineages that still need attention."""
-    from gza.query import HistoryFilter, build_lineage_tree
-
     config = Config.load(args.project_dir)
     store = get_store(config)
-    limit = args.last
-    lineage_limit = None if limit == 0 else limit
-    c = TASK_COLORS
-
-    f = query_incomplete(
-        store,
-        HistoryFilter(
-            limit=lineage_limit,
-            task_type=getattr(args, "type", None),
-            days=getattr(args, "days", None),
-        ),
+    service = _TaskQueryService(store)
+    limit = None if args.last == 0 else args.last
+    mode = cast(_PresentationMode, "tree" if getattr(args, "tree", False) else "one_line")
+    task_type_filter: str | None = getattr(args, "type", None)
+    date_filter = _TaskDateFilter(
+        field=cast(_QueryDateField, getattr(args, "date_field", "effective")),
+        days=getattr(args, "days", None),
+    )
+    query = _TaskQueryPresets.incomplete(
+        limit=limit,
+        task_types=(task_type_filter,) if task_type_filter else None,
+        date_filter=date_filter,
+        mode=mode,
     )
 
-    if not f:
+    target_branch: str | None = None
+    git: Git | None = None
+    try:
+        git = Git(config.project_dir)
+        target_branch = git.default_branch()
+    except GitError:
+        git = None
+        target_branch = None
+
+    result = service.run(query, config=config, git=git, target_branch=target_branch)
+    if getattr(args, "json", False):
+        import json
+
+        print(json.dumps(result.to_json(), indent=2, default=str))
+        return 0
+
+    if not result.rows:
         console.print("No unresolved task lineages")
         return 0
 
-    STATUS_WIDTH = 11
+    rendered = result.render(mode)
+    if rendered:
+        console.print(rendered)
 
-    def _status_label_and_color(task: DbTask, unresolved_ids: set[str]) -> tuple[str, str]:
-        if task.id in unresolved_ids:
-            if task.status == "failed":
-                return ("failed", c['failure'])
-            if task.status == "dropped":
-                return ("dropped", c['failure'])
-            if task.status == "unmerged" or task.merge_status == "unmerged":
-                return ("unmerged", c['unmerged'])
-        if task.status == "failed":
-            return ("completed", c['success'])
-        if task.status == "dropped":
-            return ("dropped", c['failure'])
-        if task.status == "unmerged" or task.merge_status == "unmerged":
-            return ("unmerged", c['unmerged'])
-        return ("completed", c['success'])
-
-    def _render_lineage_group(group: IncompleteLineage) -> None:
-        # Rebuild with full descendants so lineage context remains visible.
-        lineage_tree = build_lineage_tree(store, group.root, max_depth=None)
-        unresolved_ids = {task.id for task in group.unresolved_tasks if task.id is not None}
-
-        def _render_node(node: TaskLineageNode, *, prefix: str = "", is_last: bool = True) -> None:
-            if prefix:
-                connector = "└── " if is_last else "├── "
-                first_prefix = f"{prefix}{connector}"
-                child_prefix = f"{prefix}{'    ' if is_last else '│   '}"
-            else:
-                first_prefix = ""
-                child_prefix = ""
-
-            status_label, status_color = _status_label_and_color(node.task, unresolved_ids)
-            status_padded = f"{status_label:<{STATUS_WIDTH}}"
-            date_str = (
-                f" ({node.task.completed_at.strftime('%Y-%m-%d %H:%M')})"
-                if node.task.completed_at
-                else ""
-            )
-            prompt_display = shorten_prompt(node.task.prompt, prompt_available_width(prefix=len(first_prefix) + STATUS_WIDTH + 8))
+    if getattr(args, "verbose", False) and mode != "tree":
+        c = TASK_COLORS
+        for row in result.rows:
+            if not isinstance(row, _LineageRow):
+                continue
+            owner = row.owner_task
+            owner_time = owner.completed_at or owner.created_at
+            owner_time_text = owner_time.strftime('%Y-%m-%d %H:%M') if owner_time else ""
             console.print(
-                f"{first_prefix}[{status_color}]{status_padded}[/{status_color}] "
-                f"[{c['task_id']}]{node.task.id}[/{c['task_id']}]"
-                f"[{c['date']}]{date_str}[/{c['date']}] "
-                f"[{c['prompt']}]{prompt_display}[/{c['prompt']}]"
+                f"    [{c['task_id']}]{owner.id}[/{c['task_id']}]"
+                f" \\[{owner.task_type}]"
+                f" [{c['date']}]{owner_time_text}[/{c['date']}]"
             )
-            console.print(f"{child_prefix}    \\[{node.task.task_type}]")
-
-            if (
-                node.task.id in unresolved_ids
-                and node.task.status == "failed"
-                and node.task.failure_reason
-                and node.task.failure_reason != "UNKNOWN"
-            ):
-                console.print(
-                    f"{child_prefix}    [{c['failure']}]reason: {node.task.failure_reason}[/{c['failure']}]"
-                )
-
-            for index, child in enumerate(node.children):
-                _render_node(
-                    child,
-                    prefix=child_prefix,
-                    is_last=index == (len(node.children) - 1),
-                )
-
-        _render_node(lineage_tree)
-
-    for idx, lineage in enumerate(f):
-        if idx > 0:
-            console.print("\n" + "-" * 32 + "\n")
-        _render_lineage_group(lineage)
-        print()
 
     return 0
 
@@ -1751,6 +1831,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
     config = Config.load(args.project_dir)
     store = get_store(config)
+    service = _TaskQueryService(store)
 
     task_id: str = resolve_id(config, args.task_id)
     task = store.get(task_id)
@@ -1758,8 +1839,16 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task {task_id} not found[/red]")
         return 1
 
-    root = _resolve_lineage_root_task(store, task)
-    lineage_tree = _build_lineage_tree_for_root(store, root, max_depth=None)
+    lineage_query = _TaskQueryPresets.lineage(task_id)
+    lineage_result = service.run(lineage_query)
+    if not lineage_result.rows or not isinstance(lineage_result.rows[0], _LineageRow):
+        console.print(f"[red]Error: unable to build lineage for {task_id}[/red]")
+        return 1
+    lineage_tree = lineage_result.rows[0].tree
+    if lineage_tree is None:
+        console.print(f"[red]Error: unable to build lineage for {task_id}[/red]")
+        return 1
+    lineage_tree = cast(TaskLineageNode, lineage_tree)
 
     def _status_text(t: DbTask) -> str:
         if t.status == "failed":

@@ -230,6 +230,73 @@ class TestHistoryCommand:
         assert "Internal task" in result.stdout
         assert "Implement task" not in result.stdout
 
+    def test_history_json_matches_default_internal_filtering(self, tmp_path: Path):
+        """history and history --json should select the same default task IDs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        public_task = store.add("public history task", task_type="implement")
+        public_task.status = "completed"
+        public_task.completed_at = datetime.now(UTC)
+        store.update(public_task)
+
+        internal_task = store.add("internal history task", task_type="internal")
+        internal_task.status = "completed"
+        internal_task.completed_at = datetime.now(UTC)
+        store.update(internal_task)
+
+        text_result = run_gza("history", "--project", str(tmp_path))
+        json_result = run_gza("history", "--json", "--project", str(tmp_path))
+
+        assert text_result.returncode == 0
+        assert json_result.returncode == 0
+        assert "public history task" in text_result.stdout
+        assert "internal history task" not in text_result.stdout
+
+        payload = json.loads(json_result.stdout)
+        ids = {row["id"] for row in payload}
+        assert public_task.id in ids
+        assert internal_task.id not in ids
+
+    def test_history_internal_type_json_includes_internal_rows(self, tmp_path: Path):
+        """history --type internal --json should include internal tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        public_task = store.add("public history task", task_type="implement")
+        public_task.status = "completed"
+        public_task.completed_at = datetime.now(UTC)
+        store.update(public_task)
+
+        internal_task = store.add("internal history task", task_type="internal")
+        internal_task.status = "completed"
+        internal_task.completed_at = datetime.now(UTC)
+        store.update(internal_task)
+
+        result = run_gza("history", "--type", "internal", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        ids = {row["id"] for row in payload}
+        assert internal_task.id in ids
+        assert public_task.id not in ids
+
+    def test_history_fields_override_requires_json(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("history projection test", task_type="implement")
+
+        result = run_gza(
+            "history",
+            "--fields",
+            "id,status",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 2
+        assert "--fields and --preset require --json for gza history" in result.stderr
+
     def test_history_shows_task_type_labels(self, tmp_path: Path):
         """History command displays task type labels for all task types."""
         setup_db_with_tasks(tmp_path, [
@@ -1069,6 +1136,17 @@ class TestSearchCommand:
         assert result.returncode == 0
         assert "No tasks found matching 'missing'" in result.stdout
 
+    def test_search_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "alpha task", "status": "completed"},
+        ])
+
+        result = run_gza("search", "missing", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert "No tasks found matching 'missing'" not in result.stdout
+
     def test_search_last_limit(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1121,6 +1199,53 @@ class TestSearchCommand:
         assert "style needle task" in result.stdout
         assert "[implement]" in result.stdout
         assert "branch: feat/search-style" in result.stdout
+
+    def test_search_json_fields_override_limits_projection(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("needle alpha", task_type="implement")
+        first.status = "completed"
+        first.completed_at = datetime.now(UTC)
+        store.update(first)
+
+        second = store.add("needle beta", task_type="plan")
+        second.status = "failed"
+        second.completed_at = datetime.now(UTC)
+        store.update(second)
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--json",
+            "--fields",
+            "id,status",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        for row in payload:
+            assert set(row.keys()) == {"id", "status"}
+
+    def test_search_fields_override_requires_json(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("needle projection test", task_type="implement")
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--fields",
+            "id,status",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 2
+        assert "--fields and --preset require --json for gza search" in result.stderr
 
 
 class TestNextCommand:
@@ -5650,6 +5775,15 @@ class TestPsSortKey:
 class TestIncompleteCommand:
     """Tests for `gza incomplete` command."""
 
+    def test_incomplete_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert "No unresolved task lineages" not in result.stdout
+
     def test_incomplete_hides_merged_root_with_completed_review_improve(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -5832,6 +5966,72 @@ class TestIncompleteCommand:
         assert "ROOT_TEST_FAILURE" not in result.stdout
         # The unresolved retry's own failure reason should still be rendered.
         assert "RETRY_TEST_FAILURE" in result.stdout
+
+    def test_incomplete_tree_renders_owner_grouped_subtrees(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root failed", task_type="implement")
+        root.status = "failed"
+        root.completed_at = datetime.now(UTC)
+        root.failure_reason = "ROOT_TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
+        retry_completed.status = "completed"
+        retry_completed.completed_at = datetime.now(UTC)
+        retry_completed.has_commits = True
+        retry_completed.merge_status = "unmerged"
+        store.update(retry_completed)
+        assert retry_completed.id is not None
+
+        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC)
+        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        result = run_gza("incomplete", "--tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "└──" in result.stdout
+        assert "--------------------------------" in result.stdout
+
+    def test_incomplete_tree_marks_context_nodes_resolved(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root failed", task_type="implement")
+        root.status = "failed"
+        root.completed_at = datetime.now(UTC)
+        root.failure_reason = "ROOT_TEST_FAILURE"
+        store.update(root)
+        assert root.id is not None
+
+        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
+        retry_completed.status = "completed"
+        retry_completed.completed_at = datetime.now(UTC)
+        retry_completed.has_commits = True
+        retry_completed.merge_status = "unmerged"
+        store.update(retry_completed)
+        assert retry_completed.id is not None
+
+        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC)
+        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        result = run_gza("incomplete", "--tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert re.search(rf"resolved\s+{re.escape(root.id)}\s+Root failed", result.stdout)
+        assert not re.search(rf"failed\s+{re.escape(root.id)}\s+Root failed", result.stdout)
+        assert "ROOT_TEST_FAILURE" not in result.stdout
+        assert re.search(rf"failed\s+{re.escape(retry_failed.id)}\s+Retry failed", result.stdout)
 
     def test_incomplete_hides_failed_root_when_completed_descendant_has_different_type(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -6037,3 +6237,112 @@ class TestIncompleteCommand:
 
         assert result.returncode != 0
         assert "value must be >= 0" in result.stderr
+
+    def test_incomplete_one_line_groups_by_owner_for_multiple_unresolved_branches(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Merged root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC) - timedelta(hours=3)
+        root.has_commits = True
+        root.merge_status = "merged"
+        store.update(root)
+        assert root.id is not None
+
+        retry_failed = store.add("Retry branch failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC) - timedelta(hours=2)
+        retry_failed.failure_reason = "TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        retry_unmerged = store.add("Retry branch unmerged", task_type="implement", based_on=root.id)
+        retry_unmerged.status = "completed"
+        retry_unmerged.completed_at = datetime.now(UTC) - timedelta(hours=1)
+        retry_unmerged.has_commits = True
+        retry_unmerged.merge_status = "unmerged"
+        store.update(retry_unmerged)
+        assert retry_unmerged.id is not None
+
+        result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"{retry_failed.id}:" in result.stdout
+        assert f"{retry_unmerged.id}:" in result.stdout
+        assert f"{root.id}:" not in result.stdout
+
+    def test_incomplete_json_next_action_owner_id_matches_owner_row(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Merged root", task_type="implement")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC) - timedelta(hours=3)
+        root.has_commits = True
+        root.merge_status = "merged"
+        store.update(root)
+        assert root.id is not None
+
+        retry_failed = store.add("Retry branch failed", task_type="implement", based_on=root.id)
+        retry_failed.status = "failed"
+        retry_failed.completed_at = datetime.now(UTC) - timedelta(hours=2)
+        retry_failed.failure_reason = "TEST_FAILURE"
+        store.update(retry_failed)
+        assert retry_failed.id is not None
+
+        retry_unmerged = store.add("Retry branch unmerged", task_type="implement", based_on=root.id)
+        retry_unmerged.status = "completed"
+        retry_unmerged.completed_at = datetime.now(UTC) - timedelta(hours=1)
+        retry_unmerged.has_commits = True
+        retry_unmerged.merge_status = "unmerged"
+        store.update(retry_unmerged)
+        assert retry_unmerged.id is not None
+
+        result = run_gza("incomplete", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        ids = {row["id"] for row in payload}
+        assert retry_failed.id in ids
+        assert retry_unmerged.id in ids
+        assert root.id not in ids
+        for row in payload:
+            assert row["next_action_owner_id"] == row["id"]
+            assert row["id"] in row["unresolved_ids"]
+
+    def test_incomplete_last_one_uses_owner_row_ranking_after_owner_rollup(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_a = store.add("Root A owner old", task_type="implement")
+        root_a.status = "completed"
+        root_a.completed_at = datetime.now(UTC) - timedelta(days=30)
+        root_a.has_commits = True
+        root_a.merge_status = "merged"
+        store.update(root_a)
+        assert root_a.id is not None
+
+        recent_failed_descendant = store.add(
+            "Recent unresolved descendant on A",
+            task_type="improve",
+            based_on=root_a.id,
+            same_branch=True,
+        )
+        recent_failed_descendant.status = "failed"
+        recent_failed_descendant.completed_at = datetime.now(UTC) - timedelta(hours=1)
+        recent_failed_descendant.failure_reason = "TEST_FAILURE"
+        store.update(recent_failed_descendant)
+
+        root_b = store.add("Root B owner newer", task_type="implement")
+        root_b.status = "failed"
+        root_b.completed_at = datetime.now(UTC) - timedelta(hours=2)
+        root_b.failure_reason = "TEST_FAILURE"
+        store.update(root_b)
+        assert root_b.id is not None
+
+        result = run_gza("incomplete", "--last", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"{root_b.id}:" in result.stdout
+        assert f"{root_a.id}:" not in result.stdout
