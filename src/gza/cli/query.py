@@ -254,6 +254,13 @@ def cmd_history(args: argparse.Namespace) -> int:
     end_date = getattr(args, 'end_date', None)
     date_field = cast(_QueryDateField, getattr(args, 'date_field', "effective"))
     lineage_depth = getattr(args, 'lineage_depth', 0)
+    projection_fields = _parse_csv(getattr(args, "fields", None))
+    projection_preset = getattr(args, "preset", None)
+    use_json = bool(getattr(args, "json", False))
+
+    if not use_json and (projection_fields is not None or projection_preset):
+        print("error: --fields and --preset require --json for gza history", file=sys.stderr)
+        return 2
 
     # If a date-based filter is active and --last/-n wasn't explicitly provided,
     # don't cap results with the default limit.
@@ -273,7 +280,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         lineage_depth=lineage_depth,
     )
 
-    if getattr(args, "json", False):
+    if use_json:
         selected_tasks = query_history(store, f)
         selected_ids = [task.id for task in selected_tasks if task.id is not None]
         if not selected_ids:
@@ -284,8 +291,8 @@ def cmd_history(args: argparse.Namespace) -> int:
             scope="tasks",
             limit=None,
             projection=_TaskProjectionSpec(
-                preset=getattr(args, "preset", None) or "history_default",
-                fields=_parse_csv(getattr(args, "fields", None)),
+                preset=projection_preset or "history_default",
+                fields=projection_fields,
             ),
             presentation=_TaskPresentationSpec(mode="json"),
         )
@@ -591,6 +598,14 @@ def cmd_search(args: argparse.Namespace) -> int:
     service = _TaskQueryService(store)
     term = args.term
     limit = None if args.last == 0 else args.last
+    projection_fields = _parse_csv(getattr(args, "fields", None))
+    projection_preset = getattr(args, "preset", None)
+    use_json = bool(getattr(args, "json", False))
+
+    if not use_json and (projection_fields is not None or projection_preset):
+        print("error: --fields and --preset require --json for gza search", file=sys.stderr)
+        return 2
+
     date_filter = _TaskDateFilter(
         field=cast(_QueryDateField, getattr(args, "date_field", "created")),
         days=getattr(args, "days", None),
@@ -614,7 +629,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         lineage_of=lineage_of,
         root_ids=root_ids,
     )
-    if getattr(args, "preset", None) or getattr(args, "fields", None):
+    if projection_preset or projection_fields is not None:
         query = _TaskQuery(
             scope=query.scope,
             limit=query.limit,
@@ -631,8 +646,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             date_filter=query.date_filter,
             sort=query.sort,
             projection=_TaskProjectionSpec(
-                preset=getattr(args, "preset", None) or query.projection.preset,
-                fields=_parse_csv(getattr(args, "fields", None)),
+                preset=projection_preset or query.projection.preset,
+                fields=projection_fields,
             ),
             presentation=query.presentation,
         )
@@ -643,7 +658,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         console.print(f"No tasks found matching '{term}'")
         return 0
 
-    if getattr(args, "json", False):
+    if use_json:
         import json
 
         print(json.dumps(result.to_json(), indent=2, default=str))

@@ -919,8 +919,8 @@ gza history [options]
 | `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
-| `--fields CSV` | Projection fields override (comma-separated) |
-| `--preset NAME` | Projection preset override |
+| `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
+| `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
 | `--json` | Output JSON rows from the unified query API |
 
 ### search
@@ -944,8 +944,8 @@ gza search <term> [options]
 | `--related-to TASK_ID` | Restrict to tasks related to the given lineage |
 | `--lineage-of TASK_ID` | Restrict to the canonical lineage containing TASK_ID |
 | `--root CSV` | Restrict by lineage root IDs (comma-separated) |
-| `--fields CSV` | Projection fields override (comma-separated) |
-| `--preset NAME` | Projection preset override |
+| `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
+| `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
 | `--json` | Output JSON rows from the unified query API |
 
 ### incomplete

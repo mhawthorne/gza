@@ -303,16 +303,67 @@ class TaskQueryService:
                 date_field=(query.date_filter.field if query.date_filter else "effective"),
             )
             incomplete = _query_incomplete(self._store, f)
-            rows = [
-                LineageRow(
-                    owner_task=item.root,
-                    members=tuple(_flatten_lineage_tree(item.tree)),
-                    tree=item.tree,
-                    unresolved_tasks=tuple(item.unresolved_tasks),
-                    values={},
+            unresolved_by_owner: dict[str, list[DbTask]] = {}
+            incomplete_owner_by_id: dict[str, DbTask] = {}
+            root_by_owner_id: dict[str, DbTask] = {}
+            tree_by_root_id: dict[str, Any] = {}
+
+            for item in incomplete:
+                root = item.root
+                if root.id is None:
+                    continue
+                tree_by_root_id[root.id] = item.tree
+
+                for task in item.unresolved_tasks:
+                    owner = self._resolve_branch_owner(task)
+                    owner_id = owner.id
+                    if owner_id is None:
+                        continue
+                    unresolved_by_owner.setdefault(owner_id, []).append(task)
+                    incomplete_owner_by_id[owner_id] = owner
+                    root_by_owner_id[owner_id] = root
+
+            rows = []
+            for owner_id, unresolved_tasks in unresolved_by_owner.items():
+                owner = incomplete_owner_by_id[owner_id]
+                root = root_by_owner_id[owner_id]
+                root_id = root.id
+                if root_id is None:
+                    continue
+
+                unresolved_by_id = {
+                    task.id: task for task in unresolved_tasks if task.id is not None
+                }
+                owner_unresolved = tuple(
+                    sorted(
+                        unresolved_by_id.values(),
+                        key=lambda task: self._sort_key(task, query.sort),
+                        reverse=query.sort.descending,
+                    )
                 )
-                for item in incomplete
-            ]
+
+                keep_ids = {task_id for task_id in unresolved_by_id}
+                if owner.id is not None:
+                    keep_ids.add(owner.id)
+                keep_ids.add(root_id)
+
+                root_tree = tree_by_root_id.get(root_id) or _build_lineage_tree(
+                    self._store,
+                    root,
+                    max_depth=None,
+                )
+                pruned_tree = _prune_lineage_tree_to_ids(root_tree, keep_ids)
+                members = tuple(_flatten_lineage_tree(pruned_tree))
+
+                rows.append(
+                    LineageRow(
+                        owner_task=owner,
+                        members=members,
+                        tree=pruned_tree,
+                        unresolved_tasks=owner_unresolved,
+                        values={},
+                    )
+                )
         else:
             grouped: dict[str, list[DbTask]] = {}
             owner_by_id: dict[str, DbTask] = {}
@@ -344,13 +395,15 @@ class TaskQueryService:
                 owner_by_id[owner_id] = owner
 
             rows = []
-            for owner_id, members in grouped.items():
+            for owner_id, owner_members in grouped.items():
                 owner = owner_by_id[owner_id]
                 root = _resolve_lineage_root(self._store, owner)
                 rows.append(
                     LineageRow(
                         owner_task=owner,
-                        members=tuple(sorted(members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)),
+                        members=tuple(
+                            sorted(owner_members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)
+                        ),
                         tree=_build_lineage_tree(self._store, root, max_depth=None),
                     )
                 )
@@ -784,6 +837,32 @@ def _query_incomplete(store: SqliteTaskStore, history_filter: Any) -> list[Any]:
     from gza.query import query_incomplete
 
     return query_incomplete(store, history_filter)
+
+
+def _prune_lineage_tree_to_ids(tree: Any, keep_ids: set[str]) -> Any:
+    def _filter(node: Any, *, is_root: bool) -> Any | None:
+        kept_children: list[Any] = []
+        for child in node.children:
+            filtered_child = _filter(child, is_root=False)
+            if filtered_child is not None:
+                kept_children.append(filtered_child)
+
+        task_id = node.task.id
+        should_keep = is_root or (task_id is not None and task_id in keep_ids) or bool(kept_children)
+        if not should_keep:
+            return None
+
+        node_type = type(node)
+        return node_type(
+            task=node.task,
+            depth=node.depth,
+            relationship=node.relationship,
+            children=kept_children,
+        )
+
+    filtered = _filter(tree, is_root=True)
+    assert filtered is not None
+    return filtered
 
 
 def _is_shared_branch_descendant_query(task: DbTask, root_task: DbTask) -> bool:

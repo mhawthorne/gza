@@ -276,12 +276,12 @@ def main() -> int:
     history_parser.add_argument(
         "--fields",
         metavar="CSV",
-        help="Projection fields override (comma-separated)",
+        help="Projection fields override (comma-separated, requires --json)",
     )
     history_parser.add_argument(
         "--preset",
         metavar="NAME",
-        help="Projection preset override",
+        help="Projection preset override (requires --json)",
     )
     history_parser.add_argument(
         "--json",
@@ -360,12 +360,12 @@ def main() -> int:
     search_parser.add_argument(
         "--fields",
         metavar="CSV",
-        help="Projection fields override (comma-separated)",
+        help="Projection fields override (comma-separated, requires --json)",
     )
     search_parser.add_argument(
         "--preset",
         metavar="NAME",
-        help="Projection preset override",
+        help="Projection preset override (requires --json)",
     )
     search_parser.add_argument(
         "--json",
