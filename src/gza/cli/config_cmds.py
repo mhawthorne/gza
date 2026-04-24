@@ -7,12 +7,15 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import median
+from typing import Any
 
 from rich.table import Table
 
+from .. import colors as _colors
 from ..config import Config
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
@@ -33,6 +36,141 @@ def _percentile(sorted_vals: list[int], p: float) -> int:
         return 0
     k = max(0, min(len(sorted_vals) - 1, int(len(sorted_vals) * p / 100 + 0.5) - 1))
     return sorted_vals[k]
+
+
+@dataclass(frozen=True)
+class _ScoreRecord:
+    week_label: str
+    week_iso: str
+    score: int
+    reviewer_provider: str | None
+    reviewer_model: str | None
+    implementer_provider: str | None
+    implementer_model: str | None
+    planner_provider: str | None
+    planner_model: str | None
+
+
+def _display_provider_model(provider: str | None, model: str | None, *, no_plan: bool = False) -> str:
+    if no_plan and provider is None and model is None:
+        return "(no-plan)"
+    provider_text = provider or "unknown"
+    model_text = model or "unknown"
+    return f"{provider_text}/{model_text}"
+
+
+def _round_stat(value: float) -> int | float:
+    rounded = round(value, 1)
+    if float(rounded).is_integer():
+        return int(rounded)
+    return rounded
+
+
+def _score_stats(scores: list[int]) -> dict[str, int | float]:
+    if not scores:
+        return {"n": 0, "mean": 0.0, "median": 0.0, "p10": 0, "p90": 0, "min": 0, "max": 0}
+    ordered = sorted(scores)
+    return {
+        "n": len(ordered),
+        "mean": round(sum(ordered) / len(ordered), 1),
+        "median": _round_stat(float(median(ordered))),
+        "p10": _percentile(ordered, 10),
+        "p90": _percentile(ordered, 90),
+        "min": ordered[0],
+        "max": ordered[-1],
+    }
+
+
+def _group_score_rows(
+    grouped: dict[tuple[Any, ...], list[int]],
+    key_names: list[str],
+    *,
+    min_samples: int = 1,
+    sort_mode: str = "count_desc",
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, values in grouped.items():
+        if len(values) < min_samples:
+            continue
+        ordered = sorted(values)
+        row: dict[str, Any] = {name: part for name, part in zip(key_names, key)}
+        row["n"] = len(ordered)
+        row["mean"] = round(sum(ordered) / len(ordered), 1)
+        row["median"] = _round_stat(float(median(ordered)))
+        rows.append(row)
+    if sort_mode == "mean_desc":
+        rows.sort(key=lambda row: (row["mean"], row["n"]), reverse=True)
+    else:
+        rows.sort(key=lambda row: (row["n"], row["mean"]), reverse=True)
+    return rows
+
+
+def _build_score_analytics(records: list[_ScoreRecord], pipeline_min_samples: int = 3) -> dict[str, Any]:
+    overall = _score_stats([r.score for r in records])
+
+    by_reviewer: dict[tuple[str | None, str | None], list[int]] = defaultdict(list)
+    by_implementer: dict[tuple[str | None, str | None], list[int]] = defaultdict(list)
+    by_pipeline: dict[
+        tuple[str | None, str | None, str | None, str | None, str | None, str | None],
+        list[int],
+    ] = defaultdict(list)
+    by_week: dict[str, list[int]] = defaultdict(list)
+
+    for record in records:
+        by_reviewer[(record.reviewer_provider, record.reviewer_model)].append(record.score)
+        by_implementer[(record.implementer_provider, record.implementer_model)].append(record.score)
+        by_pipeline[
+            (
+                record.planner_provider,
+                record.planner_model,
+                record.implementer_provider,
+                record.implementer_model,
+                record.reviewer_provider,
+                record.reviewer_model,
+            )
+        ].append(record.score)
+        by_week[record.week_iso].append(record.score)
+
+    weekly_rows: list[dict[str, Any]] = []
+    for week in sorted(by_week.keys())[-8:]:
+        week_scores = sorted(by_week[week])
+        weekly_rows.append(
+            {
+                "week": week,
+                "n": len(week_scores),
+                "mean": round(sum(week_scores) / len(week_scores), 1),
+            }
+        )
+
+    return {
+        "overall": overall,
+        "by_reviewer": _group_score_rows(
+            grouped=by_reviewer,
+            key_names=["provider", "model"],
+            min_samples=1,
+            sort_mode="count_desc",
+        ),
+        "by_implementer": _group_score_rows(
+            grouped=by_implementer,
+            key_names=["provider", "model"],
+            min_samples=1,
+            sort_mode="count_desc",
+        ),
+        "by_pipeline": _group_score_rows(
+            grouped=by_pipeline,
+            key_names=[
+                "planner_provider",
+                "planner_model",
+                "implementer_provider",
+                "implementer_model",
+                "reviewer_provider",
+                "reviewer_model",
+            ],
+            min_samples=pipeline_min_samples,
+            sort_mode="mean_desc",
+        ),
+        "weekly_trend": weekly_rows,
+    }
 
 
 def _count_section_items(content: str, header_pattern: str) -> int:
@@ -91,6 +229,7 @@ def _cmd_stats_reviews(
     end_date: date,
     show_issues: bool,
     all_time: bool = False,
+    output_json: bool = False,
 ) -> int:
     """Show review count stats per implementation task."""
     all_tasks = store.get_all()
@@ -136,6 +275,32 @@ def _cmd_stats_reviews(
         parts = label.split(" - ")
         return datetime.strptime(parts[0] + f" {today.year}", "%b %d %Y").date()
 
+    def week_iso_label(dt: datetime) -> str:
+        iso_year, iso_week, _ = dt.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
+
+    def find_plan_task(task_id: str, visited: set[str] | None = None) -> Task | None:
+        if visited is None:
+            visited = set()
+        if task_id in visited:
+            return None
+        visited.add(task_id)
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            return None
+        for parent_id in (task.depends_on, task.based_on):
+            if not parent_id:
+                continue
+            parent = tasks_by_id.get(parent_id)
+            if parent is None:
+                continue
+            if parent.task_type == "plan":
+                return parent
+            plan = find_plan_task(parent_id, visited)
+            if plan is not None:
+                return plan
+        return None
+
     # Find review/improve tasks in date range that have a parent link
     ri_tasks = [
         t for t in all_tasks
@@ -149,6 +314,7 @@ def _cmd_stats_reviews(
     # Count reviews per root impl, tracking models
     root_reviews: dict[str, list[datetime]] = defaultdict(list)
     root_review_models: dict[str, list[str | None]] = defaultdict(list)
+    root_review_tasks: dict[str, list[Task]] = defaultdict(list)
     for ri in ri_tasks:
         parent_id = ri.depends_on or ri.based_on
         if parent_id is None:
@@ -161,6 +327,7 @@ def _cmd_stats_reviews(
             if dt:
                 root_reviews[root].append(dt)
                 root_review_models[root].append(ri.model)
+                root_review_tasks[root].append(ri)
 
     # Find all root implement tasks in range (only count completed ones —
     # pending/failed impls can't meaningfully be "reviewed or not")
@@ -195,7 +362,14 @@ def _cmd_stats_reviews(
     review_pct = (len(reviewed_impls) / total_impls * 100) if total_impls else 0
 
     # Group by week
-    week_data: dict[str, dict] = defaultdict(lambda: {"impls": 0, "reviews": 0, "reviewed_cycles": []})
+    week_data: dict[str, dict] = defaultdict(
+        lambda: {
+            "impls": 0,
+            "reviews": 0,
+            "reviewed_cycles": [],
+            "score_values": [],
+        }
+    )
     for impl in root_impls_in_range:
         dt = _task_dt(impl)
         if dt:
@@ -213,21 +387,47 @@ def _cmd_stats_reviews(
         week_data[wk]["reviews"] += len(review_dates)
         week_data[wk]["reviewed_cycles"].append(len(review_dates))
 
+    plan_task_by_root: dict[str, Task | None] = {}
+    scored_records: list[_ScoreRecord] = []
+    for root_id, reviews in root_review_tasks.items():
+        if root_id not in seen_roots:
+            continue
+        root_impl = tasks_by_id.get(root_id)
+        if root_impl is None:
+            continue
+        impl_dt = _task_dt(root_impl)
+        if impl_dt is None:
+            continue
+        planner = plan_task_by_root.setdefault(root_id, find_plan_task(root_id))
+        week_lbl = week_label(impl_dt)
+        week_iso = week_iso_label(impl_dt)
+        for review_task in reviews:
+            if review_task.review_score is None:
+                continue
+            score = int(review_task.review_score)
+            week_data[week_lbl]["score_values"].append(score)
+            scored_records.append(
+                _ScoreRecord(
+                    week_label=week_lbl,
+                    week_iso=week_iso,
+                    score=score,
+                    reviewer_provider=review_task.provider,
+                    reviewer_model=review_task.model,
+                    implementer_provider=root_impl.provider,
+                    implementer_model=root_impl.model,
+                    planner_provider=planner.provider if planner else None,
+                    planner_model=planner.model if planner else None,
+                )
+            )
+
     sorted_weeks = sorted(week_data.keys(), key=week_sort_key)
-
-    header_range = "all time" if all_time else f"{start_date} to {end_date}"
-    print(f"\nReview stats ({header_range})")
-    print(f"Implement tasks: {total_impls}")
-    print(f"Improve tasks:   {total_improves}")
-    print(f"Review tasks:    {total_reviews}")
-    print(f"Reviewed:        {len(reviewed_impls)}/{total_impls} ({review_pct:.0f}%)")
-
-    print(f"\n{'Week':<22} {'Impls':>5} {'Rvws':>5} {'Rv%':>5} {'Med':>5} {'P90':>5} {'Max':>5}")
-    print("-" * 56)
+    score_analytics = _build_score_analytics(scored_records)
 
     all_reviewed_cycles: list[int] = []
+    all_scores: list[int] = []
     total_row_impls = 0
     total_row_reviews = 0
+    weekly_rows: list[dict[str, Any]] = []
 
     for wk in sorted_weeks:
         d = week_data[wk]
@@ -235,38 +435,65 @@ def _cmd_stats_reviews(
         total_row_reviews += d["reviews"]
         cycles = sorted(d["reviewed_cycles"])
         all_reviewed_cycles.extend(cycles)
+        scores = sorted(d["score_values"])
+        all_scores.extend(scores)
         rv_pct = (len(cycles) / d["impls"] * 100) if d["impls"] else 0
+        row: dict[str, Any] = {
+            "week": wk,
+            "impls": d["impls"],
+            "reviews": d["reviews"],
+            "review_pct": round(rv_pct, 1),
+            "reviewed_impls": len(cycles),
+            "score_n": len(scores),
+            "score_mean": round(sum(scores) / len(scores), 1) if scores else None,
+        }
         if cycles:
-            med = int(median(cycles))
-            p90 = _percentile(cycles, 90)
-            mx = max(cycles)
-            print(f"{wk:<22} {d['impls']:>5} {d['reviews']:>5} {rv_pct:>4.0f}% {med:>5} {p90:>5} {mx:>5}")
+            row["review_cycles_median"] = int(median(cycles))
+            row["review_cycles_p90"] = _percentile(cycles, 90)
+            row["review_cycles_max"] = max(cycles)
         else:
-            print(f"{wk:<22} {d['impls']:>5} {d['reviews']:>5} {rv_pct:>4.0f}%     -     -     -")
+            row["review_cycles_median"] = None
+            row["review_cycles_p90"] = None
+            row["review_cycles_max"] = None
+        weekly_rows.append(row)
+
+    total_week_row: dict[str, Any] | None = None
 
     if len(sorted_weeks) > 1:
         all_reviewed_cycles.sort()
-        print("-" * 56)
         rv_pct = (len(all_reviewed_cycles) / total_row_impls * 100) if total_row_impls else 0
+        total_week_row = {
+            "week": "Total",
+            "impls": total_row_impls,
+            "reviews": total_row_reviews,
+            "review_pct": round(rv_pct, 1),
+            "reviewed_impls": len(all_reviewed_cycles),
+            "score_n": len(all_scores),
+            "score_mean": round(sum(all_scores) / len(all_scores), 1) if all_scores else None,
+        }
         if all_reviewed_cycles:
-            med = int(median(all_reviewed_cycles))
-            p90 = _percentile(all_reviewed_cycles, 90)
-            mx = max(all_reviewed_cycles)
-            print(f"{'Total':<22} {total_row_impls:>5} {total_row_reviews:>5} {rv_pct:>4.0f}% {med:>5} {p90:>5} {mx:>5}")
+            total_week_row["review_cycles_median"] = int(median(all_reviewed_cycles))
+            total_week_row["review_cycles_p90"] = _percentile(all_reviewed_cycles, 90)
+            total_week_row["review_cycles_max"] = max(all_reviewed_cycles)
         else:
-            print(f"{'Total':<22} {total_row_impls:>5} {total_row_reviews:>5} {rv_pct:>4.0f}%     -     -     -")
+            total_week_row["review_cycles_median"] = None
+            total_week_row["review_cycles_p90"] = None
+            total_week_row["review_cycles_max"] = None
 
     # Review count distribution
+    dist_rows: list[dict[str, Any]] = []
     if all_reviewed_cycles:
         dist = Counter(all_reviewed_cycles)
         total = len(all_reviewed_cycles)
-        print("\nReviews per implementation (reviewed tasks only):")
         for cnt in sorted(dist.keys()):
             pct = dist[cnt] / total * 100
-            bar = "#" * dist[cnt]
-            label = "review" if cnt == 1 else "reviews"
-            left = f"{cnt} {label}:"
-            print(f"  {left:<12}{dist[cnt]:>3} ({pct:3.0f}%)  {bar}")
+            dist_rows.append(
+                {
+                    "reviews_per_impl": cnt,
+                    "impl_count": dist[cnt],
+                    "pct": round(pct, 1),
+                }
+            )
 
     # Per-model review cycle stats
     model_cycles: dict[str, list[int]] = defaultdict(list)
@@ -303,9 +530,23 @@ def _cmd_stats_reviews(
             )
         return table
 
+    cycle_by_reviewer_model_rows: list[dict[str, Any]] = []
     if model_cycles:
-        console.print()
-        console.print(_model_breakdown_table("Review model", "Review model", model_cycles))
+        total = sum(len(v) for v in model_cycles.values())
+        for model in sorted(model_cycles):
+            cycles_sorted = sorted(model_cycles[model])
+            n = len(cycles_sorted)
+            cycle_by_reviewer_model_rows.append(
+                {
+                    "model": model,
+                    "n": n,
+                    "pct": round((n / total * 100) if total else 0, 1),
+                    "median": int(median(cycles_sorted)),
+                    "p75": _percentile(cycles_sorted, 75),
+                    "p90": _percentile(cycles_sorted, 90),
+                    "max": max(cycles_sorted),
+                }
+            )
 
     # Per-implementer-model review cycle stats
     impl_model_cycles: dict[str, list[int]] = defaultdict(list)
@@ -316,11 +557,23 @@ def _cmd_stats_reviews(
         impl_model = root_impl.model or "unknown"
         impl_model_cycles[impl_model].append(len(root_reviews[root_id]))
 
+    cycle_by_implement_model_rows: list[dict[str, Any]] = []
     if impl_model_cycles:
-        console.print()
-        console.print(
-            _model_breakdown_table("Implement model", "Implement model", impl_model_cycles)
-        )
+        total = sum(len(v) for v in impl_model_cycles.values())
+        for model in sorted(impl_model_cycles):
+            cycles_sorted = sorted(impl_model_cycles[model])
+            n = len(cycles_sorted)
+            cycle_by_implement_model_rows.append(
+                {
+                    "model": model,
+                    "n": n,
+                    "pct": round((n / total * 100) if total else 0, 1),
+                    "median": int(median(cycles_sorted)),
+                    "p75": _percentile(cycles_sorted, 75),
+                    "p90": _percentile(cycles_sorted, 90),
+                    "max": max(cycles_sorted),
+                }
+            )
 
     # Per-pair (implement model × review model) cycle stats
     pair_cycles: dict[tuple[str, str], list[int]] = defaultdict(list)
@@ -334,9 +587,178 @@ def _cmd_stats_reviews(
         rv_model = rv_counts.most_common(1)[0][0] if rv_counts else "unknown"
         pair_cycles[(impl_model, rv_model)].append(len(root_reviews[root_id]))
 
+    cycle_by_pair_rows: list[dict[str, Any]] = []
     if pair_cycles:
         total_pairs = sum(len(v) for v in pair_cycles.values())
         overall_median = median(all_reviewed_cycles) if all_reviewed_cycles else 0
+        sorted_pairs = sorted(
+            pair_cycles.items(),
+            key=lambda kv: (median(kv[1]), -len(kv[1])),
+        )
+        for (impl_m, rv_m), cycles in sorted_pairs:
+            cycles_sorted = sorted(cycles)
+            n = len(cycles_sorted)
+            pct = (n / total_pairs * 100) if total_pairs else 0
+            delta = median(cycles_sorted) - overall_median
+            cycle_by_pair_rows.append(
+                {
+                    "implement_model": impl_m,
+                    "review_model": rv_m,
+                    "n": n,
+                    "pct": round(pct, 1),
+                    "median": _round_stat(float(median(cycles_sorted))),
+                    "p75": _percentile(cycles_sorted, 75),
+                    "p90": _percentile(cycles_sorted, 90),
+                    "max": max(cycles_sorted),
+                    "delta_vs_overall_median": round(delta, 1),
+                }
+            )
+
+    # Per-model issue counts (--issues mode)
+    issue_rows: list[dict[str, Any]] = []
+    unparsed_review_ids: list[str] = []
+    issue_totals_blockers: list[int] = []
+    issue_totals_followups: list[int] = []
+    parsed_review_count = 0
+    if show_issues:
+        review_content = {
+            t.id: t.output_content
+            for t in all_tasks
+            if t.task_type == "review"
+            and t.output_content is not None
+            and t.id is not None
+            and _task_dt(t) is not None
+            and start_dt <= _task_dt(t) < end_dt  # type: ignore
+        }
+        parsed_review_count = len(review_content)
+        model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for ri in ri_tasks:
+            if ri.task_type != "review":
+                continue
+            content = review_content.get(ri.id)  # type: ignore
+            if content is None:
+                continue
+            must_fix, sugg = _count_review_issues(content)
+            if must_fix == 0 and sugg == 0:
+                unparsed_review_ids.append(ri.id or "")
+            model = ri.model or "unknown"
+            model_issues[model].append((must_fix, sugg))
+        for model in sorted(model_issues):
+            pairs = model_issues[model]
+            fixes = sorted(mf for mf, _ in pairs)
+            suggs = sorted(sg for _, sg in pairs)
+            issue_totals_blockers.extend(fixes)
+            issue_totals_followups.extend(suggs)
+            issue_rows.append(
+                {
+                    "model": model,
+                    "reviews": len(pairs),
+                    "blockers": {
+                        "median": int(median(fixes)),
+                        "p75": _percentile(fixes, 75),
+                        "p90": _percentile(fixes, 90),
+                        "max": max(fixes),
+                    },
+                    "follow_ups": {
+                        "median": int(median(suggs)),
+                        "p75": _percentile(suggs, 75),
+                        "p90": _percentile(suggs, 90),
+                        "max": max(suggs),
+                    },
+                }
+            )
+
+    if output_json:
+        coverage_payload: dict[str, Any] = {
+            "range": {
+                "all_time": all_time,
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+            },
+            "summary": {
+                "implement_tasks": total_impls,
+                "improve_tasks": total_improves,
+                "review_tasks": total_reviews,
+                "reviewed_impls": len(reviewed_impls),
+                "review_pct": round(review_pct, 1),
+            },
+            "weekly": weekly_rows,
+            "reviews_per_implementation_distribution": dist_rows,
+            "review_cycles_by_review_model": cycle_by_reviewer_model_rows,
+            "review_cycles_by_implement_model": cycle_by_implement_model_rows,
+            "review_cycles_by_pair": cycle_by_pair_rows,
+        }
+        if total_week_row is not None:
+            coverage_payload["weekly_total"] = total_week_row
+        if show_issues:
+            coverage_payload["issues"] = {
+                "rows": issue_rows,
+                "unparsed_review_ids": [rid for rid in unparsed_review_ids if rid],
+            }
+        payload = {
+            "coverage": coverage_payload,
+            "scores": score_analytics,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    header_range = "all time" if all_time else f"{start_date} to {end_date}"
+    print(f"\nReview stats ({header_range})")
+    print(f"Implement tasks: {total_impls}")
+    print(f"Improve tasks:   {total_improves}")
+    print(f"Review tasks:    {total_reviews}")
+    print(f"Reviewed:        {len(reviewed_impls)}/{total_impls} ({review_pct:.0f}%)")
+
+    print(
+        f"\n{'Week':<22} {'Impls':>5} {'Rvws':>5} {'Rv%':>5} {'Med':>5} {'P90':>5} {'Max':>5} {'ScN':>5} {'Mean':>7}"
+    )
+    print("-" * 70)
+    for row in weekly_rows:
+        med_val = row["review_cycles_median"] if row["review_cycles_median"] is not None else "-"
+        p90_val = row["review_cycles_p90"] if row["review_cycles_p90"] is not None else "-"
+        max_val = row["review_cycles_max"] if row["review_cycles_max"] is not None else "-"
+        score_n = row["score_n"] if int(row["score_n"]) > 0 else "-"
+        score_mean = f"{row['score_mean']:.1f}" if row["score_mean"] is not None else "-"
+        print(
+            f"{row['week']:<22} {int(row['impls']):>5} {int(row['reviews']):>5} "
+            f"{float(row['review_pct']):>4.0f}% {med_val:>5} {p90_val:>5} {max_val:>5} "
+            f"{score_n:>5} {score_mean:>7}"
+        )
+    if total_week_row is not None:
+        print("-" * 70)
+        med_val = total_week_row["review_cycles_median"] if total_week_row["review_cycles_median"] is not None else "-"
+        p90_val = total_week_row["review_cycles_p90"] if total_week_row["review_cycles_p90"] is not None else "-"
+        max_val = total_week_row["review_cycles_max"] if total_week_row["review_cycles_max"] is not None else "-"
+        score_n = total_week_row["score_n"] if int(total_week_row["score_n"]) > 0 else "-"
+        score_mean = f"{total_week_row['score_mean']:.1f}" if total_week_row["score_mean"] is not None else "-"
+        print(
+            f"{'Total':<22} {int(total_week_row['impls']):>5} {int(total_week_row['reviews']):>5} "
+            f"{float(total_week_row['review_pct']):>4.0f}% {med_val:>5} {p90_val:>5} {max_val:>5} "
+            f"{score_n:>5} {score_mean:>7}"
+        )
+
+    if dist_rows:
+        print("\nReviews per implementation (reviewed tasks only):")
+        for row in dist_rows:
+            cnt = int(row["reviews_per_impl"])
+            impl_count = int(row["impl_count"])
+            pct = float(row["pct"])
+            bar = "#" * impl_count
+            label = "review" if cnt == 1 else "reviews"
+            left = f"{cnt} {label}:"
+            print(f"  {left:<12}{impl_count:>3} ({pct:3.0f}%)  {bar}")
+
+    if model_cycles:
+        console.print()
+        console.print(_model_breakdown_table("Review model", "Review model", model_cycles))
+
+    if impl_model_cycles:
+        console.print()
+        console.print(
+            _model_breakdown_table("Implement model", "Implement model", impl_model_cycles)
+        )
+
+    if pair_cycles:
         pair_table = Table(
             title="Implement → review pairs",
             title_justify="left",
@@ -348,78 +770,159 @@ def _cmd_stats_reviews(
         pair_table.add_column("Pct", justify="right")
         pair_table.add_column("med/p75/p90/max", justify="right")
         pair_table.add_column("vs med", justify="right")
-        sorted_pairs = sorted(
-            pair_cycles.items(),
-            key=lambda kv: (median(kv[1]), -len(kv[1])),
-        )
-        for (impl_m, rv_m), cycles in sorted_pairs:
-            cycles_sorted = sorted(cycles)
-            n = len(cycles_sorted)
-            pct = (n / total_pairs * 100) if total_pairs else 0
-            delta = median(cycles_sorted) - overall_median
+        for row in cycle_by_pair_rows:
+            delta = float(row["delta_vs_overall_median"])
             delta_str = f"{delta:+.1f}" if delta else "0"
             pair_table.add_row(
-                impl_m,
-                rv_m,
-                str(n),
-                f"{pct:.0f}%",
-                _cycle_stats_str(cycles_sorted),
+                str(row["implement_model"]),
+                str(row["review_model"]),
+                str(row["n"]),
+                f"{float(row['pct']):.0f}%",
+                f"{row['median']}/{row['p75']}/{row['p90']}/{row['max']}",
                 delta_str,
             )
         console.print()
         console.print(pair_table)
 
-    # Per-model issue counts (--issues mode)
+    overall = score_analytics["overall"]
+    rc = _colors.RUNNER_COLORS
+    console.print()
+    console.print(f"[{rc.label}]Score stats (scored reviews only):[/{rc.label}]")
+    if int(overall["n"]) == 0:
+        console.print(f"  [{rc.value}]No scored reviews in range.[/{rc.value}]")
+    else:
+        console.print(
+            f"  [{rc.label}]Overall:[/{rc.label}] "
+            f"[{rc.value}]n={overall['n']}  mean={overall['mean']}  median={overall['median']}  "
+            f"p10={overall['p10']}  p90={overall['p90']}  min={overall['min']}  max={overall['max']}[/{rc.value}]"
+        )
+
+    reviewer_rows = score_analytics["by_reviewer"]
+    if len(reviewer_rows) > 1:
+        reviewer_table = Table(title="Score by reviewer provider/model", title_justify="left", title_style="bold")
+        reviewer_table.add_column("Provider")
+        reviewer_table.add_column("Model")
+        reviewer_table.add_column("N", justify="right")
+        reviewer_table.add_column("Mean", justify="right")
+        reviewer_table.add_column("Median", justify="right")
+        for row in reviewer_rows:
+            reviewer_table.add_row(
+                str(row["provider"] or "unknown"),
+                str(row["model"] or "unknown"),
+                str(row["n"]),
+                f"{float(row['mean']):.1f}",
+                str(row["median"]),
+            )
+        console.print()
+        console.print(reviewer_table)
+
+    implementer_rows = score_analytics["by_implementer"]
+    if len(implementer_rows) > 1:
+        implementer_table = Table(title="Score by implementer provider/model", title_justify="left", title_style="bold")
+        implementer_table.add_column("Provider")
+        implementer_table.add_column("Model")
+        implementer_table.add_column("N", justify="right")
+        implementer_table.add_column("Mean", justify="right")
+        implementer_table.add_column("Median", justify="right")
+        for row in implementer_rows:
+            implementer_table.add_row(
+                str(row["provider"] or "unknown"),
+                str(row["model"] or "unknown"),
+                str(row["n"]),
+                f"{float(row['mean']):.1f}",
+                str(row["median"]),
+            )
+        console.print()
+        console.print(implementer_table)
+
+    pipeline_rows = score_analytics["by_pipeline"]
+    if pipeline_rows:
+        pipeline_table = Table(title="Score by pipeline", title_justify="left", title_style="bold")
+        pipeline_table.add_column("Planner")
+        pipeline_table.add_column("Implementer")
+        pipeline_table.add_column("Reviewer")
+        pipeline_table.add_column("N", justify="right")
+        pipeline_table.add_column("Mean", justify="right")
+        pipeline_table.add_column("Median", justify="right")
+        for row in pipeline_rows:
+            pipeline_table.add_row(
+                _display_provider_model(
+                    row["planner_provider"], row["planner_model"], no_plan=True
+                ),
+                _display_provider_model(
+                    row["implementer_provider"], row["implementer_model"]
+                ),
+                _display_provider_model(
+                    row["reviewer_provider"], row["reviewer_model"]
+                ),
+                str(row["n"]),
+                f"{float(row['mean']):.1f}",
+                str(row["median"]),
+            )
+        console.print()
+        console.print(pipeline_table)
+
+    weekly_trend = score_analytics["weekly_trend"]
+    if weekly_trend:
+        console.print()
+        console.print(f"[{rc.label}]Score trend (last 8 weeks):[/{rc.label}]")
+        for row in weekly_trend:
+            console.print(
+                f"  [{rc.label}]{row['week']}:[/{rc.label}] "
+                f"[{rc.value}]n={int(row['n'])}  mean={float(row['mean']):.1f}[/{rc.value}]"
+            )
+
     if show_issues:
-        review_content = {
-            t.id: t.output_content
-            for t in all_tasks
-            if t.task_type == "review"
-            and t.output_content is not None
-            and t.id is not None
-            and _task_dt(t) is not None
-            and start_dt <= _task_dt(t) < end_dt  # type: ignore
-        }
-        print(f"\nParsing issue counts from {len(review_content)} review(s)...")
-        model_issues: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        unparsed: list[int] = []
-        for ri in ri_tasks:
-            if ri.task_type != "review":
-                continue
-            content = review_content.get(ri.id)  # type: ignore
-            if content is None:
-                continue
-            must_fix, sugg = _count_review_issues(content)
-            if must_fix == 0 and sugg == 0:
-                unparsed.append(ri.id)  # type: ignore
-            model = ri.model or "unknown"
-            model_issues[model].append((must_fix, sugg))
-        if unparsed:
-            ids = ", ".join(str(i) for i in unparsed)
-            print(f"\nwarning: could not parse issues from {len(unparsed)} review(s): {ids}", file=sys.stderr)
-        if model_issues:
-            def _stats_str(vals: list[int]) -> str:
-                return f"{int(median(vals))}/{_percentile(vals, 75)}/{_percentile(vals, 90)}/{max(vals)}"
+        print(f"\nParsing issue counts from {parsed_review_count} review(s)...")
+        if unparsed_review_ids:
+            ids = ", ".join(unparsed_review_ids)
+            print(
+                f"\nwarning: could not parse issues from {len(unparsed_review_ids)} review(s): {ids}",
+                file=sys.stderr,
+            )
+        if issue_rows:
+            def _stats_str_from_row(metric: dict[str, int]) -> str:
+                return (
+                    f"{metric['median']}/{metric['p75']}/{metric['p90']}/{metric['max']}"
+                )
 
             print("\nIssue counts per review (parsed from markdown)")
             print(f"{'Review model':<35} {'Rvws':>5}  {'Blockers':>16}  {'Follow-ups':>16}")
             print(f"{'':35} {'':>5}  {'med/p75/p90/max':>16}  {'med/p75/p90/max':>16}")
             print("-" * 77)
-            all_fixes: list[int] = []
-            all_suggs: list[int] = []
-            for model in sorted(model_issues):
-                pairs = model_issues[model]
-                n = len(pairs)
-                fixes = sorted(mf for mf, _ in pairs)
-                suggs = sorted(sg for _, sg in pairs)
-                all_fixes.extend(fixes)
-                all_suggs.extend(suggs)
-                print(f"{model:<35} {n:>5}  {_stats_str(fixes):>16}  {_stats_str(suggs):>16}")
-            if len(model_issues) > 1:
-                all_fixes.sort()
-                all_suggs.sort()
+            for row in issue_rows:
+                model = str(row["model"])
+                n = int(row["reviews"])
+                blockers_metric = row["blockers"]
+                follow_ups_metric = row["follow_ups"]
+                if not isinstance(blockers_metric, dict) or not isinstance(follow_ups_metric, dict):
+                    continue
+                blockers_metric_int = {
+                    "median": int(blockers_metric.get("median", 0)),
+                    "p75": int(blockers_metric.get("p75", 0)),
+                    "p90": int(blockers_metric.get("p90", 0)),
+                    "max": int(blockers_metric.get("max", 0)),
+                }
+                follow_ups_metric_int = {
+                    "median": int(follow_ups_metric.get("median", 0)),
+                    "p75": int(follow_ups_metric.get("p75", 0)),
+                    "p90": int(follow_ups_metric.get("p90", 0)),
+                    "max": int(follow_ups_metric.get("max", 0)),
+                }
+                print(
+                    f"{model:<35} {n:>5}  "
+                    f"{_stats_str_from_row(blockers_metric_int):>16}  "
+                    f"{_stats_str_from_row(follow_ups_metric_int):>16}"
+                )
+            if len(issue_rows) > 1 and issue_totals_blockers and issue_totals_followups:
+                issue_totals_blockers.sort()
+                issue_totals_followups.sort()
                 print("-" * 77)
-                print(f"{'Total':<35} {len(all_fixes):>5}  {_stats_str(all_fixes):>16}  {_stats_str(all_suggs):>16}")
+                print(
+                    f"{'Total':<35} {sum(int(r['reviews']) for r in issue_rows):>5}  "
+                    f"{int(median(issue_totals_blockers))}/{_percentile(issue_totals_blockers, 75)}/{_percentile(issue_totals_blockers, 90)}/{max(issue_totals_blockers):>16}  "
+                    f"{int(median(issue_totals_followups))}/{_percentile(issue_totals_followups, 75)}/{_percentile(issue_totals_followups, 90)}/{max(issue_totals_followups):>16}"
+                )
 
     return 0
 
@@ -643,8 +1146,15 @@ def cmd_stats(args: argparse.Namespace) -> int:
             else:
                 start_date_r = end_date_r - timedelta(days=14)
         show_issues: bool = getattr(args, 'issues', False)
+        output_json: bool = getattr(args, 'json', False)
         return _cmd_stats_reviews(
-            config, store, start_date_r, end_date_r, show_issues, all_time=all_time
+            config,
+            store,
+            start_date_r,
+            end_date_r,
+            show_issues,
+            all_time=all_time,
+            output_json=output_json,
         )
 
     if stats_subcommand == "iterations":
