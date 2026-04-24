@@ -230,6 +230,57 @@ class TestHistoryCommand:
         assert "Internal task" in result.stdout
         assert "Implement task" not in result.stdout
 
+    def test_history_json_matches_default_internal_filtering(self, tmp_path: Path):
+        """history and history --json should select the same default task IDs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        public_task = store.add("public history task", task_type="implement")
+        public_task.status = "completed"
+        public_task.completed_at = datetime.now(UTC)
+        store.update(public_task)
+
+        internal_task = store.add("internal history task", task_type="internal")
+        internal_task.status = "completed"
+        internal_task.completed_at = datetime.now(UTC)
+        store.update(internal_task)
+
+        text_result = run_gza("history", "--project", str(tmp_path))
+        json_result = run_gza("history", "--json", "--project", str(tmp_path))
+
+        assert text_result.returncode == 0
+        assert json_result.returncode == 0
+        assert "public history task" in text_result.stdout
+        assert "internal history task" not in text_result.stdout
+
+        payload = json.loads(json_result.stdout)
+        ids = {row["id"] for row in payload}
+        assert public_task.id in ids
+        assert internal_task.id not in ids
+
+    def test_history_internal_type_json_includes_internal_rows(self, tmp_path: Path):
+        """history --type internal --json should include internal tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        public_task = store.add("public history task", task_type="implement")
+        public_task.status = "completed"
+        public_task.completed_at = datetime.now(UTC)
+        store.update(public_task)
+
+        internal_task = store.add("internal history task", task_type="internal")
+        internal_task.status = "completed"
+        internal_task.completed_at = datetime.now(UTC)
+        store.update(internal_task)
+
+        result = run_gza("history", "--type", "internal", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        ids = {row["id"] for row in payload}
+        assert internal_task.id in ids
+        assert public_task.id not in ids
+
     def test_history_shows_task_type_labels(self, tmp_path: Path):
         """History command displays task type labels for all task types."""
         setup_db_with_tasks(tmp_path, [
@@ -1121,6 +1172,36 @@ class TestSearchCommand:
         assert "style needle task" in result.stdout
         assert "[implement]" in result.stdout
         assert "branch: feat/search-style" in result.stdout
+
+    def test_search_json_fields_override_limits_projection(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("needle alpha", task_type="implement")
+        first.status = "completed"
+        first.completed_at = datetime.now(UTC)
+        store.update(first)
+
+        second = store.add("needle beta", task_type="plan")
+        second.status = "failed"
+        second.completed_at = datetime.now(UTC)
+        store.update(second)
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--json",
+            "--fields",
+            "id,status",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        for row in payload:
+            assert set(row.keys()) == {"id", "status"}
 
 
 class TestNextCommand:

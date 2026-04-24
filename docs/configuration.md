@@ -918,6 +918,10 @@ gza history [options]
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
 | `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
+| `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
+| `--fields CSV` | Projection fields override (comma-separated) |
+| `--preset NAME` | Projection preset override |
+| `--json` | Output JSON rows from the unified query API |
 
 ### search
 
@@ -931,10 +935,22 @@ gza search <term> [options]
 |--------|-------------|
 | `term` | Substring to match in task prompt text |
 | `--last N`, `-n N` | Show last N matching tasks (default: 10; use `0` for all) |
+| `--status CSV` | Filter statuses (comma-separated) |
+| `--type CSV` | Filter task types (comma-separated) |
+| `--days N` | Show only matches from the last N days |
+| `--start-date YYYY-MM-DD` | Show only matches on or after this date |
+| `--end-date YYYY-MM-DD` | Show only matches on or before this date |
+| `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `created`) |
+| `--related-to TASK_ID` | Restrict to tasks related to the given lineage |
+| `--lineage-of TASK_ID` | Restrict to the canonical lineage containing TASK_ID |
+| `--root CSV` | Restrict by lineage root IDs (comma-separated) |
+| `--fields CSV` | Projection fields override (comma-separated) |
+| `--preset NAME` | Projection preset override |
+| `--json` | Output JSON rows from the unified query API |
 
 ### incomplete
 
-Show unresolved task lineages that still need attention.
+Show unresolved task lineages that still need attention. Default output is one line per unresolved lineage owner.
 
 ```bash
 gza incomplete [options]
@@ -945,6 +961,10 @@ gza incomplete [options]
 | `--last N`, `-n N` | Show last N unresolved lineages (default: 5; use `0` for all) |
 | `--type TYPE` | Filter tasks by task type before lineage rollup: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
 | `--days N` | Show only unresolved lineages with activity in the last N days |
+| `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
+| `--tree` | Show tree output instead of one-line summaries |
+| `--verbose` | Include owner metadata under one-line output |
+| `--json` | Output JSON rows from the unified query API |
 
 ### checkout
 

@@ -267,6 +267,27 @@ def main() -> int:
             "resolved root"
         ),
     )
+    history_parser.add_argument(
+        "--date-field",
+        choices=["created", "completed", "effective"],
+        default="effective",
+        help="Date field used by --days/--start-date/--end-date filters (default: effective)",
+    )
+    history_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override (comma-separated)",
+    )
+    history_parser.add_argument(
+        "--preset",
+        metavar="NAME",
+        help="Projection preset override",
+    )
+    history_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON rows from the unified query API",
+    )
 
     # search command
     search_parser = subparsers.add_parser(
@@ -286,6 +307,70 @@ def main() -> int:
         type=_parse_search_last,
         metavar="N",
         help="Show last N matching tasks (default: 10, 0 for all)",
+    )
+    search_parser.add_argument(
+        "--status",
+        metavar="CSV",
+        help="Filter statuses (comma-separated, e.g. completed,failed)",
+    )
+    search_parser.add_argument(
+        "--type",
+        metavar="CSV",
+        help="Filter task types (comma-separated)",
+    )
+    search_parser.add_argument(
+        "--days",
+        type=_parse_non_negative_int,
+        metavar="N",
+        help="Show only matches from the last N days",
+    )
+    search_parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        metavar="YYYY-MM-DD",
+        help="Show only matches on or after this date",
+    )
+    search_parser.add_argument(
+        "--end-date",
+        dest="end_date",
+        metavar="YYYY-MM-DD",
+        help="Show only matches on or before this date",
+    )
+    search_parser.add_argument(
+        "--date-field",
+        choices=["created", "completed", "effective"],
+        default="created",
+        help="Date field used by --days/--start-date/--end-date filters (default: created)",
+    )
+    search_parser.add_argument(
+        "--related-to",
+        metavar="TASK_ID",
+        help="Limit matches to tasks in the same lineage as TASK_ID",
+    )
+    search_parser.add_argument(
+        "--lineage-of",
+        metavar="TASK_ID",
+        help="Limit matches to the canonical lineage containing TASK_ID",
+    )
+    search_parser.add_argument(
+        "--root",
+        metavar="CSV",
+        help="Filter by lineage root task IDs (comma-separated)",
+    )
+    search_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override (comma-separated)",
+    )
+    search_parser.add_argument(
+        "--preset",
+        metavar="NAME",
+        help="Projection preset override",
+    )
+    search_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON rows from the unified query API",
     )
 
     # incomplete command
@@ -313,6 +398,27 @@ def main() -> int:
         type=_parse_non_negative_int,
         metavar="N",
         help="Show only unresolved lineages with activity in the last N days",
+    )
+    incomplete_parser.add_argument(
+        "--date-field",
+        choices=["created", "completed", "effective"],
+        default="effective",
+        help="Date field used by --days filters (default: effective)",
+    )
+    incomplete_parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="Show unresolved lineages as trees instead of one-line summaries",
+    )
+    incomplete_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include owner metadata under one-line summaries",
+    )
+    incomplete_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON rows from the unified query API",
     )
 
     # unmerged command

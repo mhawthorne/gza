@@ -8,9 +8,17 @@ gza.api.v0 scripting namespace.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
+from typing import Literal
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
+from gza.task_query import (
+    DateFilter,
+    TaskQuery,
+    TaskQueryPresets,
+    TaskQueryService as _TaskQueryService,
+    TaskRow,
+)
 from gza.task_slug import get_base_task_slug as _get_base_task_slug, get_task_slug as _get_task_slug_from_task_id
 
 
@@ -25,6 +33,7 @@ class HistoryFilter:
     days: int | None = None  # Only tasks within the last N days
     start_date: str | None = None  # Only tasks on or after this date (YYYY-MM-DD)
     end_date: str | None = None  # Only tasks on or before this date (YYYY-MM-DD)
+    date_field: Literal["created", "completed", "effective"] = "effective"
     lineage_depth: int = 0  # Expand lineage N levels (0 = flat)
 
 
@@ -86,28 +95,79 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     post-filters in Python, then applies the limit. This is correct at
     gza scale (typically <1000 tasks).
     """
-    since: datetime | None = None
-    if f.days is not None:
-        since = datetime.now(UTC) - timedelta(days=f.days)
-    elif f.start_date is not None:
-        since = datetime.fromisoformat(f.start_date).replace(tzinfo=UTC)
+    service = _TaskQueryService(store)
 
-    until: datetime | None = None
-    if f.end_date is not None:
-        until = datetime.fromisoformat(f.end_date).replace(tzinfo=UTC)
-        # Include the full end date day
-        until = until.replace(hour=23, minute=59, second=59)
-
-    # When post-filtering for incomplete, defer the limit to after filtering
-    effective_limit = None if f.incomplete else f.limit
-
-    tasks = store.get_history(
-        limit=effective_limit,
-        status=f.status,
-        task_type=f.task_type,
-        since=since,
-        until=until,
+    date_filter = DateFilter(
+        field=f.date_field,
+        days=f.days,
+        start=datetime.fromisoformat(f.start_date).date() if f.start_date else None,
+        end=datetime.fromisoformat(f.end_date).date() if f.end_date else None,
     )
+
+    statuses: tuple[str, ...] | None = None
+    merge_chain_state: tuple[str, ...] | None = None
+    if f.status == "unmerged":
+        merge_chain_state = ("unmerged",)
+        statuses = ("completed", "unmerged")
+    elif f.status:
+        statuses = (f.status,)
+    else:
+        statuses = ("completed", "failed", "unmerged", "dropped")
+
+    task_types: tuple[str, ...] | None = (f.task_type,) if f.task_type else None
+    lifecycle_state: tuple[str, ...] | None = ("terminal",)
+
+    effective_limit = None if f.incomplete else f.limit
+    q = TaskQueryPresets.history(
+        limit=effective_limit,
+        statuses=statuses,
+        task_types=task_types,
+        lifecycle_state=lifecycle_state,
+        date_filter=date_filter,
+    )
+    if not f.task_type:
+        # Preserve legacy default history behavior: hide internal unless explicitly requested.
+        q = TaskQuery(
+            scope=q.scope,
+            limit=q.limit,
+            text=q.text,
+            statuses=q.statuses,
+            task_types=None,
+            lifecycle_state=q.lifecycle_state,
+            merge_chain_state=merge_chain_state,
+            dependency_state=q.dependency_state,
+            related_to=q.related_to,
+            lineage_of=q.lineage_of,
+            root_ids=q.root_ids,
+            branch_owner_ids=q.branch_owner_ids,
+            date_filter=q.date_filter,
+            sort=q.sort,
+            projection=q.projection,
+            presentation=q.presentation,
+        )
+    else:
+        q = TaskQuery(
+            scope=q.scope,
+            limit=q.limit,
+            text=q.text,
+            statuses=q.statuses,
+            task_types=q.task_types,
+            lifecycle_state=q.lifecycle_state,
+            merge_chain_state=merge_chain_state,
+            dependency_state=q.dependency_state,
+            related_to=q.related_to,
+            lineage_of=q.lineage_of,
+            root_ids=q.root_ids,
+            branch_owner_ids=q.branch_owner_ids,
+            date_filter=q.date_filter,
+            sort=q.sort,
+            projection=q.projection,
+            presentation=q.presentation,
+        )
+
+    rows = service.run(q).rows
+    task_rows = [row for row in rows if isinstance(row, TaskRow)]
+    tasks = [row.task for row in task_rows if row.task.task_type != "internal" or f.task_type == "internal"]
 
     if f.incomplete:
         tasks = [t for t in tasks if not is_lineage_complete(t)]
@@ -279,6 +339,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         days=f.days,
         start_date=f.start_date,
         end_date=f.end_date,
+        date_field=f.date_field,
     )
     tasks = query_history(store, filtered)
     if not tasks:
