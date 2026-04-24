@@ -22,6 +22,7 @@ from ..db import (
     validate_prompt,
 )
 from ..git import Git
+from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
 from ..review_verdict import get_review_report
@@ -294,7 +295,6 @@ def cmd_implement(args: argparse.Namespace) -> int:
             prompt = f"Implement plan from task {plan_task.id}"
 
     group = args.group if hasattr(args, 'group') and args.group else None
-    depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
@@ -305,9 +305,8 @@ def cmd_implement(args: argparse.Namespace) -> int:
     impl_task = store.add(
         prompt,
         task_type="implement",
-        based_on=plan_task.id,
+        depends_on=plan_task.id,
         group=group,
-        depends_on=depends_on,
         create_review=create_review,
         same_branch=same_branch,
         task_type_hint=branch_type,
@@ -317,7 +316,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
     )
 
     print(f"✓ Created implement task {impl_task.id}")
-    print(f"  Based on: plan {plan_task.id}")
+    print(f"  Depends on: plan {plan_task.id}")
 
     # Handle background mode - spawn worker to run the implement task
     if hasattr(args, 'background') and args.background:
@@ -900,68 +899,6 @@ def _latest_completed_review_for_impl(store: SqliteTaskStore, impl_task_id: str)
     return reviews[0] if reviews else None
 
 
-def _resolve_impl_task(
-    store: SqliteTaskStore, task_id: str
-) -> tuple[DbTask, None] | tuple[None, str]:
-    """Resolve implement/review/improve/fix IDs to the owning implementation task."""
-    task = store.get(task_id)
-    if not task:
-        return None, f"Task {task_id} not found"
-
-    if task.task_type == "implement":
-        return task, None
-
-    if task.task_type in {"improve", "fix"}:
-        label = "Improve" if task.task_type == "improve" else "Fix"
-        if not task.based_on:
-            return None, f"{label} task {task.id} has no based_on implementation task"
-        parent = store.get(task.based_on)
-        if parent is None:
-            return None, f"{label} task {task.id} points to task {task.based_on}, which was not found"
-        seen: set[str] = set()
-        while parent.task_type in {"improve", "fix"}:
-            if parent.id is None:
-                return None, f"{label} task {task.id} points to an invalid retry ancestor"
-            if parent.id in seen:
-                return None, f"{label} task {task.id} has a cycle in its based_on chain"
-            seen.add(parent.id)
-            if not parent.based_on:
-                return None, (
-                    f"{label} task {task.id} points to task {parent.id}, "
-                    "which has no based_on implementation task"
-                )
-            next_parent = store.get(parent.based_on)
-            if next_parent is None:
-                return None, (
-                    f"{label} task {task.id} points to task {parent.based_on}, "
-                    "which was not found"
-                )
-            parent = next_parent
-        if parent.task_type != "implement":
-            return None, (
-                f"{label} task {task.id} points to task {parent.id}, "
-                "which is not an implementation task"
-            )
-        return parent, None
-
-    if task.task_type == "review":
-        if not task.depends_on:
-            return None, f"Review task {task.id} has no depends_on implementation task"
-        parent = store.get(task.depends_on)
-        if parent is None:
-            return None, f"Review task {task.id} points to task {task.depends_on}, which was not found"
-        if parent.task_type != "implement":
-            return None, (
-                f"Review task {task.id} points to task {task.depends_on}, "
-                "which is not an implementation task"
-            )
-        return parent, None
-
-    return None, (
-        f"Task {task_id} is a {task.task_type} task, not an implementation, improve, review, or fix task"
-    )
-
-
 def cmd_improve(args: argparse.Namespace) -> int:
     """Create an improve task based on an implementation task and its most recent review."""
     config = Config.load(args.project_dir)
@@ -975,7 +912,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     store = get_store(config)
 
-    impl_task, err = _resolve_impl_task(store, resolve_id(config, args.task_id))
+    impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
         print(f"Error: {err}")
         return 1
@@ -1189,7 +1126,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         config.max_turns = args.max_turns
 
     store = get_store(config)
-    impl_task, err = _resolve_impl_task(store, resolve_id(config, args.task_id))
+    impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
         print(f"Error: {err}")
         return 1
@@ -1274,7 +1211,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     store = get_store(config)
 
     # Resolve target implementation from provided task (accepts implement, improve, or review)
-    impl_task, err = _resolve_impl_task(store, resolve_id(config, args.task_id))
+    impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
         print(f"Error: {err}")
         return 1

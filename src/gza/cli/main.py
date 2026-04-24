@@ -1523,12 +1523,6 @@ def main() -> int:
         help="Set task group",
     )
     implement_parser.add_argument(
-        "--depends-on",
-        type=str,
-        metavar="ID",
-        help="Set dependency on another task",
-    )
-    implement_parser.add_argument(
         "--same-branch",
         action="store_true",
         help="Continue on depends_on task's branch instead of creating new",

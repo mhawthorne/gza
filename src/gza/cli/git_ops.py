@@ -1204,7 +1204,7 @@ def _cmd_advance_unimplemented(
         impl_task = store.add(
             prompt=prompt_text,
             task_type="implement",
-            based_on=task.id,
+            depends_on=task.id,
             group=task.group,
         )
         print(f"✓ Created implement task {impl_task.id} for {task.task_type} {task.id}")
@@ -1780,7 +1780,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             impl_task = store.add(
                 prompt=prompt_text,
                 task_type="implement",
-                based_on=task.id,
+                depends_on=task.id,
                 group=task.group,
             )
             console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")

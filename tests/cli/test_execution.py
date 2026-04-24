@@ -1925,13 +1925,15 @@ class TestImplementCommand:
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
 
-        impl_task = get_latest_task(store, based_on=plan_task.id, task_type="implement")
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
         assert impl_task is not None
         assert impl_task.id != plan_task.id
         assert impl_task.task_type == "implement"
-        assert impl_task.based_on == plan_task.id
+        assert impl_task.based_on is None
+        assert impl_task.depends_on == plan_task.id
         assert impl_task.prompt == "Implement auth rollout"
         assert impl_task.create_review is True
+        assert f"Depends on: plan {plan_task.id}" in result.stdout
 
     def test_implement_fails_for_missing_plan_task(self, tmp_path: Path):
         """Implement command validates referenced plan task exists."""
@@ -1988,11 +1990,12 @@ class TestImplementCommand:
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
 
-        impl_task = get_latest_task(store, based_on=plan_task.id, task_type="implement")
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
         assert impl_task is not None
         assert impl_task.id != plan_task.id
         assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
-        assert impl_task.based_on == plan_task.id
+        assert impl_task.based_on is None
+        assert impl_task.depends_on == plan_task.id
 
     def test_implement_derives_prompt_from_base_plan_slug_when_retry_suffix_present(self, tmp_path: Path):
         """Implement command strips numeric retry suffix from plan slug."""
@@ -2011,11 +2014,38 @@ class TestImplementCommand:
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
 
-        impl_task = get_latest_task(store, based_on=plan_task.id, task_type="implement")
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
         assert impl_task is not None
         assert impl_task.id != plan_task.id
         assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
-        assert impl_task.based_on == plan_task.id
+        assert impl_task.based_on is None
+        assert impl_task.depends_on == plan_task.id
+
+    def test_implement_rejects_depends_on_flag(self, tmp_path: Path):
+        """Implement command should fail fast for removed --depends-on flag."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        dep_task = store.add("Independent dependency", task_type="implement")
+
+        result = run_gza(
+            "implement",
+            str(plan_task.id),
+            "--depends-on",
+            str(dep_task.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 2
+        assert "unrecognized arguments: --depends-on" in result.stderr
 
 
 class TestImproveCommand:

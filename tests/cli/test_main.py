@@ -207,6 +207,15 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "implement, improve, review, or fix" in normalized_output
 
+    def test_implement_help_does_not_expose_depends_on_flag(self, tmp_path):
+        """`implement --help` should match parser behavior and omit removed --depends-on."""
+        setup_config(tmp_path)
+
+        result = run_gza("implement", "--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "--depends-on" not in result.stdout
+
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""
 

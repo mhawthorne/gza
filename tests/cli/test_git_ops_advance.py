@@ -2888,8 +2888,8 @@ class TestAdvanceCommand:
         assert len(started) == 1
         assert started[0] != extra_pending.id
         assert plan.id is not None
-        children = store.get_based_on_children(plan.id)
-        assert any(child.task_type == "implement" for child in children)
+        children = store.get_impl_tasks_by_depends_on_or_based_on(plan.id)
+        assert any(child.task_type == "implement" and child.depends_on == plan.id for child in children)
 
     def test_advance_iterate_new_batch_create_implement_consumes_slot(self, tmp_path: Path):
         """iterate mode accounts for create_implement as worker-consuming in --new --batch planning/execution."""

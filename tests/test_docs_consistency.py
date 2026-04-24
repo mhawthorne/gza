@@ -49,7 +49,6 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `--review-id ID` | Explicit full prefixed review task ID to base the improve on",
         "| `task_id` | Full prefixed task ID (implement, improve, review, or fix",
         "| `plan_task_id` | Full prefixed completed plan task ID to implement",
-        "| `--depends-on ID` | Set dependency on another task by full prefixed task ID",
         "| `task_id` | Specific full prefixed task ID to advance",
         "| `impl_task_id` | Full prefixed implementation task ID to iterate",
         "| `task_id` | Full prefixed task ID to refresh",

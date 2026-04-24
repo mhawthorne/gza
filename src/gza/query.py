@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
+from gza.lineage import walk_ancestors
 from gza.task_query import (
     DateFilter,
     TaskQuery,
@@ -703,17 +704,9 @@ def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
         return task
 
     graph_nodes: dict[str, Task] = {task.id: task}
-    to_visit = _get_parent_ids(task)
-
-    while to_visit:
-        parent_id = to_visit.pop(0)
-        if parent_id in graph_nodes:
-            continue
-        parent = store.get(parent_id)
-        if parent is None or parent.id is None:
-            continue
-        graph_nodes[parent.id] = parent
-        to_visit.extend(_get_parent_ids(parent))
+    for ancestor in walk_ancestors(store, task, follow_based_on=True, follow_depends_on=True):
+        if ancestor.id is not None:
+            graph_nodes[ancestor.id] = ancestor
 
     if len(graph_nodes) == 1:
         return task
