@@ -513,12 +513,45 @@ def test_collect_live_running_state_tracks_worker_and_pid_only_tasks(tmp_path: P
 
 def test_format_wake_message_includes_running_task_ids() -> None:
     """WAKE line should append task IDs when tasks are actively running."""
-    assert _format_wake_message(running=1, slots=0, running_task_ids=["gza-42"]) == (
-        "checking... (1 running, 0 slots) tasks: gza-42"
+    assert _format_wake_message(running=1, pending=3, slots=0, running_task_ids=["gza-42"]) == (
+        "checking... (1 running, 3 pending, 0 slots) tasks: gza-42"
     )
-    assert _format_wake_message(running=0, slots=2, running_task_ids=[]) == (
-        "checking... (0 running, 2 slots)"
+    assert _format_wake_message(running=0, pending=2, slots=2, running_task_ids=[]) == (
+        "checking... (0 running, 2 pending, 2 slots)"
     )
+
+
+def test_watch_cycle_logs_group_scoped_pending_count_in_wake_line(tmp_path: Path) -> None:
+    """WAKE line should report runnable pending tasks using the selected group filter."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    store.add("Release runnable", task_type="plan", group="release-1")
+    release_blocker = store.add("Release blocker", task_type="plan", group="release-1")
+    assert release_blocker.id is not None
+    store.add("Release blocked", task_type="plan", group="release-1", depends_on=release_blocker.id)
+    store.add("Backlog runnable", task_type="plan", group="backlog")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            group="release-1",
+        )
+
+    assert "WAKE   checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()
 
 
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
@@ -2066,22 +2099,22 @@ def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pyt
 
     with patch("gza.cli.watch._format_hms", side_effect=["18:08:47", "18:13:47"]):
         log.begin_cycle()
-        log.emit("WAKE", "checking... (0 running, 1 slots)")
+        log.emit("WAKE", "checking... (0 running, 2 pending, 1 slots)")
         log.end_cycle()
 
         log.begin_cycle()
-        log.emit("WAKE", "checking... (1 running, 0 slots)")
+        log.emit("WAKE", "checking... (1 running, 0 pending, 0 slots)")
         log.end_cycle()
 
     assert log_path.read_text() == (
-        "18:08:47 WAKE   checking... (0 running, 1 slots)\n"
+        "18:08:47 WAKE   checking... (0 running, 2 pending, 1 slots)\n"
         "\n"
-        "18:13:47 WAKE   checking... (1 running, 0 slots)\n"
+        "18:13:47 WAKE   checking... (1 running, 0 pending, 0 slots)\n"
     )
     assert capsys.readouterr().out == (
-        "18:08:47 WAKE   checking... (0 running, 1 slots)\n"
+        "18:08:47 WAKE   checking... (0 running, 2 pending, 1 slots)\n"
         "\n"
-        "18:13:47 WAKE   checking... (1 running, 0 slots)\n"
+        "18:13:47 WAKE   checking... (1 running, 0 pending, 0 slots)\n"
     )
 
 

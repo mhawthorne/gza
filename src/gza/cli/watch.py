@@ -248,8 +248,8 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
     return live_pids, sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id))
 
 
-def _format_wake_message(*, running: int, slots: int, running_task_ids: list[str]) -> str:
-    message = f"checking... ({running} running, {slots} slots)"
+def _format_wake_message(*, running: int, pending: int, slots: int, running_task_ids: list[str]) -> str:
+    message = f"checking... ({running} running, {pending} pending, {slots} slots)"
     if running_task_ids:
         message += f" tasks: {', '.join(running_task_ids)}"
     return message
@@ -306,13 +306,22 @@ def _run_cycle(
         prune_terminal_dead_workers(config)
 
     live_pids, running_task_ids = _collect_live_running_state(config, store)
+    pending_count = len(_pending_runnable_tasks(store, group=group))
     running = len(live_pids)
     slots = max(0, batch - running)
     work_done = False
     started_task_ids: set[str] = set()
     step1_handled_child_task_ids: set[str] = set()
 
-    log.emit("WAKE", _format_wake_message(running=running, slots=slots, running_task_ids=running_task_ids))
+    log.emit(
+        "WAKE",
+        _format_wake_message(
+            running=running,
+            pending=pending_count,
+            slots=slots,
+            running_task_ids=running_task_ids,
+        ),
+    )
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
