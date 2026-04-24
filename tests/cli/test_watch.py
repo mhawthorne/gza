@@ -665,6 +665,130 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
     assert f"MERGE  {task.id} -> main" in log_path.read_text()
 
 
+def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_tasks(tmp_path: Path) -> None:
+    """Watch should treat APPROVED_WITH_FOLLOWUPS as mergeable and create follow-up tasks first."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement", group="release-1")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-followups-merge"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    review = store.add("Review task", task_type="review", depends_on=task.id)
+    assert review.id is not None
+
+    finding = SimpleNamespace(id="F1")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    created_followup = SimpleNamespace(id="gza-999")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._determine_advance_action",
+            return_value={
+                "type": "merge_with_followups",
+                "review_task": review,
+                "followup_findings": (finding,),
+            },
+        ),
+        patch(
+            "gza.cli.watch._create_or_reuse_followup_tasks",
+            return_value=([created_followup], []),
+        ) as create_followups,
+        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    create_followups.assert_called_once()
+    kwargs = create_followups.call_args.kwargs
+    assert create_followups.call_args.args == (store,)
+    assert kwargs["review_task"].id == review.id
+    assert kwargs["impl_task"].id == task.id
+    assert kwargs["findings"] == (finding,)
+    assert merge_single.call_count == 1
+    assert f"MERGE  {task.id} -> main" in log_path.read_text()
+
+
+def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_followup_tasks(tmp_path: Path) -> None:
+    """Dry-run should preview merge_with_followups without mutating follow-up tasks."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-followups-dry-run"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    review = store.add("Review task", task_type="review", depends_on=task.id)
+    assert review.id is not None
+
+    finding = SimpleNamespace(id="F1")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._determine_advance_action",
+            return_value={
+                "type": "merge_with_followups",
+                "review_task": review,
+                "followup_findings": (finding,),
+            },
+        ),
+        patch("gza.cli.watch._create_or_reuse_followup_tasks") as create_followups,
+        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    create_followups.assert_not_called()
+    assert merge_single.call_count == 0
+    assert f"MERGE  {task.id} -> main [dry-run]" in log_path.read_text()
+
+
 def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

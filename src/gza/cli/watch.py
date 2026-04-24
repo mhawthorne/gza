@@ -20,6 +20,7 @@ from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..workers import WorkerRegistry
 from ._common import (
+    _create_or_reuse_followup_tasks,
     _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
@@ -293,7 +294,7 @@ def _run_cycle(
                 )
             )
         action_plan.sort(key=lambda item: _WATCH_ADVANCE_ACTION_ORDER.get(item[1].get("type", ""), 1))
-        has_merge_action = any(action.get("type") == "merge" for _, action in action_plan)
+        has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, action in action_plan)
         can_merge = True
         if has_merge_action:
             can_merge = _run_with_optional_stdout_suppressed(
@@ -318,7 +319,7 @@ def _run_cycle(
                 )
                 continue
 
-            if action_type == "merge":
+            if action_type in {"merge", "merge_with_followups"}:
                 if not can_merge:
                     log.emit(
                         "SKIP",
@@ -330,6 +331,16 @@ def _run_cycle(
                     log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
                     work_done = True
                     continue
+                if action_type == "merge_with_followups":
+                    review_task = action.get("review_task")
+                    followup_findings = action.get("followup_findings")
+                    if isinstance(review_task, DbTask) and isinstance(followup_findings, tuple):
+                        _create_or_reuse_followup_tasks(
+                            store,
+                            review_task=review_task,
+                            impl_task=task,
+                            findings=followup_findings,
+                        )
                 merge_args = _build_auto_merge_args(config, git, task, target_branch)
                 rc = _run_with_optional_stdout_suppressed(
                     quiet,
