@@ -1514,6 +1514,8 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
         assert create_rebase.call_count == 0
     log_lines = log_path.read_text().splitlines()
     assert any("[dry-run]" in line and expected_fragment in line for line in log_lines)
+    if action_type == "create_implement":
+        assert any(f"(new) implement for {root.id} [dry-run]" in line for line in log_lines)
 
 
 def test_watch_dry_run_command_does_not_reconcile_or_prune_dead_in_progress_task(tmp_path: Path) -> None:
