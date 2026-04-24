@@ -276,6 +276,8 @@ def build_docker_cmd(
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm", stdio_flag,
         "-v", f"{work_dir}:/workspace",
+        # Shadow host /workspace/.venv from bind mount with a container-local volume.
+        "-v", "/workspace/.venv",
         "-w", "/workspace",
     ]
 

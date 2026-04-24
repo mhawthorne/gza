@@ -465,6 +465,23 @@ class TestBuildDockerCmd:
         mount_arg = cmd[mount_idx + 1]
         assert mount_arg == f"{tmp_path}:/workspace"
 
+    def test_mounts_anonymous_workspace_venv_volume(self, tmp_path):
+        """Should shadow /workspace/.venv with a container-local anonymous volume."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        volume_mounts = [cmd[i + 1] for i in v_indices]
+        assert "/workspace/.venv" in volume_mounts
+        assert volume_mounts[0] == f"{tmp_path}:/workspace"
+        assert volume_mounts[1] == "/workspace/.venv"
+
     def test_mounts_config_dir(self, tmp_path):
         """Should mount provider config directory."""
         docker_config = DockerConfig(
@@ -477,10 +494,10 @@ class TestBuildDockerCmd:
 
         cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
 
-        # Find the config mount (second -v)
+        # Find the config mount after workspace + .venv mounts.
         v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        assert len(v_indices) >= 2
-        config_mount = cmd[v_indices[1] + 1]
+        assert len(v_indices) >= 3
+        config_mount = cmd[v_indices[2] + 1]
         assert ".myconfig" in config_mount
         assert "/home/gza/.myconfig" in config_mount
 
@@ -574,10 +591,11 @@ class TestBuildDockerCmd:
         v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
         volume_mounts = [cmd[i + 1] for i in v_indices]
 
-        # Workspace and config should come before custom
-        assert len(volume_mounts) >= 3
+        # Workspace, .venv shadow mount, and config should come before custom
+        assert len(volume_mounts) >= 4
         assert volume_mounts[0] == f"{tmp_path}:/workspace"
-        assert ".testconfig" in volume_mounts[1]
+        assert volume_mounts[1] == "/workspace/.venv"
+        assert ".testconfig" in volume_mounts[2]
         assert "/custom:/custom" in volume_mounts
 
     def test_custom_volumes_with_none(self, tmp_path):
@@ -597,9 +615,9 @@ class TestBuildDockerCmd:
             docker_volumes=None
         )
 
-        # Should only have workspace and config mounts
+        # Should only have workspace, .venv, and config mounts
         v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        assert len(v_indices) == 2
+        assert len(v_indices) == 3
 
     def test_custom_volumes_with_empty_list(self, tmp_path):
         """Should handle docker_volumes=[] gracefully."""
@@ -618,9 +636,9 @@ class TestBuildDockerCmd:
             docker_volumes=[]
         )
 
-        # Should only have workspace and config mounts
+        # Should only have workspace, .venv, and config mounts
         v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        assert len(v_indices) == 2
+        assert len(v_indices) == 3
 
     def test_passes_setup_command_as_env_var(self, tmp_path):
         """Should pass GZA_DOCKER_SETUP_COMMAND when docker_setup_command is set."""
