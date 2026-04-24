@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -131,6 +131,18 @@ def task_id_numeric_key(task_id: str | None) -> int:
         return int(suffix)
     except ValueError:
         return 0
+
+
+def _next_monotonic_iso_timestamp(now: datetime, floor_iso: str | None) -> str:
+    """Return an ISO timestamp that is strictly later than ``floor_iso`` when needed."""
+    if floor_iso:
+        try:
+            floor = datetime.fromisoformat(floor_iso)
+        except ValueError:
+            floor = None
+        if floor is not None and now <= floor:
+            now = floor + timedelta(microseconds=1)
+    return now.isoformat()
 
 
 class ManualMigrationRequired(Exception):
@@ -2143,7 +2155,6 @@ class SqliteTaskStore:
         normalized = content.strip()
         if not normalized:
             raise ValueError("Comment content cannot be empty")
-        created_at = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             existing = conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ?",
@@ -2151,6 +2162,22 @@ class SqliteTaskStore:
             ).fetchone()
             if existing is None:
                 raise KeyError(f"Task {task_id} not found")
+            previous_row = conn.execute(
+                """
+                SELECT created_at
+                FROM task_comments
+                WHERE task_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            previous_created_at = (
+                str(previous_row["created_at"])
+                if previous_row is not None and previous_row["created_at"] is not None
+                else None
+            )
+            created_at = _next_monotonic_iso_timestamp(datetime.now(UTC), previous_created_at)
             cur = conn.execute(
                 """
                 INSERT INTO task_comments (task_id, content, source, author, created_at)

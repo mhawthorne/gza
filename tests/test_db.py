@@ -4,6 +4,7 @@ import subprocess
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1355,6 +1356,26 @@ class TestTaskComments:
         store.resolve_comments(task.id, created_on_or_before=snapshot)
         unresolved_after = store.get_comments(task.id, unresolved_only=True)
         assert [comment.content for comment in unresolved_after] == ["New comment"]
+
+    def test_add_comment_makes_created_at_monotonic_when_clock_repeats(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with repeated comment timestamps", task_type="implement")
+        assert task.id is not None
+
+        repeated_now = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
+        with patch("gza.db.datetime", wraps=datetime) as mock_datetime:
+            mock_datetime.now.return_value = repeated_now
+            first = store.add_comment(task.id, "First comment", source="direct")
+            second = store.add_comment(task.id, "Second comment", source="direct")
+
+        assert first.created_at is not None
+        assert second.created_at is not None
+        assert second.created_at > first.created_at
+
+        scoped = store.get_comments(task.id, created_on_or_before=first.created_at)
+        assert [comment.content for comment in scoped] == ["First comment"]
 
 
 class TestMergeStatus:
