@@ -2357,6 +2357,9 @@ class TestWatchConfigValidation:
         ("field", "value"),
         [
             ("batch", "bad"),
+            ("failure_backoff_initial", "bad"),
+            ("failure_backoff_max", "bad"),
+            ("failure_halt_after", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
             ("max_iterations", "bad"),
@@ -2370,7 +2373,18 @@ class TestWatchConfigValidation:
         with pytest.raises(ConfigError, match=f"watch.{field}"):
             Config.load(tmp_path)
 
-    @pytest.mark.parametrize("field", ["batch", "poll", "max_idle", "max_iterations"])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "batch",
+            "failure_backoff_initial",
+            "failure_backoff_max",
+            "failure_halt_after",
+            "poll",
+            "max_idle",
+            "max_iterations",
+        ],
+    )
     def test_config_watch_invalid_bounds_raises(self, tmp_path: Path, field: str) -> None:
         """Config.load raises ConfigError when watch values are out of bounds."""
         from gza.config import Config, ConfigError
@@ -2387,12 +2401,18 @@ class TestWatchConfigValidation:
             tmp_path,
             "watch:\n"
             "  batch: 7\n"
+            "  failure_backoff_initial: 30\n"
+            "  failure_backoff_max: 900\n"
+            "  failure_halt_after: 6\n"
             "  poll: 45\n"
             "  max_idle: 180\n"
             "  max_iterations: 9\n",
         )
         config = Config.load(tmp_path)
         assert config.watch.batch == 7
+        assert config.watch.failure_backoff_initial == 30
+        assert config.watch.failure_backoff_max == 900
+        assert config.watch.failure_halt_after == 6
         assert config.watch.poll == 45
         assert config.watch.max_idle == 180
         assert config.watch.max_iterations == 9
@@ -2405,10 +2425,34 @@ class TestWatchConfigValidation:
         config = Config.load(tmp_path)
         assert config.watch.max_idle is None
 
+    def test_config_watch_null_failure_halt_after_loads(self, tmp_path: Path) -> None:
+        """Config.load accepts null failure_halt_after."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "watch:\n  failure_halt_after: null\n")
+        config = Config.load(tmp_path)
+        assert config.watch.failure_halt_after is None
+
+    def test_config_watch_backoff_max_must_be_at_least_initial(self, tmp_path: Path) -> None:
+        """Config.load rejects inverted watch failure backoff bounds."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(
+            tmp_path,
+            "watch:\n"
+            "  failure_backoff_initial: 120\n"
+            "  failure_backoff_max: 60\n",
+        )
+        with pytest.raises(ConfigError, match="watch.failure_backoff_max must be >= watch.failure_backoff_initial"):
+            Config.load(tmp_path)
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [
             ("batch", "bad"),
+            ("failure_backoff_initial", "bad"),
+            ("failure_backoff_max", "bad"),
+            ("failure_halt_after", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
             ("max_iterations", "bad"),
@@ -2423,7 +2467,18 @@ class TestWatchConfigValidation:
         assert is_valid is False
         assert f"watch.{field}" in "\n".join(errors)
 
-    @pytest.mark.parametrize("field", ["batch", "poll", "max_idle", "max_iterations"])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "batch",
+            "failure_backoff_initial",
+            "failure_backoff_max",
+            "failure_halt_after",
+            "poll",
+            "max_idle",
+            "max_iterations",
+        ],
+    )
     def test_validate_watch_invalid_bounds(self, tmp_path: Path, field: str) -> None:
         """Config.validate flags out-of-bounds watch values."""
         from gza.config import Config
@@ -2432,6 +2487,20 @@ class TestWatchConfigValidation:
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert f"watch.{field}" in "\n".join(errors)
+
+    def test_validate_watch_backoff_max_must_be_at_least_initial(self, tmp_path: Path) -> None:
+        """Config.validate flags inverted watch failure backoff bounds."""
+        from gza.config import Config
+
+        self._write_config(
+            tmp_path,
+            "watch:\n"
+            "  failure_backoff_initial: 120\n"
+            "  failure_backoff_max: 60\n",
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "watch.failure_backoff_max must be >= watch.failure_backoff_initial" in "\n".join(errors)
 
 
 class TestIterateMaxIterationsConfigValidation:

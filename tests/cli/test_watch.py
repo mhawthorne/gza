@@ -12,6 +12,8 @@ import pytest
 
 from gza.cli.watch import (
     _collect_live_running_state,
+    _collect_unhandled_failures,
+    _compute_failure_backoff_seconds,
     _count_live_workers,
     _CycleResult,
     _emit_transition_events,
@@ -2173,6 +2175,209 @@ def test_cmd_watch_dry_run_actionable_cycles_do_not_count_toward_max_idle(tmp_pa
 
     assert rc == 0
     assert run_cycle.call_count == 3
+
+
+def test_collect_unhandled_failures_skips_auto_resumable_failures(tmp_path: Path) -> None:
+    """Resumable failures should not contribute to watch backoff decisions."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    resumable = store.add("Resumable implement", task_type="implement")
+    assert resumable.id is not None
+    resumable.status = "failed"
+    resumable.failure_reason = "MAX_TURNS"
+    resumable.session_id = "sess-123"
+    resumable.completed_at = datetime.now(UTC)
+    store.update(resumable)
+
+    config = Config.load(tmp_path)
+    old = {str(resumable.id): {"status": "in_progress"}}
+    new = {
+        str(resumable.id): {
+            "status": "failed",
+            "task_type": "implement",
+            "failure_reason": "MAX_TURNS",
+        }
+    }
+
+    failures = _collect_unhandled_failures(old, new, store=store, config=config)
+    assert failures == []
+
+
+def test_collect_unhandled_failures_includes_unknown_failures(tmp_path: Path) -> None:
+    """Unknown failures should contribute to watch backoff decisions."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Broken plan", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "UNKNOWN"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    old = {str(failed.id): {"status": "in_progress"}}
+    new = {
+        str(failed.id): {
+            "status": "failed",
+            "task_type": "plan",
+            "failure_reason": "UNKNOWN",
+        }
+    }
+
+    failures = _collect_unhandled_failures(old, new, store=store, config=config)
+    assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "UNKNOWN")]
+
+
+def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:
+    """Watch failure backoff should grow exponentially and clamp at the configured max."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 300\n"
+    )
+    config = Config.load(tmp_path)
+
+    assert _compute_failure_backoff_seconds(config, 1) == 60
+    assert _compute_failure_backoff_seconds(config, 2) == 120
+    assert _compute_failure_backoff_seconds(config, 3) == 240
+    assert _compute_failure_backoff_seconds(config, 4) == 300
+
+
+def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
+    """watch should log explicit cooldowns after consecutive non-auto-resumable failures."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 10\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Pending plan", task_type="plan")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+
+    snapshots = [
+        {str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None}},
+        {str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None}},
+        {str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"}},
+        {str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"}},
+        {str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"}},
+    ]
+    cycle_results = [
+        _CycleResult(True, 0, 1),
+        _CycleResult(False, 0, 1),
+    ]
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert sleeps == [60]
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" in log_text
+    assert "sleeping 60s before starting more work" in log_text
+
+
+def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None:
+    """watch should stop and log when the configured failure streak threshold is reached."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 3600\n"
+        "  failure_halt_after: 2\n"
+    )
+    store = make_store(tmp_path)
+    task1 = store.add("Pending plan 1", task_type="plan")
+    task2 = store.add("Pending plan 2", task_type="plan")
+    assert task1.id is not None
+    assert task2.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+
+    snapshots = [
+        {
+            str(task1.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+            str(task2.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task1.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+            str(task2.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task1.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+            str(task2.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task1.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+            str(task2.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task1.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+            str(task2.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+        },
+    ]
+    cycle_results = [
+        _CycleResult(True, 0, 2),
+        _CycleResult(True, 0, 1),
+    ]
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert sleeps == [60]
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "failure halt threshold reached" in log_text
 
 
 def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
