@@ -1463,6 +1463,24 @@ class TestQueueCommand:
         assert "Internal pending" not in result.stdout
         assert "Blocked pending" not in result.stdout
 
+    def test_queue_group_filters_runnable_tasks_to_group(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_task = store.add("Release task", group="release-1")
+        other_task = store.add("Other task", group="backlog")
+        blocked_parent = store.add("Release blocker", group="release-1")
+        store.add("Blocked release task", group="release-1", depends_on=blocked_parent.id)
+        assert release_task.id is not None
+        assert other_task.id is not None
+
+        result = run_gza("queue", "--group", "release-1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Release task" in result.stdout
+        assert "Other task" not in result.stdout
+        assert "Blocked release task" not in result.stdout
+
     def test_queue_shows_no_runnable_tasks_when_only_non_pickable_pending_exist(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1474,6 +1492,23 @@ class TestQueueCommand:
 
         assert result.returncode == 0
         assert "No runnable tasks" in result.stdout
+
+    def test_next_group_filters_pending_and_blocked_counts(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Release runnable", group="release-1")
+        blocker = store.add("Release blocker", group="release-1")
+        store.add("Release blocked", group="release-1", depends_on=blocker.id)
+        store.add("Backlog runnable", group="backlog")
+
+        result = run_gza("next", "--group", "release-1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Release runnable" in result.stdout
+        assert "Release blocked" not in result.stdout
+        assert "Backlog runnable" not in result.stdout
+        assert "1 task blocked by dependencies" in result.stdout
 
 
 class TestShowCommand:

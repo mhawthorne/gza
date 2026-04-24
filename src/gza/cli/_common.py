@@ -373,6 +373,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     explicit_task_id = task_id
     selected_task: DbTask | None = None
     resume_mode = bool(getattr(args, "resume", False))
+    selected_group = getattr(args, "group", None)
 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
@@ -407,9 +408,12 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print("Error: Cannot resume without specifying a task ID")
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
-        selected_task = store.get_next_pending()
+        selected_task = store.get_next_pending(group=selected_group)
         if not selected_task:
-            print("No pending tasks found")
+            if selected_group:
+                print(f"No pending tasks found in group '{selected_group}'")
+            else:
+                print("No pending tasks found")
             return 0
 
     assert selected_task is not None
@@ -425,6 +429,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     if explicit_task_id is not None:
         inner_cmd.append(str(explicit_task_id))
+    elif selected_group:
+        inner_cmd.extend(["--group", selected_group])
 
     if args.no_docker:
         inner_cmd.append("--no-docker")
@@ -872,6 +878,8 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     """
     # Determine how many workers to spawn
     count = args.count if args.count is not None else 1
+    selected_group = getattr(args, "group", None)
+    store = get_store(config)
 
     # If specific task_ids are provided, spawn one worker per task ID
     if hasattr(args, 'task_ids') and args.task_ids:
@@ -888,6 +896,22 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         if len(args.task_ids) > 1:
             print(f"\n=== Spawned {spawned_count} background worker(s) for {len(args.task_ids)} task(s) ===")
 
+        return 0
+
+    if selected_group:
+        pending_tasks = store.get_pending_pickup(limit=count, group=selected_group)
+        spawned_count = 0
+        for task in pending_tasks:
+            if task.id is None:
+                continue
+            result = _spawn_background_worker(args, config, task_id=task.id)
+            if result == 0:
+                spawned_count += 1
+        if count > 1:
+            print(
+                f"\n=== Attempted to spawn {count} background worker(s) "
+                f"for group '{selected_group}' ==="
+            )
         return 0
 
     # Spawn N workers - each will atomically claim a pending task

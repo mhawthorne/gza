@@ -98,6 +98,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             _print_orphaned_warning(orphaned)
             print()
     task_id_for_registration = None
+    selected_group = getattr(args, "group", None)
 
     # Check if specific task IDs were provided
     if hasattr(args, 'task_ids') and args.task_ids:
@@ -123,7 +124,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         task_id_for_registration = args.task_ids[0]
     else:
         # For loop mode, we'll register with the first task we're about to run
-        next_task = store.get_next_pending()
+        next_task = store.get_next_pending(group=selected_group)
         if next_task:
             task_id_for_registration = next_task.id
 
@@ -195,7 +196,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         for i in range(count):
             if tasks_completed > 0:
                 print(task_separator)
-            result = run(config, **run_kwargs)
+            if selected_group:
+                next_task = store.get_next_pending(group=selected_group)
+                if not next_task:
+                    if tasks_completed == 0:
+                        print(f"No pending tasks found in group '{selected_group}'")
+                    else:
+                        elapsed = format_duration(time.time() - start_time)
+                        print(
+                            f"\nCompleted {tasks_completed} task(s) in {elapsed}. "
+                            f"No more pending tasks in group '{selected_group}'."
+                        )
+                    break
+                worker.task_id = next_task.id
+                registry.update(worker)
+                result = run(config, task_id=next_task.id, **run_kwargs)
+            else:
+                result = run(config, **run_kwargs)
 
             # Any non-zero exit means the run failed.
             if result != 0:
@@ -213,10 +230,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             if i < count - 1:  # Not the last iteration
                 from ..db import SqliteTaskStore
                 store = SqliteTaskStore(config.db_path)
-                next_task = store.get_next_pending()
+                next_task = store.get_next_pending(group=selected_group)
                 if not next_task:
                     elapsed = format_duration(time.time() - start_time)
-                    print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")
+                    if selected_group:
+                        print(
+                            f"\nCompleted {tasks_completed} task(s) in {elapsed}. "
+                            f"No more pending tasks in group '{selected_group}'."
+                        )
+                    else:
+                        print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")
                     break
                 # Update worker registry to track the next task
                 worker.task_id = next_task.id

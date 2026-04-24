@@ -149,9 +149,10 @@ def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    group = getattr(args, "group", None)
 
-    pending = store.get_pending()
-    runnable = get_runnable_pending_tasks(store)
+    pending = store.get_pending(group=group)
+    runnable = get_runnable_pending_tasks(store, group=group)
     blocked: list[tuple[DbTask, str | None]] = []
 
     # Check for orphaned/stale tasks once, regardless of whether pending tasks exist
@@ -159,7 +160,10 @@ def cmd_next(args: argparse.Namespace) -> int:
     orphaned = _get_orphaned_tasks(registry, store)
 
     if not pending:
-        console.print("No pending tasks")
+        if group:
+            console.print(f"No pending tasks in group '{group}'")
+        else:
+            console.print("No pending tasks")
         if orphaned:
             _print_orphaned_warning(orphaned)
         return 0
@@ -216,7 +220,10 @@ def cmd_next(args: argparse.Namespace) -> int:
             _print_task_row(i, task)
     else:
         if not show_all:
-            console.print("No runnable tasks")
+            if group:
+                console.print(f"No runnable tasks in group '{group}'")
+            else:
+                console.print("No runnable tasks")
 
     # Show blocked tasks if --all is specified
     if show_all and blocked:

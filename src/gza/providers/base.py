@@ -91,10 +91,17 @@ def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
     # Docker Desktop can't share individual files, so copy it into the config dir
     config_file = Path.home() / f"{docker_config.config_dir}.json"
     if config_file.exists():
-        config_dir.mkdir(parents=True, exist_ok=True)
-        dest = config_dir / f"{docker_config.config_dir}.json"
-        shutil.copy2(config_file, dest)
-        args.extend(["-v", f"{dest}:/home/gza/{docker_config.config_dir}.json"])
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            dest = config_dir / f"{docker_config.config_dir}.json"
+            shutil.copy2(config_file, dest)
+        except OSError:
+            # Best effort only: inability to mirror the JSON file should not
+            # prevent docker command construction when the config dir itself
+            # can still be mounted.
+            pass
+        else:
+            args.extend(["-v", f"{dest}:/home/gza/{docker_config.config_dir}.json"])
     return args
 
 

@@ -1374,17 +1374,17 @@ class SqliteTaskStore:
 
     # === Query methods ===
 
-    def get_next_pending(self) -> Task | None:
+    def get_next_pending(self, group: str | None = None) -> Task | None:
         """Get the next pending task (oldest first), skipping blocked tasks.
 
         A task is unblocked when its dependency is completed OR when its
         dependency is failed but a completed retry exists anywhere in the
         based_on chain.
         """
-        pending = self.get_pending_pickup(limit=1)
+        pending = self.get_pending_pickup(limit=1, group=group)
         return pending[0] if pending else None
 
-    def get_pending_pickup(self, limit: int | None = None) -> list[Task]:
+    def get_pending_pickup(self, limit: int | None = None, group: str | None = None) -> list[Task]:
         """Get runnable pending tasks in pickup order.
 
         Pickup semantics match default worker selection: excludes internal and
@@ -1403,6 +1403,7 @@ class SqliteTaskStore:
                 SELECT t.* FROM tasks t
                 WHERE t.status = 'pending'
                 AND t.task_type != 'internal'
+                AND (? IS NULL OR t."group" = ?)
                 AND (
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
@@ -1412,10 +1413,10 @@ class SqliteTaskStore:
                     COALESCE(t.urgent_bumped_at, '') DESC,
                     t.created_at ASC
                 """
-            params: tuple[int, ...] | tuple[()] = ()
+            params: tuple[str | int | None, ...] = (group, group)
             if limit is not None:
                 query += " LIMIT ?"
-                params = (limit,)
+                params += (limit,)
             cur = conn.execute(query, params)
             return [self._row_to_task(row) for row in cur.fetchall()]
 
@@ -1450,14 +1451,18 @@ class SqliteTaskStore:
             # Database busy after timeout — treat as CAS loss.
             return None
 
-    def get_pending(self, limit: int | None = None) -> list[Task]:
+    def get_pending(self, limit: int | None = None, group: str | None = None) -> list[Task]:
         """Get all pending tasks."""
         with self._connect() as conn:
-            query = "SELECT * FROM tasks WHERE status = 'pending' ORDER BY urgent DESC, created_at ASC"
-            params: tuple[int, ...] | tuple[()] = ()
+            query = (
+                'SELECT * FROM tasks WHERE status = \'pending\' '
+                'AND (? IS NULL OR "group" = ?) '
+                "ORDER BY urgent DESC, created_at ASC"
+            )
+            params: tuple[str | int | None, ...] = (group, group)
             if limit is not None:
                 query += " LIMIT ?"
-                params = (limit,)
+                params += (limit,)
             cur = conn.execute(query, params)
             return [self._row_to_task(row) for row in cur.fetchall()]
 
