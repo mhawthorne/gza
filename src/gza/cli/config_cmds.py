@@ -15,6 +15,7 @@ from typing import Any
 
 from rich.table import Table
 
+from .. import colors as _colors
 from ..config import Config
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
@@ -784,14 +785,16 @@ def _cmd_stats_reviews(
         console.print(pair_table)
 
     overall = score_analytics["overall"]
-    print("\nScore stats (scored reviews only):")
+    rc = _colors.RUNNER_COLORS
+    console.print()
+    console.print(f"[{rc.label}]Score stats (scored reviews only):[/{rc.label}]")
     if int(overall["n"]) == 0:
-        print("  No scored reviews in range.")
+        console.print(f"  [{rc.value}]No scored reviews in range.[/{rc.value}]")
     else:
-        print(
-            "  "
-            f"n={overall['n']}  mean={overall['mean']}  median={overall['median']}  "
-            f"p10={overall['p10']}  p90={overall['p90']}  min={overall['min']}  max={overall['max']}"
+        console.print(
+            f"  [{rc.label}]Overall:[/{rc.label}] "
+            f"[{rc.value}]n={overall['n']}  mean={overall['mean']}  median={overall['median']}  "
+            f"p10={overall['p10']}  p90={overall['p90']}  min={overall['min']}  max={overall['max']}[/{rc.value}]"
         )
 
     reviewer_rows = score_analytics["by_reviewer"]
@@ -861,11 +864,13 @@ def _cmd_stats_reviews(
 
     weekly_trend = score_analytics["weekly_trend"]
     if weekly_trend:
-        print("\nScore trend (last 8 weeks):")
-        print(f"{'Week':<10} {'N':>5} {'Mean':>7}")
-        print("-" * 24)
+        console.print()
+        console.print(f"[{rc.label}]Score trend (last 8 weeks):[/{rc.label}]")
         for row in weekly_trend:
-            print(f"{row['week']:<10} {int(row['n']):>5} {float(row['mean']):>7.1f}")
+            console.print(
+                f"  [{rc.label}]{row['week']}:[/{rc.label}] "
+                f"[{rc.value}]n={int(row['n'])}  mean={float(row['mean']):.1f}[/{rc.value}]"
+            )
 
     if show_issues:
         print(f"\nParsing issue counts from {parsed_review_count} review(s)...")

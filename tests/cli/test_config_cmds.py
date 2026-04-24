@@ -1498,7 +1498,7 @@ class TestStatsReviewsCommand:
         assert str(today) in result.stdout
 
     def test_stats_reviews_text_includes_score_sections(self, tmp_path: Path):
-        """Text mode includes score summary and trend sections."""
+        """Text mode includes score sections using label/value-style summary rows."""
         from gza.db import TaskStats
 
         setup_config(tmp_path)
@@ -1529,7 +1529,9 @@ class TestStatsReviewsCommand:
         assert result.returncode == 0
         assert "ScN" in result.stdout
         assert "Score stats (scored reviews only):" in result.stdout
+        assert "Overall: n=1  mean=88.0  median=88" in result.stdout
         assert "Score trend (last 8 weeks):" in result.stdout
+        assert re.search(r"\d{4}-W\d{2}: n=1  mean=88\.0", result.stdout)
 
     def test_stats_reviews_json_outputs_score_breakdowns_and_filters_null_scores(self, tmp_path: Path):
         """JSON output includes score analytics and excludes reviews with null scores."""
