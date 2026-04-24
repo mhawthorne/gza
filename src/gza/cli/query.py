@@ -654,14 +654,14 @@ def cmd_search(args: argparse.Namespace) -> int:
     result = service.run(query)
     matches = [row.task for row in result.rows if isinstance(row, _TaskRow)]
 
-    if not matches:
-        console.print(f"No tasks found matching '{term}'")
-        return 0
-
     if use_json:
         import json
 
         print(json.dumps(result.to_json(), indent=2, default=str))
+        return 0
+
+    if not matches:
+        console.print(f"No tasks found matching '{term}'")
         return 0
 
     c = TASK_COLORS
@@ -738,14 +738,14 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         target_branch = None
 
     result = service.run(query, config=config, git=git, target_branch=target_branch)
-    if not result.rows:
-        console.print("No unresolved task lineages")
-        return 0
-
     if getattr(args, "json", False):
         import json
 
         print(json.dumps(result.to_json(), indent=2, default=str))
+        return 0
+
+    if not result.rows:
+        console.print("No unresolved task lineages")
         return 0
 
     rendered = result.render(mode)

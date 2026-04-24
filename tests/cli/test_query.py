@@ -1136,6 +1136,17 @@ class TestSearchCommand:
         assert result.returncode == 0
         assert "No tasks found matching 'missing'" in result.stdout
 
+    def test_search_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "alpha task", "status": "completed"},
+        ])
+
+        result = run_gza("search", "missing", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert "No tasks found matching 'missing'" not in result.stdout
+
     def test_search_last_limit(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -5763,6 +5774,15 @@ class TestPsSortKey:
 
 class TestIncompleteCommand:
     """Tests for `gza incomplete` command."""
+
+    def test_incomplete_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert "No unresolved task lineages" not in result.stdout
 
     def test_incomplete_hides_merged_root_with_completed_review_improve(self, tmp_path: Path):
         setup_config(tmp_path)
