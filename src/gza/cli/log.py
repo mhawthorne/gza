@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.markup import escape as rich_escape
-from rich.panel import Panel
 
 from ..colors import (
     LINEAGE_STATUS_COLORS,
@@ -24,11 +23,9 @@ from ..db import SqliteTaskStore, Task as DbTask
 from ..log_events import is_new_step
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
-    _extract_agent_failure_marker_reason,
-    _extract_failure_log_context,
-    _extract_last_agent_message_for_failure,
-    _failure_summary,
+    _build_failure_diagnostics,
     _parse_iso,
+    _render_failure_diagnostics,
     get_store,
     pager_context,
     resolve_id,
@@ -913,36 +910,14 @@ def _print_log_header(
 
 def _print_failure_focus(task: DbTask, log_path: Path, config: Config) -> None:
     """Print failure-first diagnostics for a failed task."""
-    status_failed = SHOW_COLORS_DICT["status_failed"]
-    value_color = SHOW_COLORS_DICT["value"]
-    reason = task.failure_reason or "UNKNOWN"
-    marker_reason = _extract_agent_failure_marker_reason(log_path)
-    marker_text = ""
-    if marker_reason:
-        marker_text = f" [{status_failed}]{rich_escape(f'[GZA_FAILURE:{marker_reason}]')}[/{status_failed}]"
-
-    console.print(f"[{_lc()}]Failure Reason:[/{_lc()}] [{status_failed}]{reason}[/{status_failed}]{marker_text}", soft_wrap=True)
-    console.print(f"[{_lc()}]Failure Summary:[/{_lc()}] [{value_color}]{_failure_summary(reason)}[/{value_color}]", soft_wrap=True)
-
-    explanation = _extract_last_agent_message_for_failure(log_path)
-    console.print(f"[{_lc()}]Agent Explanation:[/{_lc()}]", soft_wrap=True)
-    if explanation:
-        console.print(
-            Panel(
-                rich_escape(explanation),
-                border_style=status_failed,
-                padding=(0, 1),
-                expand=False,
-            )
-        )
-    else:
-        console.print(f"[{value_color}]  (not found in log)[/{value_color}]", soft_wrap=True)
-
-    verify_context, result_context = _extract_failure_log_context(log_path, config.verify_command)
-    if verify_context:
-        console.print(f"[{_lc()}]Last Verify Failure:[/{_lc()}] [{value_color}]{rich_escape(verify_context)}[/{value_color}]", soft_wrap=True)
-    if result_context:
-        console.print(f"[{_lc()}]Last Result Context:[/{_lc()}] [{value_color}]{rich_escape(result_context)}[/{value_color}]", soft_wrap=True)
+    diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command)
+    _render_failure_diagnostics(
+        diagnostics,
+        label_color=_lc(),
+        value_color=SHOW_COLORS_DICT["value"],
+        status_failed_color=SHOW_COLORS_DICT["status_failed"],
+        soft_wrap=True,
+    )
 
 
 def cmd_log(args: argparse.Namespace) -> int:

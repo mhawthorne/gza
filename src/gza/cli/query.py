@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Literal, cast
 
 from rich.markup import escape as rich_escape
-from rich.panel import Panel
 
 import gza.colors as _colors
 
@@ -66,12 +65,12 @@ from ..task_query import (
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     TASK_COLORS,
-    _extract_agent_failure_marker_reason,
-    _extract_last_agent_message_for_failure,
+    _build_failure_diagnostics,
     _failure_next_steps,
-    _failure_summary,
     _format_lineage,
     _parse_iso,
+    _render_failure_diagnostics,
+    _resolve_task_log_path,
     _spawn_background_worker,
     format_stats,
     get_review_score,
@@ -2000,7 +1999,6 @@ def _cmd_show_output(
     store: SqliteTaskStore,
 ) -> int:
     """Render the full show output. Called within pager_context when needed."""
-    from ._common import _extract_failure_log_context, _resolve_task_log_path
     from .log import _latest_worker_for_task
 
     # Colors for show output — defined in gza.colors.
@@ -2140,24 +2138,17 @@ def _cmd_show_output(
                     )
 
     if task.status == "failed":
-        reason = task.failure_reason or "UNKNOWN"
         log_path = _resolve_task_log_path(config, task)
-        marker_reason = None
-        if log_path and log_path.exists():
-            marker_reason = _extract_agent_failure_marker_reason(log_path)
-        marker_text = ""
-        if marker_reason:
-            marker_label = rich_escape(f"[GZA_FAILURE:{marker_reason}]")
-            marker_text = f" [{c['status_failed']}]{marker_label}[/{c['status_failed']}]"
-
-        console.print(
-            f"[{c['label']}]Failure Reason:[/{c['label']}] "
-            f"[{c['status_failed']}]{reason}[/{c['status_failed']}]"
-            f"{marker_text}"
+        diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command)
+        _render_failure_diagnostics(
+            diagnostics,
+            label_color=c["label"],
+            value_color=c["value"],
+            status_failed_color=c["status_failed"],
+            include_explanation=bool(log_path and log_path.exists()),
         )
-        console.print(f"[{c['label']}]Failure Summary:[/{c['label']}] [{c['value']}]{_failure_summary(reason)}[/{c['value']}]")
 
-        if reason in {"MAX_STEPS", "MAX_TURNS"}:
+        if diagnostics.reason in {"MAX_STEPS", "MAX_TURNS"}:
             _, _, effective_max_steps = get_effective_config_for_task(task, config)
             steps_used = task.num_steps_reported if task.num_steps_reported is not None else task.num_steps_computed
             if steps_used is not None:
@@ -2172,34 +2163,7 @@ def _cmd_show_output(
                     f"[{c['value']}]{turns_used}[/{c['value']}]"
                 )
 
-        if log_path and log_path.exists():
-            explanation = _extract_last_agent_message_for_failure(log_path)
-            console.print(f"[{c['label']}]Agent Explanation:[/{c['label']}]")
-            if explanation:
-                console.print(
-                    Panel(
-                        rich_escape(explanation),
-                        border_style=c["status_failed"],
-                        padding=(0, 1),
-                        expand=False,
-                    )
-                )
-            else:
-                console.print(f"[{c['value']}]  (not found in log)[/{c['value']}]")
-
-            verify_context, result_context = _extract_failure_log_context(log_path, config.verify_command)
-            if verify_context:
-                console.print(
-                    f"[{c['label']}]Last Verify Failure:[/{c['label']}] "
-                    f"[{c['value']}]{verify_context}[/{c['value']}]"
-                )
-            if result_context:
-                console.print(
-                    f"[{c['label']}]Last Result Context:[/{c['label']}] "
-                    f"[{c['value']}]{result_context}[/{c['value']}]"
-                )
-
-        next_step_commands = _failure_next_steps(task, reason, config=config)
+        next_step_commands = _failure_next_steps(task, diagnostics.reason, config=config)
         if next_step_commands:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:
