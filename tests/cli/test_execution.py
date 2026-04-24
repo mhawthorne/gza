@@ -7853,6 +7853,55 @@ class TestForegroundInvocationContextWiring:
         assert invocation.command == "review"
         assert invocation.execution_mode == "foreground_worker"
 
+    def test_cmd_review_prints_followup_summary_after_success(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        from gza.cli.execution import cmd_review
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement auth", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            model=None,
+            provider=None,
+            background=False,
+            queue=False,
+            open=False,
+            force=False,
+        )
+
+        def fake_run_foreground(*_args, **kwargs):
+            review_id = kwargs["task_id"]
+            review = store.get(review_id)
+            assert review is not None
+            review.status = "completed"
+            review.output_content = (
+                "## Summary\n\nLooks good.\n\n"
+                "## Blockers\n\nNone.\n\n"
+                "## Follow-Ups\n\n"
+                "### F1 Validation\n"
+                "Recommended follow-up: add validation.\n\n"
+                "## Verdict\n\n"
+                "Verdict: APPROVED_WITH_FOLLOWUPS\n"
+            )
+            review.completed_at = datetime.now(UTC)
+            store.update(review)
+            return 0
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_review(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert "Review " in output
+        assert "APPROVED_WITH_FOLLOWUPS [follow-ups: F1]" in output
+
     def test_cmd_improve_passes_improve_invocation(self, tmp_path: Path):
         from gza.cli.execution import cmd_improve
 

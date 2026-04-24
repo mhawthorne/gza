@@ -76,6 +76,23 @@ class DockerConfig:
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
 
 
+@dataclass(frozen=True)
+class PreflightCheckResult:
+    """Structured result for provider preflight verification."""
+
+    ok: bool
+    failure_reason: str | None = None
+    message: str | None = None
+
+    @classmethod
+    def success(cls) -> PreflightCheckResult:
+        return cls(ok=True)
+
+    @classmethod
+    def failure(cls, *, failure_reason: str, message: str) -> PreflightCheckResult:
+        return cls(ok=False, failure_reason=failure_reason, message=message)
+
+
 def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
     """Return Docker -v args for mounting provider config dir and JSON file.
 
@@ -386,7 +403,7 @@ def verify_docker_credentials(
     error_patterns: list[str],
     error_message: str,
     log_file: Path | None = None,
-) -> bool:
+) -> PreflightCheckResult:
     """Verify credentials work in Docker by running a version check.
 
     Args:
@@ -396,7 +413,7 @@ def verify_docker_credentials(
         error_message: Message to print on auth error
 
     Returns:
-        True if credentials are valid
+        Structured result describing whether preflight succeeded
     """
     if not is_docker_running():
         write_preflight_entry(
@@ -410,7 +427,10 @@ def verify_docker_credentials(
         )
         print("Error: Docker daemon is not running")
         print("  Start Docker Desktop or use --no-docker flag")
-        return False
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message="Preflight failed: Docker daemon is not running",
+        )
 
     try:
         cmd = ["docker", "run", "--rm"]
@@ -442,10 +462,13 @@ def verify_docker_credentials(
         for pattern in error_patterns:
             if pattern in output:
                 print(error_message)
-                return False
+                return PreflightCheckResult.failure(
+                    failure_reason="PROVIDER_UNAVAILABLE",
+                    message="Preflight failed: provider credential verification failed",
+                )
 
         if result.returncode == 0:
-            return True
+            return PreflightCheckResult.success()
 
         # Non-zero exit code without matching error patterns
         print(f"Error: Credential verification failed (exit code {result.returncode})")
@@ -470,7 +493,10 @@ def verify_docker_credentials(
                 print(f"\n  Hint: {config_path} directory not found")
                 print("  You may need to set the API key environment variable or run the login command")
 
-        return False
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message=f"Preflight failed: Docker verify command exited {result.returncode}",
+        )
     except subprocess.TimeoutExpired:
         write_preflight_entry(
             log_file,
@@ -482,7 +508,10 @@ def verify_docker_credentials(
             message="Docker command timed out during verify",
         )
         print("Error: Docker command timed out")
-        return False
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message="Preflight failed: Docker command timed out during verification",
+        )
     except FileNotFoundError:
         write_preflight_entry(
             log_file,
@@ -494,9 +523,15 @@ def verify_docker_credentials(
             message="Docker binary not found on PATH",
         )
         print("Error: Docker not found")
-        return False
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message="Preflight failed: Docker is not installed or not on PATH",
+        )
 
-    return False
+    return PreflightCheckResult.failure(
+        failure_reason="INFRASTRUCTURE_ERROR",
+        message="Preflight failed: Docker verification failed",
+    )
 
 
 @dataclass
@@ -546,7 +581,7 @@ class Provider(ABC):
         ...
 
     @abstractmethod
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work by testing the command.
 
         If ``log_file`` is provided, implementations should append a JSONL

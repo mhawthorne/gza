@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base import (
     DockerConfig,
+    PreflightCheckResult,
     Provider,
     RunResult,
     build_docker_cmd,
@@ -157,13 +158,13 @@ class CodexProvider(Provider):
             return True
         return False
 
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify Codex credentials by testing the codex command."""
         if config.use_docker:
             return self._verify_docker(config, log_file=log_file)
         return self._verify_direct(log_file=log_file)
 
-    def _verify_docker(self, config: Config, log_file: Path | None = None) -> bool:
+    def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         docker_config = _get_docker_config(f"{config.docker_image}-codex")
         if not ensure_docker_image(docker_config, config.project_dir):
@@ -177,8 +178,11 @@ class CodexProvider(Provider):
                 message="Failed to build Codex Docker image",
             )
             print("Error: Failed to build Docker image")
-            return False
-        return verify_docker_credentials(
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: failed to build Codex Docker image",
+            )
+        result = verify_docker_credentials(
             docker_config=docker_config,
             version_cmd=["codex", "--version"],
             error_patterns=["Invalid API key", "authentication", "unauthorized"],
@@ -188,8 +192,14 @@ class CodexProvider(Provider):
             ),
             log_file=log_file,
         )
+        if not result.ok and result.failure_reason == "PROVIDER_UNAVAILABLE":
+            return PreflightCheckResult.failure(
+                failure_reason="PROVIDER_UNAVAILABLE",
+                message="Preflight failed: Codex credential verification failed",
+            )
+        return result
 
-    def _verify_direct(self, log_file: Path | None = None) -> bool:
+    def _verify_direct(self, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work directly."""
         cmd = ["codex", "--version"]
         try:
@@ -212,9 +222,12 @@ class CodexProvider(Provider):
             if "Invalid API key" in output or "authentication" in output.lower() or "unauthorized" in output.lower():
                 print("Error: Invalid or missing Codex credentials")
                 print("  Run 'codex login' or set CODEX_API_KEY in .env")
-                return False
+                return PreflightCheckResult.failure(
+                    failure_reason="PROVIDER_UNAVAILABLE",
+                    message="Preflight failed: Codex credential verification failed",
+                )
             if result.returncode == 0:
-                return True
+                return PreflightCheckResult.success()
         except subprocess.TimeoutExpired:
             write_preflight_entry(
                 log_file,
@@ -226,7 +239,10 @@ class CodexProvider(Provider):
                 message="codex --version timed out after 5s",
             )
             print("Error: 'codex --version' timed out (CLI may be hanging on an update prompt)")
-            return False
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: codex --version timed out",
+            )
         except FileNotFoundError:
             write_preflight_entry(
                 log_file,
@@ -239,8 +255,14 @@ class CodexProvider(Provider):
             )
             print("Error: 'codex' command not found")
             print("  Install with: npm install -g @openai/codex")
-            return False
-        return False
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: codex CLI not found on PATH",
+            )
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message=f"Preflight failed: codex --version exited {result.returncode}",
+        )
 
     def run(
         self,

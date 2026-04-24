@@ -1219,7 +1219,9 @@ class TestDockerDaemonCheck:
                 error_message="Auth failed",
             )
 
-        assert result is False
+        assert result.ok is False
+        assert result.failure_reason == "INFRASTRUCTURE_ERROR"
+        assert result.message == "Preflight failed: Docker daemon is not running"
         captured = capsys.readouterr()
         assert "Docker daemon is not running" in captured.out
         assert "--no-docker" in captured.out
@@ -1248,7 +1250,7 @@ class TestDockerDaemonCheck:
                     error_message="Auth failed",
                 )
 
-        assert result is True
+        assert result.ok is True
         # Verify docker run was called (not just docker info)
         call_args = mock_run.call_args[0][0]
         assert "docker" in call_args
@@ -5529,7 +5531,8 @@ class TestPreflightLogging:
         with patch("gza.providers.codex.subprocess.run", side_effect=FileNotFoundError()):
             ok = provider._verify_direct(log_file=log_file)
 
-        assert ok is False
+        assert ok.ok is False
+        assert ok.failure_reason == "INFRASTRUCTURE_ERROR"
         entries = self._read_preflight_entries(log_file)
         assert len(entries) == 1
         assert entries[0]["event"] == "verify_credentials_missing_binary"
@@ -5547,7 +5550,8 @@ class TestPreflightLogging:
         ):
             ok = provider._verify_direct(log_file=log_file)
 
-        assert ok is False
+        assert ok.ok is False
+        assert ok.failure_reason == "INFRASTRUCTURE_ERROR"
         entries = self._read_preflight_entries(log_file)
         assert entries and entries[0]["event"] == "verify_credentials_timeout"
 
@@ -5565,7 +5569,7 @@ class TestPreflightLogging:
         with patch("gza.providers.codex.subprocess.run", return_value=fake_result):
             ok = provider._verify_direct(log_file=log_file)
 
-        assert ok is True
+        assert ok.ok is True
         entries = self._read_preflight_entries(log_file)
         assert entries and entries[0]["event"] == "verify_credentials_direct"
         assert entries[0]["returncode"] == 0
@@ -5579,7 +5583,8 @@ class TestPreflightLogging:
         with patch("gza.providers.claude.subprocess.run", side_effect=FileNotFoundError()):
             ok = provider._verify_direct(log_file=log_file)
 
-        assert ok is False
+        assert ok.ok is False
+        assert ok.failure_reason == "INFRASTRUCTURE_ERROR"
         entries = self._read_preflight_entries(log_file)
         assert entries and entries[0]["event"] == "verify_credentials_missing_binary"
 

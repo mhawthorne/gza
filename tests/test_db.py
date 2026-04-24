@@ -2122,6 +2122,7 @@ class TestFailureReasonTracking:
         """KNOWN_FAILURE_REASONS contains expected values."""
         from gza.db import KNOWN_FAILURE_REASONS
 
+        assert "INFRASTRUCTURE_ERROR" in KNOWN_FAILURE_REASONS
         assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
         assert "PR_REQUIRED" in KNOWN_FAILURE_REASONS

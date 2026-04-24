@@ -80,6 +80,14 @@ class ParsedReviewReport:
 
 
 @dataclass(frozen=True)
+class ReviewOutcome:
+    """Shared review outcome summary for CLI display and automation."""
+
+    verdict: str | None
+    followup_findings: tuple[ReviewFinding, ...]
+
+
+@dataclass(frozen=True)
 class ParsedReview:
     """Parsed review-template sections used for derived review scoring."""
 
@@ -369,6 +377,25 @@ def parse_review_verdict(content: str | None) -> str | None:
     return parse_review_report(content).verdict
 
 
+def summarize_review_report(report: ParsedReviewReport) -> ReviewOutcome:
+    """Extract display/automation-friendly review outcome details."""
+    return ReviewOutcome(
+        verdict=report.verdict,
+        followup_findings=tuple(
+            finding for finding in report.findings if finding.severity == "FOLLOWUP"
+        ),
+    )
+
+
+def format_review_outcome(outcome: ReviewOutcome, *, unknown_label: str = "UNKNOWN") -> str:
+    """Format a concise review outcome string, including parsed follow-up IDs."""
+    verdict = outcome.verdict or unknown_label
+    if not outcome.followup_findings:
+        return verdict
+    finding_ids = ", ".join(finding.id for finding in outcome.followup_findings)
+    return f"{verdict} [follow-ups: {finding_ids}]"
+
+
 def get_review_report(project_dir: Path, review_task: Task) -> ParsedReviewReport:
     """Extract parsed review report from cached output or the report file."""
     if review_task.output_content:
@@ -387,6 +414,11 @@ def get_review_report(project_dir: Path, review_task: Task) -> ParsedReviewRepor
 def get_review_verdict(project_dir: Path, review_task: Task) -> str | None:
     """Extract the review verdict from cached output or the report file."""
     return get_review_report(project_dir, review_task).verdict
+
+
+def get_review_outcome(project_dir: Path, review_task: Task) -> ReviewOutcome:
+    """Extract parsed review outcome details from cached output or the report file."""
+    return summarize_review_report(get_review_report(project_dir, review_task))
 
 
 def get_review_score(project_dir: Path, review_task: Task) -> int | None:

@@ -24,7 +24,7 @@ from ._common import (
     _create_resume_task,
     _spawn_background_resume_worker,
     _spawn_background_worker,
-    get_review_verdict,
+    format_review_outcome,
     get_store,
     resolve_id,
     set_task_urgency,
@@ -189,8 +189,12 @@ def _emit_transition_events(
             if task_type == "review":
                 task = store.get(task_id)
                 impl_id = new_row.get("depends_on") or "unknown"
-                verdict = get_review_verdict(config, task) if task is not None else None
-                log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict or 'UNKNOWN'}")
+                verdict = (
+                    format_review_outcome(config, task)
+                    if task is not None
+                    else "UNKNOWN"
+                )
+                log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict}")
             else:
                 log.emit("DONE", f"{task_id} {task_type}{elapsed_suffix}")
         elif new_status == "failed":
@@ -201,9 +205,16 @@ def _emit_transition_events(
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
     registry = WorkerRegistry(config.workers_path)
     live_pids: set[int] = set()
+    active_task_statuses = {
+        str(task.id): task.status
+        for task in store.get_in_progress()
+        if task.id is not None
+    }
 
     for worker in registry.list_all(include_completed=False):
         if worker.status != "running":
+            continue
+        if worker.task_id is not None and active_task_statuses.get(str(worker.task_id)) not in {"pending", "in_progress"}:
             continue
         if not registry.is_running(worker.worker_id):
             continue
@@ -418,6 +429,10 @@ def _run_cycle(
                     ),
                 )
                 rc = merge_result.rc
+                for followup_task in merge_result.created_followups:
+                    log.emit("FOLLOW", f"{followup_task.id} created from {task.id}")
+                for followup_task in merge_result.reused_followups:
+                    log.emit("FOLLOW", f"{followup_task.id} reused from {task.id}")
                 if rc == 0:
                     log.emit("MERGE", f"{task.id} -> {target_branch}")
                     work_done = True
@@ -715,6 +730,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
         while True:
             if stop_requested:
                 break
+
+            pre_cycle_snapshot = _task_snapshot(store)
+            _emit_transition_events(
+                previous_snapshot,
+                pre_cycle_snapshot,
+                store=store,
+                config=config,
+                log=log,
+            )
+            previous_snapshot = pre_cycle_snapshot
 
             cycle_result = _run_cycle(
                 config=config,

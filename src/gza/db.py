@@ -44,6 +44,7 @@ __all__ = [
 
 # Known failure reason categories
 KNOWN_FAILURE_REASONS = {
+    "INFRASTRUCTURE_ERROR",
     "MAX_STEPS",
     "MAX_TURNS",
     "PR_REQUIRED",
