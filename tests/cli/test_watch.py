@@ -514,7 +514,7 @@ def test_watch_cycle_skips_merge_off_default_branch(tmp_path: Path, capsys) -> N
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
         _run_cycle(
             config=config,
@@ -527,7 +527,7 @@ def test_watch_cycle_skips_merge_off_default_branch(tmp_path: Path, capsys) -> N
 
     output = capsys.readouterr().out
     assert "`gza merge` must be run from the default branch 'main'" in output
-    assert merge_single.call_count == 0
+    execute_merge.assert_not_called()
     assert " MERGE " not in log_path.read_text()
 
 
@@ -647,7 +647,14 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._merge_single_task", side_effect=noisy_merge),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            side_effect=lambda *_args, **_kwargs: SimpleNamespace(
+                rc=noisy_merge(),
+                created_followups=[],
+                reused_followups=[],
+            ),
+        ),
     ):
         _run_cycle(
             config=config,
@@ -706,10 +713,13 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
             },
         ),
         patch(
-            "gza.cli.watch._create_or_reuse_followup_tasks",
-            return_value=([created_followup], []),
-        ) as create_followups,
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(
+                rc=0,
+                created_followups=[created_followup],
+                reused_followups=[],
+            ),
+        ) as execute_merge,
     ):
         result = _run_cycle(
             config=config,
@@ -722,13 +732,18 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
         )
 
     assert result.work_done is True
-    create_followups.assert_called_once()
-    kwargs = create_followups.call_args.kwargs
-    assert create_followups.call_args.args == (store,)
-    assert kwargs["review_task"].id == review.id
-    assert kwargs["impl_task"].id == task.id
-    assert kwargs["findings"] == (finding,)
-    assert merge_single.call_count == 1
+    execute_merge.assert_called_once()
+    args = execute_merge.call_args.args
+    kwargs = execute_merge.call_args.kwargs
+    assert args[0] is config
+    assert args[1] is store
+    assert args[2] is git
+    assert args[3].id == task.id
+    assert args[4]["type"] == "merge_with_followups"
+    assert args[4]["review_task"].id == review.id
+    assert args[4]["followup_findings"] == (finding,)
+    assert kwargs["target_branch"] == "main"
+    assert kwargs["current_branch"] == "main"
     assert f"MERGE  {task.id} -> main" in log_path.read_text()
 
 
@@ -770,8 +785,14 @@ def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_fol
                 "followup_findings": (finding,),
             },
         ),
-        patch("gza.cli.watch._create_or_reuse_followup_tasks") as create_followups,
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(
+                rc=0,
+                created_followups=[],
+                reused_followups=[],
+            ),
+        ) as execute_merge,
     ):
         result = _run_cycle(
             config=config,
@@ -784,8 +805,7 @@ def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_fol
         )
 
     assert result.work_done is True
-    create_followups.assert_not_called()
-    assert merge_single.call_count == 0
+    execute_merge.assert_not_called()
     assert f"MERGE  {task.id} -> main [dry-run]" in log_path.read_text()
 
 

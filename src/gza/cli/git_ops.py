@@ -1223,6 +1223,13 @@ _ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0, 'merge_with_followups': 0}
 
 
 @dataclass
+class _MergeActionResult:
+    rc: int
+    created_followups: list[DbTask]
+    reused_followups: list[DbTask]
+
+
+@dataclass
 class _CreateReviewActionResult:
     status: str
     review_task: DbTask | None
@@ -1251,6 +1258,41 @@ def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _Crea
         status="created",
         review_task=review_task,
         message=f"✓ Created review task {review_task.id}",
+    )
+
+
+def _execute_merge_action(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    task: DbTask,
+    action: dict,
+    *,
+    target_branch: str,
+    current_branch: str,
+) -> _MergeActionResult:
+    """Execute a merge-style advance action and materialize follow-up tasks if needed."""
+    created_followups: list[DbTask] = []
+    reused_followups: list[DbTask] = []
+
+    if action.get("type") == "merge_with_followups":
+        review_task = action.get("review_task")
+        followup_findings = action.get("followup_findings")
+        if isinstance(review_task, DbTask) and isinstance(followup_findings, tuple):
+            created_followups, reused_followups = _create_or_reuse_followup_tasks(
+                store,
+                review_task=review_task,
+                impl_task=task,
+                findings=followup_findings,
+            )
+
+    assert task.id is not None
+    merge_args = _build_auto_merge_args(config, git, task, target_branch)
+    rc = _merge_single_task(task.id, config, store, git, merge_args, current_branch)
+    return _MergeActionResult(
+        rc=rc,
+        created_followups=created_followups,
+        reused_followups=reused_followups,
     )
 
 
@@ -1566,24 +1608,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
         if action_type in {'merge', 'merge_with_followups'}:
-            if action_type == "merge_with_followups":
-                review_task = action.get("review_task")
-                followup_findings = action.get("followup_findings")
-                if isinstance(review_task, DbTask) and isinstance(followup_findings, tuple):
-                    created_followups, reused_followups = _create_or_reuse_followup_tasks(
-                        store,
-                        review_task=review_task,
-                        impl_task=task,
-                        findings=followup_findings,
-                    )
-                    if created_followups:
-                        created_ids = ", ".join(str(t.id) for t in created_followups if t.id is not None)
-                        console.print(f"      [{_c_ok}]✓ Created follow-up task(s): {created_ids}[/{_c_ok}]")
-                    if reused_followups:
-                        reused_ids = ", ".join(str(t.id) for t in reused_followups if t.id is not None)
-                        console.print(f"      [{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
-            merge_args = _build_auto_merge_args(config, git, task, target_branch)
-            rc = _merge_single_task(task.id, config, store, git, merge_args, target_branch)
+            merge_result = _execute_merge_action(
+                config,
+                store,
+                git,
+                task,
+                action,
+                target_branch=target_branch,
+                current_branch=target_branch,
+            )
+            if merge_result.created_followups:
+                created_ids = ", ".join(str(t.id) for t in merge_result.created_followups if t.id is not None)
+                console.print(f"      [{_c_ok}]✓ Created follow-up task(s): {created_ids}[/{_c_ok}]")
+            if merge_result.reused_followups:
+                reused_ids = ", ".join(str(t.id) for t in merge_result.reused_followups if t.id is not None)
+                console.print(f"      [{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
+            rc = merge_result.rc
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
                 success_count += 1

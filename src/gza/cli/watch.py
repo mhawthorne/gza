@@ -20,7 +20,6 @@ from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..workers import WorkerRegistry
 from ._common import (
-    _create_or_reuse_followup_tasks,
     _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
@@ -34,10 +33,9 @@ from ._common import (
 )
 from .execution import _spawn_background_iterate
 from .git_ops import (
-    _build_auto_merge_args,
     _collect_advance_completed_tasks,
     _determine_advance_action,
-    _merge_single_task,
+    _execute_merge_action,
     _prepare_create_review_action,
     _require_default_branch,
     _unimplemented_implement_prompt,
@@ -331,21 +329,19 @@ def _run_cycle(
                     log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
                     work_done = True
                     continue
-                if action_type == "merge_with_followups":
-                    review_task = action.get("review_task")
-                    followup_findings = action.get("followup_findings")
-                    if isinstance(review_task, DbTask) and isinstance(followup_findings, tuple):
-                        _create_or_reuse_followup_tasks(
-                            store,
-                            review_task=review_task,
-                            impl_task=task,
-                            findings=followup_findings,
-                        )
-                merge_args = _build_auto_merge_args(config, git, task, target_branch)
-                rc = _run_with_optional_stdout_suppressed(
+                merge_result = _run_with_optional_stdout_suppressed(
                     quiet,
-                    lambda: _merge_single_task(str(task.id), config, store, git, merge_args, current_branch),
+                    lambda: _execute_merge_action(
+                        config,
+                        store,
+                        git,
+                        task,
+                        action,
+                        target_branch=target_branch,
+                        current_branch=current_branch,
+                    ),
                 )
+                rc = merge_result.rc
                 if rc == 0:
                     log.emit("MERGE", f"{task.id} -> {target_branch}")
                     work_done = True
