@@ -736,7 +736,14 @@ class TestBuildDockerCmd:
         )
         setup_cmd = setup_value.split("=", 1)[1]
         assert "cat > /tmp/gza-shims/gza <<'EOF'" in setup_cmd
-        assert 'exec uv run --directory /workspace gza "$@"' in setup_cmd
+        assert "if [ -x /workspace/bin/gza ]; then" in setup_cmd
+        assert 'exec /workspace/bin/gza "$@"' in setup_cmd
+        assert 'path_without_shim="${PATH#/tmp/gza-shims:}"' in setup_cmd
+        assert 'gza_path="$(PATH="$path_without_shim" command -v gza 2>/dev/null || true)"' in setup_cmd
+        assert 'exec "$gza_path" "$@"' in setup_cmd
+        assert "Supported options:" in setup_cmd
+        assert "Set docker_setup_command in gza.yaml to install gza into PATH" in setup_cmd
+        assert 'exec uv run --directory /workspace gza "$@"' not in setup_cmd
         assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
 

@@ -55,10 +55,16 @@ cat > /tmp/gza-shims/gza <<'EOF'
 if [ -x /workspace/bin/gza ]; then
     exec /workspace/bin/gza "$@"
 fi
-if command -v uv >/dev/null 2>&1; then
-    exec uv run --directory /workspace gza "$@"
+shim_path="/tmp/gza-shims/gza"
+path_without_shim="${PATH#/tmp/gza-shims:}"
+gza_path="$(PATH="$path_without_shim" command -v gza 2>/dev/null || true)"
+if [ -n "$gza_path" ] && [ "$gza_path" != "$shim_path" ]; then
+    exec "$gza_path" "$@"
 fi
-echo "Error: gza command unavailable in container. Use 'uv run gza ...' from /workspace." >&2
+echo "Error: gza command unavailable in container." >&2
+echo "Supported options:" >&2
+echo "  1) Add /workspace/bin/gza to this project." >&2
+echo "  2) Set docker_setup_command in gza.yaml to install gza into PATH (for example: 'uv sync', 'poetry install')." >&2
 exit 127
 EOF
 chmod +x /tmp/gza-shims/gza
