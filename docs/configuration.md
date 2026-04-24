@@ -438,6 +438,7 @@ gza work [task_id...] [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
 | `--pr` | Create/reuse a GitHub PR for completed code tasks before auto-created review runs (when the branch has commits) |
+| `--group NAME` | Only pick pending tasks from this group when no task IDs are specified |
 
 ### add
 
@@ -1128,6 +1129,7 @@ gza next [options]
 ```
 
 Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
+Use `--group NAME` to scope the list to one task group, such as a release queue.
 
 ### queue
 
@@ -1142,9 +1144,11 @@ gza queue unbump <task_id>
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed task ID to bump/unbump (e.g. `gza-1234`) |
+| `--group NAME` | Only list runnable tasks from this group; for `bump`/`unbump`, only affects the runnable-status message |
 
 Queue pickup ordering is urgent-first. `queue bump` moves a task to the front of the urgent lane (next pickup), then remaining tasks stay FIFO by creation time within each lane.
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
+To treat a group as a release queue, assign tasks with `gza add --group release-1.2 ...` and inspect them with `gza queue --group release-1.2`.
 
 ### implement
 
@@ -1229,6 +1233,7 @@ gza watch [options]
 | `--max-iterations N` | Iterate loop cap for implement tasks (default: `watch.max_iterations` or `10`) |
 | `--dry-run` | Show what each cycle would do without executing |
 | `--quiet` | Write events to `.gza/watch.log` only |
+| `--group NAME` | Only advance, resume, and start tasks from this group |
 
 ### learnings
 

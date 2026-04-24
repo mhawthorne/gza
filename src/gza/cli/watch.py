@@ -209,8 +209,8 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
     return len(live_pids)
 
 
-def _pending_runnable_tasks(store: SqliteTaskStore) -> list[DbTask]:
-    return get_runnable_pending_tasks(store)
+def _pending_runnable_tasks(store: SqliteTaskStore, group: str | None = None) -> list[DbTask]:
+    return get_runnable_pending_tasks(store, group=group)
 
 
 def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
@@ -249,6 +249,7 @@ def _run_cycle(
     max_iterations: int,
     dry_run: bool,
     log: _WatchLog,
+    group: str | None = None,
     quiet: bool = False,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
@@ -270,6 +271,8 @@ def _run_cycle(
     # with no implement child, aligned with gza advance).
     # Merges run first; worker-spawning actions consume available slots.
     merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store)
+    if group is not None:
+        merge_candidates = [task for task in merge_candidates if task.group == group]
     if merge_candidates:
         git = Git(config.project_dir)
         current_branch = git.current_branch()
@@ -616,6 +619,8 @@ def _run_cycle(
     pending_resume_task_ids: set[str] = set()
     if slots > 0:
         failed_tasks = store.get_resumable_failed_tasks()
+        if group is not None:
+            failed_tasks = [task for task in failed_tasks if task.group == group]
         for failed in failed_tasks:
             if slots <= 0:
                 break
@@ -679,7 +684,7 @@ def _run_cycle(
             )
 
     # 3) Start new queued tasks (consumes slots)
-    pending_tasks = _pending_runnable_tasks(store)
+    pending_tasks = _pending_runnable_tasks(store, group=group)
     if slots > 0:
         for task in pending_tasks:
             if slots <= 0:
@@ -741,7 +746,7 @@ def _run_cycle(
             started_task_ids.add(str(task.id))
             log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
 
-    pending_count = len(_pending_runnable_tasks(store))
+    pending_count = len(_pending_runnable_tasks(store, group=group))
     log.end_cycle()
     return _CycleResult(
         work_done=work_done,
@@ -763,6 +768,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = bool(getattr(args, "quiet", False))
+    group = getattr(args, "group", None)
 
     if batch < 1:
         print("Error: --batch must be a positive integer")
@@ -802,6 +808,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             dry_run=True,
             quiet=False,
             log=log,
+            group=group,
         )
         if preview_result.work_done:
             try:
@@ -825,6 +832,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 dry_run=dry_run,
                 quiet=quiet,
                 log=log,
+                group=group,
             )
 
             current_snapshot = _task_snapshot(store)
@@ -864,6 +872,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     action = getattr(args, "queue_action", None)
+    group = getattr(args, "group", None)
 
     if action in {"bump", "unbump"}:
         task_id = resolve_id(config, args.task_id)
@@ -878,7 +887,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"Error: Task {task_id} is internal and not part of the runnable queue")
             return 1
 
-        runnable_pending_ids = {str(pending_task.id) for pending_task in store.get_pending_pickup() if pending_task.id is not None}
+        runnable_pending_ids = {
+            str(pending_task.id)
+            for pending_task in store.get_pending_pickup(group=group)
+            if pending_task.id is not None
+        }
         is_currently_runnable = str(task_id) in runnable_pending_ids
 
         new_urgent = action == "bump"
@@ -895,9 +908,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
                 print(f"✓ Removed urgent flag from task {task_id} (task is not currently runnable)")
         return 0
 
-    pending = store.get_pending_pickup()
+    pending = store.get_pending_pickup(group=group)
     if not pending:
-        print("No runnable tasks")
+        if group:
+            print(f"No runnable tasks in group '{group}'")
+        else:
+            print("No runnable tasks")
         return 0
 
     for index, task in enumerate(pending, start=1):

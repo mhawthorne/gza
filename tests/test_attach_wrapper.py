@@ -349,6 +349,28 @@ def test_build_docker_interactive_cmd_uses_it_and_claude_resume(tmp_path: Path) 
     assert cmd[max_turns_idx + 1] == "42"
 
 
+def test_build_docker_interactive_cmd_tolerates_unwritable_provider_json_mirror(tmp_path: Path) -> None:
+    """Docker command construction should fail soft when the provider JSON mirror cannot be written."""
+    from gza.attach_wrapper import _build_docker_interactive_cmd
+
+    task_id, _ = _setup_docker_task(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    task = store.get(task_id)
+    assert task is not None
+
+    with (
+        patch("gza.attach_wrapper.ensure_docker_image", return_value=True),
+        patch("gza.attach_wrapper.sync_keychain_credentials", return_value=True),
+        patch("gza.providers.base.shutil.copy2", side_effect=PermissionError("denied")),
+        patch("gza.providers.base.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
+    ):
+        cmd = _build_docker_interactive_cmd(config, task, "sess-docker", max_turns=42)
+
+    assert "docker" in cmd
+    assert "run" in cmd
+
+
 def test_attach_wrapper_docker_task_with_no_docker_flag_uses_host(tmp_path: Path) -> None:
     """Even when config.use_docker is True, --no-docker should preserve host execution."""
     task_id, _ = _setup_docker_task(tmp_path)

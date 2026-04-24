@@ -29,6 +29,10 @@ def count_worker_consuming_actions(actions: list[dict]) -> int:
     )
 
 
-def get_runnable_pending_tasks(store: SqliteTaskStore, limit: int | None = None) -> list[Task]:
+def get_runnable_pending_tasks(
+    store: SqliteTaskStore,
+    limit: int | None = None,
+    group: str | None = None,
+) -> list[Task]:
     """Return pending tasks that default worker pickup can run, in pickup order."""
-    return store.get_pending_pickup(limit=limit)
+    return store.get_pending_pickup(limit=limit, group=group)

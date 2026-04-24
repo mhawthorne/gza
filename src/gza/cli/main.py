@@ -186,6 +186,11 @@ def main() -> int:
         dest="create_pr",
         help="Create/reuse a GitHub PR after successful code-task completion (when branch has commits)",
     )
+    work_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Only pick pending tasks from this group when no task IDs are specified",
+    )
 
     # run-inline command
     run_inline_parser = subparsers.add_parser(
@@ -235,6 +240,11 @@ def main() -> int:
         "--all",
         action="store_true",
         help="Show all pending tasks including blocked ones",
+    )
+    next_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Only show pending tasks from this group",
     )
 
     # history command
@@ -615,6 +625,11 @@ def main() -> int:
         action="store_true",
         help="Skip confirmation prompt before first cycle",
     )
+    watch_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Only advance, resume, and start tasks from this group",
+    )
 
     # queue command
     queue_parser = subparsers.add_parser(
@@ -622,13 +637,28 @@ def main() -> int:
         help="List runnable pending tasks in pickup order and manage urgent bump flags",
     )
     add_common_args(queue_parser)
+    queue_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Only list runnable tasks from this group",
+    )
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")
     queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the front of the urgent queue lane")
     queue_bump.add_argument("task_id", type=str, help="Full prefixed task ID to bump")
     add_common_args(queue_bump)
+    queue_bump.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Check runnable status within this group while bumping",
+    )
     queue_unbump = queue_subparsers.add_parser("unbump", help="Move a pending task back to the normal queue lane")
     queue_unbump.add_argument("task_id", type=str, help="Full prefixed task ID to unbump")
     add_common_args(queue_unbump)
+    queue_unbump.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Check runnable status within this group while unbumping",
+    )
 
     # refresh command
     refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
