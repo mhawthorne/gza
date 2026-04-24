@@ -811,6 +811,11 @@ def main() -> int:
         action="store_true",
         help="Show stats across all time (ignore --days/--start-date/--end-date)",
     )
+    stats_reviews_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output review stats and score analytics as JSON",
+    )
 
     # stats iterations subcommand
     stats_iterations_parser = stats_subs.add_parser(

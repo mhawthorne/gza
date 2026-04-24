@@ -16,6 +16,7 @@ gza stats reviews --days N                   # Last N days
 gza stats reviews --start-date YYYY-MM-DD    # From a specific start date
 gza stats reviews --end-date YYYY-MM-DD      # Up to a specific end date
 gza stats reviews --issues                   # Show per-model must-fix/suggestion counts
+gza stats reviews --json                     # Emit machine-readable coverage + score analytics
 ```
 
 ### Date range logic
@@ -30,8 +31,14 @@ The three-way priority for determining the start date:
 ### Output
 
 - Summary header: implement task count, total reviews, reviewed fraction.
-- Weekly table: week range, impl count, review count, review %, median/P90/max number of review iterations per impl.
+- Weekly table: week range, impl count, review count, review %, median/P90/max number of review iterations per impl, plus scored-review count/mean score columns.
 - Reviews-per-implementation distribution: histogram of how many impls had 1, 2, 3, … review iterations.
+- Score sections (reviews with non-null `review_score` only):
+  - Overall score stats (n, mean, median, p10, p90, min, max)
+  - Score by reviewer provider/model
+  - Score by implementer provider/model
+  - Score by planner+implementer+reviewer pipeline (min sample size: 3)
+  - Last-8-weeks weekly score trend (`YYYY-Www`)
 - Per-model section: when `--issues` is passed, must-fix and suggestion counts parsed from review content.
 
 ### Notes

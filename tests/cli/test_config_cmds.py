@@ -1,9 +1,9 @@
 """Tests for configuration, setup, and admin CLI commands."""
 
 
-import re
 import json
 import os
+import re
 import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1278,6 +1278,89 @@ class TestCleanArchiveCommand:
 class TestStatsReviewsCommand:
     """Tests for 'gza stats reviews' command."""
 
+    def test_score_analytics_helper_breakdowns(self):
+        """Score helper computes overall/group stats and enforces pipeline min sample size."""
+        from gza.cli.config_cmds import _build_score_analytics, _ScoreRecord
+
+        records = [
+            _ScoreRecord(
+                week_label="Apr 01 - Apr 07",
+                week_iso="2026-W14",
+                score=90,
+                reviewer_provider="claude",
+                reviewer_model="opus",
+                implementer_provider="codex",
+                implementer_model="gpt-5.4",
+                planner_provider="claude",
+                planner_model="opus",
+            ),
+            _ScoreRecord(
+                week_label="Apr 01 - Apr 07",
+                week_iso="2026-W14",
+                score=80,
+                reviewer_provider="claude",
+                reviewer_model="opus",
+                implementer_provider="codex",
+                implementer_model="gpt-5.4",
+                planner_provider="claude",
+                planner_model="opus",
+            ),
+            _ScoreRecord(
+                week_label="Apr 08 - Apr 14",
+                week_iso="2026-W15",
+                score=70,
+                reviewer_provider="claude",
+                reviewer_model="opus",
+                implementer_provider="codex",
+                implementer_model="gpt-5.4",
+                planner_provider="claude",
+                planner_model="opus",
+            ),
+            _ScoreRecord(
+                week_label="Apr 08 - Apr 14",
+                week_iso="2026-W15",
+                score=60,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.4",
+                implementer_provider="claude",
+                implementer_model="opus",
+                planner_provider=None,
+                planner_model=None,
+            ),
+            _ScoreRecord(
+                week_label="Apr 08 - Apr 14",
+                week_iso="2026-W15",
+                score=50,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.4",
+                implementer_provider="claude",
+                implementer_model="opus",
+                planner_provider=None,
+                planner_model=None,
+            ),
+        ]
+
+        analytics = _build_score_analytics(records, pipeline_min_samples=3)
+
+        assert analytics["overall"]["n"] == 5
+        assert analytics["overall"]["mean"] == 70.0
+        assert analytics["overall"]["median"] == 70
+        assert analytics["overall"]["p10"] == 50
+        assert analytics["overall"]["p90"] == 90
+
+        by_reviewer = analytics["by_reviewer"]
+        assert len(by_reviewer) == 2
+        assert by_reviewer[0]["n"] == 3
+        assert by_reviewer[0]["provider"] == "claude"
+
+        by_pipeline = analytics["by_pipeline"]
+        assert len(by_pipeline) == 1
+        assert by_pipeline[0]["n"] == 3
+        assert by_pipeline[0]["planner_provider"] == "claude"
+
+        weekly = analytics["weekly_trend"]
+        assert [row["week"] for row in weekly] == ["2026-W14", "2026-W15"]
+
     def test_stats_reviews_no_tasks(self, tmp_path: Path):
         """gza stats reviews with no tasks shows zero counts."""
         setup_config(tmp_path)
@@ -1413,6 +1496,111 @@ class TestStatsReviewsCommand:
         start = today - timedelta(days=14)
         assert str(start) in result.stdout
         assert str(today) in result.stdout
+
+    def test_stats_reviews_text_includes_score_sections(self, tmp_path: Path):
+        """Text mode includes score summary and trend sections."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add(
+            "Implement feature",
+            task_type="implement",
+            provider="codex",
+            model="gpt-5.4",
+        )
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        review = store.add(
+            "Review feature",
+            task_type="review",
+            depends_on=impl.id,
+            provider="claude",
+            model="opus",
+        )
+        review.review_score = 88
+        store.update(review)
+        store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "ScN" in result.stdout
+        assert "Score stats (scored reviews only):" in result.stdout
+        assert "Score trend (last 8 weeks):" in result.stdout
+
+    def test_stats_reviews_json_outputs_score_breakdowns_and_filters_null_scores(self, tmp_path: Path):
+        """JSON output includes score analytics and excludes reviews with null scores."""
+        from gza.db import TaskStats
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add(
+            "Plan feature",
+            task_type="plan",
+            provider="claude",
+            model="claude-opus-4-6",
+        )
+        assert plan.id is not None
+        store.mark_completed(plan, has_commits=False, stats=TaskStats(cost_usd=0.05))
+
+        impl = store.add(
+            "Implement feature",
+            task_type="implement",
+            depends_on=plan.id,
+            provider="codex",
+            model="gpt-5.4",
+        )
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
+
+        for score in (90, 80, 70):
+            review = store.add(
+                "Review feature",
+                task_type="review",
+                depends_on=impl.id,
+                provider="claude",
+                model="claude-opus-4-6",
+            )
+            review.review_score = score
+            store.update(review)
+            store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        null_score_review = store.add(
+            "Legacy review without score",
+            task_type="review",
+            depends_on=impl.id,
+            provider="claude",
+            model="claude-opus-4-6",
+        )
+        store.mark_completed(null_score_review, has_commits=False, stats=TaskStats(cost_usd=0.02))
+
+        result = run_gza("stats", "reviews", "--json", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+
+        assert "coverage" in payload
+        assert "scores" in payload
+        assert payload["scores"]["overall"]["n"] == 3
+        assert payload["scores"]["overall"]["mean"] == 80.0
+
+        by_pipeline = payload["scores"]["by_pipeline"]
+        assert len(by_pipeline) == 1
+        assert by_pipeline[0]["planner_provider"] == "claude"
+        assert by_pipeline[0]["planner_model"] == "claude-opus-4-6"
+        assert by_pipeline[0]["implementer_provider"] == "codex"
+        assert by_pipeline[0]["implementer_model"] == "gpt-5.4"
+        assert by_pipeline[0]["reviewer_provider"] == "claude"
+        assert by_pipeline[0]["reviewer_model"] == "claude-opus-4-6"
+        assert by_pipeline[0]["n"] == 3
+
+        weekly_trend = payload["scores"]["weekly_trend"]
+        assert weekly_trend
+        assert re.match(r"^\d{4}-W\d{2}$", weekly_trend[0]["week"])
 
 
 class TestStatsIterationsCommand:
