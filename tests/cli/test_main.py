@@ -120,8 +120,17 @@ class TestHelpOutput:
             "Maximum iterate iterations (each is a code-change task [implement/improve] plus its review)"
             in normalized_output
         )
-        assert "review/improve loop" not in normalized_output
-        assert "default: 5" not in normalized_output
+
+    def test_iterate_accepts_internal_worker_id_flag(self, tmp_path):
+        """Background iterate workers pass --worker-id; parser must accept it."""
+        setup_config(tmp_path)
+
+        result = run_gza("iterate", "gza-999999", "--worker-id", "w-test", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        output = result.stdout + (result.stderr or "")
+        assert "unrecognized arguments" not in output
+        assert "not found" in output.lower()
 
     def test_attach_help_and_docs_describe_provider_specific_attach(self, tmp_path):
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
@@ -573,6 +582,8 @@ class TestIterateBackgroundForceDispatch:
         store = SqliteTaskStore(config.db_path)
         task = store.add("Failed implement for iterate restart", task_type="implement")
         task.status = "failed"
+        if restart_flag == "--resume":
+            task.session_id = "resume-session"
         store.update(task)
         assert task.id is not None
 

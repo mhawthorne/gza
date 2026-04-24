@@ -5111,6 +5111,22 @@ class TestIterateCommand:
         assert "dry-run" in result.stdout.lower()
         assert "resume" in result.stdout.lower()
 
+    def test_failed_task_background_resume_requires_session_id(self, tmp_path: Path):
+        """Background iterate should reject --resume before spawning when no session exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "failed"
+        store.update(impl)
+
+        result = run_gza("iterate", str(impl.id), "--resume", "--background", "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        output = result.stdout + (result.stderr or "")
+        assert "no session id" in output.lower()
+        assert "--retry" in output
+        assert "started iterate worker" not in output.lower()
+
     def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
         import argparse

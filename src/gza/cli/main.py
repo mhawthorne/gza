@@ -1506,6 +1506,10 @@ def main() -> int:
             help="Retry a failed task before iterating (starts fresh)",
         )
         iterate_parser.add_argument(
+            "--worker-id",
+            help=argparse.SUPPRESS,  # Internal: worker registry ID passed by parent
+        )
+        iterate_parser.add_argument(
             "--background", "-b",
             action="store_true",
             help="Run the entire iterate loop in the background",

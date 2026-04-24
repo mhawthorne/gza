@@ -1379,6 +1379,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     assert impl_task.id is not None
 
+    if impl_task.status == "failed" and use_resume and not impl_task.session_id:
+        print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
+        return 1
+
     # Handle background mode: re-exec this command as a detached process.
     if background:
         return _spawn_background_iterate(
@@ -1453,9 +1457,6 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     # If the task is failed, resume or retry it first.
     if impl_task.status == "failed":
         if use_resume:
-            if not impl_task.session_id:
-                print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
-                return 1
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
