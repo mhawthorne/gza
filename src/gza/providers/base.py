@@ -282,8 +282,10 @@ def build_docker_cmd(
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm", stdio_flag,
         "-v", f"{work_dir}:/workspace",
-        # Shadow host /workspace/.venv from bind mount with a container-local volume.
-        "-v", "/workspace/.venv",
+        # Shadow host /workspace/.venv from bind mount with a writable tmpfs mount.
+        # Anonymous volumes default to root-owned directories, which break `uv sync`
+        # under the non-root `gza` user inside the container.
+        "--tmpfs", "/workspace/.venv:rw,exec,mode=1777",
         "-w", "/workspace",
     ]
 
