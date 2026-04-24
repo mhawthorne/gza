@@ -287,6 +287,104 @@ class _CycleResult:
     pending: int
 
 
+@dataclass(frozen=True)
+class _ObservedFailure:
+    task_id: str
+    task_type: str
+    reason: str
+
+
+def _iter_status_transitions(
+    old: dict[str, dict[str, str | None]],
+    new: dict[str, dict[str, str | None]],
+) -> list[tuple[str, str | None, dict[str, str | None]]]:
+    transitions: list[tuple[str, str | None, dict[str, str | None]]] = []
+    for task_id in sorted(new.keys()):
+        old_status = (old.get(task_id) or {}).get("status")
+        new_row = new[task_id]
+        new_status = new_row.get("status")
+        if old_status == new_status:
+            continue
+        transitions.append((task_id, old_status, new_row))
+    return transitions
+
+
+def _task_matches_group(store: SqliteTaskStore, task_id: str, group: str | None) -> bool:
+    if group is None:
+        return True
+    task = store.get(task_id)
+    return task is not None and task.group == group
+
+
+def _failure_is_auto_resumable_by_watch(
+    *,
+    task_id: str,
+    store: SqliteTaskStore,
+    config: Config,
+    reason: str | None,
+) -> bool:
+    task = store.get(task_id)
+    if task is None or task.id is None:
+        return False
+    if not is_resumable_failure_reason(reason):
+        return False
+    if not task.session_id:
+        return False
+    return store.count_resume_chain_depth(task_id) < config.max_resume_attempts
+
+
+def _collect_completed_transition_ids(
+    old: dict[str, dict[str, str | None]],
+    new: dict[str, dict[str, str | None]],
+    *,
+    store: SqliteTaskStore,
+    group: str | None = None,
+) -> list[str]:
+    completed_ids: list[str] = []
+    for task_id, _old_status, new_row in _iter_status_transitions(old, new):
+        if new_row.get("status") != "completed":
+            continue
+        if not _task_matches_group(store, task_id, group):
+            continue
+        completed_ids.append(task_id)
+    return completed_ids
+
+
+def _collect_unhandled_failures(
+    old: dict[str, dict[str, str | None]],
+    new: dict[str, dict[str, str | None]],
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    group: str | None = None,
+) -> list[_ObservedFailure]:
+    failures: list[_ObservedFailure] = []
+    for task_id, _old_status, new_row in _iter_status_transitions(old, new):
+        if new_row.get("status") != "failed":
+            continue
+        if not _task_matches_group(store, task_id, group):
+            continue
+        reason = new_row.get("failure_reason") or "UNKNOWN"
+        if _failure_is_auto_resumable_by_watch(task_id=task_id, store=store, config=config, reason=reason):
+            continue
+        failures.append(
+            _ObservedFailure(
+                task_id=task_id,
+                task_type=new_row.get("task_type") or "implement",
+                reason=reason,
+            )
+        )
+    return failures
+
+
+def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
+    if streak <= 0:
+        return 0
+    initial = config.watch.failure_backoff_initial
+    maximum = config.watch.failure_backoff_max
+    return min(initial * (2 ** (streak - 1)), maximum)
+
+
 def _run_cycle(
     *,
     config: Config,
@@ -723,6 +821,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if max_iterations < 1:
         print("Error: --max-iterations must be a positive integer")
         return 1
+    if config.watch.failure_backoff_initial < 1:
+        print("Error: watch.failure_backoff_initial must be a positive integer")
+        return 1
+    if config.watch.failure_backoff_max < config.watch.failure_backoff_initial:
+        print("Error: watch.failure_backoff_max must be >= watch.failure_backoff_initial")
+        return 1
+    if config.watch.failure_halt_after is not None and config.watch.failure_halt_after < 1:
+        print("Error: watch.failure_halt_after must be null or a positive integer")
+        return 1
 
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
     stop_requested = False
@@ -736,6 +843,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
 
     idle_seconds = 0
+    failure_streak = 0
     previous_snapshot = _task_snapshot(store)
 
     # Preview first cycle and ask for confirmation before executing
@@ -794,7 +902,60 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 config=config,
                 log=log,
             )
+            completed_ids = _collect_completed_transition_ids(
+                previous_snapshot,
+                current_snapshot,
+                store=store,
+                group=group,
+            )
+            if completed_ids and failure_streak > 0:
+                failure_streak = 0
+                log.emit(
+                    "INFO",
+                    f"failure backoff reset after completion(s): {', '.join(completed_ids[:5])}",
+                )
+            unhandled_failures = _collect_unhandled_failures(
+                previous_snapshot,
+                current_snapshot,
+                store=store,
+                config=config,
+                group=group,
+            )
             previous_snapshot = current_snapshot
+
+            if unhandled_failures:
+                failure_streak += len(unhandled_failures)
+                backoff_seconds = _compute_failure_backoff_seconds(config, failure_streak)
+                summary = ", ".join(
+                    f"{failure.task_id}={failure.reason}" for failure in unhandled_failures[:3]
+                )
+                if len(unhandled_failures) > 3:
+                    summary += ", ..."
+                log.emit(
+                    "BACKOFF",
+                    (
+                        f"{len(unhandled_failures)} non-auto-resumable failure(s); "
+                        f"sleeping {backoff_seconds}s before starting more work "
+                        f"(streak {failure_streak}"
+                        + (f"; latest: {summary}" if summary else "")
+                        + ")"
+                    ),
+                )
+                halt_after = config.watch.failure_halt_after
+                if halt_after is not None and failure_streak >= halt_after:
+                    log.emit(
+                        "INFO",
+                        (
+                            "failure halt threshold reached "
+                            f"({failure_streak} consecutive non-auto-resumable failures >= {halt_after}); "
+                            "stopping watch for human intervention"
+                        ),
+                    )
+                    break
+                if stop_requested:
+                    break
+                _sleep_interruptibly(backoff_seconds, lambda: stop_requested)
+                continue
 
             if cycle_result.work_done:
                 idle_seconds = 0

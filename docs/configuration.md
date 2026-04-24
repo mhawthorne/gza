@@ -771,6 +771,9 @@ tmux.terminal_size
 use_docker
 verify_command
 watch.batch
+watch.failure_backoff_initial
+watch.failure_backoff_max
+watch.failure_halt_after
 watch.max_idle
 watch.max_iterations
 watch.poll
@@ -1255,6 +1258,7 @@ gza watch [options]
 | Option | Description |
 |--------|-------------|
 | `--batch N` | Target concurrent workers (default: `watch.batch` or `5`) |
+| failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown using `watch.failure_backoff_initial` and `watch.failure_backoff_max`, and exits when `watch.failure_halt_after` is reached |
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
 | `--max-idle SECS` | Exit after consecutive idle time (default: `watch.max_idle`, no limit when unset) |
 | `--max-iterations N` | Iterate loop cap for implement tasks (default: `watch.max_iterations` or `10`) |

@@ -64,6 +64,9 @@ DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_MAX_IDLE: int | None = None
 DEFAULT_WATCH_MAX_ITERATIONS = 10
+DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL = 60
+DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
+DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
@@ -133,6 +136,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "poll": None,
         "max_idle": None,
         "max_iterations": None,
+        "failure_backoff_initial": None,
+        "failure_backoff_max": None,
+        "failure_halt_after": None,
     },
     "iterate_max_iterations": None,
     "interactive_worktree_dir": None,
@@ -299,6 +305,9 @@ class WatchConfig:
     poll: int = DEFAULT_WATCH_POLL
     max_idle: int | None = DEFAULT_WATCH_MAX_IDLE
     max_iterations: int = DEFAULT_WATCH_MAX_ITERATIONS
+    failure_backoff_initial: int = DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL
+    failure_backoff_max: int = DEFAULT_WATCH_FAILURE_BACKOFF_MAX
+    failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
 
 
 @dataclass
@@ -1016,12 +1025,45 @@ class Config:
             raise ConfigError("watch.max_iterations must be a positive integer")
         if watch_max_iterations < 1:
             raise ConfigError("watch.max_iterations must be a positive integer")
+        try:
+            watch_failure_backoff_initial = int(
+                watch_data.get("failure_backoff_initial", DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("watch.failure_backoff_initial must be a positive integer")
+        if watch_failure_backoff_initial < 1:
+            raise ConfigError("watch.failure_backoff_initial must be a positive integer")
+        try:
+            watch_failure_backoff_max = int(
+                watch_data.get("failure_backoff_max", DEFAULT_WATCH_FAILURE_BACKOFF_MAX)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("watch.failure_backoff_max must be a positive integer")
+        if watch_failure_backoff_max < 1:
+            raise ConfigError("watch.failure_backoff_max must be a positive integer")
+        if watch_failure_backoff_max < watch_failure_backoff_initial:
+            raise ConfigError("watch.failure_backoff_max must be >= watch.failure_backoff_initial")
+        watch_failure_halt_after_raw = watch_data.get(
+            "failure_halt_after", DEFAULT_WATCH_FAILURE_HALT_AFTER
+        )
+        if watch_failure_halt_after_raw is None:
+            watch_failure_halt_after = None
+        else:
+            try:
+                watch_failure_halt_after = int(watch_failure_halt_after_raw)
+            except (TypeError, ValueError):
+                raise ConfigError("watch.failure_halt_after must be null or a positive integer")
+            if watch_failure_halt_after < 1:
+                raise ConfigError("watch.failure_halt_after must be null or a positive integer")
 
         watch_config = WatchConfig(
             batch=watch_batch,
             poll=watch_poll,
             max_idle=watch_max_idle,
             max_iterations=watch_max_iterations,
+            failure_backoff_initial=watch_failure_backoff_initial,
+            failure_backoff_max=watch_failure_backoff_max,
+            failure_halt_after=watch_failure_halt_after,
         )
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
 
@@ -1377,6 +1419,34 @@ class Config:
                 if "max_iterations" in watch_data:
                     if not isinstance(watch_data["max_iterations"], int) or watch_data["max_iterations"] < 1:
                         errors.append("watch.max_iterations must be a positive integer")
+                if "failure_backoff_initial" in watch_data:
+                    if (
+                        not isinstance(watch_data["failure_backoff_initial"], int)
+                        or watch_data["failure_backoff_initial"] < 1
+                    ):
+                        errors.append("watch.failure_backoff_initial must be a positive integer")
+                if "failure_backoff_max" in watch_data:
+                    if (
+                        not isinstance(watch_data["failure_backoff_max"], int)
+                        or watch_data["failure_backoff_max"] < 1
+                    ):
+                        errors.append("watch.failure_backoff_max must be a positive integer")
+                initial_raw = watch_data.get("failure_backoff_initial")
+                max_raw = watch_data.get("failure_backoff_max")
+                if (
+                    isinstance(initial_raw, int)
+                    and initial_raw >= 1
+                    and isinstance(max_raw, int)
+                    and max_raw >= 1
+                    and max_raw < initial_raw
+                ):
+                    errors.append("watch.failure_backoff_max must be >= watch.failure_backoff_initial")
+                if "failure_halt_after" in watch_data and watch_data["failure_halt_after"] is not None:
+                    if (
+                        not isinstance(watch_data["failure_halt_after"], int)
+                        or watch_data["failure_halt_after"] < 1
+                    ):
+                        errors.append("watch.failure_halt_after must be null or a positive integer")
 
         if "claude_args" in data:
             warnings.append("'claude_args' is deprecated. Migrate to 'claude.args'.")
