@@ -42,6 +42,7 @@ from ._common import (
     _spawn_background_resume_worker,
     _spawn_background_worker,
     _spawn_background_workers,
+    format_review_outcome,
     get_review_verdict,
     get_store,
     get_task_step_count,
@@ -1280,13 +1281,19 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     print(f"\nRunning review task {review_task.id}...")
     open_after = hasattr(args, 'open') and args.open
-    return _run_foreground(
+    rc = _run_foreground(
         config,
         task_id=review_task.id,
         open_after=open_after,
         force=getattr(args, "force", False),
         invocation=_foreground_command_invocation("review"),
     )
+    if rc == 0:
+        assert review_task.id is not None
+        refreshed_review = store.get(review_task.id)
+        if refreshed_review is not None and refreshed_review.status == "completed":
+            print(f"Review {refreshed_review.id}: {format_review_outcome(config, refreshed_review)}")
+    return rc
 
 
 def _spawn_background_iterate(
@@ -1965,7 +1972,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
         if action_type in {"create_review", "run_review"}:
             verdict = get_review_verdict(config, action_task)
-            print(f"  Review {action_task.id}: verdict={verdict or '(none)'}")
+            print(
+                f"  Review {action_task.id}: "
+                f"{format_review_outcome(config, action_task, unknown_label='(none)')}"
+            )
             _append_summary_row(
                 summary_rows,
                 iteration_index=iteration,

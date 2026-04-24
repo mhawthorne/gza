@@ -755,6 +755,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     assert kwargs["target_branch"] == "main"
     assert kwargs["current_branch"] == "main"
     assert f"MERGE  {task.id} -> main" in log_path.read_text()
+    assert "FOLLOW gza-999 created from" in log_path.read_text()
 
 
 def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_followup_tasks(tmp_path: Path) -> None:
@@ -817,6 +818,117 @@ def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_fol
     assert result.work_done is True
     execute_merge.assert_not_called()
     assert f"MERGE  {task.id} -> main [dry-run]" in log_path.read_text()
+
+
+def test_emit_transition_events_includes_followup_ids_for_review(tmp_path: Path) -> None:
+    """Completed review transition logs parsed follow-up IDs."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed impl", task_type="implement")
+    assert impl.id is not None
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.output_content = (
+        "## Summary\n\nLooks good.\n\n"
+        "## Blockers\n\nNone.\n\n"
+        "## Follow-Ups\n\n"
+        "### F1 Input validation\n"
+        "Recommended follow-up: add validation.\n\n"
+        "## Verdict\n\n"
+        "Verdict: APPROVED_WITH_FOLLOWUPS\n"
+    )
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    _emit_transition_events(
+        {review.id: {"status": "in_progress"}},
+        {
+            review.id: {
+                "status": "completed",
+                "task_type": "review",
+                "started_at": None,
+                "completed_at": review.completed_at.isoformat() if review.completed_at else None,
+                "failure_reason": None,
+                "depends_on": impl.id,
+            }
+        },
+        store=store,
+        config=config,
+        log=log,
+    )
+
+    assert (
+        f"REVIEW {review.id} for {impl.id}: APPROVED_WITH_FOLLOWUPS [follow-ups: F1]"
+        in log_path.read_text()
+    )
+
+
+def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:
+    """Pre-cycle transitions should land before merge logs from the same watch pass."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    impl_task = store.add("Impl", task_type="implement")
+    assert impl_task.id is not None
+    review_task = store.add("Review", task_type="review", depends_on=impl_task.id)
+    assert review_task.id is not None
+    review_task.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review_task.status = "completed"
+    review_task.completed_at = datetime.now(UTC)
+    store.update(review_task)
+
+    impl_id = impl_task.id
+    review_id = review_task.id
+    snapshots = [
+        {review_id: {"status": "in_progress", "task_type": "review", "started_at": None, "completed_at": None, "failure_reason": None, "depends_on": impl_id}},
+        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
+        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
+        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
+        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
+    ]
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=1,
+        max_idle=1,
+        max_iterations=3,
+        dry_run=False,
+        quiet=True,
+        group=None,
+        yes=True,
+    )
+
+    def fake_run_cycle(**kwargs):
+        log = kwargs["log"]
+        if not hasattr(fake_run_cycle, "seen"):
+            fake_run_cycle.seen = True  # type: ignore[attr-defined]
+            log.emit("MERGE", f"{impl_id} -> main")
+            return _CycleResult(work_done=True, pending=0, running=0)
+        return _CycleResult(work_done=False, pending=0, running=0)
+
+    with (
+        patch("gza.cli.watch.Config.load", return_value=config),
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=fake_run_cycle),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        assert cmd_watch(args) == 0
+
+    lines = log_path.read_text().splitlines()
+    review_index = next(i for i, line in enumerate(lines) if " REVIEW " in line)
+    merge_index = next(i for i, line in enumerate(lines) if " MERGE " in line)
+    assert review_index < merge_index
 
 
 def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
@@ -1800,7 +1912,7 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
     store.update(review)
     after = _task_snapshot(store)
 
-    with patch("gza.cli.watch.get_review_verdict", return_value="APPROVED"):
+    with patch("gza.cli.watch.format_review_outcome", return_value="APPROVED"):
         _emit_transition_events(before, after, store=store, config=config, log=log)
 
     review_lines = [line for line in log_path.read_text().splitlines() if " REVIEW " in line]

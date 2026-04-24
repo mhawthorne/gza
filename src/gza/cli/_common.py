@@ -36,6 +36,8 @@ from ..review_tasks import (
 )
 from ..review_verdict import (
     ReviewFinding,
+    format_review_outcome as _format_review_outcome,
+    get_review_outcome as _get_review_outcome,
     get_review_score as _get_review_score,
     get_review_verdict as _get_review_verdict,
     parse_review_verdict,
@@ -1008,6 +1010,14 @@ def get_review_verdict(config: Config, review_task: DbTask) -> str | None:
         Verdict string ('APPROVED', 'APPROVED_WITH_FOLLOWUPS', 'CHANGES_REQUESTED', 'NEEDS_DISCUSSION') or None if not found
     """
     return _get_review_verdict(config.project_dir, review_task)
+
+
+def format_review_outcome(config: Config, review_task: DbTask, *, unknown_label: str = "UNKNOWN") -> str:
+    """Format verdict plus parsed follow-up IDs for a completed review task."""
+    return _format_review_outcome(
+        _get_review_outcome(config.project_dir, review_task),
+        unknown_label=unknown_label,
+    )
 
 
 def get_review_score(config: Config, review_task: DbTask) -> int | None:
