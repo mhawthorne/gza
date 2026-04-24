@@ -14,7 +14,7 @@ from typing import TypeVar
 
 from ..config import Config
 from ..console import truncate
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..failure_policy import is_resumable_failure_reason
 from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
@@ -146,11 +146,18 @@ class _WatchLog:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.quiet = quiet
+        self._has_emitted_cycle = False
         self._skip_keys_prev_cycle: set[str] = set()
         self._skip_keys_this_cycle: set[str] = set()
 
     def begin_cycle(self) -> None:
+        if self._has_emitted_cycle:
+            with open(self.path, "a") as f:
+                f.write("\n")
+            if not self.quiet:
+                print()
         self._skip_keys_this_cycle.clear()
+        self._has_emitted_cycle = True
 
     def end_cycle(self) -> None:
         self._skip_keys_prev_cycle = set(self._skip_keys_this_cycle)
@@ -203,8 +210,14 @@ def _emit_transition_events(
 
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
+    live_pids, _ = _collect_live_running_state(config, store)
+    return len(live_pids)
+
+
+def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str]]:
     registry = WorkerRegistry(config.workers_path)
     live_pids: set[int] = set()
+    live_task_ids: set[str] = set()
     active_task_statuses = {
         str(task.id): task.status
         for task in store.get_in_progress()
@@ -220,6 +233,8 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
             continue
         if worker.pid > 0:
             live_pids.add(worker.pid)
+        if worker.task_id is not None:
+            live_task_ids.add(str(worker.task_id))
 
     for task in store.get_in_progress():
         pid = task.running_pid
@@ -227,8 +242,17 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
             continue
         assert pid is not None
         live_pids.add(pid)
+        if task.id is not None:
+            live_task_ids.add(str(task.id))
 
-    return len(live_pids)
+    return live_pids, sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id))
+
+
+def _format_wake_message(*, running: int, slots: int, running_task_ids: list[str]) -> str:
+    message = f"checking... ({running} running, {slots} slots)"
+    if running_task_ids:
+        message += f" tasks: {', '.join(running_task_ids)}"
+    return message
 
 
 def _pending_runnable_tasks(store: SqliteTaskStore, group: str | None = None) -> list[DbTask]:
@@ -281,13 +305,14 @@ def _run_cycle(
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
 
-    running = _count_live_workers(config, store)
+    live_pids, running_task_ids = _collect_live_running_state(config, store)
+    running = len(live_pids)
     slots = max(0, batch - running)
     work_done = False
     started_task_ids: set[str] = set()
     step1_handled_child_task_ids: set[str] = set()
 
-    log.emit("WAKE", f"checking... ({running} running, {slots} slots)")
+    log.emit("WAKE", _format_wake_message(running=running, slots=slots, running_task_ids=running_task_ids))
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).

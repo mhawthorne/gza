@@ -11,9 +11,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.cli.watch import (
+    _collect_live_running_state,
     _count_live_workers,
     _CycleResult,
     _emit_transition_events,
+    _format_wake_message,
     _run_cycle,
     _task_snapshot,
     _WatchLog,
@@ -465,6 +467,58 @@ def test_count_live_workers_ignores_shutting_down_worker_for_terminal_task(tmp_p
         patch("gza.cli.watch._pid_alive", return_value=True),
     ):
         assert _count_live_workers(config, store) == 0
+
+
+def test_collect_live_running_state_tracks_worker_and_pid_only_tasks(tmp_path: Path) -> None:
+    """WAKE task summaries should include both worker-backed and pid-only in-progress tasks."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    worker_task = store.add("Worker-backed task", task_type="implement")
+    pid_only_task = store.add("PID-only task", task_type="review")
+    terminal_task = store.add("Terminal task", task_type="plan")
+    assert worker_task.id is not None
+    assert pid_only_task.id is not None
+    assert terminal_task.id is not None
+
+    worker_task.status = "in_progress"
+    worker_task.running_pid = None
+    store.update(worker_task)
+
+    pid_only_task.status = "in_progress"
+    pid_only_task.running_pid = 5252
+    store.update(pid_only_task)
+
+    terminal_task.status = "completed"
+    terminal_task.running_pid = None
+    store.update(terminal_task)
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=worker_task.id, pid=4242, status="running"),
+        WorkerMetadata(worker_id="w-2", task_id=terminal_task.id, pid=4343, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with (
+        patch("gza.cli.watch.WorkerRegistry", return_value=registry),
+        patch("gza.cli.watch._pid_alive", side_effect=lambda pid: pid == 5252),
+    ):
+        live_pids, running_task_ids = _collect_live_running_state(config, store)
+
+    assert live_pids == {4242, 5252}
+    assert running_task_ids == [worker_task.id, pid_only_task.id]
+
+
+def test_format_wake_message_includes_running_task_ids() -> None:
+    """WAKE line should append task IDs when tasks are actively running."""
+    assert _format_wake_message(running=1, slots=0, running_task_ids=["gza-42"]) == (
+        "checking... (1 running, 0 slots) tasks: gza-42"
+    )
+    assert _format_wake_message(running=0, slots=2, running_task_ids=[]) == (
+        "checking... (0 running, 2 slots)"
+    )
 
 
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
@@ -2003,6 +2057,32 @@ def test_watch_cycle_dedupes_max_resume_attempts_skip_across_cycles(tmp_path: Pa
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
 
     assert log_path.read_text().count(f"{failed.id}: max_resume_attempts reached") == 1
+
+
+def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Each watch cycle should be visually separated in stdout and watch.log."""
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+
+    with patch("gza.cli.watch._format_hms", side_effect=["18:08:47", "18:13:47"]):
+        log.begin_cycle()
+        log.emit("WAKE", "checking... (0 running, 1 slots)")
+        log.end_cycle()
+
+        log.begin_cycle()
+        log.emit("WAKE", "checking... (1 running, 0 slots)")
+        log.end_cycle()
+
+    assert log_path.read_text() == (
+        "18:08:47 WAKE   checking... (0 running, 1 slots)\n"
+        "\n"
+        "18:13:47 WAKE   checking... (1 running, 0 slots)\n"
+    )
+    assert capsys.readouterr().out == (
+        "18:08:47 WAKE   checking... (0 running, 1 slots)\n"
+        "\n"
+        "18:13:47 WAKE   checking... (1 running, 0 slots)\n"
+    )
 
 
 def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
