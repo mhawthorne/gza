@@ -78,6 +78,7 @@ def set_task_urgency(store: SqliteTaskStore, task_id: str, *, urgent: bool) -> b
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
+_FAILURE_MARKER_LINE_RE = re.compile(r"^\s*\[GZA_FAILURE:(?P<reason>[A-Z0-9_]+)\]\s*$")
 
 
 def _looks_like_task_id(arg: str) -> bool:
@@ -1669,6 +1670,57 @@ def _failure_summary(reason: str) -> str:
         "UNKNOWN": "Task failed; inspect log output for details.",
     }
     return summaries.get(reason, f"Task failed: {reason}")
+
+
+def _extract_last_agent_message_text(log_path: Path) -> str | None:
+    """Extract the most recent ``item.completed`` agent_message text from a log file."""
+    from .log import _load_log_file_entries
+
+    try:
+        _log_data, entries, _content = _load_log_file_entries(log_path)
+    except OSError:
+        return None
+
+    last_message: str | None = None
+    for entry in entries:
+        if entry.get("type") != "item.completed":
+            continue
+        item = entry.get("item", {})
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            last_message = text
+    return last_message
+
+
+def _extract_agent_failure_marker_reason(log_path: Path) -> str | None:
+    """Return the last ``[GZA_FAILURE:REASON]`` marker from the final agent message."""
+    text = _extract_last_agent_message_text(log_path)
+    if not text:
+        return None
+    marker_reason: str | None = None
+    for line in text.splitlines():
+        match = _FAILURE_MARKER_LINE_RE.match(line)
+        if match:
+            marker_reason = match.group("reason")
+    return marker_reason
+
+
+def _extract_last_agent_message_for_failure(log_path: Path) -> str | None:
+    """Return final agent message text with failure marker lines removed."""
+    text = _extract_last_agent_message_text(log_path)
+    if not text:
+        return None
+
+    cleaned_lines = [
+        line for line in text.splitlines()
+        if _FAILURE_MARKER_LINE_RE.match(line) is None
+    ]
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned or None
 
 
 def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) -> str | None:

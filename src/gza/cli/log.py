@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.markup import escape as rich_escape
+from rich.panel import Panel
 
 from ..colors import (
     LINEAGE_STATUS_COLORS,
@@ -22,7 +23,16 @@ from ..console import console, format_duration, truncate
 from ..db import SqliteTaskStore, Task as DbTask
 from ..log_events import is_new_step
 from ..workers import WorkerMetadata, WorkerRegistry
-from ._common import _parse_iso, get_store, pager_context, resolve_id
+from ._common import (
+    _extract_agent_failure_marker_reason,
+    _extract_failure_log_context,
+    _extract_last_agent_message_for_failure,
+    _failure_summary,
+    _parse_iso,
+    get_store,
+    pager_context,
+    resolve_id,
+)
 
 
 def _lc() -> str:
@@ -901,6 +911,40 @@ def _print_log_header(
     console.print()
 
 
+def _print_failure_focus(task: DbTask, log_path: Path, config: Config) -> None:
+    """Print failure-first diagnostics for a failed task."""
+    status_failed = SHOW_COLORS_DICT["status_failed"]
+    value_color = SHOW_COLORS_DICT["value"]
+    reason = task.failure_reason or "UNKNOWN"
+    marker_reason = _extract_agent_failure_marker_reason(log_path)
+    marker_text = ""
+    if marker_reason:
+        marker_text = f" [{status_failed}]{rich_escape(f'[GZA_FAILURE:{marker_reason}]')}[/{status_failed}]"
+
+    console.print(f"[{_lc()}]Failure Reason:[/{_lc()}] [{status_failed}]{reason}[/{status_failed}]{marker_text}", soft_wrap=True)
+    console.print(f"[{_lc()}]Failure Summary:[/{_lc()}] [{value_color}]{_failure_summary(reason)}[/{value_color}]", soft_wrap=True)
+
+    explanation = _extract_last_agent_message_for_failure(log_path)
+    console.print(f"[{_lc()}]Agent Explanation:[/{_lc()}]", soft_wrap=True)
+    if explanation:
+        console.print(
+            Panel(
+                rich_escape(explanation),
+                border_style=status_failed,
+                padding=(0, 1),
+                expand=False,
+            )
+        )
+    else:
+        console.print(f"[{value_color}]  (not found in log)[/{value_color}]", soft_wrap=True)
+
+    verify_context, result_context = _extract_failure_log_context(log_path, config.verify_command)
+    if verify_context:
+        console.print(f"[{_lc()}]Last Verify Failure:[/{_lc()}] [{value_color}]{rich_escape(verify_context)}[/{value_color}]", soft_wrap=True)
+    if result_context:
+        console.print(f"[{_lc()}]Last Result Context:[/{_lc()}] [{value_color}]{rich_escape(result_context)}[/{value_color}]", soft_wrap=True)
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     """Display the log for a task or worker."""
     config = Config.load(args.project_dir)
@@ -982,6 +1026,10 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     # Check for raw mode
     raw_mode = hasattr(args, 'raw') and args.raw
+    failure_only = bool(getattr(args, "failure", False))
+    if failure_only and (follow or raw_mode):
+        print("Error: --failure cannot be used with --follow or --raw")
+        return 1
 
     if follow and not raw_mode:
         _print_log_header(
@@ -1035,6 +1083,16 @@ def cmd_log(args: argparse.Namespace) -> int:
             is_running=is_running,
             using_startup_log=using_startup_log,
         )
+
+        if failure_only:
+            if task is None:
+                print("Error: --failure requires a task target")
+                return 1
+            if task.status != "failed":
+                print(f"Error: Task {task.id} is not failed")
+                return 1
+            _print_failure_focus(task, log_path, config)
+            return 0
 
         _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
 

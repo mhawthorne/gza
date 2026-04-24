@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from rich.markup import escape as rich_escape
+from rich.panel import Panel
 
 import gza.colors as _colors
 
@@ -65,6 +66,8 @@ from ..task_query import (
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     TASK_COLORS,
+    _extract_agent_failure_marker_reason,
+    _extract_last_agent_message_for_failure,
     _failure_next_steps,
     _failure_summary,
     _format_lineage,
@@ -2138,7 +2141,20 @@ def _cmd_show_output(
 
     if task.status == "failed":
         reason = task.failure_reason or "UNKNOWN"
-        console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['status_failed']}]{reason}[/{c['status_failed']}]")
+        log_path = _resolve_task_log_path(config, task)
+        marker_reason = None
+        if log_path and log_path.exists():
+            marker_reason = _extract_agent_failure_marker_reason(log_path)
+        marker_text = ""
+        if marker_reason:
+            marker_label = rich_escape(f"[GZA_FAILURE:{marker_reason}]")
+            marker_text = f" [{c['status_failed']}]{marker_label}[/{c['status_failed']}]"
+
+        console.print(
+            f"[{c['label']}]Failure Reason:[/{c['label']}] "
+            f"[{c['status_failed']}]{reason}[/{c['status_failed']}]"
+            f"{marker_text}"
+        )
         console.print(f"[{c['label']}]Failure Summary:[/{c['label']}] [{c['value']}]{_failure_summary(reason)}[/{c['value']}]")
 
         if reason in {"MAX_STEPS", "MAX_TURNS"}:
@@ -2156,8 +2172,21 @@ def _cmd_show_output(
                     f"[{c['value']}]{turns_used}[/{c['value']}]"
                 )
 
-        log_path = _resolve_task_log_path(config, task)
         if log_path and log_path.exists():
+            explanation = _extract_last_agent_message_for_failure(log_path)
+            console.print(f"[{c['label']}]Agent Explanation:[/{c['label']}]")
+            if explanation:
+                console.print(
+                    Panel(
+                        rich_escape(explanation),
+                        border_style=c["status_failed"],
+                        padding=(0, 1),
+                        expand=False,
+                    )
+                )
+            else:
+                console.print(f"[{c['value']}]  (not found in log)[/{c['value']}]")
+
             verify_context, result_context = _extract_failure_log_context(log_path, config.verify_command)
             if verify_context:
                 console.print(

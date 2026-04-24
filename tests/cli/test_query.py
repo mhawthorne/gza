@@ -1912,6 +1912,20 @@ class TestShowCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         lines = [
             {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "Initial attempt note",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "[GZA_FAILURE:MAX_STEPS]\nBlocked by ordering prerequisite; implementation not started.",
+                },
+            },
+            {
                 "type": "assistant",
                 "message": {
                     "role": "assistant",
@@ -1943,7 +1957,11 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Failure Reason: MAX_STEPS" in result.stdout
+        assert "[GZA_FAILURE:MAX_STEPS]" in result.stdout
+        assert result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
         assert "Failure Summary: Stopped due to max steps limit." in result.stdout
+        assert "Agent Explanation:" in result.stdout
+        assert "Blocked by ordering prerequisite; implementation not started." in result.stdout
         assert "Step Limit: 55 / 50" in result.stdout
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout

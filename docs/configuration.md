@@ -532,6 +532,7 @@ gza log <identifier> [options]
 | `--follow`, `-f` | Follow log in real-time |
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
+| `--failure`, `-F` | Show failure-focused diagnostics for failed tasks (reason, summary, marker, agent explanation, and last verify/result context) |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
 By default, the identifier is treated as a full task ID (for example `gza-1234`).

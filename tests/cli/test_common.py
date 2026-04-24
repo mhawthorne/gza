@@ -1,9 +1,13 @@
-"""Tests for shared CLI utility functions in gza.cli._common."""
+import pytest
 
-from gza.cli._common import _looks_like_task_id, format_stats, run_with_resume
+from gza.cli._common import (
+    _extract_last_agent_message_for_failure,
+    _looks_like_task_id,
+    format_stats,
+    run_with_resume,
+)
 from gza.config import Config
 from gza.db import SqliteTaskStore
-import pytest
 
 
 class TestLooksLikeTaskId:
@@ -234,3 +238,69 @@ class TestRunWithResume:
         assert rc == 1
         assert final_task.status == "failed"
         assert len(store.get_all()) == 1
+
+
+class TestExtractLastAgentMessageForFailure:
+    """Unit tests for extracting final agent explanation from JSONL logs."""
+
+    def test_returns_last_agent_message_and_strips_failure_marker(self, tmp_path):
+        import json
+
+        log_path = tmp_path / "run.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "First explanation"}}),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": "[GZA_FAILURE:MAX_STEPS]\nSecond explanation line 1\nline 2",
+                            },
+                        }
+                    ),
+                ]
+            )
+        )
+
+        explanation = _extract_last_agent_message_for_failure(log_path)
+        assert explanation == "Second explanation line 1\nline 2"
+
+    def test_returns_none_when_no_agent_messages(self, tmp_path):
+        import json
+
+        log_path = tmp_path / "run.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}}),
+                    json.dumps({"type": "result", "subtype": "error_max_steps"}),
+                ]
+            )
+        )
+
+        assert _extract_last_agent_message_for_failure(log_path) is None
+
+    def test_tolerates_malformed_json_lines(self, tmp_path):
+        import json
+
+        log_path = tmp_path / "run.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "{bad-json-line",
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": "[GZA_FAILURE:UNKNOWN]\nUsable explanation",
+                            },
+                        }
+                    ),
+                ]
+            )
+        )
+
+        assert _extract_last_agent_message_for_failure(log_path) == "Usable explanation"
