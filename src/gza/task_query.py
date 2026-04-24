@@ -295,7 +295,7 @@ class TaskQueryService:
                     "lineages scope with lifecycle_state=incomplete supports at most one task type"
                 )
             f = _history_filter_cls()(
-                limit=query.limit,
+                limit=None,
                 task_type=(query.task_types[0] if query.task_types and len(query.task_types) == 1 else None),
                 days=query.date_filter.days if query.date_filter else None,
                 start_date=(query.date_filter.start.isoformat() if query.date_filter and query.date_filter.start else None),

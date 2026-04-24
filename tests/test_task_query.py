@@ -228,3 +228,41 @@ def test_lineages_incomplete_rejects_multi_task_type_filter(tmp_path: Path) -> N
         match="lineages scope with lifecycle_state=incomplete supports at most one task type",
     ):
         service.run(query)
+
+
+def test_incomplete_limit_applies_once_at_owner_row_level(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    root_a = store.add("Root A owner old", task_type="implement")
+    root_a.status = "completed"
+    root_a.completed_at = datetime.now(UTC) - timedelta(days=30)
+    root_a.has_commits = True
+    root_a.merge_status = "merged"
+    store.update(root_a)
+    assert root_a.id is not None
+
+    recent_failed_descendant = store.add(
+        "Recent unresolved descendant on A",
+        task_type="improve",
+        based_on=root_a.id,
+        same_branch=True,
+    )
+    recent_failed_descendant.status = "failed"
+    recent_failed_descendant.completed_at = datetime.now(UTC) - timedelta(hours=1)
+    recent_failed_descendant.failure_reason = "TEST_FAILURE"
+    store.update(recent_failed_descendant)
+
+    root_b = store.add("Root B owner newer", task_type="implement")
+    root_b.status = "failed"
+    root_b.completed_at = datetime.now(UTC) - timedelta(hours=2)
+    root_b.failure_reason = "TEST_FAILURE"
+    store.update(root_b)
+    assert root_b.id is not None
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.incomplete(limit=1))
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "owner_task")
+    assert row.owner_task.id == root_b.id

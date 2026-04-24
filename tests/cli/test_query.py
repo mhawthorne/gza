@@ -6290,3 +6290,39 @@ class TestIncompleteCommand:
         for row in payload:
             assert row["next_action_owner_id"] == row["id"]
             assert row["id"] in row["unresolved_ids"]
+
+    def test_incomplete_last_one_uses_owner_row_ranking_after_owner_rollup(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_a = store.add("Root A owner old", task_type="implement")
+        root_a.status = "completed"
+        root_a.completed_at = datetime.now(UTC) - timedelta(days=30)
+        root_a.has_commits = True
+        root_a.merge_status = "merged"
+        store.update(root_a)
+        assert root_a.id is not None
+
+        recent_failed_descendant = store.add(
+            "Recent unresolved descendant on A",
+            task_type="improve",
+            based_on=root_a.id,
+            same_branch=True,
+        )
+        recent_failed_descendant.status = "failed"
+        recent_failed_descendant.completed_at = datetime.now(UTC) - timedelta(hours=1)
+        recent_failed_descendant.failure_reason = "TEST_FAILURE"
+        store.update(recent_failed_descendant)
+
+        root_b = store.add("Root B owner newer", task_type="implement")
+        root_b.status = "failed"
+        root_b.completed_at = datetime.now(UTC) - timedelta(hours=2)
+        root_b.failure_reason = "TEST_FAILURE"
+        store.update(root_b)
+        assert root_b.id is not None
+
+        result = run_gza("incomplete", "--last", "1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"{root_b.id}:" in result.stdout
+        assert f"{root_a.id}:" not in result.stdout
