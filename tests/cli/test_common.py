@@ -70,6 +70,44 @@ class TestFormatStats:
 class TestRunWithResume:
     """Unit tests for shared run_with_resume execution helper."""
 
+    def test_resumes_on_handled_timeout_failure_with_zero_exit(self, tmp_path):
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.session_id = "sess-123"
+        store.update(task)
+
+        outcomes = ["TIMEOUT", None]
+        seen_resume_flags: list[bool] = []
+
+        def _run_task(run_task, resume: bool) -> int:
+            seen_resume_flags.append(resume)
+            outcome = outcomes.pop(0)
+            if outcome is None:
+                run_task.status = "completed"
+                store.update(run_task)
+                return 0
+            run_task.status = "failed"
+            run_task.failure_reason = outcome
+            run_task.session_id = "sess-123"
+            store.update(run_task)
+            return 0
+
+        final_task, rc = run_with_resume(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=1,
+        )
+
+        assert rc == 0
+        assert final_task.status == "completed"
+        assert seen_resume_flags == [False, True]
+        assert len(store.get_all()) == 2  # original + 1 resume child
+
     def test_resumes_on_max_steps_and_max_turns(self, tmp_path):
         (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
         config = Config.load(tmp_path)
@@ -166,4 +204,33 @@ class TestRunWithResume:
         assert rc == 1
         assert final_task.status == "failed"
         assert seen_resume_flags == [False]
+        assert len(store.get_all()) == 1
+
+    def test_returns_nonzero_for_handled_failed_outcome_with_zero_exit(self, tmp_path):
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.session_id = "sess-123"
+        store.update(task)
+
+        def _run_task(run_task, resume: bool) -> int:
+            del resume
+            run_task.status = "failed"
+            run_task.failure_reason = "TEST_FAILURE"
+            run_task.session_id = "sess-123"
+            store.update(run_task)
+            return 0
+
+        final_task, rc = run_with_resume(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=3,
+        )
+
+        assert rc == 1
+        assert final_task.status == "failed"
         assert len(store.get_all()) == 1

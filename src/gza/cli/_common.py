@@ -1446,6 +1446,9 @@ def run_with_resume(
     Returns:
         Tuple of ``(final_task, exit_code)``.
     """
+    def _failure_exit_code(raw_rc: int) -> int:
+        return raw_rc if raw_rc != 0 else 1
+
     effective_limit = config.max_resume_attempts if max_resume_attempts is None else max_resume_attempts
     if not isinstance(effective_limit, int):
         effective_limit = 0
@@ -1464,7 +1467,9 @@ def run_with_resume(
         else:
             refreshed = current_task
 
-        if rc == 0:
+        # The runner reports handled task outcomes through task state. A timed-out
+        # or max-steps task can still return process exit 0 after marking itself failed.
+        if refreshed.status != "failed":
             return refreshed, 0
 
         resumable_failure = is_resumable_failure(
@@ -1473,10 +1478,10 @@ def run_with_resume(
             session_id=refreshed.session_id,
         )
         if not resumable_failure:
-            return refreshed, rc
+            return refreshed, _failure_exit_code(rc)
 
         if resume_attempt >= effective_limit:
-            return refreshed, rc
+            return refreshed, _failure_exit_code(rc)
 
         resume_attempt += 1
         resume_task = _create_resume_task(store, refreshed)
