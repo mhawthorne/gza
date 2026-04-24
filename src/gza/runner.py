@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -86,6 +87,9 @@ __all__ = [
     "run",
     "build_prompt",
     "write_log_entry",
+    "TaskExecutionLogger",
+    "ensure_task_log_path",
+    "task_log_storage_path",
     "extract_content_from_log",
     "get_effective_config_for_task",
     "post_review_to_pr",
@@ -104,13 +108,78 @@ def write_log_entry(log_file: "Path", entry: dict) -> None:
         logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
 
 
+def task_log_storage_path(config: Config, path: Path) -> str:
+    """Convert a task log path to the DB storage string (project-relative when possible)."""
+    try:
+        return str(path.relative_to(config.project_dir))
+    except ValueError:
+        return str(path)
+
+
+def _resolve_task_log_path(config: Config, task: Task) -> Path:
+    """Resolve canonical task log path without mutating task state."""
+    if task.log_file:
+        stored_path = Path(task.log_file)
+        if not stored_path.is_absolute():
+            return config.project_dir / stored_path
+        return stored_path
+    if task.slug:
+        return config.log_path / f"{task.slug}.log"
+    suffix = task.id or "unknown-task"
+    return config.log_path / f"{suffix}.startup.log"
+
+
+def ensure_task_log_path(config: Config, store: SqliteTaskStore, task: Task) -> Path:
+    """Ensure the task owns a canonical log path and persist it immediately."""
+    path = _resolve_task_log_path(config, task)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.touch()
+    storage_path = task_log_storage_path(config, path)
+    if task.log_file != storage_path:
+        task.log_file = storage_path
+        store.update(task)
+    return path
+
+
+class TaskExecutionLogger:
+    """Emit provider-agnostic task execution events to the canonical task log."""
+
+    def __init__(self, log_file: Path, *, echo: bool = True) -> None:
+        self.log_file = log_file
+        self.echo = echo
+
+    def _emit(self, subtype: str, message: str, *, stderr: bool = False, extra: dict | None = None) -> None:
+        payload: dict[str, object] = {
+            "type": "gza",
+            "subtype": subtype,
+            "message": message,
+        }
+        if extra:
+            payload.update(extra)
+        write_log_entry(self.log_file, payload)
+        if self.echo:
+            print(message, file=sys.stderr if stderr else sys.stdout)
+
+    def info(self, message: str, *, extra: dict | None = None) -> None:
+        self._emit("info", message, extra=extra)
+
+    def warning(self, message: str, *, extra: dict | None = None) -> None:
+        self._emit("warning", message, stderr=True, extra=extra)
+
+    def error(self, message: str, *, extra: dict | None = None) -> None:
+        self._emit("error", message, stderr=True, extra=extra)
+
+    def phase(self, message: str, *, extra: dict | None = None) -> None:
+        self._emit("phase", message, extra=extra)
+
+    def command(self, message: str, *, extra: dict | None = None) -> None:
+        self._emit("command", message, extra=extra)
+
+
 def open_task_startup_log(config: Config, task: Task) -> Path:
     """Return the startup log path for a task, creating parent directories."""
-    if task.log_file:
-        path = config.project_dir / Path(task.log_file)
-    else:
-        suffix = task.id or "unknown-task"
-        path = config.log_path / f"{suffix}.startup.log"
+    path = _resolve_task_log_path(config, task)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.touch()
@@ -220,15 +289,7 @@ def _mark_preflight_provider_unavailable(
     message: str,
 ) -> None:
     """Persist preflight credential failures as provider-unavailable task failures."""
-    log_file = (
-        config.project_dir / Path(task.log_file)
-        if task.log_file
-        else open_task_startup_log(config, task)
-    )
-    log_file_relative = str(log_file.relative_to(config.project_dir))
-    if task.log_file != log_file_relative:
-        task.log_file = log_file_relative
-        store.update(task)
+    log_file = ensure_task_log_path(config, store, task)
 
     write_worker_start_event(log_file, resumed=resume)
     write_log_entry(
@@ -261,7 +322,7 @@ def _mark_preflight_provider_unavailable(
     )
     store.mark_failed(
         task,
-        log_file=str(log_file.relative_to(config.project_dir)),
+        log_file=task_log_storage_path(config, log_file),
         failure_reason="PROVIDER_UNAVAILABLE",
     )
 
@@ -1991,11 +2052,7 @@ def run(
     # Get the provider for this task
     provider = get_provider(task_config)
     resolved_interaction_mode = _resolve_interaction_mode(invocation_context, provider)
-    preflight_log = open_task_startup_log(config, task)
-    preflight_log_relative = str(preflight_log.relative_to(config.project_dir))
-    if task.log_file != preflight_log_relative:
-        task.log_file = preflight_log_relative
-        store.update(task)
+    preflight_log = ensure_task_log_path(config, store, task)
 
     if not provider.check_credentials():
         error_message(f"Error: No {provider.name} credentials found")
@@ -2014,10 +2071,7 @@ def run(
 
     # Verify credentials work before proceeding
     console.print(f"Verifying {provider.name} credentials...")
-    preflight_log_path: Path | None = None
-    if task.log_file:
-        preflight_log_path = config.project_dir / Path(task.log_file)
-    if not provider.verify_credentials(task_config, log_file=preflight_log_path):
+    if not provider.verify_credentials(task_config, log_file=preflight_log):
         _mark_preflight_provider_unavailable(
             task=task,
             config=config,

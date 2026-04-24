@@ -216,6 +216,27 @@ def test_tv_auto_mode_backfills_finished_tasks_when_live_count_drops(monkeypatch
     assert _FakeLive.instance.updates[1] == [live_2.id, live_1.id, finished_1.id, finished_2.id]
 
 
+def test_tv_panel_displays_rebase_log_content_for_completed_task(tmp_path: Path):
+    """Completed rebase tasks with logs should render content instead of '(no log available)'."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Completed rebase task", task_type="rebase")
+    assert task.id is not None
+    task.status = "completed"
+    task.slug = "20260424-tv-rebase"
+    task.log_file = ".gza/logs/20260424-tv-rebase.log"
+    store.update(task)
+
+    log_path = tmp_path / ".gza" / "logs" / "20260424-tv-rebase.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{\"type\":\"gza\",\"subtype\":\"info\",\"message\":\"mechanical rebase complete\"}\\n')
+
+    panel = tv_module._build_task_panel(task, log_path, n_lines=4, width=100)
+    rendered = panel.renderable.plain
+    assert "mechanical rebase complete" in rendered
+    assert "(no log available)" not in rendered
+
+
 def test_tv_explicit_ids_stay_fixed(monkeypatch, tmp_path: Path):
     """Explicit task IDs should remain on screen and keep polling after completion."""
     setup_config(tmp_path)

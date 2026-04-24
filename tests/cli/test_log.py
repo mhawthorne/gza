@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from gza.cli import _LiveLogPrinter, _build_step_timeline, _format_log_entry
+from gza.cli import _LiveLogPrinter, _build_step_timeline, _format_log_entry, _load_log_file_entries
 from gza.db import SqliteTaskStore
 
 from .conftest import LOG_FIXTURES_DIR, make_store, run_gza, setup_config
@@ -206,6 +206,41 @@ class TestLogCommand:
 
         assert result.returncode == 0
         assert "Recovered via inferred path" in result.stdout
+
+    def test_log_task_lookup_prefers_explicit_task_log_file_without_slug(self, tmp_path: Path):
+        """Task log resolution should use task.log_file even when no slug exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Explicit log path task")
+        task.status = "completed"
+        task.slug = None
+        task.log_file = ".gza/logs/explicit.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "explicit.log").write_text(json.dumps({"type": "result", "result": "explicit"}))
+
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "explicit" in result.stdout
+
+    def test_load_log_file_entries_preserves_mixed_json_and_raw_lines(self, tmp_path: Path):
+        """Mixed JSON and raw lines are preserved for display."""
+        log_path = tmp_path / "mixed.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "gza", "subtype": "info", "message": "phase start"}),
+                    "raw line from provider",
+                    json.dumps({"type": "result", "subtype": "success", "result": "done"}),
+                ]
+            )
+        )
+        log_data, entries, _content = _load_log_file_entries(log_path)
+        assert log_data is not None
+        assert [e.get("type") for e in entries] == ["gza", "raw", "result"]
+        assert entries[1].get("message") == "raw line from provider"
 
     def test_log_by_task_id_shows_exact_task_log_not_latest_retry_resume_attempt(self, tmp_path: Path):
         """Task lookup should show the requested task's own log, not a later based_on retry."""
@@ -834,8 +869,8 @@ class TestLogCommand:
 
         result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
 
-        assert result.returncode == 1
-        assert "Using startup log (main task log not available)." in result.stdout
+        assert result.returncode == 0
+        assert "startup log" in result.stdout
         assert "Docker daemon is not running" in result.stdout
 
     def test_log_by_worker_shows_failed_status_for_startup_failure_without_task(self, tmp_path: Path):
@@ -954,8 +989,8 @@ class TestLogCommand:
         else:
             result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
-        assert result.returncode == 1
-        assert "Using startup log (main task log not available)." in result.stdout
+        assert result.returncode == 0
+        assert "startup log" in result.stdout
         assert "startup-output-from-worker" in result.stdout
 
     @pytest.mark.parametrize("query_mode", ["task_id", "slug"])
@@ -1046,7 +1081,7 @@ class TestLogCommand:
         assert "Error: Log file not found at" in result.stdout
 
     def test_log_by_task_id_startup_failure(self, tmp_path: Path):
-        """Log command shows startup error when log contains non-JSON content."""
+        """Raw non-JSON task logs are rendered as displayable lines."""
 
         setup_config(tmp_path)
 
@@ -1065,12 +1100,8 @@ class TestLogCommand:
 
         result = run_gza("log", str(task.id), "--project", str(tmp_path))
 
-        # Should detect startup failure and display the error
-        assert result.returncode == 1
-        assert "Task failed during startup (no Claude session):" in result.stdout
+        assert result.returncode == 0
         assert "exec /usr/local/bin/docker-entrypoint.sh: argument list too long" in result.stdout
-        # The error should be indented
-        assert "  exec /usr/local/bin/docker-entrypoint.sh" in result.stdout
 
     def test_log_default_uses_task_id(self, tmp_path: Path):
         """Log command defaults to task ID lookup without any flag."""

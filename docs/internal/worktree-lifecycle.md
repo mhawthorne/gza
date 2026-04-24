@@ -30,7 +30,9 @@ Unlike code task worktrees, non-code task worktrees are **removed on success** a
 
 ### `gza rebase` CLI (foreground mode)
 
-`gza rebase` creates a **temporary** worktree at `config.worktree_path / task.id` for the duration of the rebase. Unlike task worktrees, this worktree is always removed after use — a `try/finally` block in `cmd_rebase` calls `git.worktree_remove(worktree_path, force=True)` on all exit paths (mechanical success, provider-resolved success, failure, and exception). If `worktree_remove` leaves the directory behind, `shutil.rmtree` is used as a fallback. This worktree is never left registered with git after `gza rebase` exits.
+Foreground `gza rebase` creates a dedicated `rebase` child task and uses that row as the canonical execution owner (status + `log_file`) across both mechanical and provider-assisted phases.
+
+It creates a **temporary** worktree at `config.worktree_path / rebase_task.id` for the duration of the run. Unlike task worktrees, this worktree is always removed after use — cleanup runs on all exit paths (mechanical success, provider-resolved success, failure, and exception), with `shutil.rmtree` fallback if `git worktree remove` leaves a directory behind. This worktree is never left registered with git after `gza rebase` exits.
 
 ## Local path dependency symlinks
 

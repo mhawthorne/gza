@@ -7684,7 +7684,8 @@ class TestRunForeground:
         rebase_task = rebase_children[0]
         assert rebase_task.status == "completed"
         assert rebase_task.branch == task.branch
-        assert "before resuming" in (rebase_task.output_content or "")
+        assert "Rebased" in (rebase_task.output_content or "")
+        assert rebase_task.log_file is not None
 
     def test_run_foreground_marks_failed_on_keyboard_interrupt(self, tmp_path: Path):
         """_run_foreground marks worker as failed when interrupted."""

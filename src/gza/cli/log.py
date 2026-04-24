@@ -229,6 +229,10 @@ def _build_step_timeline(entries: list[dict]) -> list[dict]:
                         current_step,
                         f"{substep_type} {truncate(output, 120)}".strip(),
                     )
+        elif entry_type == "raw":
+            message = entry.get("message", "")
+            if isinstance(message, str) and message.strip():
+                current_step = _append_timeline_step(steps, f"[raw] {message.strip()}")
 
     return steps
 
@@ -426,6 +430,10 @@ class _LiveLogPrinter:
                 # Success result
                 if isinstance(result_text, str) and result_text.strip():
                     self._console.print(f"[green]\\[result][/green] {rich_escape(result_text.strip())}", soft_wrap=True)
+        elif entry_type == "raw":
+            message = entry.get("message", "")
+            if isinstance(message, str) and message:
+                self._console.print(rich_escape(message), soft_wrap=True)
 
     def _print_tool_use(self, content: dict) -> None:
         tool_name = content.get("name", "unknown")
@@ -597,6 +605,10 @@ def _format_log_entry(entry: dict) -> str | None:
         if subtype:
             return f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}"
         return f"[{_lc()}]\\[gza][/{_lc()}] {rich_escape(message)}"
+    elif entry_type == "raw":
+        message = entry.get("message", "")
+        if message:
+            return rich_escape(str(message))
 
     return None
 
@@ -750,13 +762,14 @@ def _load_log_file_entries(log_path: Path) -> tuple[dict | None, list[dict], str
             continue
         try:
             entry = json.loads(line)
-            if not isinstance(entry, dict):
-                continue
-            entries.append(entry)
-            if entry.get("type") == "result":
-                log_data = entry
+            if isinstance(entry, dict):
+                entries.append(entry)
+                if entry.get("type") == "result":
+                    log_data = entry
+            else:
+                entries.append({"type": "raw", "message": str(entry)})
         except json.JSONDecodeError:
-            continue
+            entries.append({"type": "raw", "message": line})
 
     return log_data, entries, content
 

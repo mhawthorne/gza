@@ -2628,7 +2628,7 @@ class TestPsCommand:
     def test_ps_does_not_flag_foreground_task_with_live_pid_as_orphaned(self, tmp_path: Path):
         """A foreground in_progress task (running_pid alive, no worker) is not orphaned.
 
-        Internal flows like invoke_provider_resolve run in the foreground and set
+        Foreground rebase flows set
         running_pid via mark_in_progress without registering a worker. As long as
         the PID is alive, the task should not be classified as orphaned.
         """
@@ -2636,7 +2636,7 @@ class TestPsCommand:
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        task = store.add("Foreground internal task", task_type="internal")
+        task = store.add("Foreground rebase task", task_type="rebase")
         store.mark_in_progress(task)  # sets running_pid to the live test process
 
         result = run_gza("ps", "--json", "--project", str(tmp_path))

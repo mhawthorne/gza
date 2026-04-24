@@ -2,25 +2,14 @@
 
 
 import argparse
-import io
-import os
-import shutil
-import time
-from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-import pytest
-
-from gza.cli import _determine_advance_action, cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
 from .conftest import (
-    make_store,
     run_gza,
-    setup_config,
-    setup_db_with_tasks,
     setup_git_repo_with_task_branch,
 )
 
@@ -96,7 +85,7 @@ class TestRebaseCommand:
         assert "Successfully rebased" in result.stdout
 
     def test_rebase_logs_task_id_and_newline(self, tmp_path: Path):
-        """Rebase command logs 'Rebasing task #X...' and ends with a newline."""
+        """Rebase command logs foreground rebase-task progress and ends with a newline."""
         _store, _git, task, _worktree_path = setup_git_repo_with_task_branch(
             tmp_path, "Test rebase output format", "feature/test-rebase-output",
         )
@@ -104,7 +93,8 @@ class TestRebaseCommand:
         result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert f"Rebasing task {task.id}..." in result.stdout
+        assert "Rebasing task " in result.stdout
+        assert str(task.id) not in result.stdout
         # Output should end with a newline (after trailing whitespace is stripped per line,
         # the last non-empty content is followed by a blank line)
         assert result.stdout.endswith("\n")
@@ -144,7 +134,7 @@ class TestRebaseCommand:
         )
 
     def test_rebase_cleans_up_worktree_on_push_failure(self, tmp_path: Path):
-        """Worktree is removed even when force-push raises GitError."""
+        """Worktree is removed and command fails when force-push raises GitError."""
         from gza.cli.git_ops import cmd_rebase
         from gza.git import GitError
 
@@ -170,10 +160,32 @@ class TestRebaseCommand:
              patch("gza.git.Git.rebase", side_effect=GitError("conflict")), \
              patch("gza.git.Git.rebase_abort"), \
              patch("gza.git.Git.push_force_with_lease", side_effect=GitError("push failed")):
-            with pytest.raises(GitError, match="push failed"):
-                cmd_rebase(args)
+            rc = cmd_rebase(args)
+
+        assert rc == 1
 
         # Worktree must not exist regardless of push failure.
         assert not expected_worktree.exists(), (
             f"Worktree at {expected_worktree} should have been removed even after push failure"
         )
+
+    def test_rebase_creates_single_rebase_task_with_canonical_log(self, tmp_path: Path):
+        """Foreground rebase creates one completed rebase child with a task-owned log."""
+        _store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase task ownership", "feature/test-task-owned-log",
+        )
+
+        result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        rebases = [t for t in store.get_based_on_children(task.id) if t.task_type == "rebase"]
+        assert len(rebases) == 1
+        rebase_task = rebases[0]
+        assert rebase_task.status == "completed"
+        assert rebase_task.log_file is not None
+        log_path = config.project_dir / rebase_task.log_file
+        assert log_path.exists()
+        log_text = log_path.read_text()
+        assert "Rebasing task" in log_text

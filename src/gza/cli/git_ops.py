@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import gza.colors as _colors
@@ -34,7 +33,14 @@ from ..pickup import (
 )
 from ..pr_ops import ensure_task_pr
 from ..prompts import PromptBuilder
-from ..runner import get_effective_config_for_task, load_dotenv
+from ..runner import (
+    TaskExecutionLogger,
+    ensure_task_log_path,
+    get_effective_config_for_task,
+    load_dotenv,
+    task_log_storage_path,
+    write_log_entry,
+)
 from ._common import (
     DuplicateReviewError,
     _create_or_reuse_followup_tasks,
@@ -318,7 +324,15 @@ def _merge_single_task(
         if args.rebase and getattr(args, 'resolve', False):
             # --resolve: invoke Claude to fix conflicts
             print("Conflicts detected. Invoking provider to resolve...")
-            resolved = invoke_provider_resolve(task, task.branch, rebase_target, config)
+            resolve_log = ensure_task_log_path(config, store, task)
+            resolved = invoke_provider_resolve(
+                task,
+                task.branch,
+                rebase_target,
+                config,
+                log_file=resolve_log,
+                logger=TaskExecutionLogger(resolve_log, echo=True),
+            )
 
             if not resolved:
                 print("Could not resolve conflicts automatically.")
@@ -509,36 +523,58 @@ def _is_rebase_in_progress(worktree_path: Path) -> bool:
     return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
 
 
+def _branch_has_commits(config: Config, branch: str | None) -> bool:
+    """Return whether a branch is ahead of the default branch."""
+    if not branch:
+        return False
+    try:
+        git = Git(config.project_dir)
+        default_branch = git.default_branch()
+        return git.count_commits_ahead(branch, default_branch) > 0
+    except (GitError, OSError, ValueError):
+        return False
+
+
 def invoke_provider_resolve(
     task: DbTask,
     branch: str,
     target: str,
     config: Config,
     *,
+    log_file: Path,
+    logger: TaskExecutionLogger | None = None,
     worktree_path: Path | None = None,
 ) -> bool:
     """Invoke active provider runtime to resolve rebase conflicts via /gza-rebase.
 
-    When *worktree_path* is given the provider is run inside that worktree and
-    the skill is installed there.  When omitted the legacy behaviour is used:
-    the provider runs in the project directory with ``/gza-rebase --auto
-    --continue`` (rebase already in progress in the main working tree).
+    Provider output is appended to ``log_file`` owned by the caller's task row.
     """
     from dataclasses import replace
 
     from ..providers import get_provider
 
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if not log_file.exists():
+        log_file.touch()
+    task_logger = logger or TaskExecutionLogger(log_file, echo=True)
+    task_id_label = getattr(task, "id", None)
+    task_ref = f"{task_id_label}" if task_id_label is not None else "<unknown>"
+
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
     runtime = _resolve_runtime_skill_dir(config.project_dir, effective_provider)
     if not runtime:
-        print(f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve.")
+        task_logger.error(
+            f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve."
+        )
         return False
 
-    target_name, runtime_dir = runtime
+    target_name, _runtime_dir = runtime
     if not ensure_skill("gza-rebase", effective_provider, config.project_dir):
-        print(f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'.")
-        print(
+        task_logger.error(
+            f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'."
+        )
+        task_logger.error(
             "Install it with: "
             f"uv run gza skills-install --target {target_name} gza-rebase --project {config.project_dir}"
         )
@@ -547,11 +583,12 @@ def invoke_provider_resolve(
     # When running in a worktree, install the skill there so the provider finds it.
     if worktree_path is not None:
         from ..skills_utils import copy_skill
+
         worktree_skills_dir = worktree_path / ".claude" / "skills"
         worktree_skills_dir.mkdir(parents=True, exist_ok=True)
         ok, msg = copy_skill("gza-rebase", worktree_skills_dir)
         if not ok:
-            logger.warning("Failed to copy gza-rebase skill to worktree: %s", msg)
+            task_logger.warning(f"Warning: Failed to copy gza-rebase skill to worktree: {msg}")
 
     resolve_config = replace(
         config,
@@ -561,71 +598,192 @@ def invoke_provider_resolve(
         max_turns=effective_max_steps,
     )
 
-    log_dir = config.project_dir / config.log_dir
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_file = log_dir / f"resolve-{timestamp}.log"
-
     load_dotenv(config.project_dir)
     provider = get_provider(resolve_config)
-    store = get_store(config)
-    task_id_label = getattr(task, "id", None)
-    task_ref = f"{task_id_label}" if task_id_label is not None else "<unknown>"
 
     if worktree_path is not None:
-        # New worktree-based flow: fresh rebase, no --continue needed.
         skill_cmd = "/gza-rebase --auto"
         work_dir = worktree_path
     else:
-        # Legacy flow: rebase already in progress in the main working tree.
         skill_cmd = "/gza-rebase --auto --continue"
         work_dir = config.project_dir
 
-    internal_prompt = (
-        f"Resolve rebase conflicts for task {task_ref} branch '{branch}' onto '{target}' "
-        f"using {skill_cmd}."
+    task_logger.phase(
+        f"Provider fallback: resolving conflicts for task {task_ref} branch '{branch}' onto '{target}'.",
+        extra={"provider": effective_provider, "model": effective_model or "default"},
     )
-    internal_task = store.add(
-        prompt=internal_prompt,
-        task_type="internal",
-        skip_learnings=True,
+    task_logger.command(
+        f"Running provider command: {skill_cmd}",
+        extra={"provider": effective_provider, "command": skill_cmd},
     )
-    store.mark_in_progress(internal_task)
-
     try:
         run_result = provider.run(resolve_config, skill_cmd, log_file, work_dir)
-    except Exception:
-        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
-        raise
+    except Exception as exc:
+        task_logger.error(f"Provider resolve failed with exception: {exc}")
+        return False
 
     if run_result.exit_code != 0:
-        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
+        task_logger.error(f"Provider resolve failed with exit code {run_result.exit_code}.")
         return False
 
-    # Check if rebase completed (no longer in rebase state).
-    if worktree_path is not None:
-        rebase_in_progress = _is_rebase_in_progress(worktree_path)
-    else:
-        rebase_in_progress = (
-            (config.project_dir / ".git" / "rebase-merge").exists()
-            or (config.project_dir / ".git" / "rebase-apply").exists()
-        )
-    output_content = (
-        f"Resolved rebase conflicts with {skill_cmd}."
-        if not rebase_in_progress
-        else f"Rebase still in progress after {skill_cmd}."
-    )
+    rebase_in_progress = _is_rebase_in_progress(worktree_path or config.project_dir)
     if rebase_in_progress:
-        store.mark_failed(internal_task, log_file=str(log_file), failure_reason="UNKNOWN")
+        task_logger.error(f"Rebase still in progress after {skill_cmd}.")
         return False
 
-    store.mark_completed(
-        internal_task,
-        log_file=str(log_file),
-        output_content=output_content,
-        has_commits=False,
-    )
+    task_logger.info("Provider resolve completed successfully.")
     return True
+
+
+def _run_task_backed_rebase(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    rebase_task: DbTask,
+    branch: str,
+    target_branch: str,
+    remote: bool = False,
+    parent_task_id: str | None = None,
+    failure_hint_lines: list[str] | None = None,
+) -> int:
+    """Execute a foreground rebase flow with single-task log/state ownership."""
+    git = Git(config.project_dir)
+    log_file = ensure_task_log_path(config, store, rebase_task)
+    logger = TaskExecutionLogger(log_file, echo=True)
+    log_file_storage = task_log_storage_path(config, log_file)
+
+    if rebase_task.status != "in_progress":
+        store.mark_in_progress(rebase_task)
+
+    rebase_target = target_branch
+    logger.info(f"Rebasing task {rebase_task.id}...")
+    logger.phase(f"Current branch: {git.current_branch()}")
+    logger.phase(f"Target branch: {target_branch}")
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "branch",
+            "message": f"Branch: {branch}",
+            "branch": branch,
+            "target_branch": target_branch,
+        },
+    )
+
+    if remote:
+        logger.command("Fetching from origin...")
+        try:
+            git.fetch("origin")
+        except GitError as e:
+            logger.error(f"Error fetching from origin: {e}")
+            store.mark_failed(rebase_task, log_file=log_file_storage, branch=branch, failure_reason="GIT_ERROR")
+            return 1
+        logger.info("✓ Fetched from origin")
+        rebase_target = f"origin/{target_branch}"
+        logger.phase(f"Resolved remote target: {rebase_target}")
+
+    worktree_path = config.worktree_path / str(rebase_task.id)
+    try:
+        stale_path = cleanup_worktree_for_branch(git, branch, force=True)
+        if stale_path:
+            logger.phase(f"Removing stale worktree at {stale_path}...")
+            logger.info("✓ Removed worktree")
+        if worktree_path.exists():
+            logger.phase(f"Removing existing worktree path {worktree_path}...")
+            git.worktree_remove(worktree_path, force=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.phase(f"Creating worktree at {worktree_path}...")
+        git._run("worktree", "add", str(worktree_path), branch)
+    except GitError as e:
+        logger.error(f"Error setting up worktree: {e}")
+        store.mark_failed(rebase_task, log_file=log_file_storage, branch=branch, failure_reason="GIT_ERROR")
+        return 1
+
+    worktree_git = Git(worktree_path)
+
+    try:
+        logger.command(f"Rebasing '{branch}' onto '{rebase_target}'...")
+        resolved_by_provider = False
+        try:
+            worktree_git.rebase(rebase_target)
+            output_content = f"Rebased '{branch}' onto '{rebase_target}'."
+        except GitError as e:
+            logger.warning(f"Conflicts detected: {e}")
+            try:
+                worktree_git.rebase_abort()
+                logger.phase("Aborted conflicted mechanical rebase before provider fallback.")
+            except GitError as abort_error:
+                logger.warning(f"Warning: Could not abort rebase cleanly: {abort_error}")
+
+            logger.phase("Invoking provider to resolve via /gza-rebase --auto...")
+            resolved = invoke_provider_resolve(
+                rebase_task,
+                branch,
+                rebase_target,
+                config,
+                log_file=log_file,
+                logger=logger,
+                worktree_path=worktree_path,
+            )
+            if not resolved:
+                logger.error("Could not resolve conflicts automatically.")
+                if failure_hint_lines:
+                    for line in failure_hint_lines:
+                        logger.error(line)
+                store.mark_failed(
+                    rebase_task,
+                    log_file=log_file_storage,
+                    branch=branch,
+                    failure_reason="TEST_FAILURE",
+                )
+                print()
+                return 1
+
+            resolved_by_provider = True
+            logger.command(f"Pushing {branch}...")
+            worktree_git.push_force_with_lease(branch)
+            logger.info(f"✓ Pushed {branch}")
+            output_content = f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
+
+        has_commits = _branch_has_commits(config, branch)
+        store.mark_completed(
+            rebase_task,
+            branch=branch,
+            log_file=log_file_storage,
+            output_content=output_content,
+            has_commits=has_commits,
+        )
+
+        target_parent_id = parent_task_id or rebase_task.based_on
+        if target_parent_id:
+            store.invalidate_review_state(target_parent_id)
+            parent = store.get(target_parent_id)
+            if parent and parent.id is not None and parent.merge_status == "merged":
+                store.set_merge_status(parent.id, "unmerged")
+
+        if resolved_by_provider:
+            logger.info(f"✓ Successfully rebased {branch} with provider assistance")
+        else:
+            logger.info(f"✓ Successfully rebased {branch} onto {rebase_target}")
+        print()
+        return 0
+
+    except GitError as e:
+        logger.error(f"Error during rebase: {e}")
+        store.mark_failed(rebase_task, log_file=log_file_storage, branch=branch, failure_reason="GIT_ERROR")
+        print()
+        return 1
+    finally:
+        try:
+            logger.phase(f"Cleaning up worktree at {worktree_path}...")
+            git.worktree_remove(worktree_path, force=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            logger.phase("Worktree cleanup complete.")
+        except Exception:
+            logger.warning(f"Warning: Failed to remove rebase worktree at {worktree_path}")
 
 
 def cmd_rebase(args: argparse.Namespace) -> int:
@@ -682,82 +840,20 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     # Determine rebase target: use --onto if provided, else current branch
     rebase_target = getattr(args, 'onto', None) or current_branch
 
-    # Handle --remote flag
-    if hasattr(args, 'remote') and args.remote:
-        print("Fetching from origin...")
-        git.fetch("origin")
-        print("✓ Fetched from origin")
-        rebase_target = f"origin/{rebase_target}"
+    rebase_task = _create_rebase_task(store, task_id, task.branch, rebase_target)
+    assert rebase_task.id is not None
+    rebase_task.branch = task.branch
+    store.update(rebase_task)
 
-    # Set up the task's worktree so the rebase never touches the main working tree.
-    # --force and --resolve are accepted for backward compatibility but are now no-ops:
-    # worktrees are always force-cleaned and auto-resolve is always the fallback.
-    worktree_path = config.worktree_path / str(task.id)
-    print(f"Rebasing task {task.id}...")
-    try:
-        # Remove any existing worktree for this branch (may be at a different path).
-        stale_path = cleanup_worktree_for_branch(git, task.branch, force=True)
-        if stale_path:
-            print(f"Removing stale worktree at {stale_path}...")
-            print("✓ Removed worktree")
-        # Also clean up the target path if it still exists (may be an orphaned dir
-        # not registered with git, in which case worktree_remove is a no-op).
-        if worktree_path.exists():
-            git.worktree_remove(worktree_path, force=True)
-            if worktree_path.exists():
-                shutil.rmtree(worktree_path, ignore_errors=True)
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), task.branch)
-    except GitError as e:
-        print(f"Error setting up worktree: {e}")
-        return 1
-
-    worktree_git = Git(worktree_path)
-
-    try:
-        # Attempt a mechanical rebase inside the worktree (no LLM needed if it succeeds).
-        print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
-        try:
-            worktree_git.rebase(rebase_target)
-            print(f"✓ Successfully rebased {task.branch} onto {rebase_target}")
-            print()
-            return 0
-
-        except GitError as e:
-            # Conflicts detected — abort so the worktree is clean before the provider runs.
-            print(f"Conflicts detected: {e}")
-            try:
-                worktree_git.rebase_abort()
-            except GitError:
-                pass
-
-        # Fall back to provider-driven resolution via /gza-rebase --auto.
-        print("Invoking provider to resolve via /gza-rebase --auto...")
-        resolved = invoke_provider_resolve(
-            task, task.branch, rebase_target, config, worktree_path=worktree_path
-        )
-
-        if not resolved:
-            print("Could not resolve conflicts automatically.")
-            print()
-            return 1
-
-        # Force-push the resolved branch (provider never pushes automatically).
-        print(f"Pushing {task.branch}...")
-        worktree_git.push_force_with_lease(task.branch)
-
-        print(f"✓ Successfully rebased {task.branch}")
-        print()
-        return 0
-
-    finally:
-        # Clean up the temporary worktree on all exit paths (success, failure, exception).
-        try:
-            git.worktree_remove(worktree_path, force=True)
-            if worktree_path.exists():
-                shutil.rmtree(worktree_path, ignore_errors=True)
-        except Exception:
-            logger.warning("Failed to remove rebase worktree at %s", worktree_path)
+    return _run_task_backed_rebase(
+        config=config,
+        store=store,
+        rebase_task=rebase_task,
+        branch=task.branch,
+        target_branch=rebase_target,
+        remote=bool(getattr(args, "remote", False)),
+        parent_task_id=task.id,
+    )
 
 
 def cmd_checkout(args: argparse.Namespace) -> int:
